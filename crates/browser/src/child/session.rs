@@ -518,7 +518,7 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
             timeout_ms,
         } => {
             let timeout = timeout_ms.map(Duration::from_millis);
-            let value = engine.execute_remote_in(frame, &source, timeout);
+            let value = engine.execute_remote_in(frame, source.as_ref(), timeout);
             Handled::Reply(Reply::Value(value))
         }
         Command::Screenshot { frame, request } => match engine.screenshot_frame(frame, &request) {

@@ -43,9 +43,23 @@ mod tests {
     #[test]
     fn blobs_round_trip() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let idl: Vec<_> = fs::read_dir(root.join("../webidl-bindgen/idl"))
+            .expect("read IDL corpus")
+            .map(|entry| entry.expect("read IDL entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "idl"))
+            .map(|path| {
+                (
+                    path.display().to_string(),
+                    fs::read_to_string(path).expect("read IDL extract"),
+                )
+            })
+            .collect();
+        let idl: Vec<_> = idl
+            .iter()
+            .map(|(name, text)| webidl_bindgen::Source { name, text })
+            .collect();
         let dir = PathBuf::from(env!("OUT_DIR")).join("js_blobs");
-        let manifest =
-            fs::read_to_string(dir.join("manifest.txt")).expect("read blob manifest");
+        let manifest = fs::read_to_string(dir.join("manifest.txt")).expect("read blob manifest");
         assert!(!manifest.trim().is_empty(), "blob manifest is empty");
         for line in manifest.lines() {
             let (blob, rest) = line.split_once('\t').expect("manifest blob field");
@@ -55,26 +69,33 @@ mod tests {
                 .read_to_string(&mut out)
                 .expect("inflate blob");
             let (mode, payload) = rest.split_once('\t').expect("manifest mode field");
-            match mode {
-                "single" => {
-                    let source =
-                        fs::read_to_string(root.join(payload)).expect("read shim source");
-                    assert_eq!(out, source, "{blob} drifted from {payload}");
-                }
+            let expected = match mode {
+                "single" => fs::read_to_string(root.join(payload)).expect("read shim source"),
                 "bundle" => {
                     let (wrap, paths) = payload.split_once('\t').expect("bundle manifest");
                     let (prefix, suffix) = wrap.split_once('|').expect("bundle wrapper");
                     let mut expected = String::from(prefix);
                     for path in paths.split(',') {
-                        let source =
-                            fs::read_to_string(root.join(path)).expect("read shim source");
+                        let source = fs::read_to_string(root.join(path)).expect("read shim source");
                         expected.push_str(&source);
                     }
                     expected.push_str(suffix);
-                    assert_eq!(out, expected, "{blob} drifted from its ordered sources");
+                    expected
                 }
                 _ => panic!("unknown manifest mode {mode}"),
-            }
+            };
+            let generated = webidl_bindgen::compile_javascript(
+                &idl,
+                &webidl_bindgen::Source {
+                    name: blob,
+                    text: &expected,
+                },
+            )
+            .expect("compile JS contracts");
+            assert_eq!(
+                out, generated.source,
+                "{blob} drifted from its ordered sources and IDL contracts"
+            );
         }
     }
 }

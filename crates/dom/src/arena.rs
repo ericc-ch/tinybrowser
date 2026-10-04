@@ -10,6 +10,7 @@ use crate::form::FormState;
 use crate::id::NodeId;
 use crate::named::NamedIndex;
 use crate::node::{Attribute, NodeKind, QualName, html_namespace};
+use crate::string::DomString;
 
 pub use self::tree::Children;
 use self::tree::Slot;
@@ -311,7 +312,7 @@ impl Document {
     /// # Panics
     ///
     /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
-    pub fn create_text(&mut self, data: impl Into<String>) -> NodeId {
+    pub fn create_text(&mut self, data: impl Into<DomString>) -> NodeId {
         self.alloc(NodeKind::Text { data: data.into() })
     }
 
@@ -320,7 +321,7 @@ impl Document {
     /// # Panics
     ///
     /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
-    pub fn create_comment(&mut self, data: impl Into<String>) -> NodeId {
+    pub fn create_comment(&mut self, data: impl Into<DomString>) -> NodeId {
         self.alloc(NodeKind::Comment { data: data.into() })
     }
 
@@ -329,7 +330,7 @@ impl Document {
     /// # Panics
     ///
     /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
-    pub fn create_cdata_section(&mut self, data: impl Into<String>) -> NodeId {
+    pub fn create_cdata_section(&mut self, data: impl Into<DomString>) -> NodeId {
         self.alloc(NodeKind::CDataSection { data: data.into() })
     }
 
@@ -341,7 +342,7 @@ impl Document {
     pub fn create_processing_instruction(
         &mut self,
         target: impl Into<String>,
-        data: impl Into<String>,
+        data: impl Into<DomString>,
     ) -> NodeId {
         self.alloc(NodeKind::ProcessingInstruction {
             target: target.into(),
@@ -403,14 +404,14 @@ impl Document {
     /// so its data is included. A stale handle has no children, so this
     /// yields the empty string.
     #[must_use]
-    pub fn child_text_content(&self, id: NodeId) -> String {
-        let mut text = String::new();
+    pub fn child_text_content(&self, id: NodeId) -> DomString {
+        let mut text = DomString::default();
         if let Some(children) = self.children(id) {
             for child in children {
                 if let Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) =
                     self.kind(child)
                 {
-                    text.push_str(data);
+                    text.push_dom(data);
                 }
             }
         }
@@ -419,12 +420,12 @@ impl Document {
 
     /// The text content of `id`: every descendant text node's data.
     #[must_use]
-    pub fn text_content(&self, id: NodeId) -> String {
-        let mut text = String::new();
+    pub fn text_content(&self, id: NodeId) -> DomString {
+        let mut text = DomString::default();
         for node in self.tree.descendants(id) {
             if let Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) = self.kind(node)
             {
-                text.push_str(data);
+                text.push_dom(data);
             }
         }
         text

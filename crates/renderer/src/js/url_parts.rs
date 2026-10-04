@@ -26,11 +26,11 @@ const HASH: u32 = 8;
 
 /// Installs the decomposition hooks the JS shim calls.
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.globals().set(
+    super::bridge::object(ctx)?.set(
         "__tbUrlParts",
         Func::from(|spec: String, base: String| parts(&spec, &base)),
     )?;
-    ctx.globals().set(
+    super::bridge::object(ctx)?.set(
         "__tbUrlSetPart",
         Func::from(|spec: String, base: String, part: u32, value: String| {
             set_part(&spec, &base, part, &value)

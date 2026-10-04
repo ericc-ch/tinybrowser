@@ -131,7 +131,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     let date_provider = Rc::clone(&provider);
     let currency_provider = Rc::clone(&provider);
     let locale_canonicalizer = Rc::clone(&canonicalizer);
-    let globals = ctx.globals();
+    let globals = super::bridge::object(ctx)?;
     globals.set(
         "__tbIntlCanonicalLocale",
         Func::from(move |tag: String| canonicalize_locale(&locale_canonicalizer, &tag)),
@@ -158,7 +158,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
             format_date_time_args(&ctx, &date_provider, &args)
         }),
     )?;
-    ctx.eval::<(), _>(install_intl_js(ctx)?)
+    super::bridge::evaluate(ctx, install_intl_js(ctx)?)
 }
 
 fn resolve_locale(tag: &str) -> String {

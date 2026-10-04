@@ -83,8 +83,8 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
     parsed.quirks_mode = quirks_mode;
     let document = parsed.document.document();
     for child in children {
-        let child =
-            materialize_import(&mut parsed.document, &child).map_err(|err| throw_dom_error(ctx, err))?;
+        let child = materialize_import(&mut parsed.document, &child)
+            .map_err(|err| throw_dom_error(ctx, err))?;
         dom::mutation::append(&mut parsed.document, document, child)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
@@ -99,13 +99,13 @@ pub(crate) enum ImportSnapshot {
         children: Vec<ImportSnapshot>,
         template_contents: Option<Vec<ImportSnapshot>>,
     },
-    Text(String),
-    CData(String),
+    Text(dom::DomString),
+    CData(dom::DomString),
     ProcessingInstruction {
         target: String,
-        data: String,
+        data: dom::DomString,
     },
-    Comment(String),
+    Comment(dom::DomString),
     Doctype {
         name: String,
         public_id: String,
@@ -114,7 +114,11 @@ pub(crate) enum ImportSnapshot {
     Fragment(Vec<ImportSnapshot>),
 }
 
-pub(crate) fn import_snapshot(dom: &dom::Document, id: NodeId, deep: bool) -> Option<ImportSnapshot> {
+pub(crate) fn import_snapshot(
+    dom: &dom::Document,
+    id: NodeId,
+    deep: bool,
+) -> Option<ImportSnapshot> {
     let children = |deep: bool| -> Vec<ImportSnapshot> {
         if !deep {
             return Vec::new();

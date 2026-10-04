@@ -1,0 +1,19 @@
+[package]
+name = "webidl-bindgen"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+weedle = { package = "weedle4", path = "../../third_party/weedle4" }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }
+prettyplease = "0.3"
+oxc_allocator = "0.152"
+oxc_ast = "0.152"
+oxc_ast_visit = "0.152"
+oxc_parser = "0.152"
+oxc_span = "0.152"

@@ -307,8 +307,8 @@ async function main() {
     return;
   }
 
-  const binary = process.env.TINYBROWSER_BIN;
-  if (!binary) throw new Error("TINYBROWSER_BIN is not set; run ./tools/cdp-tests/run");
+  const binary = process.env.TINYBROWSER_BINARY;
+  if (!binary) throw new Error("TINYBROWSER_BINARY is not set; run ./tools/cdp-tests/run");
   console.log(`Running ${selected.length} of ${tests.length} Blink CDP tests using ${options.jobs} worker(s)`);
   const temporaryRoot = join(ROOT, "target/cdp-tmp");
   runTemporaryRoot = temporaryRoot;

@@ -1,54 +1,44 @@
 //! `DOMImplementation`, DOM parsing, and serialization.
 
 use super::{
-    FromJs, JsAttr, LegacyNullString, NodeContext, OptString, OptionalTitle, WebIdlString,
+    NodeContext,
     clone::{import_snapshot, materialize_import},
-    create_kind, host_node_id, throw_dom, throw_dom_error, validate_and_extract, world,
-    world_for_node, wrap_new_document,
+    create_kind, throw_dom, throw_dom_error, validate_and_extract, world, world_for_node,
+    wrap_new_document, wrap_new_document_in_world,
 };
-use rquickjs::function::{Opt, Rest};
 
 use dom::{LocalName, NodeId, NodeKind, QualName, html_namespace};
 
-use rquickjs::{Class, Ctx, Exception, Result, Value, class::Trace};
+use rquickjs::{Ctx, Exception, Result, Value, class::Trace};
 
 use crate::js::world::Handle;
 
 /// `DOMImplementation` as a platform object
 /// (<https://dom.spec.whatwg.org/#interface-domimplementation>).
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "DOMImplementation")]
 pub struct JsImplementation {
     pub(crate) document: Handle,
 }
 
-#[rquickjs::methods]
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; DOMImplementation methods ignore self"
-)]
-impl JsImplementation {
-    #[qjs(constructor)]
-    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
-        Err(Exception::throw_type(&ctx, "Illegal constructor"))
-    }
+include!(concat!(env!("OUT_DIR"), "/DOMImplementation.rs"));
 
+impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementation {
     // https://dom.spec.whatwg.org/#dom-domimplementation-hasfeature
-    #[qjs(rename = "hasFeature")]
-    fn has_feature(&self, _args: Rest<Value<'_>>) -> bool {
-        true
+    fn has_feature(&self, _ctx: Ctx<'js>) -> Result<bool> {
+        Ok(true)
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype
-    #[qjs(rename = "createDocumentType")]
-    fn create_document_type<'js>(
+    fn create_document_type(
         &self,
         ctx: Ctx<'js>,
-        name: String,
-        public_id: String,
-        system_id: String,
+        name: rquickjs::String<'js>,
+        public_id: rquickjs::String<'js>,
+        system_id: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
+        let name = name.to_string()?;
+        let public_id = public_id.to_string()?;
+        let system_id = system_id.to_string()?;
         if !valid_doctype_name(&name) {
             return Err(throw_dom(
                 &ctx,
@@ -61,18 +51,19 @@ impl JsImplementation {
         })
     }
 
-    /// Creating a second document needs the renderer's World to own several
-    /// trees; refused honestly until then.
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
-    #[qjs(rename = "createDocument")]
-    fn create_document<'js>(
+    fn create_document(
         &self,
         ctx: Ctx<'js>,
-        namespace: OptString,
-        qualified: LegacyNullString,
-        doctype: Value<'js>,
+        namespace: Option<rquickjs::String<'js>>,
+        qualified: rquickjs::String<'js>,
+        doctype: Option<NodeId>,
     ) -> Result<Value<'js>> {
-        let namespace = namespace.0.unwrap_or_default();
+        let namespace = namespace
+            .map(|value| value.to_string())
+            .transpose()?
+            .unwrap_or_default();
+        let qualified = qualified.to_string()?;
         let content_type = match namespace.as_str() {
             "http://www.w3.org/1999/xhtml" => "application/xhtml+xml",
             "http://www.w3.org/2000/svg" => "image/svg+xml",
@@ -80,32 +71,19 @@ impl JsImplementation {
         };
         // `qualifiedName` validates before the doctype steps run
         // (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>).
-        let root = if qualified.0.is_empty() {
+        let root = if qualified.is_empty() {
             None
         } else {
             Some(validate_and_extract(
                 &ctx,
                 (!namespace.is_empty()).then_some(namespace.as_str()),
-                &qualified.0,
+                &qualified,
                 NodeContext::Element,
             )?)
         };
         let mut parsed = crate::Parsed::empty(content_type);
         let document = parsed.document.document();
-        if !doctype.is_null()
-            && !doctype.is_undefined()
-            && doctype_fields_for(&ctx, host_node_id(&ctx, &doctype).unwrap_or(document)).is_none()
-        {
-            return Err(Exception::throw_type(
-                &ctx,
-                "doctype argument is not a DocumentType",
-            ));
-        }
-        // The argument node itself appends (adopted across arenas), keeping
-        // wrapper identity with the passed doctype.
-        if let Some(doctype) = host_node_id(&ctx, &doctype)
-            && doctype_fields_for(&ctx, doctype).is_some()
-        {
+        if let Some(doctype) = doctype {
             let owner_rc = world_for_node(&ctx, doctype)?;
             let snapshot = {
                 let owner = owner_rc.borrow();
@@ -126,15 +104,14 @@ impl JsImplementation {
             dom::mutation::append(&mut parsed.document, document, element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        wrap_new_document(&ctx, parsed)
+        wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument
-    #[qjs(rename = "createHTMLDocument")]
-    fn create_html_document<'js>(
+    fn create_html_document(
         &self,
         ctx: Ctx<'js>,
-        title: Opt<OptionalTitle>,
+        title: Option<rquickjs::String<'js>>,
     ) -> Result<Value<'js>> {
         let mut parsed = crate::Parsed::empty("text/html");
         let document = parsed.document.document();
@@ -151,13 +128,15 @@ impl JsImplementation {
             .create_element(html_element_name("head"), Vec::new());
         dom::mutation::append(&mut parsed.document, html, head)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        if let Some(title) = title.0.and_then(|title| title.0) {
+        if let Some(title) = title {
             let title_element = parsed
                 .document
                 .create_element(html_element_name("title"), Vec::new());
             dom::mutation::append(&mut parsed.document, head, title_element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
-            let text = parsed.document.create_text(title);
+            let text = parsed
+                .document
+                .create_text(dom::DomString::from_utf16(title.to_utf16()?));
             dom::mutation::append(&mut parsed.document, title_element, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
@@ -166,7 +145,7 @@ impl JsImplementation {
             .create_element(html_element_name("body"), Vec::new());
         dom::mutation::append(&mut parsed.document, html, body)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        wrap_new_document(&ctx, parsed)
+        wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
 }
 
@@ -185,14 +164,6 @@ pub(super) fn doctype_fields(
     }
 }
 
-/// [`doctype_fields`] for `id` in the current realm's world.
-fn doctype_fields_for(ctx: &Ctx<'_>, id: NodeId) -> Option<(String, String, String)> {
-    let world_rc = world(ctx).ok()?;
-    let world = world_rc.borrow();
-    let parsed = world.document(id)?;
-    doctype_fields(&parsed, id)
-}
-
 /// An HTML-namespace qualified name for document construction.
 fn html_element_name(local: &str) -> QualName {
     QualName::new(None, html_namespace(), LocalName::from(local))
@@ -207,8 +178,10 @@ fn valid_doctype_name(name: &str) -> bool {
 }
 
 /// `DOMParser` (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-parsing-and-serialization>).
+///
+/// The JS surface lives in Web IDL; `parse_from_string` is the platform
+/// algorithm the generated dispatcher calls.
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "DOMParser")]
 pub struct JsDomParser {
     /// The constructing realm's document URL. `parseFromString` parses with
     /// the context object's environment settings, not the caller's, so the
@@ -218,47 +191,38 @@ pub struct JsDomParser {
     url: String,
 }
 
-#[rquickjs::methods]
+include!(concat!(env!("OUT_DIR"), "/DOMParser.rs"));
+
 #[allow(
     clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value"
+    reason = "generated dispatch passes Ctx and Value by value"
 )]
-impl JsDomParser {
-    #[qjs(constructor)]
-    fn new(ctx: Ctx<'_>) -> Result<Self> {
+impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-domparser
+    fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
         Ok(Self {
-            url: world(&ctx)?.borrow().document_url.as_str().to_owned(),
+            url: world(ctx)?.borrow().document_url.as_str().to_owned(),
         })
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring
-    #[qjs(rename = "parseFromString")]
-    fn parse_from_string<'js>(
+    fn parse_from_string(
         &self,
         ctx: Ctx<'js>,
-        source: WebIdlString,
-        type_: WebIdlString,
+        source: rquickjs::String<'js>,
+        type_: dom_parser_generated::DOMParserSupportedType,
     ) -> Result<Value<'js>> {
-        let content_type = CONTENT_TYPES
-            .iter()
-            .copied()
-            .find(|valid| *valid == type_.0.as_str())
-            .ok_or_else(|| {
-                Exception::throw_type(
-                    &ctx,
-                    &format!("The provided value '{}' is not a valid enum value", type_.0),
-                )
-            })?;
+        let source = source.to_string()?;
+        let content_type = type_.as_str();
         // `DOMParser` parses with scripting disabled
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
         let mut parsed = if content_type == "text/html" {
-            let mut parsed = crate::parse_html_without_scripting(&source.0);
+            let mut parsed = crate::parse_html_without_scripting(&source);
             parsed.content_type = content_type;
             parsed.ready_state = crate::ReadyState::Complete;
             parsed
         } else {
-            crate::xml::parse_document(&source.0, content_type)
+            crate::xml::parse_document(&source, content_type)
         };
         // The instance's constructing realm decides the URL, never the
         // caller and never a forged argument: cross-realm method calls parse
@@ -273,8 +237,10 @@ impl JsDomParser {
 /// realm that constructed it; the parsed document takes that URL
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
 /// Deflated by `build.rs`, inflated once per process.
-pub(crate) const INSTALL_DOMPARSER_CTOR_DEFLATE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/dom_parser_ctor.deflate"));
+pub(crate) const INSTALL_DOMPARSER_CTOR_DEFLATE: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/js_blobs/dom_parser_ctor.deflate"
+));
 
 /// The `DOMParser` constructor shim, inflated once per process.
 pub(crate) fn install_domparser_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
@@ -282,52 +248,40 @@ pub(crate) fn install_domparser_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     crate::js::blob::decompress(ctx, INSTALL_DOMPARSER_CTOR_DEFLATE, &CACHE)
 }
 
-/// The `DOMParser` `parseFromString` `SupportedType` values
-/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
-const CONTENT_TYPES: [&str; 5] = [
-    "text/html",
-    "text/xml",
-    "application/xml",
-    "application/xhtml+xml",
-    "image/svg+xml",
-];
-
 /// `XMLSerializer` (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#xmlserializer>).
+///
+/// The JS surface lives in Web IDL; `serialize_to_string` is the platform
+/// algorithm the generated dispatcher calls.
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "XMLSerializer")]
 pub struct JsXmlSerializer {
     pub(crate) _reserved: Option<Handle>,
 }
 
-#[rquickjs::methods]
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; XMLSerializer is a stateless constructor"
-)]
-impl JsXmlSerializer {
-    #[qjs(constructor)]
-    fn new() -> Self {
-        Self { _reserved: None }
+include!(concat!(env!("OUT_DIR"), "/XMLSerializer.rs"));
+
+impl<'js> xml_serializer_generated::XMLSerializer<'js> for JsXmlSerializer {
+    fn constructor(_ctx: &Ctx<'js>) -> Result<Self> {
+        Ok(Self { _reserved: None })
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-xmlserializer-serializetostring
-    #[qjs(rename = "serializeToString")]
-    fn serialize_to_string<'js>(&self, ctx: Ctx<'js>, root: Value<'js>) -> Result<String> {
+    fn serialize_to_string(
+        &self,
+        ctx: Ctx<'js>,
+        root: super::host::NodeReference,
+    ) -> Result<rquickjs::String<'js>> {
         // An `Attr` serializes as the empty string
         // (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
-        if Class::<JsAttr>::from_js(&ctx, root.clone()).is_ok() {
-            return Ok(String::new());
-        }
-        let Some(id) = host_node_id(&ctx, &root) else {
-            return Err(Exception::throw_type(&ctx, "argument is not a Node"));
+        let super::host::NodeReference::Tree(id) = root else {
+            return rquickjs::String::from_str(ctx.clone(), "");
         };
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(parsed) = world.document(id) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        crate::serialize::serialize_xml(&parsed.document, id, false)
-            .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+        let markup = crate::serialize::serialize_xml(&parsed.document, id, false)
+            .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))?;
+        super::dom_string(&ctx, &markup)
     }
 }

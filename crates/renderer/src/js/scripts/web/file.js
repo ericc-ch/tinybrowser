@@ -3,13 +3,10 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
   constructor(type, init) {
     const eventInit = init === undefined ? {} : Object(init);
     super(String(type), eventInit);
-    Object.defineProperty(this, __tbProgressData, {
-      value: {
+    __tbProgressData.set(this, {
         lengthComputable: eventInit.lengthComputable === undefined ? false : Boolean(eventInit.lengthComputable),
         loaded: eventInit.loaded === undefined ? 0 : Number(eventInit.loaded),
         total: eventInit.total === undefined ? 0 : Number(eventInit.total),
-      },
-      writable: false, enumerable: false, configurable: false,
     });
   }
   get lengthComputable() { return __tbBrand(this, __tbProgressData).lengthComputable; }
@@ -29,22 +26,22 @@ const __tbConvertBlobParts = blobParts => {
   const iteratorMethod = parts[Symbol.iterator];
   const converted = [];
   const convertPart = part => {
-    const fromBlob = part !== null && typeof part === 'object' ? part[__tbBlobData] : undefined;
+    const fromBlob = part !== null && typeof part === 'object' ? __tbBlobData.get(part) : undefined;
     if (fromBlob !== undefined) {
-      converted.push(fromBlob.bytes);
+      __tbArray.push(converted, fromBlob.bytes);
     } else if (part instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && part instanceof SharedArrayBuffer)) {
-      converted.push(new Uint8Array(part).slice());
+      __tbArray.push(converted, __tbBytesCopy(new __tbUint8Array(part)));
     } else if (ArrayBuffer.isView(part)) {
-      converted.push(new Uint8Array(part.buffer, part.byteOffset, part.byteLength).slice());
+      __tbArray.push(converted, __tbBytesCopy(new __tbUint8Array(part.buffer, part.byteOffset, part.byteLength)));
     } else {
-      converted.push(String(part));
+      __tbArray.push(converted, String(part));
     }
   };
   if (iteratorMethod !== undefined && iteratorMethod !== null) {
     if (typeof iteratorMethod !== 'function') {
       throw new TypeError('The blobParts argument must be iterable');
     }
-    const iterator = iteratorMethod.call(parts);
+    const iterator = __tbApply(iteratorMethod, parts, []);
     while (true) {
       const step = iterator.next();
       if (step.done) break;
@@ -75,15 +72,16 @@ const __tbBlobType = value => {
   return [...value].some(character => character < ' ' || character > '~') ? '' : value;
 };
 const __tbBlobBytes = (converted, endings) => {
-  const chunks = converted.map(part => typeof part === 'string'
+  const chunks = __tbArray.map(converted, part => typeof part === 'string'
     ? __tbUtf8Encode(endings === 'native' ? __tbNativeEndings(part) : part)
     : part);
   let length = 0;
-  for (const chunk of chunks) length += chunk.length;
-  const bytes = new Uint8Array(length);
+  for (let index = 0; index < chunks.length; index++) length += chunks[index].length;
+  const bytes = host.slots.bytes(length);
   let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
+  for (let index = 0; index < chunks.length; index++) {
+    const chunk = chunks[index];
+    for (let byte = 0; byte < chunk.length; byte++) bytes[offset + byte] = chunk[byte];
     offset += chunk.length;
   }
   return bytes;
@@ -101,10 +99,7 @@ globalThis.Blob = class Blob {
       type = __tbBlobType(options.type);
     }
     const bytes = __tbBlobBytes(converted, endings);
-    Object.defineProperty(this, __tbBlobData, {
-      value: { bytes, type: type.toLowerCase() },
-      writable: false, enumerable: false, configurable: false,
-    });
+    __tbBlobData.set(this, { bytes, type: type.toLowerCase() });
   }
   get size() { return __tbBrand(this, __tbBlobData).bytes.length; }
   get type() { return __tbBrand(this, __tbBlobData).type; }
@@ -116,12 +111,12 @@ globalThis.Blob = class Blob {
   // https://w3c.github.io/FileAPI/#dom-blob-arraybuffer
   arrayBuffer() {
     const bytes = __tbBrand(this, __tbBlobData).bytes;
-    return Promise.resolve(bytes.slice().buffer);
+    return Promise.resolve(__tbBytesCopy(bytes).buffer);
   }
   // https://w3c.github.io/FileAPI/#dom-blob-bytes
   bytes() {
     const bytes = __tbBrand(this, __tbBlobData).bytes;
-    return Promise.resolve(bytes.slice());
+    return Promise.resolve(__tbBytesCopy(bytes));
   }
   // https://w3c.github.io/FileAPI/#dom-blob-slice
   slice(start, end, contentType) {
@@ -146,11 +141,11 @@ globalThis.Blob = class Blob {
       type = String(contentType);
       if ([...type].some(character => character < ' ' || character > '~')) type = '';
     }
-    return new Blob([data.bytes.subarray(relativeStart, relativeStart + span)], { type });
+    return new Blob([__tbBytesCopy(data.bytes, relativeStart, relativeStart + span)], { type });
   }
   // https://w3c.github.io/FileAPI/#dom-blob-stream
   stream() {
-    const bytes = __tbBrand(this, __tbBlobData).bytes.slice();
+    const bytes = __tbBytesCopy(__tbBrand(this, __tbBlobData).bytes);
     return new ReadableStream({
       start(controller) {
         if (bytes.length > 0) controller.enqueue(bytes);
@@ -198,10 +193,7 @@ globalThis.File = class File extends Blob {
       type = __tbBlobType(options.type);
     }
     super([__tbBlobBytes(converted, endings)], { endings, type });
-    Object.defineProperty(this, __tbFileData, {
-      value: { name, lastModified },
-      writable: false, enumerable: false, configurable: false,
-    });
+    __tbFileData.set(this, { name, lastModified });
   }
   get name() { return __tbBrand(this, __tbFileData).name; }
   get lastModified() { return __tbBrand(this, __tbFileData).lastModified; }
@@ -219,34 +211,29 @@ globalThis.FileList = class FileList {
     return index >= 0 && index < files.length ? files[index] : null;
   }
   [Symbol.iterator]() {
-    return __tbBrand(this, __tbFileListData).files[Symbol.iterator]();
+    return __tbArray.iterator(__tbBrand(this, __tbFileListData).files);
   }
 };
 Object.defineProperty(globalThis.FileList.prototype, Symbol.toStringTag, { value: 'FileList', writable: false, enumerable: false, configurable: true });
-globalThis.__tbCreateFileList = files => {
-  const list = Object.create(globalThis.FileList.prototype);
-  const items = Array.from(files);
-  Object.defineProperty(list, __tbFileListData, {
-    value: { files: items },
-    writable: false, enumerable: false, configurable: false,
-  });
+host.__tbCreateFileList = files => {
+  const list = __tbObjectCreate(globalThis.FileList.prototype);
+  const items = __tbArray.map(files, file => file);
+  __tbFileListData.set(list, { files: items });
   // The indexed getter (<https://webidl.spec.whatwg.org/#dfn-indexed-property-getter>):
   // a FileList is fixed-size, so each index is an own property.
-  items.forEach((file, index) => {
-    Object.defineProperty(list, index, {
-      value: file, writable: false, enumerable: true, configurable: true,
+  for (let index = 0; index < items.length; index++) {
+    __tbDefineProperty(list, index, {
+      __proto__: null,
+      value: items[index], writable: false, enumerable: true, configurable: true,
     });
-  });
+  }
   return list;
 };
 // https://w3c.github.io/FileAPI/#APIASynch
 globalThis.FileReader = class FileReader extends EventTarget {
   constructor() {
     super();
-    Object.defineProperty(this, __tbReaderData, {
-      value: { state: 0, result: null, error: null, generation: 0, handlers: {} },
-      writable: false, enumerable: false, configurable: false,
-    });
+    __tbReaderData.set(this, { state: 0, result: null, error: null, generation: 0, handlers: { __proto__: null } });
   }
   get readyState() { return __tbBrand(this, __tbReaderData).state; }
   get result() { return __tbBrand(this, __tbReaderData).result; }
@@ -309,13 +296,13 @@ const __tbFileReaderRead = (reader, blob, kind, argument) => {
   // Every event runs in its own task, so awaiting tests observe the order the
   // spec queues and abort() can land between steps
   // (<https://w3c.github.io/FileAPI/#readOperation>).
-  setTimeout(function() {
+  host.setTimeout(function() {
     if (stale()) return;
     fire('loadstart', 0, true);
-    setTimeout(function() {
+    host.setTimeout(function() {
       if (stale()) return;
       if (total > 0) fire('progress', total, true);
-      setTimeout(function() {
+      host.setTimeout(function() {
         if (stale()) return;
         let result = null;
         let error = null;
@@ -342,7 +329,7 @@ const __tbFileReaderRead = (reader, blob, kind, argument) => {
             const type = source.type === '' ? 'application/octet-stream' : source.type;
             result = 'data:' + type + ';base64,' + __tbBase64Encode(source.bytes);
           } else if (kind === 'arraybuffer') {
-            result = source.bytes.slice().buffer;
+            result = __tbBytesCopy(source.bytes).buffer;
           } else {
             result = '';
             for (let index = 0; index < source.bytes.length; index++) {
@@ -361,7 +348,7 @@ const __tbFileReaderRead = (reader, blob, kind, argument) => {
           data.result = result;
           fire('load', total, true);
         }
-        setTimeout(function() {
+        host.setTimeout(function() {
           if (stale()) return;
           fire('loadend', total, true);
         }, 0);
@@ -379,42 +366,35 @@ Object.defineProperty(globalThis.FileReader.prototype, Symbol.toStringTag, { val
 // `DataTransfer` only as far as tests need it: `items.add(file)` collects
 // files and `files` exposes them as a FileList
 // (<https://html.spec.whatwg.org/multipage/dnd.html#datatransfer>).
-const __tbDataTransferFiles = Symbol('tb-data-transfer-files');
-const __tbDataTransferItems = Symbol('tb-data-transfer-items');
-const __tbDataTransferFileList = Symbol('tb-data-transfer-file-list');
+const __tbDataTransferFiles = host.slots('tb-data-transfer-files');
+const __tbDataTransferItems = host.slots('tb-data-transfer-items');
+const __tbDataTransferFileList = host.slots('tb-data-transfer-file-list');
 globalThis.DataTransfer = class DataTransfer {
   constructor() {
-    Object.defineProperty(this, __tbDataTransferFiles, {
-      value: [], writable: false, enumerable: false, configurable: false,
-    });
+    __tbDataTransferFiles.set(this, []);
   }
   get items() {
-    let items = this[__tbDataTransferItems];
+    let items = __tbDataTransferItems.get(this);
     if (items === undefined) {
-      const files = this[__tbDataTransferFiles];
+      const files = __tbDataTransferFiles.get(this);
       items = {
-        add(file) { files.push(file); return null; },
+        add(file) { __tbArray.push(files, file); return null; },
       };
       Object.defineProperty(items, 'length', {
         get() { return files.length; }, enumerable: true, configurable: true,
       });
-      Object.defineProperty(this, __tbDataTransferItems, {
-        value: items, writable: false, enumerable: false, configurable: false,
-      });
+      __tbDataTransferItems.set(this, items);
     }
     return items;
   }
   get files() {
     // `files` is a `[SameObject]` FileList over the DataTransfer's items
     // (<https://html.spec.whatwg.org/multipage/dnd.html#dom-datatransfer-files>).
-    if (this[__tbDataTransferFileList] === undefined) {
-      Object.defineProperty(this, __tbDataTransferFileList, {
-        value: globalThis.__tbCreateFileList(this[__tbDataTransferFiles]),
-        writable: false, enumerable: false, configurable: false,
-      });
+    if (__tbDataTransferFileList.get(this) === undefined) {
+      __tbDataTransferFileList.set(this, host.__tbCreateFileList(__tbDataTransferFiles.get(this)));
     }
-    __tbBrand(this[__tbDataTransferFileList], __tbFileListData).files = this[__tbDataTransferFiles];
-    return this[__tbDataTransferFileList];
+    __tbBrand(__tbDataTransferFileList.get(this), __tbFileListData).files = __tbDataTransferFiles.get(this);
+    return __tbDataTransferFileList.get(this);
   }
 };
 Object.defineProperty(globalThis.DataTransfer.prototype, Symbol.toStringTag, {
@@ -423,4 +403,4 @@ Object.defineProperty(globalThis.DataTransfer.prototype, Symbol.toStringTag, {
 
 // A `type=file` input with no files still contributes an entry, an empty File
 // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-globalThis.__tbEmptyFile = () => new globalThis.File([], '');
+host.__tbEmptyFile = () => new globalThis.File([], '');

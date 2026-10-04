@@ -21,6 +21,11 @@ use crate::{Parsed, ReadyState};
 /// alive, so cached wrappers never outlive the heap.
 #[derive(Default)]
 pub(crate) struct RealmRegistry {
+    pub(crate) realm_contexts: Vec<usize>,
+    pub(crate) attributes: AttributeRegistry,
+    pub(crate) observers: super::observers::MutationObservers,
+    pub(crate) reactions: super::reactions::CustomElementReactions,
+    pub(crate) private_slots: Option<PrivateSlots>,
     budget: Rc<RefCell<ResourceBudget>>,
     /// The World that owns each document id, for wrapper realm resolution.
     documents: HashMap<u32, Weak<RefCell<World>>>,
@@ -35,6 +40,11 @@ pub(crate) struct RealmRegistry {
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
+}
+
+pub(crate) struct PrivateSlots {
+    pub(crate) factory: Persistent<Function<'static>>,
+    pub(crate) realms: HashSet<usize>,
 }
 
 impl RealmRegistry {
@@ -85,6 +95,7 @@ impl RealmRegistry {
 
     /// Drops every realm and wrapper association for a document that is gone.
     pub(crate) fn forget_document(&mut self, id: u32) {
+        self.attributes.forget_document(id);
         self.documents.remove(&id);
         self.wrappers.retain(|node, _| node.document_id() != id);
         self.frame_documents
@@ -115,6 +126,11 @@ impl RealmRegistry {
 
     /// Drops every cached wrapper; called while the runtime is still alive.
     pub(crate) fn clear(&mut self) {
+        super::bindings::forget_registry_contexts(&self.realm_contexts);
+        self.realm_contexts.clear();
+        self.attributes.clear();
+        self.reactions.clear();
+        self.private_slots = None;
         self.documents.clear();
         self.frames.clear();
         self.wrappers.clear();
@@ -192,13 +208,37 @@ pub(crate) struct ObserverOptions {
     pub subtree: bool,
     pub attribute_old_value: bool,
     pub character_data_old_value: bool,
-    pub attribute_filter: Option<Vec<String>>,
+    pub attribute_filter: Option<Vec<Vec<u16>>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct Observation {
-    pub target: Handle,
+    pub target: NodeReference,
     pub options: ObserverOptions,
+    pub order: u64,
+}
+
+/// Both native representations implementing Node, including Attr, which is
+/// not a member of a document's child tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NodeReference {
+    Tree(dom::NodeId),
+    Attribute { scope: dom::NodeId, id: u64 },
+}
+
+impl NodeReference {
+    pub(crate) fn tree(self) -> Option<dom::NodeId> {
+        match self {
+            Self::Tree(id) => Some(id),
+            Self::Attribute { .. } => None,
+        }
+    }
+
+    pub(crate) fn scope(self) -> dom::NodeId {
+        match self {
+            Self::Tree(id) | Self::Attribute { scope: id, .. } => id,
+        }
+    }
 }
 
 /// One queued `MutationRecord`, ready to wrap for JS.
@@ -212,7 +252,9 @@ pub(crate) struct RecordData {
     pub next: Option<Handle>,
     pub attribute_name: Option<String>,
     pub attribute_namespace: Option<String>,
-    pub old_value: Option<String>,
+    /// Not traced: a `DomString` holds no JavaScript value.
+    #[qjs(skip_trace)]
+    pub old_value: Option<dom::DomString>,
 }
 
 impl RecordData {
@@ -234,6 +276,7 @@ impl RecordData {
 }
 
 pub(crate) struct ObserverState {
+    pub owner: FrameId,
     pub callback: Persistent<Function<'static>>,
     /// The observer platform object, for the callback's `this` value and
     /// second argument
@@ -246,8 +289,6 @@ pub(crate) struct ObserverState {
 
 /// One observer with queued records, ready for callback delivery.
 pub(crate) struct ReadyObserver {
-    /// Creation-order id; delivery follows it.
-    pub id: u64,
     pub callback: Persistent<Function<'static>>,
     pub object: Persistent<Object<'static>>,
     pub records: Vec<RecordData>,
@@ -269,6 +310,11 @@ pub(crate) struct Listener {
 pub(crate) enum EventTargetKey {
     Window,
     Node(NodeId),
+    /// Attr registry identity: immutable creation scope and agent-issued id.
+    Attribute {
+        scope: NodeId,
+        id: u64,
+    },
     /// A constructible `EventTarget`, numbered per world.
     Standalone(u64),
 }
@@ -298,6 +344,11 @@ pub(crate) enum Wrapper {
     Dataset,
 }
 
+pub(crate) struct WeakReferences {
+    pub(crate) constructor: Persistent<rquickjs::function::Constructor<'static>>,
+    pub(crate) deref: Persistent<Function<'static>>,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -311,7 +362,8 @@ pub(crate) struct World {
     new_frames: Vec<(FrameId, NodeId, Document)>,
     /// The active document of the frame this realm belongs to.
     document: Option<u32>,
-    /// Document ids this realm created; only these feed its observers.
+    /// Document ids this realm created. Its logs feed every realm's
+    /// observers through the union drain.
     owned: HashSet<u32>,
     pub document_url: Url,
     pub(crate) history: crate::protocol::HistorySnapshot,
@@ -357,10 +409,7 @@ pub(crate) struct World {
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
     clicks_in_progress: HashSet<NodeId>,
     brands: HashMap<String, Persistent<Object<'static>>>,
-    /// `Attr` platform-object identity, keyed by a per-realm id.
-    pub(crate) attrs: HashMap<u64, AttrState>,
-    /// Owner element for each `Attr` id; `None` while detached.
-    pub(crate) attr_owners: HashMap<u64, Option<NodeId>>,
+    pub(crate) bridge: Option<Persistent<Object<'static>>>,
     /// Event handler properties (`element.onload`, `window.onmessage`) live
     /// here rather than on the wrapper, which may be collected while the node
     /// stays alive. Keyed by `(None, name)` for the window and
@@ -371,40 +420,23 @@ pub(crate) struct World {
     /// does not resurrect the element's content attribute
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
     cleared_handlers: HashSet<(Option<NodeId>, String)>,
-    /// Last known value, so a detached `Attr` keeps its data.
-    pub(crate) attr_values: HashMap<u64, String>,
-    /// Wrapper object for each `Attr` id (identity is the id).
-    pub(crate) attr_wrappers: HashMap<u64, Persistent<Value<'static>>>,
     /// Stable `WebDriver` element ids for nodes, and the reverse lookup.
     remote_ids: HashMap<NodeId, u64>,
     remote_nodes: HashMap<u64, NodeId>,
-    /// Attached attributes: (element, namespace, local) -> `Attr` id.
-    pub(crate) attr_ids: HashMap<(NodeId, String, String), u64>,
-    pub(crate) next_attr_id: u64,
     /// Registered `MutationObserver`s, keyed by their platform id.
-    pub(crate) observers: HashMap<u64, ObserverState>,
-    pub(crate) next_observer_id: u64,
-    pub(crate) delivery_scheduled: bool,
     /// Pristine intrinsics captured at install, before page script runs.
     /// `WebIDL` conversions and scheduling must use these, never
     /// `ctx.globals()`: a page that replaces `String`/`Number`/`Boolean` (or
     /// deletes `queueMicrotask`) must not change conversion behavior, which
     /// follows the realm's original intrinsics.
-    pub(crate) pristine_string: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_number: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_reflect_set: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
+    pub(crate) weak_references: Option<WeakReferences>,
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Captured `HTMLOptionsCollection` indexed-write entry point. The install
-    /// script defines the setter, Rust captures it, then the global is deleted
-    /// so page script cannot call `__tbSetOption` directly.
-    pub(crate) option_setter: Option<Persistent<Function<'static>>>,
-    /// Unforgeable token for the trusted-event bridge: our shims close over
-    /// a copy, page script cannot name it, and the bridge rejects calls made
-    /// without it.
-    pub(crate) host_token: Option<Persistent<Value<'static>>>,
     /// Decoded `<img>` bitmaps for this document, used by both paint and
     /// script geometry.
     pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
@@ -487,26 +519,17 @@ impl World {
             active_elements: HashMap::new(),
             clicks_in_progress: HashSet::new(),
             brands: HashMap::new(),
-            attrs: HashMap::new(),
-            attr_owners: HashMap::new(),
+            bridge: None,
             handler_attributes: HashMap::new(),
             cleared_handlers: HashSet::new(),
-            attr_values: HashMap::new(),
-            attr_wrappers: HashMap::new(),
             remote_ids: HashMap::new(),
             remote_nodes: HashMap::new(),
-            attr_ids: HashMap::new(),
-            next_attr_id: 0,
-            observers: HashMap::new(),
-            next_observer_id: 0,
-            delivery_scheduled: false,
-            pristine_string: None,
             pristine_number: None,
             pristine_boolean: None,
+            pristine_reflect_set: None,
             pristine_queue_microtask: None,
+            weak_references: None,
             deliver_mutations_fn: None,
-            option_setter: None,
-            host_token: None,
             images: HashMap::new(),
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
@@ -515,72 +538,12 @@ impl World {
         }
     }
 
-    /// Turns mutation recording on for this realm's documents.
-    pub(crate) fn set_recording(&mut self, recording: bool) {
-        let mut documents = self.runtime.documents.borrow_mut();
-        for id in &self.owned {
-            if let Some(parsed) = documents.get_mut(*id) {
-                dom::mutation::set_recording(&mut parsed.document, recording);
-            }
-        }
-    }
-
-    /// Drains this realm's documents' mutation logs and matches the mutations
-    /// against all registered observers, appending to their queues.
-    pub(crate) fn drain_mutations(&mut self) {
-        let mut documents = self.runtime.documents.borrow_mut();
-        for id in &self.owned {
-            let Some(parsed) = documents.get_mut(*id) else {
-                continue;
-            };
-            let mutations = dom::mutation::take(&mut parsed.document);
-            if mutations.is_empty() || self.observers.is_empty() {
-                continue;
-            }
-            for mutation in mutations {
-                for observer in self.observers.values_mut() {
-                    if let Some(record) = match_observation(&parsed.document, observer, &mutation) {
-                        observer.queue.push(record);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Removes and returns one observer's queued records.
-    pub(crate) fn take_observer_queue(&mut self, observer: u64) -> Vec<RecordData> {
-        self.observers
-            .get_mut(&observer)
-            .map(|state| std::mem::take(&mut state.queue))
-            .unwrap_or_default()
-    }
-
-    /// Removes observers that have queued records, for callback delivery
-    /// (<https://dom.spec.whatwg.org/#notify-mutation-observers>).
-    ///
-    /// Sorted by observer id so delivery is deterministic and follows
-    /// registration order; `HashMap` iteration order is not.
-    pub(crate) fn take_ready(&mut self) -> Vec<ReadyObserver> {
-        let mut ready = Vec::new();
-        for (&id, state) in &mut self.observers {
-            if state.queue.is_empty() {
-                continue;
-            }
-            // Drain regardless: an observer whose wrapper is gone can never
-            // fire, and its queue must not grow forever.
-            let records = std::mem::take(&mut state.queue);
-            let Some(object) = &state.object else {
-                continue;
-            };
-            ready.push(ReadyObserver {
-                id,
-                callback: state.callback.clone(),
-                object: object.clone(),
-                records,
-            });
-        }
-        ready.sort_by_key(|observer| observer.id);
-        ready
+    pub(crate) fn clear_observers(&mut self) {
+        self.runtime
+            .registry
+            .borrow_mut()
+            .observers
+            .forget_frame(self.frame, &mut self.runtime.documents.borrow_mut());
     }
 
     /// Installs `parsed` as the active document and returns its id.
@@ -595,7 +558,6 @@ impl World {
         self.wrappers.clear();
         self.implementations.clear();
         self.active_elements.clear();
-        self.clear_attributes();
         self.frame_navigations.clear();
         self.image_updates.clear();
         self.clear_images();
@@ -611,8 +573,7 @@ impl World {
         let pending = self.take_document_stream();
         drop(pending);
         // A new realm owns fresh observers; navigation drops the old ones.
-        self.observers.clear();
-        self.delivery_scheduled = false;
+        self.clear_observers();
         id
     }
 
@@ -839,23 +800,42 @@ impl World {
 
     /// Creates the documents and realms for every registered frame.
     ///
-    /// Must not run while a `QuickJS` realm is executing; every caller is a
-    /// renderer-loop entry point or a bindings path that runs outside JS.
-    pub(crate) fn materialize_frames(&mut self) -> Vec<NodeId> {
-        let mut created = Vec::new();
-        for (frame, container) in std::mem::take(&mut self.pending_frames) {
-            let mut document = self.create_frame_document(frame);
-            document.load_about_blank(Some(self.document_url.as_str()));
-            self.new_frames.push((frame, container, document));
-            created.push(container);
-        }
+    /// Borrow discipline: no `World` borrow is held while a frame document
+    /// loads. Loading runs the parser, which delivers mutations, which fans
+    /// out across live worlds; holding this world's borrow across that
+    /// would alias the fan-out borrows and panic the renderer.
+    pub(crate) fn adopt_pending_frames(world_rc: &Rc<RefCell<World>>) -> Vec<NodeId> {
+        let mut created = world_rc.borrow_mut().register_pending_frames();
+        created.extend(Self::materialize_frames(world_rc));
         created
     }
 
-    /// Registers and materializes frames; safe only outside JS execution.
-    pub(crate) fn adopt_pending_frames(&mut self) -> Vec<NodeId> {
-        let mut created = self.register_pending_frames();
-        created.extend(self.materialize_frames());
+    /// Loads every registered frame document without holding the world
+    /// borrow: pending frames and the base URL are taken first, documents
+    /// load unborrowed, and only then are the results published.
+    fn materialize_frames(world_rc: &Rc<RefCell<World>>) -> Vec<NodeId> {
+        let (pending, runtime, base_url) = {
+            let mut world = world_rc.borrow_mut();
+            (
+                std::mem::take(&mut world.pending_frames),
+                world.runtime.clone(),
+                world.document_url.clone(),
+            )
+        };
+        let mut loaded = Vec::with_capacity(pending.len());
+        let mut created = Vec::with_capacity(pending.len());
+        for (frame, container) in pending {
+            let mut document = Document::with_shared(frame, &runtime);
+            document.load_about_blank(Some(base_url.as_str()));
+            loaded.push((frame, container, document));
+            created.push(container);
+        }
+        {
+            let mut world = world_rc.borrow_mut();
+            for (frame, container, document) in loaded {
+                world.new_frames.push((frame, container, document));
+            }
+        }
         created
     }
 
@@ -1035,7 +1015,8 @@ impl World {
 
     /// The root node of the frame's active document.
     pub(crate) fn main_document_root(&self) -> Option<NodeId> {
-        self.main_document().map(|parsed| parsed.document.document())
+        self.main_document()
+            .map(|parsed| parsed.document.document())
     }
 
     pub(crate) fn queue_frame_navigation(&mut self, navigation: FrameNavigation) {
@@ -1166,7 +1147,11 @@ impl World {
     /// element positions.
     pub(crate) fn author_stylesheets(&self, parsed: &Parsed) -> Vec<String> {
         let mut sheets = Vec::new();
-        for node in parsed.document.tree().descendants(parsed.document.document()) {
+        for node in parsed
+            .document
+            .tree()
+            .descendants(parsed.document.document())
+        {
             let Some(dom::NodeKind::Element { name, .. }) = parsed.document.kind(node) else {
                 continue;
             };
@@ -1178,10 +1163,9 @@ impl World {
                     let mut css = String::new();
                     if let Some(children) = parsed.document.children(node) {
                         for child in children {
-                            if let Some(dom::NodeKind::Text { data }) =
-                                parsed.document.kind(child)
+                            if let Some(dom::NodeKind::Text { data }) = parsed.document.kind(child)
                             {
-                                css.push_str(data);
+                                css.push_str(&data.to_string_lossy());
                             }
                         }
                     }
@@ -1315,18 +1299,57 @@ impl World {
     }
 
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Rc<Listener>) {
+        if let EventTargetKey::Attribute { id, .. } = target {
+            if let Some(entry) = self
+                .runtime
+                .registry
+                .borrow_mut()
+                .attributes
+                .entries
+                .get_mut(&id)
+            {
+                entry.listeners.push(listener);
+            }
+            return;
+        }
         self.listeners.entry(target).or_default().push(listener);
     }
 
     /// A clone of one target's listener list, taken when dispatch invokes the
     /// target (<https://dom.spec.whatwg.org/#concept-event-listener-invoke>).
     pub(crate) fn listener_snapshot(&self, target: EventTargetKey) -> Vec<Rc<Listener>> {
+        if let EventTargetKey::Attribute { id, .. } = target {
+            return self
+                .runtime
+                .registry
+                .borrow()
+                .attributes
+                .entries
+                .get(&id)
+                .map(|entry| entry.listeners.clone())
+                .unwrap_or_default();
+        }
         self.listeners.get(&target).cloned().unwrap_or_default()
     }
 
     /// Drops one listener from a target's list; the listener's `removed` flag
     /// is what a concurrent dispatch checks, so both happen together.
     pub(crate) fn remove_listener(&mut self, target: EventTargetKey, listener: &Rc<Listener>) {
+        if let EventTargetKey::Attribute { id, .. } = target {
+            if let Some(entry) = self
+                .runtime
+                .registry
+                .borrow_mut()
+                .attributes
+                .entries
+                .get_mut(&id)
+            {
+                entry
+                    .listeners
+                    .retain(|existing| !Rc::ptr_eq(existing, listener));
+            }
+            return;
+        }
         if let Some(list) = self.listeners.get_mut(&target) {
             list.retain(|existing| !Rc::ptr_eq(existing, listener));
         }
@@ -1375,7 +1398,8 @@ impl World {
 
     /// The parent of `id` in its tree, if any.
     pub(crate) fn node_parent(&self, id: NodeId) -> Option<NodeId> {
-        self.document(id).and_then(|parsed| parsed.document.parent(id))
+        self.document(id)
+            .and_then(|parsed| parsed.document.parent(id))
     }
 
     /// Whether `id` is the root document node of its tree.
@@ -1394,8 +1418,7 @@ impl World {
         self.brands.clear();
         self.handler_attributes.clear();
         self.cleared_handlers.clear();
-        self.clear_attributes();
-        self.observers.clear();
+        self.clear_observers();
     }
 
     /// Drops the captured host primitives. Like every other JS-holding field,
@@ -1404,22 +1427,18 @@ impl World {
     /// `Rc<World>` closures) alive, so an unreleased primitive deadlocks
     /// teardown and trips `JS_FreeRuntime`'s live-object assertion.
     pub(crate) fn release_host_primitives(&mut self) {
-        self.pristine_string = None;
+        self.runtime
+            .registry
+            .borrow_mut()
+            .reactions
+            .forget_frame(self.frame);
         self.pristine_number = None;
         self.pristine_boolean = None;
+        self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
+        self.weak_references = None;
         self.deliver_mutations_fn = None;
-        self.option_setter = None;
-        self.host_token = None;
-    }
-
-    fn clear_attributes(&mut self) {
-        self.attrs.clear();
-        self.attr_owners.clear();
-        self.attr_values.clear();
-        self.attr_wrappers.clear();
-        self.attr_ids.clear();
-        self.next_attr_id = 0;
+        self.bridge = None;
     }
 
     /// One cached platform object, if this realm created it.
@@ -1551,24 +1570,27 @@ impl World {
 /// record per mutation, and it carries the old value when *any* interested
 /// registration asked for it (the spec's `interestedObservers` map folds the
 /// registrations per observer).
-fn match_observation(
+pub(super) fn match_observation(
     dom: &dom::Document,
     observer: &ObserverState,
     mutation: &dom::Mutation,
-) -> Option<RecordData> {
+) -> Option<(usize, u64, RecordData)> {
     let (target, kind) = match mutation {
         dom::Mutation::ChildList { target, .. } => (*target, 0_u8),
         dom::Mutation::Attributes { target, .. } => (*target, 1_u8),
         dom::Mutation::CharacterData { target, .. } => (*target, 2_u8),
     };
-    let mut matched = false;
+    let mut first_registration = None;
     let mut want_attribute_old_value = false;
     let mut want_character_data_old_value = false;
     for observation in &observer.observations {
-        let in_scope = observation.target.0 == target
-            || (observation.options.subtree
-                && inclusive_descendant(dom, observation.target.0, target));
-        if !in_scope {
+        let Some(root) = observation.target.tree() else {
+            continue;
+        };
+        let Some(depth) = ancestor_distance(dom, root, target) else {
+            continue;
+        };
+        if depth != 0 && !observation.options.subtree {
             continue;
         }
         let enabled = match kind {
@@ -1584,7 +1606,12 @@ fn match_observation(
                             dom::Mutation::Attributes {
                                 name, namespace, ..
                             },
-                        ) => namespace.is_empty() && filter.iter().any(|wanted| wanted == name),
+                        ) => {
+                            namespace.is_empty()
+                                && filter
+                                    .iter()
+                                    .any(|wanted| wanted.iter().copied().eq(name.encode_utf16()))
+                        }
                         _ => true,
                     }
             }
@@ -1593,15 +1620,21 @@ fn match_observation(
         if !enabled {
             continue;
         }
-        matched = true;
+        let position = (depth, observation.order);
+        first_registration =
+            Some(first_registration.map_or(position, |first: (usize, u64)| first.min(position)));
         want_attribute_old_value |= observation.options.attribute_old_value;
         want_character_data_old_value |= observation.options.character_data_old_value;
     }
-    matched.then(|| {
-        record(
-            want_attribute_old_value,
-            want_character_data_old_value,
-            mutation,
+    first_registration.map(|(depth, order)| {
+        (
+            depth,
+            order,
+            record(
+                want_attribute_old_value,
+                want_character_data_old_value,
+                mutation,
+            ),
         )
     })
 }
@@ -1635,7 +1668,8 @@ fn record(
             attribute_namespace: (!namespace.is_empty()).then(|| namespace.clone()),
             old_value: want_attribute_old_value
                 .then(|| old_value.clone())
-                .flatten(),
+                .flatten()
+                .map(dom::DomString::from),
             ..RecordData::new("attributes", Handle(*target))
         },
         dom::Mutation::CharacterData { target, old_value } => RecordData {
@@ -1645,24 +1679,169 @@ fn record(
     }
 }
 
-fn inclusive_descendant(dom: &dom::Document, ancestor: NodeId, node: NodeId) -> bool {
+fn ancestor_distance(dom: &dom::Document, ancestor: NodeId, node: NodeId) -> Option<usize> {
     let mut cursor = Some(node);
+    let mut depth = 0;
     while let Some(id) = cursor {
         if id == ancestor {
-            return true;
+            return Some(depth);
         }
         cursor = dom.parent(id);
+        depth += 1;
     }
-    false
+    None
 }
 
 /// Identity of one `Attr` platform object.
 #[derive(Clone)]
 pub(crate) struct AttrState {
+    pub scope: NodeId,
+    pub document: NodeId,
+    pub owner: Option<NodeId>,
+    pub value: String,
     pub namespace: String,
     pub prefix: Option<String>,
     pub local: String,
     pub qualified: String,
+}
+
+/// Agent-owned Attr identities, attachment indexes, and weak wrappers.
+/// Adoption changes the node document, never the creation scope or id
+/// (<https://dom.spec.whatwg.org/#concept-element-attributes-append>).
+#[derive(Default)]
+pub(crate) struct AttributeRegistry {
+    entries: HashMap<u64, AttrEntry>,
+    attached: HashMap<(NodeId, String, String), u64>,
+    next_id: u64,
+}
+
+struct AttrEntry {
+    state: AttrState,
+    wrapper: Option<Persistent<Value<'static>>>,
+    listeners: Vec<Rc<Listener>>,
+}
+
+pub(crate) enum AttrAttachError {
+    Stale,
+    InUse,
+    Dom(dom::DomError),
+}
+
+impl AttributeRegistry {
+    pub(crate) fn create(&mut self, state: AttrState) -> Option<u64> {
+        let id = self.next_id.checked_add(1)?;
+        self.next_id = id;
+        if let Some(owner) = state.owner {
+            self.attached
+                .insert((owner, state.namespace.clone(), state.local.clone()), id);
+        }
+        self.entries.insert(
+            id,
+            AttrEntry {
+                state,
+                wrapper: None,
+                listeners: Vec::new(),
+            },
+        );
+        Some(id)
+    }
+
+    pub(crate) fn state(&self, id: u64) -> Option<&AttrState> {
+        self.entries.get(&id).map(|entry| &entry.state)
+    }
+
+    pub(crate) fn state_mut(&mut self, id: u64) -> Option<&mut AttrState> {
+        self.entries.get_mut(&id).map(|entry| &mut entry.state)
+    }
+
+    pub(crate) fn wrapper(&self, id: u64) -> Option<Persistent<Value<'static>>> {
+        self.entries
+            .get(&id)
+            .and_then(|entry| entry.wrapper.clone())
+    }
+
+    pub(crate) fn intern_wrapper(&mut self, id: u64, value: Persistent<Value<'static>>) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.wrapper = Some(value);
+        }
+    }
+
+    pub(crate) fn attached(&self, element: NodeId, namespace: &str, local: &str) -> Option<u64> {
+        self.attached
+            .get(&(element, namespace.to_owned(), local.to_owned()))
+            .copied()
+    }
+
+    pub(crate) fn detach(&mut self, element: NodeId, namespace: &str, local: &str) {
+        if let Some(id) = self
+            .attached
+            .remove(&(element, namespace.to_owned(), local.to_owned()))
+            && let Some(state) = self.state_mut(id)
+        {
+            state.owner = None;
+        }
+    }
+
+    pub(crate) fn touch(&mut self, element: NodeId, namespace: &str, local: &str, value: String) {
+        if let Some(id) = self.attached(element, namespace, local)
+            && let Some(state) = self.state_mut(id)
+        {
+            state.value = value;
+        }
+    }
+
+    /// Validates the source identity and owner before mutating the destination,
+    /// then publishes replacement and adoption in the same registry borrow.
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-set>
+    pub(crate) fn attach(
+        &mut self,
+        id: u64,
+        document: &mut dom::Document,
+        element: NodeId,
+        value: String,
+    ) -> Result<Option<u64>, AttrAttachError> {
+        let entry = self.entries.get_mut(&id).ok_or(AttrAttachError::Stale)?;
+        let state = &mut entry.state;
+        if state.owner.is_some_and(|owner| owner != element) {
+            return Err(AttrAttachError::InUse);
+        }
+        let key = (element, state.namespace.clone(), state.local.clone());
+        let previous = self.attached.get(&key).copied();
+        if previous == Some(id) {
+            return Ok(previous);
+        }
+        dom::mutation::set_attribute_by_ns(
+            document,
+            element,
+            &state.namespace,
+            state.prefix.as_deref(),
+            &state.local,
+            value.clone(),
+        )
+        .map_err(AttrAttachError::Dom)?;
+        state.owner = Some(element);
+        state.document = document.document();
+        state.value = value;
+        if let Some(previous) = previous
+            && let Some(state) = self.state_mut(previous)
+        {
+            state.owner = None;
+        }
+        self.attached.insert(key, id);
+        Ok(previous)
+    }
+
+    fn forget_document(&mut self, document: u32) {
+        self.entries
+            .retain(|_, entry| entry.state.document.document_id() != document);
+        self.attached
+            .retain(|(element, _, _), _| element.document_id() != document);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.attached.clear();
+    }
 }
 
 /// Strips the `<![CDATA[` / `]]>` wrapper a `<style>` element carries when the

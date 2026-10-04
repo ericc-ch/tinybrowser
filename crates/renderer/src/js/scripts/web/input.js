@@ -5,7 +5,10 @@
 // every source run in order. Durations are treated as zero: the engine has no
 // per-frame interpolation yet.
 (function() {
-  const pointerStates = new Map();
+  const { Event, MouseEvent, PointerEvent, KeyboardEvent, InputEvent, WheelEvent } = globalThis;
+  const addEventListener = Node.prototype.addEventListener;
+  const changeState = host.slots('input change state');
+  const pointerStates = new __tbPrivateMap();
   const pointerState = (id, pointerType) => {
     if (!pointerStates.has(id)) {
       pointerStates.set(id, { x: 0, y: 0, buttons: 0, target: null, pointerType: pointerType || 'mouse' });
@@ -18,7 +21,7 @@
   };
   const centerOf = origin => {
     if (!origin || typeof origin !== 'object' || typeof origin.__tbRemote !== 'number') return null;
-    const element = globalThis.__tb_webdriver_element(origin.__tbRemote);
+    const element = host.__tb_webdriver_element(origin.__tbRemote);
     if (!element || typeof element.getBoundingClientRect !== 'function') return null;
     const rect = element.getBoundingClientRect();
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
@@ -36,7 +39,7 @@
       pointerId: 1, isPrimary: true, pointerType: state.pointerType,
     });
   };
-  const fire = (node, event) => node ? node.dispatchEvent(event) : false;
+  const fire = (node, event) => node ? host.__tbDispatchTargetTrusted(node, event) : false;
   const pointerItem = (state, item) => {
     if (item.type === 'pointerMove') {
       const center = centerOf(item.origin);
@@ -82,7 +85,7 @@
       if (button === 0 && fire(node, new MouseEvent('click', mouseInit(state.x, state.y, 0, { button: 0 })))) {
         // A non-canceled click runs the activation behavior
         // (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
-        if (typeof globalThis.__tbActivate === 'function') globalThis.__tbActivate(node);
+        if (typeof host.__tbActivate === 'function') host.__tbActivate(node);
       }
     } else if (item.type === 'pointerCancel') {
       fire(at(state.x, state.y), new PointerEvent('pointercancel', pointerInit(state, state.x, state.y, state.buttons)));
@@ -144,14 +147,14 @@
     const before = new InputEvent('beforeinput', {
       bubbles: true, cancelable: true, inputType: inputType, data: data,
     });
-    if (!element.dispatchEvent(before)) return;
-    if (typeof globalThis.__tbMarkUserEdited === 'function') globalThis.__tbMarkUserEdited(element);
+    if (!fire(element, before)) return;
+    if (typeof host.__tbMarkUserEdited === 'function') host.__tbMarkUserEdited(element);
     const value = element.value.slice(0, start) + text + element.value.slice(end);
     // Native user editing changes the control's internal value without
     // invoking an author-defined own `value` setter. React observes the
     // subsequent input event against its previous tracked value.
     // <https://html.spec.whatwg.org/multipage/interaction.html#input-events>
-    globalThis.__tbSetNativeValue(element, value);
+    host.__tbSetNativeValue(element, value);
     if (supportsSelection(element)) {
       const position = start + text.length;
       element.setSelectionRange(position, position);
@@ -238,19 +241,19 @@
   // keys like Backspace edit instead of appending their private-use codepoint
   // (<https://w3c.github.io/webdriver/#element-send-keys>).
   const hookChangeOnBlur = element => {
-    if (element.__tbChangeHooked) return;
-    Object.defineProperty(element, '__tbChangeHooked', { value: true, configurable: true });
-    element.addEventListener('blur', () => {
-      if (element.value !== element.__tbChangeBaseline) {
-        element.dispatchEvent(new Event('change', { bubbles: true }));
+    if (changeState.has(element)) return;
+    changeState.set(element, { baseline: element.value });
+    __tbApply(addEventListener, element, ['blur', () => {
+      if (element.value !== changeState.get(element).baseline) {
+        fire(element, new Event('change', { bubbles: true }));
       }
-    });
+    }]);
   };
-  globalThis.__tbWebDriverSendKeys = function(element, text) {
+  host.__tbWebDriverSendKeys = function(element, text) {
     if (!element || typeof element.focus !== 'function') return false;
     try { element.focus(); } catch (error) {}
     hookChangeOnBlur(element);
-    element.__tbChangeBaseline = element.value;
+    changeState.get(element).baseline = element.value;
     for (const character of String(text)) {
       const code = character.charCodeAt(0);
       if (character.length === 1 && code >= 0xE000 && code <= 0xE05D) {
@@ -267,10 +270,10 @@
     }
     return true;
   };
-  Object.defineProperty(globalThis, '__tbWebDriverSendKeys', {
+  Object.defineProperty(host, '__tbWebDriverSendKeys', {
     writable: false, configurable: false, enumerable: false,
   });
-  globalThis.__tbWebDriverActions = function(actions) {
+  host.__tbWebDriverActions = function(actions) {
     let ticks = 0;
     for (const source of actions) {
       const count = source.actions ? source.actions.length : 0;
@@ -296,7 +299,7 @@
     }
     return true;
   };
-  Object.defineProperty(globalThis, '__tbWebDriverActions', {
+  Object.defineProperty(host, '__tbWebDriverActions', {
     writable: false, configurable: false, enumerable: false,
   });
 })();

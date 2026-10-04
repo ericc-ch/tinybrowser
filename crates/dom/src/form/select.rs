@@ -310,7 +310,7 @@ use crate::{Document, DomError, LocalName, NodeId, NodeKind, QualName, html_name
         for child in children {
             match document.kind(child) {
                 Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => {
-                    text.push_str(data);
+                    text.push_str(&data.to_string_lossy());
                 }
                 Some(NodeKind::Element { name, .. }) => {
                     let is_script = name.local.as_ref().eq_ignore_ascii_case("script");

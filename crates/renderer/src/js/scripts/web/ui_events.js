@@ -4,38 +4,35 @@
 // from Rust; these classes exist so pages can construct events with the
 // spec's properties.
 
-const __tbUIEventData = Symbol.for('tinybrowser.uievent.data');
-globalThis.UIEvent = class UIEvent extends Event {
+const __tbUIEventData = host.slots('tinybrowser.uievent.data');
+const __tbUIEventConstructor = globalThis.UIEvent = class UIEvent extends Event {
   constructor(type, init) {
     if (arguments.length < 1) {
       throw new TypeError("Failed to construct 'UIEvent': 1 argument required, but only 0 present.");
     }
     init = init || {};
-    super(type, init);
-    Object.defineProperty(this, __tbUIEventData, {
-      value: { view: init.view || null, detail: init.detail || 0 },
-      writable: false, enumerable: false, configurable: false,
-    });
+    const event = __tbConstruct(__tbEventConstructor, [type, init], new.target);
+    __tbUIEventData.set(event, { view: init.view || null, detail: init.detail || 0 });
+    return event;
   }
   get view() { return __tbBrand(this, __tbUIEventData).view; }
   get detail() { return __tbBrand(this, __tbUIEventData).detail; }
 };
 Object.defineProperty(globalThis.UIEvent.prototype, Symbol.toStringTag, { value: 'UIEvent', writable: false, enumerable: false, configurable: true });
 
-const __tbMouseEventData = Symbol.for('tinybrowser.mouseevent.data');
-globalThis.MouseEvent = class MouseEvent extends UIEvent {
+const __tbMouseEventData = host.slots('tinybrowser.mouseevent.data');
+const __tbMouseEventConstructor = globalThis.MouseEvent = class MouseEvent extends UIEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
       throw new TypeError("Failed to construct 'MouseEvent': 1 argument required, but only 0 present.");
     }
     init = init || {};
-    super(type, init);
+    const event = __tbConstruct(__tbUIEventConstructor, [type, init], new.target);
     // `long` members convert with `ToNumber`, not truthiness: `"5"` is 5
     // (<https://w3c.github.io/uievents/#dom-mouseevent-clientx>).
     const toLong = value => { const n = Number(value); return Number.isNaN(n) ? 0 : Math.trunc(n); };
     const button = init.button === undefined ? 0 : toLong(init.button);
-    Object.defineProperty(this, __tbMouseEventData, {
-      value: {
+    __tbMouseEventData.set(event, {
         screenX: init.screenX === undefined ? 0 : toLong(init.screenX),
         screenY: init.screenY === undefined ? 0 : toLong(init.screenY),
         clientX: init.clientX === undefined ? 0 : toLong(init.clientX),
@@ -44,9 +41,8 @@ globalThis.MouseEvent = class MouseEvent extends UIEvent {
         altKey: !!init.altKey, metaKey: !!init.metaKey,
         button: button, buttons: init.buttons === undefined ? 0 : toLong(init.buttons),
         relatedTarget: init.relatedTarget || null,
-      },
-      writable: false, enumerable: false, configurable: false,
     });
+    return event;
   }
   get screenX() { return __tbBrand(this, __tbMouseEventData).screenX; }
   get screenY() { return __tbBrand(this, __tbMouseEventData).screenY; }
@@ -65,16 +61,15 @@ globalThis.MouseEvent = class MouseEvent extends UIEvent {
 };
 Object.defineProperty(globalThis.MouseEvent.prototype, Symbol.toStringTag, { value: 'MouseEvent', writable: false, enumerable: false, configurable: true });
 
-const __tbPointerEventData = Symbol.for('tinybrowser.pointerevent.data');
+const __tbPointerEventData = host.slots('tinybrowser.pointerevent.data');
 globalThis.PointerEvent = class PointerEvent extends MouseEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
       throw new TypeError("Failed to construct 'PointerEvent': 1 argument required, but only 0 present.");
     }
     init = init || {};
-    super(type, init);
-    Object.defineProperty(this, __tbPointerEventData, {
-      value: {
+    const event = __tbConstruct(__tbMouseEventConstructor, [type, init], new.target);
+    __tbPointerEventData.set(event, {
         pointerId: init.pointerId === undefined ? 1 : init.pointerId,
         // An explicit 0 is a valid width, not a missing one
         // (<https://w3c.github.io/pointerevents/#dom-pointerevent-width>).
@@ -85,9 +80,8 @@ globalThis.PointerEvent = class PointerEvent extends MouseEvent {
         tiltX: init.tiltX || 0, tiltY: init.tiltY || 0, twist: init.twist || 0,
         pointerType: init.pointerType || 'mouse',
         isPrimary: init.isPrimary === undefined ? true : !!init.isPrimary,
-      },
-      writable: false, enumerable: false, configurable: false,
     });
+    return event;
   }
   get pointerId() { return __tbBrand(this, __tbPointerEventData).pointerId; }
   get width() { return __tbBrand(this, __tbPointerEventData).width; }
@@ -102,21 +96,19 @@ globalThis.PointerEvent = class PointerEvent extends MouseEvent {
 };
 Object.defineProperty(globalThis.PointerEvent.prototype, Symbol.toStringTag, { value: 'PointerEvent', writable: false, enumerable: false, configurable: true });
 
-const __tbWheelEventData = Symbol.for('tinybrowser.wheelevent.data');
+const __tbWheelEventData = host.slots('tinybrowser.wheelevent.data');
 globalThis.WheelEvent = class WheelEvent extends MouseEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
       throw new TypeError("Failed to construct 'WheelEvent': 1 argument required, but only 0 present.");
     }
     init = init || {};
-    super(type, init);
-    Object.defineProperty(this, __tbWheelEventData, {
-      value: {
+    const event = __tbConstruct(__tbMouseEventConstructor, [type, init], new.target);
+    __tbWheelEventData.set(event, {
         deltaX: init.deltaX || 0, deltaY: init.deltaY || 0, deltaZ: init.deltaZ || 0,
         deltaMode: init.deltaMode || 0,
-      },
-      writable: false, enumerable: false, configurable: false,
     });
+    return event;
   }
   get deltaX() { return __tbBrand(this, __tbWheelEventData).deltaX; }
   get deltaY() { return __tbBrand(this, __tbWheelEventData).deltaY; }
@@ -125,17 +117,16 @@ globalThis.WheelEvent = class WheelEvent extends MouseEvent {
 };
 Object.defineProperty(globalThis.WheelEvent.prototype, Symbol.toStringTag, { value: 'WheelEvent', writable: false, enumerable: false, configurable: true });
 
-const __tbKeyboardEventData = Symbol.for('tinybrowser.keyboardevent.data');
+const __tbKeyboardEventData = host.slots('tinybrowser.keyboardevent.data');
 globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
       throw new TypeError("Failed to construct 'KeyboardEvent': 1 argument required, but only 0 present.");
     }
     init = init || {};
-    super(type, init);
+    const event = __tbConstruct(__tbUIEventConstructor, [type, init], new.target);
     const key = init.key === undefined ? '' : String(init.key);
-    Object.defineProperty(this, __tbKeyboardEventData, {
-      value: {
+    __tbKeyboardEventData.set(event, {
         key: key,
         code: init.code === undefined ? '' : String(init.code),
         location: init.location || 0,
@@ -144,9 +135,8 @@ globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
         repeat: !!init.repeat, isComposing: !!init.isComposing,
         keyCode: init.keyCode === undefined ? (key.length === 1 ? key.charCodeAt(0) : 0) : init.keyCode,
         charCode: init.charCode || 0,
-      },
-      writable: false, enumerable: false, configurable: false,
     });
+    return event;
   }
   get key() { return __tbBrand(this, __tbKeyboardEventData).key; }
   get code() { return __tbBrand(this, __tbKeyboardEventData).code; }
@@ -165,23 +155,21 @@ globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
 };
 Object.defineProperty(globalThis.KeyboardEvent.prototype, Symbol.toStringTag, { value: 'KeyboardEvent', writable: false, enumerable: false, configurable: true });
 
-const __tbInputEventData = Symbol.for('tinybrowser.inputevent.data');
+const __tbInputEventData = host.slots('tinybrowser.inputevent.data');
 globalThis.InputEvent = class InputEvent extends UIEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
       throw new TypeError("Failed to construct 'InputEvent': 1 argument required, but only 0 present.");
     }
     init = init || {};
-    super(type, init);
-    Object.defineProperty(this, __tbInputEventData, {
-      value: {
+    const event = __tbConstruct(__tbUIEventConstructor, [type, init], new.target);
+    __tbInputEventData.set(event, {
         data: init.data === undefined ? null : init.data,
         inputType: init.inputType === undefined ? '' : String(init.inputType),
         isComposing: !!init.isComposing,
         dataTransfer: init.dataTransfer || null,
-      },
-      writable: false, enumerable: false, configurable: false,
     });
+    return event;
   }
   get data() { return __tbBrand(this, __tbInputEventData).data; }
   get inputType() { return __tbBrand(this, __tbInputEventData).inputType; }

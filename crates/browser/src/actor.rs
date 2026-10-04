@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
-use renderer::{DialFailure, FrameId, HistorySnapshot, Mount, RemoteValue, RendererEvent, ResourceLimit, TabError};
+use renderer::{
+    DialFailure, FrameId, HistorySnapshot, Mount, RemoteValue, RendererEvent, ResourceLimit,
+    TabError,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
@@ -80,7 +83,7 @@ enum Command {
     },
     Execute {
         frame: FrameId,
-        source: String,
+        source: renderer::ScriptSource,
         timeout: Option<Duration>,
     },
     Screenshot {
@@ -92,7 +95,7 @@ enum Command {
     },
     RunUntilJsTrue {
         frame: FrameId,
-        source: String,
+        source: renderer::ScriptSource,
         timeout: Duration,
     },
     DocumentUrl,
@@ -189,7 +192,7 @@ struct RunUntilJs {
     /// Frame to evaluate in.
     frame: FrameId,
     /// Predicate source.
-    source: String,
+    source: renderer::ScriptSource,
     /// Maximum time to wait.
     timeout: Duration,
 }
@@ -208,7 +211,7 @@ struct Shutdown;
 struct Waiter {
     id: RequestId,
     deadline: Instant,
-    source: Option<(FrameId, String)>,
+    source: Option<(FrameId, renderer::ScriptSource)>,
 }
 
 /// Async value-only handle to one tab coordinator.
@@ -223,7 +226,7 @@ pub struct ExecuteScriptInOptions<'a> {
     /// Frame to evaluate in.
     pub frame: FrameId,
     /// Script source.
-    pub source: &'a str,
+    pub source: renderer::ScriptSource<&'a str>,
     /// Optional `QuickJS` interruption timeout.
     pub timeout: Option<Duration>,
 }
@@ -233,7 +236,7 @@ pub struct RunUntilJsTrueInOptions<'a> {
     /// Frame to evaluate in.
     pub frame: FrameId,
     /// Predicate source; waits until it evaluates to JS `true`.
-    pub source: &'a str,
+    pub source: renderer::ScriptSource<&'a str>,
     /// Maximum time to wait.
     pub timeout: Duration,
 }
@@ -279,6 +282,22 @@ impl TabHandle {
         self.execute_script_timeout(source, None).await
     }
 
+    /// Evaluates a browser-owned expression with private realm capabilities.
+    /// Never interpolate page code into `source`; use the private page evaluator
+    /// with a separately encoded string. Returns a value-only result.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::Script`] or [`TabError::ActorStopped`].
+    pub async fn execute_browser_script(&self, source: &str) -> Result<RemoteValue, TabError> {
+        self.execute_script_in(ExecuteScriptInOptions {
+            frame: FrameId::MAIN,
+            source: renderer::ScriptSource::Browser(source),
+            timeout: None,
+        })
+        .await
+    }
+
     /// Evaluates `source`, interrupting `QuickJS` if `timeout` elapses.
     ///
     /// # Errors
@@ -291,7 +310,7 @@ impl TabHandle {
     ) -> Result<RemoteValue, TabError> {
         self.execute_script_in(ExecuteScriptInOptions {
             frame: FrameId::MAIN,
-            source,
+            source: renderer::ScriptSource::Page(source),
             timeout,
         })
         .await
@@ -360,7 +379,7 @@ impl TabHandle {
     ) -> Result<bool, TabError> {
         self.run_until_js_true_in(RunUntilJsTrueInOptions {
             frame: FrameId::MAIN,
-            source,
+            source: renderer::ScriptSource::Page(source),
             timeout,
         })
         .await
@@ -383,7 +402,7 @@ impl TabHandle {
         } = options;
         self.ask(RunUntilJs {
             frame,
-            source: source.to_owned(),
+            source: source.into_owned(),
             timeout,
         })
         .await?
@@ -1100,7 +1119,7 @@ async fn handle_command(
         } => {
             ExecuteScriptInOptions {
                 frame,
-                source: source.as_str(),
+                source: source.as_ref(),
                 timeout,
             }
             .serve(ctx)
@@ -1190,7 +1209,7 @@ impl TabOperation for ExecuteScriptInOptions<'_> {
     fn into_command(self) -> Command {
         Command::Execute {
             frame: self.frame,
-            source: self.source.to_owned(),
+            source: self.source.into_owned(),
             timeout: self.timeout,
         }
     }
@@ -1207,7 +1226,7 @@ impl TabOperation for ExecuteScriptInOptions<'_> {
         let result = tab
             .renderer_request(RendererCommand::ExecuteScript {
                 frame: self.frame,
-                source: self.source.to_owned(),
+                source: self.source.into_owned(),
                 timeout_ms: self.timeout.map(millis),
             })
             .await

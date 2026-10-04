@@ -344,7 +344,7 @@ mod tests {
                 assignment: crate::wire::RendererAssignmentId::new(1),
                 command: crate::wire::Command::ExecuteScript {
                     frame: renderer::FrameId::MAIN,
-                    source: "1+1".into(),
+                    source: renderer::ScriptSource::Page("1+1".into()),
                     timeout_ms: None,
                 },
             },
@@ -393,7 +393,7 @@ mod tests {
                 assignment: crate::wire::RendererAssignmentId::new(1),
                 command: crate::wire::Command::ExecuteScript {
                     frame: renderer::FrameId::MAIN,
-                    source: "x".repeat(MAX_CONTROL_BYTES),
+                    source: renderer::ScriptSource::Page("x".repeat(MAX_CONTROL_BYTES)),
                     timeout_ms: None,
                 },
             },

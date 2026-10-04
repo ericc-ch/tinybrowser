@@ -1,4 +1,8 @@
-globalThis.__tbUSVString = value => {
+const __tbUrlSlots = host.slots('URL');
+const __tbParamsSlots = host.slots('URLSearchParams');
+const __tbUrlState = value => __tbBrand(value, __tbUrlSlots);
+const __tbParamsState = value => __tbBrand(value, __tbParamsSlots);
+host.__tbUSVString = value => {
   value = String(value);
   let out = '';
   for (let index = 0; index < value.length; index++) {
@@ -23,13 +27,13 @@ globalThis.__tbUSVString = value => {
 // URL decomposition components; indexes match `js/url_parts.rs`
 // (<https://html.spec.whatwg.org/multipage/links.html#url-decomposition-idl-attributes>).
 const __tbUrlPart = (href, index) => {
-  const values = globalThis.__tbUrlParts(href, href);
+  const values = host.__tbUrlParts(href, href);
   return values === null || values === undefined ? null : values[index];
 };
 const __tbRefreshUrlParams = url => {
-  if (url._searchParams !== null) {
-    const fresh = new URLSearchParams(__tbUrlPart(url._href, 7) || '')._pairs;
-    const pairs = url._searchParams._pairs;
+  if (__tbUrlState(url).searchParams !== null) {
+    const fresh = __tbParamsState(new URLSearchParams(__tbUrlPart(__tbUrlState(url).href, 7) || '')).pairs;
+    const pairs = __tbParamsState(__tbUrlState(url).searchParams).pairs;
     // Replace the contents without replacing the array, so live iterators
     // keep observing the same list
     // (<https://url.spec.whatwg.org/#urlsearchparams-iterate>).
@@ -38,9 +42,9 @@ const __tbRefreshUrlParams = url => {
   }
 };
 const __tbSetUrlPart = (url, index, value) => {
-  const result = globalThis.__tbUrlSetPart(url._href, url._href, index, value);
+  const result = host.__tbUrlSetPart(__tbUrlState(url).href, __tbUrlState(url).href, index, value);
   if (result !== null && result !== undefined) {
-    url._href = result;
+    __tbUrlState(url).href = result;
     __tbRefreshUrlParams(url);
   }
 };
@@ -50,66 +54,65 @@ globalThis.URL = class URL {
     // No base means no document fallback: the input must parse absolutely
     // (<https://url.spec.whatwg.org/#concept-url-parser>).
     const href = base === undefined
-      ? globalThis.__tbParseUrl(globalThis.__tbUSVString(input))
-      : globalThis.__tbResolveUrl(globalThis.__tbUSVString(input), globalThis.__tbUSVString(base));
+      ? host.__tbParseUrl(host.__tbUSVString(input))
+      : host.__tbResolveUrl(host.__tbUSVString(input), host.__tbUSVString(base));
     if (href == null) throw new TypeError('Invalid URL');
-    this._href = href;
-    this._searchParams = null;
+    __tbUrlSlots.set(this, { href, searchParams: null });
   }
-  get href() { return this._href; }
+  get href() { return __tbUrlState(this).href; }
   set href(value) {
     // A value that fails to parse leaves the URL unchanged; it does not
     // throw (<https://url.spec.whatwg.org/#dom-url-href>).
-    const parsed = globalThis.__tbParseUrl(globalThis.__tbUSVString(value));
+    const parsed = host.__tbParseUrl(host.__tbUSVString(value));
     if (parsed !== null && parsed !== undefined) {
-      this._href = parsed;
+      __tbUrlState(this).href = parsed;
       __tbRefreshUrlParams(this);
     }
   }
-  toString() { return this._href; }
-  toJSON() { return this._href; }
-  get protocol() { return __tbUrlPart(this._href, 0); }
-  set protocol(value) { __tbSetUrlPart(this, 0, globalThis.__tbUSVString(value)); }
-  get username() { return __tbUrlPart(this._href, 1); }
-  set username(value) { __tbSetUrlPart(this, 1, globalThis.__tbUSVString(value)); }
-  get password() { return __tbUrlPart(this._href, 2); }
-  set password(value) { __tbSetUrlPart(this, 2, globalThis.__tbUSVString(value)); }
-  get host() { return __tbUrlPart(this._href, 3); }
-  set host(value) { __tbSetUrlPart(this, 3, globalThis.__tbUSVString(value)); }
-  get hostname() { return __tbUrlPart(this._href, 4); }
-  set hostname(value) { __tbSetUrlPart(this, 4, globalThis.__tbUSVString(value)); }
-  get port() { return __tbUrlPart(this._href, 5); }
-  set port(value) { __tbSetUrlPart(this, 5, globalThis.__tbUSVString(value)); }
-  get pathname() { return __tbUrlPart(this._href, 6); }
-  set pathname(value) { __tbSetUrlPart(this, 6, globalThis.__tbUSVString(value)); }
-  get search() { return __tbUrlPart(this._href, 7); }
-  set search(value) { __tbSetUrlPart(this, 7, globalThis.__tbUSVString(value)); }
-  get hash() { return __tbUrlPart(this._href, 8); }
-  set hash(value) { __tbSetUrlPart(this, 8, globalThis.__tbUSVString(value)); }
-  get origin() { return __tbUrlPart(this._href, 9); }
+  toString() { return __tbUrlState(this).href; }
+  toJSON() { return __tbUrlState(this).href; }
+  get protocol() { return __tbUrlPart(__tbUrlState(this).href, 0); }
+  set protocol(value) { __tbSetUrlPart(this, 0, host.__tbUSVString(value)); }
+  get username() { return __tbUrlPart(__tbUrlState(this).href, 1); }
+  set username(value) { __tbSetUrlPart(this, 1, host.__tbUSVString(value)); }
+  get password() { return __tbUrlPart(__tbUrlState(this).href, 2); }
+  set password(value) { __tbSetUrlPart(this, 2, host.__tbUSVString(value)); }
+  get host() { return __tbUrlPart(__tbUrlState(this).href, 3); }
+  set host(value) { __tbSetUrlPart(this, 3, host.__tbUSVString(value)); }
+  get hostname() { return __tbUrlPart(__tbUrlState(this).href, 4); }
+  set hostname(value) { __tbSetUrlPart(this, 4, host.__tbUSVString(value)); }
+  get port() { return __tbUrlPart(__tbUrlState(this).href, 5); }
+  set port(value) { __tbSetUrlPart(this, 5, host.__tbUSVString(value)); }
+  get pathname() { return __tbUrlPart(__tbUrlState(this).href, 6); }
+  set pathname(value) { __tbSetUrlPart(this, 6, host.__tbUSVString(value)); }
+  get search() { return __tbUrlPart(__tbUrlState(this).href, 7); }
+  set search(value) { __tbSetUrlPart(this, 7, host.__tbUSVString(value)); }
+  get hash() { return __tbUrlPart(__tbUrlState(this).href, 8); }
+  set hash(value) { __tbSetUrlPart(this, 8, host.__tbUSVString(value)); }
+  get origin() { return __tbUrlPart(__tbUrlState(this).href, 9); }
   get searchParams() {
-    if (this._searchParams === null) {
+    if (__tbUrlState(this).searchParams === null) {
       const params = new URLSearchParams(this.search);
       const url = this;
-      params._sync = value => {
-        const result = globalThis.__tbUrlSetPart(url._href, url._href, 7, String(value));
-        if (result !== null && result !== undefined) url._href = result;
+      __tbParamsState(params).sync = value => {
+        const result = host.__tbUrlSetPart(__tbUrlState(url).href, __tbUrlState(url).href, 7, String(value));
+        if (result !== null && result !== undefined) __tbUrlState(url).href = result;
       };
-      this._searchParams = params;
+      __tbUrlState(this).searchParams = params;
     }
-    return this._searchParams;
+    return __tbUrlState(this).searchParams;
   }
 };
 globalThis.URL.createObjectURL = function(blob) {
   const data = __tbBrand(blob, __tbBlobData, 'value is not a Blob');
   const text = __tbUtf8Decode(data.bytes, false, true).text;
-  const url = globalThis.__tbCreateObjectURL(text, data.type);
+  const url = host.__tbCreateObjectURL(text, data.type);
   if (url == null) throw new RangeError('object URL budget exceeded');
   return url;
 };
 // https://w3c.github.io/FileAPI/#dfn-revokeObjectURL
 globalThis.URL.revokeObjectURL = function(url) {
-  globalThis.__tbRevokeObjectURL(String(url));
+  host.__tbRevokeObjectURL(String(url));
 };
 Object.defineProperty(globalThis.URL.prototype, Symbol.toStringTag, { value: 'URL', writable: false, enumerable: false, configurable: true });
 // `location` stringifies to its URL, which is what `new URL(input, location)`
@@ -133,10 +136,9 @@ globalThis.URL.canParse = function(input, base) {
 // https://url.spec.whatwg.org/#interface-urlsearchparams
 globalThis.URLSearchParams = class URLSearchParams {
   constructor(init) {
-    this._pairs = [];
-    this._sync = null;
+    __tbParamsSlots.set(this, { pairs: [], sync: null });
     if (init instanceof URLSearchParams) {
-      this._pairs = init._pairs.map(pair => pair.slice());
+      __tbParamsState(this).pairs = __tbArray.map(__tbParamsState(init).pairs, pair => [pair[0], pair[1]]);
       return;
     }
     if (init !== null && typeof init === 'object') {
@@ -144,16 +146,16 @@ globalThis.URLSearchParams = class URLSearchParams {
         for (const pair of init) {
           const values = Array.from(pair);
           if (values.length !== 2) throw new TypeError('parameter pair must contain two values');
-          this._pairs.push([globalThis.__tbUSVString(values[0]), globalThis.__tbUSVString(values[1])]);
+          __tbArray.push(__tbParamsState(this).pairs, [host.__tbUSVString(values[0]), host.__tbUSVString(values[1])]);
         }
       } else {
         for (const name of Object.keys(init)) {
-          this._pairs.push([globalThis.__tbUSVString(name), globalThis.__tbUSVString(init[name])]);
+          __tbArray.push(__tbParamsState(this).pairs, [host.__tbUSVString(name), host.__tbUSVString(init[name])]);
         }
       }
       return;
     }
-    var input = globalThis.__tbUSVString(init === undefined ? '' : init);
+    var input = host.__tbUSVString(init === undefined ? '' : init);
     if (input.charAt(0) === '?') input = input.slice(1);
     if (!input) return;
     const decode = value => {
@@ -168,83 +170,100 @@ globalThis.URLSearchParams = class URLSearchParams {
       const separator = item.indexOf('=');
       const name = separator < 0 ? item : item.slice(0, separator);
       const value = separator < 0 ? '' : item.slice(separator + 1);
-      this._pairs.push([
+      __tbArray.push(__tbParamsState(this).pairs, [
         decode(name),
         decode(value)
       ]);
     }
   }
-  get size() { return this._pairs.length; }
+  get size() { return __tbParamsState(this).pairs.length; }
   get(name) {
-    name = globalThis.__tbUSVString(name);
-    for (const pair of this._pairs) {
+    name = host.__tbUSVString(name);
+    const pairs = __tbParamsState(this).pairs;
+    for (let index = 0; index < pairs.length; index++) {
+      const pair = pairs[index];
       if (pair[0] === name) return pair[1];
     }
     return null;
   }
   getAll(name) {
-    name = globalThis.__tbUSVString(name);
-    return this._pairs.filter(pair => pair[0] === name).map(pair => pair[1]);
+    name = host.__tbUSVString(name);
+    return __tbArray.map(__tbArray.filter(__tbParamsState(this).pairs, pair => pair[0] === name), pair => pair[1]);
   }
   has(name, value) {
-    name = globalThis.__tbUSVString(name);
-    if (arguments.length < 2 || value === undefined) return this._pairs.some(pair => pair[0] === name);
-    value = globalThis.__tbUSVString(value);
-    return this._pairs.some(pair => pair[0] === name && pair[1] === value);
+    name = host.__tbUSVString(name);
+    if (arguments.length < 2 || value === undefined) return __tbArray.some(__tbParamsState(this).pairs, pair => pair[0] === name);
+    value = host.__tbUSVString(value);
+    return __tbArray.some(__tbParamsState(this).pairs, pair => pair[0] === name && pair[1] === value);
   }
   append(name, value) {
-    this._pairs.push([globalThis.__tbUSVString(name), globalThis.__tbUSVString(value)]);
-    if (this._sync) this._sync(this.toString());
+    __tbArray.push(__tbParamsState(this).pairs, [host.__tbUSVString(name), host.__tbUSVString(value)]);
+    if (__tbParamsState(this).sync) __tbParamsState(this).sync(this.toString());
   }
   set(name, value) {
-    name = globalThis.__tbUSVString(name);
-    value = globalThis.__tbUSVString(value);
+    name = host.__tbUSVString(name);
+    value = host.__tbUSVString(value);
     let first = -1;
-    for (let index = 0; index < this._pairs.length; index++) {
-      if (this._pairs[index][0] !== name) continue;
+    for (let index = 0; index < __tbParamsState(this).pairs.length; index++) {
+      if (__tbParamsState(this).pairs[index][0] !== name) continue;
       if (first < 0) {
         first = index;
-        this._pairs[index][1] = value;
+        __tbParamsState(this).pairs[index][1] = value;
       } else {
-        this._pairs.splice(index, 1);
+        __tbArray.remove(__tbParamsState(this).pairs, index);
         index--;
       }
     }
-    if (first < 0) this._pairs.push([name, value]);
-    if (this._sync) this._sync(this.toString());
+    if (first < 0) __tbArray.push(__tbParamsState(this).pairs, [name, value]);
+    if (__tbParamsState(this).sync) __tbParamsState(this).sync(this.toString());
   }
   delete(name, value) {
-    name = globalThis.__tbUSVString(name);
+    name = host.__tbUSVString(name);
     const removeValue = !(arguments.length < 2 || value === undefined);
-    if (removeValue) value = globalThis.__tbUSVString(value);
+    if (removeValue) value = host.__tbUSVString(value);
     // Splice in place: an iterator over this object must observe mutations
     // (<https://url.spec.whatwg.org/#urlsearchparams-iterate>).
-    for (let index = this._pairs.length - 1; index >= 0; index--) {
-      const pair = this._pairs[index];
-      if (pair[0] === name && (!removeValue || pair[1] === value)) this._pairs.splice(index, 1);
+    for (let index = __tbParamsState(this).pairs.length - 1; index >= 0; index--) {
+      const pair = __tbParamsState(this).pairs[index];
+      if (pair[0] === name && (!removeValue || pair[1] === value)) __tbArray.remove(__tbParamsState(this).pairs, index);
     }
-    if (this._sync) this._sync(this.toString());
+    if (__tbParamsState(this).sync) __tbParamsState(this).sync(this.toString());
   }
   sort() {
     // Array.prototype.sort is stable, matching the spec's sort
     // (<https://url.spec.whatwg.org/#dom-urlsearchparams-sort>).
-    this._pairs.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-    if (this._sync) this._sync(this.toString());
+    __tbArray.sort(__tbParamsState(this).pairs, (a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+    if (__tbParamsState(this).sync) __tbParamsState(this).sync(this.toString());
   }
-  entries() { return this._pairs[Symbol.iterator](); }
-  keys() { return this._pairs.map(pair => pair[0])[Symbol.iterator](); }
-  values() { return this._pairs.map(pair => pair[1])[Symbol.iterator](); }
+  // https://webidl.spec.whatwg.org/#dfn-iterator-object-next
+  entries() {
+    const pairs = __tbParamsState(this).pairs;
+    let index = 0;
+    return {
+      next() {
+        if (index >= pairs.length) return { value: undefined, done: true };
+        const pair = pairs[index++];
+        return { value: [pair[0], pair[1]], done: false };
+      },
+      [Symbol.iterator]() { return this; },
+    };
+  }
+  keys() { return __tbArray.iterator(__tbArray.map(__tbParamsState(this).pairs, pair => pair[0])); }
+  values() { return __tbArray.iterator(__tbArray.map(__tbParamsState(this).pairs, pair => pair[1])); }
   forEach(callback, thisArg) {
-    for (const pair of this._pairs) callback.call(thisArg, pair[1], pair[0], this);
+    const pairs = __tbParamsState(this).pairs;
+    for (let index = 0; index < pairs.length; index++) {
+      const pair = pairs[index];
+      __tbApply(callback, thisArg, [pair[1], pair[0], this]);
+    }
   }
   toString() {
     const encode = value => encodeURIComponent(value)
       .replace(/%20/g, '+')
       .replace(/[!'()~]/g, character =>
         '%' + character.charCodeAt(0).toString(16).toUpperCase());
-    return this._pairs.map(pair => encode(pair[0]) + '=' + encode(pair[1])).join('&');
+    return __tbArray.join(__tbArray.map(__tbParamsState(this).pairs, pair => encode(pair[0]) + '=' + encode(pair[1])), '&');
   }
   [Symbol.iterator]() { return this.entries(); }
 };
 Object.defineProperty(globalThis.URLSearchParams.prototype, Symbol.toStringTag, { value: 'URLSearchParams', writable: false, enumerable: false, configurable: true });
-

@@ -18,7 +18,7 @@
       }
       // Constructing this view also rejects a detached destination buffer.
       const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
-      bytes.set(globalThis.__tbRandomBytes(bytes.length));
+      bytes.set(host.__tbRandomBytes(bytes.length));
       return array;
     },
     randomUUID() {

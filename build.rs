@@ -11,7 +11,7 @@
 //! unwind index (dropped here) nor the `.eh_frame` body (`tools/release` removes
 //! it).
 //!
-//! Sizes and method: `docs/researches/size-budget.md`.
+//! Sizes and method: `docs/size.md`.
 
 fn main() {
     if std::env::var("PROFILE").as_deref() != Ok("release") {

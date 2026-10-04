@@ -1,34 +1,32 @@
-// Blob bytes live as a Uint8Array under a symbol key, so no IDL member is an
-// own property and a method called from another realm of the same runtime can
-// still recognize its receiver.
-const __tbBlobData = Symbol.for('tinybrowser.blob.data');
-const __tbFileData = Symbol.for('tinybrowser.file.data');
-const __tbFileListData = Symbol.for('tinybrowser.filelist.data');
-const __tbReaderData = Symbol.for('tinybrowser.filereader.data');
-const __tbProgressData = Symbol.for('tinybrowser.progress.data');
-const __tbDecoderData = Symbol.for('tinybrowser.textdecoder.data');
-const __tbStreamData = Symbol.for('tinybrowser.readablestream.data');
+const __tbBlobData = host.slots('tinybrowser.blob.data');
+const __tbFileData = host.slots('tinybrowser.file.data');
+const __tbFileListData = host.slots('tinybrowser.filelist.data');
+const __tbReaderData = host.slots('tinybrowser.filereader.data');
+const __tbProgressData = host.slots('tinybrowser.progress.data');
+const __tbDecoderData = host.slots('tinybrowser.textdecoder.data');
+const __tbStreamData = host.slots('tinybrowser.readablestream.data');
 // https://encoding.spec.whatwg.org/#utf-8-encoder, with lone surrogates
 // replaced as the standard requires.
 const __tbUtf8Encode = value => {
-  value = String(value);
-  const bytes = [];
-  for (let index = 0; index < value.length; index++) {
-    let code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
-      const low = value.charCodeAt(index + 1);
+  value = __tbIDLString(value);
+  const length = value.length;
+  const bytes = __tbPrivateArray();
+  for (let index = 0; index < length; index++) {
+    let code = __tbApply(__tbIDLCharCodeAt, value, [index]);
+    if (code >= 0xd800 && code <= 0xdbff && index + 1 < length) {
+      const low = __tbApply(__tbIDLCharCodeAt, value, [index + 1]);
       if (low >= 0xdc00 && low <= 0xdfff) {
         code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
         index++;
       }
     }
     if (code >= 0xd800 && code <= 0xdfff) code = 0xfffd;
-    if (code <= 0x7f) bytes.push(code);
-    else if (code <= 0x7ff) bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-    else if (code <= 0xffff) bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
-    else bytes.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    if (code <= 0x7f) __tbArray.push(bytes, code);
+    else if (code <= 0x7ff) __tbArray.push(bytes, 0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    else if (code <= 0xffff) __tbArray.push(bytes, 0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    else __tbArray.push(bytes, 0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
   }
-  return new Uint8Array(bytes);
+  return new __tbUint8Array(bytes);
 };
 // https://encoding.spec.whatwg.org/#utf-8-decoder. The trailing incomplete
 // sequence is returned so a streaming TextDecoder can carry it forward.
@@ -40,7 +38,7 @@ const __tbUtf8Decode = (bytes, fatal, ignoreBOM) => {
     const first = bytes[index];
     let needed = 0;
     let code = 0;
-    if (first < 0x80) { text += String.fromCharCode(first); index++; continue; }
+    if (first < 0x80) { text += __tbIDLFromCharCode(first); index++; continue; }
     if (first >= 0xc2 && first <= 0xdf) { needed = 1; code = first & 0x1f; }
     else if (first >= 0xe0 && first <= 0xef) { needed = 2; code = first & 0x0f; }
     else if (first >= 0xf0 && first <= 0xf4) { needed = 3; code = first & 0x07; }
@@ -67,10 +65,10 @@ const __tbUtf8Decode = (bytes, fatal, ignoreBOM) => {
       index++;
       continue;
     }
-    text += String.fromCodePoint(code);
+    text += __tbIDLFromCodePoint(code);
     index += needed + 1;
   }
-  return { text, remainder: bytes.slice(index) };
+  return { text, remainder: __tbBytesCopy(bytes, index) };
 };
 // https://encoding.spec.whatwg.org/#utf-16le-decoder
 const __tbUtf16Decode = (bytes, littleEndian, ignoreBOM) => {
@@ -83,17 +81,18 @@ const __tbUtf16Decode = (bytes, littleEndian, ignoreBOM) => {
   let text = '';
   for (let index = start; index + 1 < bytes.length; index += 2) {
     const code = swap ? bytes[index] | (bytes[index + 1] << 8) : (bytes[index] << 8) | bytes[index + 1];
-    text += String.fromCharCode(code);
+    text += __tbIDLFromCharCode(code);
   }
   const consumed = bytes.length - ((bytes.length - start) & 1);
-  return { text, remainder: bytes.slice(consumed) };
+  return { text, remainder: __tbBytesCopy(bytes, consumed) };
 };
 // https://encoding.spec.whatwg.org/#windows-1252
 const __tbWindows1252 = bytes => {
   const table = '\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160\u2039\u0152\u008d\u017d\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u0161\u203a\u0153\u009d\u017e\u0178';
   let text = '';
-  for (const byte of bytes) {
-    text += byte >= 0x80 && byte <= 0x9f ? table[byte - 0x80] : String.fromCharCode(byte);
+  for (let index = 0; index < bytes.length; index++) {
+    const byte = bytes[index];
+    text += byte >= 0x80 && byte <= 0x9f ? table[byte - 0x80] : __tbIDLFromCharCode(byte);
   }
   return text;
 };
@@ -129,28 +128,24 @@ const __tbClampRound = value => {
   if (fraction > 0.5) return floor + 1;
   return floor % 2 === 0 ? floor : floor + 1;
 };
-globalThis.TextEncoder = class TextEncoder {
-  constructor() {
-    Object.defineProperty(this, 'encoding', { value: 'utf-8', enumerable: true, configurable: true });
-  }
+globalThis.TextEncoder = __tbInstallInterface(class TextEncoder {
+  constructor() {}
+  get encoding() { return 'utf-8'; }
   encode(input) {
-    return __tbUtf8Encode(input === undefined ? '' : input);
+    return __tbUtf8Encode(input);
   }
   encodeInto(source, destination) {
-    if (!ArrayBuffer.isView(destination) || destination instanceof DataView) {
-      throw new TypeError('The destination argument must be a Uint8Array');
-    }
-    source = String(source === undefined ? '' : source);
     // Encode code point by code point so `read` can stop at the last code
     // unit whose bytes fit in the destination
     // (<https://encoding.spec.whatwg.org/#dom-textencoder-encodeinto>).
+    const length = __tbApply(__tbIDLTypedArrayLength, destination, []);
     let read = 0;
     let written = 0;
     while (read < source.length) {
-      let code = source.charCodeAt(read);
+      let code = __tbApply(__tbIDLCharCodeAt, source, [read]);
       let units = 1;
       if (code >= 0xd800 && code <= 0xdbff && read + 1 < source.length) {
-        const low = source.charCodeAt(read + 1);
+        const low = __tbApply(__tbIDLCharCodeAt, source, [read + 1]);
         if (low >= 0xdc00 && low <= 0xdfff) {
           code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
           units = 2;
@@ -158,7 +153,7 @@ globalThis.TextEncoder = class TextEncoder {
       }
       if (code >= 0xd800 && code <= 0xdfff) code = 0xfffd;
       const size = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
-      if (written + size > destination.length) break;
+      if (written + size > length) break;
       if (size === 1) {
         destination[written++] = code;
       } else if (size === 2) {
@@ -178,21 +173,17 @@ globalThis.TextEncoder = class TextEncoder {
     }
     return { read, written };
   }
-};
-Object.defineProperty(globalThis.TextEncoder.prototype, Symbol.toStringTag, { value: 'TextEncoder', writable: false, enumerable: false, configurable: true });
+});
 globalThis.TextDecoder = class TextDecoder {
   constructor(label, options) {
     const optionsObject = options === undefined ? {} : Object(options);
     const encoding = label === undefined ? 'utf-8' : __tbEncoding(String(label));
     if (encoding === null) throw new RangeError('The encoding label is not supported');
-    Object.defineProperty(this, __tbDecoderData, {
-      value: {
+    __tbDecoderData.set(this, {
         encoding,
         fatal: optionsObject.fatal !== undefined && Boolean(optionsObject.fatal),
         ignoreBOM: optionsObject.ignoreBOM !== undefined && Boolean(optionsObject.ignoreBOM),
-        pending: new Uint8Array(0),
-      },
-      writable: false, enumerable: false, configurable: false,
+        pending: host.slots.bytes(0),
     });
   }
   get encoding() { return __tbBrand(this, __tbDecoderData).encoding; }
@@ -206,9 +197,9 @@ globalThis.TextDecoder = class TextDecoder {
       else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
       else throw new TypeError('The input argument must be an ArrayBuffer or ArrayBufferView');
       if (bytes.length > 0) {
-        const combined = new Uint8Array(data.pending.length + bytes.length);
-        combined.set(data.pending);
-        combined.set(bytes, data.pending.length);
+        const combined = host.slots.bytes(data.pending.length + bytes.length);
+        for (let index = 0; index < data.pending.length; index++) combined[index] = data.pending[index];
+        for (let index = 0; index < bytes.length; index++) combined[data.pending.length + index] = bytes[index];
         data.pending = combined;
       }
     }
@@ -216,7 +207,7 @@ globalThis.TextDecoder = class TextDecoder {
     let text;
     if (data.encoding === 'utf-8') {
       const decoded = __tbUtf8Decode(data.pending, data.fatal, data.ignoreBOM);
-      data.pending = stream ? decoded.remainder : new Uint8Array(0);
+      data.pending = stream ? host.slots.bytes(decoded.remainder) : host.slots.bytes(0);
       if (!stream && decoded.remainder.length) {
         // A truncated tail is a decode error; fatal turns it into a throw,
         // otherwise it is one replacement character
@@ -228,10 +219,10 @@ globalThis.TextDecoder = class TextDecoder {
       }
     } else if (data.encoding === 'windows-1252') {
       text = __tbWindows1252(data.pending);
-      data.pending = new Uint8Array(0);
+      data.pending = host.slots.bytes(0);
     } else {
       const decoded = __tbUtf16Decode(data.pending, data.encoding === 'utf-16le', data.ignoreBOM);
-      data.pending = stream ? decoded.remainder : new Uint8Array(0);
+      data.pending = stream ? host.slots.bytes(decoded.remainder) : host.slots.bytes(0);
       text = decoded.text;
     }
     return text;

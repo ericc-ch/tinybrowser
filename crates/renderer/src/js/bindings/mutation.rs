@@ -1,200 +1,164 @@
 //! Mutation records, observers, and the mutation delivery queue.
 
-use super::{
-    CollectionKind, child_value, live_collection, option_truthy, required_node, string_value,
-    webidl_to_string, world, wrap_node,
-};
+use super::{CollectionKind, child_value, live_collection, world, wrap_node};
 
 use dom::NodeId;
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
 use rquickjs::{
-    Class, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace, prelude::This,
+    Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace, prelude::This,
 };
 
-use crate::js::world::{Handle, Observation, ObserverOptions, ObserverState, RecordData};
+use crate::js::world::{Handle, ObserverOptions, ReadyObserver, RealmRegistry, RecordData};
 
 /// `MutationRecord` (<https://dom.spec.whatwg.org/#interface-mutationrecord>).
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "MutationRecord")]
-pub struct JsMutationRecord {
-    pub(crate) record: RecordData,
+pub struct JsMutationRecord<'js> {
+    record: RecordData,
+    target: Value<'js>,
+    added_nodes: Value<'js>,
+    removed_nodes: Value<'js>,
 }
 
-#[rquickjs::methods]
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value"
-)]
-impl JsMutationRecord {
-    #[qjs(constructor)]
-    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
-        Err(Exception::throw_type(&ctx, "Illegal constructor"))
-    }
-
-    #[qjs(get, rename = "type")]
-    fn record_type(&self) -> String {
-        self.record.typ.clone()
-    }
-
-    #[qjs(get)]
-    fn target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        wrap_node(&ctx, self.record.target.0)
-    }
-
-    #[qjs(get, rename = "addedNodes")]
-    fn added_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        node_list(&ctx, self.record.target.0, &self.record.added)
-    }
-
-    #[qjs(get, rename = "removedNodes")]
-    fn removed_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        node_list(&ctx, self.record.target.0, &self.record.removed)
-    }
-
-    #[qjs(get, rename = "previousSibling")]
-    fn previous_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        child_value(&ctx, self.record.previous.map(|handle| handle.0))
-    }
-
-    #[qjs(get, rename = "nextSibling")]
-    fn next_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        child_value(&ctx, self.record.next.map(|handle| handle.0))
-    }
-
-    #[qjs(get, rename = "attributeName")]
-    fn attribute_name<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match &self.record.attribute_name {
-            Some(name) => string_value(&ctx, name),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(get, rename = "attributeNamespace")]
-    fn attribute_namespace<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match &self.record.attribute_namespace {
-            Some(namespace) => string_value(&ctx, namespace),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(get, rename = "oldValue")]
-    fn old_value<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match &self.record.old_value {
-            Some(value) => string_value(&ctx, value),
-            None => Ok(Value::new_null(ctx)),
-        }
+impl<'js> JsMutationRecord<'js> {
+    // https://dom.spec.whatwg.org/#interface-mutationrecord
+    fn new(ctx: &Ctx<'js>, mut record: RecordData) -> Result<Self> {
+        let target = wrap_node(ctx, record.target.0)?;
+        let added_nodes = node_list(ctx, record.target.0, std::mem::take(&mut record.added))?;
+        let removed_nodes = node_list(ctx, record.target.0, std::mem::take(&mut record.removed))?;
+        Ok(Self {
+            record,
+            target,
+            added_nodes,
+            removed_nodes,
+        })
     }
 }
 
-fn node_list<'js>(ctx: &Ctx<'js>, scope: NodeId, nodes: &[Handle]) -> Result<Value<'js>> {
-    live_collection(ctx, scope, CollectionKind::Static(nodes.to_vec()), None)
+impl<'js> mutation_record_generated::MutationRecord<'js> for JsMutationRecord<'js> {
+    fn get_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        rquickjs::String::from_str(ctx.clone(), &self.record.typ)
+    }
+
+    fn get_target(&self, _ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.target.clone())
+    }
+
+    fn get_added_nodes(&self, _ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.added_nodes.clone())
+    }
+
+    fn get_removed_nodes(&self, _ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.removed_nodes.clone())
+    }
+
+    fn get_previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        child_value(ctx, self.record.previous.map(|handle| handle.0))
+    }
+
+    fn get_next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        child_value(ctx, self.record.next.map(|handle| handle.0))
+    }
+
+    fn get_attribute_name(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.record
+            .attribute_name
+            .as_deref()
+            .map(|name| rquickjs::String::from_str(ctx.clone(), name))
+            .transpose()
+    }
+
+    fn get_attribute_namespace(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.record
+            .attribute_namespace
+            .as_deref()
+            .map(|namespace| rquickjs::String::from_str(ctx.clone(), namespace))
+            .transpose()
+    }
+
+    fn get_old_value(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.record
+            .old_value
+            .as_ref()
+            .map(|value| super::dom_string(ctx, value))
+            .transpose()
+    }
+}
+
+include!(concat!(env!("OUT_DIR"), "/MutationRecord.rs"));
+include!(concat!(env!("OUT_DIR"), "/MutationObserver.rs"));
+
+fn node_list<'js>(ctx: &Ctx<'js>, scope: NodeId, nodes: Vec<Handle>) -> Result<Value<'js>> {
+    live_collection(ctx, scope, CollectionKind::Static(nodes), None)
 }
 
 /// `MutationObserver` (<https://dom.spec.whatwg.org/#interface-mutationobserver>).
+///
+/// The JS surface lives in Web IDL; these are the platform algorithms the
+/// generated dispatcher calls.
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "MutationObserver")]
 pub struct JsMutationObserver {
     pub(crate) id: u64,
+    #[qjs(skip_trace)]
+    registry: Weak<RefCell<RealmRegistry>>,
 }
 
-#[rquickjs::methods]
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value"
-)]
 impl JsMutationObserver {
+    fn registry(&self, ctx: &Ctx<'_>) -> Result<Rc<RefCell<RealmRegistry>>> {
+        self.registry
+            .upgrade()
+            .ok_or_else(|| Exception::throw_type(ctx, "observer realm is gone"))
+    }
+}
+
+impl<'js> mutation_observer_generated::MutationObserver<'js> for JsMutationObserver {
     // https://dom.spec.whatwg.org/#dom-mutationobserver-mutationobserver
-    #[qjs(constructor)]
-    fn new<'js>(ctx: Ctx<'js>, callback: Function<'js>) -> Result<Self> {
-        let world_rc = world(&ctx)?;
-        let mut world = world_rc.borrow_mut();
-        world.next_observer_id += 1;
-        let id = world.next_observer_id;
-        world.observers.insert(
+    fn constructor(ctx: &Ctx<'js>, callback: Function<'js>) -> Result<Self> {
+        let world_rc = world(ctx)?;
+        let (registry, owner) = {
+            let world = world_rc.borrow();
+            (Rc::clone(&world.runtime.registry), world.frame())
+        };
+        let id = registry
+            .borrow_mut()
+            .observers
+            .create(owner, Persistent::save(ctx, callback));
+        Ok(Self {
             id,
-            ObserverState {
-                callback: Persistent::save(&ctx, callback),
-                object: None,
-                observations: Vec::new(),
-                queue: Vec::new(),
-            },
-        );
-        Ok(Self { id })
+            registry: Rc::downgrade(&registry),
+        })
     }
 
     // https://dom.spec.whatwg.org/#dom-mutationobserver-observe
-    #[qjs(rename = "observe")]
-    fn observe<'js>(
+    fn observe(
         &self,
         ctx: Ctx<'js>,
-        this: This<Object<'js>>,
-        target: Value<'js>,
-        options: Object<'js>,
+        observer_object: Object<'js>,
+        target: super::host::NodeReference,
+        options: mutation_observer_generated::MutationObserverInit,
     ) -> Result<()> {
-        let target = required_node(&ctx, &target)?;
         // Dictionary presence ignores explicit `undefined`: `{attributes:
         // undefined}` behaves as absent
         // (<https://webidl.spec.whatwg.org/#es-dictionary>).
-        let attributes_present = !options.get::<_, Value>("attributes")?.is_undefined();
-        let attributes = option_truthy(&ctx, &options, "attributes")?;
-        let attribute_old_value_present =
-            !options.get::<_, Value>("attributeOldValue")?.is_undefined();
-        let attribute_old_value = option_truthy(&ctx, &options, "attributeOldValue")?;
-        let character_data_present = !options.get::<_, Value>("characterData")?.is_undefined();
-        let character_data = option_truthy(&ctx, &options, "characterData")?;
-        let character_data_old_value_present = !options
-            .get::<_, Value>("characterDataOldValue")?
-            .is_undefined();
-        let character_data_old_value = option_truthy(&ctx, &options, "characterDataOldValue")?;
-        let attribute_filter = match options.get::<_, Value>("attributeFilter") {
-            // `sequence<DOMString>` is not nullable: explicit `null` throws
-            // instead of vanishing
-            // (<https://dom.spec.whatwg.org/#dom-mutationobserver-observe>).
-            Ok(value) if value.is_null() => {
-                return Err(Exception::throw_type(
-                    &ctx,
-                    "attributeFilter must be a sequence",
-                ));
-            }
-            Ok(value) if !value.is_undefined() => {
-                let array = value.into_array().ok_or_else(|| {
-                    Exception::throw_type(&ctx, "attributeFilter must be a sequence")
-                })?;
-                let mut filter = Vec::new();
-                for entry in array.iter::<Value>() {
-                    filter.push(webidl_to_string(&ctx, entry?)?);
-                }
-                Some(filter)
-            }
-            _ => None,
-        };
-        // Present-but-false option flags conflict with their companions
-        // (<https://dom.spec.whatwg.org/#dom-mutationobserver-observe>).
-        if attributes_present
-            && !attributes
-            && (attribute_old_value_present || attribute_filter.is_some())
-        {
-            return Err(Exception::throw_type(
-                &ctx,
-                "attributes is false but attributeOldValue/attributeFilter is present",
-            ));
-        }
-        if character_data_present && !character_data && character_data_old_value_present {
-            return Err(Exception::throw_type(
-                &ctx,
-                "characterData is false but characterDataOldValue is present",
-            ));
-        }
+        let attributes_present = options.attributes.is_some();
+        let attributes = options.attributes.unwrap_or(false);
+        let attribute_old_value_present = options.attribute_old_value.is_some();
+        let attribute_old_value = options.attribute_old_value.unwrap_or(false);
+        let character_data_present = options.character_data.is_some();
+        let character_data = options.character_data.unwrap_or(false);
+        let character_data_old_value_present = options.character_data_old_value.is_some();
+        let character_data_old_value = options.character_data_old_value.unwrap_or(false);
+        let attribute_filter = options.attribute_filter;
         let parsed = ObserverOptions {
-            child_list: option_truthy(&ctx, &options, "childList")?,
+            child_list: options.child_list,
             attributes: attributes
                 || (!attributes_present
                     && (attribute_old_value_present || attribute_filter.is_some())),
             character_data: character_data
                 || (!character_data_present && character_data_old_value_present),
-            subtree: option_truthy(&ctx, &options, "subtree")?,
+            subtree: options.subtree,
             attribute_old_value,
             character_data_old_value,
             attribute_filter,
@@ -205,70 +169,59 @@ impl JsMutationObserver {
                 "options must set childList, attributes, or characterData",
             ));
         }
-        let world_rc = world(&ctx)?;
-        let mut world = world_rc.borrow_mut();
-        // Records already in the log belong to observers registered before
-        // this call; this observer's stream starts at registration. The spec
-        // queues records only to already-registered observers, so the defer
-        // has to close the gap here.
-        world.drain_mutations();
-        let Some(observer) = world.observers.get_mut(&self.id) else {
-            return Ok(());
-        };
-        // One registration per (observer, target): a repeated observe
-        // replaces the options instead of adding a second registration
-        // (<https://dom.spec.whatwg.org/#dom-mutationobserver-observe>).
-        if let Some(existing) = observer
-            .observations
-            .iter_mut()
-            .find(|observation| observation.target.0 == target)
-        {
-            existing.options = parsed;
-        } else {
-            observer.observations.push(Observation {
-                target: Handle(target),
-                options: parsed,
-            });
+        if !parsed.attributes && parsed.attribute_old_value {
+            return Err(Exception::throw_type(
+                &ctx,
+                "attributeOldValue requires attributes",
+            ));
         }
-        observer.object = Some(Persistent::save(&ctx, this.0));
-        world.set_recording(true);
-        Ok(())
+        if !parsed.attributes && parsed.attribute_filter.is_some() {
+            return Err(Exception::throw_type(
+                &ctx,
+                "attributeFilter requires attributes",
+            ));
+        }
+        if !parsed.character_data && parsed.character_data_old_value {
+            return Err(Exception::throw_type(
+                &ctx,
+                "characterDataOldValue requires characterData",
+            ));
+        }
+        let runtime = world(&ctx)?.borrow().runtime.clone();
+        self.registry(&ctx)?.borrow_mut().observers.observe(
+            self.id,
+            target,
+            parsed,
+            Persistent::save(&ctx, observer_object),
+            &mut runtime.documents.borrow_mut(),
+        );
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-mutationobserver-disconnect
-    #[qjs(rename = "disconnect")]
-    fn disconnect(&self, ctx: Ctx<'_>) -> Result<()> {
-        let world_rc = world(&ctx)?;
-        let mut world = world_rc.borrow_mut();
-        if let Some(observer) = world.observers.get_mut(&self.id) {
-            observer.observations.clear();
-            observer.queue.clear();
-            observer.object = None;
-        }
-        // Recording costs nothing while nobody has a registration.
-        if world
+    fn disconnect(&self, ctx: Ctx<'js>) -> Result<()> {
+        let runtime = world(&ctx)?.borrow().runtime.clone();
+        self.registry(&ctx)?
+            .borrow_mut()
             .observers
-            .values()
-            .all(|observer| observer.observations.is_empty())
-        {
-            world.set_recording(false);
-        }
-        Ok(())
+            .disconnect(self.id, &mut runtime.documents.borrow_mut());
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-mutationobserver-takerecords
-    #[qjs(rename = "takeRecords")]
-    fn take_records<'js>(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
-        let world_rc = world(&ctx)?;
-        let queue = {
-            let mut world = world_rc.borrow_mut();
-            world.drain_mutations();
-            world.take_observer_queue(self.id)
-        };
+    fn take_records(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
+        let runtime = world(&ctx)?.borrow().runtime.clone();
+        let queue = self
+            .registry(&ctx)?
+            .borrow_mut()
+            .observers
+            .take_records(self.id, &mut runtime.documents.borrow_mut());
+        schedule_mutation_delivery(&ctx)?;
         queue
             .into_iter()
             .map(|record| {
-                Ok(Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value())
+                let record = JsMutationRecord::new(&ctx, record)?;
+                Ok(super::host::instance(&ctx, record)?.into_value())
             })
             .collect()
     }
@@ -282,61 +235,52 @@ impl JsMutationObserver {
     reason = "rquickjs Func ABI passes Ctx by value"
 )]
 pub(crate) fn deliver_mutations(ctx: Ctx<'_>) -> Result<()> {
-    let result = deliver_ready(&ctx);
-    // Release the schedule slot even when a callback threw; otherwise a
-    // throwing observer would silently stop every later delivery.
-    world(&ctx)?.borrow_mut().delivery_scheduled = false;
-    result
-}
-
-fn deliver_ready(ctx: &Ctx<'_>) -> Result<()> {
-    let world_rc = world(ctx)?;
-    // A callback can mutate again and queue more records; keep draining until
-    // nothing is left.
-    let mut first_error = None;
-    loop {
-        let ready = {
-            let mut world = world_rc.borrow_mut();
-            world.drain_mutations();
-            world.take_ready()
-        };
-        if ready.is_empty() {
-            break;
-        }
-        for observer in ready {
-            // One observer's broken wrapper must not discard the records
-            // already dequeued for the rest: setup failures skip that
-            // observer and are reported at the end with callback errors.
-            let step: Result<()> = (|| {
-                let array = rquickjs::Array::new(ctx.clone())?;
-                for (index, record) in observer.records.into_iter().enumerate() {
-                    array.set(
-                        index,
-                        Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value(),
-                    )?;
-                }
-                let object = observer.object.restore(ctx)?;
-                let callback = observer.callback.restore(ctx)?;
-                // The callback's `this` value and second argument are the
-                // observer object. A throwing callback is reported and does not
-                // stop the remaining observers.
-                if let Err(error) = callback.call::<_, ()>((This(object.clone()), array, object))
-                    && first_error.is_none()
-                {
-                    first_error = Some(error);
-                }
-                Ok(())
-            })();
-            if let Err(error) = step
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
+    let runtime = world(&ctx)?.borrow().runtime.clone();
+    let pending = runtime
+        .registry
+        .borrow_mut()
+        .observers
+        .begin_notification(&mut runtime.documents.borrow_mut());
+    for id in pending {
+        let ready = runtime.registry.borrow_mut().observers.delivery(id);
+        if let Some(observer) = ready {
+            deliver_observer(&ctx, observer);
         }
     }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    Ok(())
+}
+
+/// One observer's queued records, invoked in its callback's home realm
+/// (<https://dom.spec.whatwg.org/#notify-mutation-observers>). A throwing
+/// callback is reported to its own realm's window and does not stop the
+/// remaining observers; setup failures report to the delivering realm.
+fn deliver_observer(delivery: &Ctx<'_>, observer: ReadyObserver) {
+    let step: Result<()> = (|| {
+        // The entry realm is whoever runs the microtask, which can be a
+        // different window's realm (an iframe observing a parent node, or the
+        // reverse). Rebind through the callback's own realm so its globals,
+        // prototypes, and error reporting are the ones it closed over.
+        let home = observer.callback.clone().restore(delivery)?.realm()?;
+        let callback = observer.callback.restore(&home)?;
+        let records = observer
+            .records
+            .into_iter()
+            .map(|record| {
+                super::host::instance(&home, JsMutationRecord::new(&home, record)?)
+                    .map(rquickjs::Class::into_value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let array = super::host::sequence(&home, records)?;
+        let object = observer.object.restore(&home)?;
+        // The callback's `this` value and second argument are the observer
+        // object.
+        if let Err(error) = callback.call::<_, ()>((This(object.clone()), array, object)) {
+            super::host::report_callback_error(&home, &error);
+        }
+        Ok(())
+    })();
+    if let Err(error) = step {
+        super::host::report_callback_error(delivery, &error);
     }
 }
 
@@ -348,27 +292,41 @@ fn deliver_ready(ctx: &Ctx<'_>) -> Result<()> {
 /// observer (`<https://dom.spec.whatwg.org/#queue-a-mutation-record>` picks
 /// interested observers when the mutation is queued).
 pub(crate) fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
-    let world_rc = world(ctx)?;
-    let mut world = world_rc.borrow_mut();
-    world.drain_mutations();
-    if world.observers.is_empty() || world.delivery_scheduled {
-        return Ok(());
+    // https://dom.spec.whatwg.org/#queue-a-mutation-observer-microtask
+    let (runtime, pristine) = {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        (
+            world.runtime.clone(),
+            world
+                .deliver_mutations_fn
+                .clone()
+                .zip(world.pristine_queue_microtask.clone()),
+        )
+    };
+    {
+        let mut registry = runtime.registry.borrow_mut();
+        registry
+            .observers
+            .drain(&mut runtime.documents.borrow_mut());
+        if !registry.observers.needs_notification() {
+            return Ok(());
+        }
+        registry.observers.scheduled = true;
     }
-    world.delivery_scheduled = true;
-    // The pristine entry points, captured at install: a page that deleted
-    // `__tb_deliver_mutations` or `queueMicrotask` must not turn every DOM
-    // mutation into an exception.
-    let deliver = world.deliver_mutations_fn.clone();
-    let queue = world.pristine_queue_microtask.clone();
-    drop(world);
-    if let (Some(deliver), Some(queue)) = (deliver, queue) {
-        let deliver: Function = deliver.restore(ctx)?;
-        let queue: Function = queue.restore(ctx)?;
-        queue.call::<_, ()>((deliver,))?;
-        return Ok(());
+    let result = (|| {
+        let (deliver, queue) = if let Some((deliver, queue)) = pristine {
+            (deliver.restore(ctx)?, queue.restore(ctx)?)
+        } else {
+            (
+                crate::js::bridge::object(ctx)?.get::<_, Function>("__tb_deliver_mutations")?,
+                ctx.globals().get::<_, Function>("queueMicrotask")?,
+            )
+        };
+        queue.call::<_, ()>((deliver,))
+    })();
+    if result.is_err() {
+        runtime.registry.borrow_mut().observers.scheduled = false;
     }
-    let deliver: Function = ctx.globals().get("__tb_deliver_mutations")?;
-    let queue: Function = ctx.globals().get("queueMicrotask")?;
-    queue.call::<_, ()>((deliver,))?;
-    Ok(())
+    result
 }

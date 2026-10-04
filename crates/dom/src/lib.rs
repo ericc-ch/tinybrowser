@@ -28,6 +28,7 @@ mod node;
 pub mod selector;
 pub mod shadow;
 mod state;
+mod string;
 mod value;
 
 pub use state::{
@@ -43,10 +44,11 @@ pub use metadata::QuirksMode;
 pub use mutation::Mutation;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
-    html_qualified_name_eq, qualified_name_eq, svg_namespace, xlink_namespace, xml_namespace,
-    xmlns_namespace,
+    html_qualified_name_eq, mathml_namespace, qualified_name_eq, svg_namespace, xlink_namespace,
+    xml_namespace, xmlns_namespace,
 };
 pub use selector::{ParseFail, ParseFailKind, SelectError};
+pub use string::DomString;
 pub use value::{
     is_valid_date, is_valid_floating_point, is_valid_local_date_time, is_valid_month,
     is_valid_simple_color, is_valid_time, is_valid_week,

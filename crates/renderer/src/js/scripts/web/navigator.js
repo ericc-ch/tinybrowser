@@ -11,7 +11,7 @@
     Object.freeze({ brand: 'Chromium', version: '152.0.0.0' }),
     Object.freeze({ brand: 'Google Chrome', version: '152.0.0.0' }),
   ]);
-  const uaDataKey = Symbol('NavigatorUAData');
+  const uaDataKey = host.slots('NavigatorUAData');
   class NavigatorUAData {
     constructor() {
       throw new TypeError('Illegal constructor');
@@ -69,9 +69,7 @@
     value: 'NavigatorUAData', writable: false, enumerable: false, configurable: true,
   });
   const userAgentData = Object.create(NavigatorUAData.prototype);
-  Object.defineProperty(userAgentData, uaDataKey, {
-    value: Object.freeze({}), writable: false, enumerable: false, configurable: false,
-  });
+  uaDataKey.set(userAgentData, Object.freeze({}));
   class Navigator {
     get userAgent() {
       return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
@@ -95,7 +93,6 @@
       if (globalThis.isSecureContext === false) return undefined;
       return userAgentData;
     }
-    sendBeacon() { return false; }
   }
   Object.defineProperty(globalThis, 'NavigatorUAData', {
     value: NavigatorUAData, writable: true, configurable: true,

@@ -1114,8 +1114,7 @@ impl Conn {
     }
 
     /// `Runtime.evaluate` / `Runtime.callFunctionOn` with value or handle
-    /// semantics. Handles live in the page as `globalThis.__tb_handles`, so the
-    /// adapter needs no JS value storage of its own.
+    /// semantics. Handles are retained in private renderer realm state.
     async fn dispatch_runtime(
         &mut self,
         method: &str,
@@ -1150,18 +1149,21 @@ impl Conn {
                 .ok_or_else(|| DispatchError::Failed("missing expression".into()))?;
             // `expression` is a script (statements allowed); indirect eval keeps
             // its completion value without parenthesizing a trailing `;`.
-            format!("(0, eval)({})", json_string(expression))
+            format!("host.evaluatePage({})", json_string(expression))
         } else {
             let declaration = params
                 .get("functionDeclaration")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DispatchError::Failed("missing functionDeclaration".into()))?;
             let receiver = match params.get("objectId").and_then(Value::as_str) {
-                Some(id) => format!("globalThis.__tb_handles[{}]", json_string(id)),
+                Some(id) => format!("host.__tb_handles[{}]", json_string(id)),
                 None => "undefined".to_owned(),
             };
             let arguments = arguments_expression(params);
-            format!("({declaration}).apply({receiver}, {arguments})")
+            format!(
+                "host.apply(host.evaluatePage({}), {receiver}, {arguments})",
+                json_string(&format!("({declaration})"))
+            )
         };
         if return_by_value {
             let id = self.next_handle;
@@ -1195,7 +1197,7 @@ impl Conn {
         if let Err(error) = tab
             .execute_script_in(ExecuteScriptInOptions {
                 frame,
-                source: &schedule,
+                source: browser::ScriptSource::Browser(&schedule),
                 timeout: None,
             })
             .await
@@ -1203,7 +1205,7 @@ impl Conn {
             return exception_reply(&error);
         }
         let ready = format!(
-            "Boolean(globalThis.__tb_async_handles && globalThis.__tb_async_handles[{id}] && globalThis.__tb_async_handles[{id}].done)"
+            "Boolean(host.__tb_async_handles && host.__tb_async_handles[{id}] && host.__tb_async_handles[{id}].done)"
         );
         // A navigation replaces the main frame's realm, so an awaited slot in
         // the old realm never settles. Stop waiting as soon as the navigation
@@ -1213,7 +1215,7 @@ impl Conn {
         let mut events = tab.subscribe().ok();
         let run = tab.run_until_js_true_in(RunUntilJsTrueInOptions {
             frame,
-            source: &ready,
+            source: browser::ScriptSource::Browser(&ready),
             timeout,
         });
         tokio::pin!(run);
@@ -1237,9 +1239,9 @@ impl Conn {
                 let _ = tab
                     .execute_script_in(ExecuteScriptInOptions {
                         frame,
-                        source: &format!(
-                            "if (globalThis.__tb_async_handles) delete globalThis.__tb_async_handles[{id}]; undefined"
-                        ),
+                        source: browser::ScriptSource::Browser(&format!(
+                            "(() => {{ if (host.__tb_async_handles) delete host.__tb_async_handles[{id}]; }})()"
+                        )),
                         timeout: None,
                     })
                     .await;
@@ -1251,7 +1253,7 @@ impl Conn {
         let value = match tab
             .execute_script_in(ExecuteScriptInOptions {
                 frame,
-                source: &read,
+                source: browser::ScriptSource::Browser(&read),
                 timeout: None,
             })
             .await
@@ -1281,7 +1283,7 @@ impl Conn {
         let value = match tab
             .execute_script_in(ExecuteScriptInOptions {
                 frame,
-                source: &script,
+                source: browser::ScriptSource::Browser(&script),
                 timeout: None,
             })
             .await
@@ -1313,7 +1315,7 @@ impl Conn {
         if let Err(error) = tab
             .execute_script_in(ExecuteScriptInOptions {
                 frame,
-                source: &schedule,
+                source: browser::ScriptSource::Browser(&schedule),
                 timeout: None,
             })
             .await
@@ -1321,12 +1323,12 @@ impl Conn {
             return exception_reply(&error);
         }
         let ready = format!(
-            "Boolean(globalThis.__tb_async && globalThis.__tb_async[{id}] && globalThis.__tb_async[{id}].done)"
+            "Boolean(host.__tb_async && host.__tb_async[{id}] && host.__tb_async[{id}].done)"
         );
         match tab
             .run_until_js_true_in(RunUntilJsTrueInOptions {
                 frame,
-                source: &ready,
+                source: browser::ScriptSource::Browser(&ready),
                 timeout,
             })
             .await
@@ -1338,9 +1340,9 @@ impl Conn {
                 let _ = tab
                     .execute_script_in(ExecuteScriptInOptions {
                         frame,
-                        source: &format!(
-                            "if (globalThis.__tb_async) delete globalThis.__tb_async[{id}]; undefined"
-                        ),
+                        source: browser::ScriptSource::Browser(&format!(
+                            "(() => {{ if (host.__tb_async) delete host.__tb_async[{id}]; }})()"
+                        )),
                         timeout: None,
                     })
                     .await;
@@ -1351,7 +1353,7 @@ impl Conn {
         let value = match tab
             .execute_script_in(ExecuteScriptInOptions {
                 frame,
-                source: &RUNTIME_READ.replace("__ID__", &id),
+                source: browser::ScriptSource::Browser(&RUNTIME_READ.replace("__ID__", &id)),
                 timeout: None,
             })
             .await

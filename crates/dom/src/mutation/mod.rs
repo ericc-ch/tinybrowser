@@ -12,13 +12,30 @@ mod journal;
 mod text;
 
 use crate::lifecycle;
+use crate::string::DomString;
 use crate::{Document, DomError, NodeId};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+/// Shared operation order for documents whose observer notifications share
+/// an agent. Create one order, attach it with [`share_order`], then merge
+/// [`take_ordered`] results by their position to preserve mutation chronology.
+#[derive(Clone, Debug, Default)]
+pub struct MutationOrder(Arc<AtomicU64>);
+
+impl MutationOrder {
+    fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 pub use attributes::{
     add_attrs_if_missing, remove_attribute, remove_attribute_ns, set_attribute, set_attribute_by_ns,
 };
-pub use clone::clone_node;
 pub(crate) use attributes::{find_attribute, merge_attrs};
+pub use clone::clone_node;
 pub use insert::{
     append, destroy, insert_before, pre_insert, reparent_children, replace_all, replace_child,
     validate_pre_insert,
@@ -49,7 +66,10 @@ pub enum Mutation {
         old_value: Option<String>,
     },
     /// Character data replaced on `target`.
-    CharacterData { target: NodeId, old_value: String },
+    CharacterData {
+        target: NodeId,
+        old_value: DomString,
+    },
 }
 
 /// Enable or disable mutation-observer recording for this document.
@@ -60,6 +80,21 @@ pub fn set_recording(document: &mut Document, recording: bool) {
 /// Drain mutation records in operation order.
 pub fn take(document: &mut Document) -> Vec<Mutation> {
     document.journal.take()
+}
+
+/// Attach a document to a shared observer operation order. Existing queued
+/// records receive positions at attachment time, in their original order.
+/// Reattaching the same order preserves every queued position.
+/// For example, attach each iframe tree to its renderer's `MutationOrder`.
+pub fn share_order(document: &mut Document, order: &MutationOrder) {
+    document.journal.share_order(order);
+}
+
+/// Drain records with their positions in the document's shared operation
+/// order. For example, merge parent and iframe results and sort by position
+/// before delivering records to an observer of both trees.
+pub fn take_ordered(document: &mut Document) -> Vec<(u64, Mutation)> {
+    document.journal.take_ordered()
 }
 
 /// The serial advances on record requests and shadow-root attachment. A

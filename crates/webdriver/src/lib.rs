@@ -294,7 +294,11 @@ async fn execute(
     let wrapped = wrap_script(script, &args, asynchronous);
     match window
         .tab
-        .execute_script_timeout(&wrapped, Some(script_timeout))
+        .execute_script_in(browser::ExecuteScriptInOptions {
+            frame: browser::FrameId::MAIN,
+            source: browser::ScriptSource::Browser(&wrapped),
+            timeout: Some(script_timeout),
+        })
         .await
     {
         Err(err) => script_error(&err),
@@ -303,7 +307,7 @@ async fn execute(
         }
         Ok(value) => match window
             .tab
-            .execute_script("globalThis.__wd_wait === true")
+            .execute_browser_script("host.webDriver.wait === true")
             .await
         {
             Ok(RemoteValue::Bool(true)) => {
@@ -322,7 +326,11 @@ fn remaining(started: Instant, budget: Duration) -> Duration {
 async fn wait_for_async(window: &Window, handle: &str, script_timeout: Duration) -> (u16, Value) {
     match window
         .tab
-        .run_until_js_true("globalThis.__wd_done === true", script_timeout)
+        .run_until_js_true_in(browser::RunUntilJsTrueInOptions {
+            frame: browser::FrameId::MAIN,
+            source: browser::ScriptSource::Browser("host.webDriver.done === true"),
+            timeout: script_timeout,
+        })
         .await
     {
         Ok(false) => return error(500, "script timeout", "script timeout"),
@@ -331,13 +339,13 @@ async fn wait_for_async(window: &Window, handle: &str, script_timeout: Duration)
     }
     match window
         .tab
-        .execute_script("globalThis.__wd_failed === true")
+        .execute_browser_script("host.webDriver.failed === true")
         .await
     {
         Ok(RemoteValue::Bool(true)) => {
             let message = match window
                 .tab
-                .execute_script("String(globalThis.__wd_err)")
+                .execute_browser_script("String(host.webDriver.error)")
                 .await
             {
                 Ok(RemoteValue::String(text)) => text,
@@ -349,7 +357,11 @@ async fn wait_for_async(window: &Window, handle: &str, script_timeout: Duration)
         Ok(_) => {}
         Err(err) => return script_error(&err),
     }
-    match window.tab.execute_script("globalThis.__wd_async").await {
+    match window
+        .tab
+        .execute_browser_script("host.webDriver.value")
+        .await
+    {
         Ok(value) => ok(encode_scoped(&value, handle)),
         Err(err) => script_error(&err),
     }
@@ -364,39 +376,32 @@ fn script_error(err: &TabError) -> (u16, Value) {
     }
 }
 
-/// Script wait flags live on the realm so a later poll can read them, but
-/// they must not show up in `Object.keys(window)` / `for...in`.
-const WD_RESET: &str = "\
-(function(){\
-  var d=function(n,v){Object.defineProperty(globalThis,n,{value:v,writable:true,enumerable:false,configurable:true});};\
-  d('__wd_async',undefined);d('__wd_err',undefined);d('__wd_failed',false);d('__wd_done',false);d('__wd_wait',false);\
-})();";
-
 fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
     let args_json = args.to_string();
+    let function = Value::String(format!("(function() {{\n{script}\n}})")).to_string();
+    let setup = "const slot = { __proto__: null, value: undefined, error: undefined, failed: false, done: false, wait: false }; host.webDriver = slot;";
     if asynchronous {
         format!(
-            "{WD_RESET}\n\
-             (function() {{ {script} }}).apply(null, {args_json}.concat([function(v) {{ \
-               globalThis.__wd_async = v === undefined ? null : v; \
-               globalThis.__wd_done = true; \
-             }}]));"
+            "(() => {{ {setup}\n\
+             const args = {args_json};\n\
+             args[args.length] = function(v) {{ slot.value = v === undefined ? null : v; slot.done = true; }};\n\
+             host.apply(host.evaluatePage({function}), null, args);\n\
+             }})()"
         )
     } else {
         format!(
-            "{WD_RESET}\n\
-             (function() {{\n\
-               var result = (function() {{ {script} }}).apply(null, {args_json});\n\
-               if (result && typeof result.then === 'function') {{\n\
-                 result.then(function(v) {{\n\
-                   globalThis.__wd_async = v === undefined ? null : v;\n\
-                   globalThis.__wd_done = true;\n\
-                 }}, function(e) {{\n\
-                   globalThis.__wd_failed = true;\n\
-                   globalThis.__wd_err = e == null ? 'undefined' : (e && e.message ? String(e.message) : String(e));\n\
-                   globalThis.__wd_done = true;\n\
-                 }});\n\
-                 globalThis.__wd_wait = true;\n\
+            "(function() {{ {setup}\n\
+               var result = host.apply(host.evaluatePage({function}), null, {args_json});\n\
+                if (result && typeof result.then === 'function') {{\n\
+                  result.then(function(v) {{\n\
+                    slot.value = v === undefined ? null : v;\n\
+                    slot.done = true;\n\
+                  }}, function(e) {{\n\
+                    slot.failed = true;\n\
+                    slot.error = e == null ? 'undefined' : (e && e.message ? String(e.message) : String(e));\n\
+                    slot.done = true;\n\
+                  }});\n\
+                  slot.wait = true;\n\
                  return null;\n\
                }}\n\
                return result;\n\
@@ -572,10 +577,10 @@ async fn element_click(sessions: &Sessions, session: &str, element: &str) -> (u1
         return error(404, "no such element", "element belongs to another window");
     }
     let script = format!(
-        "(function(){{const el=__tb_webdriver_element({remote});\
-         if(el===null)return false;__tb_webdriver_click(el);return true;}})()"
+        "(function(){{const el=host.__tb_webdriver_element({remote});\
+         if(el===null)return false;host.__tb_webdriver_click(el);return true;}})()"
     );
-    match window.tab.execute_script(&script).await {
+    match window.tab.execute_browser_script(&script).await {
         Ok(RemoteValue::Bool(true)) => ok(Value::Null),
         Ok(_) => error(404, "no such element", "unknown element id"),
         Err(err) => script_error(&err),
@@ -610,11 +615,11 @@ async fn element_send_keys(
         return error(404, "no such element", "element belongs to another window");
     }
     let script = format!(
-        "(function(){{const el=__tb_webdriver_element({remote});\
-         if(el===null)return false;__tbWebDriverSendKeys(el, {});return true;}})()",
+        "(function(){{const el=host.__tb_webdriver_element({remote});\
+         if(el===null)return false;host.__tbWebDriverSendKeys(el, {});return true;}})()",
         json!(text)
     );
-    match window.tab.execute_script(&script).await {
+    match window.tab.execute_browser_script(&script).await {
         Ok(RemoteValue::Bool(true)) => ok(Value::Null),
         Ok(_) => error(404, "no such element", "unknown element id"),
         Err(err) => script_error(&err),
@@ -694,10 +699,10 @@ async fn perform_actions(sessions: &Sessions, session: &str, body: &str) -> (u16
         resolved.push(source);
     }
     let script = format!(
-        "(function(){{return globalThis.__tbWebDriverActions({});}})()",
+        "(function(){{return host.__tbWebDriverActions({});}})()",
         serde_json::to_string(&Value::Array(resolved)).unwrap_or_else(|_| "[]".to_owned())
     );
-    match window.tab.execute_script(&script).await {
+    match window.tab.execute_browser_script(&script).await {
         Ok(RemoteValue::Bool(true)) => ok(Value::Null),
         Ok(_) => error(500, "unknown error", "actions were not performed"),
         Err(err) => script_error(&err),
@@ -996,10 +1001,10 @@ async fn element_rect(sessions: &Sessions, session: &str, element: &str) -> (u16
         return error(404, "no such element", "element belongs to another window");
     }
     let script = format!(
-        "(function(){{const el=__tb_webdriver_element({remote});\
+        "(function(){{const el=host.__tb_webdriver_element({remote});\
          if(el===null)return null;return JSON.stringify(el.getBoundingClientRect());}})()"
     );
-    match window.tab.execute_script(&script).await {
+    match window.tab.execute_browser_script(&script).await {
         Ok(RemoteValue::String(text)) => match serde_json::from_str::<Value>(&text) {
             Ok(rect) => ok(json!({
                 "x": rect.get("x").cloned().unwrap_or(json!(0)),

@@ -28,10 +28,7 @@ const SINGLES: &[(&str, &str)] = &[
         "src/js/scripts/events/event_target_ctor.js",
     ),
     ("abort.deflate", "src/js/scripts/events/abort.js"),
-    (
-        "event_ctor.deflate",
-        "src/js/scripts/events/event_ctor.js",
-    ),
+    ("event_ctor.deflate", "src/js/scripts/events/event_ctor.js"),
     (
         "custom_event.deflate",
         "src/js/scripts/events/custom_event.js",
@@ -44,6 +41,7 @@ const WEB_PREFIX: &str = "(function(){";
 const WEB_SUFFIX: &str = "})();";
 
 fn main() {
+    let mut contracts = generate_bindings();
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set")).join("js_blobs");
     fs::create_dir_all(&out).expect("create js_blobs dir");
@@ -66,7 +64,10 @@ fn main() {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
             "order.txt entry {file:?} must be a plain file name"
         );
-        assert!(seen.insert(file.to_owned()), "duplicate order.txt entry {file}");
+        assert!(
+            seen.insert(file.to_owned()),
+            "duplicate order.txt entry {file}"
+        );
         let rel = format!("src/js/scripts/web/{file}");
         println!("cargo:rerun-if-changed={}", root.join(&rel).display());
         bundle.push_str(
@@ -80,6 +81,7 @@ fn main() {
         "order.txt lists no shims; refusing to ship an empty web bundle"
     );
     bundle.push_str(WEB_SUFFIX);
+    let bundle = contracts.javascript("web_bundle", &bundle);
     write_blob(&out, "web_bundle.deflate", bundle.as_bytes());
     writeln!(
         manifest,
@@ -92,6 +94,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root.join(input).display());
         let text = fs::read_to_string(root.join(input))
             .unwrap_or_else(|err| panic!("read shim {input}: {err}"));
+        let text = contracts.javascript(input, &text);
         write_blob(&out, blob, text.as_bytes());
         writeln!(manifest, "{blob}\tsingle\t{input}").expect("write manifest line");
     }
@@ -101,9 +104,90 @@ fn main() {
 /// Deflate-compresses `bytes` at maximum level; output is deterministic for
 /// one `flate2` version, which `Cargo.lock` pins.
 fn write_blob(out: &Path, name: &str, bytes: &[u8]) {
-    let mut encoder =
-        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(bytes).expect("deflate shim");
     let compressed = encoder.finish().expect("finish deflate");
     fs::write(out.join(name), compressed).expect("write blob");
+}
+
+/// Compiles only the declared native surface. Unsupported semantics fail the
+/// build instead of producing bindings that merely look like Web IDL.
+struct Contracts {
+    idl: Vec<(String, String)>,
+    providers: HashSet<String>,
+}
+
+impl Contracts {
+    fn javascript(&mut self, name: &str, text: &str) -> String {
+        let idl: Vec<_> = self
+            .idl
+            .iter()
+            .map(|(name, text)| webidl_bindgen::Source { name, text })
+            .collect();
+        let binding =
+            webidl_bindgen::compile_javascript(&idl, &webidl_bindgen::Source { name, text })
+                .unwrap_or_else(|error| panic!("JS IDL contracts: {error}"));
+        for interface in binding.interfaces {
+            assert!(
+                self.providers.insert(interface.clone()),
+                "conflicting binding implementations of {interface}"
+            );
+        }
+        binding.source
+    }
+}
+
+fn generate_bindings() -> Contracts {
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let mut contracts = Contracts {
+        idl: Vec::new(),
+        providers: HashSet::new(),
+    };
+    binding_sources(
+        &root.join("../webidl-bindgen/idl"),
+        "idl",
+        &mut contracts.idl,
+    );
+    let mut implementations = Vec::new();
+    binding_sources(&root.join("src/js"), "rs", &mut implementations);
+    let extracts: Vec<_> = contracts
+        .idl
+        .iter()
+        .map(|(name, text)| webidl_bindgen::Source { name, text })
+        .collect();
+    let implementations: Vec<_> = implementations
+        .iter()
+        .map(|(name, text)| webidl_bindgen::Source { name, text })
+        .collect();
+    let bindings = webidl_bindgen::compile_contracts(&extracts, &implementations)
+        .unwrap_or_else(|error| panic!("upstream IDL contracts: {error}"));
+    for binding in bindings {
+        contracts.providers.insert(binding.interface.clone());
+        fs::write(
+            out.join(&binding.interface).with_extension("rs"),
+            binding.rust,
+        )
+        .expect("write generated contract");
+    }
+    contracts
+}
+
+fn binding_sources(directory: &Path, extension: &str, sources: &mut Vec<(String, String)>) {
+    println!("cargo:rerun-if-changed={}", directory.display());
+    let mut paths: Vec<_> = fs::read_dir(directory)
+        .expect("read binding input directory")
+        .map(|entry| entry.expect("read binding input entry").path())
+        .collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            binding_sources(&path, extension, sources);
+        } else if path.extension().is_some_and(|item| item == extension) {
+            sources.push((
+                path.display().to_string(),
+                fs::read_to_string(&path).expect("read binding input"),
+            ));
+        }
+    }
 }

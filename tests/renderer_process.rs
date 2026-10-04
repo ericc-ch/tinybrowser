@@ -479,8 +479,6 @@ fn window_messages_are_limited_to_related_tabs() {
     fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
     let _ = fixture.wait_json();
     let mut client = fixture.connect();
-    let initial = target_ids(&mut client);
-    let unrelated: u64 = initial[0].parse().expect("numeric target id");
     let sender = create(&mut client);
     let session = attach(&mut client, &sender);
     client
@@ -495,14 +493,15 @@ fn window_messages_are_limited_to_related_tabs() {
         .expect("navigate");
     wait_for_load(&mut client, Duration::from_secs(5));
 
-    // Forged: the host entry point names a tab this document never opened.
-    let forged = eval(
-        &mut client,
-        &sender,
-        &format!("__tbWindowPostMessage({unrelated}, '{{}}'); true"),
-    )
-    .unwrap();
-    assert_eq!(forged, "true");
+    assert_eq!(
+        eval(
+            &mut client,
+            &sender,
+            "typeof __tbWindowPostMessage === 'undefined'"
+        )
+        .unwrap(),
+        "true"
+    );
     std::thread::sleep(Duration::from_millis(300));
     let path = fixture.data.join("tinybrowser/logs/default.log");
     let log = std::fs::read_to_string(&path).unwrap_or_default();
