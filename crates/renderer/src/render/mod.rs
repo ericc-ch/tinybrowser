@@ -40,6 +40,7 @@ mod geometry;
 mod layout;
 mod paint;
 mod png;
+mod providers;
 mod style;
 mod svg;
 mod text;

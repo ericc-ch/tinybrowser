@@ -2654,6 +2654,7 @@ dependencies = [
  "image-webp",
  "kurbo",
  "markup5ever",
+ "net",
  "parley",
  "png",
  "rquickjs",
