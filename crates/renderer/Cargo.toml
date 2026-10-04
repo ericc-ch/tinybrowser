@@ -56,15 +56,22 @@ image-webp = "0.2.4"
 selectors = "0.40"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 web_atoms = "0.2"
-style = { package = "stylo", version = "0.21" }
-stylo_dom = "0.21"
-stylo_static_prefs = "0.21"
-style_traits = { package = "stylo_traits", version = "0.21" }
+style = { package = "stylo", version = "0.20" }
+stylo_dom = "0.20"
+stylo_static_prefs = "0.20"
+style_traits = { package = "stylo_traits", version = "0.20" }
 taffy = "0.14"
 tiny-skia = "0.12"
 # Already retained by Parley; used directly to parse SVG path data without a
 # second SVG geometry implementation.
 kurbo = "0.13"
+# Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
+# Pinned exact: beta drift is fast, and Cargo.lock pins the rest.
+blitz-dom = "=0.3.0-beta.2"
+blitz-html = "=0.3.0-beta.2"
+blitz-paint = "=0.3.0-beta.2"
+anyrender = "=0.13.0"
+anyrender_vello_cpu = "=0.17.0"
 # Inflates the build-compressed JS shims (`js::blob`). Same instance `png`
 # already retains, so this adds no new crate to the binary.
 flate2 = "1"
