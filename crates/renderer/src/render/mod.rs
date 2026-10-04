@@ -32,6 +32,7 @@ mod stylo;
 mod stylo_map;
 mod stylo_view;
 
+mod blitz;
 mod boxes;
 mod decode;
 mod font;

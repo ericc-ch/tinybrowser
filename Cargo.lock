@@ -2632,6 +2632,8 @@ dependencies = [
  "blitz-dom",
  "blitz-html",
  "blitz-paint",
+ "blitz-traits",
+ "color",
  "dom",
  "encoding_rs",
  "euclid",
