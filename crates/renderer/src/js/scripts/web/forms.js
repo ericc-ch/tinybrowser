@@ -1,6 +1,6 @@
 // Form-control infrastructure that is pure Web IDL sugar: length reflection
 // and the constraint validation API. Host state that touches the tree stays a
-// Rust binding (docs/researches/engine-source.md), so this file only reads
+// Rust binding (docs/engines.md), so this file only reads
 // attributes and the `value` IDL attribute.
 (function() {
   const ASCII_WHITESPACE = /^[\t\n\f\r ]+|[\t\n\f\r ]+$/g;

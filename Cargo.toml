@@ -78,7 +78,7 @@ cargo_common_metadata = { level = "allow", priority = 1 }
 # base64 0.22 next to the direct 0.23) plus upstream transitive splits
 # (miniz_oxide via png/flate2, syn 2/3) that no bump removes without
 # breaking a pin. Measured, not guessed, at every size checkpoint; see
-# docs/researches/size-budget.md.
+# docs/size.md.
 multiple_crate_versions = { level = "allow", priority = 1 }
 
 # restriction: explicit, no blanket
@@ -109,7 +109,7 @@ redundant_clone = "deny"
 needless_collect = "deny"
 
 # ─── Release profile ──────────────────────────────────────────────────────────
-# The tuned profile from docs/researches/size-budget.md: every tuned marginal measured
+# The tuned profile from docs/size.md: every tuned marginal measured
 # there assumes exactly these flags. Lives here so any measurement in the doc
 # reproduces verbatim (`cargo build --release`, no env overrides).
 [profile.release]

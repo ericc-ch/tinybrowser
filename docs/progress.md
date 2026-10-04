@@ -1,11 +1,11 @@
 # Progress
 
 This file records the latest snapshot. After you score WPT or measure the binary, replace this snapshot.
-Size research lives in [`docs/researches/size-budget.md`](researches/size-budget.md).
+Size method and marginals live in [`docs/size.md`](size.md).
 
 ## Binary size
 
-Target: under 10MB stripped on x86_64.
+Policy: minimize stripped size on x86_64; no hard cap.
 
 8,699,448 bytes (2026-10-02)
 

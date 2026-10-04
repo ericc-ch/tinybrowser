@@ -101,21 +101,13 @@ and inserts the binding contract into the installer call before compression.
 
 `crates/renderer/src/js/scripts/bindings.js` installs these JS contracts in the
 private bridge scope. The installer supplies brands, descriptors, argument
-conversion, and result conversion. The algorithm class stays private. Native,
-legacy, and generated JS implementations of the same interface conflict at build
+conversion, and result conversion. The algorithm class stays private. Native
+and generated JS implementations of the same interface conflict at build
 time. Generator dependencies belong to build tooling rather than the browser
 runtime.
 
 Implementations follow the pinned upstream extracts in
 `crates/webidl-bindgen/idl/` (see the manifest there for the WPT source pin).
-The renderer build rejects an interface that has both a legacy and a contract
-binding.
-
-The cleanup covers Rust-backed and JS-backed bindings. Audit existing members
-before migration. Remove confirmed nonfunctional placeholders, but keep real
-partial implementations and report their conformance gaps through WPT. Fix
-binding and ownership problems during the cleanup. Implement unrelated missing
-browser features as separate work.
 
 ## Coverage and conformance
 

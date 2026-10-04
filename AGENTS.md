@@ -1,7 +1,7 @@
 # tinybrowser
 
 We are building the smallest and lightest headless browser for AI agents.
-The target binary size is under 10MB stripped on x86_64.
+Minimize the shipping binary size (stripped on x86_64); there is no hard cap.
 
 In `docs/progress.md`, replace the latest binary size, the latest total, and scored groups only.
 
