@@ -1,6 +1,7 @@
 [workspace]
 exclude = ["third_party/rquickjs", "third_party/weedle4"]
 members = [
+    "crates/anyrender-tiny-skia",
     "crates/browser",
     "crates/cdp",
     "crates/cookies",
