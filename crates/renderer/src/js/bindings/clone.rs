@@ -67,7 +67,7 @@ pub(crate) fn adopt_across_documents(
 /// Detaches `id` from its parent for adoption, recording the removal.
 ///
 /// A node with no parent is already detached; that is a no-op.
-fn detach_for_adopt(
+pub(crate) fn detach_for_adopt(
     doc: &mut BlitzDocument,
     id: NodeId,
 ) -> std::result::Result<(), TreeError> {

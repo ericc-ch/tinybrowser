@@ -714,8 +714,18 @@ pub(crate) fn document_type_argument<'js>(
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    // Blitz has no doctype nodes; no value converts.
-    let _ = super::required_node(ctx, value)?;
+    let id = super::required_node(ctx, value)?;
+    let owner = super::world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let Some(parsed) = owner.document(id) else {
+        return Err(Exception::throw_type(ctx, "stale node"));
+    };
+    if matches!(
+        parsed.document.synthetic_kind(id.node),
+        Some(crate::documents::SyntheticKind::Doctype { .. })
+    ) {
+        return Ok(Some(NodeReference::Tree(id)));
+    }
     Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
 }
 

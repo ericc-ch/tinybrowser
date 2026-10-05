@@ -1,8 +1,9 @@
 //! `DOMImplementation`, DOM parsing, and serialization.
 
 use super::{
-    NodeContext, throw_dom, validate_and_extract, world, world_for_node, wrap_new_document,
-    wrap_new_document_in_world, wrap_node,
+    NodeContext, detach_for_adopt, import_snapshot, materialize_import, throw_dom, throw_dom_error,
+    validate_and_extract, world, world_for_node, wrap_new_document, wrap_new_document_in_world,
+    wrap_node,
 };
 
 use crate::js::world::Handle;
@@ -101,9 +102,42 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
             )?)
         };
         let mut parsed = crate::Parsed::empty(content_type);
-        // Gap: Blitz has no Doctype node kind; the doctype argument is dropped
-        // instead of being adopted into the new tree.
-        let _ = doctype;
+        // Adopt the doctype into the new tree when one was passed: snapshot
+        // it out of its document, materialize the synthetic record locally,
+        // and append it under the new root.
+        if let Some(doctype) = doctype {
+            let node = doctype.tree().ok_or_else(|| {
+                throw_dom(&ctx, "HierarchyRequestError", "attributes cannot be adopted")
+            })?;
+            let snapshot = {
+                let source_world = world_for_node(&ctx, node)?;
+                let source = source_world.borrow();
+                let Some(parsed) = source.document(node) else {
+                    return Err(Exception::throw_type(&ctx, "no document"));
+                };
+                import_snapshot(&parsed.document, node, false).ok_or_else(|| {
+                    throw_dom(&ctx, "HierarchyRequestError", "doctype cannot be adopted")
+                })?
+            };
+            {
+                let source_world = world_for_node(&ctx, node)?;
+                let source = source_world.borrow();
+                let Some(mut parsed) = source.document_mut(node) else {
+                    return Err(Exception::throw_type(&ctx, "no document"));
+                };
+                detach_for_adopt(&mut parsed.document, node)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+            }
+            let mut fresh = materialize_import(&mut parsed.document, &snapshot)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+            fresh.document = 0;
+            let document_root = parsed.document.base.root_node().id;
+            parsed
+                .document
+                .base
+                .mutate()
+                .append_children(document_root, &[fresh.node]);
+        }
         if let Some(name) = root {
             let document_root = parsed.document.base.root_node().id;
             let element = parsed.document.base.mutate().create_element(name, Vec::new());

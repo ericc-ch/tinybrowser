@@ -7521,10 +7521,13 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
 impl<'js> document_type_generated::DocumentType<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-documenttype-name
     fn get_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        // Known gap: Blitz has no doctype nodes, so the brand never
-        // instantiates and the name reads empty.
-        let _ = self.handle;
-        rquickjs::String::from_str(ctx.clone(), "")
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let value = world
+            .document(self.handle.0)
+            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
+            .map_or(String::new(), |(name, _, _)| name);
+        rquickjs::String::from_str(ctx.clone(), &value)
     }
 
     // https://dom.spec.whatwg.org/#dom-documenttype-publicid
