@@ -56,7 +56,6 @@ blitz-html = "=0.3.0-beta.2"
 blitz-paint = "=0.3.0-beta.2"
 anyrender = "=0.13.0"
 anyrender_tiny_skia = { path = "../anyrender-tiny-skia" }
-anyrender_vello_cpu = "=0.17.0"
 blitz-traits = "=0.3.0-beta.2"
 # Inflates the build-compressed JS shims (`js::blob`). Same instance `png`
 # already retains, so this adds no new crate to the binary.

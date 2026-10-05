@@ -4,10 +4,12 @@ Goal: Finish the Blitz 0.3.0-beta.2 cutover on `blitz-adopt`: Blitz owns parse/s
 
 Plan: Land forward commits on `blitz-adopt` (no history rewrite), verify each batch with `tools/check` and `cargo test --workspace`, record size and upstream Blitz limitations in `docs/progress.md`, and compare real pages against Chromium to find gaps.
 
-State: clean tree, branch `blitz-adopt` three commits ahead of the PR #41 merge `6ab35db` (`3206088` single-decode + handoff), not pushed. PR #41 (plain non-blocking logger) is merged as `6ab35db`; the review commits were rebased on top. The code-review findings from `9414c02..4013b20` are fixed. Gates on `3206088`: `tools/check` green, `cargo test --workspace` green, `saucedemo.spec.ts` passed (full Playwright gate not rerun on this commit; was 39/43 on `b59a052` with four pre-existing form gaps). WPT `dom/nodes` retest and push are outstanding.
+State: clean tree, branch `blitz-adopt` ahead of the PR #41 merge `6ab35db` (single-decode, tiny-skia backend, + this handoff), not pushed. PR #41 (plain non-blocking logger) is merged as `6ab35db`. Gates on HEAD: `tools/check` green, `cargo test --workspace` green, full Playwright gate 39/43 (same four pre-existing form gaps), `chromium-diff.spec.ts` green. WPT `dom/nodes` retest and push are outstanding.
 
-Done (this round, `b59a052`):
+Done (this round):
 
+- tiny-skia backend: new `anyrender_tiny_skia` workspace crate implements anyrender's `PaintScene`/`ImageRenderer` over tiny-skia (no fork; upstream explicitly welcomes tiny-skia backends). Fill/stroke with solid+gradient brushes, clip/blend layers, image patterns with premultiply handling, glyph runs through skrifa outlines, box shadows and single-node blur filters through the `image` crate's `fast_blur`. Screenshots paint through it; `anyrender_vello_cpu`/`vello_cpu` are deleted. Release binary 12,030,744 → 10,717,288 bytes (−1,313,456, ~11%).
+- Chromium pixel parity: `tools/playwright/chromium-diff.spec.ts` renders seven fixture pages in both browsers at 800x600 and asserts over-tolerance shares (solid pages 0.00%, text 2.13% hinting-level, shadow 1.34% blur-kernel shape; every max-delta pixel sits on a glyph edge or soft blur). Skips where system Chrome is absent.
 - Single image decode: our `<img>` dial and `render/decode.rs` (zune-jpeg, image-webp, 32 MiB pixel budget) are deleted. Blitz's fetch is the only fetch; `<img>` requests are waiters settled from Blitz's public `ElementData::image_data` on each delivery (`load` with natural dims, `error` otherwise). SVG natural size is declared absolute width/height else the 300x150 default object size (Chromium answers 300x150 even for viewBox-only SVG, probed 2026-10-06); SVG and GIF `<img>` now load instead of erroring.
 - `6ab35db` — merged PR #41: the logging crate is a plain non-blocking logger (`logging::install(level, file)`; `Config`/`Logger`/`ParseLevelError` deleted). Call sites keep using the macros; `src/main.rs` and `tests/renderer_process.rs` were updated by the PR. Rebased the review commits on top.
 
@@ -32,7 +34,7 @@ Unfinished:
 - `document.styleSheets` / `document.fonts` are still undefined (real `StyleSheetList`/`FontFaceSet` over Blitz needed); `document.images`/`document.scripts` absent (cheap `HTMLCollection`s).
 - GitHub heading wraps greedily where Chromium balances two lines (`text-wrap: balance` unsupported).
 - WPT `dom/nodes` regressions unverified since the cleanup commits (11 OK-to-ERROR/TIMEOUT/CRASH files listed in the previous handoff). Needs approval: retest just those files with `tools/wpt`.
-- Release size re-measured on `3206088`: `12,030,744 bytes (2026-10-06)`, recorded in `docs/progress.md` (+45,584 vs the 2026-10-05 snapshot across the review fixes, the logging merge, and the single-decode change). Probe: the vello_cpu backend costs ~1.6 MB stripped (null-scene swap: 12,030,744 → 10,423,592; see `docs/size.md`). Push still outstanding.
+- Release size re-measured after the vello removal: `10,717,288 bytes (2026-10-06)`, recorded in `docs/progress.md` with the realized saving in `docs/size.md`. Push still outstanding.
 - `subresource_bytes` on `Document` has no cap or eviction; cleared only on navigation.
 
 Next:

@@ -24,6 +24,6 @@ lld `--icf=all`; release-bin RELR + `.eh_frame` removal in `tools/release`).
 | Taffy layout | +304KB | probe |
 | Parley + skrifa | +883KB | shaping; floor |
 | Blitz stack | +6.7MB | pre-adoption full-stack probe (window/GPU wiring); adopted shape differs, see below |
-| vello_cpu backend | +1.6MB | measured 2026-10-06: null-`PaintScene` swap on `blitz-adopt` (12,030,744 → 10,423,592 stripped). Drops `anyrender_vello_cpu`, `vello_cpu`, `vello_common`, `glifo`, `fearless_simd`, `guillotiere`; `blitz-paint`/`anyrender`/`peniko` stay linked |
+| vello_cpu backend | −1,313,456 | removed 2026-10-06 after Chromium pixel parity (12,030,744 → 10,717,288 stripped); the null-scene probe had estimated ~1.6 MB, the ~0.3 MB gap is the tiny-skia backend plus `image`/`fast_blur` joining the graph |
 
 Watchlist: keep one `JsNode`; no native class per element.
