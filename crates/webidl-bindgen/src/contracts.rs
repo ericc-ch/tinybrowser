@@ -1388,11 +1388,12 @@ fn argument_parameter(
     let optional = arity == ArgumentArity::Optional;
     Ok(match type_ {
         ReturnType::Node => quote! { host::NodeReference },
-        ReturnType::NullableNode => quote! { Option<host::NodeReference> },
+        ReturnType::NullableNode | ReturnType::NullableDocumentType => {
+            quote! { Option<host::NodeReference> }
+        }
         ReturnType::String if optional => quote! { Option<rquickjs::String<'js>> },
         ReturnType::String => quote! { rquickjs::String<'js> },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
-        ReturnType::NullableDocumentType => quote! { Option<host::NodeReference> },
         ReturnType::Callback => quote! { rquickjs::Function<'js> },
         // A platform object or callback-interface argument arrives as the
         // original value; the platform algorithm performs any further check.

@@ -128,10 +128,7 @@ fn descendants(base: &blitz_dom::BaseDocument, scope: BlitzId) -> Vec<BlitzId> {
     order
 }
 
-fn element_name<'a>(
-    base: &'a blitz_dom::BaseDocument,
-    id: BlitzId,
-) -> Option<&'a QualName> {
+fn element_name(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&QualName> {
     base.get_node(id)
         .and_then(|node| node.data.downcast_element())
         .map(|element| &element.name)
@@ -195,10 +192,16 @@ fn set_option_selected(parsed: &mut crate::Parsed, option: NodeId, selected: boo
             .attrs
             .iter()
             .find(|attribute| attribute.name.local.as_ref() == "selected")
-            .map(|attribute| attribute.name.clone())
-            .unwrap_or_else(|| {
-                QualName::new(None, markup5ever::Namespace::from(""), LocalName::from("selected"))
-            });
+            .map_or_else(
+                || {
+                    QualName::new(
+                        None,
+                        markup5ever::Namespace::from(""),
+                        LocalName::from("selected"),
+                    )
+                },
+                |attribute| attribute.name.clone(),
+            );
         (name, attr(base, option.node, "selected").map(str::to_owned))
     };
     if selected == old_value.is_some() {
@@ -395,7 +398,7 @@ fn siblings_around(
     let mut next = None;
     if let Some(node) = base.get_node(parent) {
         let mut seen = false;
-        for &kid in node.children.iter() {
+        for &kid in &node.children {
             if kid == child {
                 seen = true;
                 continue;
@@ -421,9 +424,9 @@ fn detach_node(parsed: &mut crate::Parsed, target: NodeId) {
     let (parent, previous, next) = {
         let base = &parsed.document.base;
         let parent = base.get_node(target.node).and_then(|node| node.parent);
-        let (previous, next) = parent
-            .map(|parent| siblings_around(base, document, parent, target.node))
-            .unwrap_or((None, None));
+        let (previous, next) = parent.map_or((None, None), |parent| {
+            siblings_around(base, document, parent, target.node)
+        });
         (parent, previous, next)
     };
     parsed.document.base.mutate().remove_node(target.node);
@@ -471,9 +474,8 @@ fn insert_node_before(parsed: &mut crate::Parsed, reference: NodeId, child: Node
     let (parent, previous) = {
         let base = &parsed.document.base;
         let parent = base.get_node(reference.node).and_then(|node| node.parent);
-        let previous = parent
-            .map(|parent| siblings_around(base, document, parent, reference.node).0)
-            .unwrap_or(None);
+        let previous =
+            parent.and_then(|parent| siblings_around(base, document, parent, reference.node).0);
         (parent, previous)
     };
     let Some(parent) = parent else {
@@ -500,9 +502,9 @@ fn replace_node(parsed: &mut crate::Parsed, old: NodeId, new: NodeId) {
     let (parent, previous, next) = {
         let base = &parsed.document.base;
         let parent = base.get_node(old.node).and_then(|node| node.parent);
-        let (previous, next) = parent
-            .map(|parent| siblings_around(base, document, parent, old.node))
-            .unwrap_or((None, None));
+        let (previous, next) = parent.map_or((None, None), |parent| {
+            siblings_around(base, document, parent, old.node)
+        });
         (parent, previous, next)
     };
     let Some(parent) = parent else {

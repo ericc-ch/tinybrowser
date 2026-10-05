@@ -144,7 +144,7 @@ pub(crate) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::E
 
 /// A refused tree operation, mapped to its DOM exception class
 /// (<https://dom.spec.whatwg.org/#dom-domerror> naming).
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum TreeError {
     /// A handle named a node that no longer exists.
     Stale,
@@ -471,14 +471,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;
-    crate::js::bridge::object(ctx)?.set(
-        "__tb_deliver_mutations",
-        rquickjs::prelude::Func::from(deliver_mutations),
-    )?;
-    crate::js::bridge::object(ctx)?.set(
-        "__tb_construct",
-        rquickjs::prelude::Func::from(construct_node),
-    )?;
+    install_host_functions(ctx)?;
     node::install_custom_construction(ctx)?;
     crate::js::bridge::object(ctx)?.set("__tb_handlerNames", HANDLER_ATTRIBUTES.to_vec())?;
     crate::js::bridge::object(ctx)?.set(
@@ -537,6 +530,19 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     crate::js::bridge::object(ctx)?.set(
         "__tbDispatchTrusted",
         rquickjs::prelude::Func::from(window_dispatch_trusted_event),
+    )?;
+    Ok(())
+}
+
+/// Registers the `__tb_*` host functions page scripts call into.
+fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
+    crate::js::bridge::object(ctx)?.set(
+        "__tb_deliver_mutations",
+        rquickjs::prelude::Func::from(deliver_mutations),
+    )?;
+    crate::js::bridge::object(ctx)?.set(
+        "__tb_construct",
+        rquickjs::prelude::Func::from(construct_node),
     )?;
     Ok(())
 }
@@ -1089,7 +1095,11 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
 
 /// [Replaces data](https://dom.spec.whatwg.org/#concept-cd-replace) on a
 /// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
-pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: crate::dom_string::DomString) -> Result<()> {
+pub(super) fn set_character_data(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    data: &crate::dom_string::DomString,
+) -> Result<()> {
     // Lone surrogates cannot survive the UTF-8 tree: they become the
     // replacement character at this boundary, a known cutover gap.
     let data = data.to_string_lossy().into_owned();

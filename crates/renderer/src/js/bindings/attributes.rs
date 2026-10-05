@@ -1232,7 +1232,7 @@ fn attribute_at(ctx: &Ctx<'_>, element: NodeId, index: i64) -> Result<Option<(St
     };
     Ok(usize::try_from(index)
         .ok()
-        .and_then(|index| data.attrs.iter().nth(index))
+        .and_then(|index| data.attrs.as_slice().get(index))
         .map(|attribute| {
             (
                 attribute.name.ns.to_string(),
@@ -1401,7 +1401,7 @@ fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Resul
         parsed.document.record(JournalEntry::Attributes {
             target: owner,
             name: qualified_name(&name),
-            namespace: snapshot.namespace.clone(),
+            namespace: snapshot.namespace,
             old_value,
         });
         drop(parsed);
@@ -1646,12 +1646,11 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
 /// `input` becomes selectable again after a non-selectable type (for example
 /// `color` back to `text`), the text entry cursor moves to the beginning
 /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-fn apply_input_type_change(_ctx: &Ctx<'_>, _element: NodeId) -> Result<()> {
+fn apply_input_type_change(_ctx: &Ctx<'_>, _element: NodeId) {
     // Known gap (Blitz cutover): the old `dom::form` selection-tracking APIs
     // (`selection_supported`, `input_selectable`, `set_selection`,
     // `set_input_selectable`) have no Blitz equivalent yet, so the input
     // `type`-change text-selection step is a no-op until they land.
-    Ok(())
 }
 
 /// After an attribute change, runs the element's attribute-change hooks: an
@@ -1671,7 +1670,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         compile_handler_attribute(ctx, element, typ)?;
     }
     if local == "type" {
-        apply_input_type_change(ctx, element)?;
+        apply_input_type_change(ctx, element);
     }
     if local != "src" {
         return Ok(());
@@ -1874,10 +1873,10 @@ pub(crate) fn set_attribute_sync(
             .attrs
             .iter()
             .find(|attribute| attribute.name.local.as_ref() == local)
-            .map(|attribute| attribute.name.clone())
-            .unwrap_or_else(|| {
-                QualName::new(None, js_world::html_namespace(), LocalName::from(local))
-            });
+            .map_or_else(
+                || QualName::new(None, js_world::html_namespace(), LocalName::from(local)),
+                |attribute| attribute.name.clone(),
+            );
         let old_value = js_world::attr(base, element.node, local).map(ToOwned::to_owned);
         (name, old_value)
     };
@@ -1912,27 +1911,21 @@ fn namespace_element(
     if data.downcast_element().is_some() {
         return Some(node);
     }
-    match data {
-        blitz_dom::NodeData::Document(_) => {
-            base.get_node(node.node)?
-                .children
-                .iter()
-                .find_map(|child| {
-                    let id = NodeId {
-                        document,
-                        node: *child,
-                    };
-                    super::is_element(base, *child).then_some(id)
-                })
-        }
-        _ => {
-            let parent = base.get_node(node.node)?.parent?;
+    if let blitz_dom::NodeData::Document(_) = data {
+        base.get_node(node.node)?.children.iter().find_map(|child| {
             let id = NodeId {
                 document,
-                node: parent,
+                node: *child,
             };
-            super::is_element(base, parent).then_some(id)
-        }
+            super::is_element(base, *child).then_some(id)
+        })
+    } else {
+        let parent = base.get_node(node.node)?.parent?;
+        let id = NodeId {
+            document,
+            node: parent,
+        };
+        super::is_element(base, parent).then_some(id)
     }
 }
 

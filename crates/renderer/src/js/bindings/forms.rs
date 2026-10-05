@@ -92,10 +92,10 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
             .attrs
             .iter()
             .find(|attribute| attribute.name.local.as_ref() == "selected")
-            .map(|attribute| attribute.name.clone())
-            .unwrap_or_else(|| {
-                QualName::new(None, Namespace::from(""), LocalName::from("selected"))
-            });
+            .map_or_else(
+                || QualName::new(None, Namespace::from(""), LocalName::from("selected")),
+                |attribute| attribute.name.clone(),
+            );
         (name, attr(base, node.node, "selected").map(str::to_owned))
     };
     if selected == old_value.is_some() {
@@ -451,9 +451,7 @@ fn option_selected(base: &BaseDocument, option: BlitzId) -> bool {
 /// An `option`'s value: its `value` attribute, else its text
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
 fn option_value(base: &BaseDocument, option: BlitzId) -> String {
-    attr(base, option, "value")
-        .map(str::to_owned)
-        .unwrap_or_else(|| option_text(base, option))
+    attr(base, option, "value").map_or_else(|| option_text(base, option), str::to_owned)
 }
 
 /// An `option`'s text: its descendant text with ASCII whitespace stripped and

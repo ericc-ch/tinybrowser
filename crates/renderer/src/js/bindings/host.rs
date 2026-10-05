@@ -468,8 +468,7 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
             Some(NodeData::Text(_) | NodeData::Comment { .. })
         ),
         // Blitz has no doctype, PI, or CDATA nodes.
-        "DocumentType" => false,
-        "ProcessingInstruction" => false,
+        "DocumentType" | "ProcessingInstruction" => false,
         // Spec mixins: their members are installed on every including
         // interface, so the receiver check accepts the union of those kinds.
         // `ElementCSSInlineStyle` is included by the HTML, SVG, and MathML

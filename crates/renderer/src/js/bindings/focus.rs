@@ -142,10 +142,10 @@ fn write_attr(parsed: &mut crate::Parsed, node: NodeId, local: &str, value: Opti
             .attrs
             .iter()
             .find(|attribute| attribute.name.local.as_ref() == local)
-            .map(|attribute| attribute.name.clone())
-            .unwrap_or_else(|| {
-                QualName::new(None, Namespace::from(""), LocalName::from(local))
-            });
+            .map_or_else(
+                || QualName::new(None, Namespace::from(""), LocalName::from(local)),
+                |attribute| attribute.name.clone(),
+            );
         (name, attr(base, node.node, local).map(str::to_owned))
     };
     if old_value.as_deref() == value {

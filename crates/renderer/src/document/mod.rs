@@ -559,7 +559,7 @@ impl Document {
     ///
     /// The old DOM mutation serial is gone with the arena; always rescan.
     /// (Same-document `iframe` moves are noticed without a cheap detector.)
-    pub(crate) fn frame_order_changed(&mut self) -> bool {
+    pub(crate) fn frame_order_changed() -> bool {
         true
     }
 
@@ -928,17 +928,17 @@ impl Document {
             return;
         };
         let text = decoder.push(bytes);
-        self.write_text(text);
+        self.write_text(&text);
     }
 
     /// Feeds markup that is already decoded, as a script's `document.write`
     /// provides.
-    pub(crate) fn write_text(&mut self, text: String) {
+    pub(crate) fn write_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
         if let Some(buffer) = self.active_buffer.as_mut() {
-            buffer.push_str(&text);
+            buffer.push_str(text);
         }
         // Known gap: without an incremental parser a write after the parse
         // finished has nowhere to go, so it is ignored instead of re-parsing.
@@ -948,7 +948,7 @@ impl Document {
     pub(crate) fn end_body(&mut self) {
         if let Some(decoder) = self.decoder.take() {
             let text = decoder.finish();
-            self.write_text(text);
+            self.write_text(&text);
         }
         self.parser_eof = true;
         self.finish_parse();
@@ -1091,7 +1091,7 @@ impl Document {
     pub(crate) fn apply_document_stream(&mut self, command: DocumentStreamCommand) {
         match command {
             DocumentStreamCommand::Open => self.reopen_document(),
-            DocumentStreamCommand::Write(html) => self.write_text(html),
+            DocumentStreamCommand::Write(html) => self.write_text(&html),
             // Only a parser a script opened is a script's to close; a response
             // body ends when its exchange does.
             // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#closing-the-input-stream

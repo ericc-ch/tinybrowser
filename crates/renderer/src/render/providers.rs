@@ -52,7 +52,7 @@ impl blitz_traits::net::NetProvider for TinyNetProvider {
         let Ok(method) = net::Method::parse(request.method.as_str()) else {
             return;
         };
-        let url = request.url.clone();
+        let url = request.url;
         let resolved = url.to_string();
         let agent = self.agent.clone();
         let in_flight = self.in_flight.clone();

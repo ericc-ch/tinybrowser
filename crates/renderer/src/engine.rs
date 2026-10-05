@@ -243,6 +243,9 @@ impl Engine {
     /// window come from the caller (Playwright's `clip`); the base viewport
     /// is the shared 800x600 virtual size.
     ///
+    /// Viewport sides convert saturating at least 1 (the painter rejects
+    /// over-cap sizes).
+    ///
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] when the frame is not mounted and
@@ -264,8 +267,8 @@ impl Engine {
                     message: "no document to render".into(),
                 });
             };
-            let width = request.viewport_width.max(1.0).round() as u32;
-            let height = request.viewport_height.max(1.0).round() as u32;
+            let width = viewport_pixels(request.viewport_width);
+            let height = viewport_pixels(request.viewport_height);
             let viewport = blitz_traits::shell::Viewport::new(
                 width,
                 height,
@@ -853,7 +856,7 @@ impl Engine {
             let Some(document) = self.frames.get_mut(&parent) else {
                 continue;
             };
-            if !document.frame_order_changed() {
+            if !Document::frame_order_changed() {
                 continue;
             }
             let containers = document.iframe_containers_in_order();
@@ -1144,4 +1147,24 @@ impl Drop for Engine {
         self.runtime.registry.borrow_mut().clear();
         self.js_runtime.collect();
     }
+}
+
+/// Viewport side in device pixels: at least 1, saturating at `u32::MAX`
+/// (the painter rejects over-cap sizes with `TooLarge`).
+fn viewport_pixels(value: f32) -> u32 {
+    if !value.is_finite() {
+        return u32::MAX;
+    }
+    let rounded = value.max(1.0).round();
+    // Both conversions to f64 are exact, so the comparison loses nothing.
+    if f64::from(rounded) >= f64::from(u32::MAX) {
+        return u32::MAX;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rounded is finite and below u32::MAX, so the cast is exact and non-negative"
+    )]
+    let pixels = rounded as u32;
+    pixels
 }

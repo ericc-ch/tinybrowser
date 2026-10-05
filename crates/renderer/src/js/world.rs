@@ -287,7 +287,7 @@ pub(crate) fn svg_namespace() -> markup5ever::Namespace {
     markup5ever::ns!(svg)
 }
 
-/// The MathML namespace.
+/// The `MathML` namespace.
 pub(crate) fn mathml_namespace() -> markup5ever::Namespace {
     markup5ever::ns!(mathml)
 }
@@ -302,8 +302,7 @@ pub(crate) fn is_html_element(
         let Some(element) = node.data.downcast_element() else {
             return false;
         };
-        element.name.ns == html_namespace()
-            && element.name.local == markup5ever::LocalName::from(local)
+        element.name.ns == html_namespace() && element.name.local.as_ref() == local
     })
 }
 
@@ -521,6 +520,9 @@ pub(crate) struct World {
     /// The focused element of each document
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
     active_elements: HashMap<u32, NodeId>,
+    /// Text selection per control `(start, end, direction code)`: the
+    /// selection APIs clamp to the control's value length on read.
+    selections: HashMap<NodeId, (u32, u32, u8)>,
     /// Elements whose `click()` is running, so a nested `click()` returns
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
     clicks_in_progress: HashSet<NodeId>,
@@ -632,6 +634,7 @@ impl World {
             wrappers: HashMap::new(),
             implementations: HashMap::new(),
             active_elements: HashMap::new(),
+            selections: HashMap::new(),
             clicks_in_progress: HashSet::new(),
             brands: HashMap::new(),
             bridge: None,
@@ -673,6 +676,7 @@ impl World {
         self.wrappers.clear();
         self.implementations.clear();
         self.active_elements.clear();
+        self.selections.clear();
         self.frame_navigations.clear();
         self.image_updates.clear();
         self.clear_images();
@@ -1469,6 +1473,17 @@ impl World {
     /// The focused element of a document, if any.
     pub(crate) fn active_element(&self, document: u32) -> Option<NodeId> {
         self.active_elements.get(&document).copied()
+    }
+
+    /// A control's `(start, end, direction)` selection, defaulting to a
+    /// collapsed caret at 0.
+    pub(crate) fn selection_of(&self, id: NodeId) -> (u32, u32, u8) {
+        self.selections.get(&id).copied().unwrap_or((0, 0, 0))
+    }
+
+    /// Stores a control's `(start, end, direction)` selection.
+    pub(crate) fn set_selection(&mut self, id: NodeId, start: u32, end: u32, direction: u8) {
+        self.selections.insert(id, (start, end, direction));
     }
 
     /// The stable `WebDriver` element id for `node`, allocating one on first
