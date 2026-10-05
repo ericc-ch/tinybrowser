@@ -86,15 +86,14 @@ pub(crate) fn paint(
     height: u32,
 ) -> Result<RgbaImage, RenderError> {
     check_dims(width, height)?;
-    let view_width = u16::try_from(width).map_err(|_| RenderError::TooLarge)?;
-    let view_height = u16::try_from(height).map_err(|_| RenderError::TooLarge)?;
-    let mut painter = anyrender_vello_cpu::VelloCpuScenePainter::new(view_width, view_height);
+    let mut painter = anyrender_tiny_skia::TinySkiaScenePainter::new(width, height);
     blitz_paint::paint_scene(&mut painter, base, 1.0, width, height, 0, 0);
-    let pixmap = painter.finish();
+    let pixmap = painter.take_pixmap();
     let pixels = pixmap.data();
-    let mut data = Vec::with_capacity(pixels.len() * 4);
-    for pixel in pixels {
-        data.extend_from_slice(&over_white(*pixel));
+    let mut data = Vec::with_capacity(pixels.len());
+    for pixel in pixels.as_chunks::<4>().0 {
+        let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+        data.extend_from_slice(&over_white(r, g, b, a));
     }
     Ok(RgbaImage {
         width,
@@ -116,11 +115,11 @@ fn check_dims(width: u32, height: u32) -> Result<(), RenderError> {
 
 /// Converts one premultiplied pixel to opaque straight-alpha `[r, g, b, 255]`,
 /// compositing onto the white canvas (screenshots have no transparency).
-fn over_white(pixel: color::PremulRgba8) -> [u8; 4] {
+fn over_white(red: u8, green: u8, blue: u8, alpha: u8) -> [u8; 4] {
     // Premultiplied `c` over white: `c + 255 - a`, clamped. Opaque pixels
     // pass through; transparent pixels become white.
-    let blend = |component: u8| component.saturating_add(u8::MAX - pixel.a);
-    [blend(pixel.r), blend(pixel.g), blend(pixel.b), u8::MAX]
+    let blend = |component: u8| component.saturating_add(u8::MAX - alpha);
+    [blend(red), blend(green), blend(blue), u8::MAX]
 }
 
 #[cfg(test)]

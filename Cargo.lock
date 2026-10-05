@@ -2629,12 +2629,12 @@ name = "renderer"
 version = "0.1.0"
 dependencies = [
  "anyrender",
+ "anyrender_tiny_skia",
  "anyrender_vello_cpu",
  "blitz-dom",
  "blitz-html",
  "blitz-paint",
  "blitz-traits",
- "color",
  "encoding_rs",
  "fixed_decimal",
  "flate2",
