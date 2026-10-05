@@ -7,7 +7,7 @@ Size method and marginals live in [`docs/size.md`](size.md).
 
 Policy: minimize stripped size on x86_64; no hard cap.
 
-8,699,448 bytes (2026-10-02)
+11,985,160 bytes (2026-10-05)
 
 ```sh
 nix develop --command ./tools/release
@@ -303,3 +303,11 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 | `x-frame-options/` | 33.3% |
 | `xhr/` | 2.9% |
 | `xml/` | 47.1% |
+
+## Upstream Blitz bugs (known-fail, not worked around)
+
+Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail closed as known-fails.
+
+- `blitz-dom-0.3.0-beta.2/src/document.rs:1086` `resolve_url` panics on unresolvable relative refs (observed: `foo.jpg` against `data:text/css` base). Upstream `main` still panics the same way.
+- `blitz-dom` has no PI / CDATA / doctype node kinds; fragment parsing drops doctype and eagerly loads subresources against the scratch doc default base.
+- Pre-existing `main` crashes, out of scope: `dom/nodes/Document-characterSet-normalization-1.html`, `Document-characterSet-normalization-2.html`, `Document-createElement-namespace.html`.

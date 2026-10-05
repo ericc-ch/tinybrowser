@@ -90,9 +90,6 @@ pub(crate) enum DialContext {
         epoch: u64,
     },
     /// An `<img>` resource selected by its `src` attribute.
-    // No constructor while Blitz subresource fetch is unwired; the
-    // completion path stays so the load-event gating still compiles.
-    #[allow(dead_code, reason = "unconstructed until subresource fetch is wired")]
     Image {
         element: crate::js::world::NodeId,
         epoch: u64,
@@ -245,6 +242,10 @@ pub(crate) struct Document {
     image_selected_src: HashMap<crate::js::world::NodeId, String>,
     /// Elements with an in-flight image fetch for the current generation.
     in_flight_images: HashSet<crate::js::world::NodeId>,
+    /// Connected `<img>` elements the last lifecycle scan saw, so insertion
+    /// starts a fetch and removal drops one
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    connected_images: HashSet<crate::js::world::NodeId>,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -333,6 +334,7 @@ impl Document {
             image_generations: HashMap::new(),
             image_selected_src: HashMap::new(),
             in_flight_images: HashSet::new(),
+            connected_images: HashSet::new(),
             frame_load_sequence: 0,
             frame_load_in_flight: false,
             initial_blank: true,
@@ -454,6 +456,31 @@ impl Document {
 
     pub(crate) fn take_lifecycle(&mut self) -> Vec<Lifecycle> {
         let connected = self.world.borrow().iframe_containers_in_order();
+        // Parser insertions bypass the bindings that queue image fetches, and
+        // script insertions land directly in the Blitz tree, so a scan is
+        // what notices a connected `<img>` the way the old DOM lifecycle did
+        // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+        let connected_images: Vec<crate::js::world::NodeId> = self
+            .world
+            .borrow()
+            .with_main_document(|parsed| {
+                let base = &parsed.document.base;
+                let document = parsed.id;
+                let mut images = Vec::new();
+                let mut stack = vec![base.root_node().id];
+                while let Some(id) = stack.pop() {
+                    if crate::js::world::is_html_element(base, id, "img")
+                        && crate::js::world::is_connected(base, id)
+                    {
+                        images.push(crate::js::world::NodeId { document, node: id });
+                    }
+                    if let Some(node) = base.get_node(id) {
+                        stack.extend(node.children.iter().rev().copied());
+                    }
+                }
+                images
+            })
+            .unwrap_or_default();
         let shared = self.shared.borrow();
         let known: std::collections::HashSet<crate::js::world::NodeId> = shared
             .tree
@@ -473,6 +500,19 @@ impl Document {
         for container in &known {
             if !connected_set.contains(container) {
                 events.push(Lifecycle::Removed(*container));
+            }
+        }
+        let connected_image_set: std::collections::HashSet<crate::js::world::NodeId> =
+            connected_images.iter().copied().collect();
+        for element in &connected_images {
+            if !self.connected_images.contains(element) {
+                events.push(Lifecycle::Inserted(*element));
+            }
+        }
+        let previous = std::mem::replace(&mut self.connected_images, connected_image_set);
+        for element in previous {
+            if !self.connected_images.contains(&element) {
+                events.push(Lifecycle::Removed(element));
             }
         }
         events
@@ -1074,6 +1114,7 @@ impl Document {
         self.image_generations.clear();
         self.image_selected_src.clear();
         self.in_flight_images.clear();
+        self.connected_images.clear();
         let js_timer_ids: std::collections::HashSet<u32> =
             self.js_timer_slots.keys().copied().collect();
         self.timers
@@ -1395,9 +1436,18 @@ impl Document {
                 if self.image_generation(element) == generation {
                     self.in_flight_images.remove(&element);
                     let selected = self.image_selected_src.remove(&element).unwrap_or_default();
-                    // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
-                    self.world.borrow_mut().fail_image(element, selected);
-                    self.fire_js(|js| js.fire_node_error(element));
+                    let loaded = (200..300).contains(&outcome.status)
+                        && crate::render::decode_image(&outcome.body).is_some_and(|image| {
+                            self.world
+                                .borrow_mut()
+                                .store_image(element, image, selected.clone())
+                        });
+                    if loaded {
+                        self.fire_js(|js| js.fire_node_load(element));
+                    } else {
+                        self.world.borrow_mut().fail_image(element, selected);
+                        self.fire_js(|js| js.fire_node_error(element));
+                    }
                     self.adopt_js_work();
                 }
                 self.fire_document_load();
@@ -1574,11 +1624,34 @@ impl Document {
         self.pending_stylesheets = 0;
     }
 
-    /// Scans for the current document's `<img src>` resources. Blitz fetches
-    /// these itself through the provider bridge; the counters stay so load
-    /// gating still compiles.
+    /// Queues the current document's `<img src>` resources. Image requests
+    /// delay the load event until they succeed or fail
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     fn load_images(&mut self) {
-        self.pending_images = 0;
+        let images: Vec<crate::js::world::NodeId> = self
+            .world
+            .borrow()
+            .with_main_document(|parsed| {
+                let base = &parsed.document.base;
+                let document = parsed.id;
+                let mut images = Vec::new();
+                let mut stack = vec![base.root_node().id];
+                while let Some(id) = stack.pop() {
+                    if crate::js::world::is_html_element(base, id, "img")
+                        && crate::js::world::attr(base, id, "src").is_some()
+                    {
+                        images.push(crate::js::world::NodeId { document, node: id });
+                    }
+                    if let Some(node) = base.get_node(id) {
+                        stack.extend(node.children.iter().rev().copied());
+                    }
+                }
+                images
+            })
+            .unwrap_or_default();
+        for element in images {
+            self.queue_image(element, false);
+        }
     }
 
     /// Moves every queued Blitz subresource fetch onto a carrier dial,
@@ -1589,10 +1662,15 @@ impl Document {
         while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
             let url = fetch.url;
             self.blitz_handlers.insert(fetch.id, handler);
+            // The Fetch initiator is the document, not the fetch target: the
+            // provider never sees the document URL, so it stamps the target
+            // as initiator and the document corrects it here
+            // (<https://fetch.spec.whatwg.org/#concept-request-initiator>).
+            let initiator = self.url.clone();
             self.queued_dials.push(QueuedDial::get(
                 DialContext::BlitzResource { id: fetch.id },
                 url,
-                fetch.initiator,
+                initiator,
             ));
         }
     }
@@ -1614,12 +1692,53 @@ impl Document {
     pub(in crate::document) fn queue_image(
         &mut self,
         element: crate::js::world::NodeId,
-        _force: bool,
+        force: bool,
     ) {
-        // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
-        // The generation still advances so a later fetch cannot resurrect
-        // this request.
-        self.bump_image_generation(element);
+        if !force
+            && (self.in_flight_images.contains(&element)
+                || self.world.borrow().images.contains_key(&element))
+        {
+            return;
+        }
+        let generation = self.bump_image_generation(element);
+        self.in_flight_images.insert(element);
+        let src = self.world.borrow().document(element).and_then(|parsed| {
+            crate::js::world::is_html_element(&parsed.document.base, element.node, "img")
+                .then(|| {
+                    crate::js::world::attr(&parsed.document.base, element.node, "src")
+                        .map(str::to_owned)
+                })
+                .flatten()
+        });
+        let Some(src) = src.filter(|src| !src.is_empty()) else {
+            self.in_flight_images.remove(&element);
+            self.image_selected_src.remove(&element);
+            self.world.borrow_mut().forget_image(element);
+            self.fire_js(|js| js.fire_node_error(element));
+            return;
+        };
+        let Ok(url) = self.resolve_dial_url(&src) else {
+            self.in_flight_images.remove(&element);
+            self.image_selected_src.remove(&element);
+            self.world.borrow_mut().fail_image(element, src);
+            self.fire_js(|js| js.fire_node_error(element));
+            return;
+        };
+        let initiator = self.url.clone();
+        let selected = url.as_str().to_owned();
+        self.image_selected_src.insert(element, selected.clone());
+        self.world.borrow_mut().begin_image(element, selected);
+        self.queued_dials.push(QueuedDial::get(
+            DialContext::Image {
+                element,
+                epoch: self.js_epoch,
+                generation,
+            },
+            url,
+            initiator,
+        ));
+        self.pending_images = self.pending_images.saturating_add(1);
+        self.launch_queued_dials();
     }
 
     /// Fires this document's `load` event once it and every child browsing

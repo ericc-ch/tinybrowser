@@ -13,8 +13,6 @@ pub(crate) struct BlitzFetch {
     pub id: u64,
     /// Absolute URL to fetch.
     pub url: url::Url,
-    /// The document URL the fetch runs under.
-    pub initiator: url::Url,
 }
 
 /// Delivery target for one fetch: Blitz's response handler, counted so the
@@ -47,11 +45,7 @@ impl CountingHandler {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let fetch = BlitzFetch {
-            id,
-            url: url.clone(),
-            initiator: url,
-        };
+        let fetch = BlitzFetch { id, url };
         (
             Self {
                 inner: Some(handler),

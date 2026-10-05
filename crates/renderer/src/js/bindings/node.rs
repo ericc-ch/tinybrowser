@@ -3,20 +3,21 @@
 use super::{
     AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap, JsTokenList,
     LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits, WebIdlString,
-    WebIdlUnsignedLong, adopt_across_documents, ancestor_chain, attached_attr_id, attr_owner,
-    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
-    character_data_offset, child_value, clone_document, clone_within_document,
+    WebIdlUnsignedLong, adopt_across_documents, adoption_realms, ancestor_chain, attached_attr_id,
+    attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node,
+    character_data, character_data_offset, child_value, clone_document, clone_within_document,
     convert_union_nodes_into_node, deref_weak, descendant_text, doctype_fields,
     document_base_url_string, document_is_html, document_is_html_content, document_url_string,
     dom_string, element_at_point, element_box, element_click, element_node_name,
     element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
     focus_node, host, host_node_id, import_snapshot, is_element, is_focusable, is_html_element,
-    is_main_document, live_collection, main_document, make_weak, materialize_children,
-    materialize_import, new_detached_attr, qualified_name, rect_object, remove_attribute_sync,
-    required_node, root_of, schedule_mutation_delivery, select_error, set_attribute_node,
-    set_attribute_sync, set_character_data, sibling, sibling_value, string_value, throw_dom,
-    throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, validate_and_extract,
-    with_node_data, world, world_for_node, wrap_new_document, wrap_node,
+    is_main_document, live_collection, live_node, main_document, make_weak, materialize_children,
+    materialize_import, new_detached_attr, preorder_ids, qualified_name, record_adoption,
+    rect_object, remove_attribute_sync, required_node, root_of, schedule_mutation_delivery,
+    select_error, set_attribute_node, set_attribute_sync, set_character_data, sibling,
+    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
+    valid_attribute_local_name, validate_and_extract, with_node_data, world, world_for_node,
+    wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -1026,6 +1027,11 @@ fn snapshot_for_adopt(
 /// into the parent's document, preserving fragment backings as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
 fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
+    // Adoption by copy leaves the source wrapper pointing at the detached
+    // original; resolve first so the same-document check, the detach, and the
+    // callers see the live node.
+    let parent = live_node(ctx, parent);
+    let node = live_node(ctx, node);
     if node.document == parent.document {
         return Ok(node);
     }
@@ -1041,7 +1047,7 @@ fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
         return adopt_across_documents(ctx, parent, node);
     }
     let source_world = world_for_node(ctx, node)?;
-    let snapshots = {
+    let (snapshots, origins, realms) = {
         let source = source_world.borrow();
         let Some(parsed) = source.document(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
@@ -1052,7 +1058,12 @@ fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
             .get_node(node.node)
             .map(|backing| backing.children.iter().copied().collect())
             .unwrap_or_default();
-        children
+        let mut origins = vec![node.node];
+        for child in &children {
+            origins.extend(preorder_ids(&parsed.document, *child));
+        }
+        let realms = adoption_realms(ctx, node.document, &origins);
+        let snapshots = children
             .into_iter()
             .filter_map(|child| {
                 import_snapshot(
@@ -1064,7 +1075,8 @@ fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
                     true,
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (snapshots, origins, realms)
     };
     {
         let source = source_world.borrow();
@@ -1083,6 +1095,26 @@ fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
     // `materialize_children` builds with a placeholder document id; remap to
     // the target document before insertion.
     fresh.document = parent.document;
+    let mut fresh_ids = vec![fresh.node];
+    {
+        let backing_children: Vec<BlitzId> = parsed
+            .document
+            .base
+            .get_node(fresh.node)
+            .map(|backing| backing.children.iter().copied().collect())
+            .unwrap_or_default();
+        for child in backing_children {
+            fresh_ids.extend(preorder_ids(&parsed.document, child));
+        }
+    }
+    record_adoption(
+        ctx,
+        node.document,
+        &origins,
+        &realms,
+        fresh.document,
+        &fresh_ids,
+    );
     Ok(fresh)
 }
 
@@ -1304,11 +1336,18 @@ fn splice_parsed(
 /// (<https://dom.spec.whatwg.org/#concept-node-replace>). Returns the nodes
 /// the parent gained, for the insertion fixups.
 fn replace_parsed(
+    ctx: &Ctx<'_>,
     parsed: &mut crate::Parsed,
     parent: NodeId,
     node: NodeId,
     old: NodeId,
 ) -> Vec<NodeId> {
+    // Adopted nodes arrive by copy; replace the live ids, not the stale
+    // handles the page may still hold
+    // (https://dom.spec.whatwg.org/#concept-node-adopt).
+    let parent = live_node(ctx, parent);
+    let node = live_node(ctx, node);
+    let old = live_node(ctx, old);
     if node == old {
         let reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
             document: old.document,
@@ -1422,6 +1461,12 @@ fn insert_tree_node(
     node: NodeId,
     reference: Option<NodeId>,
 ) -> Result<()> {
+    // Adopted nodes arrive by copy; insert the live ids, not the stale
+    // handles the page may still hold
+    // (https://dom.spec.whatwg.org/#concept-node-adopt).
+    let parent = live_node(ctx, parent);
+    let node = live_node(ctx, node);
+    let reference = reference.map(|id| live_node(ctx, id));
     let world_rc = world(ctx)?;
     let moved: Vec<NodeId> = {
         let world = world_rc.borrow();
@@ -2511,12 +2556,15 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-node-firstchild
     #[qjs(skip)]
     fn first_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        // Adoption by copy leaves a stale handle behind; read the live node's
+        // children (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let id = live_node(ctx, self.handle.0);
         let world = world(ctx)?;
-        let id = world.borrow().document(self.handle.0).and_then(|parsed| {
+        let id = world.borrow().document(id).and_then(|parsed| {
             parsed
                 .document
                 .base
-                .get_node(self.handle.0.node)
+                .get_node(id.node)
                 .and_then(|node| node.children.first().copied())
                 .map(|node| NodeId {
                     document: parsed.id,
@@ -3053,7 +3101,7 @@ impl JsNode {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
             if let Some(current) = current {
-                replace_parsed(&mut parsed, root_element, node, current);
+                replace_parsed(ctx, &mut parsed, root_element, node, current);
                 drop(parsed);
                 drop(world);
                 fixup_focus_after_removal(ctx, current)?;
@@ -4115,7 +4163,10 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
     #[qjs(skip)]
     fn set_inner_html(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        let context = with_node_data(ctx, self.handle.0, |data| match data {
+        // Adoption by copy leaves a stale handle behind; parse into the live
+        // container (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let element = live_node(ctx, self.handle.0);
+        let context = with_node_data(ctx, element, |data| match data {
             Some(NodeData::Element(element) | NodeData::AnonymousBlock(element)) => {
                 Some(html_fragment_context(&element.name))
             }
@@ -4125,18 +4176,18 @@ impl JsNode {
             Exception::throw_type(ctx, "innerHTML requires an element or shadow root")
         })?;
 
-        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, self.handle.0); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
+        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, element); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
 
         // Known gap: Blitz has no template contents, so `<template>` children
         // replace as ordinary element children.
         let world = world(ctx)?;
         let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(mut parsed) = world.document_mut(element) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
         let mut replacement = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
-        replacement.document = self.handle.0.document;
+        replacement.document = element.document;
         let added: Vec<NodeId> = parsed
             .document
             .base
@@ -4152,7 +4203,7 @@ impl JsNode {
                     .collect()
             })
             .unwrap_or_default();
-        replace_all_journaled(&mut parsed, self.handle.0, added);
+        replace_all_journaled(&mut parsed, element, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -4173,27 +4224,30 @@ impl JsNode {
         ) {
             return Err(throw_dom(&ctx, "SyntaxError", "invalid position"));
         }
-        let context = with_node_data(&ctx, self.handle.0, |data| match data {
+        // Adoption by copy leaves a stale handle behind; parse against the
+        // live container (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let element = live_node(&ctx, self.handle.0);
+        let context = with_node_data(&ctx, element, |data| match data {
             Some(NodeData::Element(element) | NodeData::AnonymousBlock(element)) => {
                 Some(html_fragment_context(&element.name))
             }
             _ => None,
         })?
         .ok_or_else(|| Exception::throw_type(&ctx, "insertAdjacentHTML requires an element"))?;
-        let snapshots = { let (base_url, font_ctx) = fragment_base_url(&ctx, self.handle.0); parse_html_fragment_snapshots(&text.0, &context, &base_url, font_ctx) };
+        let snapshots = { let (base_url, font_ctx) = fragment_base_url(&ctx, element); parse_html_fragment_snapshots(&text.0, &context, &base_url, font_ctx) };
         let world = world(&ctx)?;
         let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(mut parsed) = world.document_mut(element) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let needs_parent = matches!(position.as_str(), "beforebegin" | "afterend");
         let parent = parsed
             .document
             .base
-            .get_node(self.handle.0.node)
+            .get_node(element.node)
             .and_then(|node| node.parent)
             .map(|node| NodeId {
-                document: self.handle.0.document,
+                document: element.document,
                 node,
             });
         if needs_parent && parent.is_none() {
@@ -4205,7 +4259,7 @@ impl JsNode {
         }
         let mut fragment = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        fragment.document = self.handle.0.document;
+        fragment.document = element.document;
         let moved: Vec<NodeId> = parsed
             .document
             .base
@@ -4227,16 +4281,10 @@ impl JsNode {
                     throw_dom(&ctx, "NoModificationAllowedError", "element has no parent")
                 })?;
                 for child in moved {
-                    place_journaled(&mut parsed, parent, child, Some(self.handle.0));
+                    place_journaled(&mut parsed, parent, child, Some(element));
                 }
             }
-            _ => place_adjacent_rest(
-                &ctx,
-                &mut parsed,
-                position.as_str(),
-                self.handle.0,
-                moved,
-            )?,
+            _ => place_adjacent_rest(&ctx, &mut parsed, position.as_str(), element, moved)?,
         }
         drop(parsed);
         drop(world);
@@ -4246,18 +4294,21 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
     #[qjs(skip)]
     fn set_outer_html(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        // Adoption by copy leaves a stale handle behind; replace the live
+        // element (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let element = live_node(ctx, self.handle.0);
         let world_rc = world(ctx)?;
         let (parent, context) = {
             let world = world_rc.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
+            let Some(parsed) = world.document(element) else {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
             let base = &parsed.document.base;
             let Some(parent) = base
-                .get_node(self.handle.0.node)
+                .get_node(element.node)
                 .and_then(|node| node.parent)
                 .map(|node| NodeId {
-                    document: self.handle.0.document,
+                    document: element.document,
                     node,
                 })
             else {
@@ -4283,17 +4334,17 @@ impl JsNode {
                 );
             (parent, context)
         };
-        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, self.handle.0); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
+        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, element); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
 
         let world = world_rc.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(mut parsed) = world.document_mut(element) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
         let mut replacement = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
-        replacement.document = self.handle.0.document;
-        let target = self.handle.0;
-        replace_parsed(&mut parsed, parent, replacement, target);
+        replacement.document = element.document;
+        let target = element;
+        replace_parsed(ctx, &mut parsed, parent, replacement, target);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -4354,10 +4405,14 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-node-ownerdocument
     #[qjs(skip)]
     fn owner_document<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        // Adoption by copy leaves a stale handle behind; the owner is the
+        // live node's document
+        // (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let id = live_node(ctx, self.handle.0);
         let world = world(ctx)?;
-        let id = world.borrow().document(self.handle.0).and_then(|parsed| {
+        let id = world.borrow().document(id).and_then(|parsed| {
             let root = parsed.document.base.root_node().id;
-            (root != self.handle.0.node).then_some(NodeId {
+            (root != id.node).then_some(NodeId {
                 document: parsed.id,
                 node: root,
             })
@@ -5441,22 +5496,25 @@ impl JsNode {
         node: NodeReference,
         child: NodeReference,
     ) -> Result<Value<'js>> {
-        let (node, _) = insertion_tree_nodes(&ctx, self.handle.0, node, Some(child))?;
-        let Some(child) = child.tree() else {
+        // Adoption by copy leaves a stale handle behind; replace within the
+        // live parent (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let parent = live_node(&ctx, self.handle.0);
+        let (node, _) = insertion_tree_nodes(&ctx, parent, node, Some(child))?;
+        let Some(child) = child.tree().map(|id| live_node(&ctx, id)) else {
             return Err(throw_dom(
                 &ctx,
                 "NotFoundError",
                 "attributes have no parent",
             ));
         };
-        let node = adopt_node(&ctx, self.handle.0, node)?;
+        let node = adopt_node(&ctx, parent, node)?;
         let moved = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            let Some(mut parsed) = world.document_mut(parent) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            replace_parsed(&mut parsed, self.handle.0, node, child)
+            replace_parsed(&ctx, &mut parsed, parent, node, child)
         };
         fixup_focus_after_removal(&ctx, child)?;
         for id in &moved {
@@ -6559,30 +6617,33 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        // Adoption by copy leaves a stale handle behind; prepend to the live
+        // parent (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let parent = live_node(&ctx, self.handle.0);
+        let node = convert_union_nodes_into_node(&ctx, parent, union_nodes(nodes))?;
         let reference = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
+            let Some(parsed) = world.document(parent) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             parsed
                 .document
                 .base
-                .get_node(self.handle.0.node)
+                .get_node(parent.node)
                 .and_then(|parent| parent.children.first().copied())
                 .map(|node| NodeId {
-                    document: self.handle.0.document,
+                    document: parent.document,
                     node,
                 })
         };
         let (node, reference) = insertion_tree_nodes(
             &ctx,
-            self.handle.0,
+            parent,
             NodeReference::Tree(node),
             reference.map(NodeReference::Tree),
         )?;
-        insert_tree_node(&ctx, self.handle.0, node, reference)
+        insert_tree_node(&ctx, parent, node, reference)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
@@ -6591,11 +6652,15 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
-        let (node, _) = insertion_tree_nodes(&ctx, self.handle.0, NodeReference::Tree(node), None)?;
+        // Adoption by copy leaves a stale handle behind; replace the live
+        // parent's children
+        // (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let parent = live_node(&ctx, self.handle.0);
+        let node = convert_union_nodes_into_node(&ctx, parent, union_nodes(nodes))?;
+        let (node, _) = insertion_tree_nodes(&ctx, parent, NodeReference::Tree(node), None)?;
         let world = world(&ctx)?;
         let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(mut parsed) = world.document_mut(parent) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let added = if parsed.document.is_fragment(node.node) {
@@ -6626,7 +6691,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
             unlink_journaled(&mut parsed, node);
             vec![node]
         };
-        replace_all_journaled(&mut parsed, self.handle.0, added);
+        replace_all_journaled(&mut parsed, parent, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
@@ -6639,16 +6704,19 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         selectors: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
         let selectors = selectors.to_string()?;
+        // Adoption by copy leaves a stale handle behind; search the live
+        // subtree (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let scope = live_node(&ctx, self.handle.0);
         let world = world(&ctx)?;
         let found = {
             let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
+            let Some(parsed) = parsed.document(scope) else {
                 return Ok(Value::new_null(ctx));
             };
             parsed
                 .document
                 .base
-                .query_selector_in(self.handle.0.node, &selectors)
+                .query_selector_in(scope.node, &selectors)
                 .map_err(|err| select_error(&ctx, &err))?
                 .map(|node| NodeId {
                     document: parsed.id,
@@ -6665,18 +6733,21 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         selectors: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
         let selectors = selectors.to_string()?;
+        // Adoption by copy leaves a stale handle behind; search the live
+        // subtree (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let scope = live_node(&ctx, self.handle.0);
         let world = world(&ctx)?;
         let ids = {
             let parsed = world.borrow();
             // A missing document answers with an empty list, not null
             // (<https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>).
             parsed
-                .document(self.handle.0)
+                .document(scope)
                 .map(|parsed| {
                     parsed
                         .document
                         .base
-                        .query_selector_all_in(self.handle.0.node, &selectors)
+                        .query_selector_all_in(scope.node, &selectors)
                         .map_err(|err| select_error(&ctx, &err))
                         .map(|ids| {
                             ids.into_iter()
@@ -6692,7 +6763,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
                 .transpose()?
                 .unwrap_or_default()
         };
-        live_collection(&ctx, self.handle.0, CollectionKind::Static(ids), None)
+        live_collection(&ctx, scope, CollectionKind::Static(ids), None)
     }
 }
 
@@ -6703,26 +6774,29 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        // Adoption by copy leaves a stale handle behind; insert beside the
+        // live node (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let reference = live_node(&ctx, self.handle.0);
+        let node = convert_union_nodes_into_node(&ctx, reference, union_nodes(nodes))?;
         let (parent, reference) = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
+            let Some(parsed) = world.document(reference) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let Some(parent) = parsed
                 .document
                 .base
-                .get_node(self.handle.0.node)
+                .get_node(reference.node)
                 .and_then(|node| node.parent)
                 .map(|node| NodeId {
-                    document: self.handle.0.document,
+                    document: reference.document,
                     node,
                 })
             else {
                 return Ok(());
             };
-            (parent, self.handle.0)
+            (parent, reference)
         };
         let (node, reference) = insertion_tree_nodes(
             &ctx,
@@ -6739,26 +6813,29 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        // Adoption by copy leaves a stale handle behind; insert beside the
+        // live node (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let target = live_node(&ctx, self.handle.0);
+        let node = convert_union_nodes_into_node(&ctx, target, union_nodes(nodes))?;
         let (parent, reference) = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
+            let Some(parsed) = world.document(target) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let base = &parsed.document.base;
             let Some(parent) = base
-                .get_node(self.handle.0.node)
+                .get_node(target.node)
                 .and_then(|node| node.parent)
                 .map(|node| NodeId {
-                    document: self.handle.0.document,
+                    document: target.document,
                     node,
                 })
             else {
                 return Ok(());
             };
-            let reference = sibling(base, self.handle.0.node, true).map(|node| NodeId {
-                document: self.handle.0.document,
+            let reference = sibling(base, target.node, true).map(|node| NodeId {
+                document: target.document,
                 node,
             });
             (parent, reference)
@@ -6778,20 +6855,23 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        // Adoption by copy leaves a stale handle behind; replace the live
+        // node (https://dom.spec.whatwg.org/#concept-node-adopt).
+        let target = live_node(&ctx, self.handle.0);
+        let node = convert_union_nodes_into_node(&ctx, target, union_nodes(nodes))?;
         let parent = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
+            let Some(parsed) = world.document(target) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let Some(parent) = parsed
                 .document
                 .base
-                .get_node(self.handle.0.node)
+                .get_node(target.node)
                 .and_then(|node| node.parent)
                 .map(|node| NodeId {
-                    document: self.handle.0.document,
+                    document: target.document,
                     node,
                 })
             else {
@@ -6803,14 +6883,14 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
             &ctx,
             parent,
             NodeReference::Tree(node),
-            Some(NodeReference::Tree(self.handle.0)),
+            Some(NodeReference::Tree(target)),
         )?;
         let world = world(&ctx)?;
         let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(mut parsed) = world.document_mut(target) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let moved = replace_parsed(&mut parsed, parent, node, self.handle.0);
+        let moved = replace_parsed(&ctx, &mut parsed, parent, node, target);
         drop(parsed);
         drop(world);
         for id in &moved {

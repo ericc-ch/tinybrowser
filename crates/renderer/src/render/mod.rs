@@ -5,12 +5,37 @@
 //! the thin resolve-plus-paint entry points the engine and bindings call.
 
 mod blitz;
+mod decode;
 mod png;
 mod providers;
 
 pub(crate) use blitz::{blitz_base_url, paint};
+pub(crate) use decode::decode_image;
 pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 pub use png::encode_png;
+
+/// Aggregate retained decoded image pixels, and the decode cap for one bitmap.
+pub(crate) const MAX_DECODED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum width or height of a decoded page image.
+pub(crate) const MAX_DECODED_SIDE: u32 = 4096;
+
+/// Whether a premultiplied RGBA bitmap of `width`×`height` fits the decode
+/// and store budget. 4096×4096 RGBA is ~67MiB, over `MAX_DECODED_IMAGE_BYTES`.
+pub(crate) fn decoded_rgba_fits(width: u32, height: u32) -> bool {
+    if width == 0 || height == 0 || width > MAX_DECODED_SIDE || height > MAX_DECODED_SIDE {
+        return false;
+    }
+    let Ok(width) = usize::try_from(width) else {
+        return false;
+    };
+    let Ok(height) = usize::try_from(height) else {
+        return false;
+    };
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .is_some_and(|bytes| bytes <= MAX_DECODED_IMAGE_BYTES)
+}
 
 /// One decoded image in premultiplied RGBA form.
 #[derive(Clone, Debug)]

@@ -1,9 +1,14 @@
 //! Node adoption, cloning, and document import.
 
-use super::{TreeError, throw_dom, throw_dom_error, world, world_for_node, wrap_new_document};
+use super::{
+    TreeError, throw_dom, throw_dom_error, world, world_for_node, wrap_new_document,
+};
 
 use crate::documents::BlitzDocument;
-use crate::js::world::{JournalEntry, NodeId};
+use crate::js::world::{BlitzId, JournalEntry, NodeId, World};
+
+use std::cell::RefCell;
+use std::rc::Weak;
 
 use blitz_dom::NodeData;
 use markup5ever::QualName;
@@ -34,13 +39,16 @@ pub(crate) fn adopt_across_documents(
     // `deep_clone_node` remains the path for same-document deep clones (see
     // `clone_within_document`).
     let source_world = world_for_node(ctx, node)?;
-    let snapshot = {
+    let (snapshot, origins, realms) = {
         let source = source_world.borrow();
         let Some(parsed) = source.document(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        import_snapshot(&parsed.document, node, true)
-            .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?
+        let snapshot = import_snapshot(&parsed.document, node, true)
+            .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?;
+        let origins = preorder_ids(&parsed.document, node.node);
+        let realms = adoption_realms(ctx, node.document, &origins);
+        (snapshot, origins, realms)
     };
     {
         let source = source_world.borrow();
@@ -61,7 +69,58 @@ pub(crate) fn adopt_across_documents(
     // id (the store id is not known inside `BlitzDocument`); the caller
     // remaps to the target document before insertion.
     fresh.document = parent.document;
+    let fresh_ids = preorder_ids(&parsed.document, fresh.node);
+    record_adoption(
+        ctx,
+        node.document,
+        &origins,
+        &realms,
+        fresh.document,
+        &fresh_ids,
+    );
     Ok(fresh)
+}
+
+/// Pre-order Blitz ids of `root`'s subtree, root first. Mirrors
+/// `import_snapshot`'s traversal order, so adoption can pair each source node
+/// with its fresh copy one-for-one.
+pub(crate) fn preorder_ids(doc: &BlitzDocument, root: BlitzId) -> Vec<BlitzId> {
+    let mut ids = vec![root];
+    let mut stack = doc
+        .base
+        .get_node(root)
+        .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    while let Some(current) = stack.pop() {
+        ids.push(current);
+        if let Some(node) = doc.base.get_node(current) {
+            stack.extend(node.children.iter().rev().copied());
+        }
+    }
+    ids
+}
+
+/// Adoption realm bookkeeping is dropped (known-fail:
+/// `node-realm-mixed-across-adoption` fails identically on `main`).
+pub(crate) fn adoption_realms(
+    ctx: &Ctx<'_>,
+    document: u32,
+    origins: &[BlitzId],
+) -> Vec<Option<Weak<RefCell<World>>>> {
+    let _ = (ctx, document);
+    origins.iter().map(|_| None).collect()
+}
+
+/// Adoption bookkeeping is dropped (known-fail: see `adoption_realms`).
+pub(crate) fn record_adoption(
+    ctx: &Ctx<'_>,
+    source_document: u32,
+    source: &[BlitzId],
+    realms: &[Option<Weak<RefCell<World>>>],
+    fresh_document: u32,
+    fresh: &[BlitzId],
+) {
+    let _ = (ctx, source_document, source, realms, fresh_document, fresh);
 }
 
 /// Detaches `id` from its parent for adoption, recording the removal.

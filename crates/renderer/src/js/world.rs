@@ -11,6 +11,7 @@ use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
 use crate::dom_string::DomString;
+use crate::render::MAX_DECODED_IMAGE_BYTES;
 
 use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
@@ -1163,6 +1164,36 @@ impl World {
         self.input_files.get(&id).map(Vec::as_slice)
     }
 
+    /// Starts a fetch for `url`. If the current request is still available,
+    /// keep its pixels and `currentSrc` until this request commits
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
+        self.image_loading.insert(element);
+        self.image_broken.remove(&element);
+        if !self.images.contains_key(&element) {
+            self.image_current_src.insert(element, url);
+        }
+    }
+
+    /// Retains `image` if the shared decoded-image budget still has room.
+    pub(crate) fn store_image(
+        &mut self,
+        element: NodeId,
+        image: crate::render::RasterImage,
+        url: String,
+    ) -> bool {
+        self.image_loading.remove(&element);
+        self.image_broken.remove(&element);
+        self.forget_decoded_pixels(element);
+        self.image_current_src.insert(element, url);
+        let bytes = image.data.len();
+        if !self.reserve_decoded_image_bytes(bytes) {
+            return false;
+        }
+        self.images.insert(element, image);
+        true
+    }
+
     /// The current request finished without usable pixels. `url` is the
     /// selected source, or the selected source string when URL parsing failed
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
@@ -1207,6 +1238,18 @@ impl World {
     /// Drops every loaded sheet; a navigation re-scans the new document.
     pub(crate) fn clear_stylesheets(&mut self) {
         self.author_sheets.clear();
+    }
+
+    fn reserve_decoded_image_bytes(&self, bytes: usize) -> bool {
+        let mut budget = self.budget.borrow_mut();
+        let Some(total) = budget.decoded_images.checked_add(bytes) else {
+            return false;
+        };
+        if total > MAX_DECODED_IMAGE_BYTES {
+            return false;
+        }
+        budget.decoded_images = total;
+        true
     }
 
     fn release_decoded_image_bytes(&self, bytes: usize) {

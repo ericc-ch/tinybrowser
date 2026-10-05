@@ -1075,6 +1075,12 @@ pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<Wor
     }
 }
 
+/// Adoption copies by snapshot; stale handles are not forwarded (known-fail:
+/// `node-realm-mixed-across-adoption` fails identically on `main`).
+pub(crate) fn live_node(_ctx: &Ctx<'_>, id: NodeId) -> NodeId {
+    id
+}
+
 pub(super) fn with_node_data<T>(
     ctx: &Ctx<'_>,
     id: NodeId,
