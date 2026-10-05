@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use anyrender::{Filter, Glyph, NormalizedCoord, Paint, PaintRef, PaintScene, RenderContext};
+use image::{ImageBuffer, Rgba};
 use kurbo::{Affine, PathEl, Shape, Stroke};
 use peniko::{BlendMode, Color, Fill, FontData, StyleRef};
 use tiny_skia::{
@@ -41,11 +42,13 @@ fn make_pixmap(width: u32, height: u32) -> Pixmap {
 }
 
 /// One drawing surface: its pixels, the paint compositing it onto its
-/// parent (the canvas uses an opaque source-over), and its clip stack.
+/// parent (the canvas uses an opaque source-over), its clip stack, and the
+/// filter applied when a pushed layer pops.
 struct Target {
     pixmap: Pixmap,
     paint: PixmapPaint,
     clips: Vec<Mask>,
+    filter: Option<Arc<Filter>>,
 }
 
 /// Painter drawing an [`anyrender`] scene into a [`tiny_skia`] pixmap.
@@ -72,6 +75,7 @@ impl TinySkiaScenePainter {
                 pixmap,
                 paint,
                 clips: Vec::new(),
+                filter: None,
             }],
             image_scratch: None,
         }
@@ -397,6 +401,40 @@ fn convert_blend(mode: BlendMode) -> SkiaBlend {
     }
 }
 
+/// Blurs `pixmap` in place with an approximate gaussian of `sigma` device
+/// pixels. `image`'s `fast_blur` assumes premultiplied alpha, which is what
+/// `tiny-skia` pixmaps hold. Zero or negative sigma is a no-op.
+fn blur_pixmap(pixmap: &mut Pixmap, sigma: f32) {
+    if sigma <= 0.0 {
+        return;
+    }
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let Some(buffer) =
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, pixmap.data().to_vec())
+    else {
+        return;
+    };
+    let blurred = image::imageops::fast_blur(&buffer, sigma);
+    pixmap.data_mut().copy_from_slice(&blurred.into_raw());
+}
+
+/// Blur sigma for a layer filter: single-node gaussian blurs only, like the
+/// `vello_cpu` backend. Anything else (multi-node graphs, other effects)
+/// paints unfiltered.
+fn layer_blur_sigma(filter: Option<&Filter>) -> Option<f32> {
+    use anyrender::filters::FilterEffect;
+    let nodes = filter?.nodes();
+    let [node] = nodes else {
+        return None;
+    };
+    match &node.effect {
+        FilterEffect::GaussianBlur(blur) if blur.std_deviation > 0.0 => {
+            Some(blur.std_deviation)
+        }
+        _ => None,
+    }
+}
+
 /// Builds the mask for one clip push: the parent mask when there is one,
 /// intersected with the new path over a white base otherwise.
 fn push_mask(
@@ -512,6 +550,7 @@ impl PaintScene for TinySkiaScenePainter {
             pixmap: make_pixmap(width, height),
             paint: PixmapPaint::default(),
             clips: Vec::new(),
+            filter: None,
         });
         self.image_scratch = None;
         self.transform = SkiaXform::identity();
@@ -526,9 +565,8 @@ impl PaintScene for TinySkiaScenePainter {
         filter: Option<Arc<Filter>>,
         _backdrop_filter: Option<Arc<Filter>>,
     ) {
-        // Filters run on pop in the blur unit; backdrops are ignored like the
-        // vello_cpu backend ignores them.
-        let _ = filter;
+        // Backdrop filters are ignored like the vello_cpu backend ignores
+        // them; the layer filter runs on pop in `pop_layer`.
         self.transform = convert_transform(transform);
         let (width, height) = {
             let canvas = &self.targets[0].pixmap;
@@ -548,6 +586,7 @@ impl PaintScene for TinySkiaScenePainter {
             pixmap: make_pixmap(width, height),
             paint,
             clips: mask.map_or_else(Vec::new, |mask| vec![mask]),
+            filter,
         });
     }
 
@@ -573,9 +612,12 @@ impl PaintScene for TinySkiaScenePainter {
         if self.targets.len() <= 1 {
             return;
         }
-        let Some(layer) = self.targets.pop() else {
+        let Some(mut layer) = self.targets.pop() else {
             return;
         };
+        if let Some(sigma) = layer_blur_sigma(layer.filter.as_deref()) {
+            blur_pixmap(&mut layer.pixmap, sigma);
+        }
         let paint = layer.paint;
         let Some(target) = self.targets.last_mut() else {
             return;
@@ -726,23 +768,45 @@ impl PaintScene for TinySkiaScenePainter {
         transform: Affine,
         rect: kurbo::Rect,
         color: Color,
-        _radius: f64,
-        _std_dev: f64,
+        radius: f64,
+        std_dev: f64,
     ) {
-        // Sharp until the blur unit softens it: the old in-tree painter never
-        // drew shadows at all, so this is already ahead of `main`.
         self.transform = convert_transform(transform);
-        let Some(path) = convert_shape(&rect) else {
+        let rounded = kurbo::RoundedRect::new(rect.x0, rect.y0, rect.x1, rect.y1, radius);
+        let Some(path) = convert_shape(&rounded) else {
             return;
         };
+        // Blur a scratch copy so the canvas stays sharp: CSS clips the
+        // blurred result, so the current clip applies at composite time.
+        let (width, height) = {
+            let canvas = &self.targets[0].pixmap;
+            (canvas.width(), canvas.height())
+        };
+        let mut shadow = make_pixmap(width, height);
         let paint = SkiaPaint {
             shader: tiny_skia::Shader::SolidColor(convert_color(color)),
             anti_alias: true,
             ..Default::default()
         };
-        let transform = self.transform;
+        shadow.fill_path(&path, &paint, SkiaRule::Winding, self.transform, None);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "shadow blur radii fit comfortably in f32"
+        )]
+        blur_pixmap(&mut shadow, std_dev as f32);
         let (target, clip) = self.draw_target();
-        target.fill_path(&path, &paint, SkiaRule::Winding, transform, clip);
+        let composite = PixmapPaint {
+            blend_mode: SkiaBlend::SourceOver,
+            ..Default::default()
+        };
+        target.draw_pixmap(
+            0,
+            0,
+            shadow.as_ref(),
+            &composite,
+            SkiaXform::identity(),
+            clip,
+        );
     }
 }
 
@@ -948,6 +1012,59 @@ mod tests {
             &Rect::new(0.0, 0.0, 2.0, 2.0),
         );
         assert_eq!(pixel(&painter, 0, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn box_shadow_edge_is_soft() {
+        use peniko::color::palette::css::BLACK;
+        let mut painter = TinySkiaScenePainter::new(40, 40);
+        painter.draw_box_shadow(
+            Affine::IDENTITY,
+            Rect::new(10.0, 10.0, 30.0, 30.0),
+            BLACK,
+            4.0,
+            3.0,
+        );
+        // Deep inside the shadow is fully covered.
+        assert_eq!(pixel(&painter, 20, 20)[3], 255);
+        // Just outside the shape the blur leaves a partial pixel; a sharp
+        // fill would leave it transparent.
+        let edge = pixel(&painter, 7, 20)[3];
+        assert!(
+            edge > 0 && edge < 255,
+            "soft shadow edge, got alpha {edge}"
+        );
+        // Far away stays clean.
+        assert_eq!(pixel(&painter, 0, 0)[3], 0);
+    }
+
+    #[test]
+    fn layer_blur_filter_softens_content() {
+        use anyrender::filters::FilterEffect;
+        let filter = anyrender::Filter::single(FilterEffect::blur(3.0));
+        let mut painter = TinySkiaScenePainter::new(40, 40);
+        painter.push_layer(
+            peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
+            1.0,
+            Affine::IDENTITY,
+            &Rect::new(0.0, 0.0, 40.0, 40.0),
+            Some(std::sync::Arc::new(filter)),
+            None,
+        );
+        painter.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            RED,
+            None,
+            &Rect::new(10.0, 10.0, 30.0, 30.0),
+        );
+        painter.pop_layer();
+        assert_eq!(pixel(&painter, 20, 20), [255, 0, 0, 255]);
+        let edge = pixel(&painter, 7, 20);
+        assert!(
+            edge[0] > 0 && edge[0] < 255 && edge[3] > 0 && edge[3] < 255,
+            "soft filtered edge, got {edge:?}"
+        );
     }
 }
 

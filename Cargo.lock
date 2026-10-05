@@ -65,6 +65,7 @@ name = "anyrender_tiny_skia"
 version = "0.1.0"
 dependencies = [
  "anyrender",
+ "image",
  "kurbo",
  "peniko",
  "skrifa",
