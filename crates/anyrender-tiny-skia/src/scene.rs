@@ -52,6 +52,10 @@ struct Target {
 pub struct TinySkiaScenePainter {
     transform: SkiaXform,
     targets: Vec<Target>,
+    /// Converted image for the in-progress image fill. A [`tiny_skia`]
+    /// `Pattern` borrows its pixels, so the pixmap lives here instead of a
+    /// local; draw code reaches it through disjoint field borrows.
+    image_scratch: Option<Pixmap>,
 }
 
 impl TinySkiaScenePainter {
@@ -69,6 +73,7 @@ impl TinySkiaScenePainter {
                 paint,
                 clips: Vec::new(),
             }],
+            image_scratch: None,
         }
     }
 
@@ -97,6 +102,70 @@ impl TinySkiaScenePainter {
         };
         let clip = target.clips.last();
         (&mut target.pixmap, clip)
+    }
+
+    /// Fills `path` with an image brush, converting on demand. Returns false
+    /// when the bytes are unusable, so the caller falls back to transparent.
+    /// `tiny-skia` patterns take one spread mode; mismatched axes read the
+    /// horizontal one.
+    fn fill_image(
+        &mut self,
+        image: &peniko::ImageBrushRef<'_>,
+        brush_transform: Option<Affine>,
+        style: Fill,
+        path: &Path,
+    ) -> bool {
+        let data = &image.image;
+        let Some(converted) = image_to_pixmap(
+            data.data.data(),
+            data.format,
+            data.alpha_type,
+            data.width,
+            data.height,
+        ) else {
+            return false;
+        };
+        self.image_scratch = Some(converted);
+        let Some(scratch) = self.image_scratch.as_ref() else {
+            return false;
+        };
+        let spread = match image.sampler.x_extend {
+            peniko::Extend::Pad => SkiaSpread::Pad,
+            peniko::Extend::Repeat => SkiaSpread::Repeat,
+            peniko::Extend::Reflect => SkiaSpread::Reflect,
+        };
+        let quality = match image.sampler.quality {
+            peniko::ImageQuality::Low => tiny_skia::FilterQuality::Nearest,
+            peniko::ImageQuality::Medium | peniko::ImageQuality::High => {
+                tiny_skia::FilterQuality::Bilinear
+            }
+        };
+        let shader = tiny_skia::Pattern::new(
+            scratch.as_ref(),
+            spread,
+            quality,
+            image.sampler.alpha,
+            brush_transform.map_or_else(SkiaXform::identity, convert_transform),
+        );
+        let paint = SkiaPaint {
+            shader,
+            anti_alias: true,
+            ..Default::default()
+        };
+        let transform = self.transform;
+        let targets = &mut self.targets;
+        let Some(target) = targets.last_mut() else {
+            return false;
+        };
+        let clip = target.clips.last();
+        target.pixmap.fill_path(
+            path,
+            &paint,
+            convert_fill_rule(style),
+            transform,
+            clip,
+        );
+        true
     }
 }
 
@@ -188,9 +257,11 @@ fn convert_stops(stops: &peniko::ColorStops) -> Option<Vec<tiny_skia::GradientSt
     )
 }
 
-/// Resolves any brush to a `tiny-skia` shader. Image brushes arrive in the
-/// images unit; until then they read as transparent like `Resource`/`Custom`,
-/// which carry no pixels by definition (the `vello_cpu` backend agrees).
+/// Resolves any brush but images to a `tiny-skia` shader. Image brushes
+/// draw through [`TinySkiaScenePainter::fill_image`], which needs the
+/// scratch pixmap; anywhere else (strokes, glyphs) they read as transparent
+/// like `Resource`/`Custom`, which carry no pixels by definition (the
+/// `vello_cpu` backend agrees).
 fn convert_brush(brush: &PaintRef<'_>, brush_transform: Option<Affine>) -> tiny_skia::Shader<'static> {
     use tiny_skia::Shader;
     match brush {
@@ -347,6 +418,47 @@ fn push_mask(
     Some(mask)
 }
 
+/// Converts decoded image bytes into a premultiplied pixmap. Blitz hands
+/// straight-alpha `Rgba8` (and occasionally premultiplied or `Bgra8`);
+/// anything else, or a length mismatch, reads as transparent.
+fn image_to_pixmap(
+    data: &[u8],
+    format: peniko::ImageFormat,
+    alpha: peniko::ImageAlphaType,
+    width: u32,
+    height: u32,
+) -> Option<Pixmap> {
+    use peniko::{ImageAlphaType, ImageFormat};
+    let pixels = usize::try_from(width).ok()?.checked_mul(usize::try_from(height).ok()?)?;
+    let len = pixels.checked_mul(4)?;
+    if data.len() != len {
+        return None;
+    }
+    if alpha == ImageAlphaType::AlphaPremultiplied && format == ImageFormat::Rgba8 {
+        return Pixmap::from_vec(data.to_vec(), IntSize::from_wh(width, height)?);
+    }
+    let mut out = Vec::with_capacity(len);
+    for pixel in data.as_chunks::<4>().0 {
+        let (red, green, blue, byte_alpha) = (pixel[0], pixel[1], pixel[2], pixel[3]);
+        let (red, blue) = if format == ImageFormat::Bgra8 {
+            (blue, red)
+        } else {
+            (red, blue)
+        };
+        if alpha == ImageAlphaType::AlphaPremultiplied {
+            out.extend_from_slice(&[red, green, blue, byte_alpha]);
+        } else {
+            // Same rounding as a PNG decode: `(c*a+127)/255`, at most 255.
+            let mix = |channel: u8| {
+                u8::try_from((u16::from(channel) * u16::from(byte_alpha) + 127) / 255)
+                    .unwrap_or(u8::MAX)
+            };
+            out.extend_from_slice(&[mix(red), mix(green), mix(blue), byte_alpha]);
+        }
+    }
+    Pixmap::from_vec(out, IntSize::from_wh(width, height)?)
+}
+
 /// Collects one glyph outline, flipping font y-up coordinates to screen
 /// y-down around the origin; the caller places it with the pen transform.
 struct GlyphPen {
@@ -401,6 +513,7 @@ impl PaintScene for TinySkiaScenePainter {
             paint: PixmapPaint::default(),
             clips: Vec::new(),
         });
+        self.image_scratch = None;
         self.transform = SkiaXform::identity();
     }
 
@@ -477,6 +590,7 @@ impl PaintScene for TinySkiaScenePainter {
         );
     }
 
+
     fn stroke<'a>(
         &mut self,
         style: &Stroke,
@@ -512,7 +626,15 @@ impl PaintScene for TinySkiaScenePainter {
         let Some(path) = convert_shape(shape) else {
             return;
         };
-        let shader = convert_brush(&brush.into(), brush_transform);
+        let brush: PaintRef<'_> = brush.into();
+        // Image brushes convert through the scratch pixmap; anything else
+        // resolves to a plain shader below.
+        if let Paint::Image(image) = &brush
+            && self.fill_image(image, brush_transform, style, &path)
+        {
+            return;
+        }
+        let shader = convert_brush(&brush, brush_transform);
         let paint = SkiaPaint {
             shader,
             anti_alias: true,
@@ -748,6 +870,84 @@ mod tests {
         );
         assert_eq!(pixel(&painter, 10, 20), [255, 0, 0, 255]);
         assert_eq!(pixel(&painter, 20, 20), [0, 0, 0, 0]);
+    }
+
+    fn image_brush(
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        format: peniko::ImageFormat,
+    ) -> peniko::ImageBrush {
+        peniko::ImageBrush {
+            image: peniko::ImageData {
+                data: peniko::Blob::new(std::sync::Arc::new(pixels)),
+                format,
+                alpha_type: peniko::ImageAlphaType::Alpha,
+                width,
+                height,
+            },
+            sampler: peniko::ImageSampler {
+                x_extend: peniko::Extend::Repeat,
+                y_extend: peniko::Extend::Repeat,
+                quality: peniko::ImageQuality::Medium,
+                alpha: 1.0,
+            },
+        }
+    }
+
+    #[test]
+    fn straight_image_premultiplies() {
+        let brush = image_brush(
+            vec![255, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 255, 255, 255],
+            2,
+            2,
+            peniko::ImageFormat::Rgba8,
+        );
+        let mut painter = TinySkiaScenePainter::new(4, 4);
+        painter.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            brush.as_ref(),
+            None,
+            &Rect::new(0.0, 0.0, 4.0, 4.0),
+        );
+        assert_eq!(pixel(&painter, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(pixel(&painter, 1, 0), [0, 0, 255, 255]);
+        assert_eq!(pixel(&painter, 0, 1), [0, 255, 0, 255]);
+        assert_eq!(pixel(&painter, 1, 1), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn bgra_image_swaps_channels() {
+        let brush = image_brush(
+            vec![255, 0, 0, 255],
+            1,
+            1,
+            peniko::ImageFormat::Bgra8,
+        );
+        let mut painter = TinySkiaScenePainter::new(2, 2);
+        painter.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            brush.as_ref(),
+            None,
+            &Rect::new(0.0, 0.0, 2.0, 2.0),
+        );
+        assert_eq!(pixel(&painter, 0, 0), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn short_image_reads_transparent() {
+        let brush = image_brush(vec![1, 2, 3], 1, 1, peniko::ImageFormat::Rgba8);
+        let mut painter = TinySkiaScenePainter::new(2, 2);
+        painter.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            brush.as_ref(),
+            None,
+            &Rect::new(0.0, 0.0, 2.0, 2.0),
+        );
+        assert_eq!(pixel(&painter, 0, 0), [0, 0, 0, 0]);
     }
 }
 
