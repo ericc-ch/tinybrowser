@@ -185,20 +185,13 @@ fn insertion_tree_nodes(
         ));
     }
     let node_is_fragment = node_parsed.document.is_fragment(node.node);
-    let node_synthetic = node_parsed.document.synthetic_kind(node.node).cloned();
     let node_data = node_base
         .get_node(node.node)
         .map(|candidate| &candidate.data);
-    let node_is_element = node_data.is_some_and(|data| data.downcast_element().is_some())
-        && !matches!(
-            node_synthetic,
-            Some(crate::documents::SyntheticKind::Doctype { .. })
-        );
-    // Fragments, elements, text, comments, PIs, and CDATA sections insert.
-    // Doctypes insert only under a document (checked below with the content
-    // model). CDATA counts as text for the document content model.
-    let node_is_text = node_data.is_some_and(|data| matches!(data, NodeData::Text(_)))
-        || matches!(node_synthetic, Some(crate::documents::SyntheticKind::CData));
+    let node_is_element = node_data.is_some_and(|data| data.downcast_element().is_some());
+    // Only fragments, elements, text, and comments insert. Blitz has no
+    // doctype or processing-instruction kinds (upstream gap, docs/progress.md).
+    let node_is_text = node_data.is_some_and(|data| matches!(data, NodeData::Text(_)));
     let node_is_character_data =
         node_is_text || node_data.is_some_and(|data| matches!(data, NodeData::Comment { .. }));
     if !node_is_fragment && !node_is_element && !node_is_character_data {
@@ -206,18 +199,6 @@ fn insertion_tree_nodes(
             ctx,
             "HierarchyRequestError",
             "node cannot be inserted",
-        ));
-    }
-    if !parent_is_document
-        && matches!(
-            node_synthetic,
-            Some(crate::documents::SyntheticKind::Doctype { .. })
-        )
-    {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "doctype cannot be a child of an element",
         ));
     }
     // A node cannot be inserted into its own subtree.
@@ -290,57 +271,8 @@ fn ensure_no_cycle(
     Ok(())
 }
 
-/// At most one doctype child of a document
-/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-fn ensure_single_doctype(
-    ctx: &Ctx<'_>,
-    doc: &crate::documents::BlitzDocument,
-    node_doc: &crate::documents::BlitzDocument,
-    fragment_children: &[BlitzId],
-    parent: NodeId,
-    node: NodeId,
-    node_is_fragment: bool,
-) -> Result<()> {
-    let is_doctype =
-        |doc: &crate::documents::BlitzDocument, id: BlitzId| {
-            matches!(
-                doc.synthetic_kind(id),
-                Some(crate::documents::SyntheticKind::Doctype { .. })
-            )
-        };
-    let inserted = usize::from(!node_is_fragment && is_doctype(node_doc, node.node))
-        + if node_is_fragment {
-            fragment_children
-                .iter()
-                .filter(|child| is_doctype(node_doc, **child))
-                .count()
-        } else {
-            0
-        };
-    let existing = doc
-        .base
-        .get_node(parent.node)
-        .map_or(0, |root| {
-            root.children
-                .iter()
-                .filter(|child| {
-                    (node.document != parent.document || **child != node.node)
-                        && is_doctype(doc, **child)
-                })
-                .count()
-        });
-    if existing + inserted > 1 {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "a document can have only one doctype child",
-        ));
-    }
-    Ok(())
-}
-
 /// The document content model for one insertion: at most one element child,
-/// at most one doctype child, and no text directly under the document
+/// and no text directly under the document
 /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
 #[expect(
     clippy::too_many_arguments,
@@ -358,16 +290,6 @@ fn ensure_document_content_model(
 ) -> Result<()> {
     let base = &doc.base;
     let node_base = &node_doc.base;
-    // CDATA sections count as text for the content model.
-    let is_text = |doc: &crate::documents::BlitzDocument, id: BlitzId| {
-        doc.base.get_node(id).is_some_and(|candidate| {
-            matches!(candidate.data, NodeData::Text(_))
-                || matches!(
-                    doc.synthetic_kind(id),
-                    Some(crate::documents::SyntheticKind::CData)
-                )
-        })
-    };
     let fragment_children: Vec<BlitzId> = if node_is_fragment {
             node_base
                 .get_node(node.node)
@@ -384,9 +306,11 @@ fn ensure_document_content_model(
             ));
         }
         if node_is_fragment
-            && fragment_children
-                .iter()
-                .any(|child| is_text(node_doc, *child))
+            && fragment_children.iter().any(|child| {
+                node_base
+                    .get_node(*child)
+                    .is_some_and(|candidate| matches!(candidate.data, NodeData::Text(_)))
+            })
         {
             return Err(throw_dom(
                 ctx,
@@ -424,16 +348,6 @@ fn ensure_document_content_model(
                 "a document can have only one element child",
             ));
         }
-        // At most one doctype child; the node itself counts when it is one.
-        ensure_single_doctype(
-            ctx,
-            doc,
-            node_doc,
-            &fragment_children,
-            parent,
-            node,
-            node_is_fragment,
-        )?;
     Ok(())
 }
 
@@ -1754,8 +1668,7 @@ fn form_owner_of(base: &blitz_dom::BaseDocument, document: u32, node: BlitzId) -
 /// A control's value length in UTF-16 code units, the basis selection
 /// offsets clamp against: the `value` attribute for inputs, descendant text
 /// for textareas.
-fn control_value_len(doc: &crate::documents::BlitzDocument, node: BlitzId) -> u32 {
-    let base = &doc.base;
+fn control_value_len(base: &blitz_dom::BaseDocument, node: BlitzId) -> u32 {
     let Some(element) = base
         .get_node(node)
         .and_then(|target| target.data.downcast_element())
@@ -1767,7 +1680,7 @@ fn control_value_len(doc: &crate::documents::BlitzDocument, node: BlitzId) -> u3
             clippy::cast_possible_truncation,
             reason = "control values stay far below u32::MAX"
         )]
-        let len = descendant_text(doc, node).units().len() as u32;
+        let len = descendant_text(base, node).units().len() as u32;
         return len;
     }
     let len = element
@@ -1791,7 +1704,7 @@ fn selection_start_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickjs::Result<u
         return Ok(0);
     };
     let (start, _, _) = world.selection_of(id);
-    Ok(start.min(control_value_len(&parsed.document, id.node)))
+    Ok(start.min(control_value_len(&parsed.document.base, id.node)))
 }
 
 /// A control's stored selection end clamped to its value length.
@@ -1802,7 +1715,7 @@ fn selection_end_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickjs::Result<u32
         return Ok(0);
     };
     let (_, end, _) = world.selection_of(id);
-    Ok(end.min(control_value_len(&parsed.document, id.node)))
+    Ok(end.min(control_value_len(&parsed.document.base, id.node)))
 }
 
 /// A control's stored selection direction code.
@@ -2240,74 +2153,12 @@ fn serialize_html_node(
                 push_escaped_html_text(output, &data.content);
             }
         }
-        NodeData::Comment { .. } => serialize_comment_or_synthetic(doc, id, output),
-        NodeData::Document(_) => {}
-    }
-}
-
-/// Serializes a comment backing: plain comments as comments, synthetic
-/// processing instructions, CDATA sections, and doctypes in their syntax.
-fn serialize_comment_or_synthetic(
-    doc: &crate::documents::BlitzDocument,
-    id: BlitzId,
-    output: &mut HtmlOutput,
-) {
-    let contents = doc
-        .base
-        .get_node(id)
-        .and_then(|node| match &node.data {
-            NodeData::Comment { contents } => Some(contents.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    match doc.synthetic_kind(id) {
-        Some(crate::documents::SyntheticKind::Pi { target }) => {
-            let data = contents
-                .strip_prefix(target.as_str())
-                .map_or(contents.as_str(), |rest| {
-                    rest.strip_prefix(' ').unwrap_or(rest)
-                });
-            output.push_str("<?");
-            output.push_str(target);
-            if !data.is_empty() {
-                output.push_str(" ");
-                output.push_str(data);
-            }
-            output.push_str("?>");
-        }
-        Some(crate::documents::SyntheticKind::CData) => {
-            output.push_str("<![CDATA[");
-            output.push_str(&contents);
-            output.push_str("]]>");
-        }
-        Some(crate::documents::SyntheticKind::Doctype {
-            name,
-            public_id,
-            system_id,
-        }) => {
-            output.push_str("<!DOCTYPE ");
-            output.push_str(name);
-            if !public_id.is_empty() {
-                output.push_str(" PUBLIC \"");
-                output.push_str(public_id);
-                output.push_str("\"");
-                if !system_id.is_empty() {
-                    output.push_str(" \"");
-                    output.push_str(system_id);
-                    output.push_str("\"");
-                }
-            } else if !system_id.is_empty() {
-                output.push_str(" SYSTEM \"");
-                output.push_str(system_id);
-                output.push_str("\"");
-            }
-            output.push_str(">");
-        }
-        None => {
+        NodeData::Comment { contents } => {
             output.push_str("<!--");
-            output.push_str(&contents);
+            output.push_str(contents);
             output.push_str("-->");
         }
+        NodeData::Document(_) => {}
     }
 }
 
@@ -2418,7 +2269,11 @@ fn serialize_xml_node(doc: &crate::documents::BlitzDocument, id: BlitzId, output
             serialize_xml_element(doc, id, &name, &attributes, output);
         }
         NodeData::Text(data) => push_escaped_xml_text(output, &data.content),
-        NodeData::Comment { .. } => serialize_comment_or_synthetic(doc, id, output),
+        NodeData::Comment { contents } => {
+            output.push_str("<!--");
+            output.push_str(contents);
+            output.push_str("-->");
+        }
     }
 }
 
@@ -2489,22 +2344,17 @@ impl JsNode {
     }
     #[qjs(skip)]
     fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
-        // Synthetic backings report their real kind; fragment backings are
-        // elements flagged in the document's fragment set.
+        // Known gap (upstream, docs/progress.md): Blitz has no shadow-root,
+        // doctype, processing-instruction, or CDATA node kinds, so those
+        // brands never instantiate. Fragment backings are elements flagged
+        // in the document's fragment set.
         // https://dom.spec.whatwg.org/#dom-node-nodetype
         let world = world(ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
-            return Err(Exception::throw_type(ctx, "stale node"));
-        };
-        if let Some(kind) = parsed.document.synthetic_kind(self.handle.0.node) {
-            return Ok(match kind {
-                crate::documents::SyntheticKind::Pi { .. } => 7,
-                crate::documents::SyntheticKind::CData => 4,
-                crate::documents::SyntheticKind::Doctype { .. } => 10,
-            });
-        }
-        if parsed.document.is_fragment(self.handle.0.node) {
+        let is_fragment = world
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.document.is_fragment(self.handle.0.node));
+        if is_fragment {
             return Ok(11);
         }
         with_node_data(ctx, self.handle.0, |data| match data {
@@ -2522,24 +2372,13 @@ impl JsNode {
     fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
         let world = world(ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
-            return Err(Exception::throw_type(ctx, "stale node"));
-        };
-        if let Some(kind) = parsed.document.synthetic_kind(self.handle.0.node) {
-            let name = match kind {
-                crate::documents::SyntheticKind::Pi { target } => target.clone(),
-                crate::documents::SyntheticKind::CData => "#cdata-section".to_owned(),
-                crate::documents::SyntheticKind::Doctype { name, .. } => name.clone(),
-            };
-            drop(parsed);
-            return rquickjs::String::from_str(ctx.clone(), &name);
-        }
-        if parsed.document.is_fragment(self.handle.0.node) {
-            drop(parsed);
+        if world
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.document.is_fragment(self.handle.0.node))
+        {
             return rquickjs::String::from_str(ctx.clone(), "#document-fragment");
         }
-        drop(parsed);
         let name = with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(element) | NodeData::AnonymousBlock(element)) => {
                 Ok(element_node_name(&element.name, uppercase))
@@ -2811,11 +2650,14 @@ impl JsNode {
         if data.0.to_string_lossy().contains("?>") {
             return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
         }
-        create_node(&ctx, self.handle.0, |parsed| {
-            parsed
-                .document
-                .create_pi(&target.0, &data.0.to_string_lossy())
-        })
+        // Known gap (upstream, docs/progress.md): Blitz has no
+        // processing-instruction node kind, so construction throws instead
+        // of handing back a wrong-kind node.
+        Err(throw_dom(
+            &ctx,
+            "HierarchyRequestError",
+            "processing instructions are not supported",
+        ))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcdatasection
@@ -2841,11 +2683,14 @@ impl JsNode {
                 "data contains ]]>",
             ));
         }
-        create_node(&ctx, self.handle.0, |parsed| {
-            parsed
-                .document
-                .create_cdata(&data.0.to_string_lossy())
-        })
+        // Known gap (upstream, docs/progress.md): Blitz has no CDATA section
+        // node kind, so construction throws instead of handing back a
+        // wrong-kind node.
+        Err(throw_dom(
+            &ctx,
+            "HierarchyRequestError",
+            "CDATA sections are not supported",
+        ))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattribute
@@ -3143,20 +2988,9 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-doctype
     #[qjs(skip)]
     fn doctype<'js>(&self, ctx: &Ctx<'js>) -> Value<'js> {
-        let world = world(ctx);
-        let found = world.ok().and_then(|world| {
-            let parsed = world.borrow();
-            let parsed = parsed.document(self.handle.0)?;
-            let node = parsed.document.document_doctype()?;
-            Some(NodeId {
-                document: parsed.id,
-                node,
-            })
-        });
-        match found {
-            Some(id) => wrap_node(ctx, id).unwrap_or_else(|_| Value::new_null(ctx.clone())),
-            None => Value::new_null(ctx.clone()),
-        }
+        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
+        // kind, so documents never have a doctype.
+        Value::new_null(ctx.clone())
     }
 
     // https://dom.spec.whatwg.org/#dom-document-readyState
@@ -3331,7 +3165,7 @@ impl JsNode {
             return Ok(String::new());
         }
         Ok(match element.name.local.as_ref() {
-            "textarea" => descendant_text(&parsed.document, self.handle.0.node)
+            "textarea" => descendant_text(&parsed.document.base, self.handle.0.node)
                 .to_string_lossy()
                 .into_owned(),
             "select" => select_value_in(base, self.handle.0.document, self.handle.0.node),
@@ -3425,7 +3259,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(descendant_text(&parsed.document, self.handle.0.node)
+        Ok(descendant_text(&parsed.document.base, self.handle.0.node)
             .to_string_lossy()
             .into_owned())
     }
@@ -3448,7 +3282,7 @@ impl JsNode {
             clippy::cast_possible_truncation,
             reason = "a 64-bit string length beyond u32 cannot be produced by this engine"
         )]
-        Ok(descendant_text(&parsed.document, self.handle.0.node)
+        Ok(descendant_text(&parsed.document.base, self.handle.0.node)
             .to_string_lossy()
             .encode_utf16()
             .count() as u32)
@@ -3465,7 +3299,7 @@ impl JsNode {
             };
             (
                 selection_applies(&parsed.document.base, self.handle.0.node),
-                control_value_len(&parsed.document, self.handle.0.node),
+                control_value_len(&parsed.document.base, self.handle.0.node),
                 world.selection_of(self.handle.0),
             )
         };
@@ -3495,7 +3329,7 @@ impl JsNode {
             };
             (
                 selection_applies(&parsed.document.base, self.handle.0.node),
-                control_value_len(&parsed.document, self.handle.0.node),
+                control_value_len(&parsed.document.base, self.handle.0.node),
                 world.selection_of(self.handle.0),
             )
         };
@@ -4443,33 +4277,19 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
-        let synthetic = parsed.document.synthetic_kind(self.handle.0.node).cloned();
         let data = parsed
             .document
             .base
             .get_node(self.handle.0.node)
             .map(|node| &node.data);
-        let value = match (synthetic, data) {
-            (_, Some(NodeData::Text(text))) => Some(text.content.clone()),
-            (
-                Some(crate::documents::SyntheticKind::Pi { target }),
-                Some(NodeData::Comment { contents }),
-            ) => Some(
-                contents
-                    .strip_prefix(target.as_str())
-                    .map_or(contents.clone(), |rest| {
-                        rest.strip_prefix(' ').unwrap_or(rest).to_owned()
-                    }),
-            ),
-            (Some(crate::documents::SyntheticKind::Doctype { .. }), _) => None,
-            (_, Some(NodeData::Comment { contents })) => Some(contents.clone()),
-            _ => None,
-        };
-        match value {
-            // Doctype and non-character-data nodes have a null node value.
-            // A synthetic doctype matches no arm above, so it lands here.
-            Some(value) => dom_string(ctx, &DomString::from(value)).map(Some),
-            None => Ok(None),
+        match data {
+            Some(NodeData::Text(text)) => {
+                dom_string(ctx, &DomString::from(text.content.clone())).map(Some)
+            }
+            Some(NodeData::Comment { contents }) => {
+                dom_string(ctx, &DomString::from(contents.clone())).map(Some)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -4492,29 +4312,16 @@ impl JsNode {
             return Ok(None);
         };
         let base = &parsed.document.base;
-        let synthetic = parsed.document.synthetic_kind(self.handle.0.node).cloned();
         let data = base.get_node(self.handle.0.node).map(|node| &node.data);
-        match (synthetic, data) {
-            (_, Some(NodeData::Element(_) | NodeData::AnonymousBlock(_))) => {
-                let text = descendant_text(&parsed.document, self.handle.0.node);
+        match data {
+            Some(NodeData::Element(_) | NodeData::AnonymousBlock(_)) => {
+                let text = descendant_text(&parsed.document.base, self.handle.0.node);
                 dom_string(ctx, &text).map(Some)
             }
-            (_, Some(NodeData::Text(text))) => {
+            Some(NodeData::Text(text)) => {
                 dom_string(ctx, &DomString::from(text.content.clone())).map(Some)
             }
-            (
-                Some(crate::documents::SyntheticKind::Pi { target }),
-                Some(NodeData::Comment { contents }),
-            ) => {
-                let data = contents
-                    .strip_prefix(target.as_str())
-                    .map_or(contents.clone(), |rest| {
-                        rest.strip_prefix(' ').unwrap_or(rest).to_owned()
-                    });
-                dom_string(ctx, &DomString::from(data)).map(Some)
-            }
-            (Some(crate::documents::SyntheticKind::Doctype { .. }), _) => Ok(None),
-            (_, Some(NodeData::Comment { contents })) => {
+            Some(NodeData::Comment { contents }) => {
                 dom_string(ctx, &DomString::from(contents.clone())).map(Some)
             }
             _ => Ok(None),
@@ -4633,7 +4440,7 @@ impl JsNode {
         };
         let title = document_first(&parsed, "title");
         match title {
-            Some(title) => dom_string(ctx, &descendant_text(&parsed.document, title.node)),
+            Some(title) => dom_string(ctx, &descendant_text(&parsed.document.base, title.node)),
             None => rquickjs::String::from_str(ctx.clone(), ""),
         }
     }

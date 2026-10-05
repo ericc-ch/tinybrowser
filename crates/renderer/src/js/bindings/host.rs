@@ -539,12 +539,6 @@ pub(crate) fn require_node_interface(
     let document = owner
         .document(id)
         .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
-    if let Some(kind) = document.document.synthetic_kind(id.node) {
-        if synthetic_matches(kind, interface) {
-            return Ok(());
-        }
-        return Err(Exception::throw_type(ctx, "incompatible receiver"));
-    }
     let data = document
         .document
         .base
@@ -554,37 +548,6 @@ pub(crate) fn require_node_interface(
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
-    }
-}
-
-/// Whether a synthetic node kind implements the named interface.
-/// Processing instructions implement `CharacterData`; CDATA sections implement
-/// `Text` (hence `CharacterData`); doctypes implement neither.
-fn synthetic_matches(kind: &crate::documents::SyntheticKind, interface: &str) -> bool {
-    use crate::documents::SyntheticKind as Synthetic;
-    match kind {
-        Synthetic::Pi { .. } => matches!(
-            interface,
-            "ProcessingInstruction"
-                | "Node"
-                | "EventTarget"
-                | "CharacterData"
-                | "ChildNode"
-                | "NonDocumentTypeChildNode"
-        ),
-        Synthetic::CData => matches!(
-            interface,
-            "CDATASection"
-                | "Text"
-                | "Node"
-                | "EventTarget"
-                | "CharacterData"
-                | "ChildNode"
-                | "NonDocumentTypeChildNode"
-        ),
-        Synthetic::Doctype { .. } => {
-            matches!(interface, "DocumentType" | "Node" | "EventTarget" | "ChildNode")
-        }
     }
 }
 
@@ -602,9 +565,6 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
     let Some(document) = owner.document(id) else {
         return false;
     };
-    if let Some(kind) = document.document.synthetic_kind(id.node) {
-        return synthetic_matches(kind, interface);
-    }
     let data = document
         .document
         .base
@@ -714,18 +674,9 @@ pub(crate) fn document_type_argument<'js>(
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    let id = super::required_node(ctx, value)?;
-    let owner = super::world_for_node(ctx, id)?;
-    let owner = owner.borrow();
-    let Some(parsed) = owner.document(id) else {
-        return Err(Exception::throw_type(ctx, "stale node"));
-    };
-    if matches!(
-        parsed.document.synthetic_kind(id.node),
-        Some(crate::documents::SyntheticKind::Doctype { .. })
-    ) {
-        return Ok(Some(NodeReference::Tree(id)));
-    }
+    // Known gap (upstream, docs/progress.md): Blitz has no doctype nodes;
+    // no value converts.
+    let _ = super::required_node(ctx, value)?;
     Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
 }
 

@@ -238,7 +238,7 @@ fn collect_pending_entries(
         }
         let is_submitter = submitter == Some(id);
         pending.extend(pending_entry(
-            &parsed.document,
+            base,
             document,
             current,
             local,
@@ -319,21 +319,20 @@ fn has_datalist_ancestor(base: &BaseDocument, node: BlitzId) -> bool {
 /// multiple `select`) several
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 fn pending_entry(
-    doc: &crate::documents::BlitzDocument,
+    base: &BaseDocument,
     document: u32,
     node: BlitzId,
     local: &str,
     control_name: &str,
     is_submitter: bool,
 ) -> Vec<PendingEntry> {
-    let base = &doc.base;
     let id = NodeId { document, node };
     // Blitz keeps no live control values, so the submission value is the
     // `value` content attribute (the default value), or empty when absent.
     let value_attr = || attr(base, node, "value").unwrap_or_default().to_owned();
     match local {
         "textarea" => {
-            let mut value = normalize_newlines(&descendant_text(doc, node).to_string_lossy());
+            let mut value = normalize_newlines(&descendant_text(base, node).to_string_lossy());
             if wrap_is_hard(attr(base, node, "wrap")) {
                 let cols = parse_positive(attr(base, node, "cols")).unwrap_or(20);
                 value = hard_wrap(&value, cols);

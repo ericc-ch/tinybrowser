@@ -1,9 +1,8 @@
 //! `DOMImplementation`, DOM parsing, and serialization.
 
 use super::{
-    NodeContext, detach_for_adopt, import_snapshot, materialize_import, throw_dom, throw_dom_error,
-    validate_and_extract, world, world_for_node, wrap_new_document, wrap_new_document_in_world,
-    wrap_node,
+    NodeContext, throw_dom, validate_and_extract, world, world_for_node, wrap_new_document,
+    wrap_new_document_in_world, wrap_node,
 };
 
 use crate::js::world::Handle;
@@ -37,8 +36,8 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         system_id: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
         let name = name.to_string()?;
-        let public_id = public_id.to_string()?;
-        let system_id = system_id.to_string()?;
+        let _ = public_id.to_string()?;
+        let _ = system_id.to_string()?;
         if !valid_doctype_name(&name) {
             return Err(throw_dom(
                 &ctx,
@@ -46,20 +45,19 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 "doctype name contains invalid characters",
             ));
         }
-        // Gap: Blitz `NodeData` has no Doctype variant, so a document type
-        // cannot live in the tree. Materialize a Comment placeholder so the
-        // wrapper stays live; `doctype_fields` reports `None` until a Doctype
-        // kind exists.
+        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
+        // kind. Materialize a Comment placeholder so the wrapper stays live.
         let owner = world_for_node(&ctx, self.document.0)?;
         let (document, blitz_id) = {
             let owner = owner.borrow();
             let Some(mut parsed) = owner.document_mut(self.document.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let blitz_id =
-                parsed
-                    .document
-                    .create_doctype(&name, &public_id, &system_id);
+            let blitz_id = parsed
+                .document
+                .base
+                .mutate()
+                .create_comment_node(&format!("DOCTYPE {name}"));
             (self.document.0.document, blitz_id)
         };
         wrap_node(
@@ -103,42 +101,9 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         };
         let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
         let mut parsed = crate::Parsed::script(content_type, font_ctx);
-        // Adopt the doctype into the new tree when one was passed: snapshot
-        // it out of its document, materialize the synthetic record locally,
-        // and append it under the new root.
-        if let Some(doctype) = doctype {
-            let node = doctype.tree().ok_or_else(|| {
-                throw_dom(&ctx, "HierarchyRequestError", "attributes cannot be adopted")
-            })?;
-            let snapshot = {
-                let source_world = world_for_node(&ctx, node)?;
-                let source = source_world.borrow();
-                let Some(parsed) = source.document(node) else {
-                    return Err(Exception::throw_type(&ctx, "no document"));
-                };
-                import_snapshot(&parsed.document, node, false).ok_or_else(|| {
-                    throw_dom(&ctx, "HierarchyRequestError", "doctype cannot be adopted")
-                })?
-            };
-            {
-                let source_world = world_for_node(&ctx, node)?;
-                let source = source_world.borrow();
-                let Some(mut parsed) = source.document_mut(node) else {
-                    return Err(Exception::throw_type(&ctx, "no document"));
-                };
-                detach_for_adopt(&mut parsed.document, node)
-                    .map_err(|err| throw_dom_error(&ctx, err))?;
-            }
-            let mut fresh = materialize_import(&mut parsed.document, &snapshot)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-            fresh.document = 0;
-            let document_root = parsed.document.base.root_node().id;
-            parsed
-                .document
-                .base
-                .mutate()
-                .append_children(document_root, &[fresh.node]);
-        }
+        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
+        // kind, so the doctype argument is dropped instead of adopted.
+        let _ = doctype;
         if let Some(name) = root {
             let document_root = parsed.document.base.root_node().id;
             let element = parsed.document.base.mutate().create_element(name, Vec::new());
@@ -160,14 +125,8 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
         let mut parsed = crate::Parsed::script("text/html", font_ctx);
         let document_root = parsed.document.base.root_node().id;
-        // `createHTMLDocument` builds a doctype, then html/head/body
-        // (<https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument>).
-        let doctype = parsed.document.create_doctype("html", "", "");
-        parsed
-            .document
-            .base
-            .mutate()
-            .append_children(document_root, &[doctype]);
+        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
+        // kind, so `createHTMLDocument` builds no doctype, unlike the spec.
         let html = parsed
             .document
             .base
@@ -227,20 +186,16 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
     }
 }
 
-/// The doctype's name, public id, and system id, when `id` is a synthetic
-/// doctype backing in `parsed`.
+/// The doctype's name, public id, and system id, when `parsed` holds `id`.
+///
+/// Known gap (upstream, docs/progress.md): Blitz has no doctype node kind,
+/// so this always reports `None`.
 pub(super) fn doctype_fields(
     parsed: &crate::Parsed,
     id: NodeId,
 ) -> Option<(String, String, String)> {
-    match parsed.document.synthetic_kind(id.node)? {
-        crate::documents::SyntheticKind::Doctype {
-            name,
-            public_id,
-            system_id,
-        } => Some((name.clone(), public_id.clone(), system_id.clone())),
-        _ => None,
-    }
+    let _ = (parsed, id);
+    None
 }
 
 /// An HTML-namespace qualified name for document construction.

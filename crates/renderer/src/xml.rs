@@ -7,18 +7,11 @@ use crate::Parsed;
 
 /// Parses `input` as an XML document with the given content type.
 pub(crate) fn parse_document(input: &str, content_type: &'static str) -> Parsed {
-    // XML documents are never rendered; the base only needs to resolve
-    // without panicking Blitz.
-    let config = blitz_dom::DocumentConfig {
-        base_url: Some("http://invalid/".to_owned()),
-        ..blitz_dom::DocumentConfig::default()
-    };
     let base: blitz_dom::BaseDocument =
-        blitz_html::HtmlDocument::from_xml(input, config).into();
-    let mut document = crate::documents::BlitzDocument::from_base(base);
-    if let Some((name, public_id, system_id)) = crate::capture_doctype(input) {
-        crate::insert_doctype(&mut document, &name, &public_id, &system_id);
-    }
+        blitz_html::HtmlDocument::from_xml(input, blitz_dom::DocumentConfig::default()).into();
+    // Known gap (upstream): Blitz drops the doctype while parsing, so
+    // `document.doctype` reads null. Tracked in docs/progress.md.
+    let document = crate::documents::BlitzDocument::from_base(base);
     Parsed {
         id: 0,
         document,

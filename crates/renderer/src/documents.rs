@@ -14,30 +14,6 @@ use crate::js::world::JournalEntry;
 /// Process-wide mutation order for observer delivery across documents.
 static NEXT_JOURNAL_POSITION: AtomicU64 = AtomicU64::new(1);
 
-/// A node kind Blitz does not model, backed by a comment node plus this record.
-///
-/// Backings live in the tree like any node, so parent/child walks, style,
-/// and layout need no changes; only the JS-visible surface (interface brand,
-/// `nodeType`, `nodeName`, character data, serialization, insertion
-/// validity) consults the table. Blitz ids carry a slot version that bumps
-/// on reuse, so a stale entry can never alias a new node in a recycled
-/// slot; entries for removed nodes are simply never read again.
-#[derive(Clone, Debug)]
-pub(crate) enum SyntheticKind {
-    /// A processing instruction: backing comment holds `target + ' ' + data`.
-    Pi {
-        target: String,
-    },
-    /// A CDATA section: backing comment holds the data.
-    CData,
-    /// A doctype: fields live here; the backing holds nothing.
-    Doctype {
-        name: String,
-        public_id: String,
-        system_id: String,
-    },
-}
-
 /// A Blitz document plus the side data our engine keeps per document.
 pub(crate) struct BlitzDocument {
     /// The Blitz tree, style, and layout state.
@@ -52,8 +28,6 @@ pub(crate) struct BlitzDocument {
     /// the fragment's children. Membership decides the wrapper prototype
     /// and fragment-only algorithms (serialization, insertion).
     fragments: HashSet<blitz_traits::node_id::NodeId>,
-    /// Processing instructions, CDATA sections, and doctypes by backing id.
-    synthetic: HashMap<blitz_traits::node_id::NodeId, SyntheticKind>,
 }
 
 impl BlitzDocument {
@@ -64,7 +38,6 @@ impl BlitzDocument {
             journal: Vec::new(),
             recording: false,
             fragments: HashSet::new(),
-            synthetic: HashMap::new(),
         }
     }
 
@@ -75,7 +48,6 @@ impl BlitzDocument {
             journal: Vec::new(),
             recording: false,
             fragments: HashSet::new(),
-            synthetic: HashMap::new(),
         }
     }
 
@@ -107,85 +79,6 @@ impl BlitzDocument {
         let backing = self.base.mutate().create_element(name, Vec::new());
         self.fragments.insert(backing);
         backing
-    }
-
-    /// The synthetic kind of a backing node, if it stands in for a
-    /// processing instruction, CDATA section, or doctype.
-    pub(crate) fn synthetic_kind(
-        &self,
-        id: blitz_traits::node_id::NodeId,
-    ) -> Option<&SyntheticKind> {
-        self.synthetic.get(&id)
-    }
-
-    /// Creates a processing-instruction node: a backing comment holding
-    /// `target + ' ' + data` (or just `target` when data is empty).
-    pub(crate) fn create_pi(&mut self, target: &str, data: &str) -> blitz_traits::node_id::NodeId {
-        let contents = if data.is_empty() {
-            target.to_owned()
-        } else {
-            format!("{target} {data}")
-        };
-        let backing = self.base.mutate().create_comment_node(&contents);
-        self.synthetic.insert(
-            backing,
-            SyntheticKind::Pi {
-                target: target.to_owned(),
-            },
-        );
-        backing
-    }
-
-    /// Creates a CDATA-section node: a backing comment holding the data.
-    pub(crate) fn create_cdata(&mut self, data: &str) -> blitz_traits::node_id::NodeId {
-        let backing = self.base.mutate().create_comment_node(data);
-        self.synthetic.insert(backing, SyntheticKind::CData);
-        backing
-    }
-
-    /// Creates a doctype node: a backing comment plus the declaration fields.
-    pub(crate) fn create_doctype(
-        &mut self,
-        name: &str,
-        public_id: &str,
-        system_id: &str,
-    ) -> blitz_traits::node_id::NodeId {
-        let backing = self.base.mutate().create_comment_node("");
-        self.synthetic.insert(
-            backing,
-            SyntheticKind::Doctype {
-                name: name.to_owned(),
-                public_id: public_id.to_owned(),
-                system_id: system_id.to_owned(),
-            },
-        );
-        backing
-    }
-
-    /// Copies a synthetic record onto a freshly cloned backing (same-document
-    /// `cloneNode` clones the backing through Blitz, which knows nothing of
-    /// the record).
-    pub(crate) fn clone_synthetic(
-        &mut self,
-        from: blitz_traits::node_id::NodeId,
-        to: blitz_traits::node_id::NodeId,
-    ) {
-        if let Some(kind) = self.synthetic.get(&from).cloned() {
-            self.synthetic.insert(to, kind);
-        }
-    }
-
-    /// The document's doctype backing, when one was created or captured.
-    pub(crate) fn document_doctype(&self) -> Option<blitz_traits::node_id::NodeId> {
-        let root = self.base.root_node().id;
-        self.base.get_node(root).and_then(|root| {
-            root.children.iter().copied().find(|child| {
-                matches!(
-                    self.synthetic.get(child),
-                    Some(SyntheticKind::Doctype { .. })
-                )
-            })
-        })
     }
 }
 

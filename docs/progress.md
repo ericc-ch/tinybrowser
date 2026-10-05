@@ -310,4 +310,5 @@ Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail clo
 
 - `blitz-dom-0.3.0-beta.2/src/document.rs:1086` `resolve_url` panics on unresolvable relative refs (observed: `foo.jpg` against `data:text/css` base). Upstream `main` still panics the same way.
 - `blitz-dom` has no PI / CDATA / doctype node kinds; fragment parsing drops doctype and eagerly loads subresources against the scratch doc default base.
+- Our surface stays simple: `createProcessingInstruction` / `createCDATASection` throw, `document.doctype` reads null, doctype arguments are dropped. These fail as known-fails.
 - Pre-existing `main` crashes, out of scope: `dom/nodes/Document-characterSet-normalization-1.html`, `Document-characterSet-normalization-2.html`, `Document-createElement-namespace.html`.

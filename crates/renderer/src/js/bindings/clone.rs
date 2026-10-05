@@ -186,27 +186,6 @@ pub(crate) fn clone_within_document(
 ) -> std::result::Result<NodeId, TreeError> {
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
-        // Deep clones preserve child order, so a lockstep pre-order walk
-        // pairs each source node with its clone; synthetic records (which
-        // Blitz knows nothing of) copy across. Skipping self-pairs covers
-        // the root when ids coincide.
-        let mut stack = vec![(id.node, cloned)];
-        while let Some((source, target)) = stack.pop() {
-            if source != target {
-                doc.clone_synthetic(source, target);
-            }
-            let source_kids: Vec<blitz_traits::node_id::NodeId> = doc
-                .base
-                .get_node(source)
-                .map(|node| node.children.iter().copied().collect())
-                .unwrap_or_default();
-            let target_kids: Vec<blitz_traits::node_id::NodeId> = doc
-                .base
-                .get_node(target)
-                .map(|node| node.children.iter().copied().collect())
-                .unwrap_or_default();
-            stack.extend(source_kids.into_iter().zip(target_kids));
-        }
         return Ok(NodeId {
             document: doc_id,
             node: cloned,
@@ -273,9 +252,11 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
 
 /// Owned snapshot of a subtree for cross-document `importNode`.
 ///
-/// Synthetic processing instructions, CDATA sections, and doctypes ride as
-/// their own variants; template contents have no Blitz equivalent and
-/// `<template>` children snapshot as ordinary element children.
+/// Blitz has no doctype, processing-instruction, CDATA, or fragment node
+/// kinds (upstream gap, docs/progress.md), so those have no snapshot
+/// variant: a source tree built by Blitz never contains them. Template
+/// contents have no Blitz equivalent either; `<template>` children snapshot
+/// as ordinary element children.
 pub(crate) enum ImportSnapshot {
     Element {
         name: QualName,
@@ -284,16 +265,6 @@ pub(crate) enum ImportSnapshot {
     },
     Text(crate::dom_string::DomString),
     Comment(crate::dom_string::DomString),
-    Pi {
-        target: String,
-        data: crate::dom_string::DomString,
-    },
-    CData(crate::dom_string::DomString),
-    Doctype {
-        name: String,
-        public_id: String,
-        system_id: String,
-    },
     Fragment(Vec<ImportSnapshot>),
 }
 
@@ -336,36 +307,9 @@ pub(crate) fn import_snapshot(
         NodeData::Text(text) => Some(ImportSnapshot::Text(
             crate::dom_string::DomString::from(text.content.clone()),
         )),
-        NodeData::Comment { contents } => match doc.synthetic_kind(id.node) {
-            Some(crate::documents::SyntheticKind::Pi { target }) => {
-                let data = contents
-                    .strip_prefix(target.as_str())
-                    .map_or(contents.clone(), |rest| {
-                        rest.strip_prefix(' ').unwrap_or(rest).to_owned()
-                    });
-                Some(ImportSnapshot::Pi {
-                    target: target.clone(),
-                    data: crate::dom_string::DomString::from(data),
-                })
-            }
-            Some(crate::documents::SyntheticKind::CData) => {
-                Some(ImportSnapshot::CData(
-                    crate::dom_string::DomString::from(contents.clone()),
-                ))
-            }
-            Some(crate::documents::SyntheticKind::Doctype {
-                name,
-                public_id,
-                system_id,
-            }) => Some(ImportSnapshot::Doctype {
-                name: name.clone(),
-                public_id: public_id.clone(),
-                system_id: system_id.clone(),
-            }),
-            None => Some(ImportSnapshot::Comment(
-                crate::dom_string::DomString::from(contents.clone()),
-            )),
-        },
+        NodeData::Comment { contents } => Some(ImportSnapshot::Comment(
+            crate::dom_string::DomString::from(contents.clone()),
+        )),
         NodeData::Document(_) => None,
     }
 }
@@ -412,33 +356,6 @@ pub(crate) fn materialize_import(
         ImportSnapshot::Comment(data) => {
             let text = data.to_string_lossy().into_owned();
             let blitz_id = doc.base.mutate().create_comment_node(&text);
-            Ok(NodeId {
-                document: 0,
-                node: blitz_id,
-            })
-        }
-        ImportSnapshot::Pi { target, data } => {
-            let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.create_pi(target, &text);
-            Ok(NodeId {
-                document: 0,
-                node: blitz_id,
-            })
-        }
-        ImportSnapshot::CData(data) => {
-            let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.create_cdata(&text);
-            Ok(NodeId {
-                document: 0,
-                node: blitz_id,
-            })
-        }
-        ImportSnapshot::Doctype {
-            name,
-            public_id,
-            system_id,
-        } => {
-            let blitz_id = doc.create_doctype(name, public_id, system_id);
             Ok(NodeId {
                 document: 0,
                 node: blitz_id,

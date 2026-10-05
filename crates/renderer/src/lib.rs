@@ -108,12 +108,9 @@ impl Parsed {
 pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Parsed {
     let quirks_mode = sniff_quirks_mode(input);
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_html(input, config).into();
-    let mut document = BlitzDocument::from_base(base);
-    // Blitz drops the doctype while parsing; recapture it from the source so
-    // `document.doctype` and doctype-sensitive tests observe it.
-    if let Some((name, public_id, system_id)) = capture_doctype(input) {
-        insert_doctype(&mut document, &name, &public_id, &system_id);
-    }
+    // Known gap (upstream): Blitz drops the doctype while parsing, so
+    // `document.doctype` reads null. Tracked in docs/progress.md.
+    let document = BlitzDocument::from_base(base);
     Parsed {
         id: 0,
         document,
@@ -122,102 +119,6 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
         ready_state: ReadyState::Loading,
         url: None,
     }
-}
-
-/// Inserts a synthetic doctype as the document's first child, ahead of the
-/// document element.
-pub(crate) fn insert_doctype(document: &mut BlitzDocument, name: &str, public_id: &str, system_id: &str) {
-    let backing = document.create_doctype(name, public_id, system_id);
-    let root = document.base.root_node().id;
-    let first_element = document
-        .base
-        .get_node(root)
-        .and_then(|root| root.children.first().copied());
-    match first_element {
-        Some(anchor) => {
-            document.base.mutate().insert_nodes_before(anchor, &[backing]);
-        }
-        None => {
-            document.base.mutate().append_children(root, &[backing]);
-        }
-    }
-}
-
-/// The `<!DOCTYPE ...>` declaration's name and identifiers, when the input
-/// opens with one. Quoted literals decode the five predefined XML entities;
-/// anything malformed reports no doctype rather than a partial one.
-pub(crate) fn capture_doctype(input: &str) -> Option<(String, String, String)> {
-    let rest = input.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\x0c', '\r']);
-    let after_open = rest
-        .get(..9)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("<!doctype"))?;
-    let _ = after_open;
-    let mut cursor = rest[9..].trim_start_matches([' ', '\t', '\n', '\x0c', '\r']);
-    let end = cursor
-        .find(|c: char| c == '>' || c.is_ascii_whitespace())
-        .unwrap_or(cursor.len());
-    let name = cursor[..end].to_owned();
-    if name.is_empty() {
-        return None;
-    }
-    cursor = cursor[end..].trim_start_matches([' ', '\t', '\n', '\x0c', '\r']);
-    let (public_id, system_id) = if cursor.len() >= 6 && cursor[..6].eq_ignore_ascii_case("public") {
-        let rest = cursor[6..].trim_start_matches([' ', '\t', '\n', '\x0c', '\r']);
-        let (public_id, rest) = take_quoted(rest)?;
-        let rest = rest.trim_start_matches([' ', '\t', '\n', '\x0c', '\r']);
-        let (system_id, _) = take_quoted(rest).unwrap_or_default();
-        (public_id, system_id)
-    } else if cursor.len() >= 6 && cursor[..6].eq_ignore_ascii_case("system") {
-        let rest = cursor[6..].trim_start_matches([' ', '\t', '\n', '\x0c', '\r']);
-        let (system_id, _) = take_quoted(rest).unwrap_or_default();
-        (String::new(), system_id)
-    } else {
-        (String::new(), String::new())
-    };
-    Some((name, public_id, system_id))
-}
-
-/// Consumes one quoted literal, decoding character references.
-fn take_quoted(input: &str) -> Option<(String, &str)> {
-    let quote = input.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let rest = &input[1..];
-    let end = rest.find(quote)?;
-    let raw = &rest[..end];
-    let mut value = String::with_capacity(raw.len());
-    decode_references(raw, &mut value)?;
-    Some((value, &rest[end + 1..]))
-}
-
-/// Decodes the five predefined XML entities and numeric character references.
-fn decode_references(raw: &str, out: &mut String) -> Option<()> {
-    let mut rest = raw;
-    while let Some(amp) = rest.find('&') {
-        out.push_str(&rest[..amp]);
-        rest = &rest[amp + 1..];
-        let semi = rest.find(';')?;
-        match &rest[..semi] {
-            "lt" => out.push('<'),
-            "gt" => out.push('>'),
-            "amp" => out.push('&'),
-            "quot" => out.push('"'),
-            "apos" => out.push('\''),
-            entity if entity.starts_with('#') => {
-                let code = if let Some(hex) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
-                    u32::from_str_radix(hex, 16).ok()?
-                } else {
-                    entity[1..].parse().ok()?
-                };
-                out.push(char::from_u32(code)?);
-            }
-            _ => return None,
-        }
-        rest = &rest[semi + 1..];
-    }
-    out.push_str(rest);
-    Some(())
 }
 
 /// Parses a full HTML document with scripting disabled, the mode `DOMParser`
