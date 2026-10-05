@@ -676,16 +676,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dom"
-version = "0.1.0"
-dependencies = [
- "cssparser",
- "markup5ever",
- "precomputed-hash",
- "selectors",
-]
-
-[[package]]
 name = "dragonbox_ecma"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

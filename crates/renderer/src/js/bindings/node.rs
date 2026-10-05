@@ -2012,10 +2012,7 @@ fn push_escaped_html_attribute(output: &mut HtmlOutput, value: &str) {
     }
 }
 
-/// Serializes one HTML element with the fragment serialization algorithm.
-/// Known gap: `crate::serialize` still targets the pre-cutover tree, so this
-/// local port covers elements, text, and comments only (no doctypes or
-/// processing instructions, which Blitz cannot hold)
+/// Serializes one HTML element with the fragment serialization algorithm
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
 fn serialize_html_element(
     doc: &crate::documents::BlitzDocument,

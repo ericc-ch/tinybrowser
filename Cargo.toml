@@ -4,7 +4,6 @@ members = [
     "crates/browser",
     "crates/cdp",
     "crates/cookies",
-    "crates/dom",
     "crates/logging",
     "crates/net",
     "crates/renderer",
@@ -25,7 +24,6 @@ authors = ["Erick Christian <erickchristian48@gmail.com>"]
 browser = { path = "crates/browser" }
 cdp = { path = "crates/cdp" }
 cookies = { path = "crates/cookies" }
-dom = { path = "crates/dom" }
 logging = { path = "crates/logging" }
 net = { path = "crates/net" }
 renderer = { path = "crates/renderer" }

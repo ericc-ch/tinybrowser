@@ -309,6 +309,15 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail closed as known-fails.
 
 - `blitz-dom-0.3.0-beta.2/src/document.rs:1086` `resolve_url` panics on unresolvable relative refs (observed: `foo.jpg` against `data:text/css` base). Upstream `main` still panics the same way.
-- `blitz-dom` has no PI / CDATA / doctype node kinds; fragment parsing drops doctype and eagerly loads subresources against the scratch doc default base.
-- Our surface stays simple: `createProcessingInstruction` / `createCDATASection` throw, `document.doctype` reads null, doctype arguments are dropped. These fail as known-fails.
+- `blitz-dom` has no PI / CDATA / doctype node kinds; parsing drops the doctype. Our surface stays simple: `createProcessingInstruction` / `createCDATASection` throw, `document.doctype` reads null, doctype arguments are dropped. These fail as known-fails.
+- `blitz-dom` has no shadow DOM: no shadow roots, `attachShadow` never hosts, `ShadowRoot` brand never instantiates, `getComposedRanges` / composed options are no-ops.
+- `blitz-dom` has no template contents: `<template>` children live as ordinary element children.
+- `blitz-dom` keeps no form-control state: no dirty value flag, checkedness, selectedness, or indeterminate slots; values read from content attributes and descendant text, `select` events have no producer, form-state cloning carries structure only.
+- `blitz-dom` exposes no image-element state: `image_cache` / `pending_images` are `pub(crate)` with no public read API, so `complete` / `naturalWidth` / `currentSrc` / broken flag and `load` / `error` events come from our own dial + decode instead of Blitz bytes (SVG paints in Blitz but errors in our map until rasterization is rewired).
+- `blitz-dom` exposes no public visibility helper: one `style::` use remains for the `visibility` check.
+- `blitz-dom` styles with hardcoded `NoQuirks` internally, so `document.compatMode` (sniffed from the doctype) can disagree with the rendering mode.
+- `blitz-dom` puts `AnonymousBlock` layout boxes in the same tree; we treat them as transparent (snapshot/serialize children only, never brand as elements).
+- `blitz-dom` exposes only the viewport scroll offset, no per-element scroll-container offset API.
+- `blitz-dom` owns document language internally with no metadata setter; response language stays on `content_language`.
+- `blitz-html` always parses scripting-disabled (`noscript` as markup); scripting-enabled `noscript`-as-text diverges.
 - Pre-existing `main` crashes, out of scope: `dom/nodes/Document-characterSet-normalization-1.html`, `Document-characterSet-normalization-2.html`, `Document-createElement-namespace.html`.
