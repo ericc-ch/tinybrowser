@@ -49,18 +49,16 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         // cannot live in the tree. Materialize a Comment placeholder so the
         // wrapper stays live; `doctype_fields` reports `None` until a Doctype
         // kind exists.
-        let _ = (public_id, system_id);
         let owner = world_for_node(&ctx, self.document.0)?;
         let (document, blitz_id) = {
             let owner = owner.borrow();
             let Some(mut parsed) = owner.document_mut(self.document.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let blitz_id = parsed
-                .document
-                .base
-                .mutate()
-                .create_comment_node(&format!("DOCTYPE {name}"));
+            let blitz_id =
+                parsed
+                    .document
+                    .create_doctype(&name, &public_id, &system_id);
             (self.document.0.document, blitz_id)
         };
         wrap_node(
@@ -187,16 +185,20 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
     }
 }
 
-/// The doctype's name, public id, and system id, when `parsed` holds `id`.
-///
-/// Gap: Blitz `NodeData` has no Doctype variant, so this always reports
-/// `None`; `create_document_type` materializes a Comment placeholder.
+/// The doctype's name, public id, and system id, when `id` is a synthetic
+/// doctype backing in `parsed`.
 pub(super) fn doctype_fields(
     parsed: &crate::Parsed,
     id: NodeId,
 ) -> Option<(String, String, String)> {
-    let _ = (parsed, id);
-    None
+    match parsed.document.synthetic_kind(id.node)? {
+        crate::documents::SyntheticKind::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => Some((name.clone(), public_id.clone(), system_id.clone())),
+        _ => None,
+    }
 }
 
 /// An HTML-namespace qualified name for document construction.
@@ -256,9 +258,19 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
         // `DOMParser` parses with scripting disabled
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
         let mut parsed = if content_type == "text/html" {
+            let base = self
+                .url
+                .parse::<url::Url>()
+                .map_or_else(
+                    |_| "http://invalid/".to_owned(),
+                    |url| crate::render::blitz_base_url(&url),
+                );
             let mut parsed = crate::parse_html_without_scripting(
                 &source,
-                blitz_dom::DocumentConfig::default(),
+                blitz_dom::DocumentConfig {
+                    base_url: Some(base),
+                    ..blitz_dom::DocumentConfig::default()
+                },
             );
             parsed.content_type = content_type;
             parsed.ready_state = crate::ReadyState::Complete;

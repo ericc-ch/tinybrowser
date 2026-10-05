@@ -776,6 +776,19 @@ pub(super) fn wrap_new_document_in_world<'js>(
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
+    let synthetic = world(ctx)?.borrow().document(id).and_then(|parsed| {
+        parsed
+            .document
+            .synthetic_kind(id.node)
+            .map(|kind| match kind {
+                crate::documents::SyntheticKind::Pi { .. } => "ProcessingInstruction",
+                crate::documents::SyntheticKind::CData => "CDATASection",
+                crate::documents::SyntheticKind::Doctype { .. } => "DocumentType",
+            })
+    });
+    if let Some(brand) = synthetic {
+        return wrap_with_brand(ctx, id, brand);
+    }
     let is_fragment = world(ctx)?.borrow().document(id).is_some_and(|parsed| {
         parsed.document.is_fragment(id.node)
     });
@@ -794,6 +807,12 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let Some(brand) = brand else {
         return Err(Exception::throw_type(ctx, "stale node"));
     };
+    wrap_with_brand(ctx, id, brand)
+}
+
+/// Instantiates a `JsNode` wrapper with the realm-owner's prototype for
+/// `brand`.
+fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value<'js>> {
     let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
     // The wrapper belongs to the realm that owns the node's document, not to
     // the realm that happens to create it first. Its prototypes come from the
@@ -1072,6 +1091,40 @@ pub(super) fn with_node_data<T>(
 }
 
 pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<crate::dom_string::DomString> {
+    let world = world(ctx)?;
+    let parsed = world.borrow();
+    let Some(parsed) = parsed.document(id) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    // Synthetic backings store prefixed contents; the IDL data strips them.
+    if let Some(kind) = parsed.document.synthetic_kind(id.node) {
+        let contents = parsed
+            .document
+            .base
+            .get_node(id.node)
+            .and_then(|node| match &node.data {
+                NodeData::Comment { contents } => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        return Ok(match kind {
+            crate::documents::SyntheticKind::Pi { target } => {
+                let data = contents
+                    .strip_prefix(target.as_str())
+                    .map_or(contents.clone(), |rest| {
+                        rest.strip_prefix(' ').unwrap_or(rest).to_owned()
+                    });
+                crate::dom_string::DomString::from(data)
+            }
+            crate::documents::SyntheticKind::CData => {
+                crate::dom_string::DomString::from(contents)
+            }
+            crate::documents::SyntheticKind::Doctype { .. } => {
+                crate::dom_string::DomString::default()
+            }
+        });
+    }
+    drop(parsed);
     with_node_data(ctx, id, |data| match data {
         Some(NodeData::Text(text)) => crate::dom_string::DomString::from(text.content.clone()),
         Some(NodeData::Comment { contents }) => {
@@ -1109,19 +1162,39 @@ pub(super) fn set_character_data(
         return Ok(());
     };
     let old_value = {
+        let synthetic = parsed.document.synthetic_kind(id.node).cloned();
         let base = &parsed.document.base;
-        let Some(node) = base.get_node(id.node) else {
+        let contents = match base.get_node(id.node).map(|node| &node.data) {
+            Some(NodeData::Text(text)) => Some(text.content.clone()),
+            Some(NodeData::Comment { contents }) => Some(contents.clone()),
+            _ => None,
+        };
+        let Some(contents) = contents else {
             return Ok(());
         };
-        match &node.data {
-            NodeData::Text(text) => crate::dom_string::DomString::from(text.content.clone()),
-            NodeData::Comment { contents } => {
-                crate::dom_string::DomString::from(contents.clone())
+        match synthetic {
+            // Doctypes carry no character data; writing is a silent no-op.
+            Some(crate::documents::SyntheticKind::Doctype { .. }) => return Ok(()),
+            Some(crate::documents::SyntheticKind::Pi { target }) => {
+                let data = contents
+                    .strip_prefix(target.as_str())
+                    .map_or(contents.clone(), |rest| {
+                        rest.strip_prefix(' ').unwrap_or(rest).to_owned()
+                    });
+                crate::dom_string::DomString::from(data)
             }
-            _ => return Ok(()),
+            _ => crate::dom_string::DomString::from(contents),
         }
     };
     {
+        let synthetic = parsed.document.synthetic_kind(id.node).cloned();
+        // Doctypes carry no character data; writing is a silent no-op.
+        if matches!(
+            synthetic,
+            Some(crate::documents::SyntheticKind::Doctype { .. })
+        ) {
+            return Ok(());
+        }
         let base = &mut parsed.document.base;
         let Some(node) = base.get_node(id.node) else {
             return Ok(());
@@ -1131,13 +1204,23 @@ pub(super) fn set_character_data(
                 base.mutate().set_node_text(id.node, &data);
             }
             NodeData::Comment { .. } => {
+                // PI writes preserve the target prefix.
+                let text = match &synthetic {
+                    Some(crate::documents::SyntheticKind::Pi { target })
+                        if !data.is_empty() =>
+                    {
+                        format!("{target} {data}")
+                    }
+                    Some(crate::documents::SyntheticKind::Pi { target }) => target.clone(),
+                    _ => data,
+                };
                 base.snapshot_node(id.node);
                 if let Some(NodeData::Comment { contents }) = base
                     .get_node_mut(id.node)
                     .map(|node| &mut node.data)
                 {
                     contents.clear();
-                    contents.push_str(&data);
+                    contents.push_str(&text);
                 }
             }
             _ => return Ok(()),
@@ -1250,15 +1333,17 @@ pub(super) fn dom_string<'js>(
 }
 
 /// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
-/// the data of all `Text` descendants in tree order.
+/// the data of all `Text` (and CDATA) descendants in tree order.
 ///
 /// Descends only into elements: a `Document` or other non-container child
 /// contributes nothing, so its subtree is not entered. Fragment backings are
-/// plain elements, so fragments are covered.
+/// plain elements, so fragments are covered. Processing instructions never
+/// contribute text; CDATA sections contribute their data.
 pub(super) fn descendant_text(
-    base: &blitz_dom::BaseDocument,
+    doc: &crate::documents::BlitzDocument,
     id: super::world::BlitzId,
 ) -> crate::dom_string::DomString {
+    let base = &doc.base;
     let mut text = crate::dom_string::DomString::default();
     let mut stack = base
         .get_node(id)
@@ -1270,6 +1355,14 @@ pub(super) fn descendant_text(
         };
         match &node.data {
             NodeData::Text(data) => text.push_str(&data.content),
+            NodeData::Comment { contents }
+                if matches!(
+                    doc.synthetic_kind(current),
+                    Some(crate::documents::SyntheticKind::CData)
+                ) =>
+            {
+                text.push_str(contents);
+            }
             NodeData::Element(_) => {
                 stack.extend(node.children.iter().rev().copied());
             }

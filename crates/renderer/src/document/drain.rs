@@ -19,6 +19,7 @@ impl Document {
             self.tasks.push_back(Task::Timer(id));
         }
         self.adopt_js_work();
+        self.drain_blitz_fetches();
         self.launch_queued_dials();
         self.adopt_dial_completions();
         if let Some(task) = self.tasks.pop_front() {
@@ -91,7 +92,8 @@ impl Document {
             | DialContext::Stylesheet { epoch, .. }
             | DialContext::Image { epoch, .. } => *epoch == self.js_epoch,
             DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
-            DialContext::JsFetch { .. } => false,
+            // Blitz tracks its own critical resources; ours never gate load.
+            DialContext::BlitzResource { .. } | DialContext::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight
             || self.frame_load_in_flight
             || self.active_buffer.is_some()

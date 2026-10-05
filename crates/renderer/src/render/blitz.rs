@@ -13,6 +13,22 @@ use crate::render::{RenderError, RgbaImage};
 /// Largest viewport side in device pixels, matching the in-tree painter cap.
 const MAX_SIDE: u32 = 4096;
 
+/// Base URL string for a Blitz document configuration.
+///
+/// Blitz panics resolving a relative subresource URL against a
+/// cannot-be-a-base URL (`BaseDocument::resolve_url` unwraps), so
+/// non-hierarchical document URLs fall back to `http://invalid/`
+/// (RFC 2606, never resolves: relative fetches fail closed as broken
+/// resources instead of taking down the renderer). Observed
+/// `document.baseURI` is unaffected: it reads the real document URL.
+pub(crate) fn blitz_base_url(url: &url::Url) -> String {
+    if url.cannot_be_a_base() {
+        "http://invalid/".to_owned()
+    } else {
+        url.as_str().to_owned()
+    }
+}
+
 /// Renders `html` at `width` x `height` device pixels through Blitz.
 ///
 /// External subresources are not fetched on this path (dummy providers), so
@@ -109,7 +125,8 @@ fn over_white(pixel: color::PremulRgba8) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::{paint, render_html, resolve_frame};
-    use crate::render::providers::{SpawnFn, TinyNetProvider, TinyShell};
+    use blitz_traits::net::NetHandler;
+    use crate::render::providers::{TinyNetProvider, TinyShell};
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -138,6 +155,8 @@ mod tests {
 
     #[test]
     fn external_stylesheet_applies_before_paint() {
+        // The test plays the document's role: it serves the CSS itself and
+        // delivers the queued fetch straight into the filed handler.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
@@ -151,16 +170,8 @@ mod tests {
             );
             let _ = stream.write_all(response.as_bytes());
         });
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let agent = net::Agent::new(net::AgentOptions::default()).expect("agent");
-        let handle = runtime.handle().clone();
-        let spawn: SpawnFn = Arc::new(move |task| {
-            handle.spawn(task);
-        });
-        let net = Arc::new(TinyNetProvider::new(agent, spawn));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let net = Arc::new(TinyNetProvider::new(tx));
         let viewport = blitz_traits::shell::Viewport::new(
             200,
             120,
@@ -178,16 +189,41 @@ mod tests {
         );
         let document = blitz_html::HtmlDocument::from_html(&html, config);
         let mut base: blitz_dom::BaseDocument = document.into();
-        let image = runtime.block_on(async {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if resolve_frame(&mut base, &net) || Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            base.resolve(0.0);
+            base.handle_messages();
+            // Deliver every queued fetch the way the document would: read
+            // the CSS over plain TCP and hand the bytes to the handler.
+            while let Ok((fetch, handler)) = rx.try_recv() {
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+                    .expect("css server");
+                let request = format!(
+                    "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    fetch.url.path()
+                );
+                stream
+                    .write_all(request.as_bytes())
+                    .expect("css request");
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).expect("css body");
+                let body = response
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| response[index + 4..].to_vec())
+                    .unwrap_or_default();
+                Box::new(handler).bytes(
+                    fetch.url.as_str().to_owned(),
+                    blitz_traits::net::Bytes::from(body),
+                );
             }
-            paint(&mut base, 200, 120).expect("blitz render")
-        });
+            base.handle_messages();
+            if resolve_frame(&mut base, &net) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let image = paint(&mut base, 200, 120).expect("blitz render");
         let middle = &image.data[((60 * 200 + 100) * 4) as usize..][..4];
         assert!(
             middle[2] > 200 && middle[3] == 255,

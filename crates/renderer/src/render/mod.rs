@@ -8,8 +8,8 @@ mod blitz;
 mod png;
 mod providers;
 
-pub(crate) use blitz::paint;
-pub(crate) use providers::{SpawnFn, TinyNav, TinyNetProvider, TinyShell};
+pub(crate) use blitz::{blitz_base_url, paint};
+pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 pub use png::encode_png;
 
 /// One decoded image in premultiplied RGBA form.

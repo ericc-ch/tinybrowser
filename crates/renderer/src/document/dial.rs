@@ -112,8 +112,10 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         DialContext::JsFetch { .. } => DialKind::JsFetch,
         DialContext::ClassicScript { .. } => DialKind::ClassicScript,
         DialContext::Stylesheet { .. } => DialKind::Stylesheet,
-        DialContext::Image { .. } => DialKind::Image,
         DialContext::FrameLoad { .. } => DialKind::FrameLoad,
+        // Plain page subresources; no carrier policy keys off the kind
+        // except for script-initiated fetches.
+        DialContext::Image { .. } | DialContext::BlitzResource { .. } => DialKind::Image,
     };
     DialRequest {
         kind,

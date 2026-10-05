@@ -11,6 +11,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant as WallClock;
 
 use tokio::sync::Notify;
+
+use blitz_traits::net::NetHandler;
 use tokio::time::Instant;
 use url::Url;
 
@@ -101,6 +103,13 @@ pub(crate) enum DialContext {
     /// a superseded load is dropped when it completes.
     FrameLoad {
         sequence: u64,
+    },
+    /// A Blitz subresource (stylesheet, image, font) fetch. The response
+    /// handler waits in [`Document::blitz_handlers`] under this id; delivery
+    /// hands Blitz its bytes through the handler, which releases Blitz's own
+    /// critical hold.
+    BlitzResource {
+        id: u64,
     },
 }
 
@@ -196,6 +205,12 @@ pub(crate) struct Document {
     net_provider: std::sync::Arc<crate::render::TinyNetProvider>,
     /// Blitz link/form navigations, drained into frame navigations on tick.
     blitz_nav: std::sync::Arc<crate::render::TinyNav>,
+    /// Blitz subresource fetches awaiting carrier dials.
+    blitz_fetch_rx: std::sync::mpsc::Receiver<
+        (crate::render::BlitzFetch, crate::render::CountingHandler),
+    >,
+    /// Filed Blitz response handlers by fetch id, delivered on completion.
+    blitz_handlers: HashMap<u64, crate::render::CountingHandler>,
     /// The browsing context this document belongs to.
     frame: FrameId,
     /// The renderer-process state every frame shares.
@@ -282,19 +297,10 @@ impl Document {
             runtime,
         )));
         runtime.registry.borrow_mut().insert_frame(frame, &world);
-        // Blitz subresources fetch through our agent. The spawn closure runs
-        // on the carrier runtime: `Document` methods that resolve style run
-        // inside it, so `tokio::spawn` finds ambient context there. Outside
-        // one the fetch is dropped and the resource stays pending, which the
-        // resolve loop treats as unsettled rather than failed.
-        let agent = net::Agent::new(net::AgentOptions::default()).expect("default agent builds");
-        let spawn: crate::render::SpawnFn = std::sync::Arc::new(|task| {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(task);
-            }
-        });
-        let net_provider =
-            std::sync::Arc::new(crate::render::TinyNetProvider::new(agent, spawn));
+        // Blitz subresources enqueue here and ride carrier dials: the
+        // renderer owns no network runtime of its own.
+        let (blitz_tx, blitz_rx) = std::sync::mpsc::channel();
+        let net_provider = std::sync::Arc::new(crate::render::TinyNetProvider::new(blitz_tx));
         let blitz_nav = std::sync::Arc::new(crate::render::TinyNav::new());
         Self {
             world,
@@ -303,6 +309,8 @@ impl Document {
             wake: Arc::clone(&runtime.wake),
             net_provider,
             blitz_nav,
+            blitz_fetch_rx: blitz_rx,
+            blitz_handlers: HashMap::new(),
             frame,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
@@ -1141,7 +1149,7 @@ impl Document {
                     as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>,
             ),
             shell_provider: Some(std::sync::Arc::new(crate::render::TinyShell)),
-            base_url: Some(self.url.as_str().to_owned()),
+            base_url: Some(crate::render::blitz_base_url(&self.url)),
             ..blitz_dom::DocumentConfig::default()
         }
     }
@@ -1406,6 +1414,16 @@ impl Document {
                     &outcome.body,
                 );
             }
+            DialContext::BlitzResource { id } => {
+                // Stale deliveries are harmless: the handler reports into
+                // Blitz's own channel, which a dropped tree no longer drains.
+                if let Some(handler) = self.blitz_handlers.remove(&id) {
+                    Box::new(handler).bytes(
+                        outcome.final_url.clone(),
+                        blitz_traits::net::Bytes::from(outcome.body),
+                    );
+                }
+            }
         }
         self.adopt_js_work();
     }
@@ -1455,6 +1473,13 @@ impl Document {
                     // container's load event still fires because the frame is
                     // no longer waiting.
                     self.frame_load_in_flight = false;
+                }
+            }
+            DialContext::BlitzResource { id } => {
+                // Deliver empty bytes so Blitz releases the resource as
+                // failed instead of holding it pending forever.
+                if let Some(handler) = self.blitz_handlers.remove(&id) {
+                    Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
                 }
             }
         }
@@ -1531,18 +1556,34 @@ impl Document {
         self.maybe_fire_load();
     }
 
-    /// Scans for `<link rel=stylesheet>` sheets. The counters stay so the
-    /// load-event gating still compiles, but no dial is queued.
+    /// Scans for `<link rel=stylesheet>` sheets. Blitz fetches these itself
+    /// through the provider bridge; the counters stay so load-event gating
+    /// still compiles.
     fn load_stylesheets(&mut self) {
-        // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
         self.pending_stylesheets = 0;
     }
 
-    /// Scans for the current document's `<img src>` resources. The counters
-    /// stay so the load-event gating still compiles, but no dial is queued.
+    /// Scans for the current document's `<img src>` resources. Blitz fetches
+    /// these itself through the provider bridge; the counters stay so load
+    /// gating still compiles.
     fn load_images(&mut self) {
-        // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
         self.pending_images = 0;
+    }
+
+    /// Moves every queued Blitz subresource fetch onto a carrier dial,
+    /// filing its response handler under the fetch id. Unparseable URLs drop
+    /// the fetch; the handler is still filed and delivered empty on teardown
+    /// so Blitz never holds the resource pending forever.
+    fn drain_blitz_fetches(&mut self) {
+        while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
+            let url = fetch.url;
+            self.blitz_handlers.insert(fetch.id, handler);
+            self.queued_dials.push(QueuedDial::get(
+                DialContext::BlitzResource { id: fetch.id },
+                url,
+                fetch.initiator,
+            ));
+        }
     }
 
     fn image_generation(&self, element: crate::js::world::NodeId) -> u64 {
