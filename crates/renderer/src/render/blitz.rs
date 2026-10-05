@@ -77,7 +77,7 @@ pub(crate) fn paint(
     let pixels = pixmap.data();
     let mut data = Vec::with_capacity(pixels.len() * 4);
     for pixel in pixels {
-        data.extend_from_slice(&unpremultiply(*pixel));
+        data.extend_from_slice(&over_white(*pixel));
     }
     Ok(RgbaImage {
         width,
@@ -97,30 +97,13 @@ fn check_dims(width: u32, height: u32) -> Result<(), RenderError> {
     Ok(())
 }
 
-/// Converts one premultiplied pixel to straight-alpha `[r, g, b, a]`.
-fn unpremultiply(pixel: color::PremulRgba8) -> [u8; 4] {
-    if pixel.a == 0 {
-        return [0, 0, 0, 0];
-    }
-    if pixel.a == u8::MAX {
-        return [pixel.r, pixel.g, pixel.b, pixel.a];
-    }
-    let alpha = u32::from(pixel.a);
-    let unpremultiply = |component: u8| {
-        let straight = (u32::from(component) * 255 + alpha / 2) / alpha;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "rounded unpremultiply of clamped u8 inputs never exceeds 255"
-        )]
-        let narrowed = straight as u8;
-        narrowed
-    };
-    [
-        unpremultiply(pixel.r),
-        unpremultiply(pixel.g),
-        unpremultiply(pixel.b),
-        pixel.a,
-    ]
+/// Converts one premultiplied pixel to opaque straight-alpha `[r, g, b, 255]`,
+/// compositing onto the white canvas (screenshots have no transparency).
+fn over_white(pixel: color::PremulRgba8) -> [u8; 4] {
+    // Premultiplied `c` over white: `c + 255 - a`, clamped. Opaque pixels
+    // pass through; transparent pixels become white.
+    let blend = |component: u8| component.saturating_add(u8::MAX - pixel.a);
+    [blend(pixel.r), blend(pixel.g), blend(pixel.b), u8::MAX]
 }
 
 #[cfg(test)]
