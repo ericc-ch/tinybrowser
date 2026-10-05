@@ -293,6 +293,7 @@ impl RendererHandle {
             content_language: mount.content_language.clone(),
             history: mount.history.clone(),
             viewport: mount.viewport,
+            init_scripts: mount.init_scripts.clone(),
         };
         let upload = if let Ok(result) = timeout(
             request_timeout(),

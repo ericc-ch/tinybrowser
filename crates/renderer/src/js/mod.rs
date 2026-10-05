@@ -409,6 +409,15 @@ impl JsRealm {
         })
     }
 
+    /// Rebinds the realm's `document` global to the world's active document
+    /// after a same-realm navigation install.
+    pub(crate) fn refresh_document(&self) -> Result<(), JsError> {
+        self.context.with(|ctx| {
+            bindings::refresh_document_global(&ctx)?;
+            Ok(())
+        })
+    }
+
     /// Restores state without a microtask checkpoint. The caller commits the
     /// traversal before firing `popstate` and performing its checkpoint.
     /// <https://html.spec.whatwg.org/multipage/browsing-the-web.html#update-document-for-history-step-application>

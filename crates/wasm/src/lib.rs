@@ -112,6 +112,7 @@ impl GuestTab for Tab {
             body: html.into_bytes(),
             history: renderer::HistorySnapshot::default(),
             viewport: None,
+            init_scripts: Vec::new(),
         };
         renderer.mount(&mount).map_err(|error| error.to_string())?;
         Ok(Self {

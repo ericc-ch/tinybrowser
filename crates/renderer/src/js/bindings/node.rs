@@ -859,6 +859,17 @@ fn document_first(parsed: &crate::Parsed, selector: &str) -> Option<NodeId> {
 }
 
 /// The first child of `parsed`'s document root satisfying `want`.
+/// Rounds a CSSOM View extent to the nearest integer, with non-finite values
+/// reading as zero
+/// (<https://drafts.csswg.org/cssom-view/#extension-to-the-element-interface>).
+fn cssom_round(value: f32) -> i32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "float-to-int casts saturate and map NaN to zero"
+    )]
+    return value.round() as i32;
+}
+
 fn document_first_child(parsed: &crate::Parsed, want: fn(&NodeData) -> bool) -> Option<NodeId> {
     let base = &parsed.document.base;
     base.get_node(base.root_node().id).and_then(|root| {
@@ -1681,13 +1692,15 @@ fn selection_applies(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
     match element.name.local.as_ref() {
         "textarea" => true,
         "input" => {
+            // Only the text-like states support the selection APIs
+            // (<https://html.spec.whatwg.org/multipage/input.html#do-not-apply>).
             let typ = attr(base, node, "type")
                 .unwrap_or("text")
                 .trim()
                 .to_ascii_lowercase();
-            !matches!(
+            matches!(
                 typ.as_str(),
-                "hidden" | "checkbox" | "radio" | "file" | "submit" | "image" | "reset" | "button"
+                "" | "text" | "search" | "tel" | "url" | "password"
             )
         }
         _ => false,
@@ -2463,7 +2476,7 @@ impl JsNode {
         // scrolled.
         // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
         let scroll = parsed.document.base.viewport_scroll();
-        let viewport_width = f64::from(crate::engine::VIEWPORT_WIDTH);
+        let viewport_width = f64::from(parsed.document.base.viewport().window_size.0);
         let next_x = if left < scroll.x {
             left
         } else if left + width > scroll.x + viewport_width {
@@ -3484,6 +3497,103 @@ impl JsNode {
             y: value,
         });
         Ok(())
+    }
+
+    /// Runs `read` over this wrapper's Blitz layout node after flushing
+    /// pending layout; metrics are zero without one
+    /// (<https://drafts.csswg.org/cssom-view/#extension-to-the-element-interface>).
+    #[qjs(skip)]
+    fn layout_metric(
+        &self,
+        ctx: &Ctx<'_>,
+        read: impl FnOnce(&blitz_dom::Node) -> f32,
+    ) -> Result<f32> {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(0.0);
+        };
+        let base = &mut parsed.document.base;
+        base.resolve(0.0);
+        let Some(node) = base.get_node(self.handle.0.node) else {
+            return Ok(0.0);
+        };
+        Ok(read(node))
+    }
+
+    /// Whether this wrapper is its document's root element.
+    #[qjs(skip)]
+    fn is_document_element(&self, ctx: &Ctx<'_>) -> Result<bool> {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(false);
+        };
+        Ok(document_first_child(&parsed, |data| {
+            matches!(data, NodeData::Element(_))
+        }) == Some(self.handle.0))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-clientwidth
+    #[qjs(skip)]
+    fn client_width(&self, ctx: &Ctx<'_>) -> Result<i32> {
+        if self.is_document_element(ctx)? {
+            let (width, _) = world(ctx)?.borrow().viewport_size.get();
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "viewport sides are at most 4096, exactly representable"
+            )]
+            return Ok(cssom_round(width as f32));
+        }
+        Ok(cssom_round(self.layout_metric(ctx, blitz_dom::Node::client_width)?))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-clientheight
+    #[qjs(skip)]
+    fn client_height(&self, ctx: &Ctx<'_>) -> Result<i32> {
+        if self.is_document_element(ctx)? {
+            let (_, height) = world(ctx)?.borrow().viewport_size.get();
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "viewport sides are at most 4096, exactly representable"
+            )]
+            return Ok(cssom_round(height as f32));
+        }
+        Ok(cssom_round(
+            self.layout_metric(ctx, blitz_dom::Node::client_height)?,
+        ))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
+    #[qjs(skip)]
+    fn scroll_width(&self, ctx: &Ctx<'_>) -> Result<i32> {
+        Ok(cssom_round(
+            self.layout_metric(ctx, blitz_dom::Node::scroll_width)?,
+        ))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollheight
+    #[qjs(skip)]
+    fn scroll_height(&self, ctx: &Ctx<'_>) -> Result<i32> {
+        Ok(cssom_round(
+            self.layout_metric(ctx, blitz_dom::Node::scroll_height)?,
+        ))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-offsetwidth
+    #[qjs(skip)]
+    fn offset_width(&self, ctx: &Ctx<'_>) -> Result<i32> {
+        Ok(cssom_round(self.layout_metric(ctx, |node| {
+            node.final_layout().size.width
+        })?))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-offsetheight
+    #[qjs(skip)]
+    fn offset_height(&self, ctx: &Ctx<'_>) -> Result<i32> {
+        Ok(cssom_round(self.layout_metric(ctx, |node| {
+            node.final_layout().size.height
+        })?))
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
@@ -5710,6 +5820,26 @@ impl<'js> element_generated::Element<'js> for JsNode {
         self.set_scroll_top(ctx, value)
     }
 
+    // https://drafts.csswg.org/cssom-view/#dom-element-clientwidth
+    fn get_client_width(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.client_width(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-clientheight
+    fn get_client_height(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.client_height(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
+    fn get_scroll_width(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.scroll_width(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollheight
+    fn get_scroll_height(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.scroll_height(ctx)
+    }
+
     // https://dom.spec.whatwg.org/#dom-element-attachshadow
     fn attach_shadow(
         &self,
@@ -6730,6 +6860,16 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
     fn blur(&self, ctx: Ctx<'js>) -> Result<()> {
         blur_node(&ctx, self.handle.0)
     }
+
+    // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetwidth
+    fn get_offset_width(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.offset_width(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetheight
+    fn get_offset_height(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.offset_height(ctx)
+    }
 }
 
 impl<'js> svg_element_generated::SVGElement<'js> for JsNode {
@@ -7289,7 +7429,8 @@ type RenderingContext<'js> =
 impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width
     fn get_width(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        canvas_dimension(ctx, self.handle.0, "width", 300)
+        Ok(usize::try_from(canvas_dimension(ctx, self.handle.0, "width", 300))
+            .unwrap_or(usize::MAX))
     }
 
     fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
@@ -7298,7 +7439,8 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height
     fn get_height(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        canvas_dimension(ctx, self.handle.0, "height", 150)
+        Ok(usize::try_from(canvas_dimension(ctx, self.handle.0, "height", 150))
+            .unwrap_or(usize::MAX))
     }
 
     fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
@@ -7312,20 +7454,21 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
         _context_id: rquickjs::String<'js>,
         _options: Value<'js>,
     ) -> Result<Option<RenderingContext<'js>>> {
-        // No context is supported: Blitz paints no canvas and the engine ships
-        // no rasterizer or GL stack, so `getContext` answers the spec's
-        // `null` for an unsupported context id
+        // Deviation from the context-mode table: no canvas backend exists
+        // (Blitz paints no canvas and the engine ships no rasterizer or GL
+        // stack), so every context id answers `null`, including the `2d` and
+        // `bitmaprenderer` rows that require a context object
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
         Ok(None)
     }
 }
 
-/// Canvas `width`/`height` reflection: a content attribute parsed as a
-/// non-negative integer, or the IDL default when absent or invalid
+/// Canvas `width`/`height` reflection: a non-negative integer or the IDL
+/// default, per the HTML parsing rules
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
-fn canvas_dimension(ctx: &Ctx<'_>, id: NodeId, attribute: &str, default: usize) -> Result<usize> {
-    let value = attribute_value(ctx, id, attribute)?;
-    Ok(value.trim().parse::<usize>().unwrap_or(default))
+fn canvas_dimension(ctx: &Ctx<'_>, id: NodeId, attribute: &str, default: u32) -> u32 {
+    let value = attribute_value(ctx, id, attribute).unwrap_or_default();
+    super::parse_non_negative_integer(&value).unwrap_or(default)
 }
 
 impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {

@@ -5,7 +5,9 @@ mod decode;
 mod png;
 mod providers;
 
-pub(crate) use blitz::{INVALID_BASE_URL, blitz_base_url, paint, resolve_until_settled};
+pub(crate) use blitz::{
+    INVALID_BASE_URL, MAX_VIEWPORT_SIDE, blitz_base_url, paint, resolve_until_settled,
+};
 pub(crate) use decode::decode_image;
 pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 pub use png::encode_png;
@@ -107,7 +109,7 @@ pub struct NodeBox {
 /// A render failure that is the document's fault rather than the caller's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderError {
-    /// The viewport or scale was not a positive, finite size.
+    /// A zero-sized screenshot viewport was requested.
     InvalidViewport,
     /// The output image would exceed the renderer's size cap.
     TooLarge,

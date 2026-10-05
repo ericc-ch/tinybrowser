@@ -1,4 +1,5 @@
 import { chromium } from "playwright";
+import { cdpConnection, cdpSend } from "./cdp";
 import { expect, test } from "./fixtures";
 import { decodePng, pixel } from "./png";
 
@@ -29,6 +30,34 @@ test("screenshot renders layout, colors, and text", async ({ daemon }) => {
   }
   expect(dark).toBeGreaterThan(20);
 
+  await browser.close();
+});
+
+test("CDP captureScreenshot honors a clip beyond the viewport", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const context = browser.contexts()[0];
+  const page = context.pages()[0];
+  await page.goto(daemon.frameUrl);
+  const socket = await cdpConnection(daemon.origin);
+  const result = await cdpSend(socket, "Page.captureScreenshot", {
+    format: "png",
+    clip: { x: 0, y: 0, width: 200, height: 1500, scale: 1 },
+  });
+  const png = Buffer.from(result.data, "base64");
+  expect(png.readUInt32BE(16)).toBe(200);
+  expect(png.readUInt32BE(20)).toBe(1500);
+  socket.close();
+  await browser.close();
+});
+
+test("full-page screenshots capture the scrollable document", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const context = browser.contexts()[0];
+  const page = context.pages()[0];
+  await page.goto(daemon.frameUrl);
+  const png = await page.screenshot({ fullPage: true });
+  expect(png.readUInt32BE(16)).toBe(800);
+  expect(png.readUInt32BE(20)).toBeGreaterThanOrEqual(2000);
   await browser.close();
 });
 

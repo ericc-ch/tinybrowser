@@ -90,11 +90,10 @@ enum Command {
         timeout: Option<Duration>,
     },
     AddInitScript {
-        frame: FrameId,
         source: String,
+        run_immediately: bool,
     },
     RemoveInitScript {
-        frame: FrameId,
         id: u64,
     },
     SetViewport {
@@ -103,6 +102,9 @@ enum Command {
         height: u32,
     },
     ViewportSize,
+    ContentSize {
+        frame: FrameId,
+    },
     Screenshot {
         frame: FrameId,
         request: renderer::ScreenshotRequest,
@@ -128,6 +130,7 @@ enum TabReply {
     RemoveInitScript(Result<(), TabError>),
     SetViewport(Result<(), TabError>),
     ViewportSize((u32, u32)),
+    ContentSize(Result<(f32, f32), TabError>),
     Screenshot(Result<Vec<u8>, TabError>),
     RunUntilLoad(Result<bool, TabError>),
     RunUntilJs(Result<bool, TabError>),
@@ -202,18 +205,16 @@ struct ScreenshotFrame {
     request: renderer::ScreenshotRequest,
 }
 
-/// Registers an init script in a frame.
+/// Registers a page-scoped init script.
 struct AddInitScript {
-    /// Frame to register in.
-    frame: FrameId,
     /// Script source.
     source: String,
+    /// Whether existing realms run the script immediately.
+    run_immediately: bool,
 }
 
-/// Removes an init script from a frame.
+/// Removes a page-scoped init script.
 struct RemoveInitScript {
-    /// Frame the script was registered in.
-    frame: FrameId,
     /// Identifier returned by the registration.
     id: u64,
 }
@@ -230,6 +231,12 @@ struct SetViewport {
 
 /// Reads a tab's emulated viewport size.
 struct ViewportSize;
+
+/// Reads a frame's scrollable content size.
+struct ContentSize {
+    /// Frame to measure.
+    frame: FrameId,
+}
 
 /// Waits until the current navigation has fired `load`.
 struct RunUntilLoad {
@@ -389,6 +396,18 @@ impl TabHandle {
         self.ask(ViewportSize).await
     }
 
+    /// The main frame's scrollable content size in CSS pixels.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn content_size(&self) -> Result<(f32, f32), TabError> {
+        self.ask(ContentSize {
+            frame: FrameId::MAIN,
+        })
+        .await?
+    }
+
     /// Sets the main frame's persistent viewport size, re-laying out its
     /// active document.
     ///
@@ -404,16 +423,20 @@ impl TabHandle {
         .await?
     }
 
-    /// Registers `source` to run in every new document realm of the main
-    /// frame; returns the identifier used to remove it.
+    /// Registers `source` page-wide; returns the identifier used to remove
+    /// it. `run_immediately` also evaluates it in every existing realm.
     ///
     /// # Errors
     ///
     /// [`TabError::ActorStopped`].
-    pub async fn add_init_script(&self, source: String) -> Result<u64, TabError> {
+    pub async fn add_init_script(
+        &self,
+        source: String,
+        run_immediately: bool,
+    ) -> Result<u64, TabError> {
         self.ask(AddInitScript {
-            frame: FrameId::MAIN,
             source,
+            run_immediately,
         })
         .await?
     }
@@ -424,11 +447,7 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn remove_init_script(&self, id: u64) -> Result<(), TabError> {
-        self.ask(RemoveInitScript {
-            frame: FrameId::MAIN,
-            id,
-        })
-        .await?
+        self.ask(RemoveInitScript { id }).await?
     }
 
     /// Renders the tab's top-level document to a PNG.
@@ -616,10 +635,6 @@ struct ActiveNavigation {
 }
 
 /// Browser-owned tab state: identity, URL, navigation, and renderer link.
-/// Default tab viewport in device pixels, matching the renderer default
-/// before any CDP emulation.
-const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
-
 struct Tab {
     id: TabId,
     renderers: Arc<RendererProcessManager>,
@@ -631,7 +646,15 @@ struct Tab {
     document_url: Url,
     /// Emulated viewport size in device pixels
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
+    /// Divergence: the override is tab state and outlives the CDP session,
+    /// unlike Chromium, which clears it on disconnect (corpus test
+    /// `inspector-protocol/emulation/device-metrics-override-cleared-on-disconnect.js`).
     viewport: (u32, u32),
+    /// Page-scoped init scripts, replayed on every renderer acquisition
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
+    init_scripts: Vec<(u64, String)>,
+    /// Next init-script identifier.
+    next_init_script: u64,
     history: SessionHistory,
     traversal: Option<crate::history::EntryId>,
     document_loaded: bool,
@@ -663,7 +686,9 @@ impl Tab {
             site: None,
             events_rx: None,
             document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
-            viewport: DEFAULT_VIEWPORT,
+            viewport: renderer::DEFAULT_VIEWPORT,
+            init_scripts: Vec::new(),
+            next_init_script: 1,
             history: SessionHistory::new(Url::parse("about:blank").expect("about:blank is a valid URL")),
             traversal: None,
             document_loaded: false,
@@ -689,10 +714,14 @@ impl Tab {
             body: html.as_bytes().to_vec(),
             history: self.history.snapshot(),
             viewport: Some(self.viewport),
+            init_scripts: self.init_scripts.clone(),
         };
         if self.renderer.is_none() && self.document_url.scheme() == "about" {
             self.pending_mount = Some(mount);
             self.document_loaded = true;
+            // The deferred blank document still fired parsing's end, so both
+            // readiness events happen before `load`.
+            self.record_event(TabEvent::DomContentLoaded).await;
             self.record_event(TabEvent::Load).await;
             return Ok(());
         }
@@ -883,7 +912,11 @@ impl Tab {
 
     /// Mounts the virtual blank document this tab has been carrying.
     async fn mount_virtual(&mut self) -> Result<(), TabError> {
-        let mount = self.pending_mount.take().unwrap_or_else(blank_mount);
+        let mut mount = self.pending_mount.take().unwrap_or_else(blank_mount);
+        // The replacement renderer must come up with the tab's emulated
+        // viewport and script list, not the defaults.
+        mount.viewport = Some(self.viewport);
+        mount.init_scripts = self.init_scripts.clone();
         let site = Site::for_url(&self.document_url)
             .or_else(|| self.site.clone())
             .unwrap_or_else(|| Site::opaque(self.id));
@@ -960,6 +993,7 @@ impl Tab {
             body: Vec::new(),
             history: history.snapshot(),
             viewport: Some(self.viewport),
+            init_scripts: self.init_scripts.clone(),
         };
         if self
             .mount_stream(&site, outcome.status, mount, outcome.body)
@@ -1074,6 +1108,7 @@ fn blank_mount() -> Mount {
         body: b"<!doctype html><title></title>".to_vec(),
         history: HistorySnapshot::default(),
         viewport: None,
+        init_scripts: Vec::new(),
     }
 }
 
@@ -1243,12 +1278,18 @@ async fn handle_command(
         Command::Screenshot { frame, request } => {
             ScreenshotFrame { frame, request }.serve(ctx).await
         }
-        Command::AddInitScript { frame, source } => {
-            AddInitScript { frame, source }.serve(ctx).await
+        Command::AddInitScript {
+            source,
+            run_immediately,
+        } => {
+            AddInitScript {
+                source,
+                run_immediately,
+            }
+            .serve(ctx)
+            .await
         }
-        Command::RemoveInitScript { frame, id } => {
-            RemoveInitScript { frame, id }.serve(ctx).await
-        }
+        Command::RemoveInitScript { id } => RemoveInitScript { id }.serve(ctx).await,
         Command::SetViewport {
             frame,
             width,
@@ -1263,6 +1304,7 @@ async fn handle_command(
             .await
         }
         Command::ViewportSize => ViewportSize.serve(ctx).await,
+        Command::ContentSize { frame } => ContentSize { frame }.serve(ctx).await,
         Command::RunUntilLoadTimeout { timeout } => RunUntilLoad { timeout }.serve(ctx).await,
         Command::RunUntilJsTrue {
             frame,
@@ -1375,8 +1417,8 @@ impl TabOperation for AddInitScript {
 
     fn into_command(self) -> Command {
         Command::AddInitScript {
-            frame: self.frame,
             source: self.source,
+            run_immediately: self.run_immediately,
         }
     }
 
@@ -1389,13 +1431,22 @@ impl TabOperation for AddInitScript {
 
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
-        let result = tab
-            .renderer_request(RendererCommand::AddInitScript {
-                frame: self.frame,
+        let id = tab.next_init_script;
+        tab.next_init_script = tab.next_init_script.wrapping_add(1);
+        tab.init_scripts.push((id, self.source.clone()));
+        let result = if tab.renderer.is_some() {
+            tab.renderer_request(RendererCommand::AddInitScript {
+                id,
                 source: self.source,
+                run_immediately: self.run_immediately,
             })
             .await
-            .and_then(reply_init_script);
+            .and_then(reply_unit)
+            .map(|()| id)
+        } else {
+            // No renderer yet: the next mount carries the list.
+            Ok(id)
+        };
         TabOutcome::Reply(TabReply::InitScript(result))
     }
 }
@@ -1404,10 +1455,7 @@ impl TabOperation for RemoveInitScript {
     type Output = Result<(), TabError>;
 
     fn into_command(self) -> Command {
-        Command::RemoveInitScript {
-            frame: self.frame,
-            id: self.id,
-        }
+        Command::RemoveInitScript { id: self.id }
     }
 
     fn unwrap(reply: TabReply) -> Option<Self::Output> {
@@ -1419,13 +1467,14 @@ impl TabOperation for RemoveInitScript {
 
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
-        let result = tab
-            .renderer_request(RendererCommand::RemoveInitScript {
-                frame: self.frame,
-                id: self.id,
-            })
-            .await
-            .and_then(reply_unit);
+        tab.init_scripts.retain(|(script_id, _)| *script_id != self.id);
+        let result = if tab.renderer.is_some() {
+            tab.renderer_request(RendererCommand::RemoveInitScript { id: self.id })
+                .await
+                .and_then(reply_unit)
+        } else {
+            Ok(())
+        };
         TabOutcome::Reply(TabReply::RemoveInitScript(result))
     }
 }
@@ -1487,6 +1536,30 @@ impl TabOperation for ViewportSize {
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
         TabOutcome::Reply(TabReply::ViewportSize(tab.viewport))
+    }
+}
+
+impl TabOperation for ContentSize {
+    type Output = Result<(f32, f32), TabError>;
+
+    fn into_command(self) -> Command {
+        Command::ContentSize { frame: self.frame }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::ContentSize(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        let result = tab
+            .renderer_request(RendererCommand::ContentSize { frame: self.frame })
+            .await
+            .and_then(reply_content_size);
+        TabOutcome::Reply(TabReply::ContentSize(result))
     }
 }
 
@@ -1780,9 +1853,9 @@ fn reply_value(reply: Reply) -> Result<RemoteValue, TabError> {
     }
 }
 
-fn reply_init_script(reply: Reply) -> Result<u64, TabError> {
+fn reply_content_size(reply: Reply) -> Result<(f32, f32), TabError> {
     match reply {
-        Reply::InitScript(result) => result,
+        Reply::ContentSize(result) => result,
         _ => Err(TabError::ActorStopped),
     }
 }

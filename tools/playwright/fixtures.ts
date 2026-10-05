@@ -11,6 +11,10 @@ export interface Daemon {
   origin: string;
   /** Classic-script + fetch page served by the fixture. */
   pageUrl: string;
+  /** The same page reached through `localhost`, for cross-site navigations. */
+  crossSitePageUrl: string;
+  /** Page with a child frame and tall content, for viewport and clip checks. */
+  frameUrl: string;
   /** Deterministic layout page for screenshot assertions. */
   shotUrl: string;
   /** Page styled only by an external sheet. */
@@ -32,6 +36,10 @@ interface Fixtures {
 }
 
 const PAGE = `<!doctype html><title>tiny</title><script src="/lib.js"></script><script>window.ready = false; fetch('/data').then(r => r.text()).then(t => { window.payload = t; window.ready = true; });</script>`;
+
+/** A child frame plus tall content, for viewport and clip probes. */
+const FRAMES = `<!doctype html><title>frames</title><div style="height:2000px"></div><iframe id="child" src="/frame"></iframe>`;
+const CHILD = `<!doctype html><title>child</title><p>child</p>`;
 
 /** Fixed colors and positions the screenshot spec probes by pixel. */
 const SHOT = `<!doctype html><title>shot</title><style>
@@ -131,6 +139,12 @@ export const test = base.extend<Fixtures>({
       if (path === "/page") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(PAGE);
+      } else if (path === "/frames") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(FRAMES);
+      } else if (path === "/frame") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(CHILD);
       } else if (path === "/shot") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(SHOT);
@@ -181,7 +195,7 @@ export const test = base.extend<Fixtures>({
         response.end("not found");
       }
     });
-    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => httpServer.listen(0, "::", resolve));
     const httpPort = (httpServer.address() as AddressInfo).port;
 
     // Detached so cleanup can kill the daemon and its renderer children as one
@@ -201,6 +215,8 @@ export const test = base.extend<Fixtures>({
     await use({
       origin: `http://127.0.0.1:${port}`,
       pageUrl: `http://127.0.0.1:${httpPort}/page`,
+      crossSitePageUrl: `http://[::1]:${httpPort}/page`,
+      frameUrl: `http://127.0.0.1:${httpPort}/frames`,
       shotUrl: `http://127.0.0.1:${httpPort}/shot`,
       styledUrl: `http://127.0.0.1:${httpPort}/styled`,
       brokenUrl: `http://127.0.0.1:${httpPort}/broken`,

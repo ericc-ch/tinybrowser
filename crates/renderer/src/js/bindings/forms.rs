@@ -635,13 +635,11 @@ fn wrap_is_hard(wrap: Option<&str>) -> bool {
 }
 
 /// The non-negative integer in `value`, or `None` for an absent or invalid
-/// attribute (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-non-negative-integers>).
+/// attribute
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-non-negative-integers>).
 fn parse_positive(value: Option<&str>) -> Option<usize> {
-    let text = value?.trim();
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok()
+    let parsed = super::parse_non_negative_integer(value?)?;
+    Some(usize::try_from(parsed).unwrap_or(usize::MAX))
 }
 
 /// The textarea hard-wrapping transformation: break each line at `cols`

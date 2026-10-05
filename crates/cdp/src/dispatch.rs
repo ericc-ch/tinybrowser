@@ -9,20 +9,15 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
-    BrowserHandle, FrameId, RemoteValue, ScreenshotClip, ScreenshotRequest, TabError, TabEvent,
-    TabHandle, TabId,
+    BrowserHandle, DEFAULT_VIEWPORT, FrameId, RemoteValue, ScreenshotClip, ScreenshotRequest,
+    TabError, TabEvent, TabHandle, TabId,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::DEFAULT_BROWSER_CONTEXT_ID;
 
-/// Wide viewport fallback for layout metrics and default screenshots, matching
-/// the renderer's virtual viewport.
-pub(crate) const VIEWPORT_WIDTH: f64 = 800.0;
-/// Tall viewport fallback; see [`VIEWPORT_WIDTH`].
-pub(crate) const VIEWPORT_HEIGHT: f64 = 600.0;
-/// Largest screenshot dimension the renderer will raster.
+/// Largest capture or emulated dimension the renderer accepts.
 const MAX_SCREENSHOT_DIM: f64 = 4096.0;
 
 pub(crate) async fn session_method(
@@ -54,8 +49,14 @@ pub(crate) async fn session_method(
                 .viewport_size()
                 .await
                 .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            let (content_width, content_height) = tab
+                .content_size()
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?;
             let width = f64::from(width);
             let height = f64::from(height);
+            let content_width = f64::from(content_width);
+            let content_height = f64::from(content_height);
             Ok(json!({
                 "layoutViewport": viewport_rect(width, height),
                 "visualViewport": {
@@ -67,7 +68,7 @@ pub(crate) async fn session_method(
                     "clientHeight": height,
                     "scale": 1,
                 },
-                "contentSize": {"x": 0, "y": 0, "width": width, "height": height},
+                "contentSize": {"x": 0, "y": 0, "width": content_width, "height": content_height},
                 "cssLayoutViewport": viewport_rect(width, height),
                 "cssVisualViewport": {
                     "offsetX": 0,
@@ -78,7 +79,7 @@ pub(crate) async fn session_method(
                     "clientHeight": height,
                     "scale": 1,
                 },
-                "cssContentSize": {"x": 0, "y": 0, "width": width, "height": height},
+                "cssContentSize": {"x": 0, "y": 0, "width": content_width, "height": content_height},
             }))
         }
         "Page.addScriptToEvaluateOnNewDocument" => add_init_script(params, tab).await,
@@ -144,16 +145,25 @@ pub(crate) fn static_reply(method: &str) -> Option<Value> {
     })
 }
 
-/// `Page.addScriptToEvaluateOnNewDocument`: register `source` on the tab and
+/// `Page.addScriptToEvaluateOnNewDocument`: register `source` page-wide and
 /// return its identifier.
+///
+/// `worldName` is accepted but ignored: this engine has no isolated worlds,
+/// so scripts (including Playwright's utility-world registration, whose
+/// source is empty) run in the main world. That is a known isolation gap
+/// (docs/progress.md).
 async fn add_init_script(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
     let source = params
         .get("source")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let run_immediately = params
+        .get("runImmediately")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let id = tab
-        .add_init_script(source)
+        .add_init_script(source, run_immediately)
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({"identifier": id.to_string()}))
@@ -174,42 +184,101 @@ async fn remove_init_script(params: &Value, tab: &TabHandle) -> Result<Value, Di
 }
 
 /// `Emulation.setDeviceMetricsOverride`: persist the emulated viewport on the
-/// tab and the renderer.
+/// tab and the renderer. The protocol requires integer `width`/`height`, and
+/// zero on either side clears the override; `mobile`, non-default
+/// `deviceScaleFactor`, and sizes beyond the renderer's cap are refused
+/// rather than silently approximated
+/// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
 async fn set_device_metrics(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
-    let width = emulated_side(params.get("width").and_then(Value::as_f64));
-    let height = emulated_side(params.get("height").and_then(Value::as_f64));
+    let width = required_metric(params, "width")?;
+    let height = required_metric(params, "height")?;
+    if width == 0 || height == 0 {
+        return clear_device_metrics(tab).await;
+    }
+    if params.get("mobile").and_then(Value::as_bool) == Some(true) {
+        return Err(DispatchError::Failed(
+            "mobile emulation is not supported".into(),
+        ));
+    }
+    if params
+        .get("deviceScaleFactor")
+        .and_then(Value::as_f64)
+        .is_some_and(|scale| (scale - 1.0).abs() > f64::EPSILON)
+    {
+        return Err(DispatchError::Failed(
+            "device scale factors other than 1 are not supported".into(),
+        ));
+    }
+    if f64::from(width) > MAX_SCREENSHOT_DIM || f64::from(height) > MAX_SCREENSHOT_DIM {
+        return Err(DispatchError::Failed(format!(
+            "viewport exceeds the {MAX_SCREENSHOT_DIM} pixel cap"
+        )));
+    }
+    set_viewport(tab, width, height).await
+}
+
+/// `Emulation.clearDeviceMetricsOverride`: restore the default viewport.
+async fn clear_device_metrics(tab: &TabHandle) -> Result<Value, DispatchError> {
+    set_viewport(tab, DEFAULT_VIEWPORT.0, DEFAULT_VIEWPORT.1).await
+}
+
+/// Applies one viewport size to the tab.
+async fn set_viewport(tab: &TabHandle, width: u32, height: u32) -> Result<Value, DispatchError> {
     tab.set_viewport(width, height)
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({}))
 }
 
-/// `Emulation.clearDeviceMetricsOverride`: restore the default viewport.
-async fn clear_device_metrics(tab: &TabHandle) -> Result<Value, DispatchError> {
-    tab.set_viewport(
-        emulated_side(Some(VIEWPORT_WIDTH)),
-        emulated_side(Some(VIEWPORT_HEIGHT)),
-    )
-    .await
-    .map_err(|error| DispatchError::Failed(error.to_string()))?;
-    Ok(json!({}))
+/// One required integer emulation metric.
+fn required_metric(params: &Value, name: &str) -> Result<u32, DispatchError> {
+    params
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            DispatchError::Failed(format!(
+                "Emulation.setDeviceMetricsOverride requires an integer {name}"
+            ))
+        })
 }
 
-/// Emulated viewport side from a CDP `width`/`height` parameter: missing or
-/// invalid values fall back to the renderer cap, and the result is bounded so
-/// a bad client value cannot ask for an unpaintable surface.
-fn emulated_side(value: Option<f64>) -> u32 {
-    let value = value.unwrap_or(MAX_SCREENSHOT_DIM);
-    if !value.is_finite() || value < 1.0 {
+/// Capture surface side from a clip extent: at least 1, at most the renderer
+/// cap, so a bad client value cannot ask for an unpaintable surface.
+fn capture_side(extent: f64) -> u32 {
+    if !extent.is_finite() || extent < 1.0 {
         return 1;
     }
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "value is finite, positive, and capped at MAX_SCREENSHOT_DIM"
+        reason = "extent is finite, positive, and capped at MAX_SCREENSHOT_DIM"
     )]
-    let side = value.min(MAX_SCREENSHOT_DIM) as u32;
-    side
+    return extent.min(MAX_SCREENSHOT_DIM) as u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture_side, required_metric};
+    use serde_json::json;
+
+    #[test]
+    fn emulation_metrics_require_integers() {
+        let params = json!({"width": 1024, "height": 768});
+        assert_eq!(required_metric(&params, "width").expect("width"), 1024);
+        assert_eq!(required_metric(&params, "height").expect("height"), 768);
+        assert!(required_metric(&json!({}), "width").is_err());
+        assert!(required_metric(&json!({"width": 10.5}), "width").is_err());
+        assert!(required_metric(&json!({"width": -1}), "width").is_err());
+    }
+
+    #[test]
+    fn capture_sides_are_bounded() {
+        assert_eq!(capture_side(f64::NAN), 1);
+        assert_eq!(capture_side(0.0), 1);
+        assert_eq!(capture_side(1500.0), 1500);
+        assert_eq!(capture_side(10_000.0), 4096);
+    }
 }
 
 /// Domains whose remaining methods answer an empty result until their real
@@ -280,7 +349,6 @@ fn noop_method(method: &str) -> bool {
             | "Target.setAutoAttach"
             | "Runtime.runIfWaitingForDebugger"
             | "Log.enable"
-            | "Page.setLifecycleEventsEnabled"
             | "Network.enable"
             | "Emulation.setFocusEmulationEnabled"
             | "Emulation.setTouchEmulationEnabled"
@@ -818,15 +886,15 @@ pub(crate) async fn capture_screenshot(
         .get("clip")
         .filter(|value| !value.is_null())
         .and_then(parse_clip);
-    let viewport_width = clip
-        .map_or(VIEWPORT_WIDTH, |clip| f64::from(clip.x + clip.width))
-        .clamp(VIEWPORT_WIDTH, MAX_SCREENSHOT_DIM);
-    let viewport_height = clip
-        .map_or(VIEWPORT_HEIGHT, |clip| f64::from(clip.y + clip.height))
-        .clamp(VIEWPORT_HEIGHT, MAX_SCREENSHOT_DIM);
+    let viewport_width = capture_side(clip.map_or(f64::from(DEFAULT_VIEWPORT.0), |clip| {
+        f64::from(clip.x + clip.width)
+    }));
+    let viewport_height = capture_side(clip.map_or(f64::from(DEFAULT_VIEWPORT.1), |clip| {
+        f64::from(clip.y + clip.height)
+    }));
     let request = ScreenshotRequest {
-        viewport_width: narrow(viewport_width),
-        viewport_height: narrow(viewport_height),
+        viewport_width,
+        viewport_height,
         clip,
     };
     let frame = requested_frame(tab, params)?;
@@ -1075,6 +1143,7 @@ pub(crate) fn target_id(value: Option<&Value>) -> Result<TabId, DispatchError> {
     Ok(TabId::new(id))
 }
 
+#[derive(Debug)]
 pub(crate) enum DispatchError {
     MethodNotFound,
     Failed(String),

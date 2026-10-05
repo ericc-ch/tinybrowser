@@ -773,7 +773,7 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
                 let result: f64 = #call?;
                 result.into_js(&ctx)
             },
-            ReturnType::NullableNode | ReturnType::PlatformObject | ReturnType::Any => {
+            ReturnType::NullableNode | ReturnType::PlatformObject => {
                 quote! { #call }
             }
             ReturnType::Union(..) | ReturnType::NullableUnion(..) => {
@@ -792,7 +792,9 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             | ReturnType::Dictionary(_)
             | ReturnType::InterfaceSequence
             | ReturnType::StringSequence
-            | ReturnType::NullableDocumentType => {
+            | ReturnType::NullableDocumentType
+            | ReturnType::Any => {
+                // `any` attributes are rejected at lowering.
                 unreachable!("validated field mapping")
             }
         },
@@ -1159,11 +1161,23 @@ fn operation_argument_at(
         let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
     };
     match &argument.type_ {
+        ReturnType::Any => {
+            let fetch = if argument.null_default {
+                // An omitted optional argument takes its default before
+                // conversion, so `= null` supplies `null`, not `undefined`
+                // (<https://webidl.spec.whatwg.org/#es-any>).
+                quote! {
+                    let value = params.arg(#index).unwrap_or_else(|| Value::new_null(ctx.clone()));
+                }
+            } else {
+                fetch
+            };
+            converted_argument(argument, variable, &fetch)
+        }
         ReturnType::Node
         | ReturnType::NullableNode
         | ReturnType::Callback
         | ReturnType::PlatformObject
-        | ReturnType::Any
         | ReturnType::Dictionary(_)
         | ReturnType::Enumeration(_)
         | ReturnType::Union(..)

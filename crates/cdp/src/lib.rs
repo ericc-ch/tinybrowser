@@ -457,6 +457,13 @@ struct Conn {
     auto_attach: bool,
     events: Vec<Value>,
     loader_ids: HashMap<TabId, String>,
+    /// Loader id of each tab's current document, kept across commit for
+    /// lifecycle events
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-lifecycleEvent>).
+    current_loaders: HashMap<TabId, String>,
+    /// Whether the client asked for `Page.lifecycleEvent` notifications
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-setLifecycleEventsEnabled>).
+    lifecycle_events: bool,
     isolated_worlds: HashMap<TabId, Vec<String>>,
     next_loader: u64,
     next_context: u64,
@@ -495,6 +502,19 @@ impl Conn {
             TabEvent::Navigated => {
                 self.push_navigated(&mut messages, &tab, session.as_deref())
                     .await;
+                if self.lifecycle_events {
+                    let mut lifecycle = json!({
+                        "method": "Page.lifecycleEvent",
+                        "params": {
+                            "frameId": tab.id().to_string(),
+                            "loaderId": self.current_loader(tab.id()),
+                            "name": "init",
+                            "timestamp": timestamp,
+                        },
+                    });
+                    attach_session(&mut lifecycle, session.as_deref());
+                    messages.push(lifecycle);
+                }
             }
             TabEvent::SameDocumentNavigation => {
                 let url = tab.document_url().await.unwrap_or_default();
@@ -506,19 +526,19 @@ impl Conn {
                 messages.push(navigated);
             }
             TabEvent::Load => {
-                let frame_id = tab.id().to_string();
-                let loader_id = self.loader_ids.get(&tab.id()).cloned().unwrap_or_default();
-                let mut lifecycle = json!({
-                    "method": "Page.lifecycleEvent",
-                    "params": {
-                        "frameId": frame_id,
-                        "loaderId": loader_id,
-                        "name": "load",
-                        "timestamp": timestamp,
-                    },
-                });
-                attach_session(&mut lifecycle, session.as_deref());
-                messages.push(lifecycle);
+                if self.lifecycle_events {
+                    let mut lifecycle = json!({
+                        "method": "Page.lifecycleEvent",
+                        "params": {
+                            "frameId": tab.id().to_string(),
+                            "loaderId": self.current_loader(tab.id()),
+                            "name": "load",
+                            "timestamp": timestamp,
+                        },
+                    });
+                    attach_session(&mut lifecycle, session.as_deref());
+                    messages.push(lifecycle);
+                }
                 let mut load = json!({
                     "method": "Page.loadEventFired",
                     "params": {"timestamp": timestamp},
@@ -527,19 +547,19 @@ impl Conn {
                 messages.push(load);
             }
             TabEvent::DomContentLoaded => {
-                let frame_id = tab.id().to_string();
-                let loader_id = self.loader_ids.get(&tab.id()).cloned().unwrap_or_default();
-                let mut lifecycle = json!({
-                    "method": "Page.lifecycleEvent",
-                    "params": {
-                        "frameId": frame_id,
-                        "loaderId": loader_id,
-                        "name": "DOMContentLoaded",
-                        "timestamp": timestamp,
-                    },
-                });
-                attach_session(&mut lifecycle, session.as_deref());
-                messages.push(lifecycle);
+                if self.lifecycle_events {
+                    let mut lifecycle = json!({
+                        "method": "Page.lifecycleEvent",
+                        "params": {
+                            "frameId": tab.id().to_string(),
+                            "loaderId": self.current_loader(tab.id()),
+                            "name": "DOMContentLoaded",
+                            "timestamp": timestamp,
+                        },
+                    });
+                    attach_session(&mut lifecycle, session.as_deref());
+                    messages.push(lifecycle);
+                }
                 let mut fired = json!({
                     "method": "Page.domContentEventFired",
                     "params": {"timestamp": timestamp},
@@ -554,6 +574,13 @@ impl Conn {
 
     /// Emits the commit event set: frame commit plus the new document's
     /// execution contexts (default and every known isolated world).
+    /// The tab's current document loader id, for lifecycle events that arrive
+    /// after commit
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-lifecycleEvent>).
+    fn current_loader(&self, tab: TabId) -> String {
+        self.current_loaders.get(&tab).cloned().unwrap_or_default()
+    }
+
     /// Mints a fresh loader id for a navigation
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#type-Frame>).
     fn next_loader_id(&mut self) -> String {
@@ -577,6 +604,7 @@ impl Conn {
             Some(id) => id,
             None => self.next_loader_id(),
         };
+        self.current_loaders.insert(tab_id, loader_id.clone());
         // Final URL after redirects, not the requested one.
         let url = tab.document_url().await.unwrap_or_default();
         let mut navigated = json!({
@@ -1028,6 +1056,13 @@ impl Conn {
             }
             "Runtime.evaluate" | "Runtime.callFunctionOn" => {
                 self.dispatch_runtime(method, params, tab).await
+            }
+            "Page.setLifecycleEventsEnabled" => {
+                self.lifecycle_events = params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(json!({}))
             }
             _ => session_method(method, params, tab).await,
         }
@@ -1503,6 +1538,8 @@ async fn run_socket(
         auto_attach: false,
         events: Vec::new(),
         loader_ids: HashMap::new(),
+        current_loaders: HashMap::new(),
+        lifecycle_events: false,
         isolated_worlds: HashMap::new(),
         next_loader: 1,
         next_context: 1000,

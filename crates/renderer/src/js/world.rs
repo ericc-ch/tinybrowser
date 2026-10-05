@@ -484,6 +484,13 @@ pub(crate) struct World {
     pub(crate) runtime: FrameRuntime,
     /// The frame this realm belongs to.
     frame: FrameId,
+    /// Page-scoped scripts registered through CDP to run in every new realm
+    /// of this tab, shared by every frame's world, with their identifiers
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
+    pub(crate) init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
+    /// The frame's persistent viewport size in device pixels, readable
+    /// without an active document.
+    pub(crate) viewport_size: Cell<(u32, u32)>,
     /// Frames whose browsing context was registered inside a script but whose
     /// realm cannot be created until JS execution has stopped.
     pending_frames: Vec<(FrameId, NodeId)>,
@@ -608,10 +615,17 @@ impl Drop for World {
 }
 
 impl World {
-    pub(crate) fn new(document_url: Url, frame: FrameId, runtime: &FrameRuntime) -> Self {
+    pub(crate) fn new(
+        document_url: Url,
+        frame: FrameId,
+        runtime: &FrameRuntime,
+        init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
+    ) -> Self {
         Self {
             runtime: runtime.clone(),
             frame,
+            init_scripts,
+            viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),
             pending_frames: Vec::new(),
             new_frames: Vec::new(),
             document: None,
@@ -857,12 +871,6 @@ impl World {
         Rc::clone(&self.runtime.shared)
     }
 
-    /// Creates a frame's document sharing this realm's runtime, services, and
-    /// stores; used for child frames created from inside a script.
-    pub(crate) fn create_frame_document(&self, frame: FrameId) -> Document {
-        Document::with_shared(frame, &self.runtime)
-    }
-
     /// Registers a browsing context for every connected `iframe` in this
     /// frame's document that does not have one yet.
     ///
@@ -933,18 +941,22 @@ impl World {
     /// borrow: pending frames and the base URL are taken first, documents
     /// load unborrowed, and only then are the results published.
     fn materialize_frames(world_rc: &Rc<RefCell<World>>) -> Vec<NodeId> {
-        let (pending, runtime, base_url) = {
+        let (pending, runtime, base_url, init_scripts, viewport) = {
             let mut world = world_rc.borrow_mut();
             (
                 std::mem::take(&mut world.pending_frames),
                 world.runtime.clone(),
                 world.document_url.clone(),
+                Rc::clone(&world.init_scripts),
+                world.viewport_size.get(),
             )
         };
         let mut loaded = Vec::with_capacity(pending.len());
         let mut created = Vec::with_capacity(pending.len());
         for (frame, container) in pending {
-            let mut document = Document::with_shared(frame, &runtime);
+            let mut document = Document::with_shared(frame, &runtime, &init_scripts);
+            // Frames created from parsed markup share the tab's viewport too.
+            document.set_viewport_size(viewport);
             document.load_about_blank(Some(base_url.as_str()));
             loaded.push((frame, container, document));
             created.push(container);

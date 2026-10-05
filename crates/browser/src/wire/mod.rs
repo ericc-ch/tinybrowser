@@ -67,18 +67,20 @@ pub enum Command {
         url: String,
         history: renderer::HistorySnapshot,
     },
-    /// Registers a script that runs in every new document realm of a frame.
+    /// Registers a page-scoped init script, identified by `id` so a replaced
+    /// renderer can replay it.
     AddInitScript {
-        /// Frame to register in.
-        frame: FrameId,
+        /// Caller-assigned identifier.
+        id: u64,
         /// Script source.
         source: String,
+        /// Whether to evaluate the script in existing realms immediately
+        /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
+        run_immediately: bool,
     },
-    /// Removes a previously registered init script from a frame.
+    /// Removes a previously registered init script.
     RemoveInitScript {
-        /// Frame the script was registered in.
-        frame: FrameId,
-        /// Identifier returned by [`Command::AddInitScript`].
+        /// Identifier returned by the matching `AddInitScript`.
         id: u64,
     },
     /// Sets a frame's persistent viewport size.
@@ -90,6 +92,11 @@ pub enum Command {
         /// Viewport height in device pixels.
         height: u32,
     },
+    /// Reads a frame's scrollable content size.
+    ContentSize {
+        /// Frame to measure.
+        frame: FrameId,
+    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -99,14 +106,14 @@ pub enum Reply {
     Unit(Result<(), TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
-    /// Identifier of a registered init script.
-    InitScript(Result<u64, TabError>),
     /// A PNG follows in body frames for this request id; `len` is its exact
     /// byte length. The JSON control plane never carries the bytes.
     Screenshot {
         /// PNG byte length, or the failure that replaced it.
         result: Result<u32, TabError>,
     },
+    /// A frame's scrollable content size in CSS pixels.
+    ContentSize(Result<(f32, f32), TabError>),
 }
 
 /// One browser-originated renderer call.
@@ -200,6 +207,9 @@ pub struct ResponseStart {
     /// browser has one.
     #[serde(default)]
     pub viewport: Option<(u32, u32)>,
+    /// Page-scoped init scripts to register before the document's realm runs.
+    #[serde(default)]
+    pub init_scripts: Vec<(u64, String)>,
 }
 
 /// One renderer-originated browser-service call.
@@ -444,6 +454,35 @@ mod tests {
             },
             Frame::Call {
                 id: RequestId::new(2),
+                body: RendererCall::Command {
+                    assignment,
+                    command: Command::AddInitScript {
+                        id: 7,
+                        source: "window.__x = 1;".into(),
+                        run_immediately: true,
+                    },
+                },
+            },
+            Frame::Call {
+                id: RequestId::new(3),
+                body: RendererCall::Command {
+                    assignment,
+                    command: Command::RemoveInitScript { id: 7 },
+                },
+            },
+            Frame::Call {
+                id: RequestId::new(4),
+                body: RendererCall::Command {
+                    assignment,
+                    command: Command::SetViewport {
+                        frame: FrameId::MAIN,
+                        width: 1024,
+                        height: 768,
+                    },
+                },
+            },
+            Frame::Call {
+                id: RequestId::new(5),
                 body: RendererCall::Response {
                     response: ResponseStart {
                         assignment,
@@ -454,11 +493,12 @@ mod tests {
                         content_language: None,
                         history: renderer::HistorySnapshot::default(),
                         viewport: None,
+                        init_scripts: Vec::new(),
                     },
                 },
             },
             Frame::RequestEnd {
-                id: RequestId::new(2),
+                id: RequestId::new(5),
                 error: None,
             },
             Frame::Reply {
@@ -621,6 +661,7 @@ mod tests {
                     content_language: None,
                     history: renderer::HistorySnapshot::default(),
                     viewport: None,
+                    init_scripts: Vec::new(),
                 },
             },
         };

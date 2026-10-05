@@ -22,16 +22,14 @@ use crate::document::{Document, FrameRuntime, Stop, WindowMessage};
 
 /// The engine's default frame viewport in device pixels, used until CDP
 /// emulation (or a mount) sets another size.
-pub(crate) const VIEWPORT_WIDTH: u32 = 800;
-/// See [`VIEWPORT_WIDTH`].
-pub(crate) const VIEWPORT_HEIGHT: u32 = 600;
+pub const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
 
 use crate::documents::DocumentStore;
 use crate::js::{
     DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime,
 };
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
-use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, TabError};
+use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError};
 use crate::storage::PendingStorageEvent;
 
 /// One renderer process's page engine.
@@ -44,6 +42,9 @@ pub struct Engine {
     runtime: FrameRuntime,
     frames: BTreeMap<FrameId, Document>,
     js_runtime: SharedJsRuntime,
+    /// Page-scoped init scripts shared by every frame's world, with their
+    /// identifiers (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
+    init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
 }
 
 impl Engine {
@@ -54,6 +55,7 @@ impl Engine {
     #[must_use]
     pub fn new(services: Arc<dyn BrowserServices>, stop: Arc<Stop>, wake: Arc<Notify>) -> Self {
         let js_runtime = SharedJsRuntime::default();
+        let init_scripts: Rc<RefCell<Vec<(u64, String)>>> = Rc::new(RefCell::new(Vec::new()));
         let runtime = FrameRuntime {
             services,
             js_runtime: js_runtime.handle(),
@@ -65,13 +67,14 @@ impl Engine {
             pending_storage: Rc::new(RefCell::new(Vec::new())),
             font_ctx: parley::FontContext::default(),
         };
-        let main = Document::with_shared(FrameId::MAIN, &runtime);
+        let main = Document::with_shared(FrameId::MAIN, &runtime, &init_scripts);
         let mut frames = BTreeMap::new();
         frames.insert(FrameId::MAIN, main);
         Self {
             runtime,
             frames,
             js_runtime,
+            init_scripts,
         }
     }
 
@@ -81,10 +84,12 @@ impl Engine {
             return frame;
         };
         let parent_url = parent_document.inherited_url();
-        let mut document = parent_document
-            .world()
-            .borrow()
-            .create_frame_document(frame);
+        let parent_viewport = parent_document.viewport_size;
+        let mut document =
+            Document::with_shared(frame, &self.runtime, &self.init_scripts);
+        // A child frame shares the tab's viewport until a content-box-driven
+        // size exists; Blitz does not couple iframe layout to the child.
+        document.set_viewport_size(parent_viewport);
         document.load_about_blank(Some(&parent_url));
         self.frames.insert(frame, document);
         self.runtime
@@ -151,6 +156,11 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
     pub fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
+        // A main-frame mount replaces the page-scoped init scripts before the
+        // document's realm can run, so the fresh tree sees the current list.
+        if frame == FrameId::MAIN {
+            self.init_scripts.borrow_mut().clone_from(&mount.init_scripts);
+        }
         self.remove_descendants(frame);
         self.frame_mut(frame)?.mount(mount)?;
         self.reconcile_frames();
@@ -163,19 +173,20 @@ impl Engine {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host the frame.
-    pub fn open_body(
-        &mut self,
-        frame: FrameId,
-        url: Option<&Url>,
-        content_type: Option<&str>,
-        content_language: Option<&str>,
-        history: &crate::protocol::HistorySnapshot,
-        viewport: Option<(u32, u32)>,
-    ) -> Result<(), TabError> {
+    pub fn open_body(&mut self, frame: FrameId, head: &ResponseHead) -> Result<(), TabError> {
+        if frame == FrameId::MAIN {
+            self.init_scripts.borrow_mut().clone_from(&head.init_scripts);
+        }
         self.remove_descendants(frame);
         let document = self.frame_mut(frame)?;
-        document.world().borrow_mut().history = history.clone();
-        document.begin_response(url, content_type, content_language, viewport);
+        document.world().borrow_mut().history = head.history.clone();
+        let url = Url::parse(&head.url).ok();
+        document.begin_response(
+            url.as_ref(),
+            head.content_type.as_deref(),
+            head.content_language.as_deref(),
+            head.viewport,
+        );
         Ok(())
     }
 
@@ -250,27 +261,52 @@ impl Engine {
         width: u32,
         height: u32,
     ) -> Result<(), TabError> {
+        if frame == FrameId::MAIN {
+            // Child frames share the tab's viewport; Blitz does not couple
+            // iframe layout to the child, so the tab size is the correct
+            // approximation until it does.
+            let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+            for id in frames {
+                if let Some(document) = self.frames.get_mut(&id) {
+                    document.set_viewport(width, height);
+                }
+            }
+            return Ok(());
+        }
         self.frame_mut(frame)?.set_viewport(width, height);
         Ok(())
     }
 
-    /// Registers a script that runs in every new realm of `frame`.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
-    pub fn add_init_script(&mut self, frame: FrameId, source: String) -> Result<u64, TabError> {
-        Ok(self.frame_mut(frame)?.add_init_script(source))
+    /// Registers a page-scoped init script for every frame's future realms
+    /// and, when `run_immediately`, evaluates it in every existing frame now
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
+    pub fn add_init_script(&mut self, id: u64, source: &str, run_immediately: bool) {
+        self.init_scripts.borrow_mut().push((id, source.to_owned()));
+        if !run_immediately {
+            return;
+        }
+        let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+        for frame in frames {
+            if let Some(document) = self.frames.get_mut(&frame) {
+                document.run_init_script(source);
+            }
+        }
     }
 
-    /// Removes a previously registered init script.
+    /// Removes a page-scoped init script.
+    pub fn remove_init_script(&mut self, id: u64) {
+        self.init_scripts
+            .borrow_mut()
+            .retain(|(script_id, _)| *script_id != id);
+    }
+
+    /// The frame's scrollable content size in CSS pixels.
     ///
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
-    pub fn remove_init_script(&mut self, frame: FrameId, id: u64) -> Result<(), TabError> {
-        self.frame_mut(frame)?.remove_init_script(id);
-        Ok(())
+    pub fn content_size(&mut self, frame: FrameId) -> Result<(f32, f32), TabError> {
+        Ok(self.frame_mut(frame)?.content_size())
     }
 
     /// Renders one frame to a PNG.
@@ -303,17 +339,30 @@ impl Engine {
                     message: "no document to render".into(),
                 });
             };
-            // The document viewport is the frame's persistent size (the CDP
-            // emulation or frame default set it), so painting uses it directly
-            // instead of a per-capture override
-            // (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
-            let (width, height) = parsed.document.base.viewport().window_size;
+            // The capture surface may exceed the persistent viewport (a clip
+            // or full-page shot), so it applies for this capture only and is
+            // restored afterwards, keeping layout in step with `window`
+            // metrics
+            // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-captureScreenshot>).
+            let (width, height) = capture_sides(request.viewport_width, request.viewport_height)?;
+            let previous = parsed.document.base.viewport().clone();
+            parsed
+                .document
+                .base
+                .set_viewport(blitz_traits::shell::Viewport::new(
+                    width,
+                    height,
+                    1.0,
+                    blitz_traits::shell::ColorScheme::Light,
+                ));
             crate::render::resolve_until_settled(&mut parsed.document.base);
-            crate::render::paint(&mut parsed.document.base, width, height).map_err(|error| {
-                TabError::Render {
+            let image = crate::render::paint(&mut parsed.document.base, width, height).map_err(
+                |error| TabError::Render {
                     message: error.to_string(),
-                }
-            })?
+                },
+            )?;
+            parsed.document.base.set_viewport(previous);
+            image
         };
         let image = match request.clip {
             Some(clip) => image
@@ -1141,6 +1190,20 @@ fn hex_digit(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Capture surface sides: at least 1 and at most the painter cap. A capture
+/// is transient, so an out-of-range request is clamped rather than rejected.
+fn capture_sides(width: u32, height: u32) -> Result<(u32, u32), TabError> {
+    if width == 0 || height == 0 {
+        return Err(TabError::Render {
+            message: crate::render::RenderError::InvalidViewport.to_string(),
+        });
+    }
+    Ok((
+        width.min(crate::render::MAX_VIEWPORT_SIDE),
+        height.min(crate::render::MAX_VIEWPORT_SIDE),
+    ))
 }
 
 /// Forgiving-base64 decode, the shape Fetch's data URL processor requires:

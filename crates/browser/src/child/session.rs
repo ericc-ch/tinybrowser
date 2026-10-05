@@ -8,9 +8,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use renderer::{Engine, FrameId, MAX_RESPONSE_BODY_BYTES, Stop, TabError};
+use renderer::{Engine, FrameId, MAX_RESPONSE_BODY_BYTES, ResponseHead, Stop, TabError};
 use tokio::sync::Notify;
-use url::Url;
 
 use super::{AssignmentServices, ChannelServices};
 use crate::exchange::{self, Frame, RequestId};
@@ -193,14 +192,13 @@ fn handle_request(
             Command::Screenshot { .. } => Reply::Screenshot {
                 result: Err(stream_error("unknown assignment")),
             },
-            Command::RemoveInitScript { .. }
+            Command::AddInitScript { .. }
+            | Command::RemoveInitScript { .. }
             | Command::SetViewport { .. }
+            | Command::ContentSize { .. }
             | Command::WindowMessage { .. }
             | Command::HistoryTraverse { .. } => {
                 Reply::Unit(Err(stream_error("unknown assignment")))
-            }
-            Command::AddInitScript { .. } => {
-                Reply::InitScript(Err(stream_error("unknown assignment")))
             }
         };
         return send_to_browser(
@@ -353,14 +351,16 @@ impl ResponseStreams {
         if self.active.contains_key(&id) {
             return Err(stream_error("duplicate response start"));
         }
-        let url = Url::parse(&response.final_url).ok();
         engine.open_body(
             response.frame,
-            url.as_ref(),
-            response.content_type.as_deref(),
-            response.content_language.as_deref(),
-            &response.history,
-            response.viewport,
+            &ResponseHead {
+                url: response.final_url.clone(),
+                content_type: response.content_type.clone(),
+                content_language: response.content_language.clone(),
+                history: response.history.clone(),
+                viewport: response.viewport,
+                init_scripts: response.init_scripts.clone(),
+            },
         )?;
         self.active.insert(
             id,
@@ -528,17 +528,26 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
             let value = engine.execute_remote_in(frame, source.as_ref(), timeout);
             Handled::Reply(Reply::Value(value))
         }
-        Command::AddInitScript { frame, source } => {
-            Handled::Reply(Reply::InitScript(engine.add_init_script(frame, source)))
+        Command::AddInitScript {
+            id,
+            source,
+            run_immediately,
+        } => {
+            engine.add_init_script(id, &source, run_immediately);
+            Handled::Reply(Reply::Unit(Ok(())))
         }
-        Command::RemoveInitScript { frame, id } => {
-            Handled::Reply(Reply::Unit(engine.remove_init_script(frame, id)))
+        Command::RemoveInitScript { id } => {
+            engine.remove_init_script(id);
+            Handled::Reply(Reply::Unit(Ok(())))
         }
         Command::SetViewport {
             frame,
             width,
             height,
         } => Handled::Reply(Reply::Unit(engine.set_viewport(frame, width, height))),
+        Command::ContentSize { frame } => {
+            Handled::Reply(Reply::ContentSize(engine.content_size(frame)))
+        }
         Command::Screenshot { frame, request } => match engine.screenshot_frame(frame, &request) {
             Ok(png) => Handled::Screenshot(png),
             Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),

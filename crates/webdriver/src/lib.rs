@@ -22,11 +22,6 @@ use serde_json::{Value, json};
 use server::{Request, Response, Shutdown};
 use tokio::sync::Mutex;
 
-/// Virtual viewport for screenshots, matching the renderer's `innerWidth`.
-const VIEWPORT_WIDTH: f32 = 800.0;
-/// See [`VIEWPORT_WIDTH`].
-const VIEWPORT_HEIGHT: f32 = 600.0;
-
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -255,8 +250,8 @@ async fn take_screenshot(sessions: &Sessions, session: &str) -> (u16, Value) {
     match current(sessions, session) {
         Some(window) => {
             let request = ScreenshotRequest {
-                viewport_width: crate::VIEWPORT_WIDTH,
-                viewport_height: crate::VIEWPORT_HEIGHT,
+                viewport_width: browser::DEFAULT_VIEWPORT.0,
+                viewport_height: browser::DEFAULT_VIEWPORT.1,
                 clip: None,
             };
             match window.tab.screenshot(request).await {

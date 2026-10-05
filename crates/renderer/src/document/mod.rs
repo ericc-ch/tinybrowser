@@ -217,11 +217,12 @@ pub(crate) struct Document {
     subresource_bytes: HashMap<String, Vec<u8>>,
     /// The browsing context this document belongs to.
     frame: FrameId,
-    /// The frame's persistent viewport in device pixels. CDP emulation and
-    /// every document mount use it, so Blitz layout, the painted size, and
+    /// The frame's persistent viewport in device pixels (the scale is fixed
+    /// at 1, so device and CSS pixels coincide). CDP emulation and every
+    /// document mount use it, so Blitz layout, the painted size, and
     /// `window` metrics all agree
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
-    viewport_size: (u32, u32),
+    pub(crate) viewport_size: (u32, u32),
     /// The renderer-process state every frame shares.
     shared: SharedHandle,
     url: Url,
@@ -269,12 +270,9 @@ pub(crate) struct Document {
     js: Option<crate::js::JsRealm>,
     js_timer_slots: HashMap<u32, i32>,
     js_epoch: u64,
-    /// Scripts registered to run in every new realm of this frame, in
-    /// registration order, with the caller-visible identifiers
-    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
-    init_scripts: Vec<(u64, String)>,
-    /// Next init-script identifier.
-    next_init_script_id: u64,
+    /// Whether init scripts were deferred because the realm was created while
+    /// a navigation response was still streaming.
+    init_scripts_deferred: bool,
     active_buffer: Option<String>,
     /// Scripts already executed for the current parse, so a walk resumed
     /// after a `src` fetch does not run them twice.
@@ -300,13 +298,18 @@ impl Drop for Document {
 impl Document {
     /// A document sharing its renderer process's `QuickJS` heap, wake handle,
     /// document store, realm registry, and frame tree.
-    pub(crate) fn with_shared(frame: FrameId, runtime: &FrameRuntime) -> Self {
+    pub(crate) fn with_shared(
+        frame: FrameId,
+        runtime: &FrameRuntime,
+        init_scripts: &Rc<RefCell<Vec<(u64, String)>>>,
+    ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         let (dial_tx, dial_rx) = mpsc::channel();
         let world = Rc::new(RefCell::new(World::new(
             document_url.clone(),
             frame,
             runtime,
+            Rc::clone(init_scripts),
         )));
         runtime.registry.borrow_mut().insert_frame(frame, &world);
         // Blitz subresources enqueue here and ride carrier dials: the
@@ -314,7 +317,7 @@ impl Document {
         let (blitz_tx, blitz_rx) = std::sync::mpsc::channel();
         let net_provider = std::sync::Arc::new(crate::render::TinyNetProvider::new(blitz_tx));
         let blitz_nav = std::sync::Arc::new(crate::render::TinyNav::new());
-        let document = Self {
+        Self {
             world,
             services: Arc::clone(&runtime.services),
             js_runtime: runtime.js_runtime.clone(),
@@ -325,7 +328,7 @@ impl Document {
             blitz_handlers: HashMap::new(),
             subresource_bytes: HashMap::new(),
             frame,
-            viewport_size: (crate::engine::VIEWPORT_WIDTH, crate::engine::VIEWPORT_HEIGHT),
+            viewport_size: crate::engine::DEFAULT_VIEWPORT,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
             content_language: None,
@@ -352,8 +355,7 @@ impl Document {
             js: None,
             js_timer_slots: HashMap::new(),
             js_epoch: 0,
-            init_scripts: Vec::new(),
-            next_init_script_id: 1,
+            init_scripts_deferred: false,
             active_buffer: None,
             executed_scripts: HashSet::new(),
             parser_eof: true,
@@ -362,11 +364,7 @@ impl Document {
             classic_fetch_in_flight: false,
             deferred_modules: Vec::new(),
             stop: Arc::clone(&runtime.stop),
-        };
-        // The initial `about:blank` document must lay out at the frame's
-        // viewport too, before any navigation installs a parsed document.
-        document.apply_viewport();
-        document
+        }
     }
 
     /// The world this document's realm belongs to.
@@ -1085,7 +1083,13 @@ impl Document {
                 )
                 .map_err(TabError::from)?,
             );
-            self.run_init_scripts();
+            if self.decoder.is_some() && self.active_buffer.is_some() {
+                // The realm exists before the new document installs; defer the
+                // init scripts until `bind_realm_document`.
+                self.init_scripts_deferred = true;
+            } else {
+                self.run_init_scripts();
+            }
         }
         Ok(())
     }
@@ -1094,7 +1098,10 @@ impl Document {
     /// script. A failing script is reported, not fatal.
     fn run_init_scripts(&mut self) {
         let scripts: Vec<String> = self
+            .world
+            .borrow()
             .init_scripts
+            .borrow()
             .iter()
             .map(|(_, source)| source.clone())
             .collect();
@@ -1109,18 +1116,20 @@ impl Document {
         }
     }
 
-    /// Registers `source` to run in every new realm of this frame; returns
-    /// the identifier used to remove it.
-    pub(crate) fn add_init_script(&mut self, source: String) -> u64 {
-        let id = self.next_init_script_id;
-        self.next_init_script_id = self.next_init_script_id.wrapping_add(1);
-        self.init_scripts.push((id, source));
-        id
-    }
-
-    /// Removes the init script registered under `id`.
-    pub(crate) fn remove_init_script(&mut self, id: u64) {
-        self.init_scripts.retain(|(script_id, _)| *script_id != id);
+    /// Runs one init script in this frame's realm immediately, creating the
+    /// realm when needed (`Page.addScriptToEvaluateOnNewDocument` with
+    /// `runImmediately`).
+    pub(crate) fn run_init_script(&mut self, source: &str) {
+        if !self.ensure_js_ok() {
+            return;
+        }
+        let failed = match self.js.as_ref() {
+            Some(js) => js.eval(source).is_err(),
+            None => true,
+        };
+        if failed {
+            self.record_event(RendererEvent::ScriptFailed);
+        }
     }
 
     fn reset_js_realm(&mut self) {
@@ -1164,6 +1173,7 @@ impl Document {
             .retain(|timer| !js_timer_ids.contains(&timer.id));
         self.js_timer_slots.clear();
         self.js = None;
+        self.init_scripts_deferred = false;
         self.active_buffer = None;
         self.executed_scripts.clear();
         self.parser_eof = true;
@@ -1267,13 +1277,29 @@ impl Document {
             let document = self.world.borrow_mut().set_document(parsed);
             self.register_document(document);
             self.apply_viewport();
+            self.bind_realm_document();
             true
+        }
+    }
+
+    /// Rebinds the realm's `document` global to the installed document and
+    /// runs init scripts deferred while the response streamed, so page code
+    /// always sees the new tree under the same realm.
+    fn bind_realm_document(&mut self) {
+        if let Some(js) = self.js.as_ref()
+            && js.refresh_document().is_err()
+        {
+            self.record_event(RendererEvent::ScriptFailed);
+        }
+        if std::mem::take(&mut self.init_scripts_deferred) {
+            self.run_init_scripts();
         }
     }
 
     /// Applies this frame's viewport size to the active Blitz document.
     fn apply_viewport(&self) {
         let (width, height) = self.viewport_size;
+        self.world.borrow().viewport_size.set((width, height));
         let world = self.world.borrow();
         let Some(mut parsed) = world.main_document_mut() else {
             return;
@@ -1299,6 +1325,41 @@ impl Document {
             return;
         };
         crate::render::resolve_until_settled(&mut parsed.document.base);
+    }
+
+    /// Sets the frame's persisted viewport size without touching its current
+    /// document, for callers that apply it during construction.
+    pub(crate) fn set_viewport_size(&mut self, size: (u32, u32)) {
+        self.viewport_size = size;
+        self.world.borrow().viewport_size.set(size);
+    }
+
+    /// The active document's scrollable content size in CSS pixels, at least
+    /// the frame's viewport
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-getLayoutMetrics>).
+    pub(crate) fn content_size(&mut self) -> (f32, f32) {
+        let (viewport_width, viewport_height) = self.viewport_size;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "viewport sides are at most 4096, exactly representable"
+        )]
+        let mut content = (viewport_width as f32, viewport_height as f32);
+        let world = self.world.borrow();
+        let Some(mut parsed) = world.main_document_mut() else {
+            return content;
+        };
+        let base = &mut parsed.document.base;
+        crate::render::resolve_until_settled(base);
+        if let Some(root) = base
+            .root_node()
+            .children
+            .first()
+            .and_then(|id| base.get_node(*id))
+        {
+            content.0 = content.0.max(root.scroll_width());
+            content.1 = content.1.max(root.scroll_height());
+        }
+        content
     }
 
     /// Parses the accumulated markup as one whole document, installs it, and
@@ -1599,6 +1660,7 @@ impl Document {
                 // failed instead of holding it pending forever.
                 if let Some(handler) = self.blitz_handlers.remove(&id) {
                     Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
+                    self.settle_blitz_layout();
                 }
             }
         }
@@ -1608,12 +1670,16 @@ impl Document {
     /// Applies Blitz's queued resource messages and re-lays out the active
     /// document, so a stylesheet or image arrival is reflected before the
     /// next capture instead of waiting for one to pump the resolve loop.
+    /// The arrival may also be the last one holding the load event.
     fn settle_blitz_layout(&mut self) {
         let world = self.world.borrow();
         let Some(mut parsed) = world.main_document_mut() else {
             return;
         };
         crate::render::resolve_until_settled(&mut parsed.document.base);
+        drop(parsed);
+        drop(world);
+        self.fire_document_load();
     }
 
     pub(in crate::document) fn settle_js_fetch(&mut self, id: i32, outcome: Option<DialOutcome>) {
@@ -1672,10 +1738,23 @@ impl Document {
     }
 
     fn fire_document_load(&mut self) {
-        if self.world.borrow().main_ready_state() == ReadyState::Complete {
+        // `load` only follows `DOMContentLoaded`, which `fire_document_end`
+        // dispatches before calling here.
+        if self.world.borrow().main_ready_state() != ReadyState::Interactive {
             return;
         }
         if self.pending_images > 0 {
+            return;
+        }
+        // Blitz's critical resources (head stylesheets, fonts) delay the load
+        // event too
+        // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+        let pending_critical = self
+            .world
+            .borrow()
+            .main_document()
+            .is_some_and(|parsed| parsed.document.base.has_pending_critical_resources());
+        if pending_critical {
             return;
         }
         self.world
@@ -1721,10 +1800,8 @@ impl Document {
         while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
             let url = fetch.url.as_str().to_owned();
             if let Some(bytes) = self.subresource_bytes.get(&url).cloned() {
-                Box::new(handler).bytes(
-                    url,
-                    blitz_traits::net::Bytes::from(bytes),
-                );
+                Box::new(handler).bytes(url, blitz_traits::net::Bytes::from(bytes));
+                self.settle_blitz_layout();
                 continue;
             }
             self.blitz_handlers.insert(fetch.id, handler);

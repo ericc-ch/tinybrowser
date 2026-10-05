@@ -556,15 +556,10 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
-    let (width, height) = world(&ctx)
-        .ok()
-        .and_then(|world| {
-            world
-                .borrow()
-                .main_document()
-                .map(|parsed| parsed.document.base.viewport().window_size)
-        })
-        .unwrap_or((crate::engine::VIEWPORT_WIDTH, crate::engine::VIEWPORT_HEIGHT));
+    let (width, height) = world(&ctx).ok().map_or_else(
+        || crate::engine::DEFAULT_VIEWPORT,
+        |world| world.borrow().viewport_size.get(),
+    );
     vec![f64::from(width), f64::from(height)]
 }
 
@@ -1265,6 +1260,45 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
     Ok(rquickjs::String::from_str(ctx.clone(), text)?.into_value())
 }
 
+/// The HTML rules for parsing non-negative integers: skip ASCII whitespace,
+/// require an ASCII digit, then consume digits (modulo 2^32) and ignore
+/// whatever follows them
+/// (<https://infra.spec.whatwg.org/#rules-for-parsing-non-negative-integers>).
+///
+/// Divergence: Chromium returns the reflection default for values that
+/// overflow `unsigned long` (a canvas `width="4294967296"` reads 300 there)
+/// where the IDL conversion wraps to 0.
+pub(crate) fn parse_non_negative_integer(value: &str) -> Option<u32> {
+    let mut chars = value.chars().peekable();
+    while chars.peek().is_some_and(char::is_ascii_whitespace) {
+        chars.next();
+    }
+    if !chars.peek().is_some_and(char::is_ascii_digit) {
+        return None;
+    }
+    let mut result = 0_u32;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        result = result.wrapping_mul(10).wrapping_add(digit);
+        chars.next();
+    }
+    Some(result)
+}
+
+/// Rebinds the `document` global to the realm world's active document. A realm
+/// created while a navigation response was still streaming bound the outgoing
+/// document; the installed one arrives later.
+pub(crate) fn refresh_document_global(ctx: &Ctx<'_>) -> Result<()> {
+    let world = world(ctx)?;
+    let document_id = world.borrow().with_main_document(|parsed| NodeId {
+        document: parsed.id,
+        node: parsed.document.base.root_node().id,
+    });
+    if let Some(id) = document_id {
+        ctx.globals().set("document", wrap_node(ctx, id)?)?;
+    }
+    Ok(())
+}
+
 /// A DOM string as a JavaScript string value, preserving every code unit.
 pub(crate) fn dom_string<'js>(
     ctx: &Ctx<'js>,
@@ -1725,7 +1759,12 @@ mod realm_tests {
             pending_storage: Rc::new(RefCell::new(Vec::new())),
             font_ctx: parley::FontContext::default(),
         };
-        let mut world = World::new(Url::parse(url).expect("test url"), FrameId::MAIN, &runtime);
+        let mut world = World::new(
+            Url::parse(url).expect("test url"),
+            FrameId::MAIN,
+            &runtime,
+            Rc::new(RefCell::new(Vec::new())),
+        );
         let id = world.replace_document(crate::parse_html(
             html,
             blitz_dom::DocumentConfig::default(),

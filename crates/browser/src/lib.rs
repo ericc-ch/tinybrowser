@@ -31,8 +31,8 @@ pub use browser::{Browser, BrowserError, BrowserHandle, BrowserOpenError, Browse
 pub use net::{Agent, AgentOptions, CookieRecord, CookieSameSite};
 pub use profile::{Profile, ProfileError, ProfileName, default_data_home};
 pub use renderer::{
-    FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure,
-    ScriptSource, TabError,
+    DEFAULT_VIEWPORT, FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest,
+    ScriptFailure, ScriptSource, TabError,
 };
 
 /// Chrome-compatible identity sent by the browser and exposed through CDP.

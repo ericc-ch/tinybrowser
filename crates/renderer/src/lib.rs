@@ -30,13 +30,13 @@ mod xml;
 
 pub use document::Stop;
 pub use embedded::EmbeddedRenderer;
-pub use engine::Engine;
+pub use engine::{DEFAULT_VIEWPORT, Engine};
 pub use protocol::{
     BrowserServices, BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialKind,
     DialOutcome, DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost,
-    Mount, NetworkHost, RendererEvent, ResourceLimit, STORAGE_QUOTA_BYTES, ScreenshotClip,
-    ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError, StorageHost,
-    StorageKind, TabError,
+    Mount, NetworkHost, RendererEvent, ResourceLimit, ResponseHead, STORAGE_QUOTA_BYTES,
+    ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError,
+    StorageHost, StorageKind, TabError,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

@@ -251,6 +251,30 @@ pub struct Mount {
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
     #[serde(default)]
     pub viewport: Option<(u32, u32)>,
+    /// Page-scoped init scripts to register before the document's realm runs
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
+    #[serde(default)]
+    pub init_scripts: Vec<(u64, String)>,
+}
+
+/// The document state a streaming response starts from: everything a
+/// [`Mount`] carries except the body.
+#[derive(Clone, Debug, Default)]
+pub struct ResponseHead {
+    /// Absolute document URL.
+    pub url: String,
+    /// HTTP `Content-Type`, when the document came from the network.
+    pub content_type: Option<String>,
+    /// HTTP `Content-Language`, when the document came from the network.
+    pub content_language: Option<String>,
+    /// Session history visible in the newly opened document.
+    pub history: HistorySnapshot,
+    /// Emulated viewport size to apply before the document lays out, when the
+    /// browser has one.
+    pub viewport: Option<(u32, u32)>,
+    /// Page-scoped init scripts to register before the document's realm runs
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
+    pub init_scripts: Vec<(u64, String)>,
 }
 
 /// Browser-owned history state passed to a newly created document realm.
@@ -304,10 +328,11 @@ pub enum DialKind {
 /// One screenshot request: viewport size plus an optional crop window.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScreenshotRequest {
-    /// Viewport width in CSS pixels.
-    pub viewport_width: f32,
-    /// Viewport height in CSS pixels.
-    pub viewport_height: f32,
+    /// Capture surface width in device pixels: at least the clip extent, so a
+    /// clip beyond the persistent viewport still rasterizes.
+    pub viewport_width: u32,
+    /// Capture surface height in device pixels.
+    pub viewport_height: u32,
     /// Crop window in CSS pixels, when the caller wants less than the
     /// viewport (Playwright's `clip`).
     pub clip: Option<ScreenshotClip>,
