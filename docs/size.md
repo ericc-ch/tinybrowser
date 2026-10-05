@@ -23,6 +23,7 @@ lld `--icf=all`; release-bin RELR + `.eh_frame` removal in `tools/release`).
 | tiny-skia / png | +214KB / +86KB | paint + encode |
 | Taffy layout | +304KB | probe |
 | Parley + skrifa | +883KB | shaping; floor |
-| Blitz stack | +6.7MB | rejected: needs its DOM + vello |
+| Blitz stack | +6.7MB | pre-adoption full-stack probe (window/GPU wiring); adopted shape differs, see below |
+| vello_cpu backend | +1.6MB | measured 2026-10-06: null-`PaintScene` swap on `blitz-adopt` (12,030,744 → 10,423,592 stripped). Drops `anyrender_vello_cpu`, `vello_cpu`, `vello_common`, `glifo`, `fearless_simd`, `guillotiere`; `blitz-paint`/`anyrender`/`peniko` stay linked |
 
 Watchlist: keep one `JsNode`; no native class per element.

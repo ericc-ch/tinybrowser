@@ -4,7 +4,7 @@ Goal: Finish the Blitz 0.3.0-beta.2 cutover on `blitz-adopt`: Blitz owns parse/s
 
 Plan: Land forward commits on `blitz-adopt` (no history rewrite), verify each batch with `tools/check` and `cargo test --workspace`, record size and upstream Blitz limitations in `docs/progress.md`, and compare real pages against Chromium to find gaps.
 
-State: clean tree, branch `blitz-adopt` two commits ahead of the PR #41 merge `6ab35db` (`b59a052` review fixes + this handoff), not pushed. PR #41 (plain non-blocking logger) is merged as `6ab35db`; the review commits were rebased on top. The code-review findings from `9414c02..4013b20` are fixed. Gates on this revision: `tools/check` green, `cargo test --workspace` green, full Playwright gate 39 passed / 4 failed (all four are pre-existing form gaps listed below, not from this round). WPT `dom/nodes` retest, release-size re-measure, and push are outstanding.
+State: clean tree, branch `blitz-adopt` three commits ahead of the PR #41 merge `6ab35db` (`3206088` single-decode + handoff), not pushed. PR #41 (plain non-blocking logger) is merged as `6ab35db`; the review commits were rebased on top. The code-review findings from `9414c02..4013b20` are fixed. Gates on `3206088`: `tools/check` green, `cargo test --workspace` green, `saucedemo.spec.ts` passed (full Playwright gate not rerun on this commit; was 39/43 on `b59a052` with four pre-existing form gaps). WPT `dom/nodes` retest and push are outstanding.
 
 Done (this round, `b59a052`):
 
@@ -32,7 +32,7 @@ Unfinished:
 - `document.styleSheets` / `document.fonts` are still undefined (real `StyleSheetList`/`FontFaceSet` over Blitz needed); `document.images`/`document.scripts` absent (cheap `HTMLCollection`s).
 - GitHub heading wraps greedily where Chromium balances two lines (`text-wrap: balance` unsupported).
 - WPT `dom/nodes` regressions unverified since the cleanup commits (11 OK-to-ERROR/TIMEOUT/CRASH files listed in the previous handoff). Needs approval: retest just those files with `tools/wpt`.
-- Release size not re-measured since `4ecd798`; `docs/progress.md` still records `11,985,160 bytes (2026-10-05)`. Run `nix develop --command ./tools/release` and update only the latest size, latest total, and scored groups.
+- Release size re-measured on `3206088`: `12,030,744 bytes (2026-10-06)`, recorded in `docs/progress.md` (+45,584 vs the 2026-10-05 snapshot across the review fixes, the logging merge, and the single-decode change). Probe: the vello_cpu backend costs ~1.6 MB stripped (null-scene swap: 12,030,744 → 10,423,592; see `docs/size.md`). Push still outstanding.
 - `subresource_bytes` on `Document` has no cap or eviction; cleared only on navigation.
 
 Next:

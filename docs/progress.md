@@ -7,7 +7,7 @@ Size method and marginals live in [`docs/size.md`](size.md).
 
 Policy: minimize stripped size on x86_64; no hard cap.
 
-11,985,160 bytes (2026-10-05)
+12,030,744 bytes (2026-10-06)
 
 ```sh
 nix develop --command ./tools/release
