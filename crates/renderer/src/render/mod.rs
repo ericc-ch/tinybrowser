@@ -1,46 +1,58 @@
 //! Screenshots through Blitz: resolve, paint, encode.
 
 mod blitz;
-mod decode;
 mod png;
 mod providers;
 
 pub(crate) use blitz::{
     INVALID_BASE_URL, MAX_VIEWPORT_SIDE, blitz_base_url, paint, resolve_until_settled,
 };
-pub(crate) use decode::decode_image;
 pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 pub use png::encode_png;
 
-/// Aggregate retained decoded image pixels, and the decode cap for one bitmap.
-pub(crate) const MAX_DECODED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum width or height of a decoded page image.
-pub(crate) const MAX_DECODED_SIDE: u32 = 4096;
+/// Default object size for an `<img>` without intrinsic dimensions
+/// (<https://html.spec.whatwg.org/multipage/rendering.html#images>).
+const DEFAULT_OBJECT_WIDTH: u32 = 300;
+const DEFAULT_OBJECT_HEIGHT: u32 = 150;
 
-/// Whether a premultiplied RGBA bitmap of `width`×`height` fits the decode
-/// and store budget. 4096×4096 RGBA is ~67MiB, over `MAX_DECODED_IMAGE_BYTES`.
-pub(crate) fn decoded_rgba_fits(width: u32, height: u32) -> bool {
-    if width == 0 || height == 0 || width > MAX_DECODED_SIDE || height > MAX_DECODED_SIDE {
-        return false;
+/// Natural size of a decoded SVG image: the declared absolute `width` and
+/// `height` when both resolve to CSS pixels, otherwise the default object
+/// size. Chromium reports the default size even for a `viewBox`-only SVG
+/// (probed 2026-10-06: `viewBox="0 0 20 10"` with no width/height answers
+/// 300x150), so the viewBox only sizes paint, never
+/// `naturalWidth`/`naturalHeight`.
+pub(crate) fn svg_natural_size(svg: &blitz_dom::node::SvgImageData) -> (u32, u32) {
+    let dims = &svg.intrinsic_dimensions;
+    if let (Some(width), Some(height)) = (dims.width, dims.height)
+        && let (Some(width), Some(height)) = (absolute_px(width), absolute_px(height))
+    {
+        return (width, height);
     }
-    let Ok(width) = usize::try_from(width) else {
-        return false;
-    };
-    let Ok(height) = usize::try_from(height) else {
-        return false;
-    };
-    width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .is_some_and(|bytes| bytes <= MAX_DECODED_IMAGE_BYTES)
+    (DEFAULT_OBJECT_WIDTH, DEFAULT_OBJECT_HEIGHT)
 }
 
-/// One decoded image in premultiplied RGBA form.
-#[derive(Clone, Debug)]
-pub(crate) struct RasterImage {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) data: Vec<u8>,
+/// `length` in CSS pixels, if it is an absolute SVG length. Relative units
+/// (`em`, `ex`, `%`) have no meaning without layout context.
+fn absolute_px(length: svgtypes::Length) -> Option<u32> {
+    use svgtypes::LengthUnit;
+    let px = match length.unit {
+        LengthUnit::None | LengthUnit::Px => length.number,
+        LengthUnit::In => length.number * 96.0,
+        LengthUnit::Cm => length.number * 96.0 / 2.54,
+        LengthUnit::Mm => length.number * 96.0 / 25.4,
+        LengthUnit::Pt => length.number * 96.0 / 72.0,
+        LengthUnit::Pc => length.number * 16.0,
+        LengthUnit::Em | LengthUnit::Ex | LengthUnit::Percent => return None,
+    };
+    if !px.is_finite() || px <= 0.0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "finite and positive; `as` saturates at u32::MAX instead of wrapping"
+    )]
+    Some(px.floor() as u32)
 }
 
 /// One rendered viewport, 8 bits per channel, straight (non-premultiplied)

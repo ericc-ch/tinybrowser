@@ -2637,7 +2637,6 @@ dependencies = [
  "icu_provider",
  "icu_provider_adapters",
  "icu_provider_blob",
- "image-webp",
  "markup5ever",
  "parley",
  "png",
@@ -2646,13 +2645,12 @@ dependencies = [
  "serde_json",
  "stylo",
  "stylo_traits",
+ "svgtypes",
  "tokio",
  "url",
  "webidl-bindgen",
  "webstorage",
  "writeable",
- "zune-core",
- "zune-jpeg",
 ]
 
 [[package]]

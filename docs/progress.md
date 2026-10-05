@@ -313,7 +313,7 @@ Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail clo
 - `blitz-dom` has no shadow DOM: no shadow roots, `attachShadow` never hosts, `ShadowRoot` brand never instantiates, `getComposedRanges` / composed options are no-ops.
 - `blitz-dom` has no template contents: `<template>` children live as ordinary element children.
 - `blitz-dom` keeps no form-control state: no dirty value flag, checkedness, selectedness, or indeterminate slots; values read from content attributes and descendant text, `select` events have no producer, form-state cloning carries structure only.
-- `blitz-dom` exposes no image-element state: `image_cache` / `pending_images` are `pub(crate)` with no public read API, so `complete` / `naturalWidth` / `currentSrc` / broken flag and `load` / `error` events come from our own dial + decode instead of Blitz bytes (SVG paints in Blitz but errors in our map until rasterization is rewired).
+- `blitz-dom` exposes no image-request state: `image_cache` / `pending_images` are `pub(crate)`, so request tracking (selected `currentSrc`, loading/broken flags, `load` / `error` events) stays ours; the decoded result itself is public (`ElementData::image_data`), so `naturalWidth` / `naturalHeight` and the `load` / `error` decision read Blitz state with no second decode. SVG and GIF `<img>` now load like Chromium.
 - `blitz-dom` exposes no public visibility helper: one `style::` use remains for the `visibility` check.
 - `blitz-dom` styles with hardcoded `NoQuirks` internally, so `document.compatMode` (sniffed from the doctype) can disagree with the rendering mode.
 - `blitz-dom` puts `AnonymousBlock` layout boxes in the same tree; we treat them as transparent (snapshot/serialize children only, never brand as elements).

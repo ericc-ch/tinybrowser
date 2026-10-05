@@ -8,6 +8,7 @@ State: clean tree, branch `blitz-adopt` two commits ahead of the PR #41 merge `6
 
 Done (this round, `b59a052`):
 
+- Single image decode: our `<img>` dial and `render/decode.rs` (zune-jpeg, image-webp, 32 MiB pixel budget) are deleted. Blitz's fetch is the only fetch; `<img>` requests are waiters settled from Blitz's public `ElementData::image_data` on each delivery (`load` with natural dims, `error` otherwise). SVG natural size is declared absolute width/height else the 300x150 default object size (Chromium answers 300x150 even for viewBox-only SVG, probed 2026-10-06); SVG and GIF `<img>` now load instead of erroring.
 - `6ab35db` — merged PR #41: the logging crate is a plain non-blocking logger (`logging::install(level, file)`; `Config`/`Logger`/`ParseLevelError` deleted). Call sites keep using the macros; `src/main.rs` and `tests/renderer_process.rs` were updated by the PR. Rebased the review commits on top.
 
 - Init scripts are tab state: `Tab.init_scripts` with caller-assigned ids, `Mount`/`ResponseStart` replay the list on every renderer acquisition, every frame's world shares it (parsed and script-created child frames run it), `runImmediately` evaluates in existing frames, `remove` stops future documents. `worldName` is accepted but runs in the main world (no isolated worlds; Playwright's utility registration uses an empty source).

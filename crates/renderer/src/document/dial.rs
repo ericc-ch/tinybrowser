@@ -114,7 +114,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         DialContext::FrameLoad { .. } => DialKind::FrameLoad,
         // Plain page subresources; no carrier policy keys off the kind
         // except for script-initiated fetches.
-        DialContext::Image { .. } | DialContext::BlitzResource { .. } => DialKind::Image,
+        DialContext::BlitzResource { .. } => DialKind::Image,
     };
     DialRequest {
         kind,

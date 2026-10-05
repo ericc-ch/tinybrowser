@@ -81,12 +81,6 @@ pub(crate) enum DialContext {
         element: crate::js::world::NodeId,
         epoch: u64,
     },
-    /// An `<img>` resource selected by its `src` attribute.
-    Image {
-        element: crate::js::world::NodeId,
-        epoch: u64,
-        generation: u64,
-    },
     /// A child frame's own navigation
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>);
     /// a superseded load is dropped when it completes.
@@ -212,8 +206,11 @@ pub(crate) struct Document {
     >,
     /// Filed Blitz response handlers by fetch id, delivered on completion.
     blitz_handlers: HashMap<u64, crate::render::CountingHandler>,
-    /// Raw subresource bytes by URL, shared between our image dials and
-    /// Blitz fetches so the second fetch for a URL reuses bytes.
+    /// Request URL for each filed Blitz handler, so an image delivery settles
+    /// the `<img>` waiters selected for that URL.
+    blitz_request_urls: HashMap<u64, String>,
+    /// Raw subresource bytes by URL, so a repeat Blitz fetch for a URL reuses
+    /// bytes instead of dialing again.
     subresource_bytes: HashMap<String, Vec<u8>>,
     /// The browsing context this document belongs to.
     frame: FrameId,
@@ -235,14 +232,12 @@ pub(crate) struct Document {
     in_flight_dials: usize,
     fetch_cancellations: HashMap<(u64, i32), crate::protocol::DialCancellation>,
     queued_dials: Vec<QueuedDial>,
-    /// Image fetches queued or in flight. They delay the document load event.
-    pending_images: usize,
-    /// Per-element fetch generation so a superseded `src` completion is ignored.
-    image_generations: HashMap<crate::js::world::NodeId, u64>,
-    /// Selected source URL for the current generation
+    /// `<img>` elements awaiting Blitz image state. They delay the document
+    /// load event; Blitz fetches and decodes, we only watch.
+    /// Selected source URL for the current request
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     image_selected_src: HashMap<crate::js::world::NodeId, String>,
-    /// Elements with an in-flight image fetch for the current generation.
+    /// Elements with an unresolved image request for the current generation.
     in_flight_images: HashSet<crate::js::world::NodeId>,
     /// Connected `<img>` elements the last lifecycle scan saw, so insertion
     /// starts a fetch and removal drops one
@@ -326,6 +321,7 @@ impl Document {
             blitz_nav,
             blitz_fetch_rx: blitz_rx,
             blitz_handlers: HashMap::new(),
+            blitz_request_urls: HashMap::new(),
             subresource_bytes: HashMap::new(),
             frame,
             viewport_size: crate::engine::DEFAULT_VIEWPORT,
@@ -340,8 +336,6 @@ impl Document {
             in_flight_dials: 0,
             fetch_cancellations: HashMap::new(),
             queued_dials: Vec::new(),
-            pending_images: 0,
-            image_generations: HashMap::new(),
             image_selected_src: HashMap::new(),
             in_flight_images: HashSet::new(),
             connected_images: HashSet::new(),
@@ -557,9 +551,8 @@ impl Document {
         self.queue_image(element, false);
     }
 
-    /// Drops a disconnected `<img>`'s decoded pixels and ignores in-flight fetches.
+    /// Drops a disconnected `<img>`'s decoded size and ignores its waiter.
     pub(crate) fn disconnect_image(&mut self, element: crate::js::world::NodeId) {
-        self.bump_image_generation(element);
         self.in_flight_images.remove(&element);
         self.image_selected_src.remove(&element);
         self.world.borrow_mut().forget_image(element);
@@ -1158,12 +1151,11 @@ impl Document {
         for (_, handler) in self.blitz_handlers.drain() {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
         }
+        self.blitz_request_urls.clear();
         while self.blitz_fetch_rx.try_recv().is_ok() {}
         self.subresource_bytes.clear();
         self.world.borrow_mut().clear_images();
         self.world.borrow_mut().take_image_updates();
-        self.pending_images = 0;
-        self.image_generations.clear();
         self.image_selected_src.clear();
         self.in_flight_images.clear();
         self.connected_images.clear();
@@ -1536,41 +1528,6 @@ impl Document {
                     self.resume_scripts();
                 }
             }
-            DialContext::Image {
-                element,
-                epoch,
-                generation,
-            } => {
-                if epoch != self.js_epoch {
-                    return;
-                }
-                self.record_event(RendererEvent::Fetch {
-                    status: outcome.status,
-                });
-                self.pending_images = self.pending_images.saturating_sub(1);
-                if (200..300).contains(&outcome.status) {
-                    self.subresource_bytes
-                        .insert(outcome.final_url.clone(), outcome.body.clone());
-                }
-                if self.image_generation(element) == generation {
-                    self.in_flight_images.remove(&element);
-                    let selected = self.image_selected_src.remove(&element).unwrap_or_default();
-                    let loaded = (200..300).contains(&outcome.status)
-                        && crate::render::decode_image(&outcome.body).is_some_and(|image| {
-                            self.world
-                                .borrow_mut()
-                                .store_image(element, image, selected.clone())
-                        });
-                    if loaded {
-                        self.fire_js(|js| js.fire_node_load(element));
-                    } else {
-                        self.world.borrow_mut().fail_image(element, selected);
-                        self.fire_js(|js| js.fire_node_error(element));
-                    }
-                    self.adopt_js_work();
-                }
-                self.fire_document_load();
-            }
             DialContext::FrameLoad { sequence } => {
                 // The superseded-load early return deliberately skips the
                 // trailing `adopt_js_work()` below.
@@ -1602,6 +1559,7 @@ impl Document {
                         .insert(outcome.final_url.clone(), outcome.body.clone());
                 }
                 if let Some(handler) = self.blitz_handlers.remove(&id) {
+                    let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
                     Box::new(handler).bytes(
                         outcome.final_url.clone(),
                         blitz_traits::net::Bytes::from(outcome.body),
@@ -1610,6 +1568,7 @@ impl Document {
                     // tree is current for the next capture instead of waiting
                     // for one to pump the resolve loop.
                     self.settle_blitz_layout();
+                    self.settle_image_waiters(&request_url);
                 }
             }
         }
@@ -1630,23 +1589,6 @@ impl Document {
                     self.resume_scripts();
                 }
             }
-            DialContext::Image {
-                element,
-                epoch,
-                generation,
-            } => {
-                if epoch == self.js_epoch {
-                    self.pending_images = self.pending_images.saturating_sub(1);
-                    if self.image_generation(element) == generation {
-                        self.in_flight_images.remove(&element);
-                        let selected = self.image_selected_src.remove(&element).unwrap_or_default();
-                        self.world.borrow_mut().fail_image(element, selected);
-                        self.fire_js(|js| js.fire_node_error(element));
-                        self.adopt_js_work();
-                    }
-                    self.fire_document_load();
-                }
-            }
             DialContext::FrameLoad { sequence } => {
                 if sequence == self.frame_load_sequence {
                     // Keep the frame's current (about:blank) document; the
@@ -1659,8 +1601,10 @@ impl Document {
                 // Deliver empty bytes so Blitz releases the resource as
                 // failed instead of holding it pending forever.
                 if let Some(handler) = self.blitz_handlers.remove(&id) {
+                    let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
                     Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
                     self.settle_blitz_layout();
+                    self.settle_image_waiters(&request_url);
                 }
             }
         }
@@ -1743,7 +1687,7 @@ impl Document {
         if self.world.borrow().main_ready_state() != ReadyState::Interactive {
             return;
         }
-        if self.pending_images > 0 {
+        if !self.in_flight_images.is_empty() {
             return;
         }
         // Blitz's critical resources (head stylesheets, fonts) delay the load
@@ -1764,8 +1708,8 @@ impl Document {
         self.maybe_fire_load();
     }
 
-    /// Queues the current document's `<img src>` resources. Image requests
-    /// delay the load event until they succeed or fail
+    /// Registers the current document's `<img src>` requests as Blitz image
+    /// waiters. Image requests delay the load event until they succeed or fail
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     fn load_images(&mut self) {
         let images: Vec<crate::js::world::NodeId> = self
@@ -1800,10 +1744,12 @@ impl Document {
         while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
             let url = fetch.url.as_str().to_owned();
             if let Some(bytes) = self.subresource_bytes.get(&url).cloned() {
-                Box::new(handler).bytes(url, blitz_traits::net::Bytes::from(bytes));
+                Box::new(handler).bytes(url.clone(), blitz_traits::net::Bytes::from(bytes));
                 self.settle_blitz_layout();
+                self.settle_image_waiters(&url);
                 continue;
             }
+            self.blitz_request_urls.insert(fetch.id, url);
             self.blitz_handlers.insert(fetch.id, handler);
             // The Fetch initiator is the document, not the fetch target: the
             // provider never sees the document URL, so it stamps the target
@@ -1818,20 +1764,15 @@ impl Document {
         }
     }
 
-    fn image_generation(&self, element: crate::js::world::NodeId) -> u64 {
-        self.image_generations.get(&element).copied().unwrap_or(0)
-    }
-
-    fn bump_image_generation(&mut self, element: crate::js::world::NodeId) -> u64 {
-        let generation = self.image_generations.entry(element).or_insert(0);
-        *generation = generation.wrapping_add(1);
-        *generation
-    }
-
-    /// Starts or replaces the fetch for one `<img>`.
+    /// Registers the current `<img>` request as a waiter on Blitz image
+    /// state. Blitz fetches and decodes on its own — initial parse,
+    /// insertion, and `src` sets all run through its loader — so this only
+    /// watches: a request Blitz already settled (its image cache, or a
+    /// delivery that beat this registration) settles here, otherwise the
+    /// Blitz delivery for the selected URL settles it.
     ///
-    /// `force` is a `src` mutation: a connected insert skips work when a fetch
-    /// or decoded image is already current.
+    /// `force` is a `src` mutation: a connected insert skips work when a
+    /// request is already in flight or decoded.
     pub(in crate::document) fn queue_image(
         &mut self,
         element: crate::js::world::NodeId,
@@ -1843,8 +1784,6 @@ impl Document {
         {
             return;
         }
-        let generation = self.bump_image_generation(element);
-        self.in_flight_images.insert(element);
         let src = self.world.borrow().document(element).and_then(|parsed| {
             crate::js::world::is_html_element(&parsed.document.base, element.node, "img")
                 .then(|| {
@@ -1867,34 +1806,71 @@ impl Document {
             self.fire_js(|js| js.fire_node_error(element));
             return;
         };
-        let initiator = self.url.clone();
         let selected = url.as_str().to_owned();
         self.image_selected_src.insert(element, selected.clone());
         self.world.borrow_mut().begin_image(element, selected.clone());
-        if let Some(bytes) = self.subresource_bytes.get(&selected).cloned()
-            && let Some(image) = crate::render::decode_image(&bytes)
-            && self
-                .world
-                .borrow_mut()
-                .store_image(element, image, selected.clone())
-        {
-            self.in_flight_images.remove(&element);
+        if let Some((width, height)) = self.blitz_image_dims(element) {
             self.image_selected_src.remove(&element);
+            self.world
+                .borrow_mut()
+                .store_image_dims(element, width, height, selected);
             self.fire_js(|js| js.fire_node_load(element));
             self.fire_document_load();
             return;
         }
-        self.queued_dials.push(QueuedDial::get(
-            DialContext::Image {
-                element,
-                epoch: self.js_epoch,
-                generation,
-            },
-            url,
-            initiator,
-        ));
-        self.pending_images = self.pending_images.saturating_add(1);
-        self.launch_queued_dials();
+        self.in_flight_images.insert(element);
+    }
+
+    /// Decoded dimensions Blitz holds for `element`'s current request, if it
+    /// decoded one. Blitz decodes synchronously on delivery, so after
+    /// [`Self::settle_blitz_layout`] this is settled for every delivered URL.
+    fn blitz_image_dims(
+        &self,
+        element: crate::js::world::NodeId,
+    ) -> Option<(u32, u32)> {
+        let world = self.world.borrow();
+        let parsed = world.main_document()?;
+        let node = parsed.document.base.get_node(element.node)?;
+        match node.element_data()?.image_data()? {
+            blitz_dom::node::ImageData::Raster(raster) => Some((raster.width, raster.height)),
+            blitz_dom::node::ImageData::Svg(svg) => Some(crate::render::svg_natural_size(svg)),
+            blitz_dom::node::ImageData::None => None,
+        }
+    }
+
+    /// Settles every waiter selected for `url` from Blitz's decoded state:
+    /// decoded dimensions fire `load`, anything else fires `error`.
+    fn settle_image_waiters(&mut self, url: &str) {
+        let waiting: Vec<crate::js::world::NodeId> = self
+            .in_flight_images
+            .iter()
+            .filter(|element| {
+                self.image_selected_src
+                    .get(element)
+                    .is_some_and(|selected| selected == url)
+            })
+            .copied()
+            .collect();
+        for element in &waiting {
+            self.in_flight_images.remove(element);
+            let selected = self.image_selected_src.remove(element).unwrap_or_default();
+            if let Some((width, height)) = self.blitz_image_dims(*element) {
+                self.world.borrow_mut().store_image_dims(
+                    *element,
+                    width,
+                    height,
+                    selected,
+                );
+                self.fire_js(|js| js.fire_node_load(*element));
+            } else {
+                self.world.borrow_mut().fail_image(*element, selected);
+                self.fire_js(|js| js.fire_node_error(*element));
+            }
+            self.adopt_js_work();
+        }
+        if !waiting.is_empty() {
+            self.fire_document_load();
+        }
     }
 
     /// Fires this document's `load` event once it and every child browsing

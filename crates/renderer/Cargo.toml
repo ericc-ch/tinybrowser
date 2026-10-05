@@ -42,12 +42,8 @@ serde = { version = "1", features = ["derive"] }
 
 parley = { version = "0.11", default-features = false, features = ["libm"] }
 png = "0.18"
-# JPEG/WebP stay pure Rust: the workspace denies `unsafe_code`, and C codecs
-# (libjpeg/libwebp) need FFI. native-tls already dynlinks libssl; jpeg/webp
-# are not a given on the host, and the wasm crate cannot use those .so files.
-zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
-zune-core = { version = "0.5.3", default-features = false, features = ["std"] }
-image-webp = "0.2.4"
+# SVG `naturalWidth`/`naturalHeight` read Blitz's parsed intrinsic lengths.
+svgtypes = "0.16"
 style = { package = "stylo", version = "0.20" }
 style_traits = { package = "stylo_traits", version = "0.20" }
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.

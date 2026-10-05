@@ -11,7 +11,6 @@ use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
 use crate::dom_string::DomString;
-use crate::render::MAX_DECODED_IMAGE_BYTES;
 
 use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
@@ -63,7 +62,6 @@ impl RealmRegistry {
 struct ResourceBudget {
     pending_stream_bytes: usize,
     object_url_bytes: usize,
-    decoded_images: usize,
 }
 
 const MAX_PENDING_STREAM_BYTES: usize = 8 * 1024 * 1024;
@@ -572,8 +570,9 @@ pub(crate) struct World {
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Decoded `<img>` bitmaps for script geometry (`naturalWidth/Height`).
-    pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
+    /// Decoded `<img>` dimensions for script geometry (`naturalWidth/Height`).
+    /// Blitz owns the pixels; this only records the settled size.
+    pub(crate) images: HashMap<NodeId, (u32, u32)>,
     /// `<img>` elements whose current request has not finished, including a
     /// `src` mutation waiting for `update the image data`
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
@@ -593,14 +592,8 @@ impl Drop for World {
             .values()
             .map(|entry| entry.contents.len() + entry.content_type.len())
             .sum::<usize>();
-        let image_bytes = self
-            .images
-            .values()
-            .map(|image| image.data.len())
-            .sum::<usize>();
         let mut budget = self.budget.borrow_mut();
         budget.object_url_bytes = budget.object_url_bytes.saturating_sub(object_bytes);
-        budget.decoded_images = budget.decoded_images.saturating_sub(image_bytes);
         let stream_bytes = self
             .document_stream
             .iter()
@@ -1190,23 +1183,19 @@ impl World {
         }
     }
 
-    /// Retains `image` if the shared decoded-image budget still has room.
-    pub(crate) fn store_image(
+    /// Records Blitz's decoded dimensions for `element`'s current request.
+    pub(crate) fn store_image_dims(
         &mut self,
         element: NodeId,
-        image: crate::render::RasterImage,
+        width: u32,
+        height: u32,
         url: String,
-    ) -> bool {
+    ) {
         self.image_loading.remove(&element);
         self.image_broken.remove(&element);
-        self.forget_decoded_pixels(element);
+        self.images.remove(&element);
         self.image_current_src.insert(element, url);
-        let bytes = image.data.len();
-        if !self.reserve_decoded_image_bytes(bytes) {
-            return false;
-        }
-        self.images.insert(element, image);
-        true
+        self.images.insert(element, (width, height));
     }
 
     /// The current request finished without usable pixels. `url` is the
@@ -1214,7 +1203,7 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn fail_image(&mut self, element: NodeId, url: String) {
         self.image_loading.remove(&element);
-        self.forget_decoded_pixels(element);
+        self.images.remove(&element);
         self.image_current_src.insert(element, url);
         self.image_broken.insert(element);
     }
@@ -1223,43 +1212,14 @@ impl World {
         self.image_loading.remove(&element);
         self.image_current_src.remove(&element);
         self.image_broken.remove(&element);
-        self.forget_decoded_pixels(element);
-    }
-
-    fn forget_decoded_pixels(&mut self, element: NodeId) {
-        if let Some(image) = self.images.remove(&element) {
-            self.release_decoded_image_bytes(image.data.len());
-        }
+        self.images.remove(&element);
     }
 
     pub(crate) fn clear_images(&mut self) {
-        let bytes = self
-            .images
-            .values()
-            .map(|image| image.data.len())
-            .sum::<usize>();
         self.images.clear();
         self.image_loading.clear();
         self.image_current_src.clear();
         self.image_broken.clear();
-        self.release_decoded_image_bytes(bytes);
-    }
-
-    fn reserve_decoded_image_bytes(&self, bytes: usize) -> bool {
-        let mut budget = self.budget.borrow_mut();
-        let Some(total) = budget.decoded_images.checked_add(bytes) else {
-            return false;
-        };
-        if total > MAX_DECODED_IMAGE_BYTES {
-            return false;
-        }
-        budget.decoded_images = total;
-        true
-    }
-
-    fn release_decoded_image_bytes(&self, bytes: usize) {
-        let mut budget = self.budget.borrow_mut();
-        budget.decoded_images = budget.decoded_images.saturating_sub(bytes);
     }
 
     pub(crate) fn queue_document_stream(

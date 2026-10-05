@@ -2271,7 +2271,7 @@ fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
         .borrow()
         .images
         .get(&id)
-        .map(|image| (image.width, image.height)))
+        .copied())
 }
 
 /// Current viewport offset for `id`'s document.

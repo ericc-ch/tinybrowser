@@ -88,8 +88,7 @@ impl Document {
 
     pub(crate) fn waiting_for_load(&self) -> bool {
         self.queued_dials.iter().any(|dial| match &dial.context {
-            DialContext::ClassicScript { epoch, .. }
-            | DialContext::Image { epoch, .. } => *epoch == self.js_epoch,
+            DialContext::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
             DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
             // Blitz tracks its own critical resources; ours never gate load.
             DialContext::BlitzResource { .. } | DialContext::JsFetch { .. } => false,
