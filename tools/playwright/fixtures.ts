@@ -29,6 +29,12 @@ export interface Daemon {
   formUrl: string;
   /** Page with a realistic multipart form covering every control type. */
   richUrl: string;
+  /** Gradient, shadow, image, text, and filter pages for Chromium pixel diffs. */
+  gradientUrl: string;
+  shadowUrl: string;
+  imagedUrl: string;
+  textUrl: string;
+  filterUrl: string;
 }
 
 interface Fixtures {
@@ -75,6 +81,33 @@ document.getElementById('name').addEventListener('input', function (event) {
 </script>`;
 
 const STYLES = ".hot { background: #00ff00; width: 60px; height: 60px; }";
+
+/** Paint-focused pages for Chromium pixel diffs. All margin-free and static. */
+const GRADIENT = `<!doctype html><title>gradient</title><style>
+html, body { margin: 0; padding: 0; }
+div { width: 200px; height: 120px; background: linear-gradient(red, blue); }
+</style><div></div>`;
+const SHADOW = `<!doctype html><title>shadow</title><style>
+html, body { margin: 0; padding: 40px; background: #ffffff; }
+div { width: 160px; height: 100px; background: #3366cc; border-radius: 12px;
+  box-shadow: 8px 10px 12px rgba(0, 0, 0, 0.5); }
+</style><div></div>`;
+const IMAGED = `<!doctype html><title>imaged</title><style>
+html, body { margin: 0; padding: 0; }
+</style><img src="/dot.png" width="100" height="100" style="display:block">`;
+const TEXT = `<!doctype html><title>text</title><style>
+html, body { margin: 0; padding: 16px; }
+h1 { font-size: 32px; margin: 0 0 8px 0; }
+p { font-size: 16px; margin: 0 0 8px 0; }
+b { font-weight: bold; }
+</style><h1>Hello pixels</h1><p>The quick brown fox jumps over the lazy dog. <b>Bold words stand out.</b></p><p>Second paragraph with more words to shape and rasterize.</p>`;
+const FILTERED = `<!doctype html><title>filtered</title><style>
+html, body { margin: 0; padding: 0; }
+div { width: 120px; height: 80px; background: #cc3333; filter: blur(3px); }
+</style><div></div>`;
+/** 1x1 red PNG for the image page. */
+const DOT_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 const FORM = `<!doctype html><title>form</title>
 <form id="get-form" method="get" action="/echo">
@@ -166,6 +199,24 @@ export const test = base.extend<Fixtures>({
       } else if (path === "/rich") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(RICH_FORM);
+      } else if (path === "/gradient") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(GRADIENT);
+      } else if (path === "/shadow") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(SHADOW);
+      } else if (path === "/imaged") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(IMAGED);
+      } else if (path === "/text") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(TEXT);
+      } else if (path === "/filtered") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(FILTERED);
+      } else if (path === "/dot.png") {
+        response.writeHead(200, { "content-type": "image/png" });
+        response.end(Buffer.from(DOT_PNG, "base64"));
       } else if (path === "/echo") {
         const chunks: Buffer[] = [];
         request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -224,6 +275,11 @@ export const test = base.extend<Fixtures>({
       interactiveUrl: `http://127.0.0.1:${httpPort}/interactive`,
       formUrl: `http://127.0.0.1:${httpPort}/form`,
       richUrl: `http://127.0.0.1:${httpPort}/rich`,
+      gradientUrl: `http://127.0.0.1:${httpPort}/gradient`,
+      shadowUrl: `http://127.0.0.1:${httpPort}/shadow`,
+      imagedUrl: `http://127.0.0.1:${httpPort}/imaged`,
+      textUrl: `http://127.0.0.1:${httpPort}/text`,
+      filterUrl: `http://127.0.0.1:${httpPort}/filtered`,
     });
 
     try {
