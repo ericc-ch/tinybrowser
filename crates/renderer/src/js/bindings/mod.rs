@@ -438,12 +438,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsEvent>::define(&globals)?;
     crate::js::bridge::evaluate(ctx, events::install_event_ctor_js(ctx)?)?;
     install_webdriver_bridge(ctx)?;
-    globals.set("innerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
-    globals.set("innerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
-    // No browser chrome exists, so the outer window equals the inner viewport
-    // (<https://drafts.csswg.org/cssom-view/#dom-window-outerwidth>).
-    globals.set("outerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
-    globals.set("outerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
+    // `innerWidth`/`innerHeight`/`outerWidth`/`outerHeight` are live getters
+    // defined in the web shims; they read the document viewport so CDP
+    // emulation is visible without re-installing globals
+    // (<https://drafts.csswg.org/cssom-view/#dom-window-innerwidth>).
     crate::js::bridge::object(ctx)?.set(
         "__tb_new_custom_event",
         rquickjs::prelude::Func::from(events::construct_custom_event),
@@ -541,10 +539,33 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
         rquickjs::prelude::Func::from(deliver_mutations),
     )?;
     crate::js::bridge::object(ctx)?.set(
+        "__tb_viewport_size",
+        rquickjs::prelude::Func::from(viewport_size),
+    )?;
+    crate::js::bridge::object(ctx)?.set(
         "__tb_construct",
         rquickjs::prelude::Func::from(construct_node),
     )?;
     Ok(())
+}
+
+/// The active document's viewport size in CSS pixels, for the live `window`
+/// metrics (<https://drafts.csswg.org/cssom-view/#dom-window-innerwidth>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn viewport_size(ctx: Ctx<'_>) -> Result<Vec<f64>> {
+    let (width, height) = world(&ctx)
+        .ok()
+        .and_then(|world| {
+            world
+                .borrow()
+                .main_document()
+                .map(|parsed| parsed.document.base.viewport().window_size)
+        })
+        .unwrap_or((crate::engine::VIEWPORT_WIDTH, crate::engine::VIEWPORT_HEIGHT));
+    Ok(vec![f64::from(width), f64::from(height)])
 }
 
 /// Captures the pristine intrinsics and host entry points every later lookup

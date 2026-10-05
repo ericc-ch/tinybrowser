@@ -67,6 +67,29 @@ pub enum Command {
         url: String,
         history: renderer::HistorySnapshot,
     },
+    /// Registers a script that runs in every new document realm of a frame.
+    AddInitScript {
+        /// Frame to register in.
+        frame: FrameId,
+        /// Script source.
+        source: String,
+    },
+    /// Removes a previously registered init script from a frame.
+    RemoveInitScript {
+        /// Frame the script was registered in.
+        frame: FrameId,
+        /// Identifier returned by [`Command::AddInitScript`].
+        id: u64,
+    },
+    /// Sets a frame's persistent viewport size.
+    SetViewport {
+        /// Frame to resize.
+        frame: FrameId,
+        /// Viewport width in device pixels.
+        width: u32,
+        /// Viewport height in device pixels.
+        height: u32,
+    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -76,6 +99,8 @@ pub enum Reply {
     Unit(Result<(), TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
+    /// Identifier of a registered init script.
+    InitScript(Result<u64, TabError>),
     /// A PNG follows in body frames for this request id; `len` is its exact
     /// byte length. The JSON control plane never carries the bytes.
     Screenshot {
@@ -171,6 +196,10 @@ pub struct ResponseStart {
     pub content_language: Option<String>,
     /// Session history applied before the new realm parses response bytes.
     pub history: renderer::HistorySnapshot,
+    /// Emulated viewport size to apply before the document lays out, when the
+    /// browser has one.
+    #[serde(default)]
+    pub viewport: Option<(u32, u32)>,
 }
 
 /// One renderer-originated browser-service call.
@@ -424,6 +453,7 @@ mod tests {
                         content_type: Some("text/html".into()),
                         content_language: None,
                         history: renderer::HistorySnapshot::default(),
+                        viewport: None,
                     },
                 },
             },
@@ -590,6 +620,7 @@ mod tests {
                     content_type: Some("text/html".into()),
                     content_language: None,
                     history: renderer::HistorySnapshot::default(),
+                    viewport: None,
                 },
             },
         };

@@ -159,6 +159,9 @@ interface engine {
         history-traversal(s32),
         /// A frame reached `readyState = "complete"` and dispatched `load`.
         load,
+        /// A frame finished parsing and dispatched `DOMContentLoaded`;
+        /// subresources may still be loading.
+        dom-content-loaded,
         /// A host timer whose delay elapsed.
         timer(u32),
         /// A `fetch` or classic-script job finished with this HTTP status.

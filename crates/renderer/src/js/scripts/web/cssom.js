@@ -1,3 +1,22 @@
+  // `window` viewport metrics track the live document viewport, so CDP
+  // emulation changes are visible without re-installing globals
+  // (<https://drafts.csswg.org/cssom-view/#dom-window-innerwidth>).
+  const __tbViewportSize = () => host.__tb_viewport_size();
+  Object.defineProperty(globalThis, 'innerWidth', {
+    get: () => __tbViewportSize()[0], configurable: true,
+  });
+  Object.defineProperty(globalThis, 'innerHeight', {
+    get: () => __tbViewportSize()[1], configurable: true,
+  });
+  // No browser chrome exists, so the outer window equals the inner viewport
+  // (<https://drafts.csswg.org/cssom-view/#dom-window-outerwidth>).
+  Object.defineProperty(globalThis, 'outerWidth', {
+    get: () => __tbViewportSize()[0], configurable: true,
+  });
+  Object.defineProperty(globalThis, 'outerHeight', {
+    get: () => __tbViewportSize()[1], configurable: true,
+  });
+
 // Constructable stylesheet surface used by component libraries.
 // https://drafts.csswg.org/cssom/#the-cssstylesheet-interface
 {

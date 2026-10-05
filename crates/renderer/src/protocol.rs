@@ -179,6 +179,10 @@ impl std::error::Error for ScriptFailure {}
 pub enum RendererEvent {
     /// The document reached `readyState = "complete"` and dispatched `load`.
     Load,
+    /// The document finished parsing and dispatched `DOMContentLoaded`
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>);
+    /// subresources may still be loading.
+    DomContentLoaded,
     /// A frame committed a navigation to this URL. The actor re-announces the
     /// top-level document so a `CDP` client re-creates its execution contexts
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
@@ -242,6 +246,11 @@ pub struct Mount {
     /// Session history visible in the newly mounted document.
     #[serde(default)]
     pub history: HistorySnapshot,
+    /// Emulated viewport size to apply before the document lays out, when the
+    /// browser has one
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
+    #[serde(default)]
+    pub viewport: Option<(u32, u32)>,
 }
 
 /// Browser-owned history state passed to a newly created document realm.

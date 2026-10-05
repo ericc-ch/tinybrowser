@@ -50,6 +50,9 @@ pub enum TabEvent {
     SameDocumentNavigation,
     /// The top-level document fired `load`.
     Load,
+    /// The top-level document fired `DOMContentLoaded`; subresources may
+    /// still be loading.
+    DomContentLoaded,
     /// A navigation failed and left the previous document active.
     NavigationFailed,
 }
@@ -86,6 +89,20 @@ enum Command {
         source: renderer::ScriptSource,
         timeout: Option<Duration>,
     },
+    AddInitScript {
+        frame: FrameId,
+        source: String,
+    },
+    RemoveInitScript {
+        frame: FrameId,
+        id: u64,
+    },
+    SetViewport {
+        frame: FrameId,
+        width: u32,
+        height: u32,
+    },
+    ViewportSize,
     Screenshot {
         frame: FrameId,
         request: renderer::ScreenshotRequest,
@@ -107,6 +124,10 @@ enum TabReply {
     LoadHtml(Result<(), TabError>),
     Goto(Result<(), TabError>),
     Execute(Result<RemoteValue, TabError>),
+    InitScript(Result<u64, TabError>),
+    RemoveInitScript(Result<(), TabError>),
+    SetViewport(Result<(), TabError>),
+    ViewportSize((u32, u32)),
     Screenshot(Result<Vec<u8>, TabError>),
     RunUntilLoad(Result<bool, TabError>),
     RunUntilJs(Result<bool, TabError>),
@@ -180,6 +201,35 @@ struct ScreenshotFrame {
     /// Viewport and crop window.
     request: renderer::ScreenshotRequest,
 }
+
+/// Registers an init script in a frame.
+struct AddInitScript {
+    /// Frame to register in.
+    frame: FrameId,
+    /// Script source.
+    source: String,
+}
+
+/// Removes an init script from a frame.
+struct RemoveInitScript {
+    /// Frame the script was registered in.
+    frame: FrameId,
+    /// Identifier returned by the registration.
+    id: u64,
+}
+
+/// Resizes a frame's persistent viewport.
+struct SetViewport {
+    /// Frame to resize.
+    frame: FrameId,
+    /// Viewport width in device pixels.
+    width: u32,
+    /// Viewport height in device pixels.
+    height: u32,
+}
+
+/// Reads a tab's emulated viewport size.
+struct ViewportSize;
 
 /// Waits until the current navigation has fired `load`.
 struct RunUntilLoad {
@@ -328,6 +378,57 @@ impl TabHandle {
         options: ExecuteScriptInOptions<'_>,
     ) -> Result<RemoteValue, TabError> {
         self.ask(options).await?
+    }
+
+    /// The tab's current emulated viewport size in device pixels.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn viewport_size(&self) -> Result<(u32, u32), TabError> {
+        Ok(self.ask(ViewportSize).await?)
+    }
+
+    /// Sets the main frame's persistent viewport size, re-laying out its
+    /// active document.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn set_viewport(&self, width: u32, height: u32) -> Result<(), TabError> {
+        self.ask(SetViewport {
+            frame: FrameId::MAIN,
+            width,
+            height,
+        })
+        .await?
+    }
+
+    /// Registers `source` to run in every new document realm of the main
+    /// frame; returns the identifier used to remove it.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn add_init_script(&self, source: String) -> Result<u64, TabError> {
+        self.ask(AddInitScript {
+            frame: FrameId::MAIN,
+            source,
+        })
+        .await?
+    }
+
+    /// Removes a registered init script.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn remove_init_script(&self, id: u64) -> Result<(), TabError> {
+        self.ask(RemoveInitScript {
+            frame: FrameId::MAIN,
+            id,
+        })
+        .await?
     }
 
     /// Renders the tab's top-level document to a PNG.
@@ -515,6 +616,10 @@ struct ActiveNavigation {
 }
 
 /// Browser-owned tab state: identity, URL, navigation, and renderer link.
+/// Default tab viewport in device pixels, matching the renderer default
+/// before any CDP emulation.
+const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
+
 struct Tab {
     id: TabId,
     renderers: Arc<RendererProcessManager>,
@@ -524,6 +629,9 @@ struct Tab {
     site: Option<Site>,
     events_rx: Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
     document_url: Url,
+    /// Emulated viewport size in device pixels
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
+    viewport: (u32, u32),
     history: SessionHistory,
     traversal: Option<crate::history::EntryId>,
     document_loaded: bool,
@@ -555,6 +663,7 @@ impl Tab {
             site: None,
             events_rx: None,
             document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
+            viewport: DEFAULT_VIEWPORT,
             history: SessionHistory::new(Url::parse("about:blank").expect("about:blank is a valid URL")),
             traversal: None,
             document_loaded: false,
@@ -579,6 +688,7 @@ impl Tab {
             content_language: None,
             body: html.as_bytes().to_vec(),
             history: self.history.snapshot(),
+            viewport: Some(self.viewport),
         };
         if self.renderer.is_none() && self.document_url.scheme() == "about" {
             self.pending_mount = Some(mount);
@@ -849,6 +959,7 @@ impl Tab {
             content_language: outcome.content_language.clone(),
             body: Vec::new(),
             history: history.snapshot(),
+            viewport: Some(self.viewport),
         };
         if self
             .mount_stream(&site, outcome.status, mount, outcome.body)
@@ -884,6 +995,9 @@ impl Tab {
             RendererEvent::Load => {
                 self.document_loaded = true;
                 self.record_event(TabEvent::Load).await;
+            }
+            RendererEvent::DomContentLoaded => {
+                self.record_event(TabEvent::DomContentLoaded).await;
             }
             RendererEvent::HistoryUpdated { url, state, replace } => {
                 if let Ok(url) = Url::parse(url)
@@ -959,6 +1073,7 @@ fn blank_mount() -> Mount {
         content_language: None,
         body: b"<!doctype html><title></title>".to_vec(),
         history: HistorySnapshot::default(),
+        viewport: None,
     }
 }
 
@@ -1128,6 +1243,26 @@ async fn handle_command(
         Command::Screenshot { frame, request } => {
             ScreenshotFrame { frame, request }.serve(ctx).await
         }
+        Command::AddInitScript { frame, source } => {
+            AddInitScript { frame, source }.serve(ctx).await
+        }
+        Command::RemoveInitScript { frame, id } => {
+            RemoveInitScript { frame, id }.serve(ctx).await
+        }
+        Command::SetViewport {
+            frame,
+            width,
+            height,
+        } => {
+            SetViewport {
+                frame,
+                width,
+                height,
+            }
+            .serve(ctx)
+            .await
+        }
+        Command::ViewportSize => ViewportSize.serve(ctx).await,
         Command::RunUntilLoadTimeout { timeout } => RunUntilLoad { timeout }.serve(ctx).await,
         Command::RunUntilJsTrue {
             frame,
@@ -1232,6 +1367,122 @@ impl TabOperation for ExecuteScriptInOptions<'_> {
             .await
             .and_then(reply_value);
         TabOutcome::Reply(TabReply::Execute(result))
+    }
+}
+
+impl TabOperation for AddInitScript {
+    type Output = Result<u64, TabError>;
+
+    fn into_command(self) -> Command {
+        Command::AddInitScript {
+            frame: self.frame,
+            source: self.source,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::InitScript(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        let result = tab
+            .renderer_request(RendererCommand::AddInitScript {
+                frame: self.frame,
+                source: self.source,
+            })
+            .await
+            .and_then(reply_init_script);
+        TabOutcome::Reply(TabReply::InitScript(result))
+    }
+}
+
+impl TabOperation for RemoveInitScript {
+    type Output = Result<(), TabError>;
+
+    fn into_command(self) -> Command {
+        Command::RemoveInitScript {
+            frame: self.frame,
+            id: self.id,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::RemoveInitScript(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        let result = tab
+            .renderer_request(RendererCommand::RemoveInitScript {
+                frame: self.frame,
+                id: self.id,
+            })
+            .await
+            .and_then(reply_unit);
+        TabOutcome::Reply(TabReply::RemoveInitScript(result))
+    }
+}
+
+impl TabOperation for SetViewport {
+    type Output = Result<(), TabError>;
+
+    fn into_command(self) -> Command {
+        Command::SetViewport {
+            frame: self.frame,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::SetViewport(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        let (width, height) = (self.width, self.height);
+        let result = tab
+            .renderer_request(RendererCommand::SetViewport {
+                frame: self.frame,
+                width,
+                height,
+            })
+            .await
+            .and_then(reply_unit);
+        if result.is_ok() {
+            tab.viewport = (width, height);
+        }
+        TabOutcome::Reply(TabReply::SetViewport(result))
+    }
+}
+
+impl TabOperation for ViewportSize {
+    type Output = (u32, u32);
+
+    fn into_command(self) -> Command {
+        Command::ViewportSize
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::ViewportSize(size) => Some(size),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        TabOutcome::Reply(TabReply::ViewportSize(tab.viewport))
     }
 }
 
@@ -1521,6 +1772,13 @@ fn reply_unit(reply: Reply) -> Result<(), TabError> {
 fn reply_value(reply: Reply) -> Result<RemoteValue, TabError> {
     match reply {
         Reply::Value(result) => result,
+        _ => Err(TabError::ActorStopped),
+    }
+}
+
+fn reply_init_script(reply: Reply) -> Result<u64, TabError> {
+    match reply {
+        Reply::InitScript(result) => result,
         _ => Err(TabError::ActorStopped),
     }
 }

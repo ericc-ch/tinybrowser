@@ -111,6 +111,7 @@ impl GuestTab for Tab {
             content_language: None,
             body: html.into_bytes(),
             history: renderer::HistorySnapshot::default(),
+            viewport: None,
         };
         renderer.mount(&mount).map_err(|error| error.to_string())?;
         Ok(Self {
@@ -181,6 +182,7 @@ fn to_event(event: RendererEvent) -> Event {
         }
         RendererEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
         RendererEvent::Load => Event::Load,
+        RendererEvent::DomContentLoaded => Event::DomContentLoaded,
         RendererEvent::Timer(id) => Event::Timer(id),
         RendererEvent::Fetch { status } => Event::Fetch(status),
         RendererEvent::FetchFailed => Event::FetchFailed,

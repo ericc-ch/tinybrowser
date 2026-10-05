@@ -193,8 +193,14 @@ fn handle_request(
             Command::Screenshot { .. } => Reply::Screenshot {
                 result: Err(stream_error("unknown assignment")),
             },
-            Command::WindowMessage { .. } | Command::HistoryTraverse { .. } => {
+            Command::RemoveInitScript { .. }
+            | Command::SetViewport { .. }
+            | Command::WindowMessage { .. }
+            | Command::HistoryTraverse { .. } => {
                 Reply::Unit(Err(stream_error("unknown assignment")))
+            }
+            Command::AddInitScript { .. } => {
+                Reply::InitScript(Err(stream_error("unknown assignment")))
             }
         };
         return send_to_browser(
@@ -354,6 +360,7 @@ impl ResponseStreams {
             response.content_type.as_deref(),
             response.content_language.as_deref(),
             &response.history,
+            response.viewport,
         )?;
         self.active.insert(
             id,
@@ -521,6 +528,17 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
             let value = engine.execute_remote_in(frame, source.as_ref(), timeout);
             Handled::Reply(Reply::Value(value))
         }
+        Command::AddInitScript { frame, source } => {
+            Handled::Reply(Reply::InitScript(engine.add_init_script(frame, source)))
+        }
+        Command::RemoveInitScript { frame, id } => {
+            Handled::Reply(Reply::Unit(engine.remove_init_script(frame, id)))
+        }
+        Command::SetViewport {
+            frame,
+            width,
+            height,
+        } => Handled::Reply(Reply::Unit(engine.set_viewport(frame, width, height))),
         Command::Screenshot { frame, request } => match engine.screenshot_frame(frame, &request) {
             Ok(png) => Handled::Screenshot(png),
             Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),

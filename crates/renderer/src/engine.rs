@@ -20,11 +20,11 @@ use url::Url;
 use crate::RemoteValue;
 use crate::document::{Document, FrameRuntime, Stop, WindowMessage};
 
-/// The engine's virtual viewport in CSS pixels, shared with the JS bindings
-/// (`innerWidth`/`innerHeight`).
-pub(crate) const VIEWPORT_WIDTH: f32 = 800.0;
+/// The engine's default frame viewport in device pixels, used until CDP
+/// emulation (or a mount) sets another size.
+pub(crate) const VIEWPORT_WIDTH: u32 = 800;
 /// See [`VIEWPORT_WIDTH`].
-pub(crate) const VIEWPORT_HEIGHT: f32 = 600.0;
+pub(crate) const VIEWPORT_HEIGHT: u32 = 600;
 
 use crate::documents::DocumentStore;
 use crate::js::{
@@ -170,11 +170,12 @@ impl Engine {
         content_type: Option<&str>,
         content_language: Option<&str>,
         history: &crate::protocol::HistorySnapshot,
+        viewport: Option<(u32, u32)>,
     ) -> Result<(), TabError> {
         self.remove_descendants(frame);
         let document = self.frame_mut(frame)?;
         document.world().borrow_mut().history = history.clone();
-        document.begin_response(url, content_type, content_language);
+        document.begin_response(url, content_type, content_language, viewport);
         Ok(())
     }
 
@@ -238,6 +239,40 @@ impl Engine {
         result
     }
 
+    /// Sets `frame`'s persistent viewport and re-lays out its active document.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
+    pub fn set_viewport(
+        &mut self,
+        frame: FrameId,
+        width: u32,
+        height: u32,
+    ) -> Result<(), TabError> {
+        self.frame_mut(frame)?.set_viewport(width, height);
+        Ok(())
+    }
+
+    /// Registers a script that runs in every new realm of `frame`.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
+    pub fn add_init_script(&mut self, frame: FrameId, source: String) -> Result<u64, TabError> {
+        Ok(self.frame_mut(frame)?.add_init_script(source))
+    }
+
+    /// Removes a previously registered init script.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
+    pub fn remove_init_script(&mut self, frame: FrameId, id: u64) -> Result<(), TabError> {
+        self.frame_mut(frame)?.remove_init_script(id);
+        Ok(())
+    }
+
     /// Renders one frame to a PNG.
     ///
     /// The document's `<style>` sheets are applied. The viewport and crop
@@ -268,31 +303,17 @@ impl Engine {
                     message: "no document to render".into(),
                 });
             };
-            let width = viewport_pixels(request.viewport_width).map_err(|error| {
-                TabError::Render {
-                    message: error.to_string(),
-                }
-            })?;
-            let height = viewport_pixels(request.viewport_height).map_err(|error| {
-                TabError::Render {
-                    message: error.to_string(),
-                }
-            })?;
-            let viewport = blitz_traits::shell::Viewport::new(
-                width,
-                height,
-                1.0,
-                blitz_traits::shell::ColorScheme::Light,
-            );
-            let previous = parsed.document.base.viewport().clone();
-            parsed.document.base.set_viewport(viewport);
+            // The document viewport is the frame's persistent size (the CDP
+            // emulation or frame default set it), so painting uses it directly
+            // instead of a per-capture override
+            // (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
+            let (width, height) = parsed.document.base.viewport().window_size;
             crate::render::resolve_until_settled(&mut parsed.document.base);
             let image = crate::render::paint(&mut parsed.document.base, width, height).map_err(
                 |error| TabError::Render {
                     message: error.to_string(),
                 },
             )?;
-            parsed.document.base.set_viewport(previous);
             image
         };
         let image = match request.clip {
@@ -1172,21 +1193,4 @@ impl Drop for Engine {
         self.runtime.registry.borrow_mut().clear();
         self.js_runtime.collect();
     }
-}
-
-/// Viewport side in device pixels, validated for paint.
-fn viewport_pixels(value: f32) -> Result<u32, crate::render::RenderError> {
-    if !value.is_finite() || value <= 0.0 {
-        return Err(crate::render::RenderError::InvalidViewport);
-    }
-    let rounded = value.round();
-    if f64::from(rounded) > f64::from(crate::render::MAX_VIEWPORT_SIDE) {
-        return Err(crate::render::RenderError::TooLarge);
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "rounded is finite, positive, and at most 4096, so the cast is exact"
-    )]
-    Ok(rounded as u32)
 }

@@ -25,7 +25,11 @@ pub(crate) const VIEWPORT_HEIGHT: f64 = 600.0;
 /// Largest screenshot dimension the renderer will raster.
 const MAX_SCREENSHOT_DIM: f64 = 4096.0;
 
-pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Value, DispatchError> {
+pub(crate) async fn session_method(
+    method: &str,
+    params: &Value,
+    tab: &TabHandle,
+) -> Result<Value, DispatchError> {
     if noop_method(method) {
         return Ok(json!({}));
     }
@@ -43,32 +47,81 @@ pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Valu
             }}}))
         }
         // Playwright dereferences `visualViewport.pageX/pageY/scale` before
-        // every screenshot, so all three viewports are present.
-        "Page.getLayoutMetrics" => Ok(json!({
-            "layoutViewport": viewport_rect(VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
-            "visualViewport": {
-                "offsetX": 0,
-                "offsetY": 0,
-                "pageX": 0,
-                "pageY": 0,
-                "clientWidth": VIEWPORT_WIDTH,
-                "clientHeight": VIEWPORT_HEIGHT,
-                "scale": 1,
-            },
-            "contentSize": {"x": 0, "y": 0, "width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            "cssLayoutViewport": viewport_rect(VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
-            "cssVisualViewport": {
-                "offsetX": 0,
-                "offsetY": 0,
-                "pageX": 0,
-                "pageY": 0,
-                "clientWidth": VIEWPORT_WIDTH,
-                "clientHeight": VIEWPORT_HEIGHT,
-                "scale": 1,
-            },
-            "cssContentSize": {"x": 0, "y": 0, "width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-        })),
-        "Page.addScriptToEvaluateOnNewDocument" => Ok(json!({"identifier": "1"})),
+        // every screenshot, so all three viewports are present, sized to the
+        // tab's emulated viewport.
+        "Page.getLayoutMetrics" => {
+            let (width, height) = tab
+                .viewport_size()
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            let width = f64::from(width);
+            let height = f64::from(height);
+            Ok(json!({
+                "layoutViewport": viewport_rect(width, height),
+                "visualViewport": {
+                    "offsetX": 0,
+                    "offsetY": 0,
+                    "pageX": 0,
+                    "pageY": 0,
+                    "clientWidth": width,
+                    "clientHeight": height,
+                    "scale": 1,
+                },
+                "contentSize": {"x": 0, "y": 0, "width": width, "height": height},
+                "cssLayoutViewport": viewport_rect(width, height),
+                "cssVisualViewport": {
+                    "offsetX": 0,
+                    "offsetY": 0,
+                    "pageX": 0,
+                    "pageY": 0,
+                    "clientWidth": width,
+                    "clientHeight": height,
+                    "scale": 1,
+                },
+                "cssContentSize": {"x": 0, "y": 0, "width": width, "height": height},
+            }))
+        }
+        "Page.addScriptToEvaluateOnNewDocument" => {
+            let source = params
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let id = tab
+                .add_init_script(source)
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            Ok(json!({"identifier": id.to_string()}))
+        }
+        "Page.removeScriptToEvaluateOnNewDocument" => {
+            if let Some(id) = params
+                .get("identifier")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                tab.remove_init_script(id)
+                    .await
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            }
+            Ok(json!({}))
+        }
+        "Emulation.setDeviceMetricsOverride" => {
+            let width = emulated_side(params.get("width").and_then(Value::as_f64));
+            let height = emulated_side(params.get("height").and_then(Value::as_f64));
+            tab.set_viewport(width, height)
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            Ok(json!({}))
+        }
+        "Emulation.clearDeviceMetricsOverride" => {
+            tab.set_viewport(
+                emulated_side(Some(VIEWPORT_WIDTH)),
+                emulated_side(Some(VIEWPORT_HEIGHT)),
+            )
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            Ok(json!({}))
+        }
         "Page.reload" => {
             let url = tab
                 .document_url()
@@ -126,6 +179,23 @@ pub(crate) fn static_reply(method: &str) -> Option<Value> {
         "Target.attachToBrowserTarget" => json!({"sessionId": "browser"}),
         _ => return None,
     })
+}
+
+/// Emulated viewport side from a CDP `width`/`height` parameter: missing or
+/// invalid values fall back to the renderer cap, and the result is bounded so
+/// a bad client value cannot ask for an unpaintable surface.
+fn emulated_side(value: Option<f64>) -> u32 {
+    let value = value.unwrap_or(MAX_SCREENSHOT_DIM);
+    if !value.is_finite() || value < 1.0 {
+        return 1;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is finite, positive, and capped at MAX_SCREENSHOT_DIM"
+    )]
+    let side = value.min(MAX_SCREENSHOT_DIM) as u32;
+    side
 }
 
 /// Domains whose remaining methods answer an empty result until their real
@@ -199,8 +269,6 @@ fn noop_method(method: &str) -> bool {
             | "Page.setLifecycleEventsEnabled"
             | "Network.enable"
             | "Emulation.setFocusEmulationEnabled"
-            | "Emulation.setDeviceMetricsOverride"
-            | "Emulation.clearDeviceMetricsOverride"
             | "Emulation.setTouchEmulationEnabled"
             | "Emulation.setEmulatedMedia"
             | "Emulation.setScriptExecutionDisabled"

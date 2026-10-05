@@ -526,6 +526,27 @@ impl Conn {
                 attach_session(&mut load, session.as_deref());
                 messages.push(load);
             }
+            TabEvent::DomContentLoaded => {
+                let frame_id = tab.id().to_string();
+                let loader_id = self.loader_ids.get(&tab.id()).cloned().unwrap_or_default();
+                let mut lifecycle = json!({
+                    "method": "Page.lifecycleEvent",
+                    "params": {
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "name": "DOMContentLoaded",
+                        "timestamp": timestamp,
+                    },
+                });
+                attach_session(&mut lifecycle, session.as_deref());
+                messages.push(lifecycle);
+                let mut fired = json!({
+                    "method": "Page.domContentEventFired",
+                    "params": {"timestamp": timestamp},
+                });
+                attach_session(&mut fired, session.as_deref());
+                messages.push(fired);
+            }
             TabEvent::NavigationFailed => {}
         }
         messages
@@ -1008,7 +1029,7 @@ impl Conn {
             "Runtime.evaluate" | "Runtime.callFunctionOn" => {
                 self.dispatch_runtime(method, params, tab).await
             }
-            _ => session_method(method, tab).await,
+            _ => session_method(method, params, tab).await,
         }
     }
 
