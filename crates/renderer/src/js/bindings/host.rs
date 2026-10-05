@@ -498,6 +498,7 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
         "HTMLIFrameElement" => crate::js::world::is_html_tag(data, "iframe"),
         "HTMLFrameElement" => crate::js::world::is_html_tag(data, "frame"),
         "HTMLImageElement" => crate::js::world::is_html_tag(data, "img"),
+        "HTMLCanvasElement" => crate::js::world::is_html_tag(data, "canvas"),
         "HTMLBaseElement" => crate::js::world::is_html_tag(data, "base"),
         "HTMLLinkElement" => crate::js::world::is_html_tag(data, "link"),
         "HTMLMediaElement" => crate::js::world::is_html_tag(data, "audio") || crate::js::world::is_html_tag(data, "video"),

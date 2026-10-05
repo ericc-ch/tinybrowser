@@ -773,7 +773,7 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
                 let result: f64 = #call?;
                 result.into_js(&ctx)
             },
-            ReturnType::NullableNode | ReturnType::PlatformObject => {
+            ReturnType::NullableNode | ReturnType::PlatformObject | ReturnType::Any => {
                 quote! { #call }
             }
             ReturnType::Union(..) | ReturnType::NullableUnion(..) => {
@@ -988,6 +988,16 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
     let call = method_call(interface, method, &arguments_call);
     let body = match operation.result {
         OperationResult::Object => quote! { #call },
+        OperationResult::Union => quote! {
+            let result = #call?;
+            rquickjs::IntoJs::into_js(result, &ctx)
+        },
+        OperationResult::NullableUnion => quote! {
+            match #call? {
+                Some(result) => rquickjs::IntoJs::into_js(result, &ctx),
+                None => Ok(Value::new_null(ctx.clone())),
+            }
+        },
         OperationResult::Undefined => quote! {
             #call?;
             Ok(Value::new_undefined(ctx.clone()))
@@ -1107,6 +1117,12 @@ fn converted_argument(
             #fetch
             let #variable = value;
         },
+        // IDL `any` passes the original value through
+        // (<https://webidl.spec.whatwg.org/#idl-any>).
+        ReturnType::Any => quote! {
+            #fetch
+            let #variable = value;
+        },
         ReturnType::Dictionary(name) => {
             let struct_name = format_ident!("{name}");
             quote! {
@@ -1151,6 +1167,7 @@ fn operation_argument_at(
         | ReturnType::NullableNode
         | ReturnType::Callback
         | ReturnType::PlatformObject
+        | ReturnType::Any
         | ReturnType::Dictionary(_)
         | ReturnType::Enumeration(_)
         | ReturnType::Union(..)
@@ -1701,9 +1718,14 @@ fn union(union: &Union) -> TokenStream {
                     return host::node_argument(ctx, &value).map(Self::#variant);
                 }
             }),
-            UnionMemberType::Interface { node: false, .. } => unreachable!(
-                "non-node interface union members are rejected at lowering"
-            ),
+            UnionMemberType::Interface { node: false, name: interface } => trials.push(quote! {
+                // Non-node platform objects are not exposed by this engine,
+                // so this trial never matches; it keeps the generated union
+                // total without inventing values.
+                if host::is_interface(ctx, &value, #interface) {
+                    return Ok(Self::#variant(value));
+                }
+            }),
             UnionMemberType::Dictionary(name) => {
                 let name = format_ident!("{name}");
                 trials.push(quote! {
@@ -1751,6 +1773,7 @@ fn union(union: &Union) -> TokenStream {
     } else {
         quote! {}
     };
+    let into_js = union_into_js(union, &name, &generic);
     quote! {
         // A union carries every IDL member; the algorithm that receives it
         // may consume a subset, so unconsumed variants are not dead code.
@@ -1763,10 +1786,66 @@ fn union(union: &Union) -> TokenStream {
             // A union trial calls `from_object` on a reference for dictionary
             // members, so a union without a string member never consumes the
             // value.
+            #[allow(dead_code, reason = "generated from IDL; return-only unions do not convert from JS")]
             #[allow(clippy::needless_pass_by_value, reason = "generated from IDL; string members consume the value")]
             fn from_value(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
                 #(#trials)*
                 #mismatch
+            }
+        }
+
+        #into_js
+    }
+}
+
+/// `IntoJs` for a union whose members all convert back to JS values. Unions
+/// used only as arguments skip it; `union_result` rejects returned unions
+/// with members this cannot express.
+fn union_into_js(union: &Union, name: &proc_macro2::Ident, generic: &TokenStream) -> TokenStream {
+    let convertible = union.members.iter().all(|member| {
+        matches!(
+            member.type_,
+            UnionMemberType::Interface { node: false, .. }
+                | UnionMemberType::String
+                | UnionMemberType::Boolean
+                | UnionMemberType::Long
+        )
+    });
+    if !convertible {
+        return quote! {};
+    }
+    let uses_ctx = union
+        .members
+        .iter()
+        .any(|member| matches!(member.type_, UnionMemberType::Boolean | UnionMemberType::Long));
+    let ctx_name = if uses_ctx {
+        quote! { ctx }
+    } else {
+        quote! { _ctx }
+    };
+    let arms = union.members.iter().map(|member| {
+        let variant = &member.variant;
+        match member.type_ {
+            UnionMemberType::Interface { .. } => quote! {
+                Self::#variant(value) => Ok(value),
+            },
+            UnionMemberType::String => quote! {
+                Self::#variant(value) => Ok(value.into_value()),
+            },
+            UnionMemberType::Boolean | UnionMemberType::Long => quote! {
+                Self::#variant(value) => rquickjs::IntoJs::into_js(value, &#ctx_name),
+            },
+            // Excluded by `convertible` above; `union_result` rejects
+            // dictionary members before emitting a returned union.
+            UnionMemberType::Dictionary(_) => quote! {},
+        }
+    });
+    quote! {
+        impl<'js> rquickjs::IntoJs<'js> for #name #generic {
+            fn into_js(self, #ctx_name: &Ctx<'js>) -> Result<Value<'js>> {
+                match self {
+                    #(#arms)*
+                }
             }
         }
     }

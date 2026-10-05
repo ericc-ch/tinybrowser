@@ -105,6 +105,11 @@ pub(crate) enum OperationResult {
     Boolean,
     UnsignedShort,
     Long,
+    /// The method returns a union; the dispatch converts it with `IntoJs`.
+    Union,
+    /// The method returns a nullable union; `None` converts to `null`
+    /// (<https://webidl.spec.whatwg.org/#js-nullable-type>).
+    NullableUnion,
 }
 
 pub(crate) struct OperationArgument {
@@ -235,6 +240,9 @@ pub(crate) enum ReturnType {
     /// `Promise<undefined>`: the method runs synchronously and the dispatch
     /// resolves the promise (<https://webidl.spec.whatwg.org/#es-promise>).
     PromiseUndefined,
+    /// IDL `any`: the value passes through with no conversion
+    /// (<https://webidl.spec.whatwg.org/#idl-any>).
+    Any,
 }
 
 /// One flattened member of a union: the generated variant and its IDL type.

@@ -616,8 +616,12 @@ fn lower_members(
                 if overload_consumed(member, &remaining) {
                     continue;
                 }
-                let Some((operation, signature, property)) =
-                    lower_operation(database, member, &implementation.methods)?
+                let Some((operation, signature, property)) = lower_operation(
+                    database,
+                    member,
+                    &implementation.methods,
+                    &mut interface.unions,
+                )?
                 else {
                     continue;
                 };
@@ -1163,6 +1167,7 @@ fn lower_operation(
     database: &Database<'_>,
     member: &weedle::interface::OperationInterfaceMember<'_>,
     implemented: &BTreeMap<String, Method>,
+    unions: &mut Vec<model::Union>,
 ) -> Result<Option<(model::Operation, TokenStream, Option<PropertyGetter>)>, Error> {
     let Some(identifier) = &member.identifier else {
         return Ok(None);
@@ -1231,7 +1236,7 @@ fn lower_operation(
     } else {
         quote! {}
     };
-    let (result, returns) = operation_result(database, &member.return_type)?;
+    let (result, returns) = operation_result(database, &member.return_type, unions)?;
     let signature = quote! {
         fn #rust(&self, ctx: Ctx<'js>, #this_parameter #(#parameters),*) -> Result<#returns>;
     };
@@ -1297,7 +1302,12 @@ fn lower_argument(
             ReturnType::String | ReturnType::Boolean | ReturnType::Union(_, _),
             true,
             None,
-        ) => {}
+        )
+        // `any` is nullable by construction; an omitted argument carries its
+        // `null` default (<https://webidl.spec.whatwg.org/#idl-any>).
+        | (ReturnType::Any, true, None) => {}
+        (ReturnType::Any, true, Some(default))
+            if matches!(default.value, DefaultValue::Null(_)) => {}
         (ReturnType::Boolean, true, Some(default))
             if matches!(default.value, DefaultValue::Boolean(_)) => {}
         (ReturnType::NullableDocumentType, true, Some(default))
@@ -1398,6 +1408,9 @@ fn argument_parameter(
         // A platform object or callback-interface argument arrives as the
         // original value; the platform algorithm performs any further check.
         ReturnType::PlatformObject => quote! { Value<'js> },
+        // IDL `any` arrives as the original value
+        // (<https://webidl.spec.whatwg.org/#idl-any>).
+        ReturnType::Any => quote! { Value<'js> },
         ReturnType::Dictionary(name) | ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             quote! { #name }
@@ -1450,14 +1463,17 @@ fn property_getter(
 fn operation_result(
     database: &Database<'_>,
     return_type: &weedle::types::ReturnType<'_>,
+    unions: &mut Vec<model::Union>,
 ) -> Result<(OperationResult, TokenStream), Error> {
     match return_type {
         weedle::types::ReturnType::Undefined(_) => Ok((OperationResult::Undefined, quote! { () })),
         weedle::types::ReturnType::Type(type_) => {
-            match native_type(database, type_, &mut BTreeSet::new())? {
+            let lowered = native_type(database, type_, &mut BTreeSet::new())?;
+            match &lowered {
                 ReturnType::Node
                 | ReturnType::NullableNode
-                | ReturnType::PlatformObject => Ok((OperationResult::Object, quote! { Value<'js> })),
+                | ReturnType::PlatformObject
+                | ReturnType::Any => Ok((OperationResult::Object, quote! { Value<'js> })),
                 ReturnType::String => {
                     Ok((OperationResult::String, quote! { rquickjs::String<'js> }))
                 }
@@ -1475,12 +1491,57 @@ fn operation_result(
                 ReturnType::StringSequence => {
                     Ok((OperationResult::StringSequence, quote! { Vec<String> }))
                 }
+                ReturnType::Union(name, members) | ReturnType::NullableUnion(name, members) => {
+                    collect_union(&lowered, unions);
+                    union_result(&lowered, name, members)
+                }
                 _ => Err(Error(
                     "native operation result type is not supported yet".into(),
                 )),
             }
         }
     }
+}
+
+/// A union in return position: the generated enum converts with `IntoJs`.
+/// Members the conversion cannot emit fail the build instead of shipping a
+/// partial conversion.
+fn union_result(
+    lowered: &ReturnType,
+    name: &str,
+    members: &[model::UnionMember],
+) -> Result<(OperationResult, TokenStream), Error> {
+    for member in members {
+        match member.type_ {
+            model::UnionMemberType::Interface { node: false, .. }
+            | model::UnionMemberType::String
+            | model::UnionMemberType::Boolean
+            | model::UnionMemberType::Long => {}
+            model::UnionMemberType::Interface { node: true, .. } => {
+                return Err(Error(
+                    "node members in returned unions are not supported yet".into(),
+                ));
+            }
+            model::UnionMemberType::Dictionary(_) => {
+                return Err(Error(
+                    "dictionary members in returned unions are not supported yet".into(),
+                ));
+            }
+        }
+    }
+    let name = format_ident!("{name}");
+    let mut result = if members.iter().any(|member| member.type_.needs_lifetime()) {
+        quote! { #name<'js> }
+    } else {
+        quote! { #name }
+    };
+    let kind = if matches!(lowered, ReturnType::NullableUnion(..)) {
+        result = quote! { Option<#result> };
+        OperationResult::NullableUnion
+    } else {
+        OperationResult::Union
+    };
+    Ok((kind, result))
 }
 
 fn lower_attribute(
@@ -2174,6 +2235,7 @@ fn native_type(
         Type::Single(SingleType::NonAny(NonAnyType::Identifier(item))) => {
             native_named(database, item.type_.0, item.q_mark.is_some(), visited)
         }
+        Type::Single(SingleType::Any(_)) => Ok(ReturnType::Any),
         Type::Union(union_) => lower_union(database, union_),
         Type::Single(_) => Err(Error(format!(
             "native type is not supported yet: {type_:?}"

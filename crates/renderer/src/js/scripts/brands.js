@@ -160,6 +160,7 @@
   // here so each interface exposes exactly the reflecting attributes the
   // spec gives it (<https://html.spec.whatwg.org/#the-disabled-attribute>).
   const interfaceMembers = {
+    HTMLCanvasElement: ['width', 'height', 'getContext'],
     HTMLIFrameElement: ['contentDocument', 'contentWindow'],
     HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
     HTMLFormElement: ['reset', 'action', 'method', 'enctype', 'encoding', 'target', 'noValidate', 'acceptCharset'],

@@ -71,6 +71,7 @@ include!(concat!(env!("OUT_DIR"), "/HTMLHyperlinkElementUtils.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLBaseElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLLinkElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLMediaElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLCanvasElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLEmbedElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLScriptElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLSourceElement.rs"));
@@ -114,6 +115,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_base_element_generated::install(ctx)?;
     html_link_element_generated::install(ctx)?;
     html_media_element_generated::install(ctx)?;
+    html_canvas_element_generated::install(ctx)?;
     html_embed_element_generated::install(ctx)?;
     html_script_element_generated::install(ctx)?;
     html_source_element_generated::install(ctx)?;
@@ -7278,6 +7280,53 @@ impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
 }
 
 impl html_link_element_generated::HTMLLinkElement<'_> for JsNode {}
+
+/// The generated union of rendering contexts. No variant is ever produced
+/// until a canvas backend exists.
+type RenderingContext<'js> =
+    html_canvas_element_generated::CanvasRenderingContext2DOrGPUCanvasContextOrImageBitmapRenderingContextOrWebGL2RenderingContextOrWebGLRenderingContext<'js>;
+
+impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width
+    fn get_width(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        canvas_dimension(ctx, self.handle.0, "width", 300)
+    }
+
+    fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
+    }
+
+    // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height
+    fn get_height(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        canvas_dimension(ctx, self.handle.0, "height", 150)
+    }
+
+    fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())
+    }
+
+    // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext
+    fn get_context(
+        &self,
+        _ctx: Ctx<'js>,
+        _context_id: rquickjs::String<'js>,
+        _options: Value<'js>,
+    ) -> Result<Option<RenderingContext<'js>>> {
+        // No context is supported: Blitz paints no canvas and the engine ships
+        // no rasterizer or GL stack, so `getContext` answers the spec's
+        // `null` for an unsupported context id
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
+        Ok(None)
+    }
+}
+
+/// Canvas `width`/`height` reflection: a content attribute parsed as a
+/// non-negative integer, or the IDL default when absent or invalid
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
+fn canvas_dimension(ctx: &Ctx<'_>, id: NodeId, attribute: &str, default: usize) -> Result<usize> {
+    let value = attribute_value(ctx, id, attribute)?;
+    Ok(value.trim().parse::<usize>().unwrap_or(default))
+}
 
 impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
     // No media pipeline: the network state never leaves its initial value
