@@ -134,10 +134,9 @@ impl blitz_traits::navigation::NavigationProvider for TinyNav {
 
 #[cfg(test)]
 mod tests {
-    use super::{TinyNav, TinyNetProvider, TinyShell};
+    use super::{CountingHandler, TinyNav, TinyNetProvider};
     use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
     use blitz_traits::net::{NetHandler, NetProvider};
-    use blitz_traits::shell::ShellProvider;
 
     struct VecHandler {
         tx: std::sync::mpsc::Sender<(String, Vec<u8>)>,
@@ -173,9 +172,26 @@ mod tests {
     }
 
     #[test]
-    fn shell_and_nav_are_wired() {
-        let shell = TinyShell;
-        shell.request_redraw();
+    fn second_delivery_is_noop() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let spent = CountingHandler {
+            inner: None,
+            in_flight: Arc::clone(&in_flight),
+        };
+        Box::new(spent).bytes(
+            "http://127.0.0.1/b.css".to_owned(),
+            blitz_traits::net::Bytes::from_static(b"x"),
+        );
+        assert_eq!(
+            in_flight.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn nav_records_and_drains() {
         let nav = TinyNav::new();
         nav.navigate_to(NavigationOptions::new(
             "https://example.com/".parse().expect("url"),

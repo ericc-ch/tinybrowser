@@ -423,8 +423,6 @@ pub(crate) fn reflect_url_string(
         .into())
 }
 
-/// Whether `data` is an HTML element with the given local name.
-
 /// Validates an interface against native state on a shared payload.
 /// Page-controlled prototypes must not grant an interface brand.
 pub(crate) trait SharedClass {

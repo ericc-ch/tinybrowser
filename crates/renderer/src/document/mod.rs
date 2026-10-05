@@ -212,6 +212,9 @@ pub(crate) struct Document {
     >,
     /// Filed Blitz response handlers by fetch id, delivered on completion.
     blitz_handlers: HashMap<u64, crate::render::CountingHandler>,
+    /// Raw subresource bytes by URL, shared between our image dials and
+    /// Blitz fetches so the second fetch for a URL reuses bytes.
+    subresource_bytes: HashMap<String, Vec<u8>>,
     /// The browsing context this document belongs to.
     frame: FrameId,
     /// The renderer-process state every frame shares.
@@ -309,6 +312,7 @@ impl Document {
             blitz_nav,
             blitz_fetch_rx: blitz_rx,
             blitz_handlers: HashMap::new(),
+            subresource_bytes: HashMap::new(),
             frame,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
@@ -590,9 +594,6 @@ impl Document {
     }
 
     /// Whether the child frame order may have changed since the last scan.
-    ///
-    /// The old DOM mutation serial is gone with the arena; always rescan.
-    /// (Same-document `iframe` moves are noticed without a cheap detector.)
     pub(crate) fn frame_order_changed() -> bool {
         true
     }
@@ -1090,6 +1091,7 @@ impl Document {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
         }
         while self.blitz_fetch_rx.try_recv().is_ok() {}
+        self.subresource_bytes.clear();
         self.world.borrow_mut().clear_images();
         self.world.borrow_mut().take_image_updates();
         self.pending_images = 0;
@@ -1392,6 +1394,10 @@ impl Document {
                     status: outcome.status,
                 });
                 self.pending_images = self.pending_images.saturating_sub(1);
+                if (200..300).contains(&outcome.status) {
+                    self.subresource_bytes
+                        .insert(outcome.final_url.clone(), outcome.body.clone());
+                }
                 if self.image_generation(element) == generation {
                     self.in_flight_images.remove(&element);
                     let selected = self.image_selected_src.remove(&element).unwrap_or_default();
@@ -1437,6 +1443,10 @@ impl Document {
             DialContext::BlitzResource { id } => {
                 // Stale deliveries are harmless: the handler reports into
                 // Blitz's own channel, which a dropped tree no longer drains.
+                if (200..300).contains(&outcome.status) {
+                    self.subresource_bytes
+                        .insert(outcome.final_url.clone(), outcome.body.clone());
+                }
                 if let Some(handler) = self.blitz_handlers.remove(&id) {
                     Box::new(handler).bytes(
                         outcome.final_url.clone(),
@@ -1597,12 +1607,17 @@ impl Document {
     }
 
     /// Moves every queued Blitz subresource fetch onto a carrier dial,
-    /// filing its response handler under the fetch id. Unparseable URLs drop
-    /// the fetch; the handler is still filed and delivered empty on teardown
-    /// so Blitz never holds the resource pending forever.
+    /// filing its response handler under the fetch id.
     fn drain_blitz_fetches(&mut self) {
         while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
-            let url = fetch.url;
+            let url = fetch.url.as_str().to_owned();
+            if let Some(bytes) = self.subresource_bytes.get(&url).cloned() {
+                Box::new(handler).bytes(
+                    url,
+                    blitz_traits::net::Bytes::from(bytes),
+                );
+                continue;
+            }
             self.blitz_handlers.insert(fetch.id, handler);
             // The Fetch initiator is the document, not the fetch target: the
             // provider never sees the document URL, so it stamps the target
@@ -1611,7 +1626,7 @@ impl Document {
             let initiator = self.url.clone();
             self.queued_dials.push(QueuedDial::get(
                 DialContext::BlitzResource { id: fetch.id },
-                url,
+                fetch.url,
                 initiator,
             ));
         }
@@ -1669,7 +1684,20 @@ impl Document {
         let initiator = self.url.clone();
         let selected = url.as_str().to_owned();
         self.image_selected_src.insert(element, selected.clone());
-        self.world.borrow_mut().begin_image(element, selected);
+        self.world.borrow_mut().begin_image(element, selected.clone());
+        if let Some(bytes) = self.subresource_bytes.get(&selected).cloned()
+            && let Some(image) = crate::render::decode_image(&bytes)
+            && self
+                .world
+                .borrow_mut()
+                .store_image(element, image, selected.clone())
+        {
+            self.in_flight_images.remove(&element);
+            self.image_selected_src.remove(&element);
+            self.fire_js(|js| js.fire_node_load(element));
+            self.fire_document_load();
+            return;
+        }
         self.queued_dials.push(QueuedDial::get(
             DialContext::Image {
                 element,

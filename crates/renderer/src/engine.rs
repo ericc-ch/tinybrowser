@@ -1183,5 +1183,10 @@ fn viewport_pixels(value: f32) -> Result<u32, crate::render::RenderError> {
     if f64::from(rounded) > f64::from(crate::render::MAX_VIEWPORT_SIDE) {
         return Err(crate::render::RenderError::TooLarge);
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rounded is finite, positive, and at most 4096, so the cast is exact"
+    )]
     Ok(rounded as u32)
 }

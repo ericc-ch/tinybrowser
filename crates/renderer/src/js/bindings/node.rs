@@ -1899,13 +1899,8 @@ fn nodes_equal_in(
 /// Serializer output: UTF-16 code units, so a lone surrogate in character
 /// data survives into the returned string. Escaping only ever inserts ASCII,
 /// so tree units append verbatim.
+#[derive(Default)]
 pub(crate) struct HtmlOutput(Vec<u16>);
-
-impl Default for HtmlOutput {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
 
 impl HtmlOutput {
     fn push_str(&mut self, text: &str) {

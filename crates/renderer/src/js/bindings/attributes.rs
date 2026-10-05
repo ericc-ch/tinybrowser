@@ -1597,13 +1597,11 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     // A `body` element's window event handler attributes register on the
     // window itself
     // (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
-    let is_body = world_for_node(ctx, element)
-        .ok()
-        .is_some_and(|owner| {
-            owner.borrow().document(element).is_some_and(|parsed| {
-                js_world::is_html_element(&parsed.document.base, element.node, "body")
-            })
-        });
+    let is_body = world_for_node(ctx, element).is_ok_and(|owner| {
+        owner.borrow().document(element).is_some_and(|parsed| {
+            js_world::is_html_element(&parsed.document.base, element.node, "body")
+        })
+    });
     let forwarded = WINDOW_HANDLER_ATTRIBUTES.contains(&name.as_str()) && is_body;
     match body {
         Some(body) if !body.trim().is_empty() => {

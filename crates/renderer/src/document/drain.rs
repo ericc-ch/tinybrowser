@@ -242,8 +242,6 @@ impl Document {
         for element in images {
             self.queue_image(element, true);
         }
-        // Known gap: `select` events have no producer while form selection
-        // state lives in content attributes; nothing queues them.
     }
 
     fn due_timer(&mut self) -> Option<u32> {

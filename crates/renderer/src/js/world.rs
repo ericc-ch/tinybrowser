@@ -561,8 +561,7 @@ pub(crate) struct World {
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Decoded `<img>` bitmaps for this document, used by both paint and
-    /// script geometry.
+    /// Decoded `<img>` bitmaps for script geometry (`naturalWidth/Height`).
     pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
     /// `<img>` elements whose current request has not finished, including a
     /// `src` mutation waiting for `update the image data`
