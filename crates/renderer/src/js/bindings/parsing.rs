@@ -101,7 +101,8 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 NodeContext::Element,
             )?)
         };
-        let mut parsed = crate::Parsed::empty(content_type);
+        let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
+        let mut parsed = crate::Parsed::script(content_type, font_ctx);
         // Adopt the doctype into the new tree when one was passed: snapshot
         // it out of its document, materialize the synthetic record locally,
         // and append it under the new root.
@@ -156,10 +157,17 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         ctx: Ctx<'js>,
         title: Option<rquickjs::String<'js>>,
     ) -> Result<Value<'js>> {
-        let mut parsed = crate::Parsed::empty("text/html");
-        // Gap: Blitz has no Doctype node kind; `createHTMLDocument` builds no
-        // doctype, unlike the spec.
+        let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
+        let mut parsed = crate::Parsed::script("text/html", font_ctx);
         let document_root = parsed.document.base.root_node().id;
+        // `createHTMLDocument` builds a doctype, then html/head/body
+        // (<https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument>).
+        let doctype = parsed.document.create_doctype("html", "", "");
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(document_root, &[doctype]);
         let html = parsed
             .document
             .base
@@ -292,6 +300,8 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
         // `DOMParser` parses with scripting disabled
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
         let mut parsed = if content_type == "text/html" {
+            // DOMParser documents never render: share fonts, skip UA sheets.
+            let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
             let base = self
                 .url
                 .parse::<url::Url>()
@@ -303,6 +313,8 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
                 &source,
                 blitz_dom::DocumentConfig {
                     base_url: Some(base),
+                    font_ctx: Some(font_ctx),
+                    ua_stylesheets: Some(Vec::new()),
                     ..blitz_dom::DocumentConfig::default()
                 },
             );

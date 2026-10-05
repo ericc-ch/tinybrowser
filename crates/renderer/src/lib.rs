@@ -74,13 +74,13 @@ pub(crate) struct Parsed {
 }
 
 impl Parsed {
-    /// An empty document of `content_type` that is already fully loaded,
-    /// like the ones script constructors create.
-    pub(crate) fn empty(content_type: &'static str) -> Self {
-        // Empty documents never parse markup into this tree, but later
-        // insertions resolve subresources against its base: default to
-        // closed so nothing can panic in Blitz.
+    /// An empty script-created document: never rendered, so no UA sheets and
+    /// no providers; shares the process font context for speed (a fresh
+    /// scan costs ~25ms per document).
+    pub(crate) fn script(content_type: &'static str, font_ctx: parley::FontContext) -> Self {
         let config = blitz_dom::DocumentConfig {
+            font_ctx: Some(font_ctx),
+            ua_stylesheets: Some(Vec::new()),
             base_url: Some("http://invalid/".to_owned()),
             ..blitz_dom::DocumentConfig::default()
         };

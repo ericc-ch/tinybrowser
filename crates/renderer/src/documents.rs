@@ -229,3 +229,4 @@ impl DocumentStore {
         self.documents.remove(&id)
     }
 }
+

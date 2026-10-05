@@ -63,6 +63,7 @@ impl Engine {
             registry: Rc::new(RefCell::new(RealmRegistry::default())),
             shared: Rc::new(RefCell::new(crate::messaging::Shared::default())),
             pending_storage: Rc::new(RefCell::new(Vec::new())),
+            font_ctx: parley::FontContext::default(),
         };
         let main = Document::with_shared(FrameId::MAIN, &runtime);
         let mut frames = BTreeMap::new();

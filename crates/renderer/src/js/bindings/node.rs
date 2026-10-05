@@ -571,7 +571,8 @@ pub(crate) fn construct_node<'js>(
         "Document" | "XMLDocument" => {
             // The `Document` constructor creates an XML document
             // (<https://dom.spec.whatwg.org/#dom-document-document>).
-            wrap_new_document(&ctx, crate::Parsed::empty("application/xml"))
+            let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
+            wrap_new_document(&ctx, crate::Parsed::script("application/xml", font_ctx))
         }
         "HTMLElement" => {
             // https://html.spec.whatwg.org/multipage/custom-elements.html#html-element-constructors
@@ -830,18 +831,22 @@ fn place_adjacent_rest(
     Ok(())
 }
 
-/// The base URL a fragment scratch document parses under: the live
-/// document's base, so eager subresource loads resolve instead of panicking
-/// in Blitz. Falls back closed when the document is gone.
-fn fragment_base_url(ctx: &Ctx<'_>, id: NodeId) -> String {
+/// The base URL and shared font context a fragment scratch document parses
+/// under: the live document's base, so eager subresource loads resolve
+/// instead of panicking in Blitz. Falls back closed when the document is gone.
+fn fragment_base_url(ctx: &Ctx<'_>, id: NodeId) -> (String, parley::FontContext) {
     world(ctx)
         .ok()
         .and_then(|world| {
-            world.borrow().document(id).map(|parsed| {
-                parsed.document.base.base_url().as_str().to_owned()
+            let world = world.borrow();
+            world.document(id).map(|parsed| {
+                (
+                    parsed.document.base.base_url().as_str().to_owned(),
+                    world.runtime.font_ctx.clone(),
+                )
             })
         })
-        .unwrap_or_else(|| "http://invalid/".to_owned())
+        .unwrap_or_else(|| ("http://invalid/".to_owned(), parley::FontContext::default()))
 }
 
 /// Parses `markup` as an HTML fragment in `context` and snapshots the
@@ -850,15 +855,19 @@ fn parse_html_fragment_snapshots(
     markup: &str,
     context: &str,
     base_url: &str,
+    font_ctx: parley::FontContext,
 ) -> Vec<ImportSnapshot> {
     // The fragment parses into a scratch context element; only the parsed
     // children are snapshotted for insertion into a live document
     // (<https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm>).
     // The scratch document carries the live base URL so eager subresource
-    // loads resolve instead of panicking in Blitz.
+    // loads resolve instead of panicking in Blitz. It never renders, so it
+    // shares fonts and skips UA sheets.
     let context_name = fragment_context_name(context);
     let mut base = blitz_dom::BaseDocument::new(blitz_dom::DocumentConfig {
         base_url: Some(base_url.to_owned()),
+        font_ctx: Some(font_ctx),
+        ua_stylesheets: Some(Vec::new()),
         ..blitz_dom::DocumentConfig::default()
     });
     let context_id = {
@@ -4116,7 +4125,7 @@ impl JsNode {
             Exception::throw_type(ctx, "innerHTML requires an element or shadow root")
         })?;
 
-        let snapshots = { let base_url = fragment_base_url(ctx, self.handle.0); parse_html_fragment_snapshots(&value.0, &context, &base_url) };
+        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, self.handle.0); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
 
         // Known gap: Blitz has no template contents, so `<template>` children
         // replace as ordinary element children.
@@ -4171,7 +4180,7 @@ impl JsNode {
             _ => None,
         })?
         .ok_or_else(|| Exception::throw_type(&ctx, "insertAdjacentHTML requires an element"))?;
-        let snapshots = { let base_url = fragment_base_url(&ctx, self.handle.0); parse_html_fragment_snapshots(&text.0, &context, &base_url) };
+        let snapshots = { let (base_url, font_ctx) = fragment_base_url(&ctx, self.handle.0); parse_html_fragment_snapshots(&text.0, &context, &base_url, font_ctx) };
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -4274,7 +4283,7 @@ impl JsNode {
                 );
             (parent, context)
         };
-        let snapshots = { let base_url = fragment_base_url(ctx, self.handle.0); parse_html_fragment_snapshots(&value.0, &context, &base_url) };
+        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, self.handle.0); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
 
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {

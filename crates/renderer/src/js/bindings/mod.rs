@@ -1799,6 +1799,7 @@ mod realm_tests {
             registry: Rc::clone(registry),
             shared: Rc::new(RefCell::new(Shared::default())),
             pending_storage: Rc::new(RefCell::new(Vec::new())),
+            font_ctx: parley::FontContext::default(),
         };
         let mut world = World::new(Url::parse(url).expect("test url"), FrameId::MAIN, &runtime);
         let id = world.replace_document(crate::parse_html(

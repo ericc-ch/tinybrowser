@@ -194,7 +194,8 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
         };
         (parsed.content_type, parsed.quirks_mode, children)
     };
-    let mut parsed = crate::Parsed::empty(content_type);
+    let font_ctx = world(ctx)?.borrow().runtime.font_ctx.clone();
+    let mut parsed = crate::Parsed::script(content_type, font_ctx);
     parsed.quirks_mode = quirks_mode;
     let root = parsed.document.base.root_node().id;
     for child in &children {

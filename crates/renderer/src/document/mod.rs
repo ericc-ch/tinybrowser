@@ -188,6 +188,10 @@ pub(crate) struct FrameRuntime {
     /// Storage changes waiting for the `storage`-event task in their receiving
     /// frames.
     pub(crate) pending_storage: Rc<RefCell<Vec<crate::storage::PendingStorageEvent>>>,
+    /// Parley's font context, built once per process: construction scans
+    /// system fonts (~25ms), so every `BaseDocument` clones this instead of
+    /// rescanning. Cloning is cheap; Blitz shares the source cache.
+    pub(crate) font_ctx: parley::FontContext,
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
@@ -1137,7 +1141,8 @@ impl Document {
 
     /// The Blitz configuration every document of this frame shares: our net
     /// provider for subresources, a no-op shell (screenshots re-resolve
-    /// explicitly), and the frame's base URL.
+    /// explicitly), the frame's base URL, and the process-shared font
+    /// context (fresh scans cost ~25ms per document).
     fn blitz_config(&self) -> blitz_dom::DocumentConfig {
         blitz_dom::DocumentConfig {
             net_provider: Some(
@@ -1150,8 +1155,14 @@ impl Document {
             ),
             shell_provider: Some(std::sync::Arc::new(crate::render::TinyShell)),
             base_url: Some(crate::render::blitz_base_url(&self.url)),
+            font_ctx: Some(self.shared_font_ctx()),
             ..blitz_dom::DocumentConfig::default()
         }
+    }
+
+    /// The process-shared font context, cloned cheaply per document.
+    fn shared_font_ctx(&self) -> parley::FontContext {
+        self.world.borrow().runtime.font_ctx.clone()
     }
 
     /// Installs `parsed` as the active document and registers it, reporting
