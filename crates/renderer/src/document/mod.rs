@@ -14,7 +14,6 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 use url::Url;
 
-use crate::ActiveParser;
 use crate::Parsed;
 use crate::ReadyState;
 use crate::documents::DocumentStore;
@@ -77,17 +76,23 @@ pub(crate) enum DialContext {
         epoch: u64,
     },
     ClassicScript {
-        element: dom::NodeId,
+        element: crate::js::world::NodeId,
         epoch: u64,
     },
     /// A `<link rel=stylesheet>` sheet; loading sheets delay the load event.
+    // No constructor while Blitz subresource fetch is unwired; the
+    // completion path stays so the load-event gating still compiles.
+    #[allow(dead_code, reason = "unconstructed until subresource fetch is wired")]
     Stylesheet {
-        element: dom::NodeId,
+        element: crate::js::world::NodeId,
         epoch: u64,
     },
     /// An `<img>` resource selected by its `src` attribute.
+    // No constructor while Blitz subresource fetch is unwired; the
+    // completion path stays so the load-event gating still compiles.
+    #[allow(dead_code, reason = "unconstructed until subresource fetch is wired")]
     Image {
-        element: dom::NodeId,
+        element: crate::js::world::NodeId,
         epoch: u64,
         generation: u64,
     },
@@ -146,6 +151,14 @@ enum ParserOwner {
     Script,
 }
 
+/// A connection transition for one `iframe` container in this document.
+pub(crate) enum Lifecycle {
+    /// A connected container with no child frame yet.
+    Inserted(crate::js::world::NodeId),
+    /// A container whose frame is gone or disconnected.
+    Removed(crate::js::world::NodeId),
+}
+
 struct Timer {
     id: u32,
     when: Instant,
@@ -178,6 +191,11 @@ pub(crate) struct Document {
     world: Rc<RefCell<World>>,
     js_runtime: JsRuntimeHandle,
     wake: Arc<Notify>,
+    /// Blitz subresource fetches run through our agent on the carrier
+    /// runtime; Blitz owns stylesheets and images once they land.
+    net_provider: std::sync::Arc<crate::render::TinyNetProvider>,
+    /// Blitz link/form navigations, drained into frame navigations on tick.
+    blitz_nav: std::sync::Arc<crate::render::TinyNav>,
     /// The browsing context this document belongs to.
     frame: FrameId,
     /// The renderer-process state every frame shares.
@@ -202,12 +220,12 @@ pub(crate) struct Document {
     /// Image fetches queued or in flight. They delay the document load event.
     pending_images: usize,
     /// Per-element fetch generation so a superseded `src` completion is ignored.
-    image_generations: HashMap<dom::NodeId, u64>,
+    image_generations: HashMap<crate::js::world::NodeId, u64>,
     /// Selected source URL for the current generation
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    image_selected_src: HashMap<dom::NodeId, String>,
+    image_selected_src: HashMap<crate::js::world::NodeId, String>,
     /// Elements with an in-flight image fetch for the current generation.
-    in_flight_images: HashSet<dom::NodeId>,
+    in_flight_images: HashSet<crate::js::world::NodeId>,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -219,14 +237,10 @@ pub(crate) struct Document {
     /// whose `src` resolves to the parent's own URL is still on that document
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
     initial_blank: bool,
-    /// Mutation serial the child frame order was last computed from, so a
-    /// same-document move of an `iframe` is noticed without walking the tree
-    /// every turn (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
-    frame_order_serial: u64,
     /// The `iframe` containers awaiting their child's load event; this
     /// document's own `load` event is delayed until they all have
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-    pending_frame_loads: HashSet<dom::NodeId>,
+    pending_frame_loads: HashSet<crate::js::world::NodeId>,
     /// Whether this document's `load` event has fired.
     load_fired: bool,
     events: Vec<RendererEvent>,
@@ -234,7 +248,10 @@ pub(crate) struct Document {
     js: Option<crate::js::JsRealm>,
     js_timer_slots: HashMap<u32, i32>,
     js_epoch: u64,
-    active_parser: Option<ActiveParser>,
+    active_buffer: Option<String>,
+    /// Scripts already executed for the current parse, so a walk resumed
+    /// after a `src` fetch does not run them twice.
+    executed_scripts: HashSet<crate::js::world::NodeId>,
     parser_eof: bool,
     /// Who owns the active parser, which decides whether `document.close()` may
     /// end it.
@@ -243,7 +260,7 @@ pub(crate) struct Document {
     /// already in hand.
     decoder: Option<dial::ResponseDecoder>,
     classic_fetch_in_flight: bool,
-    deferred_modules: Vec<(dom::NodeId, crate::js::ScriptSource)>,
+    deferred_modules: Vec<(crate::js::world::NodeId, crate::js::ScriptSource)>,
     stop: Arc<Stop>,
 }
 
@@ -265,11 +282,27 @@ impl Document {
             runtime,
         )));
         runtime.registry.borrow_mut().insert_frame(frame, &world);
+        // Blitz subresources fetch through our agent. The spawn closure runs
+        // on the carrier runtime: `Document` methods that resolve style run
+        // inside it, so `tokio::spawn` finds ambient context there. Outside
+        // one the fetch is dropped and the resource stays pending, which the
+        // resolve loop treats as unsettled rather than failed.
+        let agent = net::Agent::new(net::AgentOptions::default()).expect("default agent builds");
+        let spawn: crate::render::SpawnFn = std::sync::Arc::new(|task| {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(task);
+            }
+        });
+        let net_provider =
+            std::sync::Arc::new(crate::render::TinyNetProvider::new(agent, spawn));
+        let blitz_nav = std::sync::Arc::new(crate::render::TinyNav::new());
         Self {
             world,
             services: Arc::clone(&runtime.services),
             js_runtime: runtime.js_runtime.clone(),
             wake: Arc::clone(&runtime.wake),
+            net_provider,
+            blitz_nav,
             frame,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
@@ -291,7 +324,6 @@ impl Document {
             frame_load_sequence: 0,
             frame_load_in_flight: false,
             initial_blank: true,
-            frame_order_serial: u64::MAX,
             pending_frame_loads: HashSet::new(),
             load_fired: false,
             events: Vec::new(),
@@ -299,7 +331,8 @@ impl Document {
             js: None,
             js_timer_slots: HashMap::new(),
             js_epoch: 0,
-            active_parser: None,
+            active_buffer: None,
+            executed_scripts: HashSet::new(),
             parser_eof: true,
             parser_owner: ParserOwner::Carrier,
             decoder: None,
@@ -321,21 +354,24 @@ impl Document {
     }
 
     /// The root node of the frame's active document.
-    pub(crate) fn document_root(&self) -> Option<dom::NodeId> {
+    pub(crate) fn document_root(&self) -> Option<crate::js::world::NodeId> {
         self.world
             .borrow()
-            .with_main_document(|parsed| parsed.document.document())
+            .with_main_document(|parsed| crate::js::world::NodeId {
+                document: parsed.id,
+                node: parsed.document.base.root_node().id,
+            })
     }
 
     /// The `iframe`'s `src` attribute value, when the element has a
     /// non-empty one
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-src>).
     #[must_use]
-    pub(crate) fn frame_src(&self, container: dom::NodeId) -> Option<String> {
+    pub(crate) fn frame_src(&self, container: crate::js::world::NodeId) -> Option<String> {
         let world = self.world.borrow();
-        let value = world
-            .document(container)
-            .and_then(|parsed| parsed.document.attribute(container, "src"))?;
+        let value = world.document(container).and_then(|parsed| {
+            crate::js::world::attr(&parsed.document.base, container.node, "src").map(str::to_owned)
+        })?;
         (!value.is_empty()).then_some(value)
     }
 
@@ -366,7 +402,7 @@ impl Document {
     /// orders the frame's child browsing contexts
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
     #[must_use]
-    pub(crate) fn iframe_containers_in_order(&self) -> Vec<dom::NodeId> {
+    pub(crate) fn iframe_containers_in_order(&self) -> Vec<crate::js::world::NodeId> {
         self.world.borrow().iframe_containers_in_order()
     }
 
@@ -392,7 +428,7 @@ impl Document {
 
     /// Takes the child frames this document's realm created for the engine to
     /// adopt.
-    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, dom::NodeId, Document)> {
+    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, crate::js::world::NodeId, Document)> {
         self.world.borrow_mut().take_new_frames()
     }
 
@@ -404,45 +440,71 @@ impl Document {
         self.url.as_str().to_owned()
     }
 
-    pub(crate) fn take_lifecycle(&mut self) -> Vec<dom::Lifecycle> {
-        self.world
-            .borrow()
-            .main_document_mut()
-            .map_or_else(Vec::new, |mut parsed| {
-                dom::lifecycle::take(&mut parsed.document)
-            })
+    pub(crate) fn take_lifecycle(&mut self) -> Vec<Lifecycle> {
+        let connected = self.world.borrow().iframe_containers_in_order();
+        let shared = self.shared.borrow();
+        let known: std::collections::HashSet<crate::js::world::NodeId> = shared
+            .tree
+            .children(self.frame)
+            .iter()
+            .filter_map(|child| shared.tree.container(*child))
+            .collect();
+        drop(shared);
+        let connected_set: std::collections::HashSet<crate::js::world::NodeId> =
+            connected.iter().copied().collect();
+        let mut events = Vec::new();
+        for container in &connected {
+            if !known.contains(container) {
+                events.push(Lifecycle::Inserted(*container));
+            }
+        }
+        for container in &known {
+            if !connected_set.contains(container) {
+                events.push(Lifecycle::Removed(*container));
+            }
+        }
+        events
     }
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
-        self.world.borrow_mut().take_frame_navigations()
+        let mut navigations = self.world.borrow_mut().take_frame_navigations();
+        // Blitz link clicks land here without a container: they target this
+        // frame itself. Container attribution (which iframe was clicked)
+        // arrives when subdocument click routing wires up.
+        navigations.extend(self.blitz_nav.drain().into_iter().map(|url| {
+            FrameNavigation::get(
+                crate::js::NavigationTarget::SelfFrame,
+                url.as_str().to_owned(),
+            )
+        }));
+        navigations
     }
 
     pub(crate) fn take_document_stream(&mut self) -> Vec<DocumentStreamCommand> {
         self.world.borrow_mut().take_document_stream()
     }
 
-    pub(crate) fn fire_node_load(&mut self, id: dom::NodeId) {
+    pub(crate) fn fire_node_load(&mut self, id: crate::js::world::NodeId) {
         self.fire_js(|js| js.fire_node_load(id));
         self.adopt_js_work();
     }
 
     /// Whether `id` is an HTML `iframe` in this document.
     #[must_use]
-    pub(crate) fn is_iframe_element(&self, id: dom::NodeId) -> bool {
-        self.world
-            .borrow()
-            .document(id)
-            .is_some_and(|parsed| dom::lifecycle::is_iframe_element(&parsed.document, id))
+    pub(crate) fn is_iframe_element(&self, id: crate::js::world::NodeId) -> bool {
+        self.world.borrow().document(id).is_some_and(|parsed| {
+            crate::js::world::is_iframe_element(&parsed.document.base, id.node)
+        })
     }
 
     /// Queues the image fetch for a newly connected `<img>`, if it still needs one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    pub(crate) fn queue_connected_image(&mut self, element: dom::NodeId) {
+    pub(crate) fn queue_connected_image(&mut self, element: crate::js::world::NodeId) {
         self.queue_image(element, false);
     }
 
     /// Drops a disconnected `<img>`'s decoded pixels and ignores in-flight fetches.
-    pub(crate) fn disconnect_image(&mut self, element: dom::NodeId) {
+    pub(crate) fn disconnect_image(&mut self, element: crate::js::world::NodeId) {
         self.bump_image_generation(element);
         self.in_flight_images.remove(&element);
         self.image_selected_src.remove(&element);
@@ -495,22 +557,10 @@ impl Document {
 
     /// Whether the child frame order may have changed since the last scan.
     ///
-    /// The DOM mutation serial is the cheap detector for a same-document
-    /// `iframe` move, which no connection lifecycle event reports
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    /// The old DOM mutation serial is gone with the arena; always rescan.
+    /// (Same-document `iframe` moves are noticed without a cheap detector.)
     pub(crate) fn frame_order_changed(&mut self) -> bool {
-        let serial = self
-            .world
-            .borrow()
-            .with_main_document(|parsed| dom::mutation::serial(&parsed.document));
-        match serial {
-            Some(serial) if serial == self.frame_order_serial => false,
-            Some(serial) => {
-                self.frame_order_serial = serial;
-                true
-            }
-            None => false,
-        }
+        true
     }
 
     /// Replaces this frame's document with a complete response, as the frame's
@@ -808,10 +858,11 @@ impl Document {
         Ok(())
     }
 
-    /// Opens a parser on `input`, taking ownership of the input stream.
+    /// Opens a parse on `input`, taking ownership of the input stream.
     ///
     /// `decoder` is set exactly when bytes still arrive from the carrier; a
-    /// script's `document.write` feeds text directly instead.
+    /// script's `document.write` feeds text directly instead. The markup only
+    /// accumulates here; `finish_parse` parses it whole.
     fn start_parser(
         &mut self,
         input: &str,
@@ -823,7 +874,7 @@ impl Document {
         self.parser_eof = eof;
         self.decoder = decoder;
         self.parser_owner = owner;
-        self.active_parser = Some(ActiveParser::new(input));
+        self.active_buffer = Some(input.to_owned());
     }
 
     /// Starts a document from a network response: a new realm, the response's
@@ -886,16 +937,11 @@ impl Document {
         if text.is_empty() {
             return;
         }
-        if let Some(parser) = &self.active_parser {
-            parser.append_html(text);
-            // A pending parsing-blocking script stops the parser: advancing
-            // past it would run later scripts first. Appending is safe, so the
-            // markup is not lost.
-            // https://html.spec.whatwg.org/multipage/scripting.html#pending-parsing-blocking-script
-            if !self.classic_fetch_in_flight {
-                self.advance_parser();
-            }
+        if let Some(buffer) = self.active_buffer.as_mut() {
+            buffer.push_str(&text);
         }
+        // Known gap: without an incremental parser a write after the parse
+        // finished has nowhere to go, so it is ignored instead of re-parsing.
     }
 
     /// Ends a body: flushes the decoder and lets the parser finish.
@@ -905,9 +951,7 @@ impl Document {
             self.write_text(text);
         }
         self.parser_eof = true;
-        if !self.classic_fetch_in_flight {
-            self.advance_parser();
-        }
+        self.finish_parse();
     }
 
     /// Aborts a body the carrier will not finish.
@@ -917,9 +961,7 @@ impl Document {
     pub(crate) fn abort_body(&mut self) {
         self.decoder = None;
         self.parser_eof = true;
-        if !self.classic_fetch_in_flight {
-            self.advance_parser();
-        }
+        self.finish_parse();
     }
 
     /// A script's `document.open()`: a new realm, a parser the script owns, and
@@ -943,7 +985,7 @@ impl Document {
     pub(crate) fn load_html(&mut self, input: &str) {
         self.reset_js_realm();
         self.start_parser(input, true, ParserOwner::Carrier, None);
-        self.advance_parser();
+        self.finish_parse();
     }
 
     /// Records `document` as this realm's so wrappers resolve its owner.
@@ -1026,7 +1068,8 @@ impl Document {
             .retain(|timer| !js_timer_ids.contains(&timer.id));
         self.js_timer_slots.clear();
         self.js = None;
-        self.active_parser = None;
+        self.active_buffer = None;
+        self.executed_scripts.clear();
         self.parser_eof = true;
         self.world.borrow_mut().parser_active = false;
         self.world.borrow_mut().current_script = None;
@@ -1063,7 +1106,7 @@ impl Document {
     fn eval_classic(
         &mut self,
         source: &str,
-        element: Option<dom::NodeId>,
+        element: Option<crate::js::world::NodeId>,
         base_line: u32,
         filename: &str,
     ) {
@@ -1084,10 +1127,32 @@ impl Document {
         self.fire_js(crate::js::JsRealm::deliver_mutations);
     }
 
+    /// The Blitz configuration every document of this frame shares: our net
+    /// provider for subresources, a no-op shell (screenshots re-resolve
+    /// explicitly), and the frame's base URL.
+    fn blitz_config(&self) -> blitz_dom::DocumentConfig {
+        blitz_dom::DocumentConfig {
+            net_provider: Some(
+                std::sync::Arc::clone(&self.net_provider)
+                    as std::sync::Arc<dyn blitz_traits::net::NetProvider>,
+            ),
+            navigation_provider: Some(
+                std::sync::Arc::clone(&self.blitz_nav)
+                    as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>,
+            ),
+            shell_provider: Some(std::sync::Arc::new(crate::render::TinyShell)),
+            base_url: Some(self.url.as_str().to_owned()),
+            ..blitz_dom::DocumentConfig::default()
+        }
+    }
+
     /// Installs `parsed` as the active document and registers it, reporting
     /// whether a realm owns it afterwards.
-    fn install_parsed(&mut self, mut parsed: Parsed) -> bool {
-        dom::metadata::set_document_language(&mut parsed.document, self.content_language.clone());
+    fn install_parsed(&mut self, parsed: Parsed) -> bool {
+        // Known gap: Blitz owns document language internally and exposes no
+        // metadata setter; the response language stays on `content_language`
+        // until that setter exists.
+        let _ = self.content_language.as_deref();
         if self.js.is_none() {
             let document = self.world.borrow_mut().replace_document(parsed);
             self.register_document(document);
@@ -1099,88 +1164,130 @@ impl Document {
         }
     }
 
+    /// Parses the accumulated markup as one whole document, installs it, and
+    /// runs its scripts in tree order
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
+    fn finish_parse(&mut self) {
+        if !self.parser_eof {
+            return;
+        }
+        let Some(mut buffer) = self.active_buffer.take() else {
+            return;
+        };
+        // Writes queued while the parser was active join this parse; later
+        // writes have no incremental parser to feed (see `write_text`).
+        let pending = std::mem::take(&mut self.world.borrow_mut().pending_html_writes);
+        let pending_bytes = pending.iter().map(String::len).sum::<usize>();
+        self.world.borrow().release_stream_bytes(pending_bytes);
+        for chunk in pending {
+            buffer.push_str(&chunk);
+        }
+        let parsed = crate::parse_html(&buffer, self.blitz_config());
+        if !self.install_parsed(parsed) {
+            self.record_event(RendererEvent::ScriptFailed);
+            return;
+        }
+        self.world.borrow_mut().parser_active = false;
+        // A script may query a child frame's window; the browsing context
+        // must exist by then.
+        self.adopt_pending_frames();
+        // Microtask checkpoint before scripts run; parser mutations queued
+        // since the last script deliver now.
+        self.deliver_mutations();
+        self.resume_scripts();
+    }
+
+    /// Continues the document after a parse settled or a parser-blocking
+    /// fetch completed: runs the remaining scripts, then the end-of-parse
+    /// steps unless another fetch blocks the walk.
+    fn resume_scripts(&mut self) {
+        if self.run_scripts() {
+            return;
+        }
+        // Style sheets delay the load event, so queue them before the
+        // document's end events.
+        self.load_stylesheets();
+        self.load_images();
+        // Deliver parser mutations before the document's events.
+        self.deliver_mutations();
+        self.fire_document_end();
+    }
+
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext
     // https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
-    fn advance_parser(&mut self) {
-        loop {
-            let Some(parser) = self.active_parser.as_ref() else {
-                return;
+    //
+    /// Runs every not-yet-executed script in tree order, stopping (returning
+    /// true) when a `src` fetch starts: the fetch completion resumes the
+    /// walk, so later scripts still run in order
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#pending-parsing-blocking-script>).
+    fn run_scripts(&mut self) -> bool {
+        let scripts: Vec<crate::js::world::NodeId> = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return false;
             };
-            match parser.advance() {
-                crate::ParseProgress::Script(id) => {
-                    let parsed = parser.take_state();
-                    if !self.install_parsed(parsed) {
-                        self.record_event(RendererEvent::ScriptFailed);
-                        self.sync_parser_from_world();
-                        continue;
-                    }
-                    // A script may query a child frame's window; the browsing
-                    // context must exist by then.
-                    self.adopt_pending_frames();
-                    // Microtask checkpoint before the script runs; parser
-                    // mutations queued since the last script deliver now.
-                    self.deliver_mutations();
-                    let script = crate::js::script_at(&self.world.borrow(), id);
-                    match script {
-                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline {
-                            source,
-                            line,
-                        })) => {
-                            let filename = self.url.as_str().to_owned();
-                            self.eval_classic(&source, Some(id), line, &filename);
-                            self.sync_parser_from_world();
-                        }
-                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
-                            if let Ok(url) = self.resolve_dial_url(&src) {
-                                self.classic_fetch_in_flight = true;
-                                let initiator = self.url.clone();
-                                self.queued_dials.push(QueuedDial::get(
-                                    DialContext::ClassicScript {
-                                        element: id,
-                                        epoch: self.js_epoch,
-                                    },
-                                    url,
-                                    initiator,
-                                ));
-                                return;
-                            }
-                            self.sync_parser_from_world();
-                        }
-                        Some(crate::js::Script::Module(source)) => {
-                            // Module scripts are deferred by default: parsing
-                            // continues, then the queue runs in document order
-                            // before `DOMContentLoaded`
-                            // (<https://html.spec.whatwg.org/multipage/scripting.html#attr-script-defer>).
-                            self.deferred_modules.push((id, source));
-                            self.sync_parser_from_world();
-                        }
-                        None => self.sync_parser_from_world(),
+            let base = &parsed.document.base;
+            let document = parsed.id;
+            let mut scripts = Vec::new();
+            let mut stack = vec![base.root_node().id];
+            while let Some(id) = stack.pop() {
+                let Some(node) = base.get_node(id) else {
+                    continue;
+                };
+                if crate::js::world::is_html_element(base, id, "script") {
+                    scripts.push(crate::js::world::NodeId {
+                        document,
+                        node: id,
+                    });
+                }
+                stack.extend(node.children.iter().rev().copied());
+            }
+            scripts
+        };
+        for id in scripts {
+            if !self.executed_scripts.insert(id) {
+                continue;
+            }
+            // A script may query a child frame's window; the browsing
+            // context must exist by then.
+            self.adopt_pending_frames();
+            // Microtask checkpoint before the script runs; parser
+            // mutations queued since the last script deliver now.
+            self.deliver_mutations();
+            let script = crate::js::script_at(&self.world.borrow(), id);
+            match script {
+                Some(crate::js::Script::Classic(
+                    crate::js::ScriptSource::Inline { source, line },
+                )) => {
+                    let filename = self.url.as_str().to_owned();
+                    self.eval_classic(&source, Some(id), line, &filename);
+                }
+                Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
+                    if let Ok(url) = self.resolve_dial_url(&src) {
+                        self.classic_fetch_in_flight = true;
+                        let initiator = self.url.clone();
+                        self.queued_dials.push(QueuedDial::get(
+                            DialContext::ClassicScript {
+                                element: id,
+                                epoch: self.js_epoch,
+                            },
+                            url,
+                            initiator,
+                        ));
+                        return true;
                     }
                 }
-                crate::ParseProgress::Done => {
-                    if !self.parser_eof {
-                        return;
-                    }
-                    let Some(parser) = self.active_parser.take() else {
-                        return;
-                    };
-                    let parsed = parser.finish();
-                    if !self.install_parsed(parsed) {
-                        self.record_event(RendererEvent::ScriptFailed);
-                        return;
-                    }
-                    self.world.borrow_mut().parser_active = false;
-                    // Style sheets delay the load event, so queue them before
-                    // the document's end events.
-                    self.load_stylesheets();
-                    self.load_images();
-                    // Deliver parser mutations before the document's events.
-                    self.deliver_mutations();
-                    self.fire_document_end();
-                    return;
+                Some(crate::js::Script::Module(source)) => {
+                    // Module scripts are deferred by default: parsing
+                    // continues, then the queue runs in document order
+                    // before `DOMContentLoaded`
+                    // (<https://html.spec.whatwg.org/multipage/scripting.html#attr-script-defer>).
+                    self.deferred_modules.push((id, source));
                 }
+                None => {}
             }
         }
+        false
     }
 
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
@@ -1195,15 +1302,15 @@ impl Document {
 
     fn base_url(&self) -> Url {
         let world = self.world.borrow();
-        let Some(parsed) = world.main_document() else {
-            return self.url.clone();
-        };
-        let Ok(Some(base_el)) =
-            dom::selector::select_first(&parsed.document, parsed.document.document(), "base[href]")
-        else {
-            return self.url.clone();
-        };
-        let Some(href) = parsed.document.attribute(base_el, "href") else {
+        let base_href = world
+            .with_main_document(|parsed| {
+                let base = &parsed.document.base;
+                let root = base.root_node().id;
+                let base_el = base.query_selector_in(root, "base[href]").ok().flatten()?;
+                crate::js::world::attr(base, base_el, "href").map(str::to_owned)
+            })
+            .flatten();
+        let Some(href) = base_href else {
             return self.url.clone();
         };
         self.url.join(&href).unwrap_or_else(|_| self.url.clone())
@@ -1231,8 +1338,7 @@ impl Document {
                         let filename = outcome.final_url.clone();
                         self.eval_classic(&source, Some(element), 1, &filename);
                     }
-                    self.sync_parser_from_world();
-                    self.advance_parser();
+                    self.resume_scripts();
                 }
             }
             DialContext::Stylesheet { element, epoch } => {
@@ -1270,18 +1376,9 @@ impl Document {
                 if self.image_generation(element) == generation {
                     self.in_flight_images.remove(&element);
                     let selected = self.image_selected_src.remove(&element).unwrap_or_default();
-                    let loaded = (200..300).contains(&outcome.status)
-                        && crate::render::decode_image(&outcome.body).is_some_and(|image| {
-                            self.world
-                                .borrow_mut()
-                                .store_image(element, image, selected.clone())
-                        });
-                    if loaded {
-                        self.fire_js(|js| js.fire_node_load(element));
-                    } else {
-                        self.world.borrow_mut().fail_image(element, selected);
-                        self.fire_js(|js| js.fire_node_error(element));
-                    }
+                    // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
+                    self.world.borrow_mut().fail_image(element, selected);
+                    self.fire_js(|js| js.fire_node_error(element));
                     self.adopt_js_work();
                 }
                 self.fire_document_load();
@@ -1324,8 +1421,7 @@ impl Document {
             DialContext::ClassicScript { epoch, .. } => {
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
-                    self.sync_parser_from_world();
-                    self.advance_parser();
+                    self.resume_scripts();
                 }
             }
             DialContext::Stylesheet { epoch, .. } => {
@@ -1367,24 +1463,6 @@ impl Document {
 
     pub(in crate::document) fn settle_js_fetch(&mut self, id: i32, outcome: Option<DialOutcome>) {
         self.fire_js(|js| js.finish_js_fetch(id, outcome));
-    }
-
-    fn sync_parser_from_world(&self) {
-        let Some(parser) = self.active_parser.as_ref() else {
-            return;
-        };
-        let mut world = self.world.borrow_mut();
-        let pending = std::mem::take(&mut world.pending_html_writes);
-        let bytes = pending.iter().map(String::len).sum::<usize>();
-        world.release_stream_bytes(bytes);
-        let writes = pending.concat();
-        if let Some(parsed) = world.take_main_document() {
-            parser.restore(parsed);
-        }
-        drop(world);
-        if !writes.is_empty() {
-            parser.insert_html(writes);
-        }
     }
 
     /// Runs the post-parsing steps of "the end": set readiness to
@@ -1453,78 +1531,25 @@ impl Document {
         self.maybe_fire_load();
     }
 
-    /// Queues every `<link rel=stylesheet>` whose URL has not been requested
-    /// yet. Sheets delay the load event, so this runs before the document end
-    /// events.
+    /// Scans for `<link rel=stylesheet>` sheets. The counters stay so the
+    /// load-event gating still compiles, but no dial is queued.
     fn load_stylesheets(&mut self) {
-        let links: Vec<(dom::NodeId, String)> = {
-            let world = self.world.borrow();
-            let Some(parsed) = world.main_document() else {
-                return;
-            };
-            let document = parsed.document.document();
-            let Ok(links) =
-                dom::selector::select_all(&parsed.document, document, "link[rel~=\"stylesheet\"]")
-            else {
-                return;
-            };
-            links
-                .into_iter()
-                .filter_map(|link| {
-                    parsed
-                        .document
-                        .attribute(link, "href")
-                        .map(|href| (link, href))
-                })
-                .collect()
-        };
-        let initiator = self.url.clone();
-        let mut queued = 0usize;
-        for (element, href) in links {
-            let Ok(url) = self.resolve_dial_url(&href) else {
-                continue;
-            };
-            if !self.stylesheet_urls.insert(url.as_str().to_owned()) {
-                continue;
-            }
-            self.queued_dials.push(QueuedDial::get(
-                DialContext::Stylesheet {
-                    element,
-                    epoch: self.js_epoch,
-                },
-                url,
-                initiator.clone(),
-            ));
-            self.pending_stylesheets = self.pending_stylesheets.saturating_add(1);
-            queued += 1;
-        }
-        if queued > 0 {
-            self.launch_queued_dials();
-        }
+        // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
+        self.pending_stylesheets = 0;
     }
 
-    /// Queues the current document's `<img src>` resources. Image requests
-    /// delay the load event until they succeed or fail
-    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    /// Scans for the current document's `<img src>` resources. The counters
+    /// stay so the load-event gating still compiles, but no dial is queued.
     fn load_images(&mut self) {
-        let images: Vec<dom::NodeId> = {
-            let world = self.world.borrow();
-            let Some(parsed) = world.main_document() else {
-                return;
-            };
-            let document = parsed.document.document();
-            dom::selector::select_all(&parsed.document, document, "img[src]").unwrap_or_default()
-        };
-        for element in images {
-            self.queue_image(element, false);
-        }
+        // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
+        self.pending_images = 0;
     }
 
-    fn image_generation(&self, element: dom::NodeId) -> u64 {
+    fn image_generation(&self, element: crate::js::world::NodeId) -> u64 {
         self.image_generations.get(&element).copied().unwrap_or(0)
     }
 
-    fn bump_image_generation(&mut self, element: dom::NodeId) -> u64 {
+    fn bump_image_generation(&mut self, element: crate::js::world::NodeId) -> u64 {
         let generation = self.image_generations.entry(element).or_insert(0);
         *generation = generation.wrapping_add(1);
         *generation
@@ -1534,49 +1559,15 @@ impl Document {
     ///
     /// `force` is a `src` mutation: a connected insert skips work when a fetch
     /// or decoded image is already current.
-    pub(in crate::document) fn queue_image(&mut self, element: dom::NodeId, force: bool) {
-        if !force
-            && (self.in_flight_images.contains(&element)
-                || self.world.borrow().images.contains_key(&element))
-        {
-            return;
-        }
-        let generation = self.bump_image_generation(element);
-        self.in_flight_images.insert(element);
-        let src = self.world.borrow().document(element).and_then(|parsed| {
-            dom::lifecycle::is_img_element(&parsed.document, element)
-                .then(|| parsed.document.attribute(element, "src"))
-                .flatten()
-        });
-        let Some(src) = src.filter(|src| !src.is_empty()) else {
-            self.in_flight_images.remove(&element);
-            self.image_selected_src.remove(&element);
-            self.world.borrow_mut().forget_image(element);
-            self.fire_js(|js| js.fire_node_error(element));
-            return;
-        };
-        let Ok(url) = self.resolve_dial_url(&src) else {
-            self.in_flight_images.remove(&element);
-            self.image_selected_src.remove(&element);
-            self.world.borrow_mut().fail_image(element, src);
-            self.fire_js(|js| js.fire_node_error(element));
-            return;
-        };
-        let initiator = self.url.clone();
-        let selected = url.as_str().to_owned();
-        self.image_selected_src.insert(element, selected.clone());
-        self.world.borrow_mut().begin_image(element, selected);
-        self.queued_dials.push(QueuedDial::get(
-            DialContext::Image {
-                element,
-                epoch: self.js_epoch,
-                generation,
-            },
-            url,
-            initiator,
-        ));
-        self.pending_images = self.pending_images.saturating_add(1);
-        self.launch_queued_dials();
+    pub(in crate::document) fn queue_image(
+        &mut self,
+        element: crate::js::world::NodeId,
+        _force: bool,
+    ) {
+        // Known gap: Blitz subresource fetch is unwired; external sheets/images do not load yet.
+        // The generation still advances so a later fetch cannot resurrect
+        // this request.
+        self.bump_image_generation(element);
     }
 
     /// Fires this document's `load` event once it and every child browsing
@@ -1597,18 +1588,18 @@ impl Document {
 
     /// A child browsing context started loading; this document's `load` event
     /// waits for it, and the container is remembered until it finishes.
-    pub(crate) fn mark_frame_load_pending(&mut self, container: dom::NodeId) {
+    pub(crate) fn mark_frame_load_pending(&mut self, container: crate::js::world::NodeId) {
         self.pending_frame_loads.insert(container);
     }
 
     /// The containers whose child frames have not finished loading.
-    pub(crate) fn pending_frame_loads(&self) -> Vec<dom::NodeId> {
+    pub(crate) fn pending_frame_loads(&self) -> Vec<crate::js::world::NodeId> {
         self.pending_frame_loads.iter().copied().collect()
     }
 
     /// Fires one container's `load` event and lets this document's own `load`
     /// event proceed once no child is left loading.
-    pub(crate) fn finish_frame_load(&mut self, container: dom::NodeId) -> bool {
+    pub(crate) fn finish_frame_load(&mut self, container: crate::js::world::NodeId) -> bool {
         if !self.pending_frame_loads.remove(&container) {
             return false;
         }
@@ -1618,7 +1609,7 @@ impl Document {
     }
 
     /// Drops a container that went away before its child finished loading.
-    pub(crate) fn cancel_frame_load(&mut self, container: dom::NodeId) {
+    pub(crate) fn cancel_frame_load(&mut self, container: crate::js::world::NodeId) {
         if self.pending_frame_loads.remove(&container) {
             self.maybe_fire_load();
         }

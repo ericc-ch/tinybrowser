@@ -1,9 +1,9 @@
 //! Attribute, class, and handler-attribute objects and plumbing.
 
 use super::{
-    FromJs, OptString, WebIdlString, child_value, deref_weak, element_is_html, is_html_element,
-    make_weak, qualified_name, realm_registry, schedule_mutation_delivery, string_value, throw_dom,
-    throw_dom_error, with_node_kind, world, world_for_node, wrap_node,
+    FromJs, OptString, WebIdlString, child_value, deref_weak, is_html_element, make_weak,
+    qualified_name, realm_registry, schedule_mutation_delivery, string_value, throw_dom,
+    with_node_data, world, world_for_node, wrap_node,
 };
 
 use std::cell::RefCell;
@@ -11,7 +11,14 @@ use std::collections::HashSet;
 
 use std::rc::Rc;
 
-use dom::{NodeId, qualified_name_eq};
+use markup5ever::{LocalName, QualName};
+
+use crate::js::world as js_world;
+use crate::js::world::{
+    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, JournalEntry,
+    NavigationTarget, NodeId, World,
+};
+use crate::names::qualified_name_eq;
 
 use rquickjs::{Class, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace};
 
@@ -19,9 +26,6 @@ use super::node::node_generated;
 use crate::js::events::{
     JsEvent, add_listener_parsed, dispatch_event, event_target_generated, listener_callback,
     listener_options, remove_capture, remove_listener_parsed, report_exception,
-};
-use crate::js::world::{
-    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, NavigationTarget, World,
 };
 
 /// `DOMTokenList` for `Element.classList`
@@ -45,7 +49,10 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         let value = world
             .borrow()
             .document(self.element.0)
-            .and_then(|parsed| parsed.document.attribute(self.element.0, "class"))
+            .and_then(|parsed| {
+                js_world::attr(&parsed.document.base, self.element.0.node, "class")
+                    .map(ToOwned::to_owned)
+            })
             .unwrap_or_default();
         rquickjs::String::from_str(ctx.clone(), &value)
     }
@@ -182,7 +189,9 @@ fn class_tokens(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<String>> {
     for token in world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.document.attribute(id, "class"))
+        .and_then(|parsed| {
+            js_world::attr(&parsed.document.base, id.node, "class").map(ToOwned::to_owned)
+        })
         .unwrap_or_default()
         .split_ascii_whitespace()
     {
@@ -237,10 +246,9 @@ fn validate_token_pair(ctx: &Ctx<'_>, old: &str, new: &str) -> Result<()> {
 /// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
 fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()> {
     if tokens.is_empty()
-        && world(ctx)?
-            .borrow()
-            .document(id)
-            .is_none_or(|parsed| parsed.document.attribute(id, "class").is_none())
+        && world(ctx)?.borrow().document(id).is_none_or(|parsed| {
+            js_world::attr(&parsed.document.base, id.node, "class").is_none()
+        })
     {
         return Ok(());
     }
@@ -248,16 +256,7 @@ fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()
 }
 
 fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(id) else {
-        return Ok(());
-    };
-    dom::mutation::set_attribute(&mut parsed.document, id, "class", value)
-        .map_err(|err| throw_dom_error(ctx, err))?;
-    drop(parsed);
-    drop(world);
-    schedule_mutation_delivery(ctx)
+    set_attribute_sync(ctx, id, "class", value)
 }
 
 /// One `Attr` platform object
@@ -445,7 +444,7 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-baseuri
-    pub(super) fn base_uri(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+    pub(super) fn base_uri(&self, ctx: &Ctx<'_>) -> Result<crate::dom_string::DomString> {
         let home = attr_context(ctx, self.scope.0, self.id)?;
         let document = attr_state(&home, self.scope.0, self.id)?.document;
         Ok(super::document_base_url_string(&home, document).into())
@@ -661,10 +660,15 @@ impl<'object> JsAttr<'object> {
         };
         let world = world_for_node(&ctx, owner)?;
         let world = world.borrow();
-        let parsed = world
-            .document(owner)
-            .ok_or_else(|| Exception::throw_type(&ctx, "stale attribute owner"))?;
-        match super::locate_namespace(&parsed.document, owner, prefix.as_deref()) {
+        let found = world.document(owner).and_then(|parsed| {
+            locate_namespace(
+                &parsed.document.base,
+                owner.document,
+                owner,
+                prefix.as_deref(),
+            )
+        });
+        match found {
             Some(namespace) => string_value(&ctx, &namespace),
             None => Ok(Value::new_null(ctx)),
         }
@@ -685,10 +689,10 @@ impl<'object> JsAttr<'object> {
         };
         let world = world_for_node(&ctx, owner)?;
         let world = world.borrow();
-        let parsed = world
-            .document(owner)
-            .ok_or_else(|| Exception::throw_type(&ctx, "stale attribute owner"))?;
-        match super::locate_prefix(&parsed.document, owner, &namespace) {
+        let found = world.document(owner).and_then(|parsed| {
+            locate_prefix(&parsed.document.base, owner.document, owner, &namespace)
+        });
+        match found {
             Some(prefix) => string_value(&ctx, &prefix),
             None => Ok(Value::new_null(ctx)),
         }
@@ -731,7 +735,7 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-baseuri
-    fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         self.base_uri(ctx)
     }
 
@@ -1081,13 +1085,29 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
     // repeats keeps its first attribute, matching own-property definition
     // order.
     fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
-        let html = element_is_html(ctx, self.element.0);
+        let html = with_node_data(ctx, self.element.0, |data| {
+            data.and_then(|data| data.downcast_element())
+                .is_some_and(|element| element.name.ns == js_world::html_namespace())
+        })
+        .unwrap_or(false);
         let world_rc = world_for_node(ctx, self.element.0)?;
         let world = world_rc.borrow();
         let mut seen = HashSet::new();
         Ok(world
             .document(self.element.0)
-            .map(|parsed| parsed.document.attribute_names(self.element.0))
+            .map(|parsed| {
+                let base = &parsed.document.base;
+                base.get_node(self.element.0.node)
+                    .and_then(|node| node.data.downcast_element())
+                    .map(|element| {
+                        element
+                            .attrs
+                            .iter()
+                            .map(|attribute| qualified_name(&attribute.name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
             .unwrap_or_default()
             .into_iter()
             .filter(|name| !html || !name.bytes().any(|byte| byte.is_ascii_uppercase()))
@@ -1120,8 +1140,10 @@ impl JsNamedNodeMap {
         };
         Ok(parsed
             .document
-            .attributes(self.element.0)
-            .map_or(0, <[dom::Attribute]>::len))
+            .base
+            .get_node(self.element.0.node)
+            .and_then(|node| node.data.downcast_element())
+            .map_or(0, |element| element.attrs.len()))
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-item
@@ -1201,12 +1223,16 @@ fn attribute_at(ctx: &Ctx<'_>, element: NodeId, index: i64) -> Result<Option<(St
     let Some(parsed) = world.document(element) else {
         return Ok(None);
     };
-    let Some(list) = parsed.document.attributes(element) else {
+    let base = &parsed.document.base;
+    let Some(data) = base
+        .get_node(element.node)
+        .and_then(|node| node.data.downcast_element())
+    else {
         return Ok(None);
     };
     Ok(usize::try_from(index)
         .ok()
-        .and_then(|index| list.get(index))
+        .and_then(|index| data.attrs.iter().nth(index))
         .map(|attribute| {
             (
                 attribute.name.ns.to_string(),
@@ -1228,7 +1254,14 @@ fn named_item<'js>(ctx: &Ctx<'js>, element: NodeId, name: &str) -> Result<Value<
 /// to ASCII lowercase, any other element keeps the name
 /// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
 pub(super) fn attribute_local_name(ctx: &Ctx<'_>, element: NodeId, name: &str) -> String {
-    if element_is_html(ctx, element) {
+    // `node.rs` calls this on every `getAttribute`, so a missing document
+    // falls back to the non-HTML spelling instead of throwing.
+    let html = with_node_data(ctx, element, |data| {
+        data.and_then(|data| data.downcast_element())
+            .is_some_and(|element| element.name.ns == js_world::html_namespace())
+    })
+    .unwrap_or(false);
+    if html {
         name.to_ascii_lowercase()
     } else {
         name.to_owned()
@@ -1250,16 +1283,23 @@ fn named_attribute_id(
         let Some(parsed) = world.document(element) else {
             return Ok(None);
         };
-        parsed.document.attributes(element).and_then(|list| {
-            list.iter()
-                .find(|attribute| qualified_name_eq(&attribute.name, &name))
-                .map(|attribute| {
-                    (
-                        attribute.name.ns.to_string(),
-                        attribute.name.local.to_string(),
-                    )
-                })
-        })
+        parsed
+            .document
+            .base
+            .get_node(element.node)
+            .and_then(|node| node.data.downcast_element())
+            .and_then(|element| {
+                element
+                    .attrs
+                    .iter()
+                    .find(|attribute| qualified_name_eq(&attribute.name, &name))
+                    .map(|attribute| {
+                        (
+                            attribute.name.ns.to_string(),
+                            attribute.name.local.to_string(),
+                        )
+                    })
+            })
     };
     let Some((namespace, local)) = found else {
         return Ok(None);
@@ -1297,10 +1337,13 @@ pub(crate) fn attr_owner(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Option<NodeId
     let world_rc = world_for_node(ctx, owner).ok()?;
     let world = world_rc.borrow();
     let parsed = world.document(owner)?;
-    parsed
-        .document
-        .attribute_ns(owner, &state.namespace, &state.local)
-        .map(|_| owner)
+    element_attribute(
+        &parsed.document.base,
+        owner.node,
+        &state.namespace,
+        &state.local,
+    )
+    .map(|_| owner)
 }
 
 fn attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Result<String> {
@@ -1309,9 +1352,12 @@ fn attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Result<String> {
         let world_rc = world_for_node(ctx, owner)?;
         let world = world_rc.borrow();
         if let Some(parsed) = world.document(owner)
-            && let Some(value) = parsed
-                .document
-                .attribute_ns(owner, &state.namespace, &state.local)
+            && let Some(value) = attribute_ns_value(
+                &parsed.document.base,
+                owner.node,
+                &state.namespace,
+                &state.local,
+            )
         {
             return Ok(value);
         }
@@ -1326,6 +1372,41 @@ fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Resul
         Some(owner) => world_for_node(&home, owner)?,
         None => world(&home)?,
     };
+    if let Some(owner) = snapshot.owner {
+        let name = QualName::new(
+            snapshot.prefix.as_deref().map(markup5ever::Prefix::from),
+            markup5ever::Namespace::from(snapshot.namespace.clone()),
+            LocalName::from(snapshot.local.clone()),
+        );
+        let world = world_rc.borrow();
+        let old_value = world.document(owner).and_then(|parsed| {
+            attribute_ns_value(
+                &parsed.document.base,
+                owner.node,
+                &snapshot.namespace,
+                &snapshot.local,
+            )
+        });
+        let Some(mut parsed) = world.document_mut(owner) else {
+            return Err(Exception::throw_type(ctx, "stale attribute owner"));
+        };
+        if parsed.document.base.get_node(owner.node).is_none() {
+            return Err(Exception::throw_type(ctx, "stale attribute owner"));
+        }
+        parsed
+            .document
+            .base
+            .mutate()
+            .set_attribute(owner.node, name.clone(), &value);
+        parsed.document.record(JournalEntry::Attributes {
+            target: owner,
+            name: qualified_name(&name),
+            namespace: snapshot.namespace.clone(),
+            old_value,
+        });
+        drop(parsed);
+        drop(world);
+    }
     let world = world_rc.borrow();
     let registry = world.registry();
     let mut registry = registry.borrow_mut();
@@ -1334,20 +1415,6 @@ fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Resul
         .state_mut(id)
         .filter(|state| state.scope == scope)
         .ok_or_else(|| Exception::throw_type(ctx, "stale attribute"))?;
-    if let Some(owner) = state.owner {
-        let mut parsed = world
-            .document_mut(owner)
-            .ok_or_else(|| Exception::throw_type(ctx, "stale attribute owner"))?;
-        dom::mutation::set_attribute_by_ns(
-            &mut parsed.document,
-            owner,
-            &state.namespace,
-            state.prefix.as_deref(),
-            &state.local,
-            value.clone(),
-        )
-        .map_err(|err| throw_dom_error(ctx, err))?;
-    }
     state.value = value;
     drop(registry);
     drop(world);
@@ -1369,31 +1436,15 @@ pub(crate) fn attached_attr_id(
         let Some(parsed) = world.document(element) else {
             return Ok(None);
         };
-        parsed.document.attributes(element).and_then(|list| {
-            list.iter()
-                .find(|attribute| {
-                    attribute.name.ns.as_ref() == namespace
-                        && attribute.name.local.as_ref() == local
-                })
-                .map(|attribute| {
-                    (
-                        attribute
-                            .name
-                            .prefix
-                            .as_ref()
-                            .filter(|prefix| !prefix.is_empty())
-                            .map(ToString::to_string),
-                        qualified_name(&attribute.name),
-                        attribute.value.clone(),
-                    )
-                })
-        })
+        element_attribute(&parsed.document.base, element.node, namespace, local)
     };
     let document = world
         .document(element)
-        .ok_or_else(|| Exception::throw_type(ctx, "stale attribute owner"))?
-        .document
-        .document();
+        .map(|parsed| NodeId {
+            document: element.document,
+            node: parsed.document.base.root_node().id,
+        })
+        .ok_or_else(|| Exception::throw_type(ctx, "stale attribute owner"))?;
     let registry = world.registry();
     drop(world);
     let mut registry = registry.borrow_mut();
@@ -1473,9 +1524,11 @@ pub(crate) fn new_detached_attr(
     let world = world_rc.borrow();
     let document = world
         .document(scope)
-        .ok_or_else(|| Exception::throw_type(ctx, "stale attribute document"))?
-        .document
-        .document();
+        .map(|parsed| NodeId {
+            document: scope.document,
+            node: parsed.document.base.root_node().id,
+        })
+        .ok_or_else(|| Exception::throw_type(ctx, "stale attribute document"))?;
     let registry = world.registry();
     drop(world);
     let id = registry
@@ -1535,18 +1588,18 @@ const WINDOW_HANDLER_ATTRIBUTES: &[&str] = &[
 /// Compiles or clears one element's event handler content attribute.
 fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Result<()> {
     let name = format!("on{typ}");
-    let body = world(ctx)?
-        .borrow()
-        .document(element)
-        .and_then(|parsed| parsed.document.attribute(element, &name));
+    let body = world(ctx)?.borrow().document(element).and_then(|parsed| {
+        js_world::attr(&parsed.document.base, element.node, &name).map(ToOwned::to_owned)
+    });
     let Some(object) = wrap_node(ctx, element)?.as_object().cloned() else {
         return Ok(());
     };
     // A `body` element's window event handler attributes register on the
     // window itself
     // (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
-    let forwarded = WINDOW_HANDLER_ATTRIBUTES.contains(&name.as_str())
-        && with_node_kind(ctx, element, |kind| is_html_element(kind, "body"))?;
+    let is_body =
+        with_node_data(ctx, element, |data| is_html_element(data, "body")).unwrap_or(false);
+    let forwarded = WINDOW_HANDLER_ATTRIBUTES.contains(&name.as_str()) && is_body;
     match body {
         Some(body) if !body.trim().is_empty() => {
             // The `onerror` handler takes the spec's five arguments, not the
@@ -1593,21 +1646,11 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
 /// `input` becomes selectable again after a non-selectable type (for example
 /// `color` back to `text`), the text entry cursor moves to the beginning
 /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
-    if !with_node_kind(ctx, element, |kind| is_html_element(kind, "input"))? {
-        return Ok(());
-    }
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(element) else {
-        return Ok(());
-    };
-    let now = dom::form::selection_supported(&parsed.document, element);
-    let previously = dom::form::input_selectable(&parsed.document, element);
-    if !previously && now {
-        dom::form::set_selection(&mut parsed.document, element, 0, 0, 0);
-    }
-    dom::form::set_input_selectable(&mut parsed.document, element, now);
+fn apply_input_type_change(_ctx: &Ctx<'_>, _element: NodeId) -> Result<()> {
+    // Known gap (Blitz cutover): the old `dom::form` selection-tracking APIs
+    // (`selection_supported`, `input_selectable`, `set_selection`,
+    // `set_input_selectable`) have no Blitz equivalent yet, so the input
+    // `type`-change text-selection step is a no-op until they land.
     Ok(())
 }
 
@@ -1633,8 +1676,10 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     if local != "src" {
         return Ok(());
     }
-    let is_iframe = with_node_kind(ctx, element, |kind| is_html_element(kind, "iframe"))?;
-    let is_img = with_node_kind(ctx, element, |kind| is_html_element(kind, "img"))?;
+    let is_iframe =
+        with_node_data(ctx, element, |data| is_html_element(data, "iframe")).unwrap_or(false);
+    let is_img =
+        with_node_data(ctx, element, |data| is_html_element(data, "img")).unwrap_or(false);
     if !is_iframe && !is_img {
         return Ok(());
     }
@@ -1642,15 +1687,16 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     let spec = world
         .borrow()
         .document(element)
-        .and_then(|parsed| parsed.document.attribute(element, "src"))
+        .and_then(|parsed| {
+            js_world::attr(&parsed.document.base, element.node, "src").map(ToOwned::to_owned)
+        })
         .unwrap_or_default();
     // A detached `iframe` has no browsing context yet; insertion reads the
     // current attribute, so queueing here would navigate it twice. The same
     // is true of `<img>`: connection starts the fetch.
-    let connected = world
-        .borrow()
-        .document(element)
-        .is_some_and(|parsed| dom::lifecycle::is_connected(&parsed.document, element));
+    let connected = world.borrow().document(element).is_some_and(|parsed| {
+        js_world::is_connected(&parsed.document.base, element.node)
+    });
     if !connected {
         return Ok(());
     }
@@ -1670,10 +1716,9 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
 /// The value of one event handler content attribute, when the element has it.
 pub(crate) fn handler_attribute(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<Option<String>> {
     let world = world(ctx)?;
-    Ok(world
-        .borrow()
-        .document(id)
-        .and_then(|parsed| parsed.document.attribute(id, name)))
+    Ok(world.borrow().document(id).and_then(|parsed| {
+        js_world::attr(&parsed.document.base, id.node, name).map(ToOwned::to_owned)
+    }))
 }
 
 /// Whether script explicitly cleared this element's handler property, which
@@ -1707,35 +1752,42 @@ pub(crate) fn remove_attribute_sync(
         let Some(mut parsed) = world.document_mut(element) else {
             return Ok(());
         };
-        let removed = parsed.document.attributes(element).and_then(|attributes| {
-            attributes
-                .iter()
-                .find(|attribute| {
-                    if by_namespace {
-                        attribute.name.ns.as_ref() == namespace
-                            && attribute.name.local.as_ref() == local
-                    } else {
-                        qualified_name_eq(&attribute.name, local)
-                    }
-                })
-                .map(|attribute| {
-                    (
-                        attribute.name.ns.to_string(),
-                        attribute.name.local.to_string(),
-                        attribute.value.clone(),
-                    )
-                })
-        });
-        if by_namespace {
-            dom::mutation::remove_attribute_ns(&mut parsed.document, element, namespace, local)
-                .map_err(|err| throw_dom_error(ctx, err))?;
-        } else {
-            dom::mutation::remove_attribute(&mut parsed.document, element, local)
-                .map_err(|err| throw_dom_error(ctx, err))?;
+        let removed = parsed
+            .document
+            .base
+            .get_node(element.node)
+            .and_then(|node| node.data.downcast_element())
+            .and_then(|data| {
+                data.attrs
+                    .iter()
+                    .find(|attribute| {
+                        if by_namespace {
+                            attribute.name.ns.as_ref() == namespace
+                                && attribute.name.local.as_ref() == local
+                        } else {
+                            qualified_name_eq(&attribute.name, local)
+                        }
+                    })
+                    .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+            });
+        if let Some((name, value)) = removed.as_ref() {
+            parsed
+                .document
+                .base
+                .mutate()
+                .clear_attribute(element.node, name.clone());
+            parsed.document.record(JournalEntry::Attributes {
+                target: element,
+                name: qualified_name(name),
+                namespace: name.ns.as_ref().to_owned(),
+                old_value: Some(value.clone()),
+            });
         }
         removed
     };
-    if let Some((namespace, local, value)) = removed {
+    if let Some((name, value)) = removed {
+        let namespace = name.ns.as_ref().to_owned();
+        let local = name.local.as_ref().to_owned();
         let registry = world_rc.borrow().registry();
         registry
             .borrow_mut()
@@ -1748,6 +1800,255 @@ pub(crate) fn remove_attribute_sync(
     }
     after_attribute_change(ctx, element, local)?;
     schedule_mutation_delivery(ctx)
+}
+
+/// One attribute on an element: its stored `(prefix, qualified name, value)`.
+fn element_attribute(
+    base: &blitz_dom::BaseDocument,
+    id: js_world::BlitzId,
+    namespace: &str,
+    local: &str,
+) -> Option<(Option<String>, String, String)> {
+    let attribute = base
+        .get_node(id)?
+        .data
+        .downcast_element()?
+        .attrs
+        .iter()
+        .find(|attribute| {
+            attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
+        })?;
+    Some((
+        attribute
+            .name
+            .prefix
+            .as_ref()
+            .map(markup5ever::Prefix::as_ref)
+            .filter(|prefix| !prefix.is_empty())
+            .map(ToString::to_string),
+        qualified_name(&attribute.name),
+        attribute.value.clone(),
+    ))
+}
+
+/// The value of the `(namespace, local)` attribute on `id`, if present.
+fn attribute_ns_value(
+    base: &blitz_dom::BaseDocument,
+    id: js_world::BlitzId,
+    namespace: &str,
+    local: &str,
+) -> Option<String> {
+    element_attribute(base, id, namespace, local).map(|(_, _, value)| value)
+}
+
+/// Sets the `local` content attribute to `value`, syncing the Attr registry
+/// and mutation observers; the reflected-attribute write path behind
+/// `host::reflect_set_string` and `write_class`
+/// (<https://dom.spec.whatwg.org/#concept-element-attributes-set>).
+pub(crate) fn set_attribute_sync(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    local: &str,
+    value: &str,
+) -> Result<()> {
+    let world_rc = world_for_node(ctx, element)?;
+    let world = world_rc.borrow();
+    let Some(mut parsed) = world.document_mut(element) else {
+        return Ok(());
+    };
+    // Reuse the stored qualified name when an attribute with this local name
+    // is already present: `Attributes::set` matches the full `QualName`, so a
+    // fresh name would duplicate instead of replacing it.
+    let (name, old_value) = {
+        let base = &parsed.document.base;
+        let Some(data) = base
+            .get_node(element.node)
+            .and_then(|node| node.data.downcast_element())
+        else {
+            return Err(Exception::throw_type(
+                ctx,
+                "attribute target is not an element",
+            ));
+        };
+        let name = data
+            .attrs
+            .iter()
+            .find(|attribute| attribute.name.local.as_ref() == local)
+            .map(|attribute| attribute.name.clone())
+            .unwrap_or_else(|| {
+                QualName::new(None, js_world::html_namespace(), LocalName::from(local))
+            });
+        let old_value = js_world::attr(base, element.node, local).map(ToOwned::to_owned);
+        (name, old_value)
+    };
+    let namespace = name.ns.as_ref().to_owned();
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_attribute(element.node, name.clone(), value);
+    parsed.document.record(JournalEntry::Attributes {
+        target: element,
+        name: qualified_name(&name),
+        namespace: namespace.clone(),
+        old_value,
+    });
+    drop(parsed);
+    drop(world);
+    touch_attr(ctx, element, &namespace, local, value)?;
+    after_attribute_change(ctx, element, local)?;
+    schedule_mutation_delivery(ctx)
+}
+
+/// The element the namespace lookup starts from: the node itself when it is
+/// an element, the document element for a document, else the parent element
+/// (<https://dom.spec.whatwg.org/#locate-a-namespace>).
+fn namespace_element(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    node: NodeId,
+) -> Option<NodeId> {
+    let data = &base.get_node(node.node)?.data;
+    if data.downcast_element().is_some() {
+        return Some(node);
+    }
+    match data {
+        blitz_dom::NodeData::Document(_) => {
+            base.get_node(node.node)?
+                .children
+                .iter()
+                .find_map(|child| {
+                    let id = NodeId {
+                        document,
+                        node: *child,
+                    };
+                    super::is_element(base, *child).then_some(id)
+                })
+        }
+        _ => {
+            let parent = base.get_node(node.node)?.parent?;
+            let id = NodeId {
+                document,
+                node: parent,
+            };
+            super::is_element(base, parent).then_some(id)
+        }
+    }
+}
+
+/// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
+/// `prefix` walking `cursor`'s inclusive ancestors. Blitz port of the `super`
+/// algorithm, which still targets the pre-cutover tree.
+fn locate_namespace(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    cursor: NodeId,
+    prefix: Option<&str>,
+) -> Option<String> {
+    let mut cursor = namespace_element(base, document, cursor);
+    while let Some(id) = cursor {
+        if let Some(element) = base
+            .get_node(id.node)
+            .and_then(|node| node.data.downcast_element())
+        {
+            match prefix {
+                Some("xml") => {
+                    return Some("http://www.w3.org/XML/1998/namespace".to_owned());
+                }
+                Some("xmlns") => return Some("http://www.w3.org/2000/xmlns/".to_owned()),
+                _ => {}
+            }
+            let actual = element
+                .name
+                .prefix
+                .as_ref()
+                .map(markup5ever::Prefix::as_ref)
+                .filter(|prefix| !prefix.is_empty());
+            if !element.name.ns.as_ref().is_empty() && actual == prefix {
+                return Some(element.name.ns.as_ref().to_owned());
+            }
+            for attribute in element.attrs.iter() {
+                if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
+                    continue;
+                }
+                let declaration = match prefix {
+                    Some(prefix) => {
+                        attribute
+                            .name
+                            .prefix
+                            .as_ref()
+                            .is_some_and(|value| value.as_ref() == "xmlns")
+                            && attribute.name.local.as_ref() == prefix
+                    }
+                    None => {
+                        attribute.name.prefix.is_none()
+                            && attribute.name.local.as_ref() == "xmlns"
+                    }
+                };
+                if declaration {
+                    return (!attribute.value.is_empty()).then(|| attribute.value.clone());
+                }
+            }
+        }
+        cursor = base
+            .get_node(id.node)
+            .and_then(|node| node.parent)
+            .map(|parent| NodeId {
+                document,
+                node: parent,
+            })
+            .filter(|parent| super::is_element(base, parent.node));
+    }
+    None
+}
+
+/// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
+/// for `namespace` walking `cursor`'s inclusive ancestors. Blitz port of the
+/// `super` algorithm, which still targets the pre-cutover tree.
+fn locate_prefix(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    cursor: NodeId,
+    namespace: &str,
+) -> Option<String> {
+    let mut cursor = namespace_element(base, document, cursor);
+    while let Some(id) = cursor {
+        if let Some(element) = base
+            .get_node(id.node)
+            .and_then(|node| node.data.downcast_element())
+        {
+            if element.name.ns.as_ref() == namespace
+                && let Some(prefix) = element
+                    .name
+                    .prefix
+                    .as_ref()
+                    .map(markup5ever::Prefix::as_ref)
+                    .filter(|prefix| !prefix.is_empty())
+            {
+                return Some(prefix.to_owned());
+            }
+            for attribute in element.attrs.iter() {
+                if attribute
+                    .name
+                    .prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.as_ref() == "xmlns")
+                    && attribute.value == namespace
+                {
+                    return Some(attribute.name.local.as_ref().to_owned());
+                }
+            }
+        }
+        cursor = base
+            .get_node(id.node)
+            .and_then(|node| node.parent)
+            .map(|parent| NodeId {
+                document,
+                node: parent,
+            })
+            .filter(|parent| super::is_element(base, parent.node));
+    }
+    None
 }
 
 /// `setAttributeNode` / `setAttributeNodeNS`
@@ -1788,11 +2089,17 @@ pub(crate) fn set_attribute_node<'js>(
         let mut parsed = world
             .document_mut(element)
             .ok_or_else(|| Exception::throw_type(ctx, "no document"))?;
+        let old_value = attribute_ns_value(
+            &parsed.document.base,
+            element.node,
+            &state.namespace,
+            &state.local,
+        );
         let registry = world.registry();
-        registry
+        let previous = registry
             .borrow_mut()
             .attributes
-            .attach(id, &mut parsed.document, element, value)
+            .attach(id, &mut parsed.document.base, element, value)
             .map_err(|err| match err {
                 AttrAttachError::Stale => Exception::throw_type(ctx, "stale attribute"),
                 AttrAttachError::InUse => throw_dom(
@@ -1800,8 +2107,22 @@ pub(crate) fn set_attribute_node<'js>(
                     "InUseAttributeError",
                     "attribute is already associated with another element",
                 ),
-                AttrAttachError::Dom(err) => throw_dom_error(ctx, err),
-            })?
+                // `attach` rejects a target with no element data; the
+                // dispatcher only offers elements, so this is unreachable
+                // through the DOM API.
+                AttrAttachError::NotAnElement => throw_dom(
+                    ctx,
+                    "HierarchyRequestError",
+                    "attribute target is not an element",
+                ),
+            })?;
+        parsed.document.record(JournalEntry::Attributes {
+            target: element,
+            name: state.qualified.clone(),
+            namespace: state.namespace.clone(),
+            old_value,
+        });
+        previous
     };
     after_attribute_change(ctx, element, &state.local)?;
     schedule_mutation_delivery(ctx)?;

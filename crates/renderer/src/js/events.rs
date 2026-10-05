@@ -1367,19 +1367,29 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
             let Some(parsed) = world.document(id) else {
                 return Ok(false);
             };
-            let dom = &parsed.document;
-            if dom.document() == id {
+            let base = &parsed.document.base;
+            if base.root_node().id == id.node {
                 return Ok(true);
             }
-            let html = dom::selector::select_first(dom, dom.document(), "html")
+            let html = base
+                .query_selector_in(base.root_node().id, "html")
                 .ok()
-                .flatten();
+                .flatten()
+                .map(|node| super::world::NodeId {
+                    document: id.document,
+                    node,
+                });
             if html == Some(id) {
                 return Ok(true);
             }
-            let body = dom::selector::select_first(dom, dom.document(), "body")
+            let body = base
+                .query_selector_in(base.root_node().id, "body")
                 .ok()
-                .flatten();
+                .flatten()
+                .map(|node| super::world::NodeId {
+                    document: id.document,
+                    node,
+                });
             Ok(body == Some(id))
         }
     }
@@ -1562,13 +1572,16 @@ fn handler_attribute_source<'js>(
 }
 
 /// The body element of the current realm's active document, when it has one.
-fn active_body(ctx: &Ctx<'_>) -> Option<dom::NodeId> {
+fn active_body(ctx: &Ctx<'_>) -> Option<super::world::NodeId> {
     let world = bindings::world(ctx).ok()?;
     let world = world.borrow();
     let parsed = world.main_document()?;
-    dom::selector::select_first(&parsed.document, parsed.document.document(), "body")
+    let document = parsed.id;
+    let base = &parsed.document.base;
+    base.query_selector_in(base.root_node().id, "body")
         .ok()
         .flatten()
+        .map(|node| super::world::NodeId { document, node })
 }
 
 /// `ToBoolean` for an optional argument; a missing or undefined argument is

@@ -1,8 +1,8 @@
 //! `WebIDL` argument conversion helpers.
 
-use super::{adopt_across_documents, throw_dom, throw_dom_error, world};
+use super::{adopt_across_documents, throw_dom, world};
 
-use dom::NodeId;
+use crate::js::world::{JournalEntry, NodeId};
 
 use rquickjs::{Ctx, Exception, Function, Object, Result, Value};
 
@@ -58,7 +58,7 @@ pub(crate) struct LegacyNullString(pub(crate) String);
 ///
 /// Character data may contain unpaired surrogates, which a Rust `String`
 /// cannot hold, so these entry points carry the exact code units instead.
-pub(crate) struct WebIdlCodeUnits(pub(crate) dom::DomString);
+pub(crate) struct WebIdlCodeUnits(pub(crate) crate::dom_string::DomString);
 
 /// `WebIDL` `unsigned long` conversion
 /// (<https://webidl.spec.whatwg.org/#es-unsigned-long>).
@@ -140,32 +140,67 @@ fn assemble_nodes_into_node(
     let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    let dom = &mut parsed.document;
     if pieces.len() == 1 {
         return match pieces.pop() {
             Some(Piece::Node(id)) => Ok(id),
-            Some(Piece::Text(text)) => Ok(dom.create_text(text)),
+            Some(Piece::Text(text)) => {
+                let node = parsed.document.base.mutate().create_text_node(&text);
+                Ok(NodeId {
+                    document: document.document,
+                    node,
+                })
+            }
             None => Err(Exception::throw_internal(ctx, "empty node list")),
         };
     }
-    let fragment = dom.create_fragment();
+    let fragment = NodeId {
+        document: document.document,
+        node: parsed.document.create_fragment(),
+    };
     for piece in pieces {
         let id = match piece {
             Piece::Node(id) => id,
-            Piece::Text(text) => dom.create_text(text),
+            Piece::Text(text) => {
+                let node = parsed
+                    .document
+                    .base
+                    .mutate()
+                    .create_text_node(&text);
+                NodeId {
+                    document: document.document,
+                    node,
+                }
+            }
         };
-        dom::mutation::append(dom, fragment, id).map_err(|err| throw_dom_error(ctx, err))?;
+        let previous = parsed
+            .document
+            .base
+            .get_node(fragment.node)
+            .and_then(|node| node.children.last().copied())
+            .map(|node| NodeId {
+                document: document.document,
+                node,
+            });
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(fragment.node, &[id.node]);
+        parsed.document.record(JournalEntry::ChildList {
+            target: fragment,
+            added: vec![id],
+            removed: Vec::new(),
+            previous,
+            next: None,
+        });
     }
     Ok(fragment)
 }
 
 /// A selector syntax error is a `SyntaxError` `DOMException`
 /// (<https://dom.spec.whatwg.org/#scope-match-a-selectors-string>).
-pub(crate) fn select_error(ctx: &Ctx<'_>, err: &dom::SelectError) -> rquickjs::Error {
-    match err {
-        dom::SelectError::Syntax(_) => throw_dom(ctx, "SyntaxError", &err.to_string()),
-        _ => Exception::throw_internal(ctx, &err.to_string()),
-    }
+pub(crate) fn select_error(ctx: &Ctx<'_>, err: &style_traits::ParseError<'_>) -> rquickjs::Error {
+    throw_dom(ctx, "SyntaxError", &format!("{err:?}"))
 }
 
 /// Integer conversion from a `double`

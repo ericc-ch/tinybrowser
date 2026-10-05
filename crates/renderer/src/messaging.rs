@@ -12,8 +12,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use dom::NodeId;
-
+use crate::js::world::NodeId;
 use crate::protocol::FrameId;
 
 /// Handle every realm holds to the renderer-process shared state.

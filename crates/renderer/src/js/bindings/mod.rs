@@ -40,10 +40,12 @@ use std::collections::HashMap;
 
 use std::rc::{Rc, Weak};
 
-use dom::{
-    DomError, LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace,
-    qualified_name_eq, svg_namespace,
-};
+use std::fmt;
+
+use blitz_dom::NodeData;
+use markup5ever::{LocalName, Namespace, Prefix, QualName};
+
+use crate::js::world::NodeId;
 
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
@@ -119,7 +121,10 @@ pub(crate) fn realm_registry(ctx: &Ctx<'_>) -> Result<Rc<RefCell<RealmRegistry>>
 pub(crate) fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
     world(ctx)?
         .borrow()
-        .with_main_document(|parsed| parsed.document.document())
+        .with_main_document(|parsed| NodeId {
+            document: parsed.id,
+            node: parsed.document.base.root_node().id,
+        })
         .ok_or_else(|| Exception::throw_type(ctx, "no document"))
 }
 
@@ -137,17 +142,39 @@ pub(crate) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::E
     }
 }
 
-/// Maps a refused DOM mutation onto its exception class
+/// A refused tree operation, mapped to its DOM exception class
 /// (<https://dom.spec.whatwg.org/#dom-domerror> naming).
-pub(crate) fn throw_dom_error(ctx: &Ctx<'_>, err: DomError) -> rquickjs::Error {
+#[derive(Debug)]
+pub(crate) enum TreeError {
+    /// A handle named a node that no longer exists.
+    Stale,
+    /// The move would place a node inside its own subtree, or the content
+    /// model forbids the operation.
+    Hierarchy,
+    /// The target has no parent to insert beside.
+    NotFound,
+}
+
+impl fmt::Display for TreeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stale => f.write_str("stale node handle"),
+            Self::Hierarchy => f.write_str("hierarchy or content model forbids this operation"),
+            Self::NotFound => f.write_str("target has no parent to insert beside"),
+        }
+    }
+}
+
+/// Maps a refused tree operation onto its exception class
+/// (<https://dom.spec.whatwg.org/#dom-domerror> naming).
+pub(crate) fn throw_dom_error(ctx: &Ctx<'_>, err: TreeError) -> rquickjs::Error {
     match err {
-        DomError::CycleForbidden | DomError::HierarchyRequest => {
+        TreeError::Hierarchy => {
             throw_dom(ctx, "HierarchyRequestError", &err.to_string())
         }
-        DomError::NoParent => throw_dom(ctx, "NotFoundError", &err.to_string()),
-        DomError::InvalidState => throw_dom(ctx, "InvalidStateError", &err.to_string()),
+        TreeError::NotFound => throw_dom(ctx, "NotFoundError", &err.to_string()),
         // Programming errors, not web-visible DOM exceptions.
-        DomError::StaleNode | DomError::WrongNodeType => {
+        TreeError::Stale => {
             Exception::throw_type(ctx, &err.to_string())
         }
     }
@@ -372,7 +399,7 @@ impl<'js> rquickjs::FromJs<'js> for LegacyNullString {
 
 impl<'js> rquickjs::FromJs<'js> for WebIdlCodeUnits {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        Ok(Self(dom::DomString::from_utf16(webidl_to_units(
+        Ok(Self(crate::dom_string::DomString::from_utf16(webidl_to_units(
             ctx, value,
         )?)))
     }
@@ -478,9 +505,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     install_collection_brand(ctx)?;
     capture_host_primitives(ctx, &globals, world)?;
 
-    let document_id = world
-        .borrow()
-        .with_main_document(|parsed| parsed.document.document());
+    let document_id = world.borrow().with_main_document(|parsed| NodeId {
+        document: parsed.id,
+        node: parsed.document.base.root_node().id,
+    });
     if let Some(id) = document_id {
         globals.set("document", wrap_node(ctx, id)?)?;
     }
@@ -571,8 +599,11 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     };
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
-        dom::lifecycle::is_connected(&parsed.document, node)
-            && matches!(parsed.document.kind(node), Some(NodeKind::Element { .. }))
+        let base = &parsed.document.base;
+        super::world::is_connected(base, node.node)
+            && base
+                .get_node(node.node)
+                .is_some_and(|node| node.data.downcast_element().is_some())
     });
     if !valid {
         return Ok(Value::new_null(ctx));
@@ -580,24 +611,43 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     wrap_node(&ctx, node)
 }
 
-/// Every element's border box from the render pipeline's layout, in tree
-/// order. Anonymous boxes carry `node: None`.
+/// Every element's border box from the Blitz layout, in tree order.
 pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate::render::NodeBox>> {
     let world = world_for_node(ctx, document)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(document) else {
+    let world_ref = world.borrow();
+    let Some(mut parsed) = world_ref.document_mut(document) else {
         return Ok(Vec::new());
     };
-    let sheets = world.author_stylesheets(&parsed);
-    let options = crate::render::RenderOptions {
-        width: crate::engine::VIEWPORT_WIDTH,
-        height: crate::engine::VIEWPORT_HEIGHT,
-        scale: 1.0,
-    };
-    Ok(
-        crate::render::layout_boxes(&parsed.document, &sheets, &options, &world.images)
-            .unwrap_or_default(),
-    )
+    let base = &mut parsed.document.base;
+    base.resolve(0.0);
+    let mut boxes = Vec::new();
+    let mut stack = vec![base.root_node().id];
+    while let Some(id) = stack.pop() {
+        let Some(node) = base.get_node(id) else {
+            continue;
+        };
+        if node.data.downcast_element().is_some() {
+            let position = node.absolute_position(0.0, 0.0);
+            let size = node.final_layout().size;
+            let visible = node.primary_styles().is_none_or(|styles| {
+                use style::properties::generated::longhands::visibility::computed_value::T as Visibility;
+                styles.get_inherited_box().visibility == Visibility::Visible
+            });
+            boxes.push(crate::render::NodeBox {
+                node: Some(NodeId {
+                    document: document.document,
+                    node: id,
+                }),
+                x: position.x,
+                y: position.y,
+                width: size.width,
+                height: size.height,
+                visible,
+            });
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    Ok(boxes)
 }
 
 /// `node`'s border box `(left, top, width, height)` from the current layout,
@@ -625,12 +675,8 @@ fn viewport_scroll(ctx: &Ctx<'_>, node: NodeId) -> Result<(f64, f64)> {
     let Some(parsed) = world.document(node) else {
         return Ok((0.0, 0.0));
     };
-    let root = dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
-        .ok()
-        .flatten();
-    Ok(root.map_or((0.0, 0.0), |root| {
-        dom::metadata::scroll_offset(&parsed.document, root)
-    }))
+    let scroll = parsed.document.base.viewport_scroll();
+    Ok((scroll.x, scroll.y))
 }
 
 /// The deepest element whose laid-out border box contains the point, if any.
@@ -724,28 +770,20 @@ pub(super) fn wrap_new_document_in_world<'js>(
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
-    let is_shadow_root = world(ctx)?
-        .borrow()
-        .document(id)
-        .is_some_and(|parsed| dom::shadow::shadow_host(&parsed.document, id).is_some());
-    let brand = with_node_kind(ctx, id, |kind| match kind {
-        Some(NodeKind::Document) => Some(if document_is_html_content(ctx, id) {
+    let is_fragment = world(ctx)?.borrow().document(id).is_some_and(|parsed| {
+        parsed.document.is_fragment(id.node)
+    });
+    let brand = with_node_data(ctx, id, |data| match data {
+        Some(NodeData::Document(_)) => Some(if document_is_html_content(ctx, id) {
             "Document"
         } else {
             "XMLDocument"
         }),
-        Some(NodeKind::Element { name, .. }) => Some(element_interface(name)),
-        Some(NodeKind::Text { .. }) => Some("Text"),
-        Some(NodeKind::CDataSection { .. }) => Some("CDATASection"),
-        Some(NodeKind::ProcessingInstruction { .. }) => Some("ProcessingInstruction"),
-        Some(NodeKind::Comment { .. }) => Some("Comment"),
-        Some(NodeKind::Doctype { .. }) => Some("DocumentType"),
-        Some(NodeKind::Fragment) => Some(if is_shadow_root {
-            "ShadowRoot"
-        } else {
-            "DocumentFragment"
-        }),
-        None => None,
+        Some(NodeData::Element(_)) if is_fragment => Some("DocumentFragment"),
+        Some(NodeData::Element(element)) => Some(element_interface(&element.name)),
+        Some(NodeData::Text(_)) => Some("Text"),
+        Some(NodeData::Comment { .. }) => Some("Comment"),
+        _ => None,
     })?;
     let Some(brand) = brand else {
         return Err(Exception::throw_type(ctx, "stale node"));
@@ -771,11 +809,11 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 /// and <https://w3c.github.io/mathml-core/#dom-mathmlelement>).
 /// Other namespaces use the base `Element` interface.
 fn element_interface(name: &QualName) -> &'static str {
-    if name.ns == html_namespace() {
+    if name.ns == super::world::html_namespace() {
         html_element_interface(name.local.as_ref())
-    } else if name.ns == svg_namespace() {
+    } else if name.ns == super::world::svg_namespace() {
         "SVGElement"
-    } else if name.ns == dom::mathml_namespace() {
+    } else if name.ns == super::world::mathml_namespace() {
         "MathMLElement"
     } else {
         "Element"
@@ -1012,28 +1050,28 @@ pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<Wor
     }
 }
 
-pub(super) fn with_node_kind<T>(
+pub(super) fn with_node_data<T>(
     ctx: &Ctx<'_>,
     id: NodeId,
-    read: impl FnOnce(Option<&NodeKind>) -> T,
+    read: impl FnOnce(Option<&NodeData>) -> T,
 ) -> Result<T> {
     let world = world(ctx)?;
     let parsed = world.borrow();
     let Some(parsed) = parsed.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    Ok(read(parsed.document.kind(id)))
+    Ok(read(
+        parsed.document.base.get_node(id.node).map(|node| &node.data),
+    ))
 }
 
-pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<dom::DomString> {
-    with_node_kind(ctx, id, |kind| match kind {
-        Some(
-            NodeKind::Text { data }
-            | NodeKind::CDataSection { data }
-            | NodeKind::ProcessingInstruction { data, .. }
-            | NodeKind::Comment { data },
-        ) => data.clone(),
-        _ => dom::DomString::default(),
+pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<crate::dom_string::DomString> {
+    with_node_data(ctx, id, |data| match data {
+        Some(NodeData::Text(text)) => crate::dom_string::DomString::from(text.content.clone()),
+        Some(NodeData::Comment { contents }) => {
+            crate::dom_string::DomString::from(contents.clone())
+        }
+        _ => crate::dom_string::DomString::default(),
     })
 }
 
@@ -1043,37 +1081,64 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
     Ok(world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.document.attribute(id, local))
+        .and_then(|parsed| {
+            super::world::attr(&parsed.document.base, id.node, local).map(str::to_owned)
+        })
         .unwrap_or_default())
 }
 
 /// [Replaces data](https://dom.spec.whatwg.org/#concept-cd-replace) on a
 /// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
-pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: dom::DomString) -> Result<()> {
+pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: crate::dom_string::DomString) -> Result<()> {
+    // Lone surrogates cannot survive the UTF-8 tree: they become the
+    // replacement character at this boundary, a known cutover gap.
+    let data = data.to_string_lossy().into_owned();
     let world = world(ctx)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
-    match parsed.document.kind(id) {
-        Some(NodeKind::Text { .. }) => {
-            dom::mutation::set_text(&mut parsed.document, id, data)
-                .map_err(|err| throw_dom_error(ctx, err))?;
+    let old_value = {
+        let base = &parsed.document.base;
+        let Some(node) = base.get_node(id.node) else {
+            return Ok(());
+        };
+        match &node.data {
+            NodeData::Text(text) => crate::dom_string::DomString::from(text.content.clone()),
+            NodeData::Comment { contents } => {
+                crate::dom_string::DomString::from(contents.clone())
+            }
+            _ => return Ok(()),
         }
-        Some(NodeKind::CDataSection { .. }) => {
-            dom::mutation::set_cdata_section(&mut parsed.document, id, data)
-                .map_err(|err| throw_dom_error(ctx, err))?;
+    };
+    {
+        let base = &mut parsed.document.base;
+        let Some(node) = base.get_node(id.node) else {
+            return Ok(());
+        };
+        match &node.data {
+            NodeData::Text(_) => {
+                base.mutate().set_node_text(id.node, &data);
+            }
+            NodeData::Comment { .. } => {
+                base.snapshot_node(id.node);
+                if let Some(NodeData::Comment { contents }) = base
+                    .get_node_mut(id.node)
+                    .map(|node| &mut node.data)
+                {
+                    contents.clear();
+                    contents.push_str(&data);
+                }
+            }
+            _ => return Ok(()),
         }
-        Some(NodeKind::ProcessingInstruction { .. }) => {
-            dom::mutation::set_processing_instruction(&mut parsed.document, id, data)
-                .map_err(|err| throw_dom_error(ctx, err))?;
-        }
-        Some(NodeKind::Comment { .. }) => {
-            dom::mutation::set_comment(&mut parsed.document, id, data)
-                .map_err(|err| throw_dom_error(ctx, err))?;
-        }
-        _ => return Ok(()),
     }
+    parsed.document.record(
+        crate::js::world::JournalEntry::CharacterData {
+            target: id,
+            old_value,
+        },
+    );
     drop(parsed);
     drop(world);
     schedule_mutation_delivery(ctx)
@@ -1107,11 +1172,30 @@ pub(super) fn child_value<'js>(ctx: &Ctx<'js>, id: Option<NodeId>) -> Result<Val
 
 pub(super) fn sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> Result<Value<'js>> {
     let world = world(ctx)?;
-    let sibling = world
-        .borrow()
-        .document(id)
-        .and_then(|parsed| parsed.document.sibling(id, forward));
+    let sibling = world.borrow().document(id).and_then(|parsed| {
+        sibling(&parsed.document.base, id.node, forward).map(|node| NodeId {
+            document: id.document,
+            node,
+        })
+    });
     child_value(ctx, sibling)
+}
+
+/// The sibling of `id` in `forward` direction, or `None` at the edge.
+pub(super) fn sibling(
+    base: &blitz_dom::BaseDocument,
+    id: super::world::BlitzId,
+    forward: bool,
+) -> Option<super::world::BlitzId> {
+    let node = base.get_node(id)?;
+    let parent = node.parent?;
+    let siblings = &base.get_node(parent)?.children;
+    let position = siblings.iter().position(|sibling| *sibling == id)?;
+    if forward {
+        siblings.get(position + 1).copied()
+    } else {
+        position.checked_sub(1).and_then(|index| siblings.get(index).copied())
+    }
 }
 
 /// The nearest element sibling in the given direction
@@ -1127,14 +1211,18 @@ pub(super) fn element_sibling_value<'js>(
         let Some(parsed) = parsed.document(id) else {
             return Ok(Value::new_null(ctx.clone()));
         };
-        let mut cursor = parsed.document.sibling(id, forward);
-        while let Some(sibling) = cursor {
-            if is_element(&parsed.document, sibling) {
+        let base = &parsed.document.base;
+        let mut cursor = sibling(base, id.node, forward);
+        while let Some(next) = cursor {
+            if is_element(base, next) {
                 break;
             }
-            cursor = parsed.document.sibling(sibling, forward);
+            cursor = sibling(base, next, forward);
         }
-        cursor
+        cursor.map(|node| NodeId {
+            document: id.document,
+            node,
+        })
     };
     child_value(ctx, found)
 }
@@ -1146,7 +1234,7 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 /// A DOM string as a JavaScript string value, preserving every code unit.
 pub(super) fn dom_string<'js>(
     ctx: &Ctx<'js>,
-    value: &dom::DomString,
+    value: &crate::dom_string::DomString,
 ) -> Result<rquickjs::String<'js>> {
     rquickjs::String::from_utf16(ctx.clone(), &value.units())
 }
@@ -1154,21 +1242,26 @@ pub(super) fn dom_string<'js>(
 /// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
 /// the data of all `Text` descendants in tree order.
 ///
-/// Descends only into elements and fragments: a `Document` or other
-/// non-container child contributes nothing, so its subtree is not entered.
-pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> dom::DomString {
-    let mut text = dom::DomString::default();
-    let mut stack: Vec<NodeId> = dom.children(id).map(Iterator::collect).unwrap_or_default();
-    stack.reverse();
+/// Descends only into elements: a `Document` or other non-container child
+/// contributes nothing, so its subtree is not entered. Fragment backings are
+/// plain elements, so fragments are covered.
+pub(super) fn descendant_text(
+    base: &blitz_dom::BaseDocument,
+    id: super::world::BlitzId,
+) -> crate::dom_string::DomString {
+    let mut text = crate::dom_string::DomString::default();
+    let mut stack = base
+        .get_node(id)
+        .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
     while let Some(current) = stack.pop() {
-        match dom.kind(current) {
-            Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_dom(data),
-            Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
-                if let Some(kids) = dom.children(current) {
-                    let mut kids: Vec<NodeId> = kids.collect();
-                    kids.reverse();
-                    stack.extend(kids);
-                }
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        match &node.data {
+            NodeData::Text(data) => text.push_str(&data.content),
+            NodeData::Element(_) => {
+                stack.extend(node.children.iter().rev().copied());
             }
             _ => {}
         }
@@ -1176,242 +1269,6 @@ pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> dom::DomString
     text
 }
 
-/// Structural `isEqualNode`
-/// (<https://dom.spec.whatwg.org/#concept-node-equals>).
-pub(super) fn nodes_equal(dom: &dom::Document, a: NodeId, b: NodeId) -> bool {
-    if a == b {
-        return true;
-    }
-    let (Some(first), Some(second)) = (dom.kind(a), dom.kind(b)) else {
-        return false;
-    };
-    let equal = match (first, second) {
-        (NodeKind::Document, NodeKind::Document) | (NodeKind::Fragment, NodeKind::Fragment) => true,
-        (
-            NodeKind::Doctype {
-                name: name_a,
-                public_id: public_a,
-                system_id: system_a,
-            },
-            NodeKind::Doctype {
-                name: name_b,
-                public_id: public_b,
-                system_id: system_b,
-            },
-        ) => name_a == name_b && public_a == public_b && system_a == system_b,
-        (
-            NodeKind::Element {
-                name: name_a,
-                attributes: attributes_a,
-            },
-            NodeKind::Element {
-                name: name_b,
-                attributes: attributes_b,
-            },
-        ) => {
-            name_a == name_b
-                && attributes_a.len() == attributes_b.len()
-                && attributes_a
-                    .iter()
-                    .all(|attribute| attributes_b.iter().any(|candidate| candidate == attribute))
-        }
-        (NodeKind::Text { data: data_a }, NodeKind::Text { data: data_b })
-        | (NodeKind::CDataSection { data: data_a }, NodeKind::CDataSection { data: data_b })
-        | (NodeKind::Comment { data: data_a }, NodeKind::Comment { data: data_b }) => {
-            data_a == data_b
-        }
-        (
-            NodeKind::ProcessingInstruction {
-                target: target_a,
-                data: data_a,
-            },
-            NodeKind::ProcessingInstruction {
-                target: target_b,
-                data: data_b,
-            },
-        ) => target_a == target_b && data_a == data_b,
-        _ => false,
-    };
-    if !equal {
-        return false;
-    }
-    // Walk both child runs in step: equal length, equal children, no
-    // allocation. Both cursors and the recursive call share the frozen tree.
-    let mut kids_a = dom.children(a).expect("live node has no slot");
-    let mut kids_b = dom.children(b).expect("live node has no slot");
-    loop {
-        match (kids_a.next(), kids_b.next()) {
-            (None, None) => return true,
-            (Some(first), Some(second)) if nodes_equal(dom, first, second) => {}
-            _ => return false,
-        }
-    }
-}
-
-/// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
-/// `prefix` walking `cursor`'s inclusive ancestors.
-pub(super) fn locate_namespace(
-    dom: &dom::Document,
-    cursor: NodeId,
-    prefix: Option<&str>,
-) -> Option<Namespace> {
-    let mut cursor = namespace_element(dom, cursor);
-    while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
-            match prefix {
-                Some("xml") => {
-                    return Some(Namespace::from("http://www.w3.org/XML/1998/namespace"));
-                }
-                Some("xmlns") => return Some(Namespace::from("http://www.w3.org/2000/xmlns/")),
-                _ => {}
-            }
-            let actual = name
-                .prefix
-                .as_ref()
-                .map(Prefix::as_ref)
-                .filter(|prefix| !prefix.is_empty());
-            if !name.ns.is_empty() && actual == prefix {
-                return Some(name.ns.clone());
-            }
-            for attribute in attributes {
-                if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
-                    continue;
-                }
-                let declaration = match prefix {
-                    Some(prefix) => {
-                        attribute
-                            .name
-                            .prefix
-                            .as_ref()
-                            .is_some_and(|value| value.as_ref() == "xmlns")
-                            && attribute.name.local.as_ref() == prefix
-                    }
-                    None => {
-                        attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns"
-                    }
-                };
-                if declaration {
-                    return (!attribute.value.is_empty())
-                        .then(|| Namespace::from(attribute.value.as_str()));
-                }
-            }
-        }
-        cursor = dom.parent(id).filter(|parent| is_element(dom, *parent));
-    }
-    None
-}
-
-/// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
-/// for `namespace` walking `cursor`'s inclusive ancestors.
-pub(super) fn locate_prefix(
-    dom: &dom::Document,
-    cursor: NodeId,
-    namespace: &str,
-) -> Option<String> {
-    let mut cursor = namespace_element(dom, cursor);
-    while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
-            if name.ns.as_ref() == namespace
-                && let Some(prefix) = name.prefix.as_ref().filter(|prefix| !prefix.is_empty())
-            {
-                return Some(prefix.to_string());
-            }
-            for attribute in attributes {
-                if attribute
-                    .name
-                    .prefix
-                    .as_ref()
-                    .is_some_and(|prefix| prefix.as_ref() == "xmlns")
-                    && attribute.value == namespace
-                {
-                    return Some(attribute.name.local.to_string());
-                }
-            }
-        }
-        cursor = dom.parent(id).filter(|parent| is_element(dom, *parent));
-    }
-    None
-}
-
-// https://dom.spec.whatwg.org/#locate-a-namespace
-// Attr dispatch supplies its owner element before entering the tree lookup.
-fn namespace_element(dom: &dom::Document, node: NodeId) -> Option<NodeId> {
-    match dom.kind(node)? {
-        NodeKind::Element { .. } => Some(node),
-        NodeKind::Document => dom.children(node)?.find(|child| is_element(dom, *child)),
-        NodeKind::Doctype { .. } | NodeKind::Fragment => None,
-        _ => dom.parent(node).filter(|parent| is_element(dom, *parent)),
-    }
-}
-
-pub(super) fn create_html_element<'js>(
-    ctx: &Ctx<'js>,
-    document: NodeId,
-    tag: &str,
-) -> Result<Value<'js>> {
-    // https://dom.spec.whatwg.org/#dom-document-createelement: validate, then
-    // lowercase for an HTML document.
-    if !valid_element_local_name(tag) {
-        return Err(throw_dom(
-            ctx,
-            "InvalidCharacterError",
-            "tag name is not a valid element local name",
-        ));
-    }
-    // XHTML documents use the HTML namespace but keep case; only text/html
-    // is an "HTML document" for lowercasing
-    // (<https://dom.spec.whatwg.org/#internal-createelementns-steps>).
-    let namespace = if document_is_html(ctx, document) {
-        html_namespace()
-    } else {
-        Namespace::from("")
-    };
-    let local = if document_is_html_content(ctx, document) {
-        tag.to_ascii_lowercase()
-    } else {
-        tag.to_owned()
-    };
-    let name = QualName::new(None, namespace, LocalName::from(local));
-    create_element_named(ctx, document, name)
-}
-
-pub(super) fn create_element_named<'js>(
-    ctx: &Ctx<'js>,
-    document: NodeId,
-    name: QualName,
-) -> Result<Value<'js>> {
-    let is_template = is_html_name(&name, "template");
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(document) else {
-        return Err(Exception::throw_type(ctx, "no document"));
-    };
-    let id = parsed.document.create_element(name, Vec::new());
-    if is_template {
-        let contents = parsed.document.create_fragment();
-        dom::shadow::set_template_contents(&mut parsed.document, id, contents)
-            .map_err(|err| throw_dom_error(ctx, err))?;
-    }
-    drop(parsed);
-    drop(world);
-    wrap_node(ctx, id)
-}
-
-pub(super) fn create_kind<'js>(
-    ctx: &Ctx<'js>,
-    document: NodeId,
-    make: impl FnOnce(&mut dom::Document) -> NodeId,
-) -> Result<Value<'js>> {
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(document) else {
-        return Err(Exception::throw_type(ctx, "no document"));
-    };
-    let id = make(&mut parsed.document);
-    drop(parsed);
-    drop(world);
-    wrap_node(ctx, id)
-}
 
 /// Which context a qualified name is validated in
 /// (<https://dom.spec.whatwg.org/#validate-and-extract> steps 6 and 7).
@@ -1528,7 +1385,7 @@ fn is_infra_whitespace(c: char) -> bool {
 
 pub(super) fn element_node_name(name: &QualName, uppercase: bool) -> String {
     let qualified = qualified_name(name);
-    if uppercase && name.ns == html_namespace() {
+    if uppercase && name.ns == super::world::html_namespace() {
         qualified.to_ascii_uppercase()
     } else {
         qualified
@@ -1591,180 +1448,48 @@ pub(super) fn live_collection<'js>(
     }
 }
 
-pub(super) fn collection_ids(
-    ctx: &Ctx<'_>,
-    scope: NodeId,
-    kind: &CollectionKind,
-) -> Result<Vec<NodeId>> {
-    let registry = realm_registry(ctx)?;
-    let Some(world) = registry.borrow().owner_world(scope) else {
-        return Ok(Vec::new());
-    };
-    let parsed = world.borrow();
-    let Some(parsed) = parsed.document(scope) else {
-        return Ok(Vec::new());
-    };
-    Ok(match kind {
-        CollectionKind::Children => parsed
-            .document
-            .children(scope)
-            .map(Iterator::collect)
-            .unwrap_or_default(),
-        CollectionKind::ElementChildren => parsed
-            .document
-            .children(scope)
-            .map(|children| {
-                children
-                    .filter(|&kid| is_element(&parsed.document, kid))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        CollectionKind::ElementsByTag(name) => collect_by_tag(&parsed.document, scope, name),
-        CollectionKind::ElementsByTagNs { namespace, local } => {
-            collect_by_tag_ns(&parsed.document, scope, namespace, local)
-        }
-        CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.document, scope, names),
-        CollectionKind::ElementsByName(name) => collect_by_name(&parsed.document, scope, name),
-        CollectionKind::SelectOptions => dom::form::select_options(&parsed.document, scope),
-        CollectionKind::SelectedOptions => dom::form::select_options(&parsed.document, scope)
-            .into_iter()
-            .filter(|&option| dom::form::option_selected(&parsed.document, option))
-            .collect(),
-        CollectionKind::WindowNamed(name) => collect_window_named(&parsed.document, scope, name),
-        CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
-    })
-}
 
-fn collect_by_tag(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
-    // In an HTML document, an HTML-namespace element matches the queried
-    // name ASCII-lowercased; other elements match the name exactly
-    // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
-    let lowered = name.to_ascii_lowercase();
-    dom.tree()
-        .descendants(scope)
-        .filter(|&id| {
-            let Some(NodeKind::Element { name: qual, .. }) = dom.kind(id) else {
-                return false;
-            };
-            name == "*"
-                || if qual.ns == html_namespace() {
-                    qualified_name_eq(qual, &lowered)
-                } else {
-                    qualified_name_eq(qual, name)
-                }
-        })
-        .collect()
-}
-
-fn collect_by_name(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
-    dom.tree()
-        .descendants(scope)
-        .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
-        .collect()
-}
-
-/// The Window named objects with `name`: every element whose ID is `name`,
-/// plus `embed`, `form`, `img`, and `object` elements whose `name` is `name`,
-/// in tree order
-/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
-fn collect_window_named(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
-    if name.is_empty() {
-        return Vec::new();
-    }
-    dom.tree()
-        .descendants(scope)
-        .filter(|&id| {
-            if dom.no_namespace_attribute(id, "id").as_deref() == Some(name) {
-                return true;
-            }
-            matches!(
-                dom.kind(id),
-                Some(NodeKind::Element { name: qual, .. })
-                    if qual.ns == html_namespace()
-                        && matches!(qual.local.as_ref(), "embed" | "form" | "img" | "object")
-                        && dom.no_namespace_attribute(id, "name").as_deref() == Some(name)
-            )
-        })
-        .collect()
-}
-
-fn collect_by_tag_ns(
-    dom: &dom::Document,
-    scope: NodeId,
-    namespace: &str,
-    local: &str,
-) -> Vec<NodeId> {
-    dom.tree()
-        .descendants(scope)
-        .filter(|&id| {
-            matches!(
-                dom.kind(id),
-                Some(NodeKind::Element { name, .. })
-                    if (namespace == "*" || name.ns.as_ref() == namespace)
-                        && (local == "*" || name.local.as_ref() == local)
-            )
-        })
-        .collect()
-}
-
-fn collect_by_class(dom: &dom::Document, scope: NodeId, names: &str) -> Vec<NodeId> {
-    let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
-    // An empty class set matches nothing
-    // (<https://dom.spec.whatwg.org/#concept-getelementsbyclassname>).
-    if wanted.is_empty() {
-        return Vec::new();
-    }
-    dom.tree()
-        .descendants(scope)
-        .filter(|&id| {
-            if !is_element(dom, id) {
-                return false;
-            }
-            let classes = dom.attribute(id, "class").unwrap_or_default();
-            let tokens: Vec<&str> = classes.split_ascii_whitespace().collect();
-            wanted.iter().all(|want| tokens.contains(want))
-        })
-        .collect()
-}
-
-pub(super) fn is_element(dom: &dom::Document, id: NodeId) -> bool {
-    matches!(dom.kind(id), Some(NodeKind::Element { .. }))
+pub(super) fn is_element(base: &blitz_dom::BaseDocument, id: super::world::BlitzId) -> bool {
+    base.get_node(id)
+        .is_some_and(|node| node.data.downcast_element().is_some())
 }
 
 /// Whether `name` is an element in the HTML namespace with local name
 /// `local`.
 pub(super) fn is_html_name(name: &QualName, local: &str) -> bool {
-    name.ns == html_namespace() && name.local.as_ref() == local
+    name.ns == super::world::html_namespace() && name.local.as_ref() == local
 }
 
-/// Whether `kind` is an element in the HTML namespace with local name `local`.
-pub(super) fn is_html_element(kind: Option<&NodeKind>, local: &str) -> bool {
-    matches!(
-        kind,
-        Some(NodeKind::Element { name, .. }) if is_html_name(name, local)
-    )
-}
-
-/// Whether `kind` is an HTML `<template>` element.
-pub(super) fn is_template_element(kind: Option<&NodeKind>) -> bool {
-    is_html_element(kind, "template")
+/// Whether `data` is an element in the HTML namespace with local name `local`.
+pub(super) fn is_html_element(data: Option<&NodeData>, local: &str) -> bool {
+    match data {
+        Some(NodeData::Element(element)) => is_html_name(&element.name, local),
+        _ => false,
+    }
 }
 
 /// The root of the tree `id` participates in (itself when detached).
-pub(super) fn root_of(dom: &dom::Document, id: NodeId) -> NodeId {
+pub(super) fn root_of(base: &blitz_dom::BaseDocument, id: super::world::BlitzId) -> super::world::BlitzId {
     let mut root = id;
-    while let Some(parent) = dom.parent(root) {
+    while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
         root = parent;
     }
     root
 }
 
 /// `id` followed by its inclusive ancestors, nearest first.
-pub(super) fn ancestor_chain(dom: &dom::Document, id: NodeId) -> Vec<NodeId> {
-    let mut chain = vec![id];
+pub(super) fn ancestor_chain(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    id: super::world::BlitzId,
+) -> Vec<NodeId> {
+    let mut chain = vec![NodeId { document, node: id }];
     let mut cursor = id;
-    while let Some(parent) = dom.parent(cursor) {
-        chain.push(parent);
+    while let Some(parent) = base.get_node(cursor).and_then(|node| node.parent) {
+        chain.push(NodeId {
+            document,
+            node: parent,
+        });
         cursor = parent;
     }
     chain
@@ -1772,10 +1497,15 @@ pub(super) fn ancestor_chain(dom: &dom::Document, id: NodeId) -> Vec<NodeId> {
 
 /// Document order of two nodes in one tree
 /// (<https://dom.spec.whatwg.org/#concept-tree-order>).
-pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp::Ordering {
+pub(super) fn tree_order(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    a: super::world::BlitzId,
+    b: super::world::BlitzId,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let chain_a = ancestor_chain(dom, a);
-    let chain_b = ancestor_chain(dom, b);
+    let chain_a = ancestor_chain(base, document, a);
+    let chain_b = ancestor_chain(base, document, b);
     let mut common = 0;
     while common < chain_a.len()
         && common < chain_b.len()
@@ -1798,24 +1528,52 @@ pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp:
     };
     let child_a = chain_a[chain_a.len() - 1 - common];
     let child_b = chain_b[chain_b.len() - 1 - common];
-    let kids: Vec<NodeId> = dom
-        .children(*parent)
-        .map(Iterator::collect)
+    let kids: Vec<NodeId> = base
+        .get_node(parent.node)
+        .map(|node| {
+            node.children
+                .iter()
+                .map(|child| NodeId {
+                    document,
+                    node: *child,
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let position_a = kids.iter().position(|&kid| kid == child_a);
     let position_b = kids.iter().position(|&kid| kid == child_b);
     position_a.cmp(&position_b)
 }
 
-pub(super) fn find_element_by_id(dom: &dom::Document, scope: NodeId, id: &str) -> Option<NodeId> {
+pub(super) fn find_element_by_id(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    scope: super::world::BlitzId,
+    id: &str,
+) -> Option<NodeId> {
     // An element with an empty ID has no ID, so no element matches
     // (<https://dom.spec.whatwg.org/#concept-id>).
     if id.is_empty() {
         return None;
     }
-    dom.tree()
-        .descendants(scope)
-        .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))
+    let mut stack = vec![scope];
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        if node.data.downcast_element().is_some_and(|element| {
+            element
+                .attr(markup5ever::LocalName::from("id"))
+                .is_some_and(|value| value == id)
+        }) {
+            return Some(NodeId {
+                document,
+                node: current,
+            });
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1830,6 +1588,7 @@ mod realm_tests {
     use super::{world, wrap_node};
     use crate::document::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
+    use crate::js::world::NodeId;
     use crate::messaging::Shared;
     use crate::protocol::{
         BrowserServices, BrowsingContextHost, DialCompletion, DialRequest, FrameId, MessagingHost,
@@ -1939,7 +1698,10 @@ mod realm_tests {
             pending_storage: Rc::new(RefCell::new(Vec::new())),
         };
         let mut world = World::new(Url::parse(url).expect("test url"), FrameId::MAIN, &runtime);
-        let id = world.replace_document(crate::parse_html(html));
+        let id = world.replace_document(crate::parse_html(
+            html,
+            blitz_dom::DocumentConfig::default(),
+        ));
         let world = Rc::new(RefCell::new(world));
         registry.borrow_mut().insert_document(id, &world);
         registry.borrow_mut().insert_frame(FrameId::MAIN, &world);
@@ -2091,7 +1853,10 @@ mod realm_tests {
             JsRealm::new(&shared.handle(), world_b.clone(), Arc::clone(&stop)).expect("realm b");
         let b_root = world_b
             .borrow()
-            .with_main_document(|parsed| parsed.document.document())
+            .with_main_document(|parsed| NodeId {
+                document: parsed.id,
+                node: parsed.document.base.root_node().id,
+            })
             .expect("b document");
 
         // Realm A wraps realm B's document: the same object as B's `document`.

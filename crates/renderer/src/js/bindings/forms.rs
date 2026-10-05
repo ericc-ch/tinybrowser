@@ -4,10 +4,21 @@
 //! walks a form's controls in tree order, keeping the ones that carry a name
 //! and contribute a value. The list is returned to the `FormData` shim as a
 //! flat `[name, value, ...]` array.
+//!
+//! Blitz keeps no form-control value store (no dirty value flag, no
+//! checkedness or selectedness slots), so every value here is read from
+//! content attributes and descendant text: an input's value is its `value`
+//! attribute, checkedness is the presence of `checked`, a select's value
+//! comes from the selected option's `value` attribute or text, and a
+//! textarea's value is its descendant text. Live values assigned through the
+//! `value` IDL setter are a known cutover gap until the control state moves
+//! into the tree.
 
-use super::{host_node_id, is_html_element, with_node_kind, world, world_for_node};
+use super::{descendant_text, host_node_id, world, world_for_node};
+use crate::js::world::{BlitzId, JournalEntry, NodeId, attr, html_namespace, is_html_element};
 use crate::js::{FrameNavigation, World};
-use dom::{NodeId, NodeKind, html_namespace, is_disabled};
+use blitz_dom::{BaseDocument, NodeData};
+use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::prelude::Opt;
 use rquickjs::{Array, Ctx, Object, Persistent, Result, Value};
 use std::cell::RefCell;
@@ -27,10 +38,7 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbSetInputFiles",
         rquickjs::prelude::Func::from(set_input_files),
     )?;
-    globals.set(
-        "__tbEncodeForm",
-        rquickjs::prelude::Func::from(encode_form),
-    )?;
+    globals.set("__tbEncodeForm", rquickjs::prelude::Func::from(encode_form))?;
     globals.set(
         "__tbEncodingName",
         rquickjs::prelude::Func::from(encoding_name),
@@ -54,7 +62,8 @@ pub(super) fn encoding_name(label: String) -> Option<String> {
 }
 
 /// Sets an option's selectedness without the dirty flag, as the `Option`
-/// constructor does.
+/// constructor does. Blitz models no selectedness slot, so the `selected`
+/// content attribute carries it directly.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
@@ -68,7 +77,49 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    dom::form::set_option_selectedness(&mut parsed.document, node, selected);
+    let (name, old_value) = {
+        let base = &parsed.document.base;
+        let Some(target) = base.get_node(node.node) else {
+            return Ok(());
+        };
+        let Some(element) = target.data.downcast_element() else {
+            return Ok(());
+        };
+        // Reuse the stored qualified name so clearing removes the exact
+        // attribute the parser kept; a fresh `selected` falls back to the
+        // empty namespace plain HTML attributes parse into.
+        let name = element
+            .attrs
+            .iter()
+            .find(|attribute| attribute.name.local.as_ref() == "selected")
+            .map(|attribute| attribute.name.clone())
+            .unwrap_or_else(|| {
+                QualName::new(None, Namespace::from(""), LocalName::from("selected"))
+            });
+        (name, attr(base, node.node, "selected").map(str::to_owned))
+    };
+    if selected == old_value.is_some() {
+        return Ok(());
+    }
+    if selected {
+        parsed
+            .document
+            .base
+            .mutate()
+            .set_attribute(node.node, name, "");
+    } else {
+        parsed
+            .document
+            .base
+            .mutate()
+            .clear_attribute(node.node, name);
+    }
+    parsed.document.record(JournalEntry::Attributes {
+        target: node,
+        name: "selected".to_owned(),
+        namespace: String::new(),
+        old_value,
+    });
     Ok(())
 }
 
@@ -93,11 +144,15 @@ pub(super) fn form_entries<'js>(
     let Some(id) = host_node_id(&ctx, &form) else {
         return Ok(entries);
     };
-    if !with_node_kind(&ctx, id, |kind| is_html_element(kind, "form"))? {
+    let world_rc = world(&ctx)?;
+    let is_form = world_rc
+        .borrow()
+        .document(id)
+        .is_some_and(|parsed| is_html_element(&parsed.document.base, id.node, "form"));
+    if !is_form {
         return Ok(entries);
     }
     let submitter = submitter.0.and_then(|value| host_node_id(&ctx, &value));
-    let world_rc = world(&ctx)?;
     let pending = collect_pending_entries(&world_rc, id, submitter);
     for entry in pending {
         match entry {
@@ -127,77 +182,162 @@ fn collect_pending_entries(
     let Some(parsed) = world.document(form) else {
         return Vec::new();
     };
-    let document = &parsed.document;
-    let root = dom::form::tree_root_of(document, form);
+    let base = &parsed.document.base;
+    let document = parsed.id;
+    // The tree `form` participates in; form owners never cross trees.
+    let mut root = form.node;
+    while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
+        root = parent;
+    }
+    // A pre-order walk visits nodes in tree order.
     let mut pending = Vec::new();
-    for node in document.tree().descendants(root) {
-        let Some(NodeKind::Element { name, .. }) = document.kind(node) else {
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
             continue;
         };
-        if name.ns != html_namespace() {
-            continue;
-        }
-        let local = name.local.as_ref();
-        if local != "input" && local != "textarea" && local != "select" && local != "button" {
-            continue;
-        }
-        if dom::form::form_owner(document, node) != Some(form) {
-            continue;
-        }
-        let Some(control_name) = document.attribute(node, "name") else {
+        stack.extend(node.children.iter().rev().copied());
+        let Some(element) = node.data.downcast_element() else {
             continue;
         };
-        if control_name.is_empty() || is_disabled(document, node) || has_datalist_ancestor(document, node)
+        if element.name.ns != html_namespace() {
+            continue;
+        }
+        let local = element.name.local.as_ref();
+        if !matches!(local, "input" | "textarea" | "select" | "button") {
+            continue;
+        }
+        let id = NodeId {
+            document,
+            node: current,
+        };
+        if form_owner(base, document, current) != Some(form) {
+            continue;
+        }
+        let Some(control_name) = attr(base, current, "name") else {
+            continue;
+        };
+        if control_name.is_empty()
+            || is_disabled(base, current)
+            || has_datalist_ancestor(base, current)
         {
             continue;
         }
         // A hidden input named `_charset_` carries the encoding name
         // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
         if local == "input"
-            && document
-                .attribute(node, "type")
+            && attr(base, current, "type")
                 .is_some_and(|typ| typ.trim().eq_ignore_ascii_case("hidden"))
             && control_name.eq_ignore_ascii_case("_charset_")
         {
-            pending.push(PendingEntry::Text(control_name, "UTF-8".to_owned()));
+            pending.push(PendingEntry::Text(
+                control_name.to_owned(),
+                "UTF-8".to_owned(),
+            ));
             continue;
         }
-        let is_submitter = submitter == Some(node);
-        pending.extend(pending_entry(document, node, local, control_name, is_submitter));
+        let is_submitter = submitter == Some(id);
+        pending.extend(pending_entry(
+            base,
+            document,
+            current,
+            local,
+            control_name,
+            is_submitter,
+        ));
     }
     pending
 }
 
+/// The form owner of a control: its nearest ancestor `form` element.
+/// The `form=""` content-attribute association is a known gap: Blitz keeps no
+/// control-to-form registry the bindings can read, so only the ancestor rule
+/// applies
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
+fn form_owner(base: &BaseDocument, document: u32, node: BlitzId) -> Option<NodeId> {
+    let mut cursor = base.get_node(node).and_then(|target| target.parent);
+    while let Some(current) = cursor {
+        if is_html_element(base, current, "form") {
+            return Some(NodeId {
+                document,
+                node: current,
+            });
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    None
+}
+
+/// Whether `node` is disabled: its own `disabled` attribute, or for an
+/// `option` a `disabled` ancestor `optgroup` or owning `select`. Inheritance
+/// through an ancestor `fieldset` (outside its first `legend`) is a known gap
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+fn is_disabled(base: &BaseDocument, node: BlitzId) -> bool {
+    if attr(base, node, "disabled").is_some() {
+        return true;
+    }
+    if !is_html_element(base, node, "option") {
+        return false;
+    }
+    let mut cursor = base.get_node(node).and_then(|target| target.parent);
+    while let Some(current) = cursor {
+        let Some(element) = base
+            .get_node(current)
+            .and_then(|target| target.data.downcast_element())
+        else {
+            cursor = base.get_node(current).and_then(|target| target.parent);
+            continue;
+        };
+        if element.name.ns != html_namespace() {
+            cursor = base.get_node(current).and_then(|target| target.parent);
+            continue;
+        }
+        match element.name.local.as_ref() {
+            "optgroup" | "select" if attr(base, current, "disabled").is_some() => return true,
+            "select" => return false,
+            _ => {}
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    false
+}
+
 /// Whether `node` has a `datalist` ancestor, which bars it from the entry list
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-fn has_datalist_ancestor(document: &dom::Document, node: NodeId) -> bool {
-    document.ancestors(node).any(|ancestor| {
-        matches!(
-            document.kind(ancestor),
-            Some(NodeKind::Element { name, .. })
-                if name.ns == html_namespace() && name.local.as_ref() == "datalist"
-        )
-    })
+fn has_datalist_ancestor(base: &BaseDocument, node: BlitzId) -> bool {
+    let mut cursor = base.get_node(node).and_then(|target| target.parent);
+    while let Some(current) = cursor {
+        if is_html_element(base, current, "datalist") {
+            return true;
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    false
 }
 
 /// One named, enabled control's contribution: nothing, one entry, or (for a
 /// multiple `select`) several
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 fn pending_entry(
-    dom: &dom::Document,
-    node: NodeId,
+    base: &BaseDocument,
+    document: u32,
+    node: BlitzId,
     local: &str,
-    control_name: String,
+    control_name: &str,
     is_submitter: bool,
 ) -> Vec<PendingEntry> {
+    let id = NodeId { document, node };
+    // Blitz keeps no live control values, so the submission value is the
+    // `value` content attribute (the default value), or empty when absent.
+    let value_attr = || attr(base, node, "value").unwrap_or_default().to_owned();
     match local {
         "textarea" => {
-            let mut value = dom::form::textarea_value(dom, node).unwrap_or_default();
-            if wrap_is_hard(dom.attribute(node, "wrap").as_deref()) {
-                let cols = parse_positive(dom.attribute(node, "cols").as_deref()).unwrap_or(20);
+            let mut value = normalize_newlines(&descendant_text(base, node).to_string_lossy());
+            if wrap_is_hard(attr(base, node, "wrap")) {
+                let cols = parse_positive(attr(base, node, "cols")).unwrap_or(20);
                 value = hard_wrap(&value, cols);
             }
-            vec![PendingEntry::Text(control_name, value)]
+            vec![PendingEntry::Text(control_name.to_owned(), value)]
         }
         "button" => {
             // A button contributes only when it is the submitter
@@ -205,15 +345,10 @@ fn pending_entry(
             if !is_submitter {
                 return Vec::new();
             }
-            vec![PendingEntry::Text(
-                control_name,
-                dom.attribute(node, "value").unwrap_or_default(),
-            )]
+            vec![PendingEntry::Text(control_name.to_owned(), value_attr())]
         }
         "input" => {
-            let typ = dom
-                .attribute(node, "type")
-                .unwrap_or_else(|| "text".to_owned());
+            let typ = attr(base, node, "type").unwrap_or("text");
             let typ = typ.trim().to_ascii_lowercase();
             if matches!(typ.as_str(), "reset" | "button") {
                 return Vec::new();
@@ -224,46 +359,180 @@ fn pending_entry(
                 if !is_submitter {
                     return Vec::new();
                 }
-                return vec![PendingEntry::Text(
-                    control_name,
-                    dom.attribute(node, "value").unwrap_or_default(),
-                )];
+                return vec![PendingEntry::Text(control_name.to_owned(), value_attr())];
             }
             if typ == "checkbox" || typ == "radio" {
                 // A checkbox or radio contributes only when checked, and its
-                // value defaults to "on"
+                // value defaults to "on". Blitz keeps no dirty checkedness
+                // flag, so checkedness is the `checked` attribute's presence
                 // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
-                if !dom::form::checkedness(dom, node) {
+                if attr(base, node, "checked").is_none() {
                     return Vec::new();
                 }
-                let value = dom
-                    .attribute(node, "value")
-                    .unwrap_or_else(|| "on".to_owned());
-                vec![PendingEntry::Text(control_name, value)]
+                let value = attr(base, node, "value").unwrap_or("on").to_owned();
+                vec![PendingEntry::Text(control_name.to_owned(), value)]
             } else if typ == "file" {
-                vec![PendingEntry::Files(control_name, node)]
+                vec![PendingEntry::Files(control_name.to_owned(), id)]
             } else {
-                vec![PendingEntry::Text(
-                    control_name,
-                    dom::form::input_value(dom, node).unwrap_or_default(),
-                )]
+                vec![PendingEntry::Text(control_name.to_owned(), value_attr())]
             }
         }
         "select" => {
-            if dom.attribute(node, "multiple").is_some() {
-                dom::form::select_options(dom, node)
-                    .iter()
-                    .filter(|&&option| dom::form::option_selected(dom, option) && !is_disabled(dom, option))
-                    .map(|&option| {
-                        PendingEntry::Text(control_name.clone(), dom::form::option_value(dom, option))
+            if attr(base, node, "multiple").is_some() {
+                select_options(base, document, node)
+                    .into_iter()
+                    .filter(|option| {
+                        option_selected(base, option.node) && !is_disabled(base, option.node)
+                    })
+                    .map(|option| {
+                        PendingEntry::Text(control_name.to_owned(), option_value(base, option.node))
                     })
                     .collect()
             } else {
-                vec![PendingEntry::Text(control_name, dom::form::select_value(dom, node))]
+                vec![PendingEntry::Text(
+                    control_name.to_owned(),
+                    select_value(base, document, node),
+                )]
             }
         }
         _ => Vec::new(),
     }
+}
+
+/// The `option` elements in a `select`'s list of options, in tree order:
+/// descendant options whose nearest ancestor `select` is this one, so options
+/// of a nested select belong to the inner select
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list>).
+fn select_options(base: &BaseDocument, document: u32, select: BlitzId) -> Vec<NodeId> {
+    let mut options = Vec::new();
+    let mut stack: Vec<BlitzId> = base
+        .get_node(select)
+        .map(|node| node.children.iter().rev().copied().collect())
+        .unwrap_or_default();
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        if node.data.downcast_element().is_some_and(|element| {
+            element.name.ns == html_namespace() && element.name.local.as_ref() == "option"
+        }) && option_select_owner(base, current) == Some(select)
+        {
+            options.push(NodeId {
+                document,
+                node: current,
+            });
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    options
+}
+
+/// The `select` whose list of options contains `node`: its nearest ancestor
+/// `select` element, if any.
+fn option_select_owner(base: &BaseDocument, node: BlitzId) -> Option<BlitzId> {
+    let mut cursor = base.get_node(node).and_then(|target| target.parent);
+    while let Some(current) = cursor {
+        if is_html_element(base, current, "select") {
+            return Some(current);
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    None
+}
+
+/// An `option`'s selectedness: whether its `selected` attribute is present.
+/// The dirty selectedness flag is a known gap; Blitz stores no per-option
+/// state
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
+fn option_selected(base: &BaseDocument, option: BlitzId) -> bool {
+    attr(base, option, "selected").is_some()
+}
+
+/// An `option`'s value: its `value` attribute, else its text
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
+fn option_value(base: &BaseDocument, option: BlitzId) -> String {
+    attr(base, option, "value")
+        .map(str::to_owned)
+        .unwrap_or_else(|| option_text(base, option))
+}
+
+/// An `option`'s text: its descendant text with ASCII whitespace stripped and
+/// collapsed, skipping HTML and SVG `script` subtrees
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text>).
+fn option_text(base: &BaseDocument, option: BlitzId) -> String {
+    let mut text = String::new();
+    let mut stack: Vec<BlitzId> = base
+        .get_node(option)
+        .map(|node| node.children.iter().rev().copied().collect())
+        .unwrap_or_default();
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        match &node.data {
+            NodeData::Text(data) => text.push_str(&data.content),
+            NodeData::Element(element) => {
+                let is_script = element.name.local.as_ref().eq_ignore_ascii_case("script")
+                    && (element.name.ns == html_namespace()
+                        || element.name.ns.as_ref() == "http://www.w3.org/2000/svg");
+                if !is_script {
+                    stack.extend(node.children.iter().rev().copied());
+                }
+            }
+            _ => {}
+        }
+    }
+    collapse_whitespace(&text)
+}
+
+/// A `select`'s value: the first selected option's value, else the empty
+/// string. The parser-time ask (selecting the first option when none is
+/// selected) is a known gap; without stored selectedness nothing selects it
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
+fn select_value(base: &BaseDocument, document: u32, select: BlitzId) -> String {
+    for option in select_options(base, document, select) {
+        if option_selected(base, option.node) {
+            return option_value(base, option.node);
+        }
+    }
+    String::new()
+}
+
+/// Strips and collapses ASCII whitespace runs to single spaces, dropping
+/// leading and trailing runs.
+fn collapse_whitespace(text: &str) -> String {
+    let mut result = String::new();
+    let mut pending_space = false;
+    for character in text.chars() {
+        if character.is_ascii_whitespace() {
+            pending_space = !result.is_empty();
+        } else {
+            if pending_space {
+                result.push(' ');
+                pending_space = false;
+            }
+            result.push(character);
+        }
+    }
+    result
+}
+
+/// An API value with CRLF and CR newlines normalized to LF
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-fe-api-value>).
+fn normalize_newlines(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
 }
 
 /// Appends one `[name, File]` pair per file a script assigned to a `type=file`
@@ -315,8 +584,8 @@ fn push_file_entries<'js>(
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 pub(super) fn encode_form(text: String, label: String) -> String {
-    let encoding = encoding_rs::Encoding::for_label(label.trim().as_bytes())
-        .unwrap_or(encoding_rs::UTF_8);
+    let encoding =
+        encoding_rs::Encoding::for_label(label.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
     let (bytes, _, _) = encoding.encode(&text);
     bytes.iter().map(|&byte| char::from(byte)).collect()
 }
@@ -458,21 +727,22 @@ pub(super) fn form_navigate(
 fn find_named_frame(world: &Rc<RefCell<World>>, name: &str) -> Option<NodeId> {
     let world = world.borrow();
     let parsed = world.main_document()?;
-    let mut stack = vec![parsed.document.document()];
-    while let Some(node) = stack.pop() {
-        if let Some(NodeKind::Element { name: element, .. }) = parsed.document.kind(node)
-            && element.ns == html_namespace()
-            && element.local.as_ref() == "iframe"
-            && parsed.document.attribute(node, "name").as_deref() == Some(name)
+    let base = &parsed.document.base;
+    let document = parsed.id;
+    let mut stack = vec![base.root_node().id];
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        if is_html_element(base, current, "iframe")
+            && attr(base, current, "name").is_some_and(|value| value == name)
         {
-            return Some(node);
+            return Some(NodeId {
+                document,
+                node: current,
+            });
         }
-        let children: Vec<NodeId> = parsed
-            .document
-            .children(node)
-            .map(Iterator::collect)
-            .unwrap_or_default();
-        stack.extend(children);
+        stack.extend(node.children.iter().rev().copied());
     }
     None
 }

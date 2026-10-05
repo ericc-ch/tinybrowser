@@ -6,6 +6,7 @@
 //! straight-alpha [`RgbaImage`](crate::render::RgbaImage). Replaces
 //! [`cascade`](crate::render::cascade) once bindings move over.
 
+#[cfg(test)]
 use crate::render::providers::TinyNetProvider;
 use crate::render::{RenderError, RgbaImage};
 
@@ -21,6 +22,7 @@ const MAX_SIDE: u32 = 4096;
 ///
 /// [`RenderError::InvalidViewport`] when either side is zero.
 /// [`RenderError::TooLarge`] when either side exceeds the pixel cap.
+#[cfg(test)]
 pub(crate) fn render_html(html: &str, width: u32, height: u32) -> Result<RgbaImage, RenderError> {
     let viewport = blitz_traits::shell::Viewport::new(
         width,
@@ -45,6 +47,7 @@ pub(crate) fn render_html(html: &str, width: u32, height: u32) -> Result<RgbaIma
 /// resources or in-flight fetches). The caller sleeps between frames on its
 /// own executor and paints with [`paint`] once this returns true (or its own
 /// deadline hits, painting whatever settled).
+#[cfg(test)]
 pub(crate) fn resolve_frame(
     base: &mut blitz_dom::BaseDocument,
     net: &TinyNetProvider,

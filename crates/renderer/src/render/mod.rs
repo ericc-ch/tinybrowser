@@ -1,78 +1,18 @@
-//! One-shot HTML/CSS rendering for screenshots.
+//! Screenshots through Blitz: resolve, paint, encode.
 //!
-//! The pipeline mirrors how minimal browsers layer their engines (`NetSurf`'s
-//! `libcss` -> `hubbub` -> layout -> `nsfb` paint, Dillo's style -> layout ->
-//! canvas, Obscura's `obscura-render` over Taffy): style the DOM, build a box
-//! tree, lay it out, paint a display list into an RGBA buffer, encode once.
-//! Nothing here is incremental; a screenshot runs the whole pipeline per call.
-//!
-//! Scope on the cascade side is the whole CSS cascade: Stylo owns selector
-//! matching, inheritance, and computed values. What stays a deliberate subset
-//! is layout and paint — the property mappings in `stylo_map.rs` feed only
-//! what the box tree, Taffy, Parley, and the CPU painter implement, and the
-//! unsupported cases are documented instead of approximated silently.
-//!
-//! Layout is split the way the CSS formatting model is:
-//!
-//! - block containers stack in-flow children and establish the containing
-//!   block (<https://drafts.csswg.org/css2/#visuren>)
-//! - inline formatting lays out line boxes of text and inline boxes
-//!   (<https://drafts.csswg.org/css2/#inline-formatting>)
-//! - flex containers use the flex layout algorithm
-//!   (<https://drafts.csswg.org/css-flexbox-1/#layout-algorithm>)
-//!
-//! The DOM arrives as an immutable [`dom::Document`]; the output is a
-//! [`RgbaImage`] ready for PNG encoding in [`png`].
-
-#![doc = include_str!("README.md")]
-
-mod cascade;
-mod color;
-mod stylo;
-mod stylo_map;
-mod stylo_view;
+//! The in-tree style/layout/paint pipeline is gone. Blitz owns cascade,
+//! layout, and paint; this module keeps the image types, PNG encoding, and
+//! the thin resolve-plus-paint entry points the engine and bindings call.
 
 mod blitz;
-mod boxes;
-mod decode;
-mod font;
-mod geometry;
-mod layout;
-mod paint;
 mod png;
 mod providers;
-mod style;
-mod svg;
-mod text;
-mod tree;
 
-pub(crate) use decode::decode_image;
+pub(crate) use blitz::paint;
+pub(crate) use providers::{SpawnFn, TinyNav, TinyNetProvider, TinyShell};
 pub use png::encode_png;
 
-/// Aggregate retained decoded image pixels, and the decode cap for one bitmap.
-pub(crate) const MAX_DECODED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum width or height of a decoded page image.
-pub(crate) const MAX_DECODED_SIDE: u32 = 4096;
-
-/// Whether a premultiplied RGBA bitmap of `width`×`height` fits the decode
-/// and store budget. 4096×4096 RGBA is ~67MiB, over `MAX_DECODED_IMAGE_BYTES`.
-pub(crate) fn decoded_rgba_fits(width: u32, height: u32) -> bool {
-    if width == 0 || height == 0 || width > MAX_DECODED_SIDE || height > MAX_DECODED_SIDE {
-        return false;
-    }
-    let Ok(width) = usize::try_from(width) else {
-        return false;
-    };
-    let Ok(height) = usize::try_from(height) else {
-        return false;
-    };
-    width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .is_some_and(|bytes| bytes <= MAX_DECODED_IMAGE_BYTES)
-}
-
-/// One decoded image in premultiplied RGBA form, ready for `tiny-skia`.
+/// One decoded image in premultiplied RGBA form.
 #[derive(Clone, Debug)]
 pub(crate) struct RasterImage {
     pub(crate) width: u32,
@@ -128,31 +68,11 @@ impl RgbaImage {
     }
 }
 
-/// Renders `dom` through the style/layout/paint pipeline into one image.
-///
-/// Stylesheets found in the document (`<style>`) and any externally fetched
-/// sheets passed by the caller are applied in document order. The viewport is
-/// the visual viewport in CSS pixels; `scale` is the device pixel ratio
-/// (<https://drafts.csswg.org/cssom-view/#dom-window-devicepixelratio>).
-///
-/// # Errors
-///
-/// Returns [`RenderError`] when a stylesheet cannot be parsed or the pipeline
-/// refuses a document it cannot lay out.
-pub(crate) fn render(
-    dom: &dom::Document,
-    stylesheets: &[String],
-    options: &RenderOptions,
-    images: &std::collections::HashMap<dom::NodeId, RasterImage>,
-) -> Result<RgbaImage, RenderError> {
-    cascade::render(dom, stylesheets, options, images)
-}
-
 /// One laid-out box in CSS pixels, keyed by its DOM element when it has one.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeBox {
-    /// The element the box was generated for; `None` for anonymous boxes.
-    pub node: Option<dom::NodeId>,
+    /// The element the box was generated for.
+    pub node: Option<crate::js::world::NodeId>,
     /// Border box in CSS pixels.
     pub x: f32,
     pub y: f32,
@@ -163,43 +83,6 @@ pub struct NodeBox {
     pub visible: bool,
 }
 
-/// Lays `dom` out without painting and returns every box in tree order, for
-/// script geometry (`getBoundingClientRect`, hit testing).
-///
-/// # Errors
-///
-/// Returns [`RenderError`] when a stylesheet cannot be parsed or the viewport
-/// is unusable.
-pub fn layout_boxes(
-    dom: &dom::Document,
-    stylesheets: &[String],
-    options: &RenderOptions,
-    images: &std::collections::HashMap<dom::NodeId, RasterImage>,
-) -> Result<Vec<NodeBox>, RenderError> {
-    cascade::boxes(dom, stylesheets, options, images)
-}
-
-/// Viewport and device parameters for one render.
-#[derive(Clone, Copy, Debug)]
-pub struct RenderOptions {
-    /// Viewport width in CSS pixels.
-    pub width: f32,
-    /// Viewport height in CSS pixels.
-    pub height: f32,
-    /// Device pixel ratio; output size is the viewport times this factor.
-    pub scale: f32,
-}
-
-impl Default for RenderOptions {
-    fn default() -> Self {
-        Self {
-            width: 800.0,
-            height: 600.0,
-            scale: 1.0,
-        }
-    }
-}
-
 /// A render failure that is the document's fault rather than the caller's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenderError {
@@ -207,8 +90,6 @@ pub enum RenderError {
     InvalidViewport,
     /// The output image would exceed the renderer's size cap.
     TooLarge,
-    /// An embedded font failed to parse; the build is corrupt.
-    Font,
     /// The PNG encoder rejected the rendered image.
     Encode,
     /// A crop rectangle had no area inside the image.
@@ -237,21 +118,11 @@ pub(crate) fn pixels(value: u32) -> f32 {
     value as f32
 }
 
-/// A DOM or list count as a layout number.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "element, line, and item counts stay far below 2^24; exact in f32"
-)]
-pub(crate) fn count(value: usize) -> f32 {
-    value as f32
-}
-
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidViewport => f.write_str("invalid viewport"),
             Self::TooLarge => f.write_str("render output exceeds the size cap"),
-            Self::Font => f.write_str("embedded font failed to parse"),
             Self::Encode => f.write_str("png encoding failed"),
             Self::InvalidCrop => f.write_str("crop rectangle is empty"),
         }
@@ -259,84 +130,3 @@ impl std::fmt::Display for RenderError {
 }
 
 impl std::error::Error for RenderError {}
-
-#[cfg(test)]
-mod tests {
-    use super::{RenderOptions, encode_png, layout_boxes, render};
-    use dom::{Document, LocalName, QualName, html_namespace};
-    use std::collections::HashMap;
-
-    fn html_name(local: &str) -> QualName {
-        QualName::new(None, html_namespace(), LocalName::from(local))
-    }
-
-    fn append_html_element(dom: &mut Document, parent: dom::NodeId, local: &str) -> dom::NodeId {
-        let element = dom.create_element(html_name(local), Vec::new());
-        dom::mutation::append(dom, parent, element).expect("append");
-        element
-    }
-
-    #[test]
-    fn renders_requested_viewport() {
-        let dom = Document::new();
-        let image = render(
-            &dom,
-            &[],
-            &RenderOptions {
-                width: 200.0,
-                height: 120.0,
-                scale: 1.0,
-            },
-            &HashMap::new(),
-        )
-        .expect("render");
-        assert_eq!((image.width, image.height), (200, 120));
-        assert_eq!(image.data.len(), 200 * 120 * 4);
-        assert!(
-            image.data.iter().all(|byte| *byte == 255),
-            "an empty document paints an opaque white viewport"
-        );
-    }
-
-    #[test]
-    fn encodes_png() {
-        let dom = Document::new();
-        let image = render(
-            &dom,
-            &[],
-            &RenderOptions {
-                width: 16.0,
-                height: 8.0,
-                scale: 1.0,
-            },
-            &HashMap::new(),
-        )
-        .expect("render");
-        let png = encode_png(&image).expect("encode");
-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-    }
-
-    #[test]
-    fn styles_a_tree_of_elements() {
-        let mut dom = Document::new();
-        let document = dom.document();
-        let html = append_html_element(&mut dom, document, "html");
-        let body = append_html_element(&mut dom, html, "body");
-        let div = append_html_element(&mut dom, body, "div");
-        let boxes = layout_boxes(
-            &dom,
-            &[],
-            &RenderOptions {
-                width: 200.0,
-                height: 120.0,
-                scale: 1.0,
-            },
-            &HashMap::new(),
-        )
-        .expect("layout");
-        assert!(
-            boxes.iter().any(|laid_out| laid_out.node == Some(div)),
-            "Stylo traversal must style the element so layout emits its box"
-        );
-    }
-}

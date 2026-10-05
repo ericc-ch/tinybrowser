@@ -1392,7 +1392,7 @@ fn argument_parameter(
         ReturnType::String if optional => quote! { Option<rquickjs::String<'js>> },
         ReturnType::String => quote! { rquickjs::String<'js> },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
-        ReturnType::NullableDocumentType => quote! { Option<dom::NodeId> },
+        ReturnType::NullableDocumentType => quote! { Option<host::NodeReference> },
         ReturnType::Callback => quote! { rquickjs::Function<'js> },
         // A platform object or callback-interface argument arrives as the
         // original value; the platform algorithm performs any further check.
@@ -1595,7 +1595,7 @@ fn attribute_result(type_: &ReturnType) -> Result<TokenStream, Error> {
     Ok(match type_ {
         ReturnType::String => quote! { rquickjs::String<'js> },
         // USVString getters hand a code-unit string to the lossy conversion.
-        ReturnType::UsvString => quote! { dom::DomString },
+        ReturnType::UsvString => quote! { crate::dom_string::DomString },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedShort => quote! { u16 },
@@ -1794,7 +1794,7 @@ fn lower_reflect_setter_attribute(
     }
     let getter = format_ident!("{getter_name}");
     let returns = if matches!(type_, ReturnType::UsvString) {
-        quote! { dom::DomString }
+        quote! { crate::dom_string::DomString }
     } else {
         quote! { rquickjs::String<'js> }
     };

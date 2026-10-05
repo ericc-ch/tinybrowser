@@ -71,7 +71,7 @@ impl MutationObservers {
             }
             observer.object = Some(object);
             if let Some(parsed) = documents.get_mut(target.scope().document_id()) {
-                dom::mutation::set_recording(&mut parsed.document, true);
+                parsed.document.set_recording(true);
             }
         }
     }
@@ -109,14 +109,14 @@ impl MutationObservers {
 
     fn refresh_recording(&self, documents: &mut DocumentStore) {
         for parsed in documents.values_mut() {
-            let id = parsed.document.document_id();
+            let id = parsed.id;
             let watched = self.observers.values().any(|observer| {
                 observer
                     .observations
                     .iter()
                     .any(|item| item.target.scope().document_id() == id)
             });
-            dom::mutation::set_recording(&mut parsed.document, watched);
+            parsed.document.set_recording(watched);
         }
     }
 
@@ -124,21 +124,21 @@ impl MutationObservers {
     pub(crate) fn drain(&mut self, documents: &mut DocumentStore) {
         let mut mutations = Vec::new();
         for parsed in documents.values_mut() {
-            let id = parsed.document.document_id();
+            let id = parsed.id;
             mutations.extend(
-                dom::mutation::take_ordered(&mut parsed.document)
+                std::mem::take(&mut parsed.document.journal)
                     .into_iter()
-                    .map(|(position, mutation)| (position, id, mutation)),
+                    .map(|(position, entry)| (position, id, entry)),
             );
         }
         mutations.sort_unstable_by_key(|(position, _, _)| *position);
-        for (_, document, mutation) in mutations {
+        for (_, document, entry) in mutations {
             if let Some(parsed) = documents.get(document) {
                 let mut interested: Vec<_> = self
                     .observers
                     .iter()
                     .filter_map(|(&id, observer)| {
-                        match_observation(&parsed.document, observer, &mutation)
+                        match_observation(&parsed.document.base, document, observer, &entry)
                             .map(|(depth, order, record)| (depth, order, id, record))
                     })
                     .collect();

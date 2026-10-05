@@ -1,8 +1,7 @@
 //! Document predicates and URL helpers.
 
 use super::{world, world_for_node};
-
-use dom::{NodeId, NodeKind, html_namespace};
+use crate::js::world::{NodeId, attr, html_namespace};
 
 use rquickjs::Ctx;
 
@@ -51,19 +50,26 @@ pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     let Some(parsed) = world.document(id) else {
         return fallback;
     };
-    let Some(base) = dom::selector::select_all(&parsed.document, parsed.document.document(), "base")
-        .ok()
-        // Frozen base URL: the first `base` element *with* an `href`
-        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
-        .and_then(|candidates| {
-            candidates
-                .into_iter()
-                .find(|candidate| parsed.document.attribute(*candidate, "href").is_some())
-        })
-    else {
-        return fallback;
-    };
-    let Some(href) = parsed.document.attribute(base, "href") else {
+    let base = &parsed.document.base;
+    // Frozen base URL: the first `base` element *with* an `href`, in tree
+    // order (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+    // A pre-order walk visits nodes in tree order, so the first match wins.
+    let mut stack = vec![base.root_node().id];
+    let mut href: Option<String> = None;
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        if node.data.downcast_element().is_some_and(|element| {
+            element.name.ns == html_namespace() && element.name.local.as_ref() == "base"
+        }) && let Some(value) = attr(base, current, "href")
+        {
+            href = Some(value.to_owned());
+            break;
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    let Some(href) = href else {
         return fallback;
     };
     url::Url::parse(&fallback)
@@ -82,18 +88,4 @@ pub(crate) fn document_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {
     world
         .document(id)
         .is_some_and(|parsed| matches!(parsed.content_type, "text/html" | "application/xhtml+xml"))
-}
-
-/// Whether `id` names an element in the HTML namespace.
-pub(crate) fn element_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {
-    let Ok(world) = world(ctx) else {
-        return false;
-    };
-    let parsed = world.borrow();
-    parsed.with_document(id, |parsed| {
-        matches!(
-            parsed.document.kind(id),
-            Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
-        )
-    }) == Some(true)
 }

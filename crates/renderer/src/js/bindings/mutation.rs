@@ -2,7 +2,7 @@
 
 use super::{CollectionKind, child_value, live_collection, world, wrap_node};
 
-use dom::NodeId;
+use crate::js::world::NodeId;
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};

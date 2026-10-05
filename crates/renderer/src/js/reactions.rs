@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 
-use dom::NodeId;
+use crate::js::world::NodeId;
 use rquickjs::function::{Args, Params};
 use rquickjs::{Array, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value};
 

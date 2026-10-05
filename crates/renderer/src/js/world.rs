@@ -4,14 +4,17 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
-use dom::NodeId;
+use blitz_traits::node_id::NodeId as BlitzNodeId;
+/// Blitz tree ids, re-exported for helper signatures across the bindings.
+pub(crate) use blitz_traits::node_id::NodeId as BlitzId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
+
+use crate::dom_string::DomString;
 
 use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
-use crate::render::MAX_DECODED_IMAGE_BYTES;
 use crate::storage::PendingStorageEvent;
 use crate::{Parsed, ReadyState};
 
@@ -186,6 +189,124 @@ pub(crate) enum DocumentStreamCommand {
     Close,
 }
 
+/// One node in one document.
+///
+/// Blitz ids are per-tree: two documents can issue the same id. Document
+/// identity rides along so wrapper caches and event maps stay sound across
+/// documents. Replaces the arena handle: same name, same
+/// [`NodeId::document_id`] accessor, new payload.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct NodeId {
+    /// The document store id owning the tree.
+    pub document: u32,
+    /// The node inside that document's tree.
+    pub node: BlitzNodeId,
+}
+
+impl NodeId {
+    /// The document store id owning the tree.
+    pub(crate) fn document_id(self) -> u32 {
+        self.document
+    }
+}
+
+impl std::fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NodeId({}.{})", self.document, self.node.as_u64())
+    }
+}
+
+impl PartialOrd for NodeId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NodeId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.document, self.node.as_u64()).cmp(&(other.document, other.node.as_u64()))
+    }
+}
+
+/// Whether `node` is connected: its ancestor chain reaches the document root.
+pub(crate) fn is_connected(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
+    let root = base.root_node().id;
+    let mut current = Some(id);
+    while let Some(node_id) = current {
+        if node_id == root {
+            return true;
+        }
+        current = base.get_node(node_id).and_then(|node| node.parent);
+    }
+    false
+}
+
+/// Whether `node` is an HTML `iframe` element.
+pub(crate) fn is_iframe_element(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
+    base.get_node(id).is_some_and(|node| {
+        node.data.is_element_with_tag_name(&markup5ever::local_name!("iframe"))
+    })
+}
+
+/// Wrapped children of `node` in `document`, in tree order.
+pub(crate) fn child_ids(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    id: BlitzNodeId,
+) -> Vec<NodeId> {
+    base.get_node(id).map_or_else(Vec::new, |node| {
+        node.children
+            .iter()
+            .map(|child| NodeId {
+                document,
+                node: *child,
+            })
+            .collect()
+    })
+}
+
+/// The value of the attribute named `name` on `id`, when it is an element.
+pub(crate) fn attr<'a>(
+    base: &'a blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+    name: &str,
+) -> Option<&'a str> {
+    base.get_node(id)?
+        .data
+        .downcast_element()?
+        .attr(markup5ever::LocalName::from(name))
+}
+
+/// The HTML namespace all HTML elements live in.
+pub(crate) fn html_namespace() -> markup5ever::Namespace {
+    markup5ever::ns!(html)
+}
+
+/// The SVG namespace.
+pub(crate) fn svg_namespace() -> markup5ever::Namespace {
+    markup5ever::ns!(svg)
+}
+
+/// The MathML namespace.
+pub(crate) fn mathml_namespace() -> markup5ever::Namespace {
+    markup5ever::ns!(mathml)
+}
+
+/// Whether `node` is an HTML element named `local`.
+pub(crate) fn is_html_element(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+    local: &str,
+) -> bool {
+    base.get_node(id).is_some_and(|node| {
+        let Some(element) = node.data.downcast_element() else {
+            return false;
+        };
+        element.name.ns == html_namespace()
+            && element.name.local == markup5ever::LocalName::from(local)
+    })
+}
+
 /// One DOM node handle owned by the JS world.
 #[derive(Clone, Copy, rquickjs::JsLifetime)]
 pub(crate) struct Handle(pub(crate) NodeId);
@@ -218,23 +339,22 @@ pub(crate) struct Observation {
     pub order: u64,
 }
 
-/// Both native representations implementing Node, including Attr, which is
-/// not a member of a document's child tree.
+/// Both native representations implementing Node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NodeReference {
-    Tree(dom::NodeId),
-    Attribute { scope: dom::NodeId, id: u64 },
+    Tree(NodeId),
+    Attribute { scope: NodeId, id: u64 },
 }
 
 impl NodeReference {
-    pub(crate) fn tree(self) -> Option<dom::NodeId> {
+    pub(crate) fn tree(self) -> Option<NodeId> {
         match self {
             Self::Tree(id) => Some(id),
             Self::Attribute { .. } => None,
         }
     }
 
-    pub(crate) fn scope(self) -> dom::NodeId {
+    pub(crate) fn scope(self) -> NodeId {
         match self {
             Self::Tree(id) | Self::Attribute { scope: id, .. } => id,
         }
@@ -254,7 +374,7 @@ pub(crate) struct RecordData {
     pub attribute_namespace: Option<String>,
     /// Not traced: a `DomString` holds no JavaScript value.
     #[qjs(skip_trace)]
-    pub old_value: Option<dom::DomString>,
+    pub old_value: Option<crate::dom_string::DomString>,
 }
 
 impl RecordData {
@@ -378,10 +498,6 @@ pub(crate) struct World {
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
     input_files: HashMap<NodeId, Vec<Persistent<Value<'static>>>>,
-    /// Controls whose selection changed and owe a queued `select` event
-    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
-    /// Interior mutability because a selection setter only holds `&World`.
-    pending_selects: RefCell<Vec<NodeId>>,
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
@@ -502,7 +618,6 @@ impl World {
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
             input_files: HashMap::new(),
-            pending_selects: RefCell::new(Vec::new()),
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
@@ -577,23 +692,16 @@ impl World {
         id
     }
 
-    /// Installs the frame's active document without clearing realm caches;
-    /// the parser owns the tree mid-parse. Returns the new document id.
-    ///
-    /// The parser hands the same tree back at every script boundary, so the
-    /// document, its wrappers, and its realm keep their identity while the
-    /// object is replaced in the store.
+    /// Installs the frame's active document without clearing realm caches.
+    /// Returns the document id, reusing the parsed document's id when it
+    /// carries one (take-and-reinsert cycles keep wrapper identity).
     pub(crate) fn set_document(&mut self, parsed: Parsed) -> u32 {
-        let id = parsed.document.document_id();
-        if self.document == Some(id) {
-            self.runtime.documents.borrow_mut().insert(parsed);
-            self.current_script = None;
-            return id;
-        }
-        self.drop_active_document();
         let id = self.runtime.documents.borrow_mut().insert(parsed);
-        self.document = Some(id);
-        self.owned.insert(id);
+        if self.document != Some(id) {
+            self.drop_active_document();
+            self.document = Some(id);
+            self.owned.insert(id);
+        }
         self.current_script = None;
         id
     }
@@ -655,13 +763,6 @@ impl World {
         .ok()
     }
 
-    /// Removes the active document from the store, for the parser to own.
-    pub(crate) fn take_main_document(&mut self) -> Option<Parsed> {
-        let id = self.document.take()?;
-        self.owned.remove(&id);
-        self.runtime.documents.borrow_mut().remove(id)
-    }
-
     /// One `DOMImplementation` object per document, for identity.
     pub(crate) fn implementation(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
         self.implementations.get(&id.document_id()).cloned()
@@ -709,10 +810,10 @@ impl World {
 
     /// Stores a secondary document and returns its root id.
     pub(crate) fn add_document(&mut self, parsed: Parsed) -> NodeId {
-        let root = parsed.document.document();
-        let id = self.runtime.documents.borrow_mut().insert(parsed);
-        self.owned.insert(id);
-        root
+        let node = parsed.document.base.root_node().id;
+        let document = self.runtime.documents.borrow_mut().insert(parsed);
+        self.owned.insert(document);
+        NodeId { document, node }
     }
 
     pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
@@ -739,7 +840,7 @@ impl World {
             owner
                 .borrow()
                 .main_document()
-                .is_some_and(|parsed| dom::lifecycle::is_connected(&parsed.document, container))
+                .is_some_and(|parsed| is_connected(&parsed.document.base, container.node))
         })
     }
 
@@ -765,7 +866,17 @@ impl World {
         let mut created = Vec::new();
         let has_iframes = self
             .with_main_document(|parsed| {
-                dom::lifecycle::connected_iframe_count(&parsed.document) > 0
+                let base = &parsed.document.base;
+                let mut stack = vec![base.root_node().id];
+                while let Some(id) = stack.pop() {
+                    if is_iframe_element(base, id) && is_connected(base, id) {
+                        return true;
+                    }
+                    if let Some(node) = base.get_node(id) {
+                        stack.extend(node.children.iter().rev().copied());
+                    }
+                }
+                false
             })
             .unwrap_or(false);
         if !has_iframes {
@@ -850,24 +961,17 @@ impl World {
     #[must_use]
     pub(crate) fn iframe_containers_in_order(&self) -> Vec<NodeId> {
         self.with_main_document(|parsed| {
+            let base = &parsed.document.base;
+            let document = parsed.id;
             let mut containers = Vec::new();
-            let mut stack = vec![parsed.document.document()];
+            let mut stack = vec![base.root_node().id];
             while let Some(id) = stack.pop() {
-                if dom::lifecycle::is_iframe_element(&parsed.document, id)
-                    && dom::lifecycle::is_connected(&parsed.document, id)
-                {
-                    containers.push(id);
+                if is_iframe_element(base, id) && is_connected(base, id) {
+                    containers.push(NodeId { document, node: id });
                 }
-                let mut children: Vec<NodeId> = parsed
-                    .document
-                    .children(id)
-                    .map(Iterator::collect)
-                    .unwrap_or_default();
-                if let Some(root) = dom::shadow::shadow_root(&parsed.document, id) {
-                    children.push(root);
+                if let Some(node) = base.get_node(id) {
+                    stack.extend(node.children.iter().rev().copied());
                 }
-                children.reverse();
-                stack.extend(children);
             }
             containers
         })
@@ -1015,8 +1119,11 @@ impl World {
 
     /// The root node of the frame's active document.
     pub(crate) fn main_document_root(&self) -> Option<NodeId> {
-        self.main_document()
-            .map(|parsed| parsed.document.document())
+        let document = self.document?;
+        self.main_document().map(|parsed| NodeId {
+            document,
+            node: parsed.document.base.root_node().id,
+        })
     }
 
     pub(crate) fn queue_frame_navigation(&mut self, navigation: FrameNavigation) {
@@ -1042,20 +1149,6 @@ impl World {
         std::mem::take(&mut self.image_updates)
     }
 
-    /// Records that `node`'s selection changed, so a `select` event is due once
-    /// the current task finishes. One event per change: a repeated identical
-    /// change does not queue a second time.
-    pub(crate) fn queue_select(&self, node: NodeId) {
-        let mut pending = self.pending_selects.borrow_mut();
-        if !pending.contains(&node) {
-            pending.push(node);
-        }
-    }
-
-    pub(crate) fn take_pending_selects(&mut self) -> Vec<NodeId> {
-        std::mem::take(&mut *self.pending_selects.borrow_mut())
-    }
-
     /// Records the file list a script assigned to a `type=file` input.
     pub(crate) fn set_input_files(&mut self, id: NodeId, files: Vec<Persistent<Value<'static>>>) {
         self.input_files.insert(id, files);
@@ -1064,36 +1157,6 @@ impl World {
     /// The file list a script assigned to a `type=file` input, if any.
     pub(crate) fn input_files(&self, id: NodeId) -> Option<&[Persistent<Value<'static>>]> {
         self.input_files.get(&id).map(Vec::as_slice)
-    }
-
-    /// Starts a fetch for `url`. If the current request is still available,
-    /// keep its pixels and `currentSrc` until this request commits
-    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
-        self.image_loading.insert(element);
-        self.image_broken.remove(&element);
-        if !self.images.contains_key(&element) {
-            self.image_current_src.insert(element, url);
-        }
-    }
-
-    /// Retains `image` if the shared decoded-image budget still has room.
-    pub(crate) fn store_image(
-        &mut self,
-        element: NodeId,
-        image: crate::render::RasterImage,
-        url: String,
-    ) -> bool {
-        self.image_loading.remove(&element);
-        self.image_broken.remove(&element);
-        self.forget_decoded_pixels(element);
-        self.image_current_src.insert(element, url);
-        let bytes = image.data.len();
-        if !self.reserve_decoded_image_bytes(bytes) {
-            return false;
-        }
-        self.images.insert(element, image);
-        true
     }
 
     /// The current request finished without usable pixels. `url` is the
@@ -1140,68 +1203,6 @@ impl World {
     /// Drops every loaded sheet; a navigation re-scans the new document.
     pub(crate) fn clear_stylesheets(&mut self) {
         self.author_sheets.clear();
-    }
-
-    /// Every stylesheet that applies to `parsed`, in document order: `<style>`
-    /// text and loaded `<link rel=stylesheet>` sheets, spliced at their
-    /// element positions.
-    pub(crate) fn author_stylesheets(&self, parsed: &Parsed) -> Vec<String> {
-        let mut sheets = Vec::new();
-        for node in parsed
-            .document
-            .tree()
-            .descendants(parsed.document.document())
-        {
-            let Some(dom::NodeKind::Element { name, .. }) = parsed.document.kind(node) else {
-                continue;
-            };
-            if name.ns != dom::html_namespace() {
-                continue;
-            }
-            match name.local.as_ref() {
-                "style" => {
-                    let mut css = String::new();
-                    if let Some(children) = parsed.document.children(node) {
-                        for child in children {
-                            if let Some(dom::NodeKind::Text { data }) = parsed.document.kind(child)
-                            {
-                                css.push_str(&data.to_string_lossy());
-                            }
-                        }
-                    }
-                    let css = strip_stylesheet_cdata(&css);
-                    if !css.trim().is_empty() {
-                        sheets.push(css.to_owned());
-                    }
-                }
-                "link" => {
-                    let rel = parsed.document.attribute(node, "rel").unwrap_or_default();
-                    if !rel
-                        .split_ascii_whitespace()
-                        .any(|token| token.eq_ignore_ascii_case("stylesheet"))
-                    {
-                        continue;
-                    }
-                    if let Some(css) = self.author_sheets.get(&node) {
-                        sheets.push(css.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        sheets
-    }
-
-    fn reserve_decoded_image_bytes(&self, bytes: usize) -> bool {
-        let mut budget = self.budget.borrow_mut();
-        let Some(total) = budget.decoded_images.checked_add(bytes) else {
-            return false;
-        };
-        if total > MAX_DECODED_IMAGE_BYTES {
-            return false;
-        }
-        budget.decoded_images = total;
-        true
     }
 
     fn release_decoded_image_bytes(&self, bytes: usize) {
@@ -1398,14 +1399,23 @@ impl World {
 
     /// The parent of `id` in its tree, if any.
     pub(crate) fn node_parent(&self, id: NodeId) -> Option<NodeId> {
-        self.document(id)
-            .and_then(|parsed| parsed.document.parent(id))
+        self.document(id).and_then(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(id.node)
+                .and_then(|node| node.parent)
+                .map(|parent| NodeId {
+                    document: id.document,
+                    node: parent,
+                })
+        })
     }
 
     /// Whether `id` is the root document node of its tree.
     pub(crate) fn node_is_document(&self, id: NodeId) -> bool {
         self.document(id)
-            .is_some_and(|parsed| parsed.document.document() == id)
+            .is_some_and(|parsed| parsed.document.base.root_node().id == id.node)
     }
 
     pub(crate) fn clear_listeners(&mut self) {
@@ -1532,7 +1542,12 @@ impl World {
         // Mirror into the document so `:focus` and `:focus-within` match
         // (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
         if let Some(parsed) = self.runtime.documents.borrow_mut().get_mut(document) {
-            dom::metadata::set_active_element(&mut parsed.document, document, node);
+            match node {
+                Some(focused) => {
+                    parsed.document.base.set_focus_to(focused.node);
+                }
+                None => parsed.document.base.clear_focus(),
+            }
         }
     }
 
@@ -1571,15 +1586,19 @@ impl World {
 /// registration asked for it (the spec's `interestedObservers` map folds the
 /// registrations per observer).
 pub(super) fn match_observation(
-    dom: &dom::Document,
+    base: &blitz_dom::BaseDocument,
+    document: u32,
     observer: &ObserverState,
-    mutation: &dom::Mutation,
+    entry: &JournalEntry,
 ) -> Option<(usize, u64, RecordData)> {
-    let (target, kind) = match mutation {
-        dom::Mutation::ChildList { target, .. } => (*target, 0_u8),
-        dom::Mutation::Attributes { target, .. } => (*target, 1_u8),
-        dom::Mutation::CharacterData { target, .. } => (*target, 2_u8),
+    let (target, kind) = match entry {
+        JournalEntry::ChildList { target, .. } => (*target, 0_u8),
+        JournalEntry::Attributes { target, .. } => (*target, 1_u8),
+        JournalEntry::CharacterData { target, .. } => (*target, 2_u8),
     };
+    if target.document != document {
+        return None;
+    }
     let mut first_registration = None;
     let mut want_attribute_old_value = false;
     let mut want_character_data_old_value = false;
@@ -1587,7 +1606,10 @@ pub(super) fn match_observation(
         let Some(root) = observation.target.tree() else {
             continue;
         };
-        let Some(depth) = ancestor_distance(dom, root, target) else {
+        if root.document != document {
+            continue;
+        }
+        let Some(depth) = ancestor_distance(base, root.node, target.node) else {
             continue;
         };
         if depth != 0 && !observation.options.subtree {
@@ -1597,13 +1619,13 @@ pub(super) fn match_observation(
             0 => observation.options.child_list,
             1 => {
                 observation.options.attributes
-                    && match (&observation.options.attribute_filter, mutation) {
+                    && match (&observation.options.attribute_filter, entry) {
                         // A filter only ever matches unnamespaced attributes;
                         // namespaced ones are always skipped
                         // (<https://dom.spec.whatwg.org/#queue-a-mutation-record>).
                         (
                             Some(filter),
-                            dom::Mutation::Attributes {
+                            JournalEntry::Attributes {
                                 name, namespace, ..
                             },
                         ) => {
@@ -1633,19 +1655,45 @@ pub(super) fn match_observation(
             record(
                 want_attribute_old_value,
                 want_character_data_old_value,
-                mutation,
+                entry,
             ),
         )
     })
 }
 
+/// One recorded tree mutation, in observer-delivery shape.
+///
+/// Binding and parser call sites push these onto the owning document's
+/// journal; Blitz only tracks a coarse changed set, so the delivery payload
+/// lives here.
+#[derive(Clone, Debug)]
+pub(crate) enum JournalEntry {
+    ChildList {
+        target: NodeId,
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        previous: Option<NodeId>,
+        next: Option<NodeId>,
+    },
+    Attributes {
+        target: NodeId,
+        name: String,
+        namespace: String,
+        old_value: Option<String>,
+    },
+    CharacterData {
+        target: NodeId,
+        old_value: DomString,
+    },
+}
+
 fn record(
     want_attribute_old_value: bool,
     want_character_data_old_value: bool,
-    mutation: &dom::Mutation,
+    entry: &JournalEntry,
 ) -> RecordData {
-    match mutation {
-        dom::Mutation::ChildList {
+    match entry {
+        JournalEntry::ChildList {
             target,
             added,
             removed,
@@ -1658,7 +1706,7 @@ fn record(
             next: next.map(Handle),
             ..RecordData::new("childList", Handle(*target))
         },
-        dom::Mutation::Attributes {
+        JournalEntry::Attributes {
             target,
             name,
             namespace,
@@ -1669,24 +1717,28 @@ fn record(
             old_value: want_attribute_old_value
                 .then(|| old_value.clone())
                 .flatten()
-                .map(dom::DomString::from),
+                .map(DomString::from),
             ..RecordData::new("attributes", Handle(*target))
         },
-        dom::Mutation::CharacterData { target, old_value } => RecordData {
+        JournalEntry::CharacterData { target, old_value } => RecordData {
             old_value: want_character_data_old_value.then(|| old_value.clone()),
             ..RecordData::new("characterData", Handle(*target))
         },
     }
 }
 
-fn ancestor_distance(dom: &dom::Document, ancestor: NodeId, node: NodeId) -> Option<usize> {
+fn ancestor_distance(
+    base: &blitz_dom::BaseDocument,
+    ancestor: BlitzNodeId,
+    node: BlitzNodeId,
+) -> Option<usize> {
     let mut cursor = Some(node);
     let mut depth = 0;
     while let Some(id) = cursor {
         if id == ancestor {
             return Some(depth);
         }
-        cursor = dom.parent(id);
+        cursor = base.get_node(id).and_then(|node| node.parent);
         depth += 1;
     }
     None
@@ -1724,7 +1776,7 @@ struct AttrEntry {
 pub(crate) enum AttrAttachError {
     Stale,
     InUse,
-    Dom(dom::DomError),
+    NotAnElement,
 }
 
 impl AttributeRegistry {
@@ -1796,7 +1848,7 @@ impl AttributeRegistry {
     pub(crate) fn attach(
         &mut self,
         id: u64,
-        document: &mut dom::Document,
+        base: &mut blitz_dom::BaseDocument,
         element: NodeId,
         value: String,
     ) -> Result<Option<u64>, AttrAttachError> {
@@ -1810,17 +1862,23 @@ impl AttributeRegistry {
         if previous == Some(id) {
             return Ok(previous);
         }
-        dom::mutation::set_attribute_by_ns(
-            document,
-            element,
-            &state.namespace,
-            state.prefix.as_deref(),
-            &state.local,
-            value.clone(),
-        )
-        .map_err(AttrAttachError::Dom)?;
+        let Some(node) = base.get_node(element.node) else {
+            return Err(AttrAttachError::Stale);
+        };
+        if node.data.downcast_element().is_none() {
+            return Err(AttrAttachError::NotAnElement);
+        }
+        let name = markup5ever::QualName::new(
+            state.prefix.clone().map(markup5ever::Prefix::from),
+            markup5ever::Namespace::from(state.namespace.clone()),
+            markup5ever::LocalName::from(state.local.clone()),
+        );
+        base.mutate().set_attribute(element.node, name, &value);
         state.owner = Some(element);
-        state.document = document.document();
+        state.document = NodeId {
+            document: element.document,
+            node: base.root_node().id,
+        };
         state.value = value;
         if let Some(previous) = previous
             && let Some(state) = self.state_mut(previous)
@@ -1842,14 +1900,4 @@ impl AttributeRegistry {
         self.entries.clear();
         self.attached.clear();
     }
-}
-
-/// Strips the `<![CDATA[` / `]]>` wrapper a `<style>` element carries when the
-/// document is XML-flavored (WPT serves `.xht` as `application/xhtml+xml`).
-fn strip_stylesheet_cdata(css: &str) -> &str {
-    let trimmed = css.trim();
-    trimmed
-        .strip_prefix("<![CDATA[")
-        .and_then(|rest| rest.strip_suffix("]]>"))
-        .unwrap_or(css)
 }

@@ -1,17 +1,16 @@
 //! `DOMImplementation`, DOM parsing, and serialization.
 
 use super::{
-    NodeContext,
-    clone::{import_snapshot, materialize_import},
-    create_kind, throw_dom, throw_dom_error, validate_and_extract, world, world_for_node,
-    wrap_new_document, wrap_new_document_in_world,
+    NodeContext, throw_dom, validate_and_extract, world, world_for_node, wrap_new_document,
+    wrap_new_document_in_world, wrap_node,
 };
 
-use dom::{LocalName, NodeId, NodeKind, QualName, html_namespace};
+use crate::js::world::Handle;
+use crate::js::world::NodeId;
+
+use markup5ever::{LocalName, QualName};
 
 use rquickjs::{Ctx, Exception, Result, Value, class::Trace};
-
-use crate::js::world::Handle;
 
 /// `DOMImplementation` as a platform object
 /// (<https://dom.spec.whatwg.org/#interface-domimplementation>).
@@ -46,9 +45,31 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 "doctype name contains invalid characters",
             ));
         }
-        create_kind(&ctx, self.document.0, |dom| {
-            dom.create_doctype(name, public_id, system_id)
-        })
+        // Gap: Blitz `NodeData` has no Doctype variant, so a document type
+        // cannot live in the tree. Materialize a Comment placeholder so the
+        // wrapper stays live; `doctype_fields` reports `None` until a Doctype
+        // kind exists.
+        let _ = (public_id, system_id);
+        let owner = world_for_node(&ctx, self.document.0)?;
+        let (document, blitz_id) = {
+            let owner = owner.borrow();
+            let Some(mut parsed) = owner.document_mut(self.document.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let blitz_id = parsed
+                .document
+                .base
+                .mutate()
+                .create_comment_node(&format!("DOCTYPE {name}"));
+            (self.document.0.document, blitz_id)
+        };
+        wrap_node(
+            &ctx,
+            NodeId {
+                document,
+                node: blitz_id,
+            },
+        )
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
@@ -57,7 +78,7 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         ctx: Ctx<'js>,
         namespace: Option<rquickjs::String<'js>>,
         qualified: rquickjs::String<'js>,
-        doctype: Option<NodeId>,
+        doctype: Option<super::host::NodeReference>,
     ) -> Result<Value<'js>> {
         let namespace = namespace
             .map(|value| value.to_string())
@@ -82,27 +103,17 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
             )?)
         };
         let mut parsed = crate::Parsed::empty(content_type);
-        let document = parsed.document.document();
-        if let Some(doctype) = doctype {
-            let owner_rc = world_for_node(&ctx, doctype)?;
-            let snapshot = {
-                let owner = owner_rc.borrow();
-                let Some(source) = owner.document(doctype) else {
-                    return Err(Exception::throw_type(&ctx, "no document"));
-                };
-                import_snapshot(&source.document, doctype, true)
-            };
-            if let Some(snapshot) = snapshot {
-                let node = materialize_import(&mut parsed.document, &snapshot)
-                    .map_err(|err| throw_dom_error(&ctx, err))?;
-                dom::mutation::append(&mut parsed.document, document, node)
-                    .map_err(|err| throw_dom_error(&ctx, err))?;
-            }
-        }
+        // Gap: Blitz has no Doctype node kind; the doctype argument is dropped
+        // instead of being adopted into the new tree.
+        let _ = doctype;
         if let Some(name) = root {
-            let element = parsed.document.create_element(name, Vec::new());
-            dom::mutation::append(&mut parsed.document, document, element)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            let document_root = parsed.document.base.root_node().id;
+            let element = parsed.document.base.mutate().create_element(name, Vec::new());
+            parsed
+                .document
+                .base
+                .mutate()
+                .append_children(document_root, &[element]);
         }
         wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
@@ -114,59 +125,87 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         title: Option<rquickjs::String<'js>>,
     ) -> Result<Value<'js>> {
         let mut parsed = crate::Parsed::empty("text/html");
-        let document = parsed.document.document();
-        let doctype = parsed.document.create_doctype("html", "", "");
-        dom::mutation::append(&mut parsed.document, document, doctype)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        // Gap: Blitz has no Doctype node kind; `createHTMLDocument` builds no
+        // doctype, unlike the spec.
+        let document_root = parsed.document.base.root_node().id;
         let html = parsed
             .document
+            .base
+            .mutate()
             .create_element(html_element_name("html"), Vec::new());
-        dom::mutation::append(&mut parsed.document, document, html)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(document_root, &[html]);
         let head = parsed
             .document
+            .base
+            .mutate()
             .create_element(html_element_name("head"), Vec::new());
-        dom::mutation::append(&mut parsed.document, html, head)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(html, &[head]);
         if let Some(title) = title {
+            let title_text = title.to_string()?;
             let title_element = parsed
                 .document
+                .base
+                .mutate()
                 .create_element(html_element_name("title"), Vec::new());
-            dom::mutation::append(&mut parsed.document, head, title_element)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            parsed
+                .document
+                .base
+                .mutate()
+                .append_children(head, &[title_element]);
+            // Lone surrogates cannot survive the UTF-8 tree: they become the
+            // replacement character at this boundary, a known cutover gap.
             let text = parsed
                 .document
-                .create_text(dom::DomString::from_utf16(title.to_utf16()?));
-            dom::mutation::append(&mut parsed.document, title_element, text)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+                .base
+                .mutate()
+                .create_text_node(&title_text);
+            parsed
+                .document
+                .base
+                .mutate()
+                .append_children(title_element, &[text]);
         }
         let body = parsed
             .document
+            .base
+            .mutate()
             .create_element(html_element_name("body"), Vec::new());
-        dom::mutation::append(&mut parsed.document, html, body)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(html, &[body]);
         wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
 }
 
 /// The doctype's name, public id, and system id, when `parsed` holds `id`.
+///
+/// Gap: Blitz `NodeData` has no Doctype variant, so this always reports
+/// `None`; `create_document_type` materializes a Comment placeholder.
 pub(super) fn doctype_fields(
     parsed: &crate::Parsed,
     id: NodeId,
 ) -> Option<(String, String, String)> {
-    match parsed.document.kind(id) {
-        Some(NodeKind::Doctype {
-            name,
-            public_id,
-            system_id,
-        }) => Some((name.clone(), public_id.clone(), system_id.clone())),
-        _ => None,
-    }
+    let _ = (parsed, id);
+    None
 }
 
 /// An HTML-namespace qualified name for document construction.
 fn html_element_name(local: &str) -> QualName {
-    QualName::new(None, html_namespace(), LocalName::from(local))
+    QualName::new(
+        None,
+        crate::js::world::html_namespace(),
+        LocalName::from(local),
+    )
 }
 
 /// [Valid doctype name](https://dom.spec.whatwg.org/#valid-doctype-name): no
@@ -217,7 +256,10 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
         // `DOMParser` parses with scripting disabled
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
         let mut parsed = if content_type == "text/html" {
-            let mut parsed = crate::parse_html_without_scripting(&source);
+            let mut parsed = crate::parse_html_without_scripting(
+                &source,
+                blitz_dom::DocumentConfig::default(),
+            );
             parsed.content_type = content_type;
             parsed.ready_state = crate::ReadyState::Complete;
             parsed
@@ -272,16 +314,10 @@ impl<'js> xml_serializer_generated::XMLSerializer<'js> for JsXmlSerializer {
     ) -> Result<rquickjs::String<'js>> {
         // An `Attr` serializes as the empty string
         // (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
-        let super::host::NodeReference::Tree(id) = root else {
-            return rquickjs::String::from_str(ctx.clone(), "");
-        };
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(id) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let markup = crate::serialize::serialize_xml(&parsed.document, id, false)
-            .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))?;
-        super::dom_string(&ctx, &markup)
+        // Gap: the old serializer still targets the previous tree type
+        // and has no Blitz equivalent yet; every tree node serializes as the
+        // empty string until the serializer is ported.
+        let _ = matches!(root, super::host::NodeReference::Tree(_));
+        rquickjs::String::from_str(ctx.clone(), "")
     }
 }

@@ -1,35 +1,38 @@
 //! The single `Node` wrapper class and its members.
 
 use super::{
-    AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap,
-    JsTokenList, LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits,
-    WebIdlString,
-    WebIdlUnsignedLong, adopt_across_documents, after_attribute_change, ancestor_chain,
-    attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
-    blur_node, character_data, character_data_offset, child_value, clone_document,
-    convert_union_nodes_into_node, create_element_named, create_html_element, create_kind,
-    deref_weak,
-    descendant_text, doctype_fields, document_base_url_string, document_is_html,
-    document_is_html_content, document_url_string, dom_string, element_at_point, element_box,
-    element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
-    fixup_focus_after_removal, focus_node, host, host_node_id, import_snapshot, is_element, is_focusable,
-    is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
-    locate_prefix, main_document, make_weak, materialize_children, materialize_import,
-    new_detached_attr, nodes_equal, qualified_name, rect_object,
-    remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
-    set_attribute_node, set_character_data, sibling_value, string_value, throw_dom,
+    AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap, JsTokenList,
+    LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits, WebIdlString,
+    WebIdlUnsignedLong, adopt_across_documents, ancestor_chain, attached_attr_id, attr_owner,
+    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
+    character_data_offset, child_value, clone_document, clone_within_document,
+    convert_union_nodes_into_node, deref_weak, descendant_text, doctype_fields,
+    document_base_url_string, document_is_html, document_is_html_content, document_url_string,
+    dom_string, element_at_point, element_box, element_click, element_node_name,
+    element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
+    focus_node, host, host_node_id, import_snapshot, is_element, is_focusable, is_html_element,
+    is_main_document, live_collection, main_document, make_weak, materialize_children,
+    materialize_import, new_detached_attr, qualified_name, rect_object, remove_attribute_sync,
+    required_node, root_of, schedule_mutation_delivery, select_error, set_attribute_node,
+    set_attribute_sync, set_character_data, sibling, sibling_value, string_value, throw_dom,
     throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, validate_and_extract,
-    with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
+    with_node_data, world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
-use dom::{LocalName, NodeId, NodeKind, QualName, html_namespace, svg_namespace};
+use blitz_dom::NodeData;
+use markup5ever::{LocalName, Namespace, QualName};
+
+use crate::dom_string::DomString;
 
 use rquickjs::{Array, Class, Ctx, Exception, Function, Persistent, Result, Value};
 
 use crate::js::events;
 
-use crate::js::world::{DocumentStreamCommand, Handle, NodeReference, Wrapper};
+use crate::js::world::{
+    BlitzId, DocumentStreamCommand, Handle, JournalEntry, NodeId, NodeReference, Wrapper, attr,
+    html_namespace, is_connected, svg_namespace,
+};
 
 use crate::ReadyState;
 
@@ -127,33 +130,6 @@ fn insertion_tree_nodes(
 ) -> Result<(NodeId, Option<NodeId>)> {
     // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
     // https://dom.spec.whatwg.org/#concept-node-replace
-    let owner = world_for_node(ctx, parent)?;
-    let owner = owner.borrow();
-    let parsed = owner
-        .document(parent)
-        .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
-    let document = &parsed.document;
-    if !matches!(
-        document.kind(parent),
-        Some(NodeKind::Document | NodeKind::Fragment | NodeKind::Element { .. })
-    ) {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "parent cannot have children",
-        ));
-    }
-    let reference = child.and_then(NodeReference::tree);
-    if let Some(node) = node.tree() {
-        dom::mutation::validate_pre_insert(document, parent, node, reference)
-            .map_err(|error| throw_dom_error(ctx, error))?;
-    } else if reference.is_some_and(|child| document.parent(child) != Some(parent)) {
-        return Err(throw_dom(
-            ctx,
-            "NotFoundError",
-            "reference is not a child of parent",
-        ));
-    }
     if matches!(child, Some(NodeReference::Attribute { .. })) {
         return Err(throw_dom(ctx, "NotFoundError", "attributes have no parent"));
     }
@@ -164,6 +140,157 @@ fn insertion_tree_nodes(
             "attributes cannot be inserted",
         )
     })?;
+    let owner = world_for_node(ctx, parent)?;
+    let owner = owner.borrow();
+    let parsed = owner
+        .document(parent)
+        .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
+    let base = &parsed.document.base;
+    // Only documents and elements can be parents. Fragment backings are
+    // plain elements, so fragments are covered by the element case.
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    let parent_is_document = base.root_node().id == parent.node;
+    if !parent_is_document && !is_element(base, parent.node) {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "parent cannot have children",
+        ));
+    }
+    // The reference child must already be parented here.
+    let reference = match child {
+        Some(NodeReference::Tree(id)) => Some(id),
+        Some(NodeReference::Attribute { .. }) | None => None,
+    };
+    if let Some(reference) = reference {
+        let parented = reference.document == parent.document
+            && base
+                .get_node(parent.node)
+                .is_some_and(|candidate| candidate.children.contains(&reference.node));
+        if !parented {
+            return Err(throw_dom(
+                ctx,
+                "NotFoundError",
+                "reference is not a child of parent",
+            ));
+        }
+    }
+    // The node itself must be live, resolved in its own document.
+    let node_parsed = owner
+        .document(node)
+        .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
+    let node_base = &node_parsed.document.base;
+    // A document (any document's root) can never be inserted.
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    if node_base.root_node().id == node.node {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "a document cannot be inserted",
+        ));
+    }
+    let node_is_fragment = node_parsed.document.is_fragment(node.node);
+    let node_data = node_base
+        .get_node(node.node)
+        .map(|candidate| &candidate.data);
+    let node_is_element = node_data.is_some_and(|data| data.downcast_element().is_some());
+    // Only fragments, elements, text, and comments insert. Blitz has no
+    // doctype or processing-instruction kinds.
+    let node_is_text = node_data.is_some_and(|data| matches!(data, NodeData::Text(_)));
+    let node_is_character_data =
+        node_is_text || node_data.is_some_and(|data| matches!(data, NodeData::Comment { .. }));
+    if !node_is_fragment && !node_is_element && !node_is_character_data {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "node cannot be inserted",
+        ));
+    }
+    // A node cannot be inserted into its own subtree.
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    if node.document == parent.document {
+        let mut cursor = Some(parent.node);
+        while let Some(current) = cursor {
+            if current == node.node {
+                return Err(throw_dom(
+                    ctx,
+                    "HierarchyRequestError",
+                    "node cannot contain itself",
+                ));
+            }
+            cursor = base
+                .get_node(current)
+                .and_then(|candidate| candidate.parent);
+        }
+    }
+    // The document content model: at most one element child, and no text
+    // directly under the document.
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    if parent_is_document {
+        let fragment_children: Vec<BlitzId> = if node_is_fragment {
+            node_base
+                .get_node(node.node)
+                .map(|fragment| fragment.children.iter().copied().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !node_is_fragment && node_is_text {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "text cannot be a child of a document",
+            ));
+        }
+        if node_is_fragment
+            && fragment_children.iter().any(|child| {
+                node_base
+                    .get_node(*child)
+                    .is_some_and(|candidate| matches!(candidate.data, NodeData::Text(_)))
+            })
+        {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "text cannot be a child of a document",
+            ));
+        }
+        let inserted_elements = if node_is_fragment {
+            fragment_children
+                .iter()
+                .filter(|child| {
+                    node_base
+                        .get_node(**child)
+                        .is_some_and(|candidate| candidate.data.downcast_element().is_some())
+                })
+                .count()
+        } else if node_is_element {
+            1
+        } else {
+            0
+        };
+        let existing_elements = base
+            .get_node(parent.node)
+            .map(|root| {
+                root.children
+                    .iter()
+                    .filter(|child| {
+                        (node.document != parent.document || **child != node.node)
+                            && base.get_node(**child).is_some_and(|candidate| {
+                                candidate.data.downcast_element().is_some()
+                            })
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if existing_elements + inserted_elements > 1 {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "a document can have only one element child",
+            ));
+        }
+    }
     Ok((node, reference))
 }
 
@@ -195,12 +322,16 @@ pub(super) fn compare_node_position(
     let (Some(node1), Some(node2)) = (node1, node2) else {
         return Ok(disconnected);
     };
+    if node1.document != node2.document {
+        return Ok(disconnected);
+    }
     let owner = world_for_node(ctx, node1)?;
     let owner = owner.borrow();
     let parsed = owner
         .document(node1)
         .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
-    let dom = &parsed.document;
+    let base = &parsed.document.base;
+    let document = parsed.id;
     if let (
         NodeReference::Attribute {
             scope: scope1,
@@ -215,24 +346,31 @@ pub(super) fn compare_node_position(
     {
         let a = attr_state(ctx, scope1, attr1)?;
         let b = attr_state(ctx, scope2, attr2)?;
-        for attribute in dom.attributes(node1).unwrap_or_default() {
-            if attribute.name.ns.as_ref() == a.namespace && attribute.name.local.as_ref() == a.local
-            {
-                return Ok(IMPLEMENTATION_SPECIFIC | PRECEDING);
-            }
-            if attribute.name.ns.as_ref() == b.namespace && attribute.name.local.as_ref() == b.local
-            {
-                return Ok(IMPLEMENTATION_SPECIFIC | FOLLOWING);
+        if let Some(element) = base
+            .get_node(node1.node)
+            .and_then(|candidate| candidate.data.downcast_element())
+        {
+            for attribute in element.attrs.iter() {
+                if attribute.name.ns.as_ref() == a.namespace
+                    && attribute.name.local.as_ref() == a.local
+                {
+                    return Ok(IMPLEMENTATION_SPECIFIC | PRECEDING);
+                }
+                if attribute.name.ns.as_ref() == b.namespace
+                    && attribute.name.local.as_ref() == b.local
+                {
+                    return Ok(IMPLEMENTATION_SPECIFIC | FOLLOWING);
+                }
             }
         }
     }
-    if root_of(dom, node1) != root_of(dom, node2) {
+    if root_of(base, node1.node) != root_of(base, node2.node) {
         return Ok(disconnected);
     }
     let attr1 = matches!(other, NodeReference::Attribute { .. });
     let attr2 = matches!(this, NodeReference::Attribute { .. });
-    let node1_ancestor = ancestor_chain(dom, node2).contains(&node1);
-    let node2_ancestor = ancestor_chain(dom, node1).contains(&node2);
+    let node1_ancestor = ancestor_chain(base, document, node2.node).contains(&node1);
+    let node2_ancestor = ancestor_chain(base, document, node1.node).contains(&node2);
     if (node1_ancestor && !attr1) || (node1 == node2 && attr2) {
         return Ok(CONTAINS | PRECEDING);
     }
@@ -240,7 +378,7 @@ pub(super) fn compare_node_position(
         return Ok(CONTAINED_BY | FOLLOWING);
     }
     Ok(
-        if tree_order(dom, node1, node2) == std::cmp::Ordering::Less {
+        if tree_order(base, document, node1.node, node2.node) == std::cmp::Ordering::Less {
             PRECEDING
         } else {
             FOLLOWING
@@ -265,16 +403,28 @@ pub(crate) fn construct_node<'js>(
         "Text" => {
             let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
-            create_kind(&ctx, document, |dom| dom.create_text(data))
+            create_node(&ctx, document, |parsed| {
+                parsed
+                    .document
+                    .base
+                    .mutate()
+                    .create_text_node(&data.to_string_lossy())
+            })
         }
         "Comment" => {
             let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
-            create_kind(&ctx, document, |dom| dom.create_comment(data))
+            create_node(&ctx, document, |parsed| {
+                parsed
+                    .document
+                    .base
+                    .mutate()
+                    .create_comment_node(&data.to_string_lossy())
+            })
         }
         "DocumentFragment" => {
             let document = main_document(&ctx)?;
-            create_kind(&ctx, document, dom::Document::create_fragment)
+            create_node(&ctx, document, |parsed| parsed.document.create_fragment())
         }
         "Document" | "XMLDocument" => {
             // The `Document` constructor creates an XML document
@@ -319,9 +469,7 @@ pub(super) fn install_custom_construction(ctx: &Ctx<'_>) -> Result<()> {
 fn push_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
     let id = host_node_id(&ctx, &value)
         .ok_or_else(|| Exception::throw_type(&ctx, "custom element candidate is not an element"))?;
-    let is_element = with_node_kind(&ctx, id, |kind| {
-        matches!(kind, Some(NodeKind::Element { .. }))
-    })?;
+    let is_element = with_node_data(&ctx, id, |data| matches!(data, Some(NodeData::Element(_))))?;
     if !is_element {
         return Err(Exception::throw_type(
             &ctx,
@@ -350,14 +498,103 @@ fn discard_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<
 
 /// Constructor `DOMString` that keeps every UTF-16 code unit, for the
 /// character-data constructors (`new Text(…)`).
-fn constructor_units<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<dom::DomString> {
+fn constructor_units<'js>(
+    ctx: &Ctx<'js>,
+    value: Option<Value<'js>>,
+) -> Result<crate::dom_string::DomString> {
     match value {
-        None => Ok(dom::DomString::default()),
-        Some(value) if value.is_undefined() => Ok(dom::DomString::default()),
-        Some(value) => Ok(dom::DomString::from_utf16(super::webidl_to_units(
-            ctx, value,
-        )?)),
+        None => Ok(crate::dom_string::DomString::default()),
+        Some(value) if value.is_undefined() => Ok(crate::dom_string::DomString::default()),
+        Some(value) => Ok(crate::dom_string::DomString::from_utf16(
+            super::webidl_to_units(ctx, value)?,
+        )),
     }
+}
+
+/// Creates a detached node in `document`'s tree and wraps it. Detached
+/// creation records no mutation: no observer can watch a node with no parent.
+fn create_node<'js>(
+    ctx: &Ctx<'js>,
+    document: NodeId,
+    make: impl FnOnce(&mut crate::Parsed) -> BlitzId,
+) -> Result<Value<'js>> {
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(document) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    let store = parsed.id;
+    let blitz = make(&mut parsed);
+    let id = NodeId {
+        document: store,
+        node: blitz,
+    };
+    drop(parsed);
+    drop(world);
+    wrap_node(ctx, id)
+}
+
+// https://dom.spec.whatwg.org/#dom-document-createelement
+fn create_html_element<'js>(ctx: &Ctx<'js>, document: NodeId, tag: &str) -> Result<Value<'js>> {
+    // https://dom.spec.whatwg.org/#dom-document-createelement: validate, then
+    // lowercase for an HTML document.
+    if !valid_element_local_name(tag) {
+        return Err(throw_dom(
+            ctx,
+            "InvalidCharacterError",
+            "tag name is not a valid element local name",
+        ));
+    }
+    // XHTML documents use the HTML namespace but keep case; only text/html
+    // is an "HTML document" for lowercasing
+    // (<https://dom.spec.whatwg.org/#internal-createelementns-steps>).
+    let namespace = if document_is_html(ctx, document) {
+        html_namespace()
+    } else {
+        Namespace::from("")
+    };
+    let local = if document_is_html_content(ctx, document) {
+        tag.to_ascii_lowercase()
+    } else {
+        tag.to_owned()
+    };
+    let name = QualName::new(None, namespace, LocalName::from(local));
+    create_element_named(ctx, document, name)
+}
+
+fn create_element_named<'js>(
+    ctx: &Ctx<'js>,
+    document: NodeId,
+    name: QualName,
+) -> Result<Value<'js>> {
+    // Known gap: Blitz has no template contents, so `<template>` children
+    // live as ordinary element children.
+    create_node(ctx, document, |parsed| {
+        parsed
+            .document
+            .base
+            .mutate()
+            .create_element(name, Vec::new())
+    })
+}
+
+/// [Valid element local name](https://dom.spec.whatwg.org/#valid-element-local-name).
+fn valid_element_local_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_alphabetic() {
+        return !name
+            .chars()
+            .any(|c| matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ' | '\0' | '/' | '>'));
+    }
+    if first != ':' && first != '_' && u32::from(first) < 0x80 {
+        return false;
+    }
+    name.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_') || u32::from(c) >= 0x80
+    })
 }
 
 #[derive(Trace, rquickjs::JsLifetime)]
@@ -397,50 +634,87 @@ fn html_fragment_context(name: &QualName) -> String {
 /// Parses `markup` as an HTML fragment in `context` and snapshots the
 /// resulting nodes for insertion into a document.
 fn parse_html_fragment_snapshots(
-    ctx: &Ctx<'_>,
+    _ctx: &Ctx<'_>,
     markup: &str,
     context: &str,
 ) -> Result<Vec<ImportSnapshot>> {
-    let parsed_fragment = crate::parse_html_fragment(markup, context, true);
-    let fragment_root = parsed_fragment
-        .document
-        .children(parsed_fragment.document.document())
-        .and_then(|mut children| {
-            children.find(|&id| {
-                matches!(
-                    parsed_fragment.document.kind(id),
-                    Some(NodeKind::Element { name, .. })
-                        if name.ns == html_namespace() && name.local.as_ref() == "html"
-                )
-            })
+    // The fragment parses into a scratch context element; only the parsed
+    // children are snapshotted for insertion into a live document
+    // (<https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm>).
+    let context_name = fragment_context_name(context);
+    let mut base = blitz_dom::BaseDocument::new(blitz_dom::DocumentConfig::default());
+    let context_id = {
+        let mut mutator = base.mutate();
+        let context_id = mutator.create_element(context_name, Vec::new());
+        blitz_html::DocumentHtmlParser::parse_inner_html_into_mutator(
+            &mut mutator,
+            context_id,
+            markup,
+        );
+        context_id
+    };
+    let scratch = crate::documents::BlitzDocument::from_base(base);
+    let children: Vec<BlitzId> = scratch
+        .base
+        .get_node(context_id)
+        .map(|node| node.children.iter().copied().collect())
+        .unwrap_or_default();
+    Ok(children
+        .into_iter()
+        .filter_map(|child| {
+            import_snapshot(
+                &scratch,
+                NodeId {
+                    document: 0,
+                    node: child,
+                },
+                true,
+            )
         })
-        .ok_or_else(|| Exception::throw_internal(ctx, "fragment parser omitted its root"))?;
-    Ok(parsed_fragment
-        .document
-        .children(fragment_root)
-        .map(|children| {
-            children
-                .filter_map(|child| import_snapshot(&parsed_fragment.document, child, true))
-                .collect()
-        })
-        .unwrap_or_default())
+        .collect())
+}
+
+/// The context element name for fragment parsing: html5lib's `svg `/`math `
+/// prefixes select the foreign namespace.
+fn fragment_context_name(spec: &str) -> QualName {
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    const MATHML: &str = "http://www.w3.org/1998/Math/MathML";
+    if let Some(local) = spec.strip_prefix("svg ") {
+        QualName::new(None, Namespace::from(SVG), LocalName::from(local))
+    } else if let Some(local) = spec.strip_prefix("math ") {
+        QualName::new(None, Namespace::from(MATHML), LocalName::from(local))
+    } else {
+        QualName::new(None, html_namespace(), LocalName::from(spec))
+    }
 }
 
 /// The first node matching `selector` under `parsed`'s document root.
 fn document_first(parsed: &crate::Parsed, selector: &str) -> Option<NodeId> {
-    dom::selector::select_first(&parsed.document, parsed.document.document(), selector)
+    let root = parsed.document.base.root_node().id;
+    parsed
+        .document
+        .base
+        .query_selector_in(root, selector)
         .ok()
         .flatten()
+        .map(|node| NodeId {
+            document: parsed.id,
+            node,
+        })
 }
 
 /// The first child of `parsed`'s document root satisfying `want`.
-fn document_first_child(parsed: &crate::Parsed, want: fn(&NodeKind) -> bool) -> Option<NodeId> {
-    parsed
-        .document
-        .children(parsed.document.document())
-        .into_iter()
-        .flatten()
-        .find(|&id| parsed.document.kind(id).is_some_and(want))
+fn document_first_child(parsed: &crate::Parsed, want: fn(&NodeData) -> bool) -> Option<NodeId> {
+    let base = &parsed.document.base;
+    base.get_node(base.root_node().id).and_then(|root| {
+        root.children.iter().find_map(|child| {
+            let node = base.get_node(*child)?;
+            want(&node.data).then_some(NodeId {
+                document: parsed.id,
+                node: *child,
+            })
+        })
+    })
 }
 
 /// Wraps the first node `find` selects in `id`'s document, or `null`.
@@ -454,6 +728,1293 @@ fn document_value<'js>(
     child_value(ctx, found)
 }
 
+/// Snapshots `id` for cross-document moves, preserving fragment backings as
+/// fragments. `import_snapshot` reads a backing as its plain backing element;
+/// fragments must snapshot as their children instead, or adoption would
+/// insert a stray `div`.
+fn snapshot_for_adopt(
+    doc: &crate::documents::BlitzDocument,
+    id: NodeId,
+    deep: bool,
+) -> Option<ImportSnapshot> {
+    if doc.is_fragment(id.node) {
+        if !deep {
+            return Some(ImportSnapshot::Fragment(Vec::new()));
+        }
+        let children: Vec<BlitzId> = doc
+            .base
+            .get_node(id.node)
+            .map(|backing| backing.children.iter().copied().collect())
+            .unwrap_or_default();
+        let children = children
+            .into_iter()
+            .filter_map(|child| {
+                import_snapshot(
+                    doc,
+                    NodeId {
+                        document: id.document,
+                        node: child,
+                    },
+                    true,
+                )
+            })
+            .collect();
+        return Some(ImportSnapshot::Fragment(children));
+    }
+    import_snapshot(doc, id, deep)
+}
+
+/// Same-document insert returns `node`. A node from another document adopts
+/// into the parent's document, preserving fragment backings as fragments
+/// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
+fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
+    if node.document == parent.document {
+        return Ok(node);
+    }
+    let source_is_fragment = {
+        let source_world = world_for_node(ctx, node)?;
+        let source = source_world.borrow();
+        let Some(parsed) = source.document(node) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        parsed.document.is_fragment(node.node)
+    };
+    if !source_is_fragment {
+        return adopt_across_documents(ctx, parent, node);
+    }
+    let source_world = world_for_node(ctx, node)?;
+    let snapshots = {
+        let source = source_world.borrow();
+        let Some(parsed) = source.document(node) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        let children: Vec<BlitzId> = parsed
+            .document
+            .base
+            .get_node(node.node)
+            .map(|backing| backing.children.iter().copied().collect())
+            .unwrap_or_default();
+        children
+            .into_iter()
+            .filter_map(|child| {
+                import_snapshot(
+                    &parsed.document,
+                    NodeId {
+                        document: node.document,
+                        node: child,
+                    },
+                    true,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    {
+        let source = source_world.borrow();
+        let Some(mut parsed) = source.document_mut(node) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        unlink_journaled(&mut parsed, node);
+    }
+    let target_world = world_for_node(ctx, parent)?;
+    let target = target_world.borrow();
+    let Some(mut parsed) = target.document_mut(parent) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    let mut fresh = materialize_children(&mut parsed.document, &snapshots)
+        .map_err(|err| throw_dom_error(ctx, err))?;
+    // `materialize_children` builds with a placeholder document id; remap to
+    // the target document before insertion.
+    fresh.document = parent.document;
+    Ok(fresh)
+}
+
+/// Siblings around `child` within `parent`, for the mutation journal.
+fn siblings_around(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    parent: BlitzId,
+    child: BlitzId,
+) -> (Option<NodeId>, Option<NodeId>) {
+    let mut previous = None;
+    let mut next = None;
+    if let Some(node) = base.get_node(parent) {
+        let mut seen = false;
+        for &kid in node.children.iter() {
+            if kid == child {
+                seen = true;
+                continue;
+            }
+            let id = NodeId {
+                document,
+                node: kid,
+            };
+            if seen && next.is_none() {
+                next = Some(id);
+                break;
+            }
+            if !seen {
+                previous = Some(id);
+            }
+        }
+    }
+    (previous, next)
+}
+
+/// Records the removal of an already-parented `target`, then detaches it. A
+/// node with no parent is already detached; that is a no-op. The removal
+/// keeps its own `childList` record, so a move reads as removed plus added
+/// (<https://dom.spec.whatwg.org/#concept-node-remove>).
+fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
+    let document = target.document;
+    let (parent, previous, next) = {
+        let base = &parsed.document.base;
+        let parent = base.get_node(target.node).and_then(|node| node.parent);
+        let (previous, next) = parent
+            .map(|parent| siblings_around(base, document, parent, target.node))
+            .unwrap_or((None, None));
+        (parent, previous, next)
+    };
+    let Some(parent) = parent else {
+        return;
+    };
+    parsed.document.base.mutate().remove_node(target.node);
+    parsed.document.record(JournalEntry::ChildList {
+        target: NodeId {
+            document,
+            node: parent,
+        },
+        added: Vec::new(),
+        removed: vec![target],
+        previous,
+        next,
+    });
+}
+
+/// Inserts the already-adopted `child` into `parent` before `reference` (or
+/// at the end for `None`), recording one `childList` addition. Blitz detaches
+/// from the old parent during the insert itself, so callers run
+/// `unlink_journaled` first and the removal keeps its own record.
+fn place_journaled(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    child: NodeId,
+    reference: Option<NodeId>,
+) {
+    let previous = match reference {
+        Some(reference) => {
+            siblings_around(
+                &parsed.document.base,
+                parent.document,
+                parent.node,
+                reference.node,
+            )
+            .0
+        }
+        None => parsed
+            .document
+            .base
+            .get_node(parent.node)
+            .and_then(|node| node.children.last().copied())
+            .map(|node| NodeId {
+                document: parent.document,
+                node,
+            }),
+    };
+    match reference {
+        Some(reference) => parsed
+            .document
+            .base
+            .mutate()
+            .insert_nodes_before(reference.node, &[child.node]),
+        None => parsed
+            .document
+            .base
+            .mutate()
+            .append_children(parent.node, &[child.node]),
+    }
+    parsed.document.record(JournalEntry::ChildList {
+        target: parent,
+        added: vec![child],
+        removed: Vec::new(),
+        previous,
+        next: reference,
+    });
+}
+
+/// Moves one already-adopted node into `parent`, expanding a fragment into
+/// its children. Inserting beside itself stays put
+/// (<https://dom.spec.whatwg.org/#concept-node-pre-insert>).
+fn insert_parsed(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    node: NodeId,
+    mut reference: Option<NodeId>,
+) {
+    if parsed.document.is_fragment(node.node) {
+        splice_parsed(parsed, parent, node, reference);
+        return;
+    }
+    if reference == Some(node) {
+        reference = sibling(&parsed.document.base, node.node, true).map(|next| NodeId {
+            document: node.document,
+            node: next,
+        });
+    }
+    unlink_journaled(parsed, node);
+    place_journaled(parsed, parent, node, reference);
+}
+
+/// Splices an adopted fragment's children into `parent` before `reference`:
+/// one removal record on the fragment plus one addition record on the parent
+/// (<https://dom.spec.whatwg.org/#concept-node-insert>).
+fn splice_parsed(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    fragment: NodeId,
+    reference: Option<NodeId>,
+) {
+    let moved: Vec<NodeId> = parsed
+        .document
+        .base
+        .get_node(fragment.node)
+        .map(|node| {
+            node.children
+                .iter()
+                .map(|child| NodeId {
+                    document: fragment.document,
+                    node: *child,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if moved.is_empty() {
+        return;
+    }
+    parsed.document.record(JournalEntry::ChildList {
+        target: fragment,
+        added: Vec::new(),
+        removed: moved.clone(),
+        previous: None,
+        next: None,
+    });
+    let previous = match reference {
+        Some(reference) => {
+            siblings_around(
+                &parsed.document.base,
+                parent.document,
+                parent.node,
+                reference.node,
+            )
+            .0
+        }
+        None => parsed
+            .document
+            .base
+            .get_node(parent.node)
+            .and_then(|node| node.children.last().copied())
+            .map(|node| NodeId {
+                document: parent.document,
+                node,
+            }),
+    };
+    for child in &moved {
+        match reference {
+            Some(reference) => parsed
+                .document
+                .base
+                .mutate()
+                .insert_nodes_before(reference.node, &[child.node]),
+            None => parsed
+                .document
+                .base
+                .mutate()
+                .append_children(parent.node, &[child.node]),
+        }
+    }
+    parsed.document.record(JournalEntry::ChildList {
+        target: parent,
+        added: moved,
+        removed: Vec::new(),
+        previous,
+        next: reference,
+    });
+}
+
+/// Replaces `old` with the already-adopted `node` (or its children for a
+/// fragment): the node's own unlink keeps a removal record when it moves,
+/// then one combined record carries the replacement
+/// (<https://dom.spec.whatwg.org/#concept-node-replace>). Returns the nodes
+/// the parent gained, for the insertion fixups.
+fn replace_parsed(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    node: NodeId,
+    old: NodeId,
+) -> Vec<NodeId> {
+    if node == old {
+        let reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
+            document: old.document,
+            node: next,
+        });
+        unlink_journaled(parsed, node);
+        place_journaled(parsed, parent, node, reference);
+        return vec![node];
+    }
+    let (previous, next) = siblings_around(
+        &parsed.document.base,
+        parent.document,
+        parent.node,
+        old.node,
+    );
+    let (added, fragment) = if parsed.document.is_fragment(node.node) {
+        let moved: Vec<NodeId> = parsed
+            .document
+            .base
+            .get_node(node.node)
+            .map(|backing| {
+                backing
+                    .children
+                    .iter()
+                    .map(|child| NodeId {
+                        document: node.document,
+                        node: *child,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (moved, true)
+    } else {
+        (vec![node], false)
+    };
+    if !fragment {
+        unlink_journaled(parsed, node);
+    } else {
+        parsed.document.record(JournalEntry::ChildList {
+            target: node,
+            added: Vec::new(),
+            removed: added.clone(),
+            previous: None,
+            next: None,
+        });
+    }
+    for child in &added {
+        parsed
+            .document
+            .base
+            .mutate()
+            .insert_nodes_before(old.node, &[child.node]);
+    }
+    parsed.document.base.mutate().remove_node(old.node);
+    parsed.document.record(JournalEntry::ChildList {
+        target: parent,
+        added: added.clone(),
+        removed: vec![old],
+        previous,
+        next,
+    });
+    added
+}
+
+/// Replaces every child of `parent` with `added`: standing children detach
+/// silently and one record carries the swap. Replacing with the same
+/// contents is silent
+/// (<https://dom.spec.whatwg.org/#concept-node-replace-all>).
+fn replace_all_journaled(parsed: &mut crate::Parsed, parent: NodeId, added: Vec<NodeId>) {
+    let removed: Vec<NodeId> = parsed
+        .document
+        .base
+        .get_node(parent.node)
+        .map(|node| {
+            node.children
+                .iter()
+                .map(|child| NodeId {
+                    document: parent.document,
+                    node: *child,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for kid in &removed {
+        parsed.document.base.mutate().remove_node(kid.node);
+    }
+    for child in &added {
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(parent.node, &[child.node]);
+    }
+    if !added.is_empty() || !removed.is_empty() {
+        parsed.document.record(JournalEntry::ChildList {
+            target: parent,
+            added,
+            removed,
+            previous: None,
+            next: None,
+        });
+    }
+}
+
+/// Inserts the adopted `node` into `parent` before `reference`, expanding
+/// fragments, journaling the move, and running the insertion fixups. The
+/// caller owns validity and adoption.
+fn insert_tree_node(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeId,
+    reference: Option<NodeId>,
+) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let moved: Vec<NodeId> = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.document(parent) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        if parsed.document.is_fragment(node.node) {
+            parsed
+                .document
+                .base
+                .get_node(node.node)
+                .map(|backing| {
+                    backing
+                        .children
+                        .iter()
+                        .map(|child| NodeId {
+                            document: node.document,
+                            node: *child,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![node]
+        }
+    };
+    {
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(parent) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        insert_parsed(&mut parsed, parent, node, reference);
+    }
+    for id in &moved {
+        fixup_option_on_insert(ctx, *id)?;
+        fixup_radio_on_insert(ctx, *id)?;
+    }
+    schedule_mutation_delivery(ctx)
+}
+
+/// An inserted selected option clears a single-select owner's other options
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
+/// Blitz keeps selectedness as the `selected` content attribute, so the rule
+/// rewrites attributes instead of slots.
+fn fixup_option_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let siblings = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.document(id) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let Some(element) = base
+            .get_node(id.node)
+            .and_then(|node| node.data.downcast_element())
+        else {
+            return Ok(());
+        };
+        if element.name.ns != html_namespace() || element.name.local.as_ref() != "option" {
+            return Ok(());
+        }
+        if attr(base, id.node, "selected").is_none() {
+            return Ok(());
+        }
+        let Some(owner) = option_select_owner(base, id.document, id.node) else {
+            return Ok(());
+        };
+        if attr(base, owner.node, "multiple").is_some() {
+            return Ok(());
+        }
+        select_options_in(base, id.document, owner.node)
+            .into_iter()
+            .filter(|option| *option != id && attr(base, option.node, "selected").is_some())
+            .collect::<Vec<_>>()
+    };
+    for option in siblings {
+        remove_attribute_sync(ctx, option, "", "selected", false)?;
+    }
+    Ok(())
+}
+
+/// An inserted checked radio unchecks the other radios it joins.
+fn fixup_radio_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let group = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.document(id) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let Some(element) = base
+            .get_node(id.node)
+            .and_then(|node| node.data.downcast_element())
+        else {
+            return Ok(());
+        };
+        if element.name.ns != html_namespace() || element.name.local.as_ref() != "input" {
+            return Ok(());
+        }
+        if attr(base, id.node, "type")
+            .unwrap_or("text")
+            .trim()
+            .eq_ignore_ascii_case("radio")
+            && attr(base, id.node, "checked").is_some()
+        {
+            let name = attr(base, id.node, "name").unwrap_or_default().to_owned();
+            radio_group_members(base, id.document, &name, id.node)
+        } else {
+            Vec::new()
+        }
+    };
+    for member in group {
+        remove_attribute_sync(ctx, member, "", "checked", false)?;
+    }
+    Ok(())
+}
+
+/// Radios sharing a `name` in the same document, in tree order, excluding
+/// `except`. Blitz keeps no form-owner model, so the group spans the document
+/// instead of the form (a known cutover gap).
+fn radio_group_members(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    name: &str,
+    except: BlitzId,
+) -> Vec<NodeId> {
+    let mut group = Vec::new();
+    let mut stack = vec![base.root_node().id];
+    while let Some(id) = stack.pop() {
+        let Some(node) = base.get_node(id) else {
+            continue;
+        };
+        if id != except
+            && node.data.downcast_element().is_some_and(|element| {
+                element.name.ns == html_namespace()
+                    && element.name.local.as_ref() == "input"
+                    && attr(base, id, "type")
+                        .unwrap_or("text")
+                        .trim()
+                        .eq_ignore_ascii_case("radio")
+                    && attr(base, id, "name").unwrap_or_default() == name
+            })
+        {
+            group.push(NodeId { document, node: id });
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    group.sort_by(|a, b| tree_order(base, document, a.node, b.node));
+    group
+}
+
+/// The `option` elements under `select` in tree order. Blitz keeps no form
+/// model, so a select's options are the descendant `option` elements.
+fn select_options_in(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    select: BlitzId,
+) -> Vec<NodeId> {
+    let mut options = Vec::new();
+    let mut stack: Vec<BlitzId> = base
+        .get_node(select)
+        .map(|node| node.children.iter().rev().copied().collect())
+        .unwrap_or_default();
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        if node.data.downcast_element().is_some_and(|element| {
+            element.name.ns == html_namespace() && element.name.local.as_ref() == "option"
+        }) {
+            options.push(NodeId {
+                document,
+                node: current,
+            });
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    options
+}
+
+/// The `select` owning `option`: its nearest ancestor `select`, if any.
+fn option_select_owner(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    option: BlitzId,
+) -> Option<NodeId> {
+    let mut cursor = base.get_node(option).and_then(|node| node.parent);
+    while let Some(current) = cursor {
+        if crate::js::world::is_html_element(base, current, "select") {
+            return Some(NodeId {
+                document,
+                node: current,
+            });
+        }
+        cursor = base.get_node(current).and_then(|node| node.parent);
+    }
+    None
+}
+
+/// An `option`'s value: its `value` attribute, else its text
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
+fn option_value_in(base: &blitz_dom::BaseDocument, option: BlitzId) -> String {
+    attr(base, option, "value")
+        .map(str::to_owned)
+        .unwrap_or_else(|| option_text_in(base, option))
+}
+
+/// An `option`'s text: its descendant text with ASCII whitespace stripped and
+/// collapsed, skipping HTML and SVG `script` subtrees
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text>).
+fn option_text_in(base: &blitz_dom::BaseDocument, option: BlitzId) -> String {
+    let mut text = String::new();
+    let mut stack: Vec<BlitzId> = base
+        .get_node(option)
+        .map(|node| node.children.iter().rev().copied().collect())
+        .unwrap_or_default();
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        match &node.data {
+            NodeData::Text(data) => text.push_str(&data.content),
+            NodeData::Element(element) => {
+                let is_script = element.name.local.as_ref().eq_ignore_ascii_case("script")
+                    && (element.name.ns == html_namespace()
+                        || element.name.ns.as_ref() == "http://www.w3.org/2000/svg");
+                if !is_script {
+                    stack.extend(node.children.iter().rev().copied());
+                }
+            }
+            _ => {}
+        }
+    }
+    collapse_option_text(&text)
+}
+
+/// Strips and collapses ASCII whitespace runs to single spaces, dropping
+/// leading and trailing runs.
+fn collapse_option_text(text: &str) -> String {
+    let mut result = String::new();
+    let mut pending_space = false;
+    for character in text.chars() {
+        if character.is_ascii_whitespace() {
+            pending_space = !result.is_empty();
+        } else {
+            if pending_space {
+                result.push(' ');
+                pending_space = false;
+            }
+            result.push(character);
+        }
+    }
+    result
+}
+
+/// A `select`'s value: the first selected option's value, else the empty
+/// string. Blitz keeps selectedness as the `selected` attribute; selecting the
+/// first option by default is a known cutover gap
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
+fn select_value_in(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> String {
+    for option in select_options_in(base, document, select) {
+        if attr(base, option.node, "selected").is_some() {
+            return option_value_in(base, option.node);
+        }
+    }
+    String::new()
+}
+
+/// The form owner of a control: its nearest ancestor `form` element. Blitz
+/// keeps no parser-associated form owner, so controls outside a form ancestor
+/// have no owner here (a known cutover gap)
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
+fn form_owner_of(base: &blitz_dom::BaseDocument, document: u32, node: BlitzId) -> Option<NodeId> {
+    let mut cursor = base.get_node(node).and_then(|target| target.parent);
+    while let Some(current) = cursor {
+        if crate::js::world::is_html_element(base, current, "form") {
+            return Some(NodeId {
+                document,
+                node: current,
+            });
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    None
+}
+
+/// Whether text selection applies to a control: textareas always, text-like
+/// inputs only. There is no stored selection state (a known cutover gap), so
+/// getters answer defaults and setters validate without persisting.
+fn selection_applies(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    let Some(element) = base
+        .get_node(node)
+        .and_then(|target| target.data.downcast_element())
+    else {
+        return false;
+    };
+    if element.name.ns != html_namespace() {
+        return false;
+    }
+    match element.name.local.as_ref() {
+        "textarea" => true,
+        "input" => {
+            let typ = attr(base, node, "type")
+                .unwrap_or("text")
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(
+                typ.as_str(),
+                "hidden" | "checkbox" | "radio" | "file" | "submit" | "image" | "reset" | "button"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// The value of the `(namespace, local)` attribute on `id`, if present.
+fn attr_ns_value(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzId,
+    namespace: &str,
+    local: &str,
+) -> Option<String> {
+    base.get_node(id)
+        .and_then(|node| node.data.downcast_element())
+        .and_then(|element| {
+            element
+                .attrs
+                .iter()
+                .find(|attribute| {
+                    attribute.name.ns.as_ref() == namespace
+                        && attribute.name.local.as_ref() == local
+                })
+                .map(|attribute| attribute.value.clone())
+        })
+}
+
+/// The element the namespace lookup starts from: the node itself when it is
+/// an element, the document element for a document, else the parent element
+/// (<https://dom.spec.whatwg.org/#locate-a-namespace>).
+fn namespace_start(base: &blitz_dom::BaseDocument, document: u32, node: NodeId) -> Option<NodeId> {
+    let data = &base.get_node(node.node)?.data;
+    if data.downcast_element().is_some() {
+        return Some(node);
+    }
+    match data {
+        NodeData::Document(_) => base.get_node(node.node)?.children.iter().find_map(|child| {
+            let id = NodeId {
+                document,
+                node: *child,
+            };
+            is_element(base, *child).then_some(id)
+        }),
+        _ => {
+            let parent = base.get_node(node.node)?.parent?;
+            let id = NodeId {
+                document,
+                node: parent,
+            };
+            is_element(base, parent).then_some(id)
+        }
+    }
+}
+
+/// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
+/// `prefix` walking `cursor`'s inclusive ancestors.
+fn locate_namespace(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    cursor: NodeId,
+    prefix: Option<&str>,
+) -> Option<String> {
+    let mut cursor = namespace_start(base, document, cursor);
+    while let Some(id) = cursor {
+        if let Some(element) = base
+            .get_node(id.node)
+            .and_then(|node| node.data.downcast_element())
+        {
+            match prefix {
+                Some("xml") => {
+                    return Some("http://www.w3.org/XML/1998/namespace".to_owned());
+                }
+                Some("xmlns") => return Some("http://www.w3.org/2000/xmlns/".to_owned()),
+                _ => {}
+            }
+            let actual = element
+                .name
+                .prefix
+                .as_ref()
+                .map(markup5ever::Prefix::as_ref)
+                .filter(|prefix| !prefix.is_empty());
+            if !element.name.ns.as_ref().is_empty() && actual == prefix {
+                return Some(element.name.ns.as_ref().to_owned());
+            }
+            for attribute in element.attrs.iter() {
+                if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
+                    continue;
+                }
+                let declaration = match prefix {
+                    Some(prefix) => {
+                        attribute
+                            .name
+                            .prefix
+                            .as_ref()
+                            .is_some_and(|value| value.as_ref() == "xmlns")
+                            && attribute.name.local.as_ref() == prefix
+                    }
+                    None => {
+                        attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns"
+                    }
+                };
+                if declaration {
+                    return (!attribute.value.is_empty()).then(|| attribute.value.clone());
+                }
+            }
+        }
+        cursor = base
+            .get_node(id.node)
+            .and_then(|node| node.parent)
+            .map(|parent| NodeId {
+                document,
+                node: parent,
+            })
+            .filter(|parent| is_element(base, parent.node));
+    }
+    None
+}
+
+/// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
+/// for `namespace` walking `cursor`'s inclusive ancestors.
+fn locate_prefix(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    cursor: NodeId,
+    namespace: &str,
+) -> Option<String> {
+    let mut cursor = namespace_start(base, document, cursor);
+    while let Some(id) = cursor {
+        if let Some(element) = base
+            .get_node(id.node)
+            .and_then(|node| node.data.downcast_element())
+        {
+            if element.name.ns.as_ref() == namespace
+                && let Some(prefix) = element
+                    .name
+                    .prefix
+                    .as_ref()
+                    .map(markup5ever::Prefix::as_ref)
+                    .filter(|prefix| !prefix.is_empty())
+            {
+                return Some(prefix.to_owned());
+            }
+            for attribute in element.attrs.iter() {
+                if attribute
+                    .name
+                    .prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.as_ref() == "xmlns")
+                    && attribute.value == namespace
+                {
+                    return Some(attribute.name.local.as_ref().to_owned());
+                }
+            }
+        }
+        cursor = base
+            .get_node(id.node)
+            .and_then(|node| node.parent)
+            .map(|parent| NodeId {
+                document,
+                node: parent,
+            })
+            .filter(|parent| is_element(base, parent.node));
+    }
+    None
+}
+
+/// Structural `isEqualNode`
+/// (<https://dom.spec.whatwg.org/#concept-node-equals>). Blitz has no
+/// doctype, processing-instruction, or CDATA kinds; fragments compare by
+/// their backing's children.
+fn nodes_equal_in(
+    base_a: &blitz_dom::BaseDocument,
+    a: BlitzId,
+    base_b: &blitz_dom::BaseDocument,
+    b: BlitzId,
+) -> bool {
+    let node_a = base_a.get_node(a);
+    let node_b = base_b.get_node(b);
+    let (Some(node_a), Some(node_b)) = (node_a, node_b) else {
+        return false;
+    };
+    let equal = match (&node_a.data, &node_b.data) {
+        (NodeData::Document(_), NodeData::Document(_)) => true,
+        (NodeData::Element(left), NodeData::Element(right))
+        | (NodeData::Element(left), NodeData::AnonymousBlock(right))
+        | (NodeData::AnonymousBlock(left), NodeData::Element(right))
+        | (NodeData::AnonymousBlock(left), NodeData::AnonymousBlock(right)) => {
+            left.name == right.name
+                && left.attrs.len() == right.attrs.len()
+                && left.attrs.iter().all(|attribute| {
+                    right.attrs.iter().any(|candidate| {
+                        candidate.name == attribute.name && candidate.value == attribute.value
+                    })
+                })
+        }
+        (NodeData::Text(left), NodeData::Text(right)) => left.content == right.content,
+        (NodeData::Comment { contents: left }, NodeData::Comment { contents: right }) => {
+            left == right
+        }
+        _ => false,
+    };
+    if !equal {
+        return false;
+    }
+    if node_a.children.len() != node_b.children.len() {
+        return false;
+    }
+    node_a
+        .children
+        .iter()
+        .zip(node_b.children.iter())
+        .all(|(left, right)| nodes_equal_in(base_a, *left, base_b, *right))
+}
+
+/// Serializer output: UTF-16 code units, so a lone surrogate in character
+/// data survives into the returned string. Escaping only ever inserts ASCII,
+/// so tree units append verbatim.
+struct HtmlOutput(Vec<u16>);
+
+impl HtmlOutput {
+    fn push_str(&mut self, text: &str) {
+        self.0.extend(text.encode_utf16());
+    }
+
+    fn push_units(&mut self, units: &[u16]) {
+        self.0.extend_from_slice(units);
+    }
+
+    fn finish(self) -> DomString {
+        DomString::from_utf16(self.0)
+    }
+}
+
+/// Whether an element serializes as void
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#serialises-as-void>).
+fn serializes_as_void(name: &QualName) -> bool {
+    name.ns == html_namespace()
+        && matches!(
+            name.local.as_ref(),
+            "area"
+                | "base"
+                | "basefont"
+                | "bgsound"
+                | "br"
+                | "col"
+                | "embed"
+                | "frame"
+                | "hr"
+                | "img"
+                | "input"
+                | "keygen"
+                | "link"
+                | "menuitem"
+                | "meta"
+                | "param"
+                | "source"
+                | "track"
+                | "wbr"
+        )
+}
+
+/// The element's HTML-serialized name: the local name for HTML, MathML, and
+/// SVG elements, the qualified name otherwise
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
+fn push_html_element_name(output: &mut HtmlOutput, name: &QualName) {
+    if name.ns == html_namespace()
+        || name.ns == svg_namespace()
+        || name.ns.as_ref() == "http://www.w3.org/1998/Math/MathML"
+    {
+        output.push_str(name.local.as_ref());
+    } else if let Some(prefix) = name.prefix.as_ref().filter(|prefix| !prefix.is_empty()) {
+        output.push_str(prefix.as_ref());
+        output.push_str(":");
+        output.push_str(name.local.as_ref());
+    } else {
+        output.push_str(name.local.as_ref());
+    }
+}
+
+/// The attribute's HTML-serialized name
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#attribute-s-serialized-name>).
+fn push_html_attribute_name(output: &mut HtmlOutput, name: &QualName) {
+    if name.ns.as_ref().is_empty() {
+        output.push_str(name.local.as_ref());
+    } else if name.ns.as_ref() == "http://www.w3.org/XML/1998/namespace" {
+        output.push_str("xml:");
+        output.push_str(name.local.as_ref());
+    } else if name.ns.as_ref() == "http://www.w3.org/2000/xmlns/" {
+        if name.local.as_ref() == "xmlns" {
+            output.push_str("xmlns");
+        } else {
+            output.push_str("xmlns:");
+            output.push_str(name.local.as_ref());
+        }
+    } else if name.ns.as_ref() == "http://www.w3.org/1999/xlink" {
+        output.push_str("xlink:");
+        output.push_str(name.local.as_ref());
+    } else if let Some(prefix) = name.prefix.as_ref().filter(|prefix| !prefix.is_empty()) {
+        output.push_str(prefix.as_ref());
+        output.push_str(":");
+        output.push_str(name.local.as_ref());
+    } else {
+        output.push_str(name.local.as_ref());
+    }
+}
+
+fn push_escaped_html_text(output: &mut HtmlOutput, text: &str) {
+    for unit in text.encode_utf16() {
+        match unit {
+            0x26 => output.push_str("&amp;"),
+            0x00a0 => output.push_str("&nbsp;"),
+            0x3c => output.push_str("&lt;"),
+            0x3e => output.push_str("&gt;"),
+            _ => output.push_units(&[unit]),
+        }
+    }
+}
+
+fn push_escaped_html_attribute(output: &mut HtmlOutput, value: &str) {
+    for unit in value.encode_utf16() {
+        match unit {
+            0x26 => output.push_str("&amp;"),
+            0x00a0 => output.push_str("&nbsp;"),
+            0x22 => output.push_str("&quot;"),
+            _ => output.push_units(&[unit]),
+        }
+    }
+}
+
+/// Serializes one HTML element with the fragment serialization algorithm.
+/// Known gap: `crate::serialize` still targets the pre-cutover tree, so this
+/// local port covers elements, text, and comments only (no doctypes or
+/// processing instructions, which Blitz cannot hold)
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
+fn serialize_html_element(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzId,
+    name: &QualName,
+    attributes: &[blitz_dom::Attribute],
+    output: &mut HtmlOutput,
+) {
+    output.push_str("<");
+    push_html_element_name(output, name);
+    for attribute in attributes {
+        output.push_str(" ");
+        push_html_attribute_name(output, &attribute.name);
+        output.push_str("=\"");
+        push_escaped_html_attribute(output, &attribute.value);
+        output.push_str("\"");
+    }
+    output.push_str(">");
+    if serializes_as_void(name) {
+        return;
+    }
+    if let Some(node) = base.get_node(id) {
+        for child in node.children.clone().iter() {
+            serialize_html_node(base, *child, Some(name), output);
+        }
+    }
+    output.push_str("</");
+    push_html_element_name(output, name);
+    output.push_str(">");
+}
+
+fn serialize_html_node(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzId,
+    parent: Option<&QualName>,
+    output: &mut HtmlOutput,
+) {
+    let Some(node) = base.get_node(id) else {
+        return;
+    };
+    match &node.data {
+        NodeData::Element(element) => {
+            let name = element.name.clone();
+            let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
+            serialize_html_element(base, id, &name, &attributes, output);
+        }
+        NodeData::AnonymousBlock(element) => {
+            let name = element.name.clone();
+            let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
+            serialize_html_element(base, id, &name, &attributes, output);
+        }
+        NodeData::Text(data) => {
+            let raw_text = parent.is_some_and(|name| {
+                name.ns == html_namespace()
+                    && matches!(
+                        name.local.as_ref(),
+                        "style"
+                            | "script"
+                            | "xmp"
+                            | "iframe"
+                            | "noembed"
+                            | "noscript"
+                            | "noframes"
+                            | "plaintext"
+                    )
+            });
+            if raw_text {
+                output.push_str(&data.content);
+            } else {
+                push_escaped_html_text(output, &data.content);
+            }
+        }
+        NodeData::Comment { contents } => {
+            output.push_str("<!--");
+            output.push_str(contents);
+            output.push_str("-->");
+        }
+        _ => {}
+    }
+}
+
+/// Serializes the children of `parent` with the HTML fragment serialization
+/// algorithm, keeping every code unit.
+fn serialize_html_children(base: &blitz_dom::BaseDocument, parent: BlitzId) -> DomString {
+    let mut output = HtmlOutput(Vec::new());
+    if let Some(node) = base.get_node(parent) {
+        for child in node.children.clone().iter() {
+            serialize_html_node(base, *child, None, &mut output);
+        }
+    }
+    output.finish()
+}
+
+/// Serializes one element with the HTML fragment serialization algorithm,
+/// returning its own markup (`outerHTML`).
+fn serialize_html_outer(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzId,
+    name: &QualName,
+    attributes: &[blitz_dom::Attribute],
+) -> DomString {
+    let mut output = HtmlOutput(Vec::new());
+    serialize_html_element(base, id, name, attributes, &mut output);
+    output.finish()
+}
+
+fn push_escaped_xml_text(output: &mut HtmlOutput, text: &str) {
+    for unit in text.encode_utf16() {
+        match unit {
+            0x26 => output.push_str("&amp;"),
+            0x3c => output.push_str("&lt;"),
+            0x3e => output.push_str("&gt;"),
+            _ => output.push_units(&[unit]),
+        }
+    }
+}
+
+fn push_escaped_xml_attribute(output: &mut HtmlOutput, value: &str) {
+    for unit in value.encode_utf16() {
+        match unit {
+            0x26 => output.push_str("&amp;"),
+            0x22 => output.push_str("&quot;"),
+            0x3c => output.push_str("&lt;"),
+            0x3e => output.push_str("&gt;"),
+            0x09 => output.push_str("&#x9;"),
+            0x0a => output.push_str("&#xA;"),
+            0x0d => output.push_str("&#xD;"),
+            _ => output.push_units(&[unit]),
+        }
+    }
+}
+
+/// XML-serializes one element: the qualified name with escaped attributes and
+/// children. Known gap: namespace prefix synthesis is skipped; the stored
+/// qualified name is used as-is
+/// (<https://w3c.github.io/DOM-Parsing/#xml-serialization>).
+fn serialize_xml_element(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzId,
+    name: &QualName,
+    attributes: &[blitz_dom::Attribute],
+    output: &mut HtmlOutput,
+) {
+    output.push_str("<");
+    output.push_str(&qualified_name(name));
+    for attribute in attributes {
+        output.push_str(" ");
+        output.push_str(&qualified_name(&attribute.name));
+        output.push_str("=\"");
+        push_escaped_xml_attribute(output, &attribute.value);
+        output.push_str("\"");
+    }
+    let children: Vec<BlitzId> = base
+        .get_node(id)
+        .map(|node| node.children.iter().copied().collect())
+        .unwrap_or_default();
+    if children.is_empty() {
+        output.push_str("/>");
+        return;
+    }
+    output.push_str(">");
+    for child in children {
+        serialize_xml_node(base, child, output);
+    }
+    output.push_str("</");
+    output.push_str(&qualified_name(name));
+    output.push_str(">");
+}
+
+fn serialize_xml_node(base: &blitz_dom::BaseDocument, id: BlitzId, output: &mut HtmlOutput) {
+    let Some(node) = base.get_node(id) else {
+        return;
+    };
+    match &node.data {
+        NodeData::Document(_) => {
+            for child in node.children.clone().iter() {
+                serialize_xml_node(base, *child, output);
+            }
+        }
+        NodeData::Element(element) => {
+            let name = element.name.clone();
+            let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
+            serialize_xml_element(base, id, &name, &attributes, output);
+        }
+        NodeData::AnonymousBlock(element) => {
+            let name = element.name.clone();
+            let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
+            serialize_xml_element(base, id, &name, &attributes, output);
+        }
+        NodeData::Text(data) => push_escaped_xml_text(output, &data.content),
+        NodeData::Comment { contents } => {
+            output.push_str("<!--");
+            output.push_str(contents);
+            output.push_str("-->");
+        }
+    }
+}
+
+/// XML-serializes the children of `parent`.
+fn serialize_xml_children(base: &blitz_dom::BaseDocument, parent: BlitzId) -> DomString {
+    let mut output = HtmlOutput(Vec::new());
+    if let Some(node) = base.get_node(parent) {
+        for child in node.children.clone().iter() {
+            serialize_xml_node(base, *child, &mut output);
+        }
+    }
+    output.finish()
+}
+
 /// Whether `id` is an HTML `iframe` or `frame` container, registering any
 /// pending browsing contexts before the caller looks its frame up. A script
 /// may have appended the container in this same task, so the browsing context
@@ -463,8 +2024,8 @@ fn document_value<'js>(
 /// so no frame document ever exists yet and the callers below return null,
 /// matching the pre-migration binary.
 fn iframe_frame(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
-    let is_frame = with_node_kind(ctx, id, |kind| {
-        is_html_element(kind, "iframe") || is_html_element(kind, "frame")
+    let is_frame = with_node_data(ctx, id, |data| {
+        is_html_element(data, "iframe") || is_html_element(data, "frame")
     })?;
     if is_frame {
         world(ctx)?.borrow_mut().register_pending_frames();
@@ -473,7 +2034,7 @@ fn iframe_frame(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
 }
 
 fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
-    if !with_node_kind(ctx, id, |kind| is_html_element(kind, "img"))? {
+    if !with_node_data(ctx, id, |data| is_html_element(data, "img"))? {
         return Ok(None);
     }
     let world = world(ctx)?;
@@ -482,6 +2043,18 @@ fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
         .images
         .get(&id)
         .map(|image| (image.width, image.height)))
+}
+
+/// Current viewport offset for `id`'s document.
+/// <https://drafts.csswg.org/cssom-view/#scrolling-viewport>
+fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {
+    let world = world_for_node(ctx, id)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Ok((0.0, 0.0));
+    };
+    let scroll = parsed.document.base.viewport_scroll();
+    Ok((scroll.x, scroll.y))
 }
 
 #[rquickjs::methods]
@@ -497,15 +2070,24 @@ impl JsNode {
     }
     #[qjs(skip)]
     fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
-        with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { .. }) => Ok(1),
-            Some(NodeKind::Text { .. }) => Ok(3),
-            Some(NodeKind::CDataSection { .. }) => Ok(4),
-            Some(NodeKind::ProcessingInstruction { .. }) => Ok(7),
-            Some(NodeKind::Comment { .. }) => Ok(8),
-            Some(NodeKind::Document) => Ok(9),
-            Some(NodeKind::Doctype { .. }) => Ok(10),
-            Some(NodeKind::Fragment) => Ok(11),
+        // Known gap: Blitz has no shadow-root, doctype,
+        // processing-instruction, or CDATA node kinds, so those brands never
+        // instantiate. Fragment backings are elements flagged in the
+        // document's fragment set.
+        // https://dom.spec.whatwg.org/#dom-node-nodetype
+        let world = world(ctx)?;
+        let is_fragment = world
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.document.is_fragment(self.handle.0.node));
+        if is_fragment {
+            return Ok(11);
+        }
+        with_node_data(ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(_)) | Some(NodeData::AnonymousBlock(_)) => Ok(1),
+            Some(NodeData::Text(_)) => Ok(3),
+            Some(NodeData::Comment { .. }) => Ok(8),
+            Some(NodeData::Document(_)) => Ok(9),
             None => Err(Exception::throw_type(ctx, "stale node")),
         })?
     }
@@ -515,15 +2097,21 @@ impl JsNode {
     #[qjs(skip)]
     fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
-        let name = with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => Ok(element_node_name(name, uppercase)),
-            Some(NodeKind::Text { .. }) => Ok("#text".into()),
-            Some(NodeKind::CDataSection { .. }) => Ok("#cdata-section".into()),
-            Some(NodeKind::ProcessingInstruction { target, .. }) => Ok(target.clone()),
-            Some(NodeKind::Comment { .. }) => Ok("#comment".into()),
-            Some(NodeKind::Document) => Ok("#document".into()),
-            Some(NodeKind::Doctype { name, .. }) => Ok(name.clone()),
-            Some(NodeKind::Fragment) => Ok("#document-fragment".into()),
+        let world = world(ctx)?;
+        if world
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.document.is_fragment(self.handle.0.node))
+        {
+            return rquickjs::String::from_str(ctx.clone(), "#document-fragment");
+        }
+        let name = with_node_data(ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => {
+                Ok(element_node_name(&element.name, uppercase))
+            }
+            Some(NodeData::Text(_)) => Ok("#text".into()),
+            Some(NodeData::Comment { .. }) => Ok("#comment".into()),
+            Some(NodeData::Document(_)) => Ok("#document".into()),
             None => Err(Exception::throw_type(ctx, "stale node")),
         })?;
         let name = name?;
@@ -534,25 +2122,34 @@ impl JsNode {
     #[qjs(skip)]
     fn first_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world = world(ctx)?;
-        let id = world
-            .borrow()
-            .with_document(self.handle.0, |parsed| {
-                parsed
-                    .document
-                    .children(self.handle.0)
-                    .and_then(|mut kids| kids.next())
-            })
-            .flatten();
+        let id = world.borrow().document(self.handle.0).and_then(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.children.first().copied())
+                .map(|node| NodeId {
+                    document: parsed.id,
+                    node,
+                })
+        });
         child_value(ctx, id)
     }
 
     #[qjs(skip)]
     fn parent_node<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world = world(ctx)?;
-        let id = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.parent(self.handle.0));
+        let id = world.borrow().document(self.handle.0).and_then(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.parent)
+                .map(|node| NodeId {
+                    document: parsed.id,
+                    node,
+                })
+        });
         child_value(ctx, id)
     }
 
@@ -565,18 +2162,9 @@ impl JsNode {
     #[qjs(skip)]
     fn append_child<'js>(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<Value<'js>> {
         let (node, _) = insertion_tree_nodes(&ctx, self.handle.0, node, None)?;
-        let node = adopt_across_documents(&ctx, self.handle.0, node)?;
+        let node = adopt_node(&ctx, self.handle.0, node)?;
         let parent = self.handle.0;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        dom::mutation::pre_insert(&mut parsed.document, parent, node, None)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)?;
+        insert_tree_node(&ctx, parent, node, None)?;
         wrap_node(&ctx, node)
     }
 
@@ -590,7 +2178,7 @@ impl JsNode {
             && world
                 .borrow()
                 .document(node)
-                .is_some_and(|parsed| dom::lifecycle::is_connected(&parsed.document, node))
+                .is_some_and(|parsed| is_connected(&parsed.document.base, node.node))
         {
             return wrap_node(ctx, node);
         }
@@ -600,7 +2188,7 @@ impl JsNode {
                 return Ok(Value::new_null(ctx.clone()));
             };
             document_first(&parsed, "body").or_else(|| {
-                document_first_child(&parsed, |kind| matches!(kind, NodeKind::Element { .. }))
+                document_first_child(&parsed, |data| matches!(data, NodeData::Element(_)))
             })
         };
         match fallback {
@@ -615,7 +2203,7 @@ impl JsNode {
     fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         match element_box(&ctx, self.handle.0)? {
             Some((left, top, width, height)) => {
-                let (scroll_x, scroll_y) = super::viewport_scroll(&ctx, self.handle.0)?;
+                let (scroll_x, scroll_y) = viewport_offset(&ctx, self.handle.0)?;
                 Ok(rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?.into_value())
             }
             None => Ok(rect_object(&ctx, 0.0, 0.0, 0.0, 0.0)?.into_value()),
@@ -626,7 +2214,7 @@ impl JsNode {
     fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let array = Array::new(ctx.clone())?;
         if let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? {
-            let (scroll_x, scroll_y) = super::viewport_scroll(&ctx, self.handle.0)?;
+            let (scroll_x, scroll_y) = viewport_offset(&ctx, self.handle.0)?;
             array.set(
                 0,
                 rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?,
@@ -647,30 +2235,24 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some(root) =
-            dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
-                .ok()
-                .flatten()
-        else {
-            return Ok(());
-        };
-        let (scroll_x, _scroll_y) = dom::metadata::scroll_offset(&parsed.document, root);
+        // Known gap: per-element scroll containers have no Blitz offset API,
+        // so scrolling moves the viewport, as if the document element
+        // scrolled.
+        // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
+        let scroll = parsed.document.base.viewport_scroll();
         let viewport_width = f64::from(crate::engine::VIEWPORT_WIDTH);
-        let next_x = if left < scroll_x {
+        let next_x = if left < scroll.x {
             left
-        } else if left + width > scroll_x + viewport_width {
+        } else if left + width > scroll.x + viewport_width {
             left + width - viewport_width
         } else {
-            scroll_x
+            scroll.x
         };
-        // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
         let next_y = top;
-        dom::metadata::set_scroll_offset(
-            &mut parsed.document,
-            root,
-            next_x.max(0.0),
-            next_y.max(0.0),
-        );
+        parsed.document.base.set_viewport_scroll(blitz_dom::Point {
+            x: next_x.max(0.0),
+            y: next_y.max(0.0),
+        });
         Ok(())
     }
 
@@ -749,13 +2331,19 @@ impl JsNode {
 
     #[qjs(skip)]
     fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
-        create_kind(&ctx, self.handle.0, |dom| dom.create_text(data.0))
+        let text = data.0.to_string_lossy().into_owned();
+        create_node(&ctx, self.handle.0, |parsed| {
+            parsed.document.base.mutate().create_text_node(&text)
+        })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
     #[qjs(skip)]
     fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
-        create_kind(&ctx, self.handle.0, |dom| dom.create_comment(data.0))
+        let text = data.0.to_string_lossy().into_owned();
+        create_node(&ctx, self.handle.0, |parsed| {
+            parsed.document.base.mutate().create_comment_node(&text)
+        })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
@@ -785,9 +2373,13 @@ impl JsNode {
         if data.0.to_string_lossy().contains("?>") {
             return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
         }
-        create_kind(&ctx, self.handle.0, |dom| {
-            dom.create_processing_instruction(target.0, data.0)
-        })
+        // Known gap: Blitz has no processing-instruction node kind, so
+        // construction throws instead of handing back a wrong-kind node.
+        Err(throw_dom(
+            &ctx,
+            "HierarchyRequestError",
+            "processing instructions are not supported",
+        ))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcdatasection
@@ -813,7 +2405,13 @@ impl JsNode {
                 "data contains ]]>",
             ));
         }
-        create_kind(&ctx, self.handle.0, |dom| dom.create_cdata_section(data.0))
+        // Known gap: Blitz has no CDATA section node kind, so construction
+        // throws instead of handing back a wrong-kind node.
+        Err(throw_dom(
+            &ctx,
+            "HierarchyRequestError",
+            "CDATA sections are not supported",
+        ))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattribute
@@ -870,7 +2468,9 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
     #[qjs(skip)]
     fn create_document_fragment<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        create_kind(&ctx, self.handle.0, dom::Document::create_fragment)
+        create_node(&ctx, self.handle.0, |parsed| {
+            parsed.document.create_fragment()
+        })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-importnode
@@ -883,14 +2483,14 @@ impl JsNode {
             let Some(source) = world.document(source_id) else {
                 return Err(Exception::throw_type(&ctx, "stale node"));
             };
-            if source.document.document() == source_id {
+            if source.document.base.root_node().id == source_id.node {
                 return Err(throw_dom(
                     &ctx,
                     "NotSupportedError",
                     "cannot import a document",
                 ));
             }
-            import_snapshot(&source.document, source_id, deep)
+            snapshot_for_adopt(&source.document, source_id, deep)
         };
         let Some(tree) = tree else {
             return Err(Exception::throw_type(&ctx, "stale node"));
@@ -899,8 +2499,11 @@ impl JsNode {
         let Some(mut target) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let id = materialize_import(&mut target.document, &tree)
+        let mut id = materialize_import(&mut target.document, &tree)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        // `materialize_import` builds detached trees with a placeholder
+        // document id; remap to the target document before wrapping.
+        id.document = self.handle.0.document;
         drop(target);
         drop(world);
         wrap_node(&ctx, id)
@@ -998,13 +2601,13 @@ impl JsNode {
         let Some(id) = host_node_id(ctx, &value) else {
             return Err(Exception::throw_type(ctx, "body must be an element"));
         };
-        let is_body = with_node_kind(ctx, id, |kind| {
-            matches!(
-                kind,
-                Some(NodeKind::Element { name, .. })
-                    if name.ns == html_namespace()
-                        && (name.local.as_ref() == "body" || name.local.as_ref() == "frameset")
-            )
+        let is_body = with_node_data(ctx, id, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => {
+                element.name.ns == html_namespace()
+                    && (element.name.local.as_ref() == "body"
+                        || element.name.local.as_ref() == "frameset")
+            }
+            _ => false,
         })?;
         if !is_body {
             return Err(throw_dom(
@@ -1019,8 +2622,8 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(ctx, "stale node"));
             };
-            document_first_child(&parsed, |kind| {
-                matches!(kind, NodeKind::Element { .. })
+            document_first_child(&parsed, |data| {
+                matches!(data, NodeData::Element(_) | NodeData::AnonymousBlock(_))
             })
         };
         let Some(root_element) = root_element else {
@@ -1035,41 +2638,68 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(ctx, "stale node"));
             };
-            parsed
-                .document
-                .children(root_element)
-                .into_iter()
-                .flatten()
-                .find(|&child| {
-                    parsed.document.kind(child).is_some_and(|kind| {
-                        matches!(
-                            kind,
-                            NodeKind::Element { name, .. }
-                                if name.ns == html_namespace()
-                                    && (name.local.as_ref() == "body"
-                                        || name.local.as_ref() == "frameset")
-                        )
-                    })
+            let base = &parsed.document.base;
+            base.get_node(root_element.node).and_then(|root| {
+                root.children.iter().find_map(|child| {
+                    let node = base.get_node(*child)?;
+                    match &node.data {
+                        NodeData::Element(element) | NodeData::AnonymousBlock(element) => {
+                            (element.name.ns == html_namespace()
+                                && (element.name.local.as_ref() == "body"
+                                    || element.name.local.as_ref() == "frameset"))
+                                .then_some(NodeId {
+                                    document: parsed.id,
+                                    node: *child,
+                                })
+                        }
+                        _ => None,
+                    }
                 })
+            })
         };
         if current == Some(id) {
             return Ok(());
         }
-        let node = adopt_across_documents(ctx, self.handle.0, id)?;
-        let world = world_rc.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(ctx, "no document"));
-        };
-        if let Some(current) = current {
-            dom::mutation::replace_child(&mut parsed.document, root_element, node, current)
-                .map_err(|error| throw_dom_error(ctx, error))?;
-            fixup_focus_after_removal(ctx, current)?;
-        } else {
-            dom::mutation::append(&mut parsed.document, root_element, node)
-                .map_err(|error| throw_dom_error(ctx, error))?;
+        let node = adopt_node(ctx, self.handle.0, id)?;
+        {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            // The new body cannot live inside the subtree it joins.
+            if node.document == self.handle.0.document {
+                let base = &parsed.document.base;
+                let mut cursor = Some(root_element.node);
+                while let Some(current) = cursor {
+                    if current == node.node {
+                        return Err(throw_dom(
+                            ctx,
+                            "HierarchyRequestError",
+                            "node cannot contain itself",
+                        ));
+                    }
+                    cursor = base
+                        .get_node(current)
+                        .and_then(|candidate| candidate.parent);
+                }
+            }
         }
-        drop(parsed);
-        drop(world);
+        {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            if let Some(current) = current {
+                replace_parsed(&mut parsed, root_element, node, current);
+                drop(parsed);
+                drop(world);
+                fixup_focus_after_removal(ctx, current)?;
+            } else {
+                insert_parsed(&mut parsed, root_element, node, None);
+                drop(parsed);
+                drop(world);
+            }
+        }
         schedule_mutation_delivery(ctx)
     }
 
@@ -1093,16 +2723,18 @@ impl JsNode {
     #[qjs(skip)]
     fn document_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         document_value(ctx, self.handle.0, |parsed| {
-            document_first_child(parsed, |kind| matches!(kind, NodeKind::Element { .. }))
+            document_first_child(parsed, |data| {
+                matches!(data, NodeData::Element(_) | NodeData::AnonymousBlock(_))
+            })
         })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-doctype
     #[qjs(skip)]
     fn doctype<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        document_value(ctx, self.handle.0, |parsed| {
-            document_first_child(parsed, |kind| matches!(kind, NodeKind::Doctype { .. }))
-        })
+        // Known gap: Blitz has no doctype node kind, so documents never have
+        // a doctype.
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-readyState
@@ -1113,7 +2745,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(String::new());
         };
-        if parsed.document.document() != self.handle.0 {
+        if parsed.document.base.root_node().id != self.handle.0.node {
             return Ok(String::new());
         }
         Ok(match parsed.ready_state {
@@ -1129,7 +2761,7 @@ impl JsNode {
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
-    fn url(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+    fn url(&self, ctx: &Ctx<'_>) -> Result<crate::dom_string::DomString> {
         Ok(document_url_string(ctx, self.handle.0).into())
     }
 
@@ -1139,7 +2771,7 @@ impl JsNode {
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
-    fn document_uri(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+    fn document_uri(&self, ctx: &Ctx<'_>) -> Result<crate::dom_string::DomString> {
         Ok(document_url_string(ctx, self.handle.0).into())
     }
 
@@ -1149,7 +2781,7 @@ impl JsNode {
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
-    fn base_uri(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+    fn base_uri(&self, ctx: &Ctx<'_>) -> Result<crate::dom_string::DomString> {
         Ok(document_base_url_string(ctx, self.handle.0).into())
     }
 
@@ -1220,10 +2852,9 @@ impl JsNode {
         // (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
         let local = attribute_local_name(&ctx, self.handle.0, &name.0);
         let world = world(&ctx)?;
-        let found = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, &local));
+        let found = world.borrow().document(self.handle.0).and_then(|parsed| {
+            attr(&parsed.document.base, self.handle.0.node, &local).map(ToOwned::to_owned)
+        });
         match found {
             Some(value) => string_value(&ctx, &value),
             None => Ok(Value::new_null(ctx)),
@@ -1240,23 +2871,7 @@ impl JsNode {
             ));
         }
         let local = attribute_local_name(&ctx, self.handle.0, &name.0);
-        {
-            let world = world(&ctx)?;
-            let world = world.borrow();
-            let Some(mut parsed) = world.document_mut(self.handle.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
-            };
-            dom::mutation::set_attribute(
-                &mut parsed.document,
-                self.handle.0,
-                &local,
-                value.0.clone(),
-            )
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        }
-        touch_attr(&ctx, self.handle.0, "", &local, &value.0)?;
-        after_attribute_change(&ctx, self.handle.0, &local)?;
-        schedule_mutation_delivery(&ctx)
+        set_attribute_sync(&ctx, self.handle.0, &local, &value.0)
     }
 
     #[qjs(skip)]
@@ -1270,6 +2885,12 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    //
+    // Known gap: Blitz keeps no control value store (no dirty value flag, no
+    // checkedness or selectedness slots), so every value here is read from
+    // content attributes and descendant text: an input's value is its `value`
+    // attribute, a textarea's is its descendant text, and a select's comes
+    // from the selected option.
     #[qjs(skip)]
     fn value(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
@@ -1277,19 +2898,100 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(dom::form::element_value(&parsed.document, self.handle.0).unwrap_or_default())
+        let base = &parsed.document.base;
+        let Some(element) = base
+            .get_node(self.handle.0.node)
+            .and_then(|node| node.data.downcast_element())
+        else {
+            return Ok(String::new());
+        };
+        if element.name.ns != html_namespace() {
+            return Ok(String::new());
+        }
+        Ok(match element.name.local.as_ref() {
+            "textarea" => descendant_text(base, self.handle.0.node)
+                .to_string_lossy()
+                .into_owned(),
+            "select" => select_value_in(base, self.handle.0.document, self.handle.0.node),
+            "option" => option_value_in(base, self.handle.0.node),
+            _ => attr(base, self.handle.0.node, "value")
+                .unwrap_or_default()
+                .to_owned(),
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
     #[qjs(skip)]
     fn set_value(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        let world = world(&ctx)?;
+        let local = with_node_data(&ctx, self.handle.0, |data| {
+            data.and_then(|data| data.downcast_element())
+                .filter(|element| element.name.ns == html_namespace())
+                .map(|element| element.name.local.to_string())
+        })?;
+        let Some(local) = local else {
+            return Ok(());
+        };
+        match local.as_str() {
+            "textarea" => self.set_textarea_value(&ctx, value.0.clone()),
+            "select" => self.set_select_value(&ctx, value.0.clone()),
+            _ => set_attribute_sync(&ctx, self.handle.0, "value", &value.0),
+        }
+    }
+
+    /// Replaces a textarea's children with one text node carrying `value`.
+    #[qjs(skip)]
+    fn set_textarea_value(&self, ctx: &Ctx<'_>, value: String) -> Result<()> {
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+            return Err(Exception::throw_type(ctx, "no document"));
         };
-        dom::form::set_element_value(&mut parsed.document, self.handle.0, value.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        let added = if value.is_empty() {
+            Vec::new()
+        } else {
+            let text = parsed.document.base.mutate().create_text_node(&value);
+            vec![NodeId {
+                document: parsed.id,
+                node: text,
+            }]
+        };
+        replace_all_journaled(&mut parsed, self.handle.0, added);
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(ctx)
+    }
+
+    /// Selects the first option whose value is `value`, deselecting the rest;
+    /// with no match every option is deselected.
+    #[qjs(skip)]
+    fn set_select_value(&self, ctx: &Ctx<'_>, value: String) -> Result<()> {
+        let world_rc = world(ctx)?;
+        let options = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            let base = &parsed.document.base;
+            select_options_in(base, self.handle.0.document, self.handle.0.node)
+        };
+        let mut matched = false;
+        for option in options {
+            let selected = !matched && {
+                let world = world_rc.borrow();
+                let Some(parsed) = world.document(option) else {
+                    continue;
+                };
+                option_value_in(&parsed.document.base, option.node) == value
+            };
+            if selected {
+                matched = true;
+            }
+            if selected {
+                set_attribute_sync(ctx, option, "selected", "")?;
+            } else {
+                remove_attribute_sync(ctx, option, "", "selected", false)?;
+            }
+        }
         Ok(())
     }
 
@@ -1301,20 +3003,15 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(dom::form::control_default_value(&parsed.document, self.handle.0).unwrap_or_default())
+        Ok(descendant_text(&parsed.document.base, self.handle.0.node)
+            .to_string_lossy()
+            .into_owned())
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
     #[qjs(skip)]
     fn set_default_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        dom::form::set_control_default_value(&mut parsed.document, self.handle.0, value.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        Ok(())
+        self.set_textarea_value(&ctx, value.0.clone())
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-textlength
@@ -1329,134 +3026,92 @@ impl JsNode {
             clippy::cast_possible_truncation,
             reason = "a 64-bit string length beyond u32 cannot be produced by this engine"
         )]
-        Ok(dom::form::textarea_value(&parsed.document, self.handle.0)
-            .map_or(0, |value| value.encode_utf16().count() as u32))
+        Ok(descendant_text(&parsed.document.base, self.handle.0.node)
+            .to_string_lossy()
+            .encode_utf16()
+            .count() as u32)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
     #[qjs(skip)]
     fn set_selection_start(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
+        // Known gap: no selection state is stored; the converted value only
+        // validates through the generated conversion.
+        let _ = value.0;
         let world = world(&ctx)?;
         let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(parsed) = world.document(self.handle.0) else {
             return Ok(());
         };
-        let Some((_, end, direction)) = dom::form::selection(&parsed.document, self.handle.0)
-        else {
+        if !selection_applies(&parsed.document.base, self.handle.0.node) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
                 "selectionStart does not apply to this control",
             ));
-        };
-        let start = value.0;
-        let changed = dom::form::set_selection(
-            &mut parsed.document,
-            self.handle.0,
-            start,
-            end.max(start),
-            direction,
-        );
-        drop(parsed);
-        if changed {
-            world.queue_select(self.handle.0);
         }
+        // Known gap: no selection state is stored, so applying the range is a
+        // no-op once it validates.
         Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
     #[qjs(skip)]
     fn set_selection_end(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
+        // Known gap: no selection state is stored; the converted value only
+        // validates through the generated conversion.
+        let _ = value.0;
         let world = world(&ctx)?;
         let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(parsed) = world.document(self.handle.0) else {
             return Ok(());
         };
-        let Some((start, _, direction)) = dom::form::selection(&parsed.document, self.handle.0)
-        else {
+        if !selection_applies(&parsed.document.base, self.handle.0.node) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
                 "selectionEnd does not apply to this control",
             ));
-        };
-        let changed = dom::form::set_selection(
-            &mut parsed.document,
-            self.handle.0,
-            start,
-            value.0,
-            direction,
-        );
-        drop(parsed);
-        if changed {
-            world.queue_select(self.handle.0);
         }
+        // Known gap: no selection state is stored, so applying the range is a
+        // no-op once it validates.
         Ok(())
     }
 
     #[qjs(skip)]
     fn set_selection_direction(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let direction = direction_code(&value.0);
+        let _ = direction;
         let world = world(&ctx)?;
         let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+        let Some(parsed) = world.document(self.handle.0) else {
             return Ok(());
         };
-        let Some((start, end, _)) = dom::form::selection(&parsed.document, self.handle.0) else {
+        if !selection_applies(&parsed.document.base, self.handle.0.node) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
                 "selectionDirection does not apply to this control",
             ));
-        };
-        let direction = direction_code(&value.0);
-        let changed =
-            dom::form::set_selection(&mut parsed.document, self.handle.0, start, end, direction);
-        drop(parsed);
-        if changed {
-            world.queue_select(self.handle.0);
         }
+        // Known gap: no selection state is stored, so applying the direction
+        // is a no-op once it validates.
         Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
     #[qjs(skip)]
     fn reset_form(&self, ctx: Ctx<'_>) -> Result<()> {
-        if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "form"))? {
+        if !with_node_data(&ctx, self.handle.0, |data| is_html_element(data, "form"))? {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
                 "reset is only available on a form",
             ));
         }
-        let world_rc = world(&ctx)?;
-        let world = world_rc.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
-        };
-        // The reset algorithm runs on the form owner's controls: for now, the
-        // descendants that are form controls. Form-owner association lands with
-        // the form units.
-        let mut controls = Vec::new();
-        let mut stack = vec![self.handle.0];
-        while let Some(node) = stack.pop() {
-            let children: Vec<NodeId> = parsed
-                .document
-                .children(node)
-                .map(Iterator::collect)
-                .unwrap_or_default();
-            for child in children {
-                if let Some(NodeKind::Element { name, .. }) = parsed.document.kind(child)
-                    && name.ns == html_namespace()
-                    && matches!(name.local.as_ref(), "input" | "textarea" | "select")
-                {
-                    controls.push(child);
-                }
-                stack.push(child);
-            }
-        }
-        for control in controls {
-            dom::form::reset_control(&mut parsed.document, control);
-        }
+        // Known gap: Blitz keeps no dirty value, checkedness, or
+        // selectedness state apart from the content attributes themselves, so
+        // there is nothing to restore and reset is a no-op.
         Ok(())
     }
 
@@ -1467,7 +3122,9 @@ impl JsNode {
         let raw = world_rc
             .borrow()
             .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "action"));
+            .and_then(|parsed| {
+                attr(&parsed.document.base, self.handle.0.node, "action").map(ToOwned::to_owned)
+            });
         let base = document_base_url_string(&ctx, self.handle.0);
         let Some(raw) = raw else {
             return Ok(base);
@@ -1482,10 +3139,9 @@ impl JsNode {
     #[qjs(skip)]
     fn form_action(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
-        let raw = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "formaction"));
+        let raw = world.borrow().document(self.handle.0).and_then(|parsed| {
+            attr(&parsed.document.base, self.handle.0.node, "formaction").map(ToOwned::to_owned)
+        });
         let base = document_base_url_string(&ctx, self.handle.0);
         let Some(raw) = raw else {
             return Ok(base);
@@ -1525,13 +3181,25 @@ impl JsNode {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+    //
+    // Known gap: Blitz exposes only the viewport scroll offset, not
+    // per-element scroll boxes, so only the document element scrolls and
+    // every other element reads zero.
     #[qjs(skip)]
     fn scroll_left(&self, ctx: &Ctx<'_>) -> Result<f64> {
         let world = world(ctx)?;
         let world = world.borrow();
-        Ok(world.document(self.handle.0).map_or(0.0, |parsed| {
-            dom::metadata::scroll_offset(&parsed.document, self.handle.0).0
-        }))
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(0.0);
+        };
+        if document_first_child(&parsed, |data| {
+            matches!(data, NodeData::Element(_) | NodeData::AnonymousBlock(_))
+        }) == Some(self.handle.0)
+        {
+            Ok(parsed.document.base.viewport_scroll().x)
+        } else {
+            Ok(0.0)
+        }
     }
 
     #[qjs(skip)]
@@ -1541,8 +3209,17 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let (_, top) = dom::metadata::scroll_offset(&parsed.document, self.handle.0);
-        dom::metadata::set_scroll_offset(&mut parsed.document, self.handle.0, value, top);
+        let is_root = document_first_child(&parsed, |data| {
+            matches!(data, NodeData::Element(_) | NodeData::AnonymousBlock(_))
+        }) == Some(self.handle.0);
+        if !is_root {
+            return Ok(());
+        }
+        let viewport = parsed.document.base.viewport_scroll();
+        parsed.document.base.set_viewport_scroll(blitz_dom::Point {
+            x: value,
+            y: viewport.y,
+        });
         Ok(())
     }
 
@@ -1551,9 +3228,17 @@ impl JsNode {
     fn scroll_top(&self, ctx: &Ctx<'_>) -> Result<f64> {
         let world = world(ctx)?;
         let world = world.borrow();
-        Ok(world.document(self.handle.0).map_or(0.0, |parsed| {
-            dom::metadata::scroll_offset(&parsed.document, self.handle.0).1
-        }))
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(0.0);
+        };
+        if document_first_child(&parsed, |data| {
+            matches!(data, NodeData::Element(_) | NodeData::AnonymousBlock(_))
+        }) == Some(self.handle.0)
+        {
+            Ok(parsed.document.base.viewport_scroll().y)
+        } else {
+            Ok(0.0)
+        }
     }
 
     #[qjs(skip)]
@@ -1563,8 +3248,17 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let (left, _) = dom::metadata::scroll_offset(&parsed.document, self.handle.0);
-        dom::metadata::set_scroll_offset(&mut parsed.document, self.handle.0, left, value);
+        let is_root = document_first_child(&parsed, |data| {
+            matches!(data, NodeData::Element(_) | NodeData::AnonymousBlock(_))
+        }) == Some(self.handle.0);
+        if !is_root {
+            return Ok(());
+        }
+        let viewport = parsed.document.base.viewport_scroll();
+        parsed.document.base.set_viewport_scroll(blitz_dom::Point {
+            x: viewport.x,
+            y: value,
+        });
         Ok(())
     }
 
@@ -1574,9 +3268,13 @@ impl JsNode {
         let form = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            world
-                .document(self.handle.0)
-                .and_then(|parsed| dom::form::form_owner(&parsed.document, self.handle.0))
+            world.document(self.handle.0).and_then(|parsed| {
+                form_owner_of(
+                    &parsed.document.base,
+                    self.handle.0.document,
+                    self.handle.0.node,
+                )
+            })
         };
         match form {
             Some(form) => wrap_node(&ctx, form),
@@ -1585,66 +3283,115 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
+    //
+    // Blitz keeps checkedness as the `checked` content attribute's presence.
     #[qjs(skip)]
     fn checked(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .is_some_and(|parsed| dom::form::checkedness(&parsed.document, self.handle.0)))
+        Ok(world.document(self.handle.0).is_some_and(|parsed| {
+            attr(&parsed.document.base, self.handle.0.node, "checked").is_some()
+        }))
     }
 
     #[qjs(skip)]
     fn set_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
-        };
-        dom::form::set_input_checkedness(&mut parsed.document, self.handle.0, value);
-        Ok(())
+        if value {
+            // Setting a radio's checkedness unchecks its group
+            // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-checked>).
+            let group = {
+                let world = world(&ctx)?;
+                let world = world.borrow();
+                let Some(parsed) = world.document(self.handle.0) else {
+                    return Ok(());
+                };
+                let base = &parsed.document.base;
+                let is_radio = base
+                    .get_node(self.handle.0.node)
+                    .and_then(|node| node.data.downcast_element())
+                    .is_some_and(|element| {
+                        element.name.ns == html_namespace()
+                            && element.name.local.as_ref() == "input"
+                            && attr(base, self.handle.0.node, "type")
+                                .unwrap_or("text")
+                                .trim()
+                                .eq_ignore_ascii_case("radio")
+                    });
+                if is_radio {
+                    let name = attr(base, self.handle.0.node, "name")
+                        .unwrap_or_default()
+                        .to_owned();
+                    radio_group_members(base, self.handle.0.document, &name, self.handle.0.node)
+                } else {
+                    Vec::new()
+                }
+            };
+            for member in group {
+                remove_attribute_sync(&ctx, member, "", "checked", false)?;
+            }
+            set_attribute_sync(&ctx, self.handle.0, "checked", "")
+        } else {
+            remove_attribute_sync(&ctx, self.handle.0, "", "checked", false)
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
     #[qjs(skip)]
     fn indeterminate(&self, ctx: Ctx<'_>) -> Result<bool> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .is_some_and(|parsed| dom::form::indeterminate(&parsed.document, self.handle.0)))
+        // Known gap: Blitz keeps no indeterminate slot, so inputs never read
+        // as indeterminate.
+        let _ = ctx;
+        Ok(false)
     }
 
     #[qjs(skip)]
     fn set_indeterminate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
-        };
-        dom::form::set_indeterminate(&mut parsed.document, self.handle.0, value);
+        // Known gap: Blitz keeps no indeterminate slot, so the setter cannot
+        // persist and is a no-op.
+        let _ = (ctx, value);
         Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
+    //
+    // Blitz keeps selectedness as the `selected` content attribute's presence.
     #[qjs(skip)]
     fn selected(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .is_some_and(|parsed| dom::form::option_selected(&parsed.document, self.handle.0)))
+        Ok(world.document(self.handle.0).is_some_and(|parsed| {
+            attr(&parsed.document.base, self.handle.0.node, "selected").is_some()
+        }))
     }
 
     #[qjs(skip)]
     fn set_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
-        };
-        dom::form::set_option_selected_in_select(&mut parsed.document, self.handle.0, value);
-        Ok(())
+        if value {
+            // Selecting an option in a single-select deselects the others
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
+            let siblings = {
+                let world = world(&ctx)?;
+                let world = world.borrow();
+                let Some(parsed) = world.document(self.handle.0) else {
+                    return Ok(());
+                };
+                let base = &parsed.document.base;
+                match option_select_owner(base, self.handle.0.document, self.handle.0.node) {
+                    Some(owner) if attr(base, owner.node, "multiple").is_none() => {
+                        select_options_in(base, self.handle.0.document, owner.node)
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            for option in siblings {
+                if option != self.handle.0 {
+                    remove_attribute_sync(&ctx, option, "", "selected", false)?;
+                }
+            }
+            set_attribute_sync(&ctx, self.handle.0, "selected", "")
+        } else {
+            remove_attribute_sync(&ctx, self.handle.0, "", "selected", false)
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
@@ -1655,10 +3402,10 @@ impl JsNode {
         Ok(world
             .document(self.handle.0)
             .map_or_else(String::new, |parsed| {
-                parsed
-                    .document
-                    .no_namespace_attribute(self.handle.0, "label")
-                    .unwrap_or_else(|| dom::form::option_text(&parsed.document, self.handle.0))
+                let base = &parsed.document.base;
+                attr(base, self.handle.0.node, "label")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| option_text_in(base, self.handle.0.node))
             }))
     }
 
@@ -1670,26 +3417,33 @@ impl JsNode {
         Ok(world
             .document(self.handle.0)
             .map_or_else(String::new, |parsed| {
-                dom::form::option_text(&parsed.document, self.handle.0)
+                option_text_in(&parsed.document.base, self.handle.0.node)
             }))
     }
 
     #[qjs(skip)]
     fn set_text(&self, ctx: Ctx<'_>, value: WebIdlCodeUnits) -> Result<()> {
+        // An option's text setter replaces its children with one text node
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text>).
+        let text = value.0.to_string_lossy().into_owned();
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let replacement = parsed.document.create_fragment();
-        if !value.0.is_empty() {
-            let text = parsed.document.create_text(value.0);
-            dom::mutation::append(&mut parsed.document, replacement, text)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-        }
-        dom::mutation::replace_all(&mut parsed.document, self.handle.0, replacement)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        Ok(())
+        let added = if text.is_empty() {
+            Vec::new()
+        } else {
+            let text = parsed.document.base.mutate().create_text_node(&text);
+            vec![NodeId {
+                document: parsed.id,
+                node: text,
+            }]
+        };
+        replace_all_journaled(&mut parsed, self.handle.0, added);
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
@@ -1700,10 +3454,12 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(0);
         };
-        let Some(select) = dom::form::option_select_owner(&parsed.document, self.handle.0) else {
+        let base = &parsed.document.base;
+        let Some(select) = option_select_owner(base, self.handle.0.document, self.handle.0.node)
+        else {
             return Ok(0);
         };
-        for (index, option) in dom::form::select_options(&parsed.document, select)
+        for (index, option) in select_options_in(base, self.handle.0.document, select.node)
             .into_iter()
             .enumerate()
         {
@@ -1720,18 +3476,43 @@ impl JsNode {
         let world = world(&ctx)?;
         let world = world.borrow();
         Ok(world.document(self.handle.0).map_or(-1, |parsed| {
-            dom::form::select_selected_index(&parsed.document, self.handle.0)
+            let base = &parsed.document.base;
+            select_options_in(base, self.handle.0.document, self.handle.0.node)
+                .iter()
+                .position(|option| attr(base, option.node, "selected").is_some())
+                .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
         }))
     }
 
     #[qjs(skip)]
     fn set_selected_index(&self, ctx: Ctx<'_>, value: i32) -> Result<()> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
+        let world_rc = world(&ctx)?;
+        let options = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Ok(());
+            };
+            select_options_in(
+                &parsed.document.base,
+                self.handle.0.document,
+                self.handle.0.node,
+            )
         };
-        dom::form::set_select_selected_index(&mut parsed.document, self.handle.0, value);
+        // A negative index clears every option; otherwise the indexed option
+        // selects and the rest deselect
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
+        let wanted = if value < 0 {
+            None
+        } else {
+            usize::try_from(value).ok()
+        };
+        for (index, option) in options.into_iter().enumerate() {
+            if Some(index) == wanted {
+                set_attribute_sync(&ctx, option, "selected", "")?;
+            } else {
+                remove_attribute_sync(&ctx, option, "", "selected", false)?;
+            }
+        }
         Ok(())
     }
 
@@ -1771,7 +3552,7 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
     #[qjs(skip)]
     fn complete(&self, ctx: Ctx<'_>) -> Result<bool> {
-        if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "img"))? {
+        if !with_node_data(&ctx, self.handle.0, |data| is_html_element(data, "img"))? {
             return Ok(false);
         }
         let world = world(&ctx)?;
@@ -1782,9 +3563,14 @@ impl JsNode {
         if world.images.contains_key(&self.handle.0) {
             return Ok(true);
         }
+        if world.image_broken.contains(&self.handle.0) {
+            return Ok(true);
+        }
         let src = world
             .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "src"));
+            .and_then(|parsed| {
+                attr(&parsed.document.base, self.handle.0.node, "src").map(str::to_owned)
+            });
         if src.as_deref().is_none_or(str::is_empty) {
             return Ok(true);
         }
@@ -1794,7 +3580,7 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
     #[qjs(skip)]
     fn current_src(&self, ctx: Ctx<'_>) -> Result<String> {
-        if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "img"))? {
+        if !with_node_data(&ctx, self.handle.0, |data| is_html_element(data, "img"))? {
             return Ok(String::new());
         }
         let world = world(&ctx)?;
@@ -1854,101 +3640,35 @@ impl JsNode {
         ctx: Ctx<'js>,
         init: element_generated::ShadowRootInit,
     ) -> Result<Value<'js>> {
-        let open = matches!(init.mode, element_generated::ShadowRootMode::Open);
-        let local = with_node_kind(&ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
-                Some(name.local.to_string())
-            }
-            _ => None,
-        })?;
-        let Some(local) = local else {
-            return Err(throw_dom(
-                &ctx,
-                "NotSupportedError",
-                "element cannot host a shadow root",
-            ));
-        };
-        let allowed = local.contains('-')
-            || matches!(
-                local.as_str(),
-                "article"
-                    | "aside"
-                    | "blockquote"
-                    | "body"
-                    | "div"
-                    | "footer"
-                    | "h1"
-                    | "h2"
-                    | "h3"
-                    | "h4"
-                    | "h5"
-                    | "h6"
-                    | "header"
-                    | "main"
-                    | "nav"
-                    | "p"
-                    | "section"
-                    | "span"
-            );
-        if !allowed {
-            return Err(throw_dom(
-                &ctx,
-                "NotSupportedError",
-                "element cannot host a shadow root",
-            ));
-        }
-
-        let world = world(&ctx)?;
-        let world_ref = world.borrow();
-        let Some(mut parsed) = world_ref.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        if dom::shadow::shadow_root(&parsed.document, self.handle.0).is_some() {
-            return Err(throw_dom(
-                &ctx,
-                "NotSupportedError",
-                "element already hosts a shadow root",
-            ));
-        }
-        let root = dom::shadow::attach_shadow(&mut parsed.document, self.handle.0, open)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world_ref);
-        wrap_node(&ctx, root)
+        let _ = (self, init);
+        // Known gap: Blitz has no shadow DOM, so no element can host a shadow
+        // root. Every call throws instead of handing back a half-built root.
+        Err(throw_dom(
+            &ctx,
+            "NotSupportedError",
+            "shadow DOM is not supported",
+        ))
     }
 
     #[qjs(skip)]
     fn shadow_root<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(ctx)?;
-        let root = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| dom::shadow::open_shadow_root(&parsed.document, self.handle.0));
-        child_value(ctx, root)
+        // Known gap: Blitz has no shadow DOM, so elements never host a shadow
+        // root.
+        Ok(Value::new_null(ctx.clone()))
     }
 
     #[qjs(skip)]
     fn host<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(ctx)?;
-        let host = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| dom::shadow::shadow_host(&parsed.document, self.handle.0));
-        match host {
-            Some(host) => wrap_node(ctx, host),
-            None => Err(Exception::throw_type(ctx, "not a shadow root")),
-        }
+        // Known gap: Blitz has no shadow DOM, so no node is ever a shadow
+        // root. The brand check rejects every receiver first.
+        Err(Exception::throw_type(ctx, "not a shadow root"))
     }
 
     #[qjs(skip)]
     fn mode(&self, ctx: &Ctx<'_>) -> Result<String> {
-        let world = world(ctx)?;
-        let open = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| dom::shadow::shadow_root_is_open(&parsed.document, self.handle.0))
-            .ok_or_else(|| Exception::throw_type(ctx, "not a shadow root"))?;
-        Ok(if open { "open" } else { "closed" }.into())
+        // Known gap: Blitz has no shadow DOM, so no node is ever a shadow
+        // root. The brand check rejects every receiver first.
+        Err(Exception::throw_type(ctx, "not a shadow root"))
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
@@ -1959,15 +3679,19 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        if parsed.content_type == "text/html" {
-            let markup = crate::serialize::serialize_html_fragment(&parsed.document, self.handle.0);
-            dom_string(ctx, &markup)
-        } else {
-            let markup =
-                crate::serialize::serialize_xml_children(&parsed.document, self.handle.0, true)
-                    .map_err(|err| throw_dom(ctx, "InvalidStateError", &err.to_string()))?;
-            dom_string(ctx, &markup)
+        let base = &parsed.document.base;
+        let Some(node) = base.get_node(self.handle.0.node) else {
+            return Err(Exception::throw_type(ctx, "stale node"));
+        };
+        if node.data.downcast_element().is_none() {
+            return Err(Exception::throw_type(ctx, "innerHTML requires an element"));
         }
+        let markup = if parsed.content_type == "text/html" {
+            serialize_html_children(base, self.handle.0.node)
+        } else {
+            serialize_xml_children(base, self.handle.0.node)
+        };
+        dom_string(ctx, &markup)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
@@ -1978,72 +3702,66 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        let Some(NodeKind::Element { name, attributes }) = parsed.document.kind(self.handle.0)
+        let base = &parsed.document.base;
+        let Some(element) = base
+            .get_node(self.handle.0.node)
+            .and_then(|node| node.data.downcast_element())
         else {
             return Err(Exception::throw_type(ctx, "outerHTML requires an element"));
         };
-        if parsed.content_type == "text/html" {
-            let markup = crate::serialize::serialize_html_outer(
-                &parsed.document,
-                self.handle.0,
-                name,
-                attributes,
-            );
-            dom_string(ctx, &markup)
+        let name = element.name.clone();
+        let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
+        let markup = if parsed.content_type == "text/html" {
+            serialize_html_outer(base, self.handle.0.node, &name, &attributes)
         } else {
-            let markup = crate::serialize::serialize_xml(&parsed.document, self.handle.0, true)
-                .map_err(|err| throw_dom(ctx, "InvalidStateError", &err.to_string()))?;
-            dom_string(ctx, &markup)
-        }
+            let mut output = HtmlOutput(Vec::new());
+            serialize_xml_element(base, self.handle.0.node, &name, &attributes, &mut output);
+            output.finish()
+        };
+        dom_string(ctx, &markup)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
     #[qjs(skip)]
     fn set_inner_html(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        let (context, is_template) = with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => {
-                Some((html_fragment_context(name), is_template_element(kind)))
+        let context = with_node_data(ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => {
+                Some(html_fragment_context(&element.name))
             }
             _ => None,
         })?
-        .or_else(|| {
-            let world = world(ctx).ok()?;
-            let world = world.borrow();
-            let parsed = world.document(self.handle.0)?;
-            let host = dom::shadow::shadow_host(&parsed.document, self.handle.0)?;
-            let Some(NodeKind::Element { name, .. }) = parsed.document.kind(host) else {
-                return None;
-            };
-            Some((html_fragment_context(name), false))
-        })
         .ok_or_else(|| {
             Exception::throw_type(ctx, "innerHTML requires an element or shadow root")
         })?;
 
         let snapshots = parse_html_fragment_snapshots(ctx, &value.0, &context)?;
 
+        // Known gap: Blitz has no template contents, so `<template>` children
+        // replace as ordinary element children.
         let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        let target = if is_template {
-            if let Some(contents) = dom::shadow::template_contents(&parsed.document, self.handle.0)
-            {
-                contents
-            } else {
-                let contents = parsed.document.create_fragment();
-                dom::shadow::set_template_contents(&mut parsed.document, self.handle.0, contents)
-                    .map_err(|err| throw_dom_error(ctx, err))?;
-                contents
-            }
-        } else {
-            self.handle.0
-        };
-        let replacement = materialize_children(&mut parsed.document, &snapshots)
+        let mut replacement = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
-        dom::mutation::replace_all(&mut parsed.document, target, replacement)
-            .map_err(|err| throw_dom_error(ctx, err))?;
+        replacement.document = self.handle.0.document;
+        let added: Vec<NodeId> = parsed
+            .document
+            .base
+            .get_node(replacement.node)
+            .map(|backing| {
+                backing
+                    .children
+                    .iter()
+                    .map(|child| NodeId {
+                        document: replacement.document,
+                        node: *child,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        replace_all_journaled(&mut parsed, self.handle.0, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -2064,8 +3782,10 @@ impl JsNode {
         ) {
             return Err(throw_dom(&ctx, "SyntaxError", "invalid position"));
         }
-        let context = with_node_kind(&ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => Some(html_fragment_context(name)),
+        let context = with_node_data(&ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => {
+                Some(html_fragment_context(&element.name))
+            }
             _ => None,
         })?
         .ok_or_else(|| Exception::throw_type(&ctx, "insertAdjacentHTML requires an element"))?;
@@ -2076,35 +3796,88 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let needs_parent = matches!(position.as_str(), "beforebegin" | "afterend");
-        if needs_parent && parsed.document.parent(self.handle.0).is_none() {
+        let parent = parsed
+            .document
+            .base
+            .get_node(self.handle.0.node)
+            .and_then(|node| node.parent)
+            .map(|node| NodeId {
+                document: self.handle.0.document,
+                node,
+            });
+        if needs_parent && parent.is_none() {
             return Err(throw_dom(
                 &ctx,
                 "NoModificationAllowedError",
                 "element has no parent",
             ));
         }
-        let fragment = materialize_children(&mut parsed.document, &snapshots)
+        let mut fragment = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        let result = if position == "beforebegin" {
-            dom::mutation::insert_before(&mut parsed.document, self.handle.0, fragment)
-        } else if position == "afterbegin" {
-            match parsed.document.first_child(self.handle.0) {
-                Some(first) => dom::mutation::insert_before(&mut parsed.document, first, fragment),
-                None => dom::mutation::append(&mut parsed.document, self.handle.0, fragment),
+        fragment.document = self.handle.0.document;
+        let moved: Vec<NodeId> = parsed
+            .document
+            .base
+            .get_node(fragment.node)
+            .map(|backing| {
+                backing
+                    .children
+                    .iter()
+                    .map(|child| NodeId {
+                        document: fragment.document,
+                        node: *child,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        match position.as_str() {
+            "beforebegin" => {
+                let parent = parent.ok_or_else(|| {
+                    throw_dom(&ctx, "NoModificationAllowedError", "element has no parent")
+                })?;
+                for child in moved {
+                    place_journaled(&mut parsed, parent, child, Some(self.handle.0));
+                }
             }
-        } else if position == "afterend" {
-            if let Some(next) = parsed.document.next_sibling(self.handle.0) {
-                dom::mutation::insert_before(&mut parsed.document, next, fragment)
-            } else {
-                let Some(parent) = parsed.document.parent(self.handle.0) else {
-                    return Ok(());
-                };
-                dom::mutation::append(&mut parsed.document, parent, fragment)
+            "afterbegin" => {
+                let reference = parsed
+                    .document
+                    .base
+                    .get_node(self.handle.0.node)
+                    .and_then(|node| node.children.first().copied())
+                    .map(|node| NodeId {
+                        document: self.handle.0.document,
+                        node,
+                    });
+                for child in moved {
+                    match reference {
+                        Some(reference) => {
+                            place_journaled(&mut parsed, self.handle.0, child, Some(reference));
+                        }
+                        None => place_journaled(&mut parsed, self.handle.0, child, None),
+                    }
+                }
             }
-        } else {
-            dom::mutation::append(&mut parsed.document, self.handle.0, fragment)
-        };
-        result.map_err(|err| throw_dom_error(&ctx, err))?;
+            "afterend" => {
+                let parent = parent.ok_or_else(|| {
+                    throw_dom(&ctx, "NoModificationAllowedError", "element has no parent")
+                })?;
+                let mut reference =
+                    sibling(&parsed.document.base, self.handle.0.node, true).map(|next| NodeId {
+                        document: self.handle.0.document,
+                        node: next,
+                    });
+                for child in moved {
+                    place_journaled(&mut parsed, parent, child, reference);
+                    reference = Some(child);
+                }
+            }
+            _ => {
+                for child in moved {
+                    place_journaled(&mut parsed, self.handle.0, child, None);
+                }
+            }
+        }
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
@@ -2119,27 +3892,34 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
-            let Some(parent) = parsed.document.parent(self.handle.0) else {
+            let base = &parsed.document.base;
+            let Some(parent) = base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.parent)
+                .map(|node| NodeId {
+                    document: self.handle.0.document,
+                    node,
+                })
+            else {
                 // A parentless element has nothing to replace.
                 return Ok(());
             };
-            let Some(kind) = parsed.document.kind(parent).cloned() else {
-                return Err(Exception::throw_type(ctx, "no document"));
-            };
-            match kind {
-                NodeKind::Document => {
-                    return Err(throw_dom(
-                        ctx,
-                        "NoModificationAllowedError",
-                        "the parent of the element is a Document",
-                    ));
-                }
-                NodeKind::Element { name, .. } => (parent, html_fragment_context(&name)),
+            if base.root_node().id == parent.node {
+                return Err(throw_dom(
+                    ctx,
+                    "NoModificationAllowedError",
+                    "the parent of the element is a Document",
+                ));
+            }
+            let context = base
+                .get_node(parent.node)
+                .and_then(|node| node.data.downcast_element())
+                .map(|element| html_fragment_context(&element.name))
                 // A DocumentFragment has no parsing context of its own; a
                 // body element stands in
                 // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml>).
-                _ => (parent, "body".to_owned()),
-            }
+                .unwrap_or_else(|| "body".to_owned());
+            (parent, context)
         };
         let snapshots = parse_html_fragment_snapshots(ctx, &value.0, &context)?;
 
@@ -2147,10 +3927,11 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        let replacement = materialize_children(&mut parsed.document, &snapshots)
+        let mut replacement = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
-        dom::mutation::replace_child(&mut parsed.document, parent, replacement, self.handle.0)
-            .map_err(|err| throw_dom_error(ctx, err))?;
+        replacement.document = self.handle.0.document;
+        let target = self.handle.0;
+        replace_parsed(&mut parsed, parent, replacement, target);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -2182,15 +3963,17 @@ impl JsNode {
     #[qjs(skip)]
     fn last_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world = world(ctx)?;
-        let id = world
-            .borrow()
-            .with_document(self.handle.0, |parsed| {
-                parsed
-                    .document
-                    .children(self.handle.0)
-                    .and_then(|mut kids| kids.next_back())
-            })
-            .flatten();
+        let id = world.borrow().document(self.handle.0).and_then(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.children.last().copied())
+                .map(|node| NodeId {
+                    document: parsed.id,
+                    node,
+                })
+        });
         child_value(ctx, id)
     }
 
@@ -2211,8 +3994,11 @@ impl JsNode {
     fn owner_document<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world = world(ctx)?;
         let id = world.borrow().document(self.handle.0).and_then(|parsed| {
-            let document = parsed.document.document();
-            (document != self.handle.0).then_some(document)
+            let root = parsed.document.base.root_node().id;
+            (root != self.handle.0.node).then_some(NodeId {
+                document: parsed.id,
+                node: root,
+            })
         });
         child_value(ctx, id)
     }
@@ -2227,8 +4013,9 @@ impl JsNode {
         };
         Ok(parsed
             .document
-            .children(self.handle.0)
-            .is_some_and(|mut kids| kids.next().is_some()))
+            .base
+            .get_node(self.handle.0.node)
+            .is_some_and(|node| !node.children.is_empty()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
@@ -2239,13 +4026,18 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
-        match parsed.document.kind(self.handle.0) {
-            Some(
-                NodeKind::Text { data }
-                | NodeKind::CDataSection { data }
-                | NodeKind::ProcessingInstruction { data, .. }
-                | NodeKind::Comment { data },
-            ) => dom_string(ctx, data).map(Some),
+        let data = parsed
+            .document
+            .base
+            .get_node(self.handle.0.node)
+            .map(|node| &node.data);
+        match data {
+            Some(NodeData::Text(text)) => {
+                dom_string(ctx, &DomString::from(text.content.clone())).map(Some)
+            }
+            Some(NodeData::Comment { contents }) => {
+                dom_string(ctx, &DomString::from(contents.clone())).map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -2254,8 +4046,8 @@ impl JsNode {
     #[qjs(skip)]
     fn set_node_value(&self, ctx: &Ctx<'_>, value: Option<rquickjs::String<'_>>) -> Result<()> {
         let value = match value {
-            Some(value) => dom::DomString::from_utf16(value.to_utf16()?),
-            None => dom::DomString::default(),
+            Some(value) => crate::dom_string::DomString::from_utf16(value.to_utf16()?),
+            None => crate::dom_string::DomString::default(),
         };
         set_character_data(ctx, self.handle.0, value)
     }
@@ -2268,17 +4060,19 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
-        match parsed.document.kind(self.handle.0) {
-            Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
-                let text = descendant_text(&parsed.document, self.handle.0);
+        let base = &parsed.document.base;
+        let data = base.get_node(self.handle.0.node).map(|node| &node.data);
+        match data {
+            Some(NodeData::Element(_)) | Some(NodeData::AnonymousBlock(_)) => {
+                let text = descendant_text(base, self.handle.0.node);
                 dom_string(ctx, &text).map(Some)
             }
-            Some(
-                NodeKind::Text { data }
-                | NodeKind::CDataSection { data }
-                | NodeKind::ProcessingInstruction { data, .. }
-                | NodeKind::Comment { data },
-            ) => dom_string(ctx, data).map(Some),
+            Some(NodeData::Text(text)) => {
+                dom_string(ctx, &DomString::from(text.content.clone())).map(Some)
+            }
+            Some(NodeData::Comment { contents }) => {
+                dom_string(ctx, &DomString::from(contents.clone())).map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -2286,12 +4080,12 @@ impl JsNode {
     #[qjs(skip)]
     fn set_text_content(&self, ctx: &Ctx<'_>, value: Option<rquickjs::String<'_>>) -> Result<()> {
         let text = match value {
-            Some(value) => dom::DomString::from_utf16(value.to_utf16()?),
-            None => dom::DomString::default(),
+            Some(value) => crate::dom_string::DomString::from_utf16(value.to_utf16()?),
+            None => crate::dom_string::DomString::default(),
         };
-        // A `CharacterData` node [replaces its data] in place; `Document` and
-        // `DocumentType` ignore the setter; every other node replaces its
-        // children with one `Text` node
+        // A `CharacterData` node [replaces its data] in place; `Document`
+        // nodes ignore the setter; every other node replaces its children
+        // with one `Text` node
         // (<https://dom.spec.whatwg.org/#dom-node-textcontent>).
         let world_rc = world(ctx)?;
         let character_data = {
@@ -2299,15 +4093,13 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Ok(());
             };
-            matches!(
-                parsed.document.kind(self.handle.0),
-                Some(
-                    NodeKind::Text { .. }
-                        | NodeKind::CDataSection { .. }
-                        | NodeKind::ProcessingInstruction { .. }
-                        | NodeKind::Comment { .. }
-                )
-            )
+            parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .is_some_and(|node| {
+                    matches!(node.data, NodeData::Text(_) | NodeData::Comment { .. })
+                })
         };
         if character_data {
             return set_character_data(ctx, self.handle.0, text);
@@ -2316,21 +4108,20 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        if matches!(
-            parsed.document.kind(self.handle.0),
-            Some(NodeKind::Document | NodeKind::Doctype { .. })
-        ) {
+        if parsed.document.base.root_node().id == self.handle.0.node {
             return Ok(());
         }
-        let dom = &mut parsed.document;
-        let replacement = dom.create_fragment();
-        if !text.is_empty() {
-            let text_id = dom.create_text(text);
-            dom::mutation::append(dom, replacement, text_id)
-                .map_err(|err| throw_dom_error(ctx, err))?;
-        }
-        dom::mutation::replace_all(dom, self.handle.0, replacement)
-            .map_err(|err| throw_dom_error(ctx, err))?;
+        let text = text.to_string_lossy().into_owned();
+        let added = if text.is_empty() {
+            Vec::new()
+        } else {
+            let text = parsed.document.base.mutate().create_text_node(&text);
+            vec![NodeId {
+                document: parsed.id,
+                node: text,
+            }]
+        };
+        replace_all_journaled(&mut parsed, self.handle.0, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -2344,7 +4135,10 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        dom::selector::matches(&parsed.document, self.handle.0, &selectors.0)
+        parsed
+            .document
+            .base
+            .matches_selector(self.handle.0.node, &selectors.0)
             .map_err(|err| select_error(&ctx, &err))
     }
 
@@ -2357,19 +4151,15 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            let mut candidate = None;
-            let mut cursor = Some(self.handle.0);
-            while let Some(id) = cursor {
-                if is_element(&parsed.document, id)
-                    && dom::selector::matches(&parsed.document, id, &selectors.0)
-                        .map_err(|err| select_error(&ctx, &err))?
-                {
-                    candidate = Some(id);
-                    break;
-                }
-                cursor = parsed.document.parent(id);
-            }
-            candidate
+            parsed
+                .document
+                .base
+                .closest(self.handle.0.node, &selectors.0)
+                .map_err(|err| select_error(&ctx, &err))?
+                .map(|node| NodeId {
+                    document: parsed.id,
+                    node,
+                })
         };
         child_value(&ctx, found)
     }
@@ -2397,54 +4187,76 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return rquickjs::String::from_str(ctx.clone(), "");
         };
-        let title =
-            dom::selector::select_first(&parsed.document, parsed.document.document(), "title")
-                .ok()
-                .flatten();
+        let title = document_first(&parsed, "title");
         match title {
-            Some(title) => dom_string(ctx, &descendant_text(&parsed.document, title)),
+            Some(title) => dom_string(ctx, &descendant_text(&parsed.document.base, title.node)),
             None => rquickjs::String::from_str(ctx.clone(), ""),
         }
     }
 
     #[qjs(skip)]
     fn set_title(&self, ctx: &Ctx<'_>, value: WebIdlCodeUnits) -> Result<()> {
+        let text = value.0.to_string_lossy().into_owned();
         let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let dom = &mut parsed.document;
-        let title = dom::selector::select_first(dom, dom.document(), "title")
+        let base_root = parsed.document.base.root_node().id;
+        let title = parsed
+            .document
+            .base
+            .query_selector_in(base_root, "title")
             .ok()
             .flatten()
+            .map(|node| NodeId {
+                document: parsed.id,
+                node,
+            })
             .unwrap_or_else(|| {
                 let name = QualName::new(None, html_namespace(), LocalName::from("title"));
-                let title = dom.create_element(name, Vec::new());
-                let target = dom::selector::select_first(dom, dom.document(), "head")
+                let title = parsed
+                    .document
+                    .base
+                    .mutate()
+                    .create_element(name, Vec::new());
+                let title = NodeId {
+                    document: parsed.id,
+                    node: title,
+                };
+                let target = parsed
+                    .document
+                    .base
+                    .query_selector_in(base_root, "head")
                     .ok()
                     .flatten()
                     .or_else(|| {
-                        dom::selector::select_first(dom, dom.document(), "html")
+                        parsed
+                            .document
+                            .base
+                            .query_selector_in(base_root, "html")
                             .ok()
                             .flatten()
+                    })
+                    .map(|node| NodeId {
+                        document: parsed.id,
+                        node,
                     });
                 if let Some(target) = target {
-                    let _ = dom::mutation::append(dom, target, title);
+                    insert_parsed(&mut parsed, target, title, None);
                 }
                 title
             });
-        let kids: Vec<NodeId> = dom
-            .children(title)
-            .map(Iterator::collect)
-            .unwrap_or_default();
-        for kid in kids {
-            dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(ctx, err))?;
-        }
-        if !value.0.is_empty() {
-            let text = dom.create_text(value.0);
-            dom::mutation::append(dom, title, text).map_err(|err| throw_dom_error(ctx, err))?;
-        }
+        let added = if text.is_empty() {
+            Vec::new()
+        } else {
+            let text = parsed.document.base.mutate().create_text_node(&text);
+            vec![NodeId {
+                document: parsed.id,
+                node: text,
+            }]
+        };
+        replace_all_journaled(&mut parsed, title, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -2490,8 +4302,10 @@ impl JsNode {
     #[qjs(skip)]
     fn tag_name(&self, ctx: &Ctx<'_>) -> Result<String> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
-        with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => element_node_name(name, uppercase),
+        with_node_data(ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => {
+                element_node_name(&element.name, uppercase)
+            }
             _ => String::new(),
         })
     }
@@ -2499,8 +4313,10 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-element-localname
     #[qjs(skip)]
     fn local_name(&self, ctx: &Ctx<'_>) -> Result<String> {
-        with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => name.local.to_string(),
+        with_node_data(ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => {
+                element.name.local.to_string()
+            }
             _ => String::new(),
         })
     }
@@ -2508,8 +4324,9 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-element-prefix
     #[qjs(skip)]
     fn prefix<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let prefix = with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => name
+        let prefix = with_node_data(ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => element
+                .name
                 .prefix
                 .as_ref()
                 .filter(|prefix| !prefix.is_empty())
@@ -2525,9 +4342,9 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-element-namespaceuri
     #[qjs(skip)]
     fn namespace_uri<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let namespace = with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => {
-                (!name.ns.is_empty()).then(|| name.ns.to_string())
+        let namespace = with_node_data(ctx, self.handle.0, |data| match data {
+            Some(NodeData::Element(element)) | Some(NodeData::AnonymousBlock(element)) => {
+                (!element.name.ns.as_ref().is_empty()).then(|| element.name.ns.to_string())
             }
             _ => None,
         })?;
@@ -2545,16 +4362,7 @@ impl JsNode {
 
     #[qjs(skip)]
     fn set_class_name(&self, ctx: &Ctx<'_>, value: WebIdlString) -> Result<()> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(ctx, "no document"));
-        };
-        dom::mutation::set_attribute(&mut parsed.document, self.handle.0, "class", value.0)
-            .map_err(|err| throw_dom_error(ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(ctx)
+        set_attribute_sync(ctx, self.handle.0, "class", &value.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classlist
@@ -2617,7 +4425,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(parsed.document.has_attribute(self.handle.0, &local))
+        Ok(attr(&parsed.document.base, self.handle.0.node, &local).is_some())
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributens
@@ -2631,9 +4439,12 @@ impl JsNode {
         let namespace = namespace.0.unwrap_or_default();
         let world = world(&ctx)?;
         let found = world.borrow().document(self.handle.0).and_then(|parsed| {
-            parsed
-                .document
-                .attribute_ns(self.handle.0, &namespace, &local.0)
+            attr_ns_value(
+                &parsed.document.base,
+                self.handle.0.node,
+                &namespace,
+                &local.0,
+            )
         });
         match found {
             Some(value) => string_value(&ctx, &value),
@@ -2655,10 +4466,13 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(parsed
-            .document
-            .attribute_ns(self.handle.0, &namespace, &local.0)
-            .is_some())
+        Ok(attr_ns_value(
+            &parsed.document.base,
+            self.handle.0.node,
+            &namespace,
+            &local.0,
+        )
+        .is_some())
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattributens
@@ -2679,11 +4493,6 @@ impl JsNode {
             NodeContext::Attribute,
         )?;
         let namespace = name.ns.to_string();
-        let prefix = name
-            .prefix
-            .as_ref()
-            .filter(|prefix| !prefix.is_empty())
-            .map(ToString::to_string);
         let local = name.local.to_string();
         {
             let world = world(&ctx)?;
@@ -2691,15 +4500,42 @@ impl JsNode {
             let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            dom::mutation::set_attribute_by_ns(
-                &mut parsed.document,
-                self.handle.0,
+            let old_value = attr_ns_value(
+                &parsed.document.base,
+                self.handle.0.node,
                 &namespace,
-                prefix.as_deref(),
                 &local,
-                value.0.clone(),
-            )
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            );
+            // Reuse the stored qualified name when the attribute is already
+            // present, so the write replaces instead of duplicating it.
+            let stored = parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.data.downcast_element())
+                .and_then(|element| {
+                    element
+                        .attrs
+                        .iter()
+                        .find(|attribute| {
+                            attribute.name.ns.as_ref() == namespace
+                                && attribute.name.local.as_ref() == local
+                        })
+                        .map(|attribute| attribute.name.clone())
+                })
+                .unwrap_or(name);
+            let qualified = qualified_name(&stored);
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_attribute(self.handle.0.node, stored, &value.0);
+            parsed.document.record(JournalEntry::Attributes {
+                target: self.handle.0,
+                name: qualified,
+                namespace: namespace.clone(),
+                old_value,
+            });
         }
         touch_attr(&ctx, self.handle.0, &namespace, &local, &value.0)?;
         schedule_mutation_delivery(&ctx)
@@ -2734,7 +4570,20 @@ impl JsNode {
         Ok(world
             .borrow()
             .document(self.handle.0)
-            .map(|parsed| parsed.document.attribute_names(self.handle.0))
+            .and_then(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(self.handle.0.node)
+                    .and_then(|node| node.data.downcast_element())
+                    .map(|element| {
+                        element
+                            .attrs
+                            .iter()
+                            .map(|attribute| qualified_name(&attribute.name))
+                            .collect::<Vec<String>>()
+                    })
+            })
             .unwrap_or_default())
     }
 
@@ -2776,8 +4625,10 @@ impl JsNode {
         };
         Ok(parsed
             .document
-            .attributes(self.handle.0)
-            .is_some_and(|list| !list.is_empty()))
+            .base
+            .get_node(self.handle.0.node)
+            .and_then(|node| node.data.downcast_element())
+            .is_some_and(|element| !element.attrs.is_empty()))
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributenode
@@ -2875,32 +4726,22 @@ impl JsNode {
             ));
         }
         let local = attribute_local_name(&ctx, self.handle.0, &name.0);
-        let (should_exist, changed) = {
+        let exists = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let exists = parsed.document.has_attribute(self.handle.0, &local);
-            let should_exist = force.unwrap_or(!exists);
-            if should_exist && !exists {
-                dom::mutation::set_attribute(
-                    &mut parsed.document,
-                    self.handle.0,
-                    &local,
-                    String::new(),
-                )
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-            }
-            (should_exist, should_exist != exists)
+            attr(&parsed.document.base, self.handle.0.node, &local).is_some()
         };
-        if changed {
-            if should_exist {
-                touch_attr(&ctx, self.handle.0, "", &local, "")?;
-            } else {
-                remove_attribute_sync(&ctx, self.handle.0, "", &local, false)?;
-            }
-            schedule_mutation_delivery(&ctx)?;
+        let should_exist = force.unwrap_or(!exists);
+        if should_exist == exists {
+            return Ok(should_exist);
+        }
+        if should_exist {
+            set_attribute_sync(&ctx, self.handle.0, &local, "")?;
+        } else {
+            remove_attribute_sync(&ctx, self.handle.0, "", &local, false)?;
         }
         Ok(should_exist)
     }
@@ -2913,50 +4754,93 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let dom = &mut parsed.document;
-        let mut containers: Vec<NodeId> = vec![self.handle.0];
-        let mut stack = vec![self.handle.0];
+        let document = parsed.id;
+        let mut containers: Vec<BlitzId> = vec![self.handle.0.node];
+        let mut stack = vec![self.handle.0.node];
         while let Some(id) = stack.pop() {
-            if let Some(kids) = dom.children(id) {
-                for kid in kids {
-                    if matches!(dom.kind(kid), Some(NodeKind::Element { .. })) {
-                        containers.push(kid);
-                        stack.push(kid);
+            if let Some(node) = parsed.document.base.get_node(id) {
+                for kid in node.children.clone().iter() {
+                    if parsed
+                        .document
+                        .base
+                        .get_node(*kid)
+                        .is_some_and(|candidate| candidate.data.downcast_element().is_some())
+                    {
+                        containers.push(*kid);
+                        stack.push(*kid);
                     }
                 }
             }
         }
         for container in containers {
-            let kids: Vec<NodeId> = dom
-                .children(container)
-                .map(Iterator::collect)
+            let kids: Vec<BlitzId> = parsed
+                .document
+                .base
+                .get_node(container)
+                .map(|node| node.children.iter().copied().collect())
                 .unwrap_or_default();
             // In tree order: drop empty Text nodes, merge contiguous runs
             // into the first non-empty one
             // (<https://dom.spec.whatwg.org/#dom-node-normalize>).
-            let mut merged: Option<NodeId> = None;
+            let mut merged: Option<BlitzId> = None;
             for kid in kids {
-                match dom.kind(kid) {
-                    Some(NodeKind::Text { data }) if data.is_empty() => {
-                        dom::mutation::detach(dom, kid)
-                            .map_err(|err| throw_dom_error(&ctx, err))?;
-                    }
-                    Some(NodeKind::Text { data }) => {
-                        if let Some(previous) = merged {
-                            let mut joined = match dom.kind(previous) {
-                                Some(NodeKind::Text { data }) => data.clone(),
-                                _ => dom::DomString::default(),
-                            };
-                            joined.push_dom(data);
-                            dom::mutation::set_text(dom, previous, joined)
-                                .map_err(|err| throw_dom_error(&ctx, err))?;
-                            dom::mutation::detach(dom, kid)
-                                .map_err(|err| throw_dom_error(&ctx, err))?;
-                        } else {
-                            merged = Some(kid);
-                        }
-                    }
-                    _ => merged = None,
+                let content =
+                    parsed
+                        .document
+                        .base
+                        .get_node(kid)
+                        .and_then(|node| match &node.data {
+                            NodeData::Text(data) => Some(data.content.clone()),
+                            _ => None,
+                        });
+                let Some(content) = content else {
+                    merged = None;
+                    continue;
+                };
+                if content.is_empty() {
+                    unlink_journaled(
+                        &mut parsed,
+                        NodeId {
+                            document,
+                            node: kid,
+                        },
+                    );
+                    continue;
+                }
+                if let Some(previous) = merged {
+                    let previous_content = parsed
+                        .document
+                        .base
+                        .get_node(previous)
+                        .and_then(|node| match &node.data {
+                            NodeData::Text(data) => Some(data.content.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let mut joined = DomString::from(previous_content.clone());
+                    joined.push_str(&content);
+                    let old_value = DomString::from(previous_content);
+                    parsed
+                        .document
+                        .base
+                        .mutate()
+                        .set_node_text(previous, &joined.to_string_lossy());
+                    parsed.document.record(JournalEntry::CharacterData {
+                        target: NodeId {
+                            document,
+                            node: previous,
+                        },
+                        old_value,
+                    });
+                    unlink_journaled(
+                        &mut parsed,
+                        NodeId {
+                            document,
+                            node: kid,
+                        },
+                    );
+                } else {
+                    merged = Some(kid);
                 }
             }
         }
@@ -2982,8 +4866,14 @@ impl JsNode {
             };
             parsed
                 .document
-                .parent(self.handle.0)
-                .filter(|&parent| is_element(&parsed.document, parent))
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.parent)
+                .filter(|parent| is_element(&parsed.document.base, *parent))
+                .map(|parent| NodeId {
+                    document: parsed.id,
+                    node: parent,
+                })
         };
         child_value(ctx, parent)
     }
@@ -3006,10 +4896,16 @@ impl JsNode {
         };
         let world = world(&ctx)?;
         let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
+        let (Some(first), Some(second)) = (parsed.document(self.handle.0), parsed.document(other))
+        else {
             return Ok(false);
         };
-        Ok(nodes_equal(&parsed.document, self.handle.0, other))
+        Ok(nodes_equal_in(
+            &first.document.base,
+            self.handle.0.node,
+            &second.document.base,
+            other.node,
+        ))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-contains
@@ -3018,17 +4914,21 @@ impl JsNode {
         let Some(NodeReference::Tree(other)) = other else {
             return Ok(false);
         };
+        if other.document != self.handle.0.document {
+            return Ok(false);
+        }
         let world = world(&ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        let mut cursor = Some(other);
+        let base = &parsed.document.base;
+        let mut cursor = Some(other.node);
         while let Some(id) = cursor {
-            if id == self.handle.0 {
+            if id == self.handle.0.node {
                 return Ok(true);
             }
-            cursor = parsed.document.parent(id);
+            cursor = base.get_node(id).and_then(|node| node.parent);
         }
         Ok(false)
     }
@@ -3040,6 +4940,9 @@ impl JsNode {
         ctx: Ctx<'js>,
         options: node_generated::GetRootNodeOptions,
     ) -> Result<Value<'js>> {
+        let _ = options.composed;
+        // Known gap: Blitz has no shadow DOM, so the composed option never
+        // crosses a shadow boundary and the root is the tree root.
         let world = world(&ctx)?;
         let mut root = self.handle.0;
         {
@@ -3047,17 +4950,12 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            loop {
-                while let Some(parent) = parsed.document.parent(root) {
-                    root = parent;
-                }
-                if options.composed
-                    && let Some(host) = dom::shadow::shadow_host(&parsed.document, root)
-                {
-                    root = host;
-                } else {
-                    break;
-                }
+            let base = &parsed.document.base;
+            while let Some(parent) = base.get_node(root.node).and_then(|node| node.parent) {
+                root = NodeId {
+                    document: root.document,
+                    node: parent,
+                };
             }
         }
         wrap_node(&ctx, root)
@@ -3071,10 +4969,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(dom::lifecycle::is_connected(
-            &parsed.document,
-            self.handle.0,
-        ))
+        Ok(is_connected(&parsed.document.base, self.handle.0.node))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-clonenode
@@ -3086,7 +4981,7 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            self.handle.0 == parsed.document.document()
+            self.handle.0.node == parsed.document.base.root_node().id
         };
         if is_document {
             return clone_document(&ctx, self.handle.0, deep);
@@ -3095,37 +4990,11 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let clone = dom::mutation::clone_node(&mut parsed.document, self.handle.0, deep)
+        let store = parsed.id;
+        // Known gap: form-state cloning (input checkedness/value) has no Blitz
+        // equivalent yet; deep clones carry structure only.
+        let clone = clone_within_document(&mut parsed.document, store, self.handle.0, deep)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        // Run the form-control cloning steps for the source and clone in
-        // parallel tree order, so a deep clone carries each control's value and
-        // checkedness
-        // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:cloning-steps>).
-        let pairs: Vec<(dom::NodeId, dom::NodeId)> = {
-            let dom = &parsed.document;
-            let mut from_stack = vec![self.handle.0];
-            let mut to_stack = vec![clone];
-            let mut pairs = Vec::new();
-            while let (Some(from), Some(to)) = (from_stack.pop(), to_stack.pop()) {
-                pairs.push((from, to));
-                let from_children: Vec<_> = dom
-                    .children(from)
-                    .map(Iterator::collect)
-                    .unwrap_or_default();
-                let to_children: Vec<_> =
-                    dom.children(to).map(Iterator::collect).unwrap_or_default();
-                for child in from_children.into_iter().rev() {
-                    from_stack.push(child);
-                }
-                for child in to_children.into_iter().rev() {
-                    to_stack.push(child);
-                }
-            }
-            pairs
-        };
-        for (from, to) in pairs {
-            dom::form::clone_form_state(&mut parsed.document, from, to);
-        }
         drop(parsed);
         drop(world);
         wrap_node(&ctx, clone)
@@ -3140,18 +5009,8 @@ impl JsNode {
         child: Option<NodeReference>,
     ) -> Result<Value<'js>> {
         let (node, child) = insertion_tree_nodes(&ctx, self.handle.0, node, child)?;
-        let node = adopt_across_documents(&ctx, self.handle.0, node)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let dom = &mut parsed.document;
-        dom::mutation::pre_insert(dom, self.handle.0, node, child)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)?;
+        let node = adopt_node(&ctx, self.handle.0, node)?;
+        insert_tree_node(&ctx, self.handle.0, node, child)?;
         wrap_node(&ctx, node)
     }
 
@@ -3166,15 +5025,21 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        if parsed.document.parent(child) != Some(self.handle.0) {
+        let parented = parsed
+            .document
+            .base
+            .get_node(child.node)
+            .and_then(|node| node.parent)
+            == Some(self.handle.0.node)
+            && child.document == self.handle.0.document;
+        if !parented {
             return Err(throw_dom(
                 &ctx,
                 "NotFoundError",
                 "child is not a child of this node",
             ));
         }
-        dom::mutation::detach(&mut parsed.document, child)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        unlink_journaled(&mut parsed, child);
         drop(parsed);
         drop(world);
         fixup_focus_after_removal(&ctx, child)?;
@@ -3198,17 +5063,20 @@ impl JsNode {
                 "attributes have no parent",
             ));
         };
-        let node = adopt_across_documents(&ctx, self.handle.0, node)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+        let node = adopt_node(&ctx, self.handle.0, node)?;
+        let moved = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            replace_parsed(&mut parsed, self.handle.0, node, child)
         };
-        dom::mutation::replace_child(&mut parsed.document, self.handle.0, node, child)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
         fixup_focus_after_removal(&ctx, child)?;
+        for id in &moved {
+            fixup_option_on_insert(&ctx, *id)?;
+            fixup_radio_on_insert(&ctx, *id)?;
+        }
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }
@@ -3229,7 +5097,12 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match locate_namespace(&parsed.document, self.handle.0, prefix.as_deref()) {
+        match locate_namespace(
+            &parsed.document.base,
+            parsed.id,
+            self.handle.0,
+            prefix.as_deref(),
+        ) {
             Some(namespace) => string_value(&ctx, &namespace),
             None => Ok(Value::new_null(ctx)),
         }
@@ -3254,7 +5127,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match locate_prefix(&parsed.document, self.handle.0, &namespace) {
+        match locate_prefix(&parsed.document.base, parsed.id, self.handle.0, &namespace) {
             Some(prefix) => string_value(&ctx, &prefix),
             None => Ok(Value::new_null(ctx)),
         }
@@ -3276,13 +5149,12 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        let found = locate_namespace(&parsed.document, self.handle.0, None);
+        let found = locate_namespace(&parsed.document.base, parsed.id, self.handle.0, None);
         Ok(found.as_deref() == namespace.as_deref())
     }
+}
 
-    }
-
-    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+// https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
 fn element_by_id<'js>(ctx: &Ctx<'js>, root: NodeId, id: &str) -> Result<Value<'js>> {
     let owner = world_for_node(ctx, root)?;
     let found = {
@@ -3290,7 +5162,7 @@ fn element_by_id<'js>(ctx: &Ctx<'js>, root: NodeId, id: &str) -> Result<Value<'j
         let Some(parsed) = owner.document(root) else {
             return Ok(Value::new_null(ctx.clone()));
         };
-        find_element_by_id(&parsed.document, root, id)
+        find_element_by_id(&parsed.document.base, parsed.id, root.node, id)
     };
     match found {
         Some(node) => wrap_node(ctx, node),
@@ -3337,7 +5209,7 @@ impl<'js> node_generated::Node<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-baseuri
-    fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         self.base_uri(ctx)
     }
 
@@ -3406,11 +5278,7 @@ impl<'js> node_generated::Node<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
-    fn set_node_value(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_node_value(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         self.set_node_value(ctx, value)
     }
 
@@ -3420,11 +5288,7 @@ impl<'js> node_generated::Node<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-textcontent
-    fn set_text_content(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_text_content(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         self.set_text_content(ctx, value)
     }
 
@@ -3439,11 +5303,7 @@ impl<'js> node_generated::Node<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isequalnode
-    fn is_equal_node(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: Option<NodeReference>,
-    ) -> Result<bool> {
+    fn is_equal_node(&self, ctx: Ctx<'js>, arg_0: Option<NodeReference>) -> Result<bool> {
         self.is_equal_node(ctx, arg_0)
     }
 
@@ -3453,11 +5313,7 @@ impl<'js> node_generated::Node<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
-    fn compare_document_position(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: NodeReference,
-    ) -> Result<u16> {
+    fn compare_document_position(&self, ctx: Ctx<'js>, arg_0: NodeReference) -> Result<u16> {
         self.compare_document_position(ctx, arg_0)
     }
 
@@ -3573,11 +5429,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-closest
-    fn closest(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn closest(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.closest(ctx, WebIdlString(arg_0.to_string()?))
     }
 
@@ -3691,10 +5543,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-namespaceuri
-    fn get_namespace_uri(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_namespace_uri(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         let value = self.namespace_uri(ctx)?;
         if value.is_null() || value.is_undefined() {
             Ok(None)
@@ -3880,31 +5729,19 @@ impl<'js> element_generated::Element<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattributenode
-    fn set_attribute_node(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: Value<'js>,
-    ) -> Result<Value<'js>> {
+    fn set_attribute_node(&self, ctx: Ctx<'js>, arg_0: Value<'js>) -> Result<Value<'js>> {
         let attr = AttrArgument::from_value(&arg_0)?;
         self.set_attribute_node(ctx, attr)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattributenodens
-    fn set_attribute_node_ns(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: Value<'js>,
-    ) -> Result<Value<'js>> {
+    fn set_attribute_node_ns(&self, ctx: Ctx<'js>, arg_0: Value<'js>) -> Result<Value<'js>> {
         let attr = AttrArgument::from_value(&arg_0)?;
         self.set_attribute_node_ns(ctx, attr)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattributenode
-    fn remove_attribute_node(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: Value<'js>,
-    ) -> Result<Value<'js>> {
+    fn remove_attribute_node(&self, ctx: Ctx<'js>, arg_0: Value<'js>) -> Result<Value<'js>> {
         let attr = AttrArgument::from_value(&arg_0)?;
         self.remove_attribute_node(ctx, attr)
     }
@@ -3958,12 +5795,12 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-documenturi
-    fn get_document_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_document_uri(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         self.document_uri(ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-url
-    fn get_url(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_url(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         self.url(ctx)
     }
 
@@ -3998,10 +5835,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-readystate
-    fn get_ready_state(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<document_generated::DocumentReadyState> {
+    fn get_ready_state(&self, ctx: &Ctx<'js>) -> Result<document_generated::DocumentReadyState> {
         Ok(match self.ready_state(ctx)?.as_str() {
             "interactive" => document_generated::DocumentReadyState::Interactive,
             "complete" => document_generated::DocumentReadyState::Complete,
@@ -4039,7 +5873,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
         // `document.title` keeps every code unit, including lone surrogates.
         self.set_title(
             ctx,
-            WebIdlCodeUnits(dom::DomString::from_utf16(value.to_utf16()?)),
+            WebIdlCodeUnits(crate::dom_string::DomString::from_utf16(value.to_utf16()?)),
         )
     }
 
@@ -4062,11 +5896,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createevent
-    fn create_event(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn create_event(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         let interface = arg_0.to_string()?;
         events::create_event(&ctx, &interface)
     }
@@ -4097,26 +5927,18 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createtextnode
-    fn create_text_node(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn create_text_node(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.create_text_node(
             ctx,
-            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+            WebIdlCodeUnits(crate::dom_string::DomString::from_utf16(arg_0.to_utf16()?)),
         )
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
-    fn create_comment(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn create_comment(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.create_comment(
             ctx,
-            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+            WebIdlCodeUnits(crate::dom_string::DomString::from_utf16(arg_0.to_utf16()?)),
         )
     }
 
@@ -4130,7 +5952,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
         self.create_processing_instruction(
             ctx,
             WebIdlString(arg_0.to_string()?),
-            WebIdlCodeUnits(dom::DomString::from_utf16(arg_1.to_utf16()?)),
+            WebIdlCodeUnits(crate::dom_string::DomString::from_utf16(arg_1.to_utf16()?)),
         )
     }
 
@@ -4142,16 +5964,12 @@ impl<'js> document_generated::Document<'js> for JsNode {
     ) -> Result<Value<'js>> {
         self.create_cdata_section(
             ctx,
-            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+            WebIdlCodeUnits(crate::dom_string::DomString::from_utf16(arg_0.to_utf16()?)),
         )
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattribute
-    fn create_attribute(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn create_attribute(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.create_attribute(ctx, WebIdlString(arg_0.to_string()?))
     }
 
@@ -4214,11 +6032,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
-    fn get_element_by_id(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn get_element_by_id(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.get_element_by_id(ctx, WebIdlString(arg_0.to_string()?))
     }
 
@@ -4255,12 +6069,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
-    fn element_from_point(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: f64,
-        arg_1: f64,
-    ) -> Result<Value<'js>> {
+    fn element_from_point(&self, ctx: Ctx<'js>, arg_0: f64, arg_1: f64) -> Result<Value<'js>> {
         self.element_from_point(ctx, arg_0, arg_1)
     }
 
@@ -4294,10 +6103,16 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx.clone()));
             };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|mut kids| kids.find(|&kid| is_element(&parsed.document, kid)))
+            let base = &parsed.document.base;
+            base.get_node(self.handle.0.node).and_then(|node| {
+                node.children
+                    .iter()
+                    .find(|kid| is_element(base, **kid))
+                    .map(|kid| NodeId {
+                        document: parsed.id,
+                        node: *kid,
+                    })
+            })
         };
         child_value(ctx, found)
     }
@@ -4310,10 +6125,17 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx.clone()));
             };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|kids| kids.rev().find(|&kid| is_element(&parsed.document, kid)))
+            let base = &parsed.document.base;
+            base.get_node(self.handle.0.node).and_then(|node| {
+                node.children
+                    .iter()
+                    .rev()
+                    .find(|kid| is_element(base, **kid))
+                    .map(|kid| NodeId {
+                        document: parsed.id,
+                        node: *kid,
+                    })
+            })
         };
         child_value(ctx, found)
     }
@@ -4325,10 +6147,16 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(0);
         };
-        Ok(parsed.document.children(self.handle.0).map_or(0, |kids| {
-            kids.filter(|&kid| is_element(&parsed.document, kid))
-                .count()
-        }))
+        let base = &parsed.document.base;
+        Ok(base
+            .get_node(self.handle.0.node)
+            .map(|node| {
+                node.children
+                    .iter()
+                    .filter(|kid| is_element(base, **kid))
+                    .count()
+            })
+            .unwrap_or(0))
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-append
@@ -4338,16 +6166,8 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
         let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, None)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
+        let (node, _) = insertion_tree_nodes(&ctx, self.handle.0, NodeReference::Tree(node), None)?;
+        insert_tree_node(&ctx, self.handle.0, node, None)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-prepend
@@ -4357,20 +6177,29 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
         let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+        let reference = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|parent| parent.children.first().copied())
+                .map(|node| NodeId {
+                    document: self.handle.0.document,
+                    node,
+                })
         };
-        let reference = parsed
-            .document
-            .children(self.handle.0)
-            .and_then(|mut kids| kids.next());
-        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
+        let (node, reference) = insertion_tree_nodes(
+            &ctx,
+            self.handle.0,
+            NodeReference::Tree(node),
+            reference.map(NodeReference::Tree),
+        )?;
+        insert_tree_node(&ctx, self.handle.0, node, reference)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
@@ -4380,13 +6209,41 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
         let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let (node, _) = insertion_tree_nodes(&ctx, self.handle.0, NodeReference::Tree(node), None)?;
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        dom::mutation::replace_all(&mut parsed.document, self.handle.0, node)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        let added = if parsed.document.is_fragment(node.node) {
+            let moved: Vec<NodeId> = parsed
+                .document
+                .base
+                .get_node(node.node)
+                .map(|backing| {
+                    backing
+                        .children
+                        .iter()
+                        .map(|child| NodeId {
+                            document: node.document,
+                            node: *child,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            parsed.document.record(JournalEntry::ChildList {
+                target: node,
+                added: Vec::new(),
+                removed: moved.clone(),
+                previous: None,
+                next: None,
+            });
+            moved
+        } else {
+            unlink_journaled(&mut parsed, node);
+            vec![node]
+        };
+        replace_all_journaled(&mut parsed, self.handle.0, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
@@ -4405,8 +6262,15 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            dom::selector::select_first(&parsed.document, self.handle.0, &selectors)
+            parsed
+                .document
+                .base
+                .query_selector_in(self.handle.0.node, &selectors)
                 .map_err(|err| select_error(&ctx, &err))?
+                .map(|node| NodeId {
+                    document: parsed.id,
+                    node,
+                })
         };
         child_value(&ctx, found)
     }
@@ -4426,14 +6290,26 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
             parsed
                 .document(self.handle.0)
                 .map(|parsed| {
-                    dom::selector::select_all(&parsed.document, self.handle.0, &selectors)
+                    parsed
+                        .document
+                        .base
+                        .query_selector_all_in(self.handle.0.node, &selectors)
                         .map_err(|err| select_error(&ctx, &err))
+                        .map(|ids| {
+                            ids.into_iter()
+                                .map(|node| {
+                                    Handle(NodeId {
+                                        document: parsed.id,
+                                        node,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
                 })
                 .transpose()?
                 .unwrap_or_default()
         };
-        let handles = ids.into_iter().map(Handle).collect();
-        live_collection(&ctx, self.handle.0, CollectionKind::Static(handles), None)
+        live_collection(&ctx, self.handle.0, CollectionKind::Static(ids), None)
     }
 }
 
@@ -4445,27 +6321,33 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
         let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        let previous = parsed.document.sibling(self.handle.0, false);
-        let reference = match previous {
-            Some(previous) => parsed.document.sibling(previous, true),
-            None => parsed
+        let (parent, reference) = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let Some(parent) = parsed
                 .document
-                .children(parent)
-                .and_then(|mut kids| kids.next()),
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.parent)
+                .map(|node| NodeId {
+                    document: self.handle.0.document,
+                    node,
+                })
+            else {
+                return Ok(());
+            };
+            (parent, self.handle.0)
         };
-        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
+        let (node, reference) = insertion_tree_nodes(
+            &ctx,
+            parent,
+            NodeReference::Tree(node),
+            Some(NodeReference::Tree(reference)),
+        )?;
+        insert_tree_node(&ctx, parent, node, reference)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-after
@@ -4475,20 +6357,36 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
         let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+        let (parent, reference) = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let base = &parsed.document.base;
+            let Some(parent) = base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.parent)
+                .map(|node| NodeId {
+                    document: self.handle.0.document,
+                    node,
+                })
+            else {
+                return Ok(());
+            };
+            let reference = sibling(base, self.handle.0.node, true).map(|node| NodeId {
+                document: self.handle.0.document,
+                node,
+            });
+            (parent, reference)
         };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        let reference = parsed.document.sibling(self.handle.0, true);
-        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
+        let (node, reference) = insertion_tree_nodes(
+            &ctx,
+            parent,
+            NodeReference::Tree(node),
+            reference.map(NodeReference::Tree),
+        )?;
+        insert_tree_node(&ctx, parent, node, reference)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-replacewith
@@ -4498,18 +6396,44 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
         let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let parent = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let Some(parent) = parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.parent)
+                .map(|node| NodeId {
+                    document: self.handle.0.document,
+                    node,
+                })
+            else {
+                return Ok(());
+            };
+            parent
+        };
+        let (node, _) = insertion_tree_nodes(
+            &ctx,
+            parent,
+            NodeReference::Tree(node),
+            Some(NodeReference::Tree(self.handle.0)),
+        )?;
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        dom::mutation::replace_child(&mut parsed.document, parent, node, self.handle.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        let moved = replace_parsed(&mut parsed, parent, node, self.handle.0);
         drop(parsed);
         drop(world);
+        for id in &moved {
+            fixup_option_on_insert(&ctx, *id)?;
+            fixup_radio_on_insert(&ctx, *id)?;
+        }
         schedule_mutation_delivery(&ctx)
     }
 
@@ -4520,8 +6444,14 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        dom::mutation::detach(&mut parsed.document, self.handle.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+        if parsed.document.base.root_node().id == self.handle.0.node {
+            return Err(throw_dom(
+                &ctx,
+                "HierarchyRequestError",
+                "a document cannot be removed",
+            ));
+        }
+        unlink_journaled(&mut parsed, self.handle.0);
         drop(parsed);
         drop(world);
         fixup_focus_after_removal(&ctx, self.handle.0)?;
@@ -4603,7 +6533,11 @@ impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
-    fn focus(&self, ctx: Ctx<'js>, _options: math_ml_element_generated::FocusOptions) -> Result<()> {
+    fn focus(
+        &self,
+        ctx: Ctx<'js>,
+        _options: math_ml_element_generated::FocusOptions,
+    ) -> Result<()> {
         focus_element(&ctx, self.handle.0)
     }
 
@@ -4622,7 +6556,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
-    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         Ok(self.form_action(ctx.clone())?.into())
     }
 
@@ -4722,21 +6656,14 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
         Ok(self.text_length(ctx.clone())? as usize)
     }
 
-    // Selection getters are non-nullable upstream. A textarea always has
-    // selectable text when attached; the null case only exists for detached
-    // nodes, which answer with the empty default. Input types where
-    // selection does not apply keep the spec-prose null, which the u32
-    // signature cannot express; that stays open until input migrates.
+    // Selection getters are non-nullable upstream. No selection state is
+    // stored (a known cutover gap), so a textarea answers the empty default.
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#textFieldSelection
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
     fn get_selection_start(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        let world = world(ctx)?;
-        let parsed = world.borrow();
-        Ok(parsed
-            .document(self.handle.0)
-            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
-            .map_or(0, |(start, _, _)| start as usize))
+        let _ = ctx;
+        Ok(0)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
@@ -4746,12 +6673,8 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
     fn get_selection_end(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        let world = world(ctx)?;
-        let parsed = world.borrow();
-        Ok(parsed
-            .document(self.handle.0)
-            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
-            .map_or(0, |(_, end, _)| end as usize))
+        let _ = ctx;
+        Ok(0)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
@@ -4761,13 +6684,7 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
     fn get_selection_direction(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let world = world(ctx)?;
-        let direction = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
-            .map_or("none", |(_, _, direction)| direction_name(direction));
-        rquickjs::String::from_str(ctx.clone(), direction)
+        rquickjs::String::from_str(ctx.clone(), direction_name(0))
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
@@ -4798,7 +6715,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
-    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         Ok(self.form_action(ctx.clone())?.into())
     }
 
@@ -4846,17 +6763,18 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
     }
 
     // Upstream selection accessors are nullable, keeping the spec-prose
-    // null for input types where selection does not apply.
+    // null for input types where selection does not apply. No selection state
+    // is stored (a known cutover gap), so applicable inputs answer zero.
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#textFieldSelection
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
     fn get_selection_start(&self, ctx: &Ctx<'js>) -> Result<Option<u32>> {
         let world = world(ctx)?;
         let parsed = world.borrow();
-        Ok(parsed
-            .document(self.handle.0)
-            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
-            .map(|(start, _, _)| start))
+        let Some(parsed) = parsed.document(self.handle.0) else {
+            return Ok(None);
+        };
+        Ok(selection_applies(&parsed.document.base, self.handle.0.node).then_some(0))
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
@@ -4869,10 +6787,10 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
     fn get_selection_end(&self, ctx: &Ctx<'js>) -> Result<Option<u32>> {
         let world = world(ctx)?;
         let parsed = world.borrow();
-        Ok(parsed
-            .document(self.handle.0)
-            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
-            .map(|(_, end, _)| end))
+        let Some(parsed) = parsed.document(self.handle.0) else {
+            return Ok(None);
+        };
+        Ok(selection_applies(&parsed.document.base, self.handle.0.node).then_some(0))
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
@@ -4884,14 +6802,14 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
     fn get_selection_direction(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         let world = world(ctx)?;
-        let direction = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
-            .map(|(_, _, direction)| direction_name(direction));
-        direction
-            .map(|direction| rquickjs::String::from_str(ctx.clone(), direction))
-            .transpose()
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.document(self.handle.0) else {
+            return Ok(None);
+        };
+        if !selection_applies(&parsed.document.base, self.handle.0.node) {
+            return Ok(None);
+        }
+        rquickjs::String::from_str(ctx.clone(), direction_name(0)).map(Some)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
@@ -4912,7 +6830,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
 
 impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-action
-    fn get_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_action(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         Ok(self.action(ctx.clone())?.into())
     }
 
@@ -5006,7 +6924,7 @@ impl<'js> html_option_element_generated::HTMLOptionElement<'js> for JsNode {
         // DOMString keeps every code unit, including lone surrogates.
         self.set_text(
             ctx.clone(),
-            WebIdlCodeUnits(dom::DomString::from_utf16(value.to_utf16()?)),
+            WebIdlCodeUnits(crate::dom_string::DomString::from_utf16(value.to_utf16()?)),
         )
     }
 
@@ -5087,7 +7005,7 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
-    fn get_current_src(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_current_src(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         Ok(self.current_src(ctx.clone())?.into())
     }
 }
@@ -5098,7 +7016,7 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
 /// (<https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinked>).
 impl<'js> html_hyperlink_element_utils_generated::HTMLHyperlinkElementUtils<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/links.html#dom-hyperlink-href
-    fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_href(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         host::reflect_url_string(ctx, self.handle.0, "href")
     }
 }
@@ -5107,14 +7025,14 @@ impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
     // Unlike generic URL reflection, an absent `href` falls back to the
     // document base URL rather than the empty string
     // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href>).
-    fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+    fn get_href(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         // Probe the node's owner document, not the calling realm's: a node
         // reached across documents must answer from its own attributes.
         let present = world_for_node(ctx, self.handle.0)
             .ok()
             .and_then(|owner| {
                 owner.borrow().with_document(self.handle.0, |parsed| {
-                    parsed.document.attribute(self.handle.0, "href").is_some()
+                    attr(&parsed.document.base, self.handle.0.node, "href").is_some()
                 })
             })
             .unwrap_or(false);
@@ -5144,13 +7062,18 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
             .ok()
             .and_then(|owner| {
                 owner.borrow().with_document(self.handle.0, |parsed| {
-                    if parsed.document.attribute(self.handle.0, "src").is_some() {
+                    let base = &parsed.document.base;
+                    if attr(base, self.handle.0.node, "src").is_some() {
                         return true;
                     }
-                    parsed.document.children(self.handle.0).is_some_and(|kids| {
-                        kids.into_iter().any(|kid| {
-                            is_html_element(parsed.document.kind(kid), "source")
-                                && parsed.document.attribute(kid, "src").is_some()
+                    base.get_node(self.handle.0.node).is_some_and(|node| {
+                        node.children.iter().any(|kid| {
+                            base.get_node(*kid).is_some_and(|candidate| {
+                                candidate.data.downcast_element().is_some_and(|element| {
+                                    element.name.ns == html_namespace()
+                                        && element.name.local.as_ref() == "source"
+                                })
+                            }) && attr(base, *kid, "src").is_some()
                         })
                     })
                 })
@@ -5193,38 +7116,29 @@ impl html_slot_element_generated::HTMLSlotElement<'_> for JsNode {}
 impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-template-contents
     fn get_content(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(ctx)?;
-        let contents = {
-            let world = world.borrow();
-            world.document(self.handle.0).and_then(|parsed| {
-                is_template_element(parsed.document.kind(self.handle.0))
-                    .then(|| dom::shadow::template_contents(&parsed.document, self.handle.0))
-                    .flatten()
-            })
-        };
-        child_value(ctx, contents)
+        // Known gap: Blitz has no template contents, so templates expose no
+        // separate content fragment.
+        Ok(Value::new_null(ctx.clone()))
     }
 }
 
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let target = with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::ProcessingInstruction { target, .. }) => target.clone(),
-            _ => String::new(),
-        })?;
-        rquickjs::String::from_str(ctx.clone(), &target)
+        // Known gap: Blitz has no processing-instruction nodes, so the brand
+        // never instantiates and the target reads empty.
+        let _ = self.handle;
+        rquickjs::String::from_str(ctx.clone(), "")
     }
 }
 
 impl<'js> document_type_generated::DocumentType<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-documenttype-name
     fn get_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let name = with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Doctype { name, .. }) => name.clone(),
-            _ => String::new(),
-        })?;
-        rquickjs::String::from_str(ctx.clone(), &name)
+        // Known gap: Blitz has no doctype nodes, so the brand never
+        // instantiates and the name reads empty.
+        let _ = self.handle;
+        rquickjs::String::from_str(ctx.clone(), "")
     }
 
     // https://dom.spec.whatwg.org/#dom-documenttype-publicid
@@ -5258,7 +7172,7 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
 
     // https://dom.spec.whatwg.org/#dom-characterdata-data
     fn set_data(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        let data = dom::DomString::from_utf16(value.to_utf16()?);
+        let data = crate::dom_string::DomString::from_utf16(value.to_utf16()?);
         set_character_data(ctx, self.handle.0, data)
     }
 
@@ -5285,7 +7199,7 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-characterdata-appenddata
     fn append_data(&self, ctx: Ctx<'js>, data: rquickjs::String<'js>) -> Result<()> {
         let mut current = character_data(&ctx, self.handle.0)?;
-        current.push_dom(&dom::DomString::from_utf16(data.to_utf16()?));
+        current.push_dom(&crate::dom_string::DomString::from_utf16(data.to_utf16()?));
         set_character_data(&ctx, self.handle.0, current)
     }
 
@@ -5295,7 +7209,11 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
         let offset = character_data_offset(&ctx, offset, units.len())?;
         let insert = data.to_utf16()?;
         units.splice(offset..offset, insert.iter().copied());
-        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
+        set_character_data(
+            &ctx,
+            self.handle.0,
+            crate::dom_string::DomString::from_utf16(units),
+        )
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-deletedata
@@ -5306,7 +7224,11 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
             .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
             .min(units.len());
         units.drain(offset..end);
-        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
+        set_character_data(
+            &ctx,
+            self.handle.0,
+            crate::dom_string::DomString::from_utf16(units),
+        )
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-replacedata
@@ -5324,7 +7246,11 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
             .min(units.len());
         let replacement = data.to_utf16()?;
         units.splice(offset..end, replacement.iter().copied());
-        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
+        set_character_data(
+            &ctx,
+            self.handle.0,
+            crate::dom_string::DomString::from_utf16(units),
+        )
     }
 }
 

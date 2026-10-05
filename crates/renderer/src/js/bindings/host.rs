@@ -14,6 +14,7 @@ use rquickjs::{
 
 use super::{world, world_for_node};
 pub(crate) use crate::js::world::NodeReference;
+use crate::js::world::NodeId;
 
 pub(crate) type Dispatch = for<'a, 'js> fn(Operation, &Params<'a, 'js>) -> Result<Value<'js>>;
 
@@ -178,14 +179,17 @@ pub(crate) fn install_unscopables(prototype: &Object<'_>, names: &[&str]) -> Res
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflect>).
 pub(crate) fn reflect_string<'js>(
     ctx: &Ctx<'js>,
-    element: dom::NodeId,
+    element: NodeId,
     name: &str,
 ) -> Result<rquickjs::String<'js>> {
     let world = super::world(ctx)?;
     let value = world
         .borrow()
         .document(element)
-        .and_then(|parsed| parsed.document.attribute(element, name))
+        .and_then(|parsed| {
+            crate::js::world::attr(&parsed.document.base, element.node, name)
+                .map(str::to_owned)
+        })
         .unwrap_or_default();
     rquickjs::String::from_str(ctx.clone(), &value)
 }
@@ -194,44 +198,32 @@ pub(crate) fn reflect_string<'js>(
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflect>).
 pub(crate) fn reflect_bool(
     ctx: &Ctx<'_>,
-    element: dom::NodeId,
+    element: NodeId,
     name: &str,
 ) -> Result<bool> {
     let world = super::world(ctx)?;
-    Ok(world
-        .borrow()
-        .document(element)
-        .is_some_and(|parsed| parsed.document.attribute(element, name).is_some()))
+    Ok(world.borrow().document(element).is_some_and(|parsed| {
+        crate::js::world::attr(&parsed.document.base, element.node, name).is_some()
+    }))
 }
 
 /// Write a reflected `DOMString` attribute: set the content attribute and
 /// notify mutation observers, mirroring the `setAttribute` algorithm.
 pub(crate) fn reflect_set_string(
     ctx: &Ctx<'_>,
-    element: dom::NodeId,
+    element: NodeId,
     name: &str,
     value: &rquickjs::String<'_>,
 ) -> Result<()> {
     let value = value.to_string()?;
-    let owner = super::world_for_node(ctx, element)?;
-    let world = owner.borrow();
-    let Some(mut parsed) = world.document_mut(element) else {
-        return Err(Exception::throw_type(ctx, "no document"));
-    };
-    dom::mutation::set_attribute(&mut parsed.document, element, name, value.clone())
-        .map_err(|error| super::throw_dom_error(ctx, error))?;
-    drop(parsed);
-    drop(world);
-    super::touch_attr(ctx, element, "", name, &value)?;
-    super::after_attribute_change(ctx, element, name)?;
-    super::schedule_mutation_delivery(ctx)
+    super::set_attribute_sync(ctx, element, name, &value)
 }
 
 /// Write a reflected `boolean` attribute: present with the empty string
 /// when true, removed when false.
 pub(crate) fn reflect_set_bool(
     ctx: &Ctx<'_>,
-    element: dom::NodeId,
+    element: NodeId,
     name: &str,
     value: bool,
 ) -> Result<()> {
@@ -257,7 +249,7 @@ pub(crate) fn instance<'js, T: JsClass<'js>>(ctx: &Ctx<'js>, value: T) -> Result
 /// interface prototype (<https://dom.spec.whatwg.org/#concept-node>).
 pub(crate) fn instance_for_node<'js, T: JsClass<'js>>(
     ctx: &Ctx<'js>,
-    node: dom::NodeId,
+    node: NodeId,
     value: T,
 ) -> Result<Class<'js, T>> {
     let owner = world_for_node(ctx, node)?;
@@ -409,17 +401,20 @@ pub(crate) fn nullable_node_argument<'js>(
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_url_string(
     ctx: &Ctx<'_>,
-    id: dom::NodeId,
+    id: NodeId,
     content: &str,
-) -> Result<dom::DomString> {
+) -> Result<crate::dom_string::DomString> {
     let world_rc = world(ctx)?;
-    let raw = world_rc
+    let raw: String = world_rc
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.document.attribute(id, content));
-    let Some(raw) = raw else {
-        return Ok(dom::DomString::default());
-    };
+        .and_then(|parsed| {
+            crate::js::world::attr(&parsed.document.base, id.node, content).map(str::to_owned)
+        })
+        .unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(crate::dom_string::DomString::default());
+    }
     let base = super::document::document_base_url_string(ctx, id);
     Ok(url::Url::parse(&base)
         .ok()
@@ -428,13 +423,15 @@ pub(crate) fn reflect_url_string(
         .into())
 }
 
-/// Whether `kind` is an HTML element with the given local name.
-fn html_local(kind: Option<&dom::NodeKind>, local: &str) -> bool {
-    matches!(
-        kind,
-        Some(dom::NodeKind::Element { name, .. })
-            if name.ns == dom::html_namespace() && name.local.as_ref() == local
-    )
+/// Whether `data` is an HTML element with the given local name.
+fn html_local(data: Option<&blitz_dom::NodeData>, local: &str) -> bool {
+    match data {
+        Some(blitz_dom::NodeData::Element(element)) => {
+            element.name.ns == crate::js::world::html_namespace()
+                && element.name.local.as_ref() == local
+        }
+        _ => false,
+    }
 }
 
 /// Validates an interface against native state on a shared payload.
@@ -443,113 +440,97 @@ pub(crate) trait SharedClass {
     fn require_interface(&self, ctx: &Ctx<'_>, interface: &str) -> Result<()>;
 }
 
-/// Whether `kind` implements the named node interface, or `None` when the
+/// Whether `data` implements the named node interface, or `None` when the
 /// name is not one the shared payload can represent.
-fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Option<bool> {
+fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -> Option<bool> {
+    use blitz_dom::NodeData;
     Some(match interface {
         // Every node is also an `EventTarget`
         // (<https://dom.spec.whatwg.org/#interface-eventtarget>).
-        "Node" | "EventTarget" => kind.is_some(),
-        "Document" | "XMLDocument" => matches!(kind, Some(dom::NodeKind::Document)),
-        // A shadow root is a fragment carrying shadow metadata.
-        "DocumentFragment" | "ShadowRoot" => matches!(kind, Some(dom::NodeKind::Fragment)),
-        "Element" => matches!(kind, Some(dom::NodeKind::Element { .. })),
+        "Node" | "EventTarget" => data.is_some(),
+        "Document" | "XMLDocument" => matches!(data, Some(NodeData::Document(_))),
+        // Blitz has no shadow roots; every fragment is a plain fragment.
+        "DocumentFragment" | "ShadowRoot" => {
+            matches!(data, Some(NodeData::Element(_)))
+        }
+        "Element" => matches!(data, Some(NodeData::Element(_))),
         "HTMLElement" => {
-            matches!(kind, Some(dom::NodeKind::Element { name, .. }) if name.ns == dom::html_namespace())
+            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
         }
         "SVGElement" => {
-            matches!(kind, Some(dom::NodeKind::Element { name, .. }) if name.ns == dom::svg_namespace())
+            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::svg_namespace())
         }
         "MathMLElement" => {
-            matches!(kind, Some(dom::NodeKind::Element { name, .. }) if name.ns == dom::mathml_namespace())
+            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::mathml_namespace())
         }
         "CharacterData" => matches!(
-            kind,
-            Some(
-                dom::NodeKind::Text { .. }
-                    | dom::NodeKind::Comment { .. }
-                    | dom::NodeKind::CDataSection { .. }
-                    | dom::NodeKind::ProcessingInstruction { .. }
-            )
+            data,
+            Some(NodeData::Text(_) | NodeData::Comment { .. })
         ),
-        "DocumentType" => matches!(kind, Some(dom::NodeKind::Doctype { .. })),
-        "ProcessingInstruction" => {
-            matches!(kind, Some(dom::NodeKind::ProcessingInstruction { .. }))
-        }
+        // Blitz has no doctype, PI, or CDATA nodes.
+        "DocumentType" => false,
+        "ProcessingInstruction" => false,
         // Spec mixins: their members are installed on every including
         // interface, so the receiver check accepts the union of those kinds.
         // `ElementCSSInlineStyle` is included by the HTML, SVG, and MathML
         // element interfaces.
         "ElementCSSInlineStyle" => matches!(
-            kind,
-            Some(dom::NodeKind::Element { name, .. })
-                if name.ns == dom::html_namespace()
-                    || name.ns == dom::svg_namespace()
-                    || name.ns == dom::mathml_namespace()
+            data,
+            Some(NodeData::Element(element))
+                if element.name.ns == crate::js::world::html_namespace()
+                    || element.name.ns == crate::js::world::svg_namespace()
+                    || element.name.ns == crate::js::world::mathml_namespace()
         ),
         "ParentNode" => matches!(
-            kind,
-            Some(dom::NodeKind::Document | dom::NodeKind::Fragment | dom::NodeKind::Element { .. })
+            data,
+            Some(NodeData::Document(_) | NodeData::Element(_))
         ),
         "ChildNode" => matches!(
-            kind,
-            Some(
-                dom::NodeKind::Element { .. }
-                    | dom::NodeKind::Text { .. }
-                    | dom::NodeKind::Comment { .. }
-                    | dom::NodeKind::CDataSection { .. }
-                    | dom::NodeKind::ProcessingInstruction { .. }
-                    | dom::NodeKind::Doctype { .. }
-            )
+            data,
+            Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
         ),
         "NonDocumentTypeChildNode" => matches!(
-            kind,
-            Some(
-                dom::NodeKind::Element { .. }
-                    | dom::NodeKind::Text { .. }
-                    | dom::NodeKind::Comment { .. }
-                    | dom::NodeKind::CDataSection { .. }
-                    | dom::NodeKind::ProcessingInstruction { .. }
-            )
+            data,
+            Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
         ),
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
         "HTMLHyperlinkElementUtils" => {
-            html_local(kind, "a") || html_local(kind, "area")
+            html_local(data, "a") || html_local(data, "area")
         }
         // HTML element interfaces check the element's local name.
-        "HTMLFormElement" => html_local(kind, "form"),
-        "HTMLInputElement" => html_local(kind, "input"),
-        "HTMLTextAreaElement" => html_local(kind, "textarea"),
-        "HTMLSelectElement" => html_local(kind, "select"),
-        "HTMLOptionElement" => html_local(kind, "option"),
-        "HTMLButtonElement" => html_local(kind, "button"),
-        "HTMLFieldSetElement" => html_local(kind, "fieldset"),
-        "HTMLOptGroupElement" => html_local(kind, "optgroup"),
-        "HTMLIFrameElement" => html_local(kind, "iframe"),
-        "HTMLFrameElement" => html_local(kind, "frame"),
-        "HTMLImageElement" => html_local(kind, "img"),
-        "HTMLBaseElement" => html_local(kind, "base"),
-        "HTMLLinkElement" => html_local(kind, "link"),
-        "HTMLMediaElement" => html_local(kind, "audio") || html_local(kind, "video"),
-        "HTMLEmbedElement" => html_local(kind, "embed"),
-        "HTMLScriptElement" => html_local(kind, "script"),
-        "HTMLSourceElement" => html_local(kind, "source"),
-        "HTMLTrackElement" => html_local(kind, "track"),
-        "HTMLMetaElement" => html_local(kind, "meta"),
-        "HTMLMapElement" => html_local(kind, "map"),
-        "HTMLObjectElement" => html_local(kind, "object"),
-        "HTMLOutputElement" => html_local(kind, "output"),
-        "HTMLParamElement" => html_local(kind, "param"),
-        "HTMLSlotElement" => html_local(kind, "slot"),
-        "HTMLTemplateElement" => html_local(kind, "template"),
+        "HTMLFormElement" => html_local(data, "form"),
+        "HTMLInputElement" => html_local(data, "input"),
+        "HTMLTextAreaElement" => html_local(data, "textarea"),
+        "HTMLSelectElement" => html_local(data, "select"),
+        "HTMLOptionElement" => html_local(data, "option"),
+        "HTMLButtonElement" => html_local(data, "button"),
+        "HTMLFieldSetElement" => html_local(data, "fieldset"),
+        "HTMLOptGroupElement" => html_local(data, "optgroup"),
+        "HTMLIFrameElement" => html_local(data, "iframe"),
+        "HTMLFrameElement" => html_local(data, "frame"),
+        "HTMLImageElement" => html_local(data, "img"),
+        "HTMLBaseElement" => html_local(data, "base"),
+        "HTMLLinkElement" => html_local(data, "link"),
+        "HTMLMediaElement" => html_local(data, "audio") || html_local(data, "video"),
+        "HTMLEmbedElement" => html_local(data, "embed"),
+        "HTMLScriptElement" => html_local(data, "script"),
+        "HTMLSourceElement" => html_local(data, "source"),
+        "HTMLTrackElement" => html_local(data, "track"),
+        "HTMLMetaElement" => html_local(data, "meta"),
+        "HTMLMapElement" => html_local(data, "map"),
+        "HTMLObjectElement" => html_local(data, "object"),
+        "HTMLOutputElement" => html_local(data, "output"),
+        "HTMLParamElement" => html_local(data, "param"),
+        "HTMLSlotElement" => html_local(data, "slot"),
+        "HTMLTemplateElement" => html_local(data, "template"),
         _ => return None,
     })
 }
 
 pub(crate) fn require_node_interface(
     ctx: &Ctx<'_>,
-    id: dom::NodeId,
+    id: NodeId,
     interface: &str,
 ) -> Result<()> {
     // https://webidl.spec.whatwg.org/#es-attributes
@@ -559,7 +540,12 @@ pub(crate) fn require_node_interface(
     let document = owner
         .document(id)
         .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
-    match node_interface_matches(document.document.kind(id), interface) {
+    let data = document
+        .document
+        .base
+        .get_node(id.node)
+        .map(|node| &node.data);
+    match node_interface_matches(data, interface) {
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
@@ -580,7 +566,12 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
     let Some(document) = owner.document(id) else {
         return false;
     };
-    node_interface_matches(document.document.kind(id), interface) == Some(true)
+    let data = document
+        .document
+        .base
+        .get_node(id.node)
+        .map(|node| &node.data);
+    node_interface_matches(data, interface) == Some(true)
 }
 
 /// The receiver JS object for hand methods that keep it (observer identity
@@ -678,24 +669,15 @@ pub(crate) fn legacy_null_string_argument<'js>(
 pub(crate) fn document_type_argument<'js>(
     ctx: &Ctx<'js>,
     value: &Value<'js>,
-) -> Result<Option<dom::NodeId>> {
+) -> Result<Option<NodeReference>> {
     // https://webidl.spec.whatwg.org/#js-interface
     // https://webidl.spec.whatwg.org/#js-nullable-type
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    let id = super::required_node(ctx, value)?;
-    let owner = super::world_for_node(ctx, id)?;
-    if owner.borrow().document(id).is_some_and(|parsed| {
-        matches!(
-            parsed.document.kind(id),
-            Some(dom::NodeKind::Doctype { .. })
-        )
-    }) {
-        Ok(Some(id))
-    } else {
-        Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
-    }
+    // Blitz has no doctype nodes; no value converts.
+    let _ = super::required_node(ctx, value)?;
+    Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
 }
 
 pub(crate) fn nullable_string_argument<'js>(

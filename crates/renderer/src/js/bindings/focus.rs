@@ -1,19 +1,19 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
 use super::{
-    LegacyNullString, events, host_node_id, throw_dom_error, webdriver_element, world_for_node,
+    LegacyNullString, events, host_node_id, webdriver_element, world_for_node,
     wrap_node,
 };
 
 use std::rc::Rc;
 
-use dom::{NodeId, NodeKind, html_namespace};
-
+use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Class, Ctx, Exception, Function, Result, Value, prelude::This};
 
 use crate::js::events::EventTargetRef;
 
 use crate::js::world::EventTargetKey;
+use crate::js::world::{BlitzId, JournalEntry, NodeId, attr, html_namespace, is_connected};
 
 /// The node-removal focus fixup: when the document's focused area is inside
 /// a removed subtree, clear it without firing events
@@ -39,36 +39,37 @@ pub(crate) fn fixup_focus_after_removal(ctx: &Ctx<'_>, removed: NodeId) -> Resul
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
 ///
 /// The engine has no layout, so visibility and being rendered cannot be part
-/// of the decision; the element-name, disabled, and connection rules are
-/// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
+/// of the decision; what remains is the element, disabled, connection, and
+/// known-focusable-locals core. Known cutover gaps: `contenteditable` editing
+/// hosts, `area`/`iframe` shapes, SVG focusability beyond `tabindex`, and the
+/// full `tabindex` value parsing (any presence counts here).
 pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    let Some(kind) = parsed.document.kind(node) else {
+    let base = &parsed.document.base;
+    let Some(tree) = base.get_node(node.node) else {
         return Ok(false);
     };
-    let NodeKind::Element { name, .. } = kind else {
+    let Some(element) = tree.data.downcast_element() else {
         return Ok(false);
     };
-    if !dom::lifecycle::is_connected(&parsed.document, node)
-        || is_actually_disabled(&parsed.document, node)
-    {
+    if !is_connected(base, node.node) || is_actually_disabled(base, node.node) {
         return Ok(false);
     }
-    // `tabindex` and `contenteditable` apply to SVG elements too.
-    if parsed.document.attribute(node, "tabindex").is_some() || is_editable(&parsed.document, node) {
+    // `tabindex` applies to SVG elements too.
+    if attr(base, node.node, "tabindex").is_some() {
         return Ok(true);
     }
-    if name.ns != html_namespace() {
+    if element.name.ns != html_namespace() {
         return Ok(false);
     }
-    Ok(match name.local.as_ref() {
-        "input" => !is_hidden_input(&parsed.document, node),
-        "a" | "area" => parsed.document.attribute(node, "href").is_some(),
-        "button" | "iframe" | "select" | "textarea" => true,
+    Ok(match element.name.local.as_ref() {
+        "input" => !is_hidden_input(base, node.node),
+        "a" => attr(base, node.node, "href").is_some(),
+        "button" | "select" | "textarea" => true,
         _ => false,
     })
 }
@@ -77,76 +78,171 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
 /// supports, including descendants of a disabled `fieldset` that are not
 /// inside its first `legend`
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
-fn is_actually_disabled(dom: &dom::Document, node: NodeId) -> bool {
-    if dom.attribute(node, "disabled").is_some()
+fn is_actually_disabled(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    if attr(base, node, "disabled").is_some()
         && matches!(
-            node_local_name(dom, node).as_deref(),
+            node_local_name(base, node).as_deref(),
             Some("button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset")
         )
     {
         return true;
     }
-    let mut cursor = dom.parent(node);
+    let mut cursor = base.get_node(node).and_then(|tree| tree.parent);
     while let Some(parent) = cursor {
-        if node_local_name(dom, parent).as_deref() == Some("fieldset")
-            && dom.attribute(parent, "disabled").is_some()
+        if node_local_name(base, parent).as_deref() == Some("fieldset")
+            && attr(base, parent, "disabled").is_some()
         {
-            let first_legend = dom
-                .children(parent)
-                .into_iter()
-                .flatten()
-                .find(|&child| node_local_name(dom, child).as_deref() == Some("legend"));
+            let first_legend = base.get_node(parent).and_then(|tree| {
+                tree.children
+                    .iter()
+                    .copied()
+                    .find(|&child| node_local_name(base, child).as_deref() == Some("legend"))
+            });
             if let Some(legend) = first_legend {
                 let mut inner = Some(node);
                 while let Some(current) = inner {
                     if current == legend {
                         return false;
                     }
-                    inner = dom.parent(current);
+                    inner = base.get_node(current).and_then(|tree| tree.parent);
                 }
             }
             return true;
         }
-        cursor = dom.parent(parent);
+        cursor = base.get_node(parent).and_then(|tree| tree.parent);
     }
     false
 }
 
-/// Whether the element is an editing host through `contenteditable`,
-/// inheriting the value from ancestors. Only `""`, `true`, and
-/// `plaintext-only` enable editing
-/// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-contenteditable>).
-fn is_editable(dom: &dom::Document, node: NodeId) -> bool {
-    let mut cursor = Some(node);
-    while let Some(current) = cursor {
-        if let Some(value) = dom.attribute(current, "contenteditable") {
-            if value.is_empty()
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("plaintext-only")
-            {
-                return true;
-            }
-            if value.eq_ignore_ascii_case("false") {
-                return false;
-            }
-        }
-        cursor = dom.parent(current);
-    }
-    false
+fn is_hidden_input(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    attr(base, node, "type").is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))
 }
 
-fn is_hidden_input(dom: &dom::Document, node: NodeId) -> bool {
-    dom.attribute(node, "type")
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))
+fn node_local_name(base: &blitz_dom::BaseDocument, node: BlitzId) -> Option<String> {
+    base.get_node(node)
+        .and_then(|tree| tree.data.downcast_element())
+        .and_then(|element| {
+            (element.name.ns == html_namespace()).then(|| element.name.local.to_string())
+        })
 }
 
-fn node_local_name(dom: &dom::Document, node: NodeId) -> Option<String> {
-    match dom.kind(node) {
-        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
-            Some(name.local.to_string())
-        }
-        _ => None,
+/// Writes one content attribute (or removes it for `None`), reusing the
+/// stored qualified name so clearing removes the exact attribute the parser
+/// kept (see `forms.rs` for the same pattern).
+fn write_attr(parsed: &mut crate::Parsed, node: NodeId, local: &str, value: Option<&str>) {
+    let (name, old_value) = {
+        let base = &parsed.document.base;
+        let Some(tree) = base.get_node(node.node) else {
+            return;
+        };
+        let Some(element) = tree.data.downcast_element() else {
+            return;
+        };
+        let name = element
+            .attrs
+            .iter()
+            .find(|attribute| attribute.name.local.as_ref() == local)
+            .map(|attribute| attribute.name.clone())
+            .unwrap_or_else(|| {
+                QualName::new(None, Namespace::from(""), LocalName::from(local))
+            });
+        (name, attr(base, node.node, local).map(str::to_owned))
+    };
+    if old_value.as_deref() == value {
+        return;
     }
+    match value {
+        Some(value) => {
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_attribute(node.node, name, value);
+        }
+        None => {
+            parsed
+                .document
+                .base
+                .mutate()
+                .clear_attribute(node.node, name);
+        }
+    }
+    parsed.document.record(JournalEntry::Attributes {
+        target: node,
+        name: local.to_owned(),
+        namespace: String::new(),
+        old_value,
+    });
+}
+
+/// Sets or clears a boolean content attribute such as `checked`.
+fn set_presence_attr(parsed: &mut crate::Parsed, node: NodeId, local: &str, present: bool) {
+    write_attr(parsed, node, local, present.then_some(""));
+}
+
+/// The `type` of an `input`, lowercased and trimmed; missing means `text`.
+fn input_type(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
+    attr(base, node, "type")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Radios sharing `node`'s `name` in the same tree, in tree order. Blitz
+/// keeps no form-owner model, so the parser-associated form owner is a known
+/// cutover gap and the group spans the document instead of the form.
+fn radio_group(base: &blitz_dom::BaseDocument, document: u32, node: BlitzId) -> Vec<NodeId> {
+    let name = attr(base, node, "name").unwrap_or_default().to_owned();
+    let mut group = Vec::new();
+    let mut stack = vec![base.root_node().id];
+    // Reverse-push keeps the pop order in tree order.
+    while let Some(id) = stack.pop() {
+        let Some(tree) = base.get_node(id) else {
+            continue;
+        };
+        if tree.data.downcast_element().is_some_and(|element| {
+            element.name.ns == html_namespace()
+                && element.name.local.as_ref() == "input"
+                && input_type(base, id) == "radio"
+                && attr(base, id, "name").unwrap_or_default() == name
+        }) {
+            group.push(NodeId { document, node: id });
+        }
+        stack.extend(tree.children.iter().rev().copied());
+    }
+    group.sort_by(|a, b| super::tree_order(base, document, a.node, b.node));
+    group
+}
+
+/// The group's currently checked radio, if any.
+fn radio_group_checked(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    node: BlitzId,
+) -> Option<NodeId> {
+    radio_group(base, document, node)
+        .into_iter()
+        .find(|member| attr(base, member.node, "checked").is_some())
+}
+
+/// The nearest ancestor `form` element. Blitz models no parser-associated
+/// form owner (the `form` attribute and its scoping are known cutover gaps),
+/// so controls outside a form ancestor have no owner here.
+fn form_owner(base: &blitz_dom::BaseDocument, node: BlitzId) -> Option<BlitzId> {
+    let mut cursor = base.get_node(node).and_then(|tree| tree.parent);
+    while let Some(id) = cursor {
+        let is_form = base
+            .get_node(id)
+            .and_then(|tree| tree.data.downcast_element())
+            .is_some_and(|element| {
+                element.name.ns == html_namespace() && element.name.local.as_ref() == "form"
+            });
+        if is_form {
+            return Some(id);
+        }
+        cursor = base.get_node(id).and_then(|tree| tree.parent);
+    }
+    None
 }
 
 /// Moves focus to `node`. The previously focused area is cleared before the
@@ -163,6 +259,7 @@ pub(crate) fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         key: EventTargetKey::Node(node),
         world: Rc::clone(&world),
     };
+    // `set_active_element` mirrors into Blitz (`set_focus_to`/`clear_focus`).
     world.borrow_mut().set_active_element(document, None);
     if let Some(previous) = previous {
         events::fire_trusted_with_related(
@@ -245,7 +342,9 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(parsed) = world.document(node) else {
             return Ok(());
         };
-        if is_actually_disabled(&parsed.document, node) || world.click_in_progress(node) {
+        if is_actually_disabled(&parsed.document.base, node.node)
+            || world.click_in_progress(node)
+        {
             return Ok(());
         }
     }
@@ -278,48 +377,43 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
 /// The checkedness state a canceled click restores.
 enum PreActivation {
     None,
-    Checkbox {
-        checked: bool,
-        indeterminate: bool,
-    },
+    Checkbox { checked: bool },
     Radio(Option<NodeId>),
 }
 
 /// The legacy-pre-activation behavior: a checkbox toggles, a radio becomes
-/// checked and remembers the group's previous checked radio.
+/// checked and remembers the group's previous checked radio. Blitz keeps no
+/// checkedness slot, so the `checked` attribute is the whole state.
 fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(PreActivation::None);
     };
-    let dom = &mut parsed.document;
-    let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
-        return Ok(PreActivation::None);
+    let type_attr = {
+        let base = &parsed.document.base;
+        let Some(tree) = base.get_node(node.node) else {
+            return Ok(PreActivation::None);
+        };
+        let Some(element) = tree.data.downcast_element() else {
+            return Ok(PreActivation::None);
+        };
+        // Only an `input` has the checkbox/radio activation behavior.
+        if element.name.ns != html_namespace() || element.name.local.as_ref() != "input" {
+            return Ok(PreActivation::None);
+        }
+        input_type(base, node.node)
     };
-    // Only an `input` has the checkbox/radio activation behavior.
-    if name.ns != html_namespace() || name.local.as_ref() != "input" {
-        return Ok(PreActivation::None);
-    }
-    let type_attr = dom
-        .attribute(node, "type")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
     Ok(match type_attr.as_str() {
         "checkbox" => {
-            let previous = PreActivation::Checkbox {
-                checked: dom::form::checkedness(dom, node),
-                indeterminate: dom::form::indeterminate(dom, node),
-            };
-            let next = !dom::form::checkedness(dom, node);
-            dom::form::set_input_checkedness(dom, node, next);
-            dom::form::set_indeterminate(dom, node, false);
+            let checked = attr(&parsed.document.base, node.node, "checked").is_some();
+            let previous = PreActivation::Checkbox { checked };
+            set_presence_attr(&mut parsed, node, "checked", !checked);
             previous
         }
         "radio" => {
-            let previous = dom::form::radio_group_checked(dom, node);
-            dom::form::set_input_checkedness(dom, node, true);
+            let previous = radio_group_checked(&parsed.document.base, node.document, node.node);
+            set_presence_attr(&mut parsed, node, "checked", true);
             PreActivation::Radio(previous)
         }
         _ => PreActivation::None,
@@ -333,21 +427,16 @@ fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivat
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    let dom = &mut parsed.document;
     match previous {
-        PreActivation::Checkbox {
-            checked,
-            indeterminate,
-        } => {
-            dom::form::set_input_checkedness(dom, node, *checked);
-            dom::form::set_indeterminate(dom, node, *indeterminate);
+        PreActivation::Checkbox { checked } => {
+            set_presence_attr(&mut parsed, node, "checked", *checked);
         }
         PreActivation::Radio(Some(other)) => {
-            dom::form::set_input_checkedness(dom, node, false);
-            dom::form::set_input_checkedness(dom, *other, true);
+            set_presence_attr(&mut parsed, node, "checked", false);
+            set_presence_attr(&mut parsed, *other, "checked", true);
         }
         PreActivation::Radio(None) => {
-            dom::form::set_input_checkedness(dom, node, false);
+            set_presence_attr(&mut parsed, node, "checked", false);
         }
         PreActivation::None => {}
     }
@@ -362,15 +451,14 @@ fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let checkable = {
         let world = world.borrow();
         world.document(node).is_some_and(|parsed| {
-            let dom = &parsed.document;
-            matches!(
-                dom.kind(node),
-                Some(NodeKind::Element { name, .. })
-                    if name.ns == html_namespace() && name.local.as_ref() == "input"
-            ) && dom.attribute(node, "type").is_some_and(|value| {
-                let value = value.trim().to_ascii_lowercase();
-                value == "checkbox" || value == "radio"
-            })
+            let base = &parsed.document.base;
+            base.get_node(node.node)
+                .and_then(|tree| tree.data.downcast_element())
+                .is_some_and(|element| {
+                    element.name.ns == html_namespace()
+                        && element.name.local.as_ref() == "input"
+                        && matches!(input_type(base, node.node).as_str(), "checkbox" | "radio")
+                })
         })
     };
     if checkable {
@@ -402,34 +490,37 @@ enum Activation {
 fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let world = world_for_node(ctx, node)?;
     let changed = {
-        let world = world.borrow_mut();
+        let world = world.borrow();
         let Some(mut parsed) = world.document_mut(node) else {
             return Ok(());
         };
-        let dom = &mut parsed.document;
-        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
-            return Ok(());
+        let type_attr = {
+            let base = &parsed.document.base;
+            let Some(tree) = base.get_node(node.node) else {
+                return Ok(());
+            };
+            let Some(element) = tree.data.downcast_element() else {
+                return Ok(());
+            };
+            if element.name.ns != html_namespace() || element.name.local.as_ref() != "input" {
+                return Ok(());
+            }
+            input_type(base, node.node)
         };
-        if name.ns != html_namespace() || name.local.as_ref() != "input" {
-            return Ok(());
-        }
-        let type_attr = dom
-            .attribute(node, "type")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
         match type_attr.as_str() {
             "checkbox" => {
-                let next = !dom::form::checkedness(dom, node);
-                dom::form::set_input_checkedness(dom, node, next);
+                let checked = attr(&parsed.document.base, node.node, "checked").is_some();
+                set_presence_attr(&mut parsed, node, "checked", !checked);
                 true
             }
             "radio" => {
                 // A checked radio cannot be unchecked by clicking.
-                if dom::form::checkedness(dom, node) {
+                if attr(&parsed.document.base, node.node, "checked").is_some() {
                     false
                 } else {
-                    dom::form::set_input_checkedness(dom, node, true);
+                    for member in radio_group(&parsed.document.base, node.document, node.node) {
+                        set_presence_attr(&mut parsed, member, "checked", member == node);
+                    }
                     true
                 }
             }
@@ -454,32 +545,37 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(parsed) = world.document(node) else {
             return Ok(());
         };
-        let dom = &parsed.document;
-        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+        let base = &parsed.document.base;
+        let Some(tree) = base.get_node(node.node) else {
             return Ok(());
         };
-        if name.ns != html_namespace() {
+        let Some(element) = tree.data.downcast_element() else {
+            return Ok(());
+        };
+        if element.name.ns != html_namespace() {
             return Ok(());
         }
-        let type_attr = |dom: &dom::Document| {
-            dom.attribute(node, "type")
-                .map(|value| value.trim().to_ascii_lowercase())
-        };
-        let activation = match name.local.as_ref() {
-            "input" => match type_attr(dom).as_deref() {
-                Some("submit") => Activation::Submit,
-                Some("reset") => Activation::Reset,
-                Some("checkbox" | "radio") => Activation::ToggleCheckedness,
+        let activation = match element.name.local.as_ref() {
+            "input" => match input_type(base, node.node).as_str() {
+                "submit" => Activation::Submit,
+                "reset" => Activation::Reset,
+                "checkbox" | "radio" => Activation::ToggleCheckedness,
                 _ => Activation::None,
             },
-            "button" => match type_attr(dom).as_deref() {
+            "button" => match input_type(base, node.node).as_str() {
                 // The missing and invalid value defaults are both Auto (submit).
-                Some("reset") => Activation::Reset,
+                // `input_type` of a button reads its own `type` attribute the
+                // same way; missing or invalid falls through to submit.
+                "reset" => Activation::Reset,
                 _ => Activation::Submit,
             },
             _ => Activation::None,
         };
-        (activation, dom::form::form_owner(dom, node))
+        let form = form_owner(base, node.node).map(|form| NodeId {
+            document: node.document,
+            node: form,
+        });
+        (activation, form)
     };
     match activation {
         Activation::None => Ok(()),
@@ -556,7 +652,7 @@ fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
         let world = world_for_node(&ctx, node)?;
         let world = world.borrow();
         if let Some(parsed) = world.document(node)
-            && is_actually_disabled(&parsed.document, node)
+            && is_actually_disabled(&parsed.document.base, node.node)
         {
             return Ok(());
         }
@@ -584,10 +680,21 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
     let Some(mut parsed) = world.document_mut(node) else {
         return Err(Exception::throw_type(&ctx, "no document"));
     };
+    if parsed
+        .document
+        .base
+        .get_node(node.node)
+        .is_none_or(|tree| tree.data.downcast_element().is_none())
+    {
+        return Err(Exception::throw_type(&ctx, "argument is not an element"));
+    }
     // Same write the IDL setter performs, minus the author-visible entry
     // point (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-    dom::form::set_element_value(&mut parsed.document, node, value.0)
-        .map_err(|err| throw_dom_error(&ctx, err))?;
+    // Blitz keeps no control value store (see `forms.rs`), so the `value`
+    // content attribute carries it; the dirty-value flag is a known cutover
+    // gap. Going through the tree mutator also keeps Blitz's text-input
+    // state in sync.
+    write_attr(&mut parsed, node, "value", Some(&value.0));
     Ok(())
 }
 
@@ -607,7 +714,7 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
         let world = world_for_node(&ctx, node)?;
         let world = world.borrow();
         if let Some(parsed) = world.document(node)
-            && is_actually_disabled(&parsed.document, node)
+            && is_actually_disabled(&parsed.document.base, node.node)
         {
             return Ok(());
         }

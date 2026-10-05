@@ -94,7 +94,7 @@ impl Document {
             DialContext::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight
             || self.frame_load_in_flight
-            || self.active_parser.is_some()
+            || self.active_buffer.is_some()
             || self.world.borrow().main_ready_state() != crate::ReadyState::Complete
     }
 
@@ -241,23 +241,8 @@ impl Document {
         for element in images {
             self.queue_image(element, true);
         }
-        self.fire_pending_selects();
-    }
-
-    /// Fires the `select` events that selection changes queued, one task after
-    /// the change. A listener that changes the selection again queues another,
-    /// so drain in a bounded loop
-    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
-    fn fire_pending_selects(&mut self) {
-        for _ in 0..64 {
-            let nodes = self.world.borrow_mut().take_pending_selects();
-            if nodes.is_empty() {
-                return;
-            }
-            for node in nodes {
-                self.fire_js(|js| js.fire_select(node));
-            }
-        }
+        // Known gap: `select` events have no producer while form selection
+        // state lives in content attributes; nothing queues them.
     }
 
     fn due_timer(&mut self) -> Option<u32> {

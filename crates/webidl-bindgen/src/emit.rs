@@ -726,7 +726,7 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
         },
         GetterMapping::ReflectUrl { content } => {
             quote! {
-                let result: dom::DomString =
+                let result: crate::dom_string::DomString =
                     host::reflect_url_string(&ctx, receiver.node_id(), #content)?;
                 result.to_string_lossy().into_js(&ctx)
             }

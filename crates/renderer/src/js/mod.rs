@@ -11,7 +11,7 @@ mod events;
 mod intl;
 mod modules;
 mod url_parts;
-mod world;
+pub(crate) mod world;
 
 mod observers;
 mod reactions;
@@ -77,7 +77,7 @@ pub enum ScriptValue {
     /// JS string.
     String(String),
     /// A DOM node handle for `WebDriver` element encoding.
-    Node(dom::NodeId),
+    Node(crate::js::world::NodeId),
     /// A JS array, for `WebDriver` JSON.
     List(Vec<ScriptValue>),
     /// A JS object, for `WebDriver` JSON.
@@ -365,25 +365,6 @@ impl JsRealm {
         })
     }
 
-    /// Fires a trusted `select` event at `node`. The DOM queues the event when
-    /// a selection setter changes the stored range, so it lands one task after
-    /// the change
-    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
-    pub(crate) fn fire_select(&self, node: dom::NodeId) -> Result<(), JsError> {
-        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
-            self.context.with(|ctx| {
-                events::fire_trusted(
-                    &ctx,
-                    world::EventTargetKey::Node(node),
-                    "select",
-                    true,
-                    false,
-                )
-                .map_err(JsError::from)
-            })
-        })
-    }
-
     pub(crate) fn finish_js_fetch(
         &self,
         js_id: i32,
@@ -478,7 +459,7 @@ impl JsRealm {
         })
     }
 
-    pub(crate) fn fire_node_load(&self, id: dom::NodeId) -> Result<(), JsError> {
+    pub(crate) fn fire_node_load(&self, id: crate::js::world::NodeId) -> Result<(), JsError> {
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_node_load(&ctx, id)?;
@@ -487,7 +468,7 @@ impl JsRealm {
         })
     }
 
-    pub(crate) fn fire_node_error(&self, id: dom::NodeId) -> Result<(), JsError> {
+    pub(crate) fn fire_node_error(&self, id: crate::js::world::NodeId) -> Result<(), JsError> {
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_node_error(&ctx, id)?;
@@ -1148,29 +1129,32 @@ impl Drop for JsRealm {
     }
 }
 
-pub(crate) fn script_at(world: &World, id: dom::NodeId) -> Option<Script> {
+pub(crate) fn script_at(world: &World, id: crate::js::world::NodeId) -> Option<Script> {
     let parsed = world.document(id)?;
-    let Some(dom::NodeKind::Element { name, .. }) = parsed.document.kind(id) else {
-        return None;
-    };
-    if name.ns != dom::html_namespace() || !name.local.as_ref().eq_ignore_ascii_case("script") {
+    let base = &parsed.document.base;
+    let node = base.get_node(id.node)?;
+    let element = node.data.downcast_element()?;
+    let name = &element.name;
+    if name.ns != crate::js::world::html_namespace()
+        || !name.local.as_ref().eq_ignore_ascii_case("script")
+    {
         return None;
     }
-    let source = match parsed.document.attribute(id, "src") {
-        Some(src) if !src.trim().is_empty() => ScriptSource::Src(src),
+    let source = match crate::js::world::attr(base, id.node, "src") {
+        Some(src) if !src.trim().is_empty() => ScriptSource::Src(src.to_owned()),
         _ => ScriptSource::Inline {
-            source: element_text(&parsed.document, id),
-            line: dom::metadata::script_line(&parsed.document, id).unwrap_or(0),
+            source: element_text(base, id.node),
+            // Known gap: Blitz stores no script line numbers.
+            line: 0,
         },
     };
-    let typ = parsed.document.attribute(id, "type");
+    let typ = crate::js::world::attr(base, id.node, "type");
     if typ
-        .as_deref()
         .is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module"))
     {
         Some(Script::Module(source))
     } else {
-        javascript_mime(typ.as_deref()).then_some(Script::Classic(source))
+        javascript_mime(typ).then_some(Script::Classic(source))
     }
 }
 
@@ -1213,19 +1197,20 @@ fn javascript_mime(typ: Option<&str>) -> bool {
     )
 }
 
-fn element_text(tree: &dom::Document, id: dom::NodeId) -> String {
+fn element_text(base: &blitz_dom::BaseDocument, id: crate::js::world::BlitzId) -> String {
     let mut text = String::new();
-    let mut stack: Vec<_> = tree.children(id).map(Iterator::collect).unwrap_or_default();
-    stack.reverse();
+    let mut stack: Vec<_> = base
+        .get_node(id)
+        .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
     while let Some(child) = stack.pop() {
-        match tree.kind(child) {
-            Some(dom::NodeKind::Text { data }) => text.push_str(&data.to_string_lossy()),
-            Some(dom::NodeKind::Element { .. }) => {
-                if let Some(kids) = tree.children(child) {
-                    let mut kids: Vec<_> = kids.collect();
-                    kids.reverse();
-                    stack.extend(kids);
-                }
+        let Some(node) = base.get_node(child) else {
+            continue;
+        };
+        match &node.data {
+            blitz_dom::NodeData::Text(data) => text.push_str(&data.content),
+            blitz_dom::NodeData::Element(_) => {
+                stack.extend(node.children.iter().rev().copied());
             }
             _ => {}
         }
