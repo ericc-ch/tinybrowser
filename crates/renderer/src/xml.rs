@@ -6,11 +6,22 @@
 use crate::Parsed;
 
 /// Parses `input` as an XML document with the given content type.
-pub(crate) fn parse_document(input: &str, content_type: &'static str) -> Parsed {
-    let base: blitz_dom::BaseDocument =
-        blitz_html::HtmlDocument::from_xml(input, blitz_dom::DocumentConfig::default()).into();
-    // Known gap (upstream): Blitz drops the doctype while parsing, so
-    // `document.doctype` reads null. Tracked in docs/progress.md.
+pub(crate) fn parse_document(
+    input: &str,
+    content_type: &'static str,
+    base_url: String,
+    font_ctx: parley::FontContext,
+) -> Parsed {
+    let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(
+        input,
+        blitz_dom::DocumentConfig {
+            base_url: Some(base_url),
+            font_ctx: Some(font_ctx),
+            ua_stylesheets: Some(Vec::new()),
+            ..blitz_dom::DocumentConfig::default()
+        },
+    )
+    .into();
     let document = crate::documents::BlitzDocument::from_base(base);
     Parsed {
         id: 0,

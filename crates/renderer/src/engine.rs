@@ -268,21 +268,32 @@ impl Engine {
                     message: "no document to render".into(),
                 });
             };
-            let width = viewport_pixels(request.viewport_width);
-            let height = viewport_pixels(request.viewport_height);
+            let width = viewport_pixels(request.viewport_width).map_err(|error| {
+                TabError::Render {
+                    message: error.to_string(),
+                }
+            })?;
+            let height = viewport_pixels(request.viewport_height).map_err(|error| {
+                TabError::Render {
+                    message: error.to_string(),
+                }
+            })?;
             let viewport = blitz_traits::shell::Viewport::new(
                 width,
                 height,
                 1.0,
                 blitz_traits::shell::ColorScheme::Light,
             );
+            let previous = parsed.document.base.viewport().clone();
             parsed.document.base.set_viewport(viewport);
-            parsed.document.base.resolve(0.0);
-            crate::render::paint(&mut parsed.document.base, width, height).map_err(|error| {
-                TabError::Render {
+            crate::render::resolve_until_settled(&mut parsed.document.base);
+            let image = crate::render::paint(&mut parsed.document.base, width, height).map_err(
+                |error| TabError::Render {
                     message: error.to_string(),
-                }
-            })?
+                },
+            )?;
+            parsed.document.base.set_viewport(previous);
+            image
         };
         let image = match request.clip {
             Some(clip) => image
@@ -463,19 +474,17 @@ impl Engine {
                 self.frames.remove(frame);
             }
             let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
-            let mut lifecycle = Vec::new();
+            let mut iframe_lifecycle = Vec::new();
+            let mut image_lifecycle = Vec::new();
             let mut navigations = Vec::new();
             let mut streams = Vec::new();
             for frame in frame_ids {
                 let Some(document) = self.frames.get_mut(&frame) else {
                     continue;
                 };
-                lifecycle.extend(
-                    document
-                        .take_lifecycle()
-                        .into_iter()
-                        .map(|event| (frame, event)),
-                );
+                let (iframes, images) = document.take_lifecycle();
+                iframe_lifecycle.extend(iframes.into_iter().map(|event| (frame, event)));
+                image_lifecycle.extend(images.into_iter().map(|event| (frame, event)));
                 navigations.extend(
                     document
                         .take_frame_navigations()
@@ -489,11 +498,13 @@ impl Engine {
             }
             let deliveries = self.runtime.shared.borrow_mut().take_deliveries();
             let had_work = adopted
-                || !lifecycle.is_empty()
+                || !iframe_lifecycle.is_empty()
+                || !image_lifecycle.is_empty()
                 || !navigations.is_empty()
                 || !streams.is_empty()
                 || !deliveries.is_empty();
-            self.apply_lifecycle(lifecycle);
+            self.apply_iframe_lifecycle(iframe_lifecycle);
+            self.apply_image_lifecycle(image_lifecycle);
             self.apply_navigations(navigations);
             self.apply_streams(streams);
             self.reorder_frames();
@@ -505,51 +516,64 @@ impl Engine {
         }
     }
 
-    /// Applies connection transitions.
-    fn apply_lifecycle(&mut self, events: Vec<(FrameId, crate::document::Lifecycle)>) {
+    /// Applies iframe connection transitions.
+    fn apply_iframe_lifecycle(
+        &mut self,
+        events: Vec<(FrameId, crate::document::IframeLifecycle)>,
+    ) {
         for (parent, event) in events {
             match event {
-                crate::document::Lifecycle::Inserted(container) => {
-                    let is_iframe = self
+                crate::document::IframeLifecycle::Inserted(container) => {
+                    if self
+                        .runtime
+                        .shared
+                        .borrow()
+                        .tree
+                        .frame_for_container(container)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
+                        continue;
+                    }
+                    let child = self.create_frame(parent, container);
+                    let src = self
                         .frames
                         .get(&parent)
-                        .is_some_and(|document| document.is_iframe_element(container));
-                    if is_iframe {
-                        if self
-                            .runtime
-                            .shared
-                            .borrow()
-                            .tree
-                            .frame_for_container(container)
-                            .is_some()
-                        {
-                            continue;
-                        }
-                        if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
-                            continue;
-                        }
-                        let child = self.create_frame(parent, container);
-                        let src = self
-                            .frames
-                            .get(&parent)
-                            .and_then(|document| document.frame_src(container));
-                        self.navigate_frame(
-                            child,
-                            container,
-                            src.as_deref().unwrap_or(""),
-                            "GET",
-                            &[],
-                            None,
-                        );
-                        self.publish_frame_document(container, child);
-                    } else if let Some(document) = self.frames.get_mut(&parent) {
-                        document.queue_connected_image(container);
+                        .and_then(|document| document.frame_src(container));
+                    self.navigate_frame(
+                        child,
+                        container,
+                        src.as_deref().unwrap_or(""),
+                        "GET",
+                        &[],
+                        None,
+                    );
+                    self.publish_frame_document(container, child);
+                }
+                crate::document::IframeLifecycle::Removed(container) => {
+                    self.remove_subtree(container);
+                }
+            }
+        }
+    }
+
+    /// Applies image connection transitions.
+    fn apply_image_lifecycle(
+        &mut self,
+        events: Vec<(FrameId, crate::document::ImageLifecycle)>,
+    ) {
+        for (parent, event) in events {
+            match event {
+                crate::document::ImageLifecycle::Connected(element) => {
+                    if let Some(document) = self.frames.get_mut(&parent) {
+                        document.queue_connected_image(element);
                     }
                 }
-                crate::document::Lifecycle::Removed(container) => {
-                    self.remove_subtree(container);
+                crate::document::ImageLifecycle::Disconnected(element) => {
                     if let Some(document) = self.frames.get_mut(&parent) {
-                        document.disconnect_image(container);
+                        document.disconnect_image(element);
                     }
                 }
             }
@@ -1150,22 +1174,14 @@ impl Drop for Engine {
     }
 }
 
-/// Viewport side in device pixels: at least 1, saturating at `u32::MAX`
-/// (the painter rejects over-cap sizes with `TooLarge`).
-fn viewport_pixels(value: f32) -> u32 {
-    if !value.is_finite() {
-        return u32::MAX;
+/// Viewport side in device pixels, validated for paint.
+fn viewport_pixels(value: f32) -> Result<u32, crate::render::RenderError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(crate::render::RenderError::InvalidViewport);
     }
-    let rounded = value.max(1.0).round();
-    // Both conversions to f64 are exact, so the comparison loses nothing.
-    if f64::from(rounded) >= f64::from(u32::MAX) {
-        return u32::MAX;
+    let rounded = value.round();
+    if f64::from(rounded) > f64::from(crate::render::MAX_VIEWPORT_SIDE) {
+        return Err(crate::render::RenderError::TooLarge);
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "rounded is finite and below u32::MAX, so the cast is exact and non-negative"
-    )]
-    let pixels = rounded as u32;
-    pixels
+    Ok(rounded as u32)
 }

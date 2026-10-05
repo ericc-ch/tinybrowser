@@ -5,7 +5,7 @@ use crate::render::providers::TinyNetProvider;
 use crate::render::{RenderError, RgbaImage};
 
 /// Largest viewport side in device pixels, matching the in-tree painter cap.
-const MAX_SIDE: u32 = 4096;
+pub(crate) const MAX_VIEWPORT_SIDE: u32 = 4096;
 
 /// Fallback base URL when the document URL cannot be a base.
 pub(crate) const INVALID_BASE_URL: &str = "http://invalid/";
@@ -16,6 +16,18 @@ pub(crate) fn blitz_base_url(url: &url::Url) -> String {
         INVALID_BASE_URL.to_owned()
     } else {
         url.as_str().to_owned()
+    }
+}
+
+/// Resolves style and layout until Blitz reports no pending critical
+/// resources, bounded so a pathological tree still paints.
+pub(crate) fn resolve_until_settled(base: &mut blitz_dom::BaseDocument) {
+    for _ in 0..8 {
+        base.resolve(0.0);
+        base.handle_messages();
+        if !base.has_pending_critical_resources() {
+            break;
+        }
     }
 }
 
@@ -58,8 +70,7 @@ pub(crate) fn resolve_frame(
     base: &mut blitz_dom::BaseDocument,
     net: &TinyNetProvider,
 ) -> bool {
-    base.resolve(0.0);
-    base.handle_messages();
+    resolve_until_settled(base);
     !base.has_pending_critical_resources() && net.in_flight() == 0
 }
 
@@ -97,7 +108,7 @@ fn check_dims(width: u32, height: u32) -> Result<(), RenderError> {
     if width == 0 || height == 0 {
         return Err(RenderError::InvalidViewport);
     }
-    if width > MAX_SIDE || height > MAX_SIDE {
+    if width > MAX_VIEWPORT_SIDE || height > MAX_VIEWPORT_SIDE {
         return Err(RenderError::TooLarge);
     }
     Ok(())

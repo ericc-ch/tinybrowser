@@ -1,15 +1,13 @@
 //! Screenshots through Blitz: resolve, paint, encode.
-//!
-//! The in-tree style/layout/paint pipeline is gone. Blitz owns cascade,
-//! layout, and paint; this module keeps the image types, PNG encoding, and
-//! the thin resolve-plus-paint entry points the engine and bindings call.
 
 mod blitz;
 mod decode;
 mod png;
 mod providers;
 
-pub(crate) use blitz::{INVALID_BASE_URL, blitz_base_url, paint};
+pub(crate) use blitz::{
+    INVALID_BASE_URL, MAX_VIEWPORT_SIDE, blitz_base_url, paint, resolve_until_settled,
+};
 pub(crate) use decode::decode_image;
 pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 pub use png::encode_png;

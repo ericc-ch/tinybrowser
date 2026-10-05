@@ -230,17 +230,17 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
         let content_type = type_.as_str();
         // `DOMParser` parses with scripting disabled
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+        // DOMParser documents never render: share fonts, skip UA sheets.
+        let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
+        let base = self
+            .url
+            .parse::<url::Url>()
+            .map_or_else(
+                |_| crate::render::INVALID_BASE_URL.to_owned(),
+                |url| crate::render::blitz_base_url(&url),
+            );
         let mut parsed = if content_type == "text/html" {
-            // DOMParser documents never render: share fonts, skip UA sheets.
-            let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
-            let base = self
-                .url
-                .parse::<url::Url>()
-                .map_or_else(
-                    |_| crate::render::INVALID_BASE_URL.to_owned(),
-                    |url| crate::render::blitz_base_url(&url),
-                );
-            let mut parsed = crate::parse_html_without_scripting(
+            let mut parsed = crate::parse_html(
                 &source,
                 blitz_dom::DocumentConfig {
                     base_url: Some(base),
@@ -253,7 +253,7 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
             parsed.ready_state = crate::ReadyState::Complete;
             parsed
         } else {
-            crate::xml::parse_document(&source, content_type)
+            crate::xml::parse_document(&source, content_type, base, font_ctx)
         };
         // The instance's constructing realm decides the URL, never the
         // caller and never a forged argument: cross-realm method calls parse

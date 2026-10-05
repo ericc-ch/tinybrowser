@@ -10,12 +10,10 @@ workspace = true
 
 [dependencies]
 webstorage = { workspace = true }
-dom = { workspace = true }
 # Exactly html5ever 0.39's own markup5ever; same pin as dom's charter, so
 # parser QualNames flow into dom as one type, no conversion layer.
 markup5ever = "=0.39.0"
 html5ever = "=0.39.0"
-tendril = "0.5"
 encoding_rs = "0.8"
 # Web Crypto entropy must come from the operating system, never the JS PRNG.
 getrandom = "0.4"
@@ -42,9 +40,6 @@ rquickjs = { version = "0.14.0", default-features = false, features = ["std", "l
 serde = { version = "1", features = ["derive"] }
 # Style / layout / paint.
 
-app_units = "0.7"
-euclid = "0.22"
-fontique = { version = "0.11", default-features = false }
 parley = { version = "0.11", default-features = false, features = ["libm"] }
 png = "0.18"
 # JPEG/WebP stay pure Rust: the workspace denies `unsafe_code`, and C codecs
@@ -53,28 +48,8 @@ png = "0.18"
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 zune-core = { version = "0.5.3", default-features = false, features = ["std"] }
 image-webp = "0.2.4"
-selectors = "0.40"
-skrifa = { version = "0.44", default-features = false, features = ["std"] }
-web_atoms = "0.2"
 style = { package = "stylo", version = "0.20" }
-stylo_dom = "0.20"
-stylo_static_prefs = "0.20"
 style_traits = { package = "stylo_traits", version = "0.20" }
-taffy = { version = "0.14", default-features = false, features = [
-    "std",
-    "taffy_tree",
-    "flexbox",
-    "grid",
-    "block_layout",
-    "float_layout",
-    "calc",
-    "content_size",
-    "detailed_layout_info",
-] }
-tiny-skia = "0.12"
-# Already retained by Parley; used directly to parse SVG path data without a
-# second SVG geometry implementation.
-kurbo = "0.13"
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
 # Pinned exact: beta drift is fast, and Cargo.lock pins the rest.
 # `floats` is not a Blitz default but the published stylo_taffy only

@@ -96,20 +96,16 @@ impl Parsed {
 }
 
 
-/// Parses a full HTML document into a fresh tree with the scripting flag
-/// enabled (the browser default).
+/// Parses a full HTML document into a fresh tree.
 ///
-/// Broken markup is recovered exactly the way the HTML spec, and therefore
-/// every browser, mandates; that recovery is html5ever's job (through
-/// `blitz-html`), not ours. Whole-document parse: script interleaving moved
-/// to tree-order execution in `document`, since the tokenizer no longer
-/// yields script boundaries.
+/// Broken markup recovery is html5ever's job (through `blitz-html`).
+/// Script interleaving runs in tree order in `document`.
+/// Blitz parses with scripting disabled, so `noscript` parses as markup;
+/// `document.write` paths handle scripting-enabled insertion separately.
 #[must_use]
 pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Parsed {
     let quirks_mode = sniff_quirks_mode(input);
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_html(input, config).into();
-    // Known gap (upstream): Blitz drops the doctype while parsing, so
-    // `document.doctype` reads null. Tracked in docs/progress.md.
     let document = BlitzDocument::from_base(base);
     Parsed {
         id: 0,
@@ -121,24 +117,8 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
     }
 }
 
-/// Parses a full HTML document with scripting disabled, the mode `DOMParser`
-/// uses
-/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
-///
-/// The Blitz parser always runs with scripting disabled (`noscript` parses as
-/// markup); the scripting-enabled `noscript`-as-text divergence is a known
-/// gap tracked with the cutover.
-#[must_use]
-pub(crate) fn parse_html_without_scripting(input: &str, config: blitz_dom::DocumentConfig) -> Parsed {
-    parse_html(input, config)
-}
-
-/// Compatibility mode from the doctype, simplified: missing means quirks, an
+/// Compatibility mode from the doctype: missing means quirks, an
 /// exact `html` doctype means standards, anything else means limited quirks.
-/// The full public-identifier table
-/// (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>)
-/// is a known gap; Blitz computes its own mode for style internally, so this
-/// only feeds `document.compatMode`.
 fn sniff_quirks_mode(input: &str) -> QuirksMode {
     let rest = input.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\x0c', '\r']);
     let Some(prefix) = rest.get(..9) else {

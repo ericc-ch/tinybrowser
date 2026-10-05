@@ -2628,18 +2628,14 @@ version = "0.1.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
- "app_units",
  "blitz-dom",
  "blitz-html",
  "blitz-paint",
  "blitz-traits",
  "color",
- "dom",
  "encoding_rs",
- "euclid",
  "fixed_decimal",
  "flate2",
- "fontique",
  "getrandom",
  "html5ever",
  "icu_calendar",
@@ -2652,25 +2648,16 @@ dependencies = [
  "icu_provider_adapters",
  "icu_provider_blob",
  "image-webp",
- "kurbo",
  "markup5ever",
  "parley",
  "png",
  "rquickjs",
- "selectors",
  "serde",
  "serde_json",
- "skrifa",
  "stylo",
- "stylo_dom",
- "stylo_static_prefs",
  "stylo_traits",
- "taffy",
- "tendril",
- "tiny-skia",
  "tokio",
  "url",
- "web_atoms",
  "webidl-bindgen",
  "webstorage",
  "writeable",
@@ -3392,21 +3379,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tiny-skia"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
-dependencies = [
- "arrayref",
- "arrayvec",
- "bytemuck",
- "cfg-if",
- "log",
- "png",
- "tiny-skia-path",
 ]
 
 [[package]]

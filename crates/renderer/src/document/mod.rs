@@ -150,11 +150,19 @@ enum ParserOwner {
 }
 
 /// A connection transition for one `iframe` container in this document.
-pub(crate) enum Lifecycle {
+pub(crate) enum IframeLifecycle {
     /// A connected container with no child frame yet.
     Inserted(crate::js::world::NodeId),
     /// A container whose frame is gone or disconnected.
     Removed(crate::js::world::NodeId),
+}
+
+/// A connection transition for one `<img>` element in this document.
+pub(crate) enum ImageLifecycle {
+    /// A newly connected image to start fetching.
+    Connected(crate::js::world::NodeId),
+    /// A disconnected image to stop fetching.
+    Disconnected(crate::js::world::NodeId),
 }
 
 struct Timer {
@@ -437,33 +445,31 @@ impl Document {
         self.url.as_str().to_owned()
     }
 
-    pub(crate) fn take_lifecycle(&mut self) -> Vec<Lifecycle> {
-        let connected = self.world.borrow().iframe_containers_in_order();
-        // Parser insertions bypass the bindings that queue image fetches, and
-        // script insertions land directly in the Blitz tree, so a scan is
-        // what notices a connected `<img>` the way the old DOM lifecycle did
-        // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-        let connected_images: Vec<crate::js::world::NodeId> = self
-            .world
-            .borrow()
-            .with_main_document(|parsed| {
-                let base = &parsed.document.base;
-                let document = parsed.id;
-                let mut images = Vec::new();
-                let mut stack = vec![base.root_node().id];
-                while let Some(id) = stack.pop() {
-                    if crate::js::world::is_html_element(base, id, "img")
-                        && crate::js::world::is_connected(base, id)
-                    {
+    pub(crate) fn take_lifecycle(
+        &mut self,
+    ) -> (Vec<IframeLifecycle>, Vec<ImageLifecycle>) {
+        let (connected, connected_images) = self.world.borrow().with_main_document(|parsed| {
+            let base = &parsed.document.base;
+            let document = parsed.id;
+            let mut containers = Vec::new();
+            let mut images = Vec::new();
+            let mut stack = vec![base.root_node().id];
+            while let Some(id) = stack.pop() {
+                if crate::js::world::is_connected(base, id) {
+                    if crate::js::world::is_iframe_element(base, id) {
+                        containers.push(crate::js::world::NodeId { document, node: id });
+                    }
+                    if crate::js::world::is_html_element(base, id, "img") {
                         images.push(crate::js::world::NodeId { document, node: id });
                     }
-                    if let Some(node) = base.get_node(id) {
-                        stack.extend(node.children.iter().rev().copied());
-                    }
                 }
-                images
-            })
-            .unwrap_or_default();
+                if let Some(node) = base.get_node(id) {
+                    stack.extend(node.children.iter().rev().copied());
+                }
+            }
+            (containers, images)
+        })
+        .unwrap_or_default();
         let shared = self.shared.borrow();
         let known: std::collections::HashSet<crate::js::world::NodeId> = shared
             .tree
@@ -474,31 +480,32 @@ impl Document {
         drop(shared);
         let connected_set: std::collections::HashSet<crate::js::world::NodeId> =
             connected.iter().copied().collect();
-        let mut events = Vec::new();
+        let mut iframe_events = Vec::new();
         for container in &connected {
             if !known.contains(container) {
-                events.push(Lifecycle::Inserted(*container));
+                iframe_events.push(IframeLifecycle::Inserted(*container));
             }
         }
         for container in &known {
             if !connected_set.contains(container) {
-                events.push(Lifecycle::Removed(*container));
+                iframe_events.push(IframeLifecycle::Removed(*container));
             }
         }
         let connected_image_set: std::collections::HashSet<crate::js::world::NodeId> =
             connected_images.iter().copied().collect();
+        let mut image_events = Vec::new();
         for element in &connected_images {
             if !self.connected_images.contains(element) {
-                events.push(Lifecycle::Inserted(*element));
+                image_events.push(ImageLifecycle::Connected(*element));
             }
         }
         let previous = std::mem::replace(&mut self.connected_images, connected_image_set);
         for element in previous {
             if !self.connected_images.contains(&element) {
-                events.push(Lifecycle::Removed(element));
+                image_events.push(ImageLifecycle::Disconnected(element));
             }
         }
-        events
+        (iframe_events, image_events)
     }
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
@@ -522,14 +529,6 @@ impl Document {
     pub(crate) fn fire_node_load(&mut self, id: crate::js::world::NodeId) {
         self.fire_js(|js| js.fire_node_load(id));
         self.adopt_js_work();
-    }
-
-    /// Whether `id` is an HTML `iframe` in this document.
-    #[must_use]
-    pub(crate) fn is_iframe_element(&self, id: crate::js::world::NodeId) -> bool {
-        self.world.borrow().document(id).is_some_and(|parsed| {
-            crate::js::world::is_iframe_element(&parsed.document.base, id.node)
-        })
     }
 
     /// Queues the image fetch for a newly connected `<img>`, if it still needs one
