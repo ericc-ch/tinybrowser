@@ -1,8 +1,11 @@
 //! Process logging: a stderr console plus an optional background file sink.
 //!
 //! Nothing is logged until [`install`] is called, so libraries and tests stay
-//! quiet by default. The console is **stderr only**: stdout carries command
-//! results in the CLI and protocol JSON in the renderer.
+//! quiet by default. The console is **stderr only**: the CLI prints command
+//! results to stdout, on platforms without a socket transport the renderer
+//! protocol rides stdout, and on Unix a renderer's stdout is `/dev/null` (its
+//! transport is the socket on stdin). stderr is the stream the daemon can
+//! read, forward, and persist.
 //!
 //! One record is one line:
 //!
