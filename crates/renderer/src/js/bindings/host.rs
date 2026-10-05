@@ -424,15 +424,6 @@ pub(crate) fn reflect_url_string(
 }
 
 /// Whether `data` is an HTML element with the given local name.
-fn html_local(data: Option<&blitz_dom::NodeData>, local: &str) -> bool {
-    match data {
-        Some(blitz_dom::NodeData::Element(element)) => {
-            element.name.ns == crate::js::world::html_namespace()
-                && element.name.local.as_ref() == local
-        }
-        _ => false,
-    }
-}
 
 /// Validates an interface against native state on a shared payload.
 /// Page-controlled prototypes must not grant an interface brand.
@@ -495,34 +486,34 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
         "HTMLHyperlinkElementUtils" => {
-            html_local(data, "a") || html_local(data, "area")
+            crate::js::world::is_html_tag(data, "a") || crate::js::world::is_html_tag(data, "area")
         }
         // HTML element interfaces check the element's local name.
-        "HTMLFormElement" => html_local(data, "form"),
-        "HTMLInputElement" => html_local(data, "input"),
-        "HTMLTextAreaElement" => html_local(data, "textarea"),
-        "HTMLSelectElement" => html_local(data, "select"),
-        "HTMLOptionElement" => html_local(data, "option"),
-        "HTMLButtonElement" => html_local(data, "button"),
-        "HTMLFieldSetElement" => html_local(data, "fieldset"),
-        "HTMLOptGroupElement" => html_local(data, "optgroup"),
-        "HTMLIFrameElement" => html_local(data, "iframe"),
-        "HTMLFrameElement" => html_local(data, "frame"),
-        "HTMLImageElement" => html_local(data, "img"),
-        "HTMLBaseElement" => html_local(data, "base"),
-        "HTMLLinkElement" => html_local(data, "link"),
-        "HTMLMediaElement" => html_local(data, "audio") || html_local(data, "video"),
-        "HTMLEmbedElement" => html_local(data, "embed"),
-        "HTMLScriptElement" => html_local(data, "script"),
-        "HTMLSourceElement" => html_local(data, "source"),
-        "HTMLTrackElement" => html_local(data, "track"),
-        "HTMLMetaElement" => html_local(data, "meta"),
-        "HTMLMapElement" => html_local(data, "map"),
-        "HTMLObjectElement" => html_local(data, "object"),
-        "HTMLOutputElement" => html_local(data, "output"),
-        "HTMLParamElement" => html_local(data, "param"),
-        "HTMLSlotElement" => html_local(data, "slot"),
-        "HTMLTemplateElement" => html_local(data, "template"),
+        "HTMLFormElement" => crate::js::world::is_html_tag(data, "form"),
+        "HTMLInputElement" => crate::js::world::is_html_tag(data, "input"),
+        "HTMLTextAreaElement" => crate::js::world::is_html_tag(data, "textarea"),
+        "HTMLSelectElement" => crate::js::world::is_html_tag(data, "select"),
+        "HTMLOptionElement" => crate::js::world::is_html_tag(data, "option"),
+        "HTMLButtonElement" => crate::js::world::is_html_tag(data, "button"),
+        "HTMLFieldSetElement" => crate::js::world::is_html_tag(data, "fieldset"),
+        "HTMLOptGroupElement" => crate::js::world::is_html_tag(data, "optgroup"),
+        "HTMLIFrameElement" => crate::js::world::is_html_tag(data, "iframe"),
+        "HTMLFrameElement" => crate::js::world::is_html_tag(data, "frame"),
+        "HTMLImageElement" => crate::js::world::is_html_tag(data, "img"),
+        "HTMLBaseElement" => crate::js::world::is_html_tag(data, "base"),
+        "HTMLLinkElement" => crate::js::world::is_html_tag(data, "link"),
+        "HTMLMediaElement" => crate::js::world::is_html_tag(data, "audio") || crate::js::world::is_html_tag(data, "video"),
+        "HTMLEmbedElement" => crate::js::world::is_html_tag(data, "embed"),
+        "HTMLScriptElement" => crate::js::world::is_html_tag(data, "script"),
+        "HTMLSourceElement" => crate::js::world::is_html_tag(data, "source"),
+        "HTMLTrackElement" => crate::js::world::is_html_tag(data, "track"),
+        "HTMLMetaElement" => crate::js::world::is_html_tag(data, "meta"),
+        "HTMLMapElement" => crate::js::world::is_html_tag(data, "map"),
+        "HTMLObjectElement" => crate::js::world::is_html_tag(data, "object"),
+        "HTMLOutputElement" => crate::js::world::is_html_tag(data, "output"),
+        "HTMLParamElement" => crate::js::world::is_html_tag(data, "param"),
+        "HTMLSlotElement" => crate::js::world::is_html_tag(data, "slot"),
+        "HTMLTemplateElement" => crate::js::world::is_html_tag(data, "template"),
         _ => return None,
     })
 }

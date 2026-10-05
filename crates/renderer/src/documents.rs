@@ -6,13 +6,9 @@
 //! realm-associated.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Parsed;
 use crate::js::world::JournalEntry;
-
-/// Process-wide mutation order for observer delivery across documents.
-static NEXT_JOURNAL_POSITION: AtomicU64 = AtomicU64::new(1);
 
 /// A Blitz document plus the side data our engine keeps per document.
 pub(crate) struct BlitzDocument {
@@ -20,6 +16,7 @@ pub(crate) struct BlitzDocument {
     pub base: blitz_dom::BaseDocument,
     /// Mutations since the last observer drain, in operation order.
     pub journal: Vec<(u64, JournalEntry)>,
+    next_journal_position: u64,
     /// Whether any observer watches this document; unobserved mutations are
     /// not recorded.
     recording: bool,
@@ -36,6 +33,7 @@ impl BlitzDocument {
         Self {
             base: blitz_dom::BaseDocument::new(config),
             journal: Vec::new(),
+            next_journal_position: 1,
             recording: false,
             fragments: HashSet::new(),
         }
@@ -46,6 +44,7 @@ impl BlitzDocument {
         Self {
             base,
             journal: Vec::new(),
+            next_journal_position: 1,
             recording: false,
             fragments: HashSet::new(),
         }
@@ -54,7 +53,8 @@ impl BlitzDocument {
     /// Records `entry` when an observer watches this document.
     pub(crate) fn record(&mut self, entry: JournalEntry) {
         if self.recording {
-            let position = NEXT_JOURNAL_POSITION.fetch_add(1, Ordering::SeqCst);
+            let position = self.next_journal_position;
+            self.next_journal_position = self.next_journal_position.wrapping_add(1);
             self.journal.push((position, entry));
         }
     }

@@ -1,10 +1,4 @@
 //! Blitz screenshots: HTML string through the Blitz stack into pixels.
-//!
-//! Scaffold for the full cutover: parses with `blitz-html`, resolves style
-//! and layout on the `BaseDocument`, paints the scene through
-//! `anyrender_vello_cpu`, and converts the premultiplied output to our
-//! straight-alpha [`RgbaImage`](crate::render::RgbaImage). Replaces
-//! [`cascade`](crate::render::cascade) once bindings move over.
 
 #[cfg(test)]
 use crate::render::providers::TinyNetProvider;
@@ -13,17 +7,13 @@ use crate::render::{RenderError, RgbaImage};
 /// Largest viewport side in device pixels, matching the in-tree painter cap.
 const MAX_SIDE: u32 = 4096;
 
+/// Fallback base URL when the document URL cannot be a base.
+pub(crate) const INVALID_BASE_URL: &str = "http://invalid/";
+
 /// Base URL string for a Blitz document configuration.
-///
-/// Blitz panics resolving a relative subresource URL against a
-/// cannot-be-a-base URL (`BaseDocument::resolve_url` unwraps), so
-/// non-hierarchical document URLs fall back to `http://invalid/`
-/// (RFC 2606, never resolves: relative fetches fail closed as broken
-/// resources instead of taking down the renderer). Observed
-/// `document.baseURI` is unaffected: it reads the real document URL.
 pub(crate) fn blitz_base_url(url: &url::Url) -> String {
     if url.cannot_be_a_base() {
-        "http://invalid/".to_owned()
+        INVALID_BASE_URL.to_owned()
     } else {
         url.as_str().to_owned()
     }

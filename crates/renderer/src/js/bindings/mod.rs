@@ -1056,16 +1056,7 @@ pub(crate) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
 pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
     let registry = realm_registry(ctx)?;
     let owner = registry.borrow().owner_world(id);
-    match owner {
-        Some(owner) => Ok(owner),
-        None => world(ctx),
-    }
-}
-
-/// Adoption copies by snapshot; stale handles are not forwarded (known-fail:
-/// `node-realm-mixed-across-adoption` fails identically on `main`).
-pub(crate) fn live_node(_ctx: &Ctx<'_>, id: NodeId) -> NodeId {
-    id
+    owner.ok_or_else(|| Exception::throw_type(ctx, "stale node"))
 }
 
 pub(super) fn with_node_data<T>(
@@ -1073,8 +1064,8 @@ pub(super) fn with_node_data<T>(
     id: NodeId,
     read: impl FnOnce(Option<&NodeData>) -> T,
 ) -> Result<T> {
-    let world = world(ctx)?;
-    let parsed = world.borrow();
+    let owner = world_for_node(ctx, id)?;
+    let parsed = owner.borrow();
     let Some(parsed) = parsed.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
@@ -1095,8 +1086,8 @@ pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<crate::dom_str
 
 /// The value of `id`'s attribute `local`, or the empty string.
 pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<String> {
-    let world = world(ctx)?;
-    Ok(world
+    let owner = world_for_node(ctx, id)?;
+    Ok(owner
         .borrow()
         .document(id)
         .and_then(|parsed| {
@@ -1115,9 +1106,9 @@ pub(super) fn set_character_data(
     // Lone surrogates cannot survive the UTF-8 tree: they become the
     // replacement character at this boundary, a known cutover gap.
     let data = data.to_string_lossy().into_owned();
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(id) else {
+    let owner = world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(id) else {
         return Ok(());
     };
     let old_value = {
@@ -1162,7 +1153,7 @@ pub(super) fn set_character_data(
         },
     );
     drop(parsed);
-    drop(world);
+    drop(owner);
     schedule_mutation_delivery(ctx)
 }
 
@@ -1236,7 +1227,7 @@ pub(super) fn element_sibling_value<'js>(
         let base = &parsed.document.base;
         let mut cursor = sibling(base, id.node, forward);
         while let Some(next) = cursor {
-            if is_element(base, next) {
+            if is_real_element(&parsed.document, next) {
                 break;
             }
             cursor = sibling(base, next, forward);
@@ -1254,7 +1245,7 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 }
 
 /// A DOM string as a JavaScript string value, preserving every code unit.
-pub(super) fn dom_string<'js>(
+pub(crate) fn dom_string<'js>(
     ctx: &Ctx<'js>,
     value: &crate::dom_string::DomString,
 ) -> Result<rquickjs::String<'js>> {
@@ -1383,7 +1374,7 @@ pub(super) fn valid_attribute_local_name(local: &str) -> bool {
 }
 
 /// [Valid element local name](https://dom.spec.whatwg.org/#valid-element-local-name).
-fn valid_element_local_name(name: &str) -> bool {
+pub(crate) fn valid_element_local_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -1473,21 +1464,14 @@ pub(super) fn live_collection<'js>(
 
 pub(super) fn is_element(base: &blitz_dom::BaseDocument, id: super::world::BlitzId) -> bool {
     base.get_node(id)
-        .is_some_and(|node| node.data.downcast_element().is_some())
+        .is_some_and(|node| matches!(node.data, NodeData::Element(_)))
 }
 
-/// Whether `name` is an element in the HTML namespace with local name
-/// `local`.
-pub(super) fn is_html_name(name: &QualName, local: &str) -> bool {
-    name.ns == super::world::html_namespace() && name.local.as_ref() == local
-}
-
-/// Whether `data` is an element in the HTML namespace with local name `local`.
-pub(super) fn is_html_element(data: Option<&NodeData>, local: &str) -> bool {
-    match data {
-        Some(NodeData::Element(element)) => is_html_name(&element.name, local),
-        _ => false,
-    }
+pub(super) fn is_real_element(
+    doc: &crate::documents::BlitzDocument,
+    id: super::world::BlitzId,
+) -> bool {
+    !doc.is_fragment(id) && is_element(&doc.base, id)
 }
 
 /// The root of the tree `id` participates in (itself when detached).

@@ -2,7 +2,7 @@
 
 use super::{
     NodeContext, throw_dom, validate_and_extract, world, world_for_node, wrap_new_document,
-    wrap_new_document_in_world, wrap_node,
+    wrap_new_document_in_world,
 };
 
 use crate::js::world::Handle;
@@ -10,7 +10,7 @@ use crate::js::world::NodeId;
 
 use markup5ever::{LocalName, QualName};
 
-use rquickjs::{Ctx, Exception, Result, Value, class::Trace};
+use rquickjs::{Ctx, Result, Value, class::Trace};
 
 /// `DOMImplementation` as a platform object
 /// (<https://dom.spec.whatwg.org/#interface-domimplementation>).
@@ -45,28 +45,11 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 "doctype name contains invalid characters",
             ));
         }
-        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
-        // kind. Materialize a Comment placeholder so the wrapper stays live.
-        let owner = world_for_node(&ctx, self.document.0)?;
-        let (document, blitz_id) = {
-            let owner = owner.borrow();
-            let Some(mut parsed) = owner.document_mut(self.document.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
-            };
-            let blitz_id = parsed
-                .document
-                .base
-                .mutate()
-                .create_comment_node(&format!("DOCTYPE {name}"));
-            (self.document.0.document, blitz_id)
-        };
-        wrap_node(
+        Err(throw_dom(
             &ctx,
-            NodeId {
-                document,
-                node: blitz_id,
-            },
-        )
+            "HierarchyRequestError",
+            "document type nodes are not supported",
+        ))
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
@@ -101,8 +84,6 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         };
         let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
         let mut parsed = crate::Parsed::script(content_type, font_ctx);
-        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
-        // kind, so the doctype argument is dropped instead of adopted.
         let _ = doctype;
         if let Some(name) = root {
             let document_root = parsed.document.base.root_node().id;
@@ -125,8 +106,6 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
         let mut parsed = crate::Parsed::script("text/html", font_ctx);
         let document_root = parsed.document.base.root_node().id;
-        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
-        // kind, so `createHTMLDocument` builds no doctype, unlike the spec.
         let html = parsed
             .document
             .base
@@ -187,9 +166,6 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
 }
 
 /// The doctype's name, public id, and system id, when `parsed` holds `id`.
-///
-/// Known gap (upstream, docs/progress.md): Blitz has no doctype node kind,
-/// so this always reports `None`.
 pub(super) fn doctype_fields(
     parsed: &crate::Parsed,
     id: NodeId,
@@ -261,7 +237,7 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
                 .url
                 .parse::<url::Url>()
                 .map_or_else(
-                    |_| "http://invalid/".to_owned(),
+                    |_| crate::render::INVALID_BASE_URL.to_owned(),
                     |url| crate::render::blitz_base_url(&url),
                 );
             let mut parsed = crate::parse_html_without_scripting(
@@ -327,10 +303,18 @@ impl<'js> xml_serializer_generated::XMLSerializer<'js> for JsXmlSerializer {
     ) -> Result<rquickjs::String<'js>> {
         // An `Attr` serializes as the empty string
         // (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
-        // Gap: the old serializer still targets the previous tree type
-        // and has no Blitz equivalent yet; every tree node serializes as the
-        // empty string until the serializer is ported.
-        let _ = matches!(root, super::host::NodeReference::Tree(_));
-        rquickjs::String::from_str(ctx.clone(), "")
+        let Some(id) = root.tree() else {
+            return rquickjs::String::from_str(ctx.clone(), "");
+        };
+        let owner = world_for_node(&ctx, id)?;
+        let text = owner.borrow().document(id).map_or_else(
+            || crate::dom_string::DomString::default(),
+            |parsed| {
+                let mut output = super::node::HtmlOutput::default();
+                super::node::serialize_xml_node(&parsed.document, id.node, &mut output);
+                output.finish()
+            },
+        );
+        crate::js::bindings::dom_string(&ctx, &text)
     }
 }

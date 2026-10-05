@@ -1,7 +1,7 @@
 //! Attribute, class, and handler-attribute objects and plumbing.
 
 use super::{
-    FromJs, OptString, WebIdlString, child_value, deref_weak, is_html_element, make_weak,
+    FromJs, OptString, WebIdlString, child_value, deref_weak, make_weak,
     qualified_name, realm_registry, schedule_mutation_delivery, string_value, throw_dom,
     with_node_data, world, world_for_node, wrap_node,
 };
@@ -1597,8 +1597,13 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     // A `body` element's window event handler attributes register on the
     // window itself
     // (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
-    let is_body =
-        with_node_data(ctx, element, |data| is_html_element(data, "body")).unwrap_or(false);
+    let is_body = world_for_node(ctx, element)
+        .ok()
+        .is_some_and(|owner| {
+            owner.borrow().document(element).is_some_and(|parsed| {
+                js_world::is_html_element(&parsed.document.base, element.node, "body")
+            })
+        });
     let forwarded = WINDOW_HANDLER_ATTRIBUTES.contains(&name.as_str()) && is_body;
     match body {
         Some(body) if !body.trim().is_empty() => {
@@ -1675,10 +1680,18 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     if local != "src" {
         return Ok(());
     }
-    let is_iframe =
-        with_node_data(ctx, element, |data| is_html_element(data, "iframe")).unwrap_or(false);
-    let is_img =
-        with_node_data(ctx, element, |data| is_html_element(data, "img")).unwrap_or(false);
+    let (is_iframe, is_img) = world_for_node(ctx, element)
+        .ok()
+        .and_then(|owner| {
+            owner.borrow().document(element).map(|parsed| {
+                let base = &parsed.document.base;
+                (
+                    js_world::is_html_element(base, element.node, "iframe"),
+                    js_world::is_html_element(base, element.node, "img"),
+                )
+            })
+        })
+        .unwrap_or((false, false));
     if !is_iframe && !is_img {
         return Ok(());
     }

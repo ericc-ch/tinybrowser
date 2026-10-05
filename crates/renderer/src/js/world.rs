@@ -293,18 +293,23 @@ pub(crate) fn mathml_namespace() -> markup5ever::Namespace {
     markup5ever::ns!(mathml)
 }
 
+/// Whether `data` is an HTML element named `local`.
+pub(crate) fn is_html_tag(data: Option<&blitz_dom::NodeData>, local: &str) -> bool {
+    match data {
+        Some(blitz_dom::NodeData::Element(element)) => {
+            element.name.ns == html_namespace() && element.name.local.as_ref() == local
+        }
+        _ => false,
+    }
+}
+
 /// Whether `node` is an HTML element named `local`.
 pub(crate) fn is_html_element(
     base: &blitz_dom::BaseDocument,
     id: BlitzNodeId,
     local: &str,
 ) -> bool {
-    base.get_node(id).is_some_and(|node| {
-        let Some(element) = node.data.downcast_element() else {
-            return false;
-        };
-        element.name.ns == html_namespace() && element.name.local.as_ref() == local
-    })
+    base.get_node(id).is_some_and(|node| is_html_tag(Some(&node.data), local))
 }
 
 /// One DOM node handle owned by the JS world.
@@ -569,10 +574,6 @@ pub(crate) struct World {
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
     pub(crate) image_broken: HashSet<NodeId>,
-    /// Loaded `<link rel=stylesheet>` text by link element, in document order
-    /// at collection time. Stored here (like decoded images) so paint and
-    /// script geometry share one source.
-    pub(crate) author_sheets: HashMap<NodeId, String>,
 }
 
 impl Drop for World {
@@ -653,7 +654,6 @@ impl World {
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
             image_broken: HashSet::new(),
-            author_sheets: HashMap::new(),
         }
     }
 
@@ -1228,16 +1228,6 @@ impl World {
         self.image_current_src.clear();
         self.image_broken.clear();
         self.release_decoded_image_bytes(bytes);
-    }
-
-    /// Retains one loaded `<link rel=stylesheet>` sheet for the cascade.
-    pub(crate) fn store_stylesheet(&mut self, element: NodeId, css: String) {
-        self.author_sheets.insert(element, css);
-    }
-
-    /// Drops every loaded sheet; a navigation re-scans the new document.
-    pub(crate) fn clear_stylesheets(&mut self) {
-        self.author_sheets.clear();
     }
 
     fn reserve_decoded_image_bytes(&self, bytes: usize) -> bool {

@@ -9,7 +9,7 @@ mod decode;
 mod png;
 mod providers;
 
-pub(crate) use blitz::{blitz_base_url, paint};
+pub(crate) use blitz::{INVALID_BASE_URL, blitz_base_url, paint};
 pub(crate) use decode::decode_image;
 pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 pub use png::encode_png;

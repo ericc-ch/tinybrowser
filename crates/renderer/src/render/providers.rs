@@ -24,10 +24,11 @@ pub(crate) struct CountingHandler {
 
 impl blitz_traits::net::NetHandler for CountingHandler {
     fn bytes(mut self: Box<Self>, resolved_url: String, bytes: blitz_traits::net::Bytes) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        if let Some(inner) = self.inner.take() {
-            inner.bytes(resolved_url, bytes);
-        }
+        inner.bytes(resolved_url, bytes);
     }
 }
 

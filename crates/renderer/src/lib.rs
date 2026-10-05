@@ -81,7 +81,7 @@ impl Parsed {
         let config = blitz_dom::DocumentConfig {
             font_ctx: Some(font_ctx),
             ua_stylesheets: Some(Vec::new()),
-            base_url: Some("http://invalid/".to_owned()),
+            base_url: Some(crate::render::INVALID_BASE_URL.to_owned()),
             ..blitz_dom::DocumentConfig::default()
         };
         Self {

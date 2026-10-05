@@ -81,14 +81,6 @@ pub(crate) enum DialContext {
         element: crate::js::world::NodeId,
         epoch: u64,
     },
-    /// A `<link rel=stylesheet>` sheet; loading sheets delay the load event.
-    // No constructor while Blitz subresource fetch is unwired; the
-    // completion path stays so the load-event gating still compiles.
-    #[allow(dead_code, reason = "unconstructed until subresource fetch is wired")]
-    Stylesheet {
-        element: crate::js::world::NodeId,
-        epoch: u64,
-    },
     /// An `<img>` resource selected by its `src` attribute.
     Image {
         element: crate::js::world::NodeId,
@@ -226,13 +218,6 @@ pub(crate) struct Document {
     in_flight_dials: usize,
     fetch_cancellations: HashMap<(u64, i32), crate::protocol::DialCancellation>,
     queued_dials: Vec<QueuedDial>,
-    /// Every stylesheet URL already queued or loaded, so re-scans do not
-    /// refetch. The loaded text lives in the world beside decoded images so
-    /// paint and script geometry share one source.
-    stylesheet_urls: HashSet<String>,
-    /// Stylesheet dials queued or in flight; the load event waits for them
-    /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
-    pending_stylesheets: usize,
     /// Image fetches queued or in flight. They delay the document load event.
     pending_images: usize,
     /// Per-element fetch generation so a superseded `src` completion is ignored.
@@ -328,8 +313,6 @@ impl Document {
             in_flight_dials: 0,
             fetch_cancellations: HashMap::new(),
             queued_dials: Vec::new(),
-            stylesheet_urls: HashSet::new(),
-            pending_stylesheets: 0,
             pending_images: 0,
             image_generations: HashMap::new(),
             image_selected_src: HashMap::new(),
@@ -1104,10 +1087,10 @@ impl Document {
         self.js_epoch = self.js_epoch.saturating_add(1);
         // Every queued dial belongs to the old realm; drop them all.
         self.queued_dials.clear();
-        // Sheets belong to the replaced document; the new parse re-scans.
-        self.world.borrow_mut().clear_stylesheets();
-        self.stylesheet_urls.clear();
-        self.pending_stylesheets = 0;
+        for (_, handler) in self.blitz_handlers.drain() {
+            Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
+        }
+        while self.blitz_fetch_rx.try_recv().is_ok() {}
         self.world.borrow_mut().clear_images();
         self.world.borrow_mut().take_image_updates();
         self.pending_images = 0;
@@ -1264,9 +1247,6 @@ impl Document {
         if self.run_scripts() {
             return;
         }
-        // Style sheets delay the load event, so queue them before the
-        // document's end events.
-        self.load_stylesheets();
         self.load_images();
         // Deliver parser mutations before the document's events.
         self.deliver_mutations();
@@ -1401,26 +1381,6 @@ impl Document {
                     self.resume_scripts();
                 }
             }
-            DialContext::Stylesheet { element, epoch } => {
-                // A navigation supersedes this dial: the counter and the
-                // stylesheet map now belong to the new document, so a stale
-                // completion must not decrement them or fire its load event
-                // early.
-                if epoch != self.js_epoch {
-                    return;
-                }
-                self.record_event(RendererEvent::Fetch {
-                    status: outcome.status,
-                });
-                self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
-                if (200..300).contains(&outcome.status) {
-                    self.world.borrow_mut().store_stylesheet(
-                        element,
-                        String::from_utf8_lossy(&outcome.body).into_owned(),
-                    );
-                }
-                self.fire_document_load();
-            }
             DialContext::Image {
                 element,
                 epoch,
@@ -1501,14 +1461,6 @@ impl Document {
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
                     self.resume_scripts();
-                }
-            }
-            DialContext::Stylesheet { epoch, .. } => {
-                // A failed sheet is simply absent; the load event proceeds.
-                // Stale dials from a superseded navigation are ignored.
-                if epoch == self.js_epoch {
-                    self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
-                    self.fire_document_load();
                 }
             }
             DialContext::Image {
@@ -1605,9 +1557,7 @@ impl Document {
         if self.world.borrow().main_ready_state() == ReadyState::Complete {
             return;
         }
-        // Style sheets that are still loading hold the load event
-        // (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
-        if self.pending_stylesheets > 0 || self.pending_images > 0 {
+        if self.pending_images > 0 {
             return;
         }
         self.world
@@ -1615,13 +1565,6 @@ impl Document {
             .set_main_ready_state(ReadyState::Complete);
         self.fire_js(crate::js::JsRealm::fire_ready_state_change);
         self.maybe_fire_load();
-    }
-
-    /// Scans for `<link rel=stylesheet>` sheets. Blitz fetches these itself
-    /// through the provider bridge; the counters stay so load-event gating
-    /// still compiles.
-    fn load_stylesheets(&mut self) {
-        self.pending_stylesheets = 0;
     }
 
     /// Queues the current document's `<img src>` resources. Image requests
