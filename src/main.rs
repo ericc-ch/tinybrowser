@@ -18,7 +18,7 @@ use browser::{
     AgentOptions, Browser, BrowserOpenError, BrowserOptions, Profile, default_data_home,
 };
 use cli::{Cli, Command};
-use logging::{Config, Level, Logger};
+use logging::Level;
 
 fn main() -> ExitCode {
     match cli::parse(std::env::args_os().skip(1)) {
@@ -85,19 +85,13 @@ fn install_logger(cli: &Cli) {
         None
     });
     let level = requested.or_else(env_level).unwrap_or(Level::Info);
-    let process = match &cli.command {
-        Some(Command::Renderer) => "renderer",
-        Some(Command::Daemon { .. }) => "daemon",
-        Some(Command::Webdriver { .. }) => "webdriver",
-        None => "cli",
+    let file = match &cli.command {
+        Some(Command::Daemon { profile } | Command::Webdriver { profile, .. }) => {
+            profile_log_file(profile)
+        }
+        Some(Command::Renderer) | None => None,
     };
-    let mut config = Config::new(process).level(level);
-    if let Some(Command::Daemon { profile } | Command::Webdriver { profile, .. }) = &cli.command
-        && let Some(path) = profile_log_file(profile)
-    {
-        config = config.file(path);
-    }
-    logging::install(Logger::new(config));
+    logging::install(level, file);
 }
 
 /// Level passed to a spawned daemon or renderer, when no flag overrides it.

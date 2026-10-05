@@ -688,9 +688,8 @@ fn log_level_reaches_the_daemon_file() {
     let mut text = String::new();
     loop {
         if let Ok(read) = std::fs::read_to_string(&path)
-            && read.contains("process=daemon")
-            && read.contains("level=DEBUG")
-            && read.contains("process=renderer")
+            && read.contains(" DEBUG daemon ")
+            && read.contains(" INFO renderer ready")
         {
             text = read;
             break;
@@ -703,7 +702,7 @@ fn log_level_reaches_the_daemon_file() {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        text.contains("message=ready"),
+        text.contains(" INFO renderer ready"),
         "renderer ready record missing"
     );
     close(&mut client, &created);

@@ -1,19 +1,21 @@
-//! Leveled process logging: stderr console plus an async batched file sink.
-//!
-//! The model is inspired by Effect's `Logger`: a flat record with a level, a
-//! target, and a message; independent sinks; a minimum-level threshold; and a
-//! batched file writer. The surface is plain Rust: one process-global
-//! [`Logger`] installed at startup and [`error!`], [`warn!`], [`info!`],
-//! [`debug!`], and [`trace!`] macros.
+//! Process logging: a stderr console plus an optional background file sink.
 //!
 //! Nothing is logged until [`install`] is called, so libraries and tests stay
 //! quiet by default. The console is **stderr only**: stdout carries command
 //! results in the CLI and protocol JSON in the renderer.
 //!
+//! One record is one line:
+//!
+//! ```text
+//! 2026-10-05T00:00:00.123Z INFO browser::tab created tab
 //! ```
-//! logging::install(logging::Logger::new(
-//!     logging::Config::new("cli").level(logging::Level::Debug),
-//! ));
+//!
+//! The file sink is best-effort and never blocks a logging thread. A full
+//! queue drops lines, and release builds abort on panic (`panic = "abort"`),
+//! so whatever is still queued at that point is lost.
+//!
+//! ```
+//! logging::install(logging::Level::Debug, None);
 //! logging::info!(target: "example", "ready");
 //! ```
 
@@ -25,7 +27,6 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Severity of one record, ordered from most to least severe.
 ///
@@ -33,18 +34,17 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 /// minimum: with a minimum of [`Level::Info`], `Debug` and `Trace` are
 /// filtered out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(u8)]
 pub enum Level {
     /// A failure callers must act on.
-    Error = 1,
+    Error,
     /// A recoverable problem worth attention.
-    Warn = 2,
+    Warn,
     /// Normal lifecycle events.
-    Info = 3,
+    Info,
     /// Developer detail for diagnosing behavior.
-    Debug = 4,
+    Debug,
     /// Very detailed tracing.
-    Trace = 5,
+    Trace,
 }
 
 impl Level {
@@ -57,18 +57,6 @@ impl Level {
             Self::Info => "INFO",
             Self::Debug => "DEBUG",
             Self::Trace => "TRACE",
-        }
-    }
-
-    /// Decodes a threshold from the atomic store.
-    const fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Error,
-            2 => Self::Warn,
-            4 => Self::Debug,
-            5 => Self::Trace,
-            // 3 (Info) and any corrupted value.
-            _ => Self::Info,
         }
     }
 }
@@ -106,155 +94,63 @@ impl fmt::Display for ParseLevelError {
 
 impl std::error::Error for ParseLevelError {}
 
-/// Process logger configuration, built with chained setters.
-pub struct Config {
-    process: &'static str,
+/// Installs the process logger: records at or above `level` go to stderr and,
+/// when `file` is given, to that file from one background writer thread.
+///
+/// A file that cannot be opened is reported on stderr and skipped; logging
+/// never takes the process down. A second install is ignored.
+pub fn install(level: Level, file: Option<PathBuf>) {
+    let _ = LOGGER.set(Logger::new(level, file));
+}
+
+struct Logger {
     level: Level,
-    console: bool,
-    file: Option<PathBuf>,
-}
-
-impl Config {
-    /// Console-on, no-file config for `process` at [`Level::Info`].
-    #[must_use]
-    pub fn new(process: &'static str) -> Self {
-        Self {
-            process,
-            level: Level::Info,
-            console: true,
-            file: None,
-        }
-    }
-
-    /// Sets the minimum level.
-    #[must_use]
-    pub fn level(mut self, level: Level) -> Self {
-        self.level = level;
-        self
-    }
-
-    /// Appends records to `path` from one background writer thread.
-    #[must_use]
-    pub fn file(mut self, path: impl Into<PathBuf>) -> Self {
-        self.file = Some(path.into());
-        self
-    }
-
-    /// Enables or disables the stderr console (enabled by default).
-    #[must_use]
-    pub fn console(mut self, on: bool) -> Self {
-        self.console = on;
-        self
-    }
-}
-
-/// One process logger: a threshold, a stderr console, and an optional file sink.
-pub struct Logger {
-    level: AtomicU8,
-    process: &'static str,
-    pid: u32,
-    console: bool,
     file: Option<file::FileSink>,
-    drops: AtomicU64,
 }
 
 impl Logger {
-    /// Builds the logger.
-    ///
-    /// A file that cannot be opened is reported on stderr and skipped; logging
-    /// never takes the process down.
-    #[must_use]
-    pub fn new(config: Config) -> Self {
-        let file = config
-            .file
-            .and_then(|path| match file::FileSink::new(path.clone()) {
-                Ok(sink) => Some(sink),
-                Err(error) => {
-                    eprintln!("logging: cannot open {}: {error}", path.display());
-                    None
-                }
-            });
-        Self {
-            level: AtomicU8::new(config.level as u8),
-            process: config.process,
-            pid: std::process::id(),
-            console: config.console,
-            file,
-            drops: AtomicU64::new(0),
-        }
-    }
-
-    /// Current minimum level.
-    #[must_use]
-    pub fn level(&self) -> Level {
-        Level::from_u8(self.level.load(Ordering::Relaxed))
-    }
-
-    /// Changes the minimum level.
-    pub fn set_level(&self, level: Level) {
-        self.level.store(level as u8, Ordering::Relaxed);
+    fn new(level: Level, path: Option<PathBuf>) -> Self {
+        let file = path.and_then(|path| match file::FileSink::new(path.clone()) {
+            Ok(sink) => Some(sink),
+            Err(error) => {
+                eprintln!("logging: cannot open {}: {error}", path.display());
+                None
+            }
+        });
+        Self { level, file }
     }
 
     /// Whether a record at `level` passes the threshold.
-    #[must_use]
-    pub fn enabled(&self, level: Level) -> bool {
-        (level as u8) <= self.level.load(Ordering::Relaxed)
+    fn enabled(&self, level: Level) -> bool {
+        level <= self.level
     }
 
     /// Writes one record when `level` is enabled.
-    pub fn log(&self, level: Level, target: &str, args: fmt::Arguments<'_>) {
-        if !self.enabled(level) {
-            return;
-        }
-        self.report_drops();
-        let line = format::record(self.process, self.pid, level, target, args);
-        if !self.emit(&line) {
-            self.drops.fetch_add(1, Ordering::Relaxed);
+    fn log(&self, level: Level, target: &str, args: fmt::Arguments<'_>) {
+        if self.enabled(level) {
+            self.emit(format::record(level, target, args));
         }
     }
 
     /// Forwards one already-formatted line (a renderer child's stderr).
-    pub fn log_forwarded(&self, line: &str) {
-        self.report_drops();
-        if !self.emit(line.trim_end_matches(['\r', '\n'])) {
-            self.drops.fetch_add(1, Ordering::Relaxed);
+    fn log_forwarded(&self, line: &str) {
+        let mut line = line.trim_end_matches(['\r', '\n']).to_owned();
+        line.push('\n');
+        self.emit(line);
+    }
+
+    /// Writes one full line to the console and queues it for the file.
+    fn emit(&self, line: String) {
+        write_console(&line);
+        if let Some(file) = &self.file {
+            file.send(line);
         }
     }
 
     /// Flushes pending records; `false` when the file writer did not catch up
     /// within its bound, or is gone. True when there is no file sink.
-    pub fn flush(&self) -> bool {
-        self.report_drops();
+    fn flush(&self) -> bool {
         self.file.as_ref().is_none_or(file::FileSink::flush)
-    }
-
-    /// Writes one line to the console and queues it for the file.
-    ///
-    /// Returns `false` when the file queue is full; console failure is
-    /// deliberately ignored.
-    fn emit(&self, line: &str) -> bool {
-        if self.console {
-            write_console(line);
-        }
-        let Some(file) = &self.file else {
-            return true;
-        };
-        file.try_send(line)
-    }
-
-    /// Emits one warning for records the bounded file queue has dropped.
-    ///
-    /// When the warning itself cannot be queued, the count is restored so the
-    /// next record reports the full total instead of just the warning.
-    fn report_drops(&self) {
-        let dropped = self.drops.swap(0, Ordering::Relaxed);
-        if dropped == 0 {
-            return;
-        }
-        let line = format::dropped(self.process, self.pid, dropped);
-        if !self.emit(&line) {
-            self.drops.fetch_add(dropped, Ordering::Relaxed);
-        }
     }
 }
 
@@ -263,15 +159,9 @@ fn write_console(line: &str) {
     let stderr = io::stderr();
     let mut out = stderr.lock();
     let _ = out.write_all(line.as_bytes());
-    let _ = out.write_all(b"\n");
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
-
-/// Installs the process logger. A second install is ignored.
-pub fn install(logger: Logger) {
-    let _ = LOGGER.set(logger);
-}
 
 /// Whether the installed logger accepts `level`; `false` when none is installed.
 #[must_use]
@@ -283,7 +173,7 @@ pub fn enabled(level: Level) -> bool {
 /// installed.
 #[must_use]
 pub fn level() -> Level {
-    LOGGER.get().map_or(Level::Info, Logger::level)
+    LOGGER.get().map_or(Level::Info, |logger| logger.level)
 }
 
 /// Writes one record through the installed logger; no-op when none is installed.
@@ -417,21 +307,17 @@ mod tests {
 
     #[test]
     fn threshold_filters_less_severe_records() {
-        let logger = Logger::new(Config::new("test").level(Level::Info).console(false));
+        let logger = Logger::new(Level::Info, None);
         assert!(logger.enabled(Level::Error));
         assert!(logger.enabled(Level::Info));
         assert!(!logger.enabled(Level::Debug));
-        logger.set_level(Level::Trace);
-        assert!(logger.enabled(Level::Trace));
     }
 
     #[test]
     fn unopenable_file_falls_back_to_console_only() {
         let logger = Logger::new(
-            Config::new("test")
-                .level(Level::Info)
-                .console(false)
-                .file("/proc/tinybrowser-cannot-exist/log"),
+            Level::Info,
+            Some(PathBuf::from("/proc/tinybrowser-cannot-exist/log")),
         );
         assert!(logger.file.is_none());
         assert!(logger.enabled(Level::Error));
@@ -449,7 +335,7 @@ mod tests {
 
     #[test]
     fn console_only_logger_flushes_trivially() {
-        let logger = Logger::new(Config::new("test").level(Level::Info).console(false));
+        let logger = Logger::new(Level::Info, None);
         assert!(logger.flush());
     }
 }
