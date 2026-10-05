@@ -309,12 +309,11 @@ impl Engine {
             // (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
             let (width, height) = parsed.document.base.viewport().window_size;
             crate::render::resolve_until_settled(&mut parsed.document.base);
-            let image = crate::render::paint(&mut parsed.document.base, width, height).map_err(
-                |error| TabError::Render {
+            crate::render::paint(&mut parsed.document.base, width, height).map_err(|error| {
+                TabError::Render {
                     message: error.to_string(),
-                },
-            )?;
-            image
+                }
+            })?
         };
         let image = match request.clip {
             Some(clip) => image

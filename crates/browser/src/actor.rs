@@ -386,7 +386,7 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn viewport_size(&self) -> Result<(u32, u32), TabError> {
-        Ok(self.ask(ViewportSize).await?)
+        self.ask(ViewportSize).await
     }
 
     /// Sets the main frame's persistent viewport size, re-laying out its
@@ -1480,6 +1480,10 @@ impl TabOperation for ViewportSize {
         }
     }
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by TabOperation contract; this op resolves synchronously"
+    )]
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
         TabOutcome::Reply(TabReply::ViewportSize(tab.viewport))

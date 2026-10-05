@@ -616,12 +616,8 @@ fn lower_members(
                 if overload_consumed(member, &remaining) {
                     continue;
                 }
-                let Some((operation, signature, property)) = lower_operation(
-                    database,
-                    member,
-                    &implementation.methods,
-                    &mut interface.unions,
-                )?
+                let Some((operation, signature, property)) =
+                    lower_operation(database, member, &implementation.methods, &mut interface.unions)?
                 else {
                     continue;
                 };
@@ -1299,13 +1295,10 @@ fn lower_argument(
     match (&type_, argument.optional.is_some(), &argument.default) {
         (_, false, None)
         | (
-            ReturnType::String | ReturnType::Boolean | ReturnType::Union(_, _),
+            ReturnType::String | ReturnType::Boolean | ReturnType::Union(_, _) | ReturnType::Any,
             true,
             None,
-        )
-        // `any` is nullable by construction; an omitted argument carries its
-        // `null` default (<https://webidl.spec.whatwg.org/#idl-any>).
-        | (ReturnType::Any, true, None) => {}
+        ) => {}
         (ReturnType::Any, true, Some(default))
             if matches!(default.value, DefaultValue::Null(_)) => {}
         (ReturnType::Boolean, true, Some(default))
@@ -1405,12 +1398,10 @@ fn argument_parameter(
         ReturnType::String => quote! { rquickjs::String<'js> },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Callback => quote! { rquickjs::Function<'js> },
-        // A platform object or callback-interface argument arrives as the
-        // original value; the platform algorithm performs any further check.
-        ReturnType::PlatformObject => quote! { Value<'js> },
-        // IDL `any` arrives as the original value
+        // A platform object or `any` argument arrives as the original value;
+        // the platform algorithm performs any further check
         // (<https://webidl.spec.whatwg.org/#idl-any>).
-        ReturnType::Any => quote! { Value<'js> },
+        ReturnType::PlatformObject | ReturnType::Any => quote! { Value<'js> },
         ReturnType::Dictionary(name) | ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             quote! { #name }

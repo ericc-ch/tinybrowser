@@ -81,47 +81,10 @@ pub(crate) async fn session_method(
                 "cssContentSize": {"x": 0, "y": 0, "width": width, "height": height},
             }))
         }
-        "Page.addScriptToEvaluateOnNewDocument" => {
-            let source = params
-                .get("source")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let id = tab
-                .add_init_script(source)
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            Ok(json!({"identifier": id.to_string()}))
-        }
-        "Page.removeScriptToEvaluateOnNewDocument" => {
-            if let Some(id) = params
-                .get("identifier")
-                .and_then(Value::as_str)
-                .and_then(|value| value.parse::<u64>().ok())
-            {
-                tab.remove_init_script(id)
-                    .await
-                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            }
-            Ok(json!({}))
-        }
-        "Emulation.setDeviceMetricsOverride" => {
-            let width = emulated_side(params.get("width").and_then(Value::as_f64));
-            let height = emulated_side(params.get("height").and_then(Value::as_f64));
-            tab.set_viewport(width, height)
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            Ok(json!({}))
-        }
-        "Emulation.clearDeviceMetricsOverride" => {
-            tab.set_viewport(
-                emulated_side(Some(VIEWPORT_WIDTH)),
-                emulated_side(Some(VIEWPORT_HEIGHT)),
-            )
-            .await
-            .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            Ok(json!({}))
-        }
+        "Page.addScriptToEvaluateOnNewDocument" => add_init_script(params, tab).await,
+        "Page.removeScriptToEvaluateOnNewDocument" => remove_init_script(params, tab).await,
+        "Emulation.setDeviceMetricsOverride" => set_device_metrics(params, tab).await,
+        "Emulation.clearDeviceMetricsOverride" => clear_device_metrics(tab).await,
         "Page.reload" => {
             let url = tab
                 .document_url()
@@ -179,6 +142,57 @@ pub(crate) fn static_reply(method: &str) -> Option<Value> {
         "Target.attachToBrowserTarget" => json!({"sessionId": "browser"}),
         _ => return None,
     })
+}
+
+/// `Page.addScriptToEvaluateOnNewDocument`: register `source` on the tab and
+/// return its identifier.
+async fn add_init_script(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
+    let source = params
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let id = tab
+        .add_init_script(source)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({"identifier": id.to_string()}))
+}
+
+/// `Page.removeScriptToEvaluateOnNewDocument`: forget a registered script.
+async fn remove_init_script(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
+    if let Some(id) = params
+        .get("identifier")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        tab.remove_init_script(id)
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    }
+    Ok(json!({}))
+}
+
+/// `Emulation.setDeviceMetricsOverride`: persist the emulated viewport on the
+/// tab and the renderer.
+async fn set_device_metrics(params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
+    let width = emulated_side(params.get("width").and_then(Value::as_f64));
+    let height = emulated_side(params.get("height").and_then(Value::as_f64));
+    tab.set_viewport(width, height)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({}))
+}
+
+/// `Emulation.clearDeviceMetricsOverride`: restore the default viewport.
+async fn clear_device_metrics(tab: &TabHandle) -> Result<Value, DispatchError> {
+    tab.set_viewport(
+        emulated_side(Some(VIEWPORT_WIDTH)),
+        emulated_side(Some(VIEWPORT_HEIGHT)),
+    )
+    .await
+    .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({}))
 }
 
 /// Emulated viewport side from a CDP `width`/`height` parameter: missing or

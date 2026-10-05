@@ -1113,13 +1113,9 @@ fn converted_argument(
             #fetch
             let #variable = host::callback_argument(&ctx, &value)?;
         },
-        ReturnType::PlatformObject => quote! {
-            #fetch
-            let #variable = value;
-        },
-        // IDL `any` passes the original value through
+        // A platform object or IDL `any` passes the original value through
         // (<https://webidl.spec.whatwg.org/#idl-any>).
-        ReturnType::Any => quote! {
+        ReturnType::PlatformObject | ReturnType::Any => quote! {
             #fetch
             let #variable = value;
         },
@@ -1842,6 +1838,7 @@ fn union_into_js(union: &Union, name: &proc_macro2::Ident, generic: &TokenStream
     });
     quote! {
         impl<'js> rquickjs::IntoJs<'js> for #name #generic {
+            #[allow(clippy::match_same_arms, reason = "generated from IDL; interface members share the identity conversion")]
             fn into_js(self, #ctx_name: &Ctx<'js>) -> Result<Value<'js>> {
                 match self {
                     #(#arms)*

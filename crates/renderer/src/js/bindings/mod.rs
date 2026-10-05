@@ -555,7 +555,7 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn viewport_size(ctx: Ctx<'_>) -> Result<Vec<f64>> {
+fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
     let (width, height) = world(&ctx)
         .ok()
         .and_then(|world| {
@@ -565,7 +565,7 @@ fn viewport_size(ctx: Ctx<'_>) -> Result<Vec<f64>> {
                 .map(|parsed| parsed.document.base.viewport().window_size)
         })
         .unwrap_or((crate::engine::VIEWPORT_WIDTH, crate::engine::VIEWPORT_HEIGHT));
-    Ok(vec![f64::from(width), f64::from(height)])
+    vec![f64::from(width), f64::from(height)]
 }
 
 /// Captures the pristine intrinsics and host entry points every later lookup
