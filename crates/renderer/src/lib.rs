@@ -10,7 +10,7 @@
 //! build. Both feed the same [`Engine`], and both implement [`BrowserServices`]
 //! to supply effects.
 
-use html5ever::tree_builder::QuirksMode;
+use markup5ever::interface::QuirksMode;
 
 use crate::documents::BlitzDocument;
 

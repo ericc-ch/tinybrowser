@@ -2586,7 +2586,6 @@ dependencies = [
  "fixed_decimal",
  "flate2",
  "getrandom",
- "html5ever",
  "icu_calendar",
  "icu_datetime",
  "icu_decimal",

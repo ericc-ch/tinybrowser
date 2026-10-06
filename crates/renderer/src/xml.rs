@@ -26,7 +26,7 @@ pub(crate) fn parse_document(
     Parsed {
         id: 0,
         document,
-        quirks_mode: html5ever::tree_builder::QuirksMode::NoQuirks,
+        quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
         content_type,
         ready_state: crate::ReadyState::Complete,
         url: None,
