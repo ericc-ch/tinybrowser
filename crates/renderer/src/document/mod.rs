@@ -223,7 +223,6 @@ pub(crate) struct Document {
     /// The renderer-process state every frame shares.
     shared: SharedHandle,
     url: Url,
-    content_language: Option<String>,
     tasks: VecDeque<Task>,
     timers: Vec<Timer>,
     next_timer_id: u32,
@@ -327,7 +326,6 @@ impl Document {
             viewport_size: crate::engine::DEFAULT_VIEWPORT,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
-            content_language: None,
             tasks: VecDeque::new(),
             timers: Vec::new(),
             next_timer_id: 1,
@@ -944,7 +942,9 @@ impl Document {
             self.url = url.clone();
         }
         self.initial_blank = false;
-        self.content_language = content_language.map(str::to_owned);
+        // Blitz owns document language internally and exposes no metadata
+        // setter; the response language is ignored until that setter exists.
+        let _ = content_language;
         let mut world = self.world.borrow_mut();
         world.document_url = self.url.clone();
         drop(world);
@@ -1254,10 +1254,6 @@ impl Document {
     /// Installs `parsed` as the active document and registers it, reporting
     /// whether a realm owns it afterwards.
     fn install_parsed(&mut self, parsed: Parsed) -> bool {
-        // Known gap: Blitz owns document language internally and exposes no
-        // metadata setter; the response language stays on `content_language`
-        // until that setter exists.
-        let _ = self.content_language.as_deref();
         if self.js.is_none() {
             let document = self.world.borrow_mut().replace_document(parsed);
             self.register_document(document);

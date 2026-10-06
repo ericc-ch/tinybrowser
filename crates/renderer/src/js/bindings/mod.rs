@@ -656,10 +656,10 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
                 styles.get_inherited_box().visibility == Visibility::Visible
             });
             boxes.push(crate::render::NodeBox {
-                node: Some(NodeId {
+                node: NodeId {
                     document: document.document,
                     node: id,
-                }),
+                },
                 x: position.x,
                 y: position.y,
                 width: size.width,
@@ -678,7 +678,7 @@ pub(super) fn element_box(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f6
     let boxes = layout_boxes(ctx, node)?;
     Ok(boxes
         .into_iter()
-        .find(|item| item.node == Some(node))
+        .find(|item| item.node == node)
         .map(|item| {
             (
                 f64::from(item.x),
@@ -714,9 +714,7 @@ pub(super) fn element_at_point(
     let boxes = layout_boxes(ctx, document)?;
     let mut best = None;
     for item in boxes {
-        let Some(node) = item.node else {
-            continue;
-        };
+        let node = item.node;
         // Hidden boxes keep their geometry but never win hit testing; the
         // flat pre-order walk still reaches visible descendants.
         if !item.visible {

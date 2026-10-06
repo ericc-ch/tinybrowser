@@ -29,11 +29,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # Pure-Rust crates with tests. Miri cannot execute FFI, so `renderer` (QuickJS)
-# is excluded even though Stylo's `unsafe fn` hooks live there. Valgrind covers
-# those hooks via `renderer::render` tests; do not add `renderer` to Miri.
+# is excluded. Valgrind covers Stylo hooks via the `blitz-dom` dependency
+# through `renderer::render` tests; do not add `renderer` to Miri.
 miri_crates=(logging)
-# Default Valgrind: logging, then the `render` module tests (Stylo hooks plus
-# empty-document smokes). Not the full QuickJS renderer suite.
+# Default Valgrind: logging, then the `render` module tests
+# (empty-document smokes). Not the full QuickJS renderer suite.
 
 usage() {
   echo "usage: tools/check [clippy|miri [crate...]|valgrind [crate...]]" >&2

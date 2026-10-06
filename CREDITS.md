@@ -16,7 +16,7 @@ License texts: [LICENSE](LICENSE) (MIT for our code) and [NOTICE](NOTICE) (third
 
 - [Obscura](https://github.com/h4ckf0r0day/obscura) (CPU paint over Taffy)
 - [Kitesurf](https://developers.cloudflare.com/browser-run/kitesurf/) (agent-first trade-offs)
-- [Blitz](https://github.com/DioxusLabs/blitz) / [DioxusLabs](https://github.com/DioxusLabs) (size/quality benchmark; Taffy + Parley + Stylo integration pattern)
+- [Blitz](https://github.com/DioxusLabs/blitz) / [DioxusLabs](https://github.com/DioxusLabs) (parse/style/layout/paint owner: `blitz-dom`/`blitz-html`/`blitz-paint`/`blitz-traits` 0.3.0-beta.2 + `anyrender` 0.13.0)
 - [NetSurf](https://www.netsurf-browser.org/) (small-engine pipeline prior art)
 - [Dillo](https://dillo-browser.github.io/) (style → layout → canvas prior art)
 - [Effect Logger](https://github.com/Effect-TS/effect) (logging crate model)
@@ -31,21 +31,18 @@ Versions move; check `Cargo.lock`. Notable licenses called out.
 
 ### HTML / DOM / CSS
 
-- [html5ever](https://crates.io/crates/html5ever), [markup5ever](https://crates.io/crates/markup5ever), [tendril](https://crates.io/crates/tendril), [web_atoms](https://crates.io/crates/web_atoms)
-- [cssparser](https://crates.io/crates/cssparser), [selectors](https://crates.io/crates/selectors), [precomputed-hash](https://crates.io/crates/precomputed-hash) ([MPL-2.0](https://www.mozilla.org/MPL/2.0/) where applicable)
-- [stylo](https://crates.io/crates/stylo), [stylo_dom](https://crates.io/crates/stylo_dom), [stylo_static_prefs](https://crates.io/crates/stylo_static_prefs), [stylo_traits](https://crates.io/crates/stylo_traits), [app_units](https://crates.io/crates/app_units) ([MPL-2.0](https://www.mozilla.org/MPL/2.0/))
-- [euclid](https://crates.io/crates/euclid), [url](https://crates.io/crates/url)
+- [html5ever](https://crates.io/crates/html5ever), [markup5ever](https://crates.io/crates/markup5ever)
+- [stylo](https://crates.io/crates/stylo), [stylo_traits](https://crates.io/crates/stylo_traits) ([MPL-2.0](https://www.mozilla.org/MPL/2.0/))
+- [url](https://crates.io/crates/url)
 
 ### Layout / text / paint
 
-- [taffy](https://crates.io/crates/taffy)
-- [parley](https://crates.io/crates/parley), [fontique](https://crates.io/crates/fontique)
-- [skrifa](https://crates.io/crates/skrifa)
-- [tiny-skia](https://crates.io/crates/tiny-skia) ([BSD-3-Clause](https://opensource.org/licenses/BSD-3-Clause))
-- [kurbo](https://crates.io/crates/kurbo)
-- [png](https://crates.io/crates/png), [zune-jpeg](https://crates.io/crates/zune-jpeg), [zune-core](https://crates.io/crates/zune-core), [image-webp](https://crates.io/crates/image-webp)
+- [parley](https://crates.io/crates/parley) (system fonts via fontconfig)
+- [png](https://crates.io/crates/png)
 - [encoding_rs](https://crates.io/crates/encoding_rs) (((Apache-2.0 OR MIT) AND BSD-3-Clause))
 - [flate2](https://crates.io/crates/flate2), [getrandom](https://crates.io/crates/getrandom)
+
+Paint backend (`crates/anyrender-tiny-skia`): `tiny-skia`, `kurbo`, `skrifa`, `peniko` via `anyrender`, blur via `image`.
 
 ### Intl
 
@@ -75,19 +72,14 @@ Versions move; check `Cargo.lock`. Notable licenses called out.
 
 Not a full copy of those engines; behavior taken from comments in-tree:
 
-- Gecko [`EnsureAllowedAsChild`](https://searchfox.org/firefox-main/source/dom/base/nsINode.cpp) → `dom/mutation/insert.rs`
 - Blink / Firefox MessagePort disentangle → `renderer/messaging.rs`
 - Blink `DispatchMessageEventWithOriginCheck` → `renderer/engine.rs`
 - Blink `[CrossOrigin]` + Firefox `sCrossOriginProperties` → `js/scripts/web/messaging.js`
 - Chromium timer clamping ([crbug.com/1108877](https://crbug.com/1108877)) → `js/scripts/web/timers.js`
 - Blink HTMLOptionsCollection 100k cap → `js/scripts/collections.js`
-- Chromium `DeselectItemsWithoutValidation` → `dom/form/select.rs`
 - Firefox [`nsDOMAttributeMap::GetSupportedNames`](https://searchfox.org/firefox-main/source/dom/base/nsDOMAttributeMap.cpp) → `js/bindings/attributes.rs`
 - SpiderMonkey / Firefox Intl option boundary → `js/intl.rs`, `js/scripts/intl.js` (e.g. [NumberFormat.cpp](https://searchfox.org/firefox-main/source/js/src/builtin/intl/NumberFormat.cpp))
-- Chromium [`html.css`](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/html/resources/html.css) form-submit UA sheet → `render/stylo.rs`
-- [Blitz](https://github.com/DioxusLabs/blitz) Stylo prefs / container-query stub → stylo integration
-- [Blitz](https://github.com/DioxusLabs/blitz) Taffy + own-paint split → `render/boxes.rs`
-- Blink / Gecko realm-agnostic document store → `documents.rs`
+- Blink / Gecko realm-agnostic document store → `renderer/documents.rs`
 - Chromium [process lock / site isolation](https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md#process-locks) → `browser/site.rs`
 - Chrome navigation headers (Accept, Sec-Fetch-*, UA-CH) → `browser/network.rs`
 - [html5lib](https://github.com/html5lib/html5lib-tests) `svg ` / `math ` foreign-content prefixes → renderer

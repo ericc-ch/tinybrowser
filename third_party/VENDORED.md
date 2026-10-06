@@ -19,6 +19,13 @@ exception is the JS engine forks below, which do ship.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here.
 
+## Vendored crates (ship in the binary)
+
+- **What**: the `weedle4` WebIDL parser tinybrowser's bindgen builds against.
+- **Upstream**: vendored source at `third_party/weedle4` (see `UPSTREAM.md` there).
+- **Wiring**: path dependency in `crates/webidl-bindgen/Cargo.toml`. Vendored,
+  not a submodule, so correctly absent from `.gitmodules`.
+
 ## Test data (never ships)
 
 ## Web IDL extracts

@@ -18,8 +18,7 @@ use tiny_skia::{
     StrokeDash as SkiaDash, Transform as SkiaXform,
 };
 
-/// Tolerance for flattening curves into a [`tiny_skia`] path, matching the
-/// `vello_cpu` backend's flattening.
+/// Tolerance for flattening curves into a [`tiny_skia`] path.
 const TOLERANCE: f64 = 0.1;
 
 /// Largest pixmap side this painter allocates. The renderer caps captures
@@ -264,8 +263,7 @@ fn convert_stops(stops: &peniko::ColorStops) -> Option<Vec<tiny_skia::GradientSt
 /// Resolves any brush but images to a `tiny-skia` shader. Image brushes
 /// draw through [`TinySkiaScenePainter::fill_image`], which needs the
 /// scratch pixmap; anywhere else (strokes, glyphs) they read as transparent
-/// like `Resource`/`Custom`, which carry no pixels by definition (the
-/// `vello_cpu` backend agrees).
+/// like `Resource`/`Custom`, which carry no pixels by definition.
 fn convert_brush(brush: &PaintRef<'_>, brush_transform: Option<Affine>) -> tiny_skia::Shader<'static> {
     use tiny_skia::Shader;
     match brush {
@@ -418,8 +416,8 @@ fn blur_pixmap(pixmap: &mut Pixmap, sigma: f32) {
     pixmap.data_mut().copy_from_slice(&blurred.into_raw());
 }
 
-/// Blur sigma for a layer filter: single-node gaussian blurs only, like the
-/// `vello_cpu` backend. Anything else (multi-node graphs, other effects)
+/// Blur sigma for a layer filter: single-node gaussian blurs only.
+/// Anything else (multi-node graphs, other effects)
 /// paints unfiltered.
 fn layer_blur_sigma(filter: Option<&Filter>) -> Option<f32> {
     use anyrender::filters::FilterEffect;
@@ -565,8 +563,8 @@ impl PaintScene for TinySkiaScenePainter {
         filter: Option<Arc<Filter>>,
         _backdrop_filter: Option<Arc<Filter>>,
     ) {
-        // Backdrop filters are ignored like the vello_cpu backend ignores
-        // them; the layer filter runs on pop in `pop_layer`.
+        // Backdrop filters are ignored; the layer filter runs on pop in
+        // `pop_layer`.
         self.transform = convert_transform(transform);
         let (width, height) = {
             let canvas = &self.targets[0].pixmap;

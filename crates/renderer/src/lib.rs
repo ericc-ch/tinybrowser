@@ -3,9 +3,9 @@
 //!
 //! The engine owns the frame actor (`document::Document`) and never links `net`.
 //! The browser process owns the tab, navigation, the network, and cookies.
-//! Style, layout, and paint live in the `render` module: one-shot screenshot
-//! and geometry (Blink `core/css`,
-//! `core/layout`, `core/paint`). A carrier drives this crate: the browser's
+//! Style, layout, and paint live in the `render` module via Blitz: one-shot
+//! screenshot and geometry through `blitz-dom`/`blitz-paint` and the
+//! `anyrender_tiny_skia` backend. A carrier drives this crate: the browser's
 //! child transport on a native build, the WebAssembly component on a wasm
 //! build. Both feed the same [`Engine`], and both implement [`BrowserServices`]
 //! to supply effects.

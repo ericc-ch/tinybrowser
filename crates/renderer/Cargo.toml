@@ -49,8 +49,7 @@ style_traits = { package = "stylo_traits", version = "0.20" }
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
 # Pinned exact: beta drift is fast, and Cargo.lock pins the rest.
 # `floats` is not a Blitz default but the published stylo_taffy only
-# initializes `float`/`clear` with it, so a shared taffy with float_layout
-# would not compile without it.
+# initializes `float`/`clear` with it.
 blitz-dom = { version = "=0.3.0-beta.2", features = ["floats"] }
 blitz-html = "=0.3.0-beta.2"
 blitz-paint = "=0.3.0-beta.2"

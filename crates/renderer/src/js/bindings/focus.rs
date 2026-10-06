@@ -5,12 +5,8 @@ use super::{
     wrap_node,
 };
 
-use std::rc::Rc;
-
 use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Class, Ctx, Exception, Function, Result, Value, prelude::This};
-
-use crate::js::events::EventTargetRef;
 
 use crate::js::world::EventTargetKey;
 use crate::js::world::{BlitzId, JournalEntry, NodeId, attr, html_namespace, is_connected};
@@ -255,42 +251,29 @@ pub(crate) fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     if previous == Some(node) {
         return Ok(());
     }
-    let target = |node| EventTargetRef {
-        key: EventTargetKey::Node(node),
-        world: Rc::clone(&world),
-    };
     // `set_active_element` mirrors into Blitz (`set_focus_to`/`clear_focus`).
+    // Focus events carry no `relatedTarget` until `FocusEvent` exists.
     world.borrow_mut().set_active_element(document, None);
     if let Some(previous) = previous {
-        events::fire_trusted_with_related(
-            ctx,
-            EventTargetKey::Node(previous),
-            "blur",
-            false,
-            false,
-            Some(target(node)),
-        )?;
+        events::fire_trusted(ctx, EventTargetKey::Node(previous), "blur", false, false)?;
         // A handler may have moved focus; the spec's focus update steps stop
-        // when the focused area changed during the blur chain, and `focusout`
-        // carries the new area as its related target.
-        if let Some(moved) = world.borrow().active_element(document) {
-            events::fire_trusted_with_related(
+        // when the focused area changed during the blur chain.
+        if world.borrow().active_element(document).is_some() {
+            events::fire_trusted(
                 ctx,
                 EventTargetKey::Node(previous),
                 "focusout",
                 true,
                 false,
-                Some(target(moved)),
             )?;
             return Ok(());
         }
-        events::fire_trusted_with_related(
+        events::fire_trusted(
             ctx,
             EventTargetKey::Node(previous),
             "focusout",
             true,
             false,
-            Some(target(node)),
         )?;
     }
     // Handlers may have made the target unfocusable; browsers then do not
@@ -299,23 +282,8 @@ pub(crate) fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         return Ok(());
     }
     world.borrow_mut().set_active_element(document, Some(node));
-    let related = previous.map(target);
-    events::fire_trusted_with_related(
-        ctx,
-        EventTargetKey::Node(node),
-        "focus",
-        false,
-        false,
-        related.clone(),
-    )?;
-    events::fire_trusted_with_related(
-        ctx,
-        EventTargetKey::Node(node),
-        "focusin",
-        true,
-        false,
-        related,
-    )?;
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "focus", false, false)?;
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "focusin", true, false)?;
     Ok(())
 }
 

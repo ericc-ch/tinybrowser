@@ -15,10 +15,10 @@ dependencies.
 
 Stylo and related CSS crates (Mozilla Public License 2.0):
 
-- stylo 0.21.0 — https://crates.io/crates/stylo/0.21.0
-- stylo_dom 0.21.0 — https://crates.io/crates/stylo_dom/0.21.0
-- stylo_static_prefs 0.21.0 — https://crates.io/crates/stylo_static_prefs/0.21.0
-- stylo_traits 0.21.0 — https://crates.io/crates/stylo_traits/0.21.0
+- stylo 0.20.0 — https://crates.io/crates/stylo/0.20.0
+- stylo_dom 0.20.0 — https://crates.io/crates/stylo_dom/0.20.0
+- stylo_static_prefs 0.20.0 — https://crates.io/crates/stylo_static_prefs/0.20.0
+- stylo_traits 0.20.0 — https://crates.io/crates/stylo_traits/0.20.0
 - selectors 0.40.0 — https://crates.io/crates/selectors/0.40.0
 - cssparser 0.37.0 — https://crates.io/crates/cssparser/0.37.0
 - app_units 0.7.8 — https://crates.io/crates/app_units/0.7.8
@@ -41,12 +41,6 @@ Locale data blob generated via icu4x-datagen.
 
 License: https://www.unicode.org/license.txt
 Crates index: https://crates.io/crates/icu_provider
-
-## SIL Open Font License 1.1
-
-Liberation Sans under crates/renderer/assets/. Full OFL text:
-crates/renderer/assets/OFL.txt
-https://openfontlicense.org/
 
 ## Public Suffix List
 

@@ -6,8 +6,10 @@ Rules for JS/Rust ownership, binding inputs, and conformance reports.
 
 Choose the language by ownership of state and authority, not by the API's name.
 
-- Rust owns the DOM tree, parsing, selector matching, layout, and native wrapper
-  identity. Tree mutation, cloning, and adoption algorithms stay in Rust.
+- Blitz owns the DOM tree, parsing, selector matching, and layout. Tree
+  mutation, cloning, and adoption algorithms stay in Rust through Blitz's
+  `DocumentMutator`, with tinybrowser keeping only the JS bindings, observer
+  journal, resource dials, and CDP surface.
 - Rust owns event dispatch, listener bookkeeping, propagation state, and trusted
   event flags. JS can hold event payloads such as `CustomEvent.detail`.
 - Rust owns I/O, browser task scheduling, frame and realm lifetimes, cross-realm

@@ -103,11 +103,11 @@ impl RgbaImage {
     }
 }
 
-/// One laid-out box in CSS pixels, keyed by its DOM element when it has one.
+/// One laid-out box in CSS pixels, keyed by its DOM element.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeBox {
     /// The element the box was generated for.
-    pub node: Option<crate::js::world::NodeId>,
+    pub node: crate::js::world::NodeId,
     /// Border box in CSS pixels.
     pub x: f32,
     pub y: f32,

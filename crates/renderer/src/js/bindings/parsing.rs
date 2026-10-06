@@ -284,15 +284,13 @@ pub(crate) fn install_domparser_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
 /// The JS surface lives in Web IDL; `serialize_to_string` is the platform
 /// algorithm the generated dispatcher calls.
 #[derive(Trace, rquickjs::JsLifetime)]
-pub struct JsXmlSerializer {
-    pub(crate) _reserved: Option<Handle>,
-}
+pub struct JsXmlSerializer;
 
 include!(concat!(env!("OUT_DIR"), "/XMLSerializer.rs"));
 
 impl<'js> xml_serializer_generated::XMLSerializer<'js> for JsXmlSerializer {
     fn constructor(_ctx: &Ctx<'js>) -> Result<Self> {
-        Ok(Self { _reserved: None })
+        Ok(Self)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-xmlserializer-serializetostring

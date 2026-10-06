@@ -1,15 +1,12 @@
 # Rendering
 
-One-shot screenshots: style, layout, paint, PNG. No compositor, no relayout.
+One-shot screenshots through Blitz. No compositor, no relayout.
 
 ```text
-DOM + sheets -> Stylo cascade -> Style -> box tree
-  -> Taffy layout (Parley measures inline) -> tiny-skia paint -> PNG
+Blitz parse/style/layout -> blitz-paint scene -> anyrender_tiny_skia -> PNG
 ```
 
-Stylo owns selectors, inheritance, computed values. Taffy owns box layout.
-Parley owns shaping and line breaking. Paint is in-tree `tiny-skia`.
-
-Subset `Style` keeps: solid `background-color` only (no image/gradient),
-tables as `Block`, `sticky` as `Static`, no `calc()` symbolic form.
-Paint draws rects, borders, images, SVG paths, glyphs.
+Blitz (`blitz-dom`/`blitz-html`/`blitz-paint`) owns parsing, style, layout,
+and display-list construction. `crates/anyrender-tiny-skia` implements
+`anyrender`'s `PaintScene` over `tiny-skia`. Screenshots flatten over white
+in `crates/renderer/src/render/blitz.rs`.

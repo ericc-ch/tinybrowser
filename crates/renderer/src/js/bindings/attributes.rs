@@ -1645,17 +1645,6 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     Ok(())
 }
 
-/// The input `type` change step that touches the text selection: when an
-/// `input` becomes selectable again after a non-selectable type (for example
-/// `color` back to `text`), the text entry cursor moves to the beginning
-/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-fn apply_input_type_change(_ctx: &Ctx<'_>, _element: NodeId) {
-    // Known gap (Blitz cutover): the old `dom::form` selection-tracking APIs
-    // (`selection_supported`, `input_selectable`, `set_selection`,
-    // `set_input_selectable`) have no Blitz equivalent yet, so the input
-    // `type`-change text-selection step is a no-op until they land.
-}
-
 /// After an attribute change, runs the element's attribute-change hooks: an
 /// `iframe`'s `src` drives its browsing context's navigation
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>),
@@ -1671,9 +1660,6 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
             .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
     {
         compile_handler_attribute(ctx, element, typ)?;
-    }
-    if local == "type" {
-        apply_input_type_change(ctx, element);
     }
     if local != "src" {
         return Ok(());

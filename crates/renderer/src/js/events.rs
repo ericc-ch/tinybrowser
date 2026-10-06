@@ -889,7 +889,9 @@ pub(crate) fn fire_trusted(
     bubbles: bool,
     cancelable: bool,
 ) -> Result<()> {
-    fire_trusted_with_related(ctx, target, typ, bubbles, cancelable, None)
+    let event = Class::instance(ctx.clone(), JsEvent::trusted(typ, bubbles, cancelable))?;
+    dispatch(ctx, target, &event, None)?;
+    Ok(())
 }
 
 /// Fires `popstate` with the deserialized state for the activated entry.
@@ -910,23 +912,6 @@ pub(crate) fn fire_trusted_popstate<'js>(ctx: &Ctx<'js>, state: Value<'js>) -> R
 pub(crate) fn fire_trusted_click(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<bool> {
     let event = Class::instance(ctx.clone(), JsEvent::trusted("click", true, true))?;
     dispatch(ctx, target, &event, None)
-}
-
-/// Creates and dispatches a trusted event. The focus update steps compute
-/// a `relatedTarget`, but it has no reader until `FocusEvent` exists, so it
-/// is dropped here
-/// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).
-pub(crate) fn fire_trusted_with_related(
-    ctx: &Ctx<'_>,
-    target: EventTargetKey,
-    typ: &str,
-    bubbles: bool,
-    cancelable: bool,
-    _related: Option<EventTargetRef>,
-) -> Result<()> {
-    let event = Class::instance(ctx.clone(), JsEvent::trusted(typ, bubbles, cancelable))?;
-    dispatch(ctx, target, &event, None)?;
-    Ok(())
 }
 
 /// [Dispatch](https://dom.spec.whatwg.org/#concept-event-dispatch) an event.
