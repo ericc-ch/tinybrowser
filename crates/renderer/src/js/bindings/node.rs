@@ -6,7 +6,7 @@ use super::{
     WebIdlUnsignedLong, adopt_across_documents, ancestor_chain, attached_attr_id,
     attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node,
     character_data, character_data_offset, child_value, clone_document, clone_within_document,
-    convert_union_nodes_into_node, deref_weak, descendant_text, doctype_fields,
+    convert_union_nodes_into_node, deref_weak, descendant_text,
     document_base_url_string, document_is_html, document_is_html_content, document_url_string,
     dom_string, element_at_point, element_box, element_click, element_node_name,
     element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
@@ -992,7 +992,7 @@ fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
 }
 
 /// Siblings around `child` within `parent`, for the mutation journal.
-fn siblings_around(
+pub(super) fn siblings_around(
     base: &blitz_dom::BaseDocument,
     document: u32,
     parent: BlitzId,
@@ -7560,35 +7560,18 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
 impl<'js> document_type_generated::DocumentType<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-documenttype-name
     fn get_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let value = world
-            .document(self.handle.0)
-            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
-            .map_or(String::new(), |(name, _, _)| name);
-        rquickjs::String::from_str(ctx.clone(), &value)
+        // Blitz has no doctype nodes, so no `DocumentType` ever has a name.
+        rquickjs::String::from_str(ctx.clone(), "")
     }
 
     // https://dom.spec.whatwg.org/#dom-documenttype-publicid
     fn get_public_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let value = world
-            .document(self.handle.0)
-            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
-            .map_or(String::new(), |(_, public_id, _)| public_id);
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), "")
     }
 
     // https://dom.spec.whatwg.org/#dom-documenttype-systemid
     fn get_system_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let value = world
-            .document(self.handle.0)
-            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
-            .map_or(String::new(), |(_, _, system_id)| system_id);
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), "")
     }
 }
 

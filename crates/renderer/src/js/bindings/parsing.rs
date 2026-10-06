@@ -6,7 +6,6 @@ use super::{
 };
 
 use crate::js::world::Handle;
-use crate::js::world::NodeId;
 
 use markup5ever::{LocalName, QualName};
 
@@ -163,15 +162,6 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
             .append_children(html, &[body]);
         wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
-}
-
-/// The doctype's name, public id, and system id, when `parsed` holds `id`.
-pub(super) fn doctype_fields(
-    parsed: &crate::Parsed,
-    id: NodeId,
-) -> Option<(String, String, String)> {
-    let _ = (parsed, id);
-    None
 }
 
 /// An HTML-namespace qualified name for document construction.

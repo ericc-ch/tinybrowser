@@ -1626,6 +1626,9 @@ pub(super) fn match_observation(
     let mut want_attribute_old_value = false;
     let mut want_character_data_old_value = false;
     for observation in &observer.observations {
+        // `Attr` targets never match: journal records target elements and
+        // `Attr` nodes are ancestors of nothing, so observing one registers
+        // successfully but legitimately never fires.
         let Some(root) = observation.target.tree() else {
             continue;
         };

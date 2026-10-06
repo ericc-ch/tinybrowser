@@ -387,35 +387,6 @@ fn collect_by_class(
         .collect()
 }
 
-/// The siblings around `child` within `parent`, for the mutation journal.
-fn siblings_around(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    parent: BlitzId,
-    child: BlitzId,
-) -> (Option<NodeId>, Option<NodeId>) {
-    let mut previous = None;
-    let mut next = None;
-    if let Some(node) = base.get_node(parent) {
-        let mut seen = false;
-        for &kid in &node.children {
-            if kid == child {
-                seen = true;
-                continue;
-            }
-            let id = NodeId { document, node: kid };
-            if seen && next.is_none() {
-                next = Some(id);
-                break;
-            }
-            if !seen {
-                previous = Some(id);
-            }
-        }
-    }
-    (previous, next)
-}
-
 /// Detaches `target` from its parent, recording the `childList` journal entry
 /// observers deliver. Blitz performs no hierarchy validation here; callers
 /// establish the parent first.
@@ -425,7 +396,7 @@ fn detach_node(parsed: &mut crate::Parsed, target: NodeId) {
         let base = &parsed.document.base;
         let parent = base.get_node(target.node).and_then(|node| node.parent);
         let (previous, next) = parent.map_or((None, None), |parent| {
-            siblings_around(base, document, parent, target.node)
+            super::node::siblings_around(base, document, parent, target.node)
         });
         (parent, previous, next)
     };
@@ -475,7 +446,7 @@ fn insert_node_before(parsed: &mut crate::Parsed, reference: NodeId, child: Node
         let base = &parsed.document.base;
         let parent = base.get_node(reference.node).and_then(|node| node.parent);
         let previous =
-            parent.and_then(|parent| siblings_around(base, document, parent, reference.node).0);
+            parent.and_then(|parent| super::node::siblings_around(base, document, parent, reference.node).0);
         (parent, previous)
     };
     let Some(parent) = parent else {
@@ -503,7 +474,7 @@ fn replace_node(parsed: &mut crate::Parsed, old: NodeId, new: NodeId) {
         let base = &parsed.document.base;
         let parent = base.get_node(old.node).and_then(|node| node.parent);
         let (previous, next) = parent.map_or((None, None), |parent| {
-            siblings_around(base, document, parent, old.node)
+            super::node::siblings_around(base, document, parent, old.node)
         });
         (parent, previous, next)
     };

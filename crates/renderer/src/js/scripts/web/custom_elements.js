@@ -5,9 +5,6 @@
   const constructors = new __tbPrivateMap();
   const upgraded = host.slots();
   const connected = host.slots();
-  // Shadow roots keyed by host. `host.shadowRoot` is null in closed mode, but
-  // lifecycle traversal still has to reach those descendants.
-  const shadowRoots = host.slots();
   const pending = new __tbPrivateMap();
   let definitionRunning = false;
   const enqueueReaction = host.__tbEnqueueCustomReaction;
@@ -49,7 +46,7 @@
   }
 
   function shadowRootOf(host) {
-    return nativeApply(shadowRootGetter, host, []) || shadowRoots.get(host) || null;
+    return nativeApply(shadowRootGetter, host, []) || null;
   }
 
   // Shadow-including element descendants, in tree order. A host's shadow tree
@@ -330,11 +327,4 @@
     subtree: true, childList: true, attributes: true, attributeOldValue: true,
   };
   nativeApply(observe, observer, [document, observerOptions]);
-  const nativeAttachShadow = Element.prototype.attachShadow;
-  Element.prototype.attachShadow = function(init) {
-    const root = nativeAttachShadow.call(this, init);
-    shadowRoots.set(this, root);
-    nativeApply(observe, observer, [root, observerOptions]);
-    return root;
-  };
 }
