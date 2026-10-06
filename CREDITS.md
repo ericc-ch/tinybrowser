@@ -69,7 +69,6 @@ Versions move; check `Cargo.lock`. Notable licenses called out.
 
 ## Fonts and data
 
-- [Liberation Sans](https://github.com/liberationfonts/liberation-fonts) ([OFL-1.1](https://openfontlicense.org/)) under `crates/renderer/assets/`
 - [Public Suffix List](https://publicsuffix.org/list/) (`crates/cookies/src/public_suffix_list.dat`) from [publicsuffix.org](https://publicsuffix.org/)
 
 ## Ports and algorithm references
@@ -109,5 +108,4 @@ Most other DOM / Fetch / HTML follows [WHATWG](https://spec.whatwg.org/) with en
 - [MPL-2.0](https://www.mozilla.org/MPL/2.0/): Stylo, selectors, cssparser, app_units (and related). Source offer / notices should stay in sync with those crates.
 - [BSD-3-Clause](https://opensource.org/licenses/BSD-3-Clause): tiny-skia; parts of encoding_rs
 - [Unicode-3.0](https://www.unicode.org/license.txt): ICU4X
-- [OFL-1.1](https://openfontlicense.org/): Liberation Sans
 - Public Suffix List: see upstream license at [publicsuffix.org](https://publicsuffix.org/)
