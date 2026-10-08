@@ -262,6 +262,33 @@
     return element;
   };
 
+  // innerHTML creates elements for the node document, not the setter's realm
+  // (<https://dom.spec.whatwg.org/#concept-create-element>,
+  // <https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
+  const ownerDocumentGetter = Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument').get;
+  const defaultViewGetter = Object.getOwnPropertyDescriptor(Document.prototype, 'defaultView').get;
+  const innerHTML = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+  function upgradeFromNodeDocument(root) {
+    const document = nativeApply(ownerDocumentGetter, root, []);
+    if (!document) return;
+    const view = nativeApply(defaultViewGetter, document, []);
+    const foreign = view && view.customElements;
+    if (foreign && typeof foreign.upgrade === 'function') {
+      foreign.upgrade(root);
+    }
+  }
+  if (innerHTML && innerHTML.set) {
+    Object.defineProperty(Element.prototype, 'innerHTML', {
+      configurable: true,
+      enumerable: innerHTML.enumerable,
+      get: innerHTML.get,
+      set: function(value) {
+        nativeApply(innerHTML.set, this, [value]);
+        upgradeFromNodeDocument(this);
+      },
+    });
+  }
+
   // The engine adopts a cross-document node by materializing a copy
   // (<crates/renderer/src/js/bindings/clone.rs>), while Web IDL adoption keeps
   // the same object. Reactions the observer enqueues for the copy never reach
