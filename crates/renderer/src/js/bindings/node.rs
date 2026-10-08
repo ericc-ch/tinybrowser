@@ -3328,21 +3328,21 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-createattribute
     #[qjs(skip)]
     fn create_attribute<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
-        if !valid_attribute_local_name(&name.0) {
+        // An HTML document ASCII-lowercases the name before the Name check
+        // (<https://dom.spec.whatwg.org/#dom-document-createattribute>).
+        let name = if document_is_html_content(&ctx, self.handle.0) {
+            name.0.to_ascii_lowercase()
+        } else {
+            name.0
+        };
+        if !valid_attribute_local_name(&name) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
                 "attribute name is not a valid attribute local name",
             ));
         }
-        let id = new_detached_attr(
-            &ctx,
-            self.handle.0,
-            String::new(),
-            None,
-            name.0.clone(),
-            name.0,
-        )?;
+        let id = new_detached_attr(&ctx, self.handle.0, String::new(), None, name.clone(), name)?;
         attr_wrapper(&ctx, id)
     }
 
