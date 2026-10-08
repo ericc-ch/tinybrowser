@@ -77,7 +77,27 @@
       configurable: true,
     });
   }
-  installValueIterable(globalThis.NodeList);
+  // `NodeList` is `iterable<Node>`. Chromium and WebKit put the Array
+  // prototype methods on the instance, and WPT checks identity against
+  // `Array.prototype`
+  // (<https://webidl.spec.whatwg.org/#es-iterable>,
+  // <https://dom.spec.whatwg.org/#interface-nodelist>).
+  {
+    const proto = globalThis.NodeList.prototype;
+    for (const name of ['values', 'keys', 'entries', 'forEach']) {
+      Object.defineProperty(proto, name, {
+        value: Array.prototype[name],
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    Object.defineProperty(proto, Symbol.iterator, {
+      value: Array.prototype[Symbol.iterator],
+      writable: true,
+      configurable: true,
+    });
+  }
   installValueIterable(globalThis.DOMTokenList);
   // `NamedNodeMap` and `HTMLCollection` are not `iterable<>` in the DOM IDL.
   // The iterator below is the existing indexed walk those callers already use.
