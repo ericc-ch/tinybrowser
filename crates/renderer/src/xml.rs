@@ -60,6 +60,12 @@ fn parse_with_config(
     // is not a node
     // (<https://www.w3.org/TR/xml/#sec-prolog-dtd>).
     attach_xml_processing_instructions(&mut document, input);
+    // xml5ever binds xmlns declarations then drops those attributes from the
+    // element, so lookupPrefix/lookupNamespaceURI cannot see them
+    // (xml5ever `process_namespaces`). Namespace declaration attributes stay
+    // on the element
+    // (<https://dom.spec.whatwg.org/#locate-a-namespace-prefix>).
+    attach_xml_namespace_declarations(&mut document, input);
     Parsed {
         id: 0,
         document,
@@ -160,6 +166,162 @@ fn attach_xml_processing_instructions(document: &mut crate::documents::BlitzDocu
         let fresh = document.create_processing_instruction(target, &data);
         document.base.mutate().replace_node_with(hole, &[fresh]);
     }
+}
+
+/// Puts xmlns attributes xml5ever dropped back onto the matching elements.
+fn attach_xml_namespace_declarations(document: &mut crate::documents::BlitzDocument, input: &str) {
+    let tags = scan_xml_start_xmlns(input);
+    if tags.is_empty() {
+        return;
+    }
+    let mut elements = Vec::new();
+    collect_xml_elements(document, document.base.root_node().id, &mut elements);
+    if tags.len() != elements.len() {
+        return;
+    }
+    for (id, attributes) in elements.into_iter().zip(tags) {
+        for (name, value) in attributes {
+            document.base.mutate().set_attribute(id, name, &value);
+        }
+    }
+}
+
+fn collect_xml_elements(
+    document: &crate::documents::BlitzDocument,
+    id: blitz_traits::node_id::NodeId,
+    elements: &mut Vec<blitz_traits::node_id::NodeId>,
+) {
+    let is_element = document.extra(id).is_none()
+        && document
+            .base
+            .get_node(id)
+            .and_then(|node| node.data.downcast_element())
+            .is_some();
+    if is_element {
+        elements.push(id);
+    }
+    let children: Vec<_> = document
+        .base
+        .get_node(id)
+        .map(|node| node.children.iter().copied().collect())
+        .unwrap_or_default();
+    for child in children {
+        collect_xml_elements(document, child, elements);
+    }
+}
+
+fn scan_xml_start_xmlns(input: &str) -> Vec<Vec<(markup5ever::QualName, String)>> {
+    let mut found = Vec::new();
+    let mut pos = 0;
+    while pos < input.len() {
+        let rest = &input[pos..];
+        if let Some(inside) = rest.strip_prefix("<!--") {
+            match inside.find("-->") {
+                Some(end) => pos += 4 + end + 3,
+                None => break,
+            }
+            continue;
+        }
+        if let Some(inside) = rest.strip_prefix("<![CDATA[") {
+            match inside.find("]]>") {
+                Some(end) => pos += 9 + end + 3,
+                None => break,
+            }
+            continue;
+        }
+        if rest.starts_with("<?") || rest.starts_with("</") || rest.starts_with("<!") {
+            pos += skip_markup(rest);
+            continue;
+        }
+        if rest.starts_with('<') {
+            let (consumed, xmlns) = parse_xml_start_xmlns(rest);
+            found.push(xmlns);
+            pos += consumed;
+            continue;
+        }
+        let Some(next) = rest.chars().next() else {
+            break;
+        };
+        pos += next.len_utf8();
+    }
+    found
+}
+
+fn parse_xml_start_xmlns(tag: &str) -> (usize, Vec<(markup5ever::QualName, String)>) {
+    let consumed = skip_markup(tag);
+    let body = tag.get(1..consumed).unwrap_or("");
+    let mut xmlns = Vec::new();
+    let mut chars = body.chars().peekable();
+    while chars
+        .peek()
+        .is_some_and(|c| !is_xml_whitespace(*c) && *c != '/' && *c != '>')
+    {
+        chars.next();
+    }
+    loop {
+        while chars.peek().is_some_and(|c| is_xml_whitespace(*c)) {
+            chars.next();
+        }
+        match chars.peek() {
+            None | Some('/' | '>') => break,
+            _ => {}
+        }
+        let mut name = String::new();
+        while let Some(c) = chars.peek().copied() {
+            if is_xml_whitespace(c) || c == '=' || c == '/' || c == '>' {
+                break;
+            }
+            name.push(c);
+            chars.next();
+        }
+        while chars.peek().is_some_and(|c| is_xml_whitespace(*c)) {
+            chars.next();
+        }
+        if chars.peek() != Some(&'=') {
+            continue;
+        }
+        chars.next();
+        while chars.peek().is_some_and(|c| is_xml_whitespace(*c)) {
+            chars.next();
+        }
+        let Some(quote) = chars.next() else {
+            break;
+        };
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        let mut value = String::new();
+        for c in chars.by_ref() {
+            if c == quote {
+                break;
+            }
+            value.push(c);
+        }
+        if let Some(name) = xmlns_attribute_name(&name) {
+            xmlns.push((name, value));
+        }
+    }
+    (consumed, xmlns)
+}
+
+fn xmlns_attribute_name(name: &str) -> Option<markup5ever::QualName> {
+    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+    if name == "xmlns" {
+        return Some(markup5ever::QualName::new(
+            None,
+            markup5ever::Namespace::from(XMLNS),
+            markup5ever::LocalName::from("xmlns"),
+        ));
+    }
+    let prefix = name.strip_prefix("xmlns:")?;
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(markup5ever::QualName::new(
+        Some(markup5ever::Prefix::from("xmlns")),
+        markup5ever::Namespace::from(XMLNS),
+        markup5ever::LocalName::from(prefix),
+    ))
 }
 
 fn collect_pi_holes(
