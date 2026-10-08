@@ -149,6 +149,10 @@
         host.__tbDiscardCustomConstruction(element);
       }
       if (constructed !== element) throw new TypeError('custom element constructor returned another object');
+      // Parser-created wrappers intern as `HTMLElement`. Point them at the
+      // definition's prototype so `instanceof` matches the node document's
+      // constructor (<https://html.spec.whatwg.org/multipage/custom-elements.html#upgrades>).
+      Object.setPrototypeOf(element, definition.constructor.prototype);
       for (const name of definition.observed) {
         if (nativeApply(hasAttribute, element, [name])) {
           invoke(element, 'attributeChangedCallback', [name, null, nativeApply(getAttribute, element, [name]), null]);
@@ -288,7 +292,14 @@
       },
     });
   }
-  host.__tbUpgradeParsedTree = upgradeFromNodeDocument;
+  host.__tbUpgradeParsedTree = function(root) {
+    upgradeFromNodeDocument(root);
+    // The node document's registry may be unreachable from this realm
+    // (`defaultView` null). Fall back to this realm's definitions, which
+    // matches innerHTML invoked as a method of that realm.
+    pushReactions();
+    try { upgradeTree(root); } finally { popReactions(); }
+  };
 
   // The engine adopts a cross-document node by materializing a copy
   // (<crates/renderer/src/js/bindings/clone.rs>), while Web IDL adoption keeps
