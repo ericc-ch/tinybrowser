@@ -589,10 +589,22 @@ const __tbFrameProxy = frame => {
         // Cross-realm constructors are not callable from this realm. Hand
         // back a local function that creates the node in the target frame's
         // document (<https://dom.spec.whatwg.org/#dom-comment-comment>).
-        case 'Comment': case 'Text':
-          return function() {
+        case 'Comment': case 'Text': {
+          // Cross-realm constructors are not callable. A local wrapper
+          // constructs in the target document; its prototype is the target
+          // realm's so `instanceof contentWindow.Comment` holds
+          // (<https://dom.spec.whatwg.org/#dom-comment-comment>).
+          const ctor = function() {
             return __tbApply(host.__tb_construct_in_frame, globalThis, [frame, property, ...arguments]);
           };
+          const sameOrigin = host.__tbFrameGlobal(frame);
+          const original = sameOrigin == null ? undefined : sameOrigin[property];
+          const proto = (original && original.prototype)
+            || (globalThis[property] && globalThis[property].prototype);
+          if (proto) ctor.prototype = proto;
+          Object.defineProperty(ctor, 'name', { value: property, configurable: true });
+          return ctor;
+        }
         case 'addEventListener':
           return function(type, callback, options) {
             return globalThis.addEventListener.call(proxy, type, callback, options);
