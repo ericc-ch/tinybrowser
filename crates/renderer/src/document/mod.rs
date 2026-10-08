@@ -653,15 +653,17 @@ impl Document {
         self.eval_frame_script(script);
     }
 
-    /// Runs one `javascript:` URL script in this frame's realm; a string
-    /// result would replace the document, which the engine does not model, so
-    /// the result is discarded.
+    /// Runs one `javascript:` URL script in this frame's realm. A string
+    /// result replaces the document with that string parsed as HTML
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
     pub(crate) fn eval_frame_script(&mut self, script: &str) {
         if script.is_empty() {
             return;
         }
-        if self.eval(script).is_err() {
-            self.record_event(RendererEvent::ScriptFailed);
+        match self.eval(script) {
+            Ok(result) if !result.is_empty() => self.load_html(&result),
+            Ok(_) => {}
+            Err(_) => self.record_event(RendererEvent::ScriptFailed),
         }
     }
 

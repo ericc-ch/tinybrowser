@@ -796,7 +796,7 @@ impl Engine {
                 if let Some(document) = self.frames.get_mut(&child) {
                     if initial {
                         // The script runs in the document the browser already
-                        // created; its result is discarded.
+                        // created; a string result still replaces it.
                         document.eval_frame_script(&script);
                     } else {
                         document.load_javascript_frame(Some(&parent_url), &script);
