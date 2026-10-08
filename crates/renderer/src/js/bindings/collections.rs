@@ -145,7 +145,7 @@ fn collect_html_scripts(
             continue;
         }
         if crate::js::world::is_html_element(&doc.base, id, "script")
-            && script_is_in_document_tree(doc, id, document_element)
+            && script_is_in_document(doc, id, document_element)
         {
             order.push(NodeId { document, node: id });
         }
@@ -156,11 +156,16 @@ fn collect_html_scripts(
     order
 }
 
-/// A document script is a descendant of the document element and not of a
-/// fragment backing. Fragment backings may sit under the synthetic root or
-/// even under `html` in the Blitz tree; they are not in the document tree
-/// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
-fn script_is_in_document_tree(
+/// A document script is connected: descendant of the document element, not of
+/// a fragment backing, and marked in-document by insertion.
+///
+/// Fragment children can sit under `body` in the Blitz parent chain without
+/// having run insertion steps. Parent-chain connectedness would count them;
+/// `IS_IN_DOCUMENT` is set only in `process_added_subtree` when the parent is
+/// already in the document
+/// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>,
+/// <https://dom.spec.whatwg.org/#connected>).
+fn script_is_in_document(
     doc: &crate::documents::BlitzDocument,
     mut id: BlitzId,
     document_element: Option<BlitzId>,
@@ -168,6 +173,13 @@ fn script_is_in_document_tree(
     let Some(document_element) = document_element else {
         return false;
     };
+    if !doc
+        .base
+        .get_node(id)
+        .is_some_and(|node| node.flags.is_in_document())
+    {
+        return false;
+    }
     loop {
         if id == document_element {
             return true;
