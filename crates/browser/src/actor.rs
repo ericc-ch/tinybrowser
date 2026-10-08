@@ -710,7 +710,6 @@ impl Tab {
         let mount = Mount {
             url: self.document_url.to_string(),
             content_type: Some("text/html; charset=utf-8".to_owned()),
-            content_language: None,
             body: html.as_bytes().to_vec(),
             history: self.history.snapshot(),
             viewport: Some(self.viewport),
@@ -989,7 +988,6 @@ impl Tab {
         let mount = Mount {
             url: outcome.final_url.to_string(),
             content_type: outcome.content_type.clone(),
-            content_language: outcome.content_language.clone(),
             body: Vec::new(),
             history: history.snapshot(),
             viewport: Some(self.viewport),
@@ -1104,7 +1102,6 @@ fn blank_mount() -> Mount {
     Mount {
         url: "about:blank".into(),
         content_type: Some("text/html; charset=utf-8".into()),
-        content_language: None,
         body: b"<!doctype html><title></title>".to_vec(),
         history: HistorySnapshot::default(),
         viewport: None,

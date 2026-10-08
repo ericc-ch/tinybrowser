@@ -71,8 +71,6 @@ interface types {
         final-url: string,
         /// `Content-Type` header, when the transport exposes it.
         content-type: option<string>,
-        /// `Content-Language` header, when the transport exposes it.
-        content-language: option<string>,
         /// Every `Set-Cookie` line of this exchange, verbatim.
         ///
         /// The component parses and stores them against the request URL. The

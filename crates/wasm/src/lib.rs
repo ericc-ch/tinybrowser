@@ -108,7 +108,6 @@ impl GuestTab for Tab {
         let mount = Mount {
             url,
             content_type: Some("text/html; charset=utf-8".into()),
-            content_language: None,
             body: html.into_bytes(),
             history: renderer::HistorySnapshot::default(),
             viewport: None,
@@ -388,7 +387,6 @@ fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOut
         status: response.status,
         final_url: final_url.into(),
         content_type: response.content_type,
-        content_language: response.content_language,
         headers: Vec::new(),
         body: response.body,
     })
@@ -641,7 +639,6 @@ mod tests {
             status: 200,
             final_url: String::new(),
             content_type: None,
-            content_language: None,
             set_cookies: Vec::new(),
             location: None,
             body: b"hi".to_vec(),

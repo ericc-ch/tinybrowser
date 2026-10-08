@@ -356,7 +356,6 @@ impl ResponseStreams {
             &ResponseHead {
                 url: response.final_url.clone(),
                 content_type: response.content_type.clone(),
-                content_language: response.content_language.clone(),
                 history: response.history.clone(),
                 viewport: response.viewport,
                 init_scripts: response.init_scripts.clone(),

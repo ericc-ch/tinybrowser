@@ -290,7 +290,6 @@ impl RendererHandle {
             status,
             final_url: mount.url.clone(),
             content_type: mount.content_type.clone(),
-            content_language: mount.content_language.clone(),
             history: mount.history.clone(),
             viewport: mount.viewport,
             init_scripts: mount.init_scripts.clone(),

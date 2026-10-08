@@ -238,8 +238,6 @@ pub struct Mount {
     pub url: String,
     /// HTTP `Content-Type`, when the document came from the network.
     pub content_type: Option<String>,
-    /// HTTP `Content-Language`, when the document came from the network.
-    pub content_language: Option<String>,
     /// Raw document bytes; the renderer decodes them.
     #[serde(skip, default)]
     pub body: Vec<u8>,
@@ -265,8 +263,6 @@ pub struct ResponseHead {
     pub url: String,
     /// HTTP `Content-Type`, when the document came from the network.
     pub content_type: Option<String>,
-    /// HTTP `Content-Language`, when the document came from the network.
-    pub content_language: Option<String>,
     /// Session history visible in the newly opened document.
     pub history: HistorySnapshot,
     /// Emulated viewport size to apply before the document lays out, when the
@@ -390,8 +386,6 @@ pub struct DialOutcome {
     pub final_url: String,
     /// `Content-Type` header, when present and UTF-8.
     pub content_type: Option<String>,
-    /// `Content-Language` header, when present and a single tag.
-    pub content_language: Option<String>,
     /// Response headers visible to page scripts, in wire order.
     #[serde(default)]
     pub headers: Vec<(String, String)>,

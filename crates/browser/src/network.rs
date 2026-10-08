@@ -23,7 +23,6 @@ pub(crate) struct NavOutcome {
     pub status: u16,
     pub final_url: Url,
     pub content_type: Option<String>,
-    pub content_language: Option<String>,
     pub body: net::Body,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -166,13 +165,12 @@ impl TabNetworkHandle {
             .map_err(|error| dial_failure(&error))?;
         let status = response.status();
         let final_url = response.final_url().clone();
-        let (content_type, content_language) = response_meta(response.headers());
+        let content_type = content_type_header(response.headers());
         let body = response.into_body();
         Ok(NavOutcome {
             status,
             final_url,
             content_type,
-            content_language,
             body,
             _permit: permits,
         })
@@ -236,7 +234,7 @@ impl TabNetworkHandle {
                 .map_err(|error| dial_failure(&error))?;
             let status = response.status();
             let final_url = response.final_url().to_string();
-            let (content_type, content_language) = response_meta(response.headers());
+            let content_type = content_type_header(response.headers());
             let headers = response
                 .headers()
                 .iter()
@@ -260,7 +258,6 @@ impl TabNetworkHandle {
                 status,
                 final_url,
                 content_type,
-                content_language,
                 headers,
                 body,
             })
@@ -403,31 +400,12 @@ fn sends_default_ua_client_hints(url: &Url) -> bool {
     }
 }
 
-/// `Content-Type` and single `Content-Language` tag from response `headers`.
-fn response_meta(headers: &net::HeaderMap) -> (Option<String>, Option<String>) {
-    let content_language = headers
-        .get("content-language")
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .and_then(content_language_tag);
-    let content_type = headers
+/// `Content-Type` from response `headers`, when it is UTF-8.
+fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
+    headers
         .get("content-type")
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .map(str::to_owned);
-    (content_type, content_language)
-}
-
-/// One `Content-Language` tag, or `None` when the header lists several
-/// languages ([HTML document language](https://html.spec.whatwg.org/multipage/dom.html#language)).
-fn content_language_tag(raw: &str) -> Option<String> {
-    let mut tags = raw
-        .split(',')
-        .map(|part| part.split(';').next().unwrap_or(part).trim())
-        .filter(|tag| !tag.is_empty());
-    let first = tags.next()?.to_owned();
-    if tags.next().is_some() {
-        return None;
-    }
-    Some(first)
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

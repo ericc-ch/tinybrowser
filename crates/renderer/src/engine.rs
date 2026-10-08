@@ -181,12 +181,7 @@ impl Engine {
         let document = self.frame_mut(frame)?;
         document.world().borrow_mut().history = head.history.clone();
         let url = Url::parse(&head.url).ok();
-        document.begin_response(
-            url.as_ref(),
-            head.content_type.as_deref(),
-            head.content_language.as_deref(),
-            head.viewport,
-        );
+        document.begin_response(url.as_ref(), head.content_type.as_deref(), head.viewport);
         Ok(())
     }
 
@@ -780,7 +775,7 @@ impl Engine {
             "data" => {
                 if let Some((content_type, body)) = decode_data_url(url.as_str()) {
                     if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_frame_response(&url, content_type.as_deref(), None, &body);
+                        document.load_frame_response(&url, content_type.as_deref(), &body);
                     }
                 } else {
                     // A malformed data URL fails the navigation; the frame
@@ -824,7 +819,6 @@ impl Engine {
                     document.load_frame_response(
                         &url,
                         content_type.as_deref(),
-                        None,
                         contents.as_deref().unwrap_or("").as_bytes(),
                     );
                 }
@@ -928,8 +922,7 @@ impl Engine {
 
     /// Reorders each frame's children to the tree order of their containers.
     ///
-    /// A same-document `iframe` move is not a connection transition, so the
-    /// scan runs whenever the parent's document mutated since the last one
+    /// A same-document `iframe` move is not a connection transition
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
     fn reorder_frames(&mut self) {
         let parents: Vec<FrameId> = self
@@ -950,9 +943,6 @@ impl Engine {
             let Some(document) = self.frames.get_mut(&parent) else {
                 continue;
             };
-            if !Document::frame_order_changed() {
-                continue;
-            }
             let containers = document.iframe_containers_in_order();
             self.runtime
                 .shared

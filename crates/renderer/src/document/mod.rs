@@ -600,21 +600,15 @@ impl Document {
         self.initial_blank
     }
 
-    /// Whether the child frame order may have changed since the last scan.
-    pub(crate) fn frame_order_changed() -> bool {
-        true
-    }
-
     /// Replaces this frame's document with a complete response, as the frame's
     /// own `src` load delivers it.
     pub(crate) fn load_frame_response(
         &mut self,
         url: &Url,
         content_type: Option<&str>,
-        content_language: Option<&str>,
         body: &[u8],
     ) {
-        self.load_response_body(url, content_type, content_language, body);
+        self.load_response_body(url, content_type, body);
         // Every frame has a window; make sure the realm exists even when the
         // document never runs a script, so a parent can set properties on it
         // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
@@ -894,12 +888,7 @@ impl Document {
             self.viewport_size = (width, height);
         }
         self.world.borrow_mut().history = mount.history.clone();
-        self.load_response_body(
-            &url,
-            mount.content_type.as_deref(),
-            mount.content_language.as_deref(),
-            &mount.body,
-        );
+        self.load_response_body(&url, mount.content_type.as_deref(), &mount.body);
         Ok(())
     }
 
@@ -923,15 +912,13 @@ impl Document {
     }
 
     /// Starts a document from a network response: a new realm, the response's
-    /// URL and language, and a body that may arrive in pieces.
+    /// URL, and a body that may arrive in pieces.
     ///
-    /// A URL that does not parse leaves the document on its previous URL, and
-    /// an absent language clears it, because both come from this response.
+    /// A URL that does not parse leaves the document on its previous URL.
     pub(crate) fn begin_response(
         &mut self,
         url: Option<&Url>,
         content_type: Option<&str>,
-        content_language: Option<&str>,
         viewport: Option<(u32, u32)>,
     ) {
         self.reset_js_realm();
@@ -942,9 +929,6 @@ impl Document {
             self.url = url.clone();
         }
         self.initial_blank = false;
-        // Blitz owns document language internally and exposes no metadata
-        // setter; the response language is ignored until that setter exists.
-        let _ = content_language;
         let mut world = self.world.borrow_mut();
         world.document_url = self.url.clone();
         drop(world);
@@ -959,15 +943,14 @@ impl Document {
     }
 
     /// Starts a document from a complete response: new realm, the response's
-    /// URL and language, and the whole body.
+    /// URL, and the whole body.
     fn load_response_body(
         &mut self,
         url: &Url,
         content_type: Option<&str>,
-        content_language: Option<&str>,
         body: &[u8],
     ) {
-        self.begin_response(Some(url), content_type, content_language, None);
+        self.begin_response(Some(url), content_type, None);
         self.write_body(body);
         self.end_body();
     }
@@ -1540,12 +1523,7 @@ impl Document {
                 self.record_event(RendererEvent::Navigated {
                     url: url.to_string(),
                 });
-                self.load_frame_response(
-                    &url,
-                    outcome.content_type.as_deref(),
-                    outcome.content_language.as_deref(),
-                    &outcome.body,
-                );
+                self.load_frame_response(&url, outcome.content_type.as_deref(), &outcome.body);
             }
             DialContext::BlitzResource { id } => {
                 // Stale deliveries are harmless: the handler reports into

@@ -199,8 +199,6 @@ pub struct ResponseStart {
     pub final_url: String,
     /// HTTP `Content-Type`, when present.
     pub content_type: Option<String>,
-    /// HTTP `Content-Language`, when present.
-    pub content_language: Option<String>,
     /// Session history applied before the new realm parses response bytes.
     pub history: renderer::HistorySnapshot,
     /// Emulated viewport size to apply before the document lays out, when the
@@ -490,7 +488,6 @@ mod tests {
                         status: 200,
                         final_url: "http://example.test/".into(),
                         content_type: Some("text/html".into()),
-                        content_language: None,
                         history: renderer::HistorySnapshot::default(),
                         viewport: None,
                         init_scripts: Vec::new(),
@@ -658,7 +655,6 @@ mod tests {
                     status: 200,
                     final_url: "http://example.test/".into(),
                     content_type: Some("text/html".into()),
-                    content_language: None,
                     history: renderer::HistorySnapshot::default(),
                     viewport: None,
                     init_scripts: Vec::new(),

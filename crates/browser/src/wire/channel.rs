@@ -28,8 +28,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// `storage` event. Version 6 added `window.open`/`window.close`. Version 7
 /// added cross-tab messaging, session copies, and remote session reads.
 /// Version 8 added `BroadcastChannel`. Version 9 replaced operation-specific
-/// body messages with directional exchange stream chunks.
-pub const PROTOCOL_VERSION: u8 = 9;
+/// body messages with directional exchange stream chunks. Version 10 dropped
+/// `content_language` from mount, response-start, and dial outcomes.
+pub const PROTOCOL_VERSION: u8 = 10;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

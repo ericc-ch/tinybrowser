@@ -318,6 +318,6 @@ Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail clo
 - `blitz-dom` styles with hardcoded `NoQuirks` internally, so `document.compatMode` (sniffed from the doctype) can disagree with the rendering mode.
 - `blitz-dom` puts `AnonymousBlock` layout boxes in the same tree; we treat them as transparent (snapshot/serialize children only, never brand as elements).
 - `blitz-dom` exposes only the viewport scroll offset, no per-element scroll-container offset API.
-- `blitz-dom` owns document language internally with no metadata setter; response language stays on `content_language`.
+- `blitz-dom` owns document language internally with no metadata setter, so a response `Content-Language` is not applied.
 - `blitz-html` always parses scripting-disabled (`noscript` as markup); scripting-enabled `noscript`-as-text diverges.
 - Pre-existing `main` crashes, out of scope: `dom/nodes/Document-characterSet-normalization-1.html`, `Document-characterSet-normalization-2.html`, `Document-createElement-namespace.html`.
