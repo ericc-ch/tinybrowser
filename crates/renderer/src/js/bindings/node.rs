@@ -3258,6 +3258,30 @@ impl JsNode {
         Ok(value)
     }
 
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
+    #[qjs(get, rename = "scripts")]
+    fn scripts<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(&ctx)?;
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::Scripts)
+            && let Some(value) = deref_weak(&ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let value = live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::HtmlScripts,
+            Some("HTMLCollection"),
+        )?;
+        let weak = make_weak(&ctx, value.clone())?;
+        world_rc.borrow_mut().intern_wrapper(
+            self.handle.0,
+            Wrapper::Scripts,
+            Persistent::save(&ctx, weak),
+        );
+        Ok(value)
+    }
+
     // https://dom.spec.whatwg.org/#dom-node-appendchild
     #[qjs(skip)]
     fn append_child<'js>(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<Value<'js>> {
@@ -4991,6 +5015,41 @@ impl JsNode {
         drop(world);
         register_inserted_iframes(ctx, &added)?;
         schedule_mutation_delivery(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    #[qjs(get, rename = "innerText")]
+    fn inner_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        match self.text_content(&ctx)? {
+            Some(value) => Ok(value),
+            None => rquickjs::String::from_str(ctx, ""),
+        }
+    }
+
+    // Not-being-rendered innerText replace-all with one text node. Converting
+    // newlines to `br` is the rendered-text-fragment path and a known gap
+    // (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
+    #[qjs(set, rename = "innerText")]
+    fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let html = world(&ctx)?
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(self.handle.0.node)
+                    .is_some_and(|node| {
+                        node.data
+                            .downcast_element()
+                            .is_some_and(|element| element.name.ns == html_namespace())
+                    })
+            });
+        if !html {
+            return Ok(());
+        }
+        let string = rquickjs::String::from_str(ctx.clone(), &value.0)?;
+        self.set_text_content(&ctx, Some(string))
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-insertadjacenthtml
@@ -8611,12 +8670,16 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
     // No media pipeline: the network state never leaves its initial value
     // (<https://html.spec.whatwg.org/multipage/media.html#dom-media-networkstate>).
     fn get_network_state(&self, ctx: &Ctx<'js>) -> Result<u16> {
-        // The sync section of resource selection picks a candidate before any
-        // fetch runs: a `src` attribute, or a `<source>` child that itself
-        // has `src`, moves the state out of NETWORK_EMPTY. With no media
-        // pipeline nothing runs past this point, so a candidate reads as
-        // NETWORK_NO_SOURCE and its absence as NETWORK_EMPTY
+        // Resource selection's first step sets NETWORK_NO_SOURCE, before the
+        // await-a-stable-state wait
         // (<https://html.spec.whatwg.org/multipage/media.html#concept-media-load-algorithm>).
+        // The algorithm runs when a media element is inserted into a document,
+        // when `src` is set, or when a `source` child is inserted even with
+        // no `src`
+        // (<https://html.spec.whatwg.org/multipage/media.html#loading-the-media-resource>,
+        // <https://html.spec.whatwg.org/multipage/embedded-content.html#the-source-element:html-element-insertion-steps>).
+        // No media pipeline runs past that point, so the state stays
+        // NETWORK_NO_SOURCE instead of NETWORK_LOADING.
         const NETWORK_NO_SOURCE: u16 = 3;
         const NETWORK_EMPTY: u16 = 0;
         let selected = world_for_node(ctx, self.handle.0)
@@ -8624,6 +8687,9 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
             .and_then(|owner| {
                 owner.borrow().with_document(self.handle.0, |parsed| {
                     let base = &parsed.document.base;
+                    if is_connected(base, self.handle.0.node) {
+                        return true;
+                    }
                     if attr(base, self.handle.0.node, "src").is_some() {
                         return true;
                     }
@@ -8634,7 +8700,7 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
                                     element.name.ns == html_namespace()
                                         && element.name.local.as_ref() == "source"
                                 })
-                            }) && attr(base, *kid, "src").is_some()
+                            })
                         })
                     })
                 })

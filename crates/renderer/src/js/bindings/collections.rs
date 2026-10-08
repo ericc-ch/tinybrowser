@@ -18,12 +18,19 @@ pub(crate) enum CollectionKind {
     Children,
     ElementChildren,
     ElementsByTag(String),
-    ElementsByTagNs { namespace: String, local: String },
+    ElementsByTagNs {
+        namespace: String,
+        local: String,
+    },
     ElementsByClass(String),
     ElementsByName(String),
     SelectOptions,
     SelectedOptions,
     WindowNamed(String),
+    /// `Document.scripts`: HTML `script` descendants of the document element,
+    /// skipping fragment backings
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
+    HtmlScripts,
     Static(Vec<Handle>),
 }
 
@@ -58,7 +65,8 @@ impl CollectionQuery {
             | CollectionKind::ElementsByName(_)
             | CollectionKind::SelectOptions
             | CollectionKind::SelectedOptions
-            | CollectionKind::WindowNamed(_) => self.ids(ctx)?.get(index).copied(),
+            | CollectionKind::WindowNamed(_)
+            | CollectionKind::HtmlScripts => self.ids(ctx)?.get(index).copied(),
         };
         match id {
             Some(id) => wrap_node(ctx, id),
@@ -102,8 +110,52 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
             .filter(|option| option_selected(base, option.node))
             .collect(),
         CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
+        CollectionKind::HtmlScripts => collect_html_scripts(&parsed.document, document, scope.node),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
+}
+
+/// HTML `script` descendants of the document element.
+///
+/// `Document.scripts` is an `HTMLCollection` rooted at the `Document` node
+/// whose filter matches `script` elements
+/// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
+/// The synthetic viewport box above the document element is not a DOM
+/// descendant of that node; walking from its first non-fragment element
+/// child keeps fragment backings that sit beside `html` off the list.
+fn collect_html_scripts(
+    doc: &crate::documents::BlitzDocument,
+    document: u32,
+    scope: BlitzId,
+) -> Vec<NodeId> {
+    let start = doc
+        .base
+        .get_node(scope)
+        .and_then(|node| {
+            node.children
+                .iter()
+                .copied()
+                .find(|child| super::is_element(&doc.base, *child) && !doc.is_fragment(*child))
+        })
+        .unwrap_or(scope);
+    let mut order = Vec::new();
+    let mut stack: Vec<BlitzId> = doc
+        .base
+        .get_node(start)
+        .map(|node| node.children.iter().rev().copied().collect())
+        .unwrap_or_default();
+    while let Some(id) = stack.pop() {
+        if doc.is_fragment(id) {
+            continue;
+        }
+        if crate::js::world::is_html_element(&doc.base, id, "script") {
+            order.push(NodeId { document, node: id });
+        }
+        if let Some(node) = doc.base.get_node(id) {
+            stack.extend(node.children.iter().rev().copied());
+        }
+    }
+    order
 }
 
 /// Descendant Blitz ids of `scope` in tree order, excluding `scope` itself.
@@ -598,7 +650,8 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
             | CollectionKind::ElementsByClass(_)
             | CollectionKind::SelectOptions
             | CollectionKind::SelectedOptions
-            | CollectionKind::WindowNamed(_) => self.query.ids(ctx)?.len(),
+            | CollectionKind::WindowNamed(_)
+            | CollectionKind::HtmlScripts => self.query.ids(ctx)?.len(),
         })
     }
 
