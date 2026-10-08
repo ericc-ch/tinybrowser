@@ -41,7 +41,7 @@ use crate::js::world::World;
 use crate::js::world::{
     BlitzId, DocumentStreamCommand, Handle, JournalEntry, NodeId, NodeReference, Wrapper, attr,
     child_ids, form_owner_of, html_namespace, is_connected, is_html_element, is_iframe_element,
-    svg_namespace,
+    mathml_namespace, svg_namespace,
 };
 
 use crate::ReadyState;
@@ -2102,7 +2102,63 @@ fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) 
             InsertionStep::MetaReferrer(id) => apply_meta_referrer(ctx, id),
         }
     }
+    // Spec gates this on a header-delivered CSP
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+    // Chromium and `moveBefore/nonce.html` clear the content attribute
+    // whenever the element becomes browsing-context connected; `move` does
+    // not disconnect, so the attribute stays.
+    clear_nonce_on_connect(ctx, inserted)?;
     Ok(())
+}
+
+/// Sets the `nonce` content attribute to the empty string on HTML, SVG, and
+/// `MathML` elements that just became browsing-context connected.
+fn clear_nonce_on_connect(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
+    let mut ids = Vec::new();
+    {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        for root in inserted {
+            let Some(parsed) = world.document(*root) else {
+                continue;
+            };
+            collect_nonce_elements(&parsed.document.base, *root, &mut ids);
+        }
+    }
+    for id in ids {
+        set_attribute_sync(ctx, id, "nonce", "")?;
+    }
+    Ok(())
+}
+
+fn collect_nonce_elements(base: &blitz_dom::BaseDocument, id: NodeId, out: &mut Vec<NodeId>) {
+    if let Some(element) = base
+        .get_node(id.node)
+        .and_then(|node| node.data.downcast_element())
+    {
+        let html = element.name.ns == html_namespace();
+        let svg = element.name.ns == svg_namespace();
+        let mathml = element.name.ns == mathml_namespace();
+        if (html || svg || mathml)
+            && attr(base, id.node, "nonce").is_some_and(|value| !value.is_empty())
+        {
+            out.push(id);
+        }
+    }
+    let children: Vec<BlitzId> = base
+        .get_node(id.node)
+        .map(|node| node.children.iter().copied().collect())
+        .unwrap_or_default();
+    for child in children {
+        collect_nonce_elements(
+            base,
+            NodeId {
+                document: id.document,
+                node: child,
+            },
+            out,
+        );
+    }
 }
 
 enum InsertionStep {
