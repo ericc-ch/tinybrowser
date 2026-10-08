@@ -21,7 +21,7 @@ WPT has many test groups (html, css, dom, and more). Each percentage is the pass
 
 The **total** row is pass / (tests − skip) across every directory that produced a report in this overnight dump — not a claim that every WPT file on earth was run. Worker excludes and known-skips stay out of the fail pile.
 
-Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (269/354 on 2026-10-08), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
+Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (271/354 on 2026-10-08), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
 nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
@@ -89,7 +89,7 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 | `document-picture-in-picture/` | 4.5% |
 | `document-policy/` | 0.0% |
 | `dom/` | 30.2% |
-| `dom/nodes/` (slice) | 76.0% |
+| `dom/nodes/` (slice) | 76.6% |
 | `domparsing/` | 27.0% |
 | `domxpath/` | 5.9% |
 | `dpub-aam/` | 0.0% |
