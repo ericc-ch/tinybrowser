@@ -3,8 +3,8 @@
 `tools/wpt/run` runs `wpt run` against tinybrowser. It builds the debug
 binary only when that binary is missing or a compiled input is newer, and
 installs the wptrunner product into WPT's venv only when the venv is missing
-or its requirements changed. It defaults to `--processes 4` (unless
-`--fully-parallel` is set), `--test-types testharness crashtest`, enables
+or its requirements changed. It defaults `--processes` to the CPU count
+(unless `--processes` or `--fully-parallel` is set), `--test-types testharness crashtest`, enables
 HTTPS with the wptserve CA, and passes `--resolve` maps instead of editing
 `/etc/hosts`.
 
@@ -56,7 +56,7 @@ In `docs/progress.md`, replace the latest total and scored groups only.
 | reftest | Screenshot comparison through the WebDriver screenshot route; the engine has no chrome, so the outer window equals the inner 800x600 viewport. |
 | HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. |
-| Parallel processes | `--processes 4` unless the command sets `--processes`. Each process gets its own browser and ports. `--fully-parallel` is separate: every test is its own group, so the browser restarts per test. |
+| Parallel processes | CPU count unless the command sets `--processes` or `--fully-parallel`. Each process gets its own browser and ports. `--fully-parallel` is separate: every test is its own group, so the browser restarts per test. |
 
 ## Blocked on engine capabilities
 
