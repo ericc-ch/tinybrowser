@@ -82,14 +82,13 @@ pub(crate) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result
 /// Dropping those code units keeps the two distinct
 /// (<https://infra.spec.whatwg.org/#javascript-string-convert>).
 pub(crate) fn js_string_to_utf8(value: &rquickjs::String<'_>) -> Result<String> {
-    match value.to_string() {
-        Ok(text) => Ok(text),
-        Err(_) => {
-            let units = value.to_utf16()?;
-            Ok(char::decode_utf16(units)
-                .filter_map(|code| code.ok())
-                .collect())
-        }
+    if let Ok(text) = value.to_string() {
+        Ok(text)
+    } else {
+        let units = value.to_utf16()?;
+        Ok(char::decode_utf16(units)
+            .filter_map(std::result::Result::<char, std::char::DecodeUtf16Error>::ok)
+            .collect())
     }
 }
 
