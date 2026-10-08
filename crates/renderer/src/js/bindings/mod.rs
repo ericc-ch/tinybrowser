@@ -1130,13 +1130,12 @@ pub(super) fn with_node_data<T>(
 }
 
 pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<crate::dom_string::DomString> {
-    with_node_data(ctx, id, |data| match data {
-        Some(NodeData::Text(text)) => crate::dom_string::DomString::from(text.content.clone()),
-        Some(NodeData::Comment { contents }) => {
-            crate::dom_string::DomString::from(contents.clone())
-        }
-        _ => crate::dom_string::DomString::default(),
-    })
+    let owner = world_for_node(ctx, id)?;
+    let parsed = owner.borrow();
+    let Some(parsed) = parsed.document(id) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    Ok(parsed.document.character_data(id.node))
 }
 
 /// The value of `id`'s attribute `local`, or the empty string.
@@ -1182,24 +1181,24 @@ fn set_character_data_inner(
     data: &crate::dom_string::DomString,
     reparse_pi: bool,
 ) -> Result<()> {
-    // Lone surrogates cannot survive the UTF-8 tree: they become the
-    // replacement character at this boundary, a known cutover gap.
-    let data = data.to_string_lossy().into_owned();
+    // Blitz's tree is UTF-8. Unpaired surrogates stay in the side table
+    // so [replace data] still operates on UTF-16 code units
+    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
+    let utf8 = data.to_string_lossy().into_owned();
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
     let Some(mut parsed) = owner.document_mut(id) else {
         return Ok(());
     };
     let old_value = {
-        let base = &parsed.document.base;
-        let Some(node) = base.get_node(id.node) else {
+        let is_character_data =
+            parsed.document.base.get_node(id.node).is_some_and(|node| {
+                matches!(node.data, NodeData::Text(_) | NodeData::Comment { .. })
+            });
+        if !is_character_data {
             return Ok(());
-        };
-        match &node.data {
-            NodeData::Text(text) => crate::dom_string::DomString::from(text.content.clone()),
-            NodeData::Comment { contents } => crate::dom_string::DomString::from(contents.clone()),
-            _ => return Ok(()),
         }
+        parsed.document.character_data(id.node)
     };
     {
         let base = &mut parsed.document.base;
@@ -1208,7 +1207,7 @@ fn set_character_data_inner(
         };
         match &node.data {
             NodeData::Text(_) => {
-                base.mutate().set_node_text(id.node, &data);
+                base.mutate().set_node_text(id.node, &utf8);
             }
             NodeData::Comment { .. } => {
                 base.snapshot_node(id.node);
@@ -1216,12 +1215,13 @@ fn set_character_data_inner(
                     base.get_node_mut(id.node).map(|node| &mut node.data)
                 {
                     contents.clear();
-                    contents.push_str(&data);
+                    contents.push_str(&utf8);
                 }
             }
             _ => return Ok(()),
         }
     }
+    parsed.document.set_exact_character_data(id.node, data);
     parsed
         .document
         .record(crate::js::world::JournalEntry::CharacterData {

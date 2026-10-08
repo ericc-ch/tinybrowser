@@ -252,64 +252,66 @@ pub(crate) enum ImportSnapshot {
     Fragment(Vec<ImportSnapshot>),
 }
 
+fn extra_snapshot(doc: &BlitzDocument, id: NodeId) -> Option<ImportSnapshot> {
+    match doc.extra(id.node).cloned() {
+        Some(crate::documents::ExtraNode::DocumentType {
+            name,
+            public_id,
+            system_id,
+        }) => Some(ImportSnapshot::DocumentType {
+            name,
+            public_id,
+            system_id,
+        }),
+        Some(crate::documents::ExtraNode::ProcessingInstruction { target, attributes }) => {
+            Some(ImportSnapshot::ProcessingInstruction {
+                target,
+                data: doc.character_data(id.node),
+                attributes,
+            })
+        }
+        Some(crate::documents::ExtraNode::CDataSection) => {
+            Some(ImportSnapshot::CData(doc.character_data(id.node)))
+        }
+        None => None,
+    }
+}
+
+fn snapshot_children(
+    doc: &BlitzDocument,
+    document: u32,
+    children: impl IntoIterator<Item = blitz_traits::node_id::NodeId>,
+) -> Vec<ImportSnapshot> {
+    children
+        .into_iter()
+        .filter_map(|child| {
+            import_snapshot(
+                doc,
+                NodeId {
+                    document,
+                    node: child,
+                },
+                true,
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn import_snapshot(
     doc: &BlitzDocument,
     id: NodeId,
     deep: bool,
 ) -> Option<ImportSnapshot> {
-    let node = doc.base.get_node(id.node)?;
-    match doc.extra(id.node) {
-        Some(crate::documents::ExtraNode::DocumentType {
-            name,
-            public_id,
-            system_id,
-        }) => {
-            return Some(ImportSnapshot::DocumentType {
-                name: name.clone(),
-                public_id: public_id.clone(),
-                system_id: system_id.clone(),
-            });
-        }
-        Some(crate::documents::ExtraNode::ProcessingInstruction { target, attributes }) => {
-            let data = match &node.data {
-                NodeData::Comment { contents } => {
-                    crate::dom_string::DomString::from(contents.clone())
-                }
-                _ => crate::dom_string::DomString::default(),
-            };
-            return Some(ImportSnapshot::ProcessingInstruction {
-                target: target.clone(),
-                data,
-                attributes: attributes.clone(),
-            });
-        }
-        Some(crate::documents::ExtraNode::CDataSection) => {
-            let data = match &node.data {
-                NodeData::Text(text) => crate::dom_string::DomString::from(text.content.clone()),
-                _ => crate::dom_string::DomString::default(),
-            };
-            return Some(ImportSnapshot::CData(data));
-        }
-        None => {}
+    if let Some(extra) = extra_snapshot(doc, id) {
+        return Some(extra);
     }
+    let node = doc.base.get_node(id.node)?;
     match &node.data {
         NodeData::Element(element) => {
             let name = element.name.clone();
             let attributes = element.attrs.iter().cloned().collect();
             let children = if deep {
-                node.children
-                    .iter()
-                    .filter_map(|child| {
-                        import_snapshot(
-                            doc,
-                            NodeId {
-                                document: id.document,
-                                node: *child,
-                            },
-                            true,
-                        )
-                    })
-                    .collect()
+                snapshot_children(doc, id.document, node.children.iter().copied())
             } else {
                 Vec::new()
             };
@@ -319,32 +321,15 @@ pub(crate) fn import_snapshot(
                 children,
             })
         }
-        NodeData::Text(text) => Some(ImportSnapshot::Text(crate::dom_string::DomString::from(
-            text.content.clone(),
-        ))),
-        NodeData::Comment { contents } => Some(ImportSnapshot::Comment(
-            crate::dom_string::DomString::from(contents.clone()),
-        )),
+        NodeData::Text(_) => Some(ImportSnapshot::Text(doc.character_data(id.node))),
+        NodeData::Comment { .. } => Some(ImportSnapshot::Comment(doc.character_data(id.node))),
         NodeData::AnonymousBlock(_) => {
-            if deep {
-                let children = node
-                    .children
-                    .iter()
-                    .filter_map(|child| {
-                        import_snapshot(
-                            doc,
-                            NodeId {
-                                document: id.document,
-                                node: *child,
-                            },
-                            true,
-                        )
-                    })
-                    .collect();
-                Some(ImportSnapshot::Fragment(children))
+            let children = if deep {
+                snapshot_children(doc, id.document, node.children.iter().copied())
             } else {
-                Some(ImportSnapshot::Fragment(Vec::new()))
-            }
+                Vec::new()
+            };
+            Some(ImportSnapshot::Fragment(children))
         }
         NodeData::Document(_) => None,
     }
@@ -380,16 +365,14 @@ pub(crate) fn materialize_import(
             })
         }
         ImportSnapshot::Text(data) => {
-            let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.base.mutate().create_text_node(&text);
+            let blitz_id = doc.create_text(data);
             Ok(NodeId {
                 document,
                 node: blitz_id,
             })
         }
         ImportSnapshot::Comment(data) => {
-            let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.base.mutate().create_comment_node(&text);
+            let blitz_id = doc.create_comment(data);
             Ok(NodeId {
                 document,
                 node: blitz_id,
@@ -417,6 +400,7 @@ pub(crate) fn materialize_import(
             // name the grammar rejects still clones
             // (<https://dom.spec.whatwg.org/#concept-node-clone>).
             doc.set_pi_attributes(blitz_id, attributes.clone());
+            doc.set_exact_character_data(blitz_id, data);
             Ok(NodeId {
                 document,
                 node: blitz_id,
@@ -425,6 +409,7 @@ pub(crate) fn materialize_import(
         ImportSnapshot::CData(data) => {
             let text = data.to_string_lossy().into_owned();
             let blitz_id = doc.create_cdata_section(&text);
+            doc.set_exact_character_data(blitz_id, data);
             Ok(NodeId {
                 document,
                 node: blitz_id,

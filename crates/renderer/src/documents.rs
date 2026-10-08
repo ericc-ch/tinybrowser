@@ -8,7 +8,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::Parsed;
+use crate::dom_string::DomString;
 use crate::js::world::JournalEntry;
+
+use blitz_dom::NodeData;
 
 /// A node kind Blitz cannot store.
 ///
@@ -58,6 +61,14 @@ pub(crate) struct BlitzDocument {
     /// backing node's id. The id's slot version dies with the node, so a
     /// stale entry cannot be mistaken for a new node in the same slot.
     extras: HashMap<blitz_traits::node_id::NodeId, ExtraNode>,
+    /// Exact `CharacterData` when the sequence has unpaired surrogates.
+    ///
+    /// Blitz stores UTF-8 only. [Replace data] and the other `CharacterData`
+    /// algorithms operate on UTF-16 code units
+    /// (<https://dom.spec.whatwg.org/#concept-cd-replace>), so this map
+    /// holds the code units while the backing node keeps the lossy UTF-8
+    /// form for layout and serialization.
+    utf16_data: HashMap<blitz_traits::node_id::NodeId, DomString>,
 }
 
 impl BlitzDocument {
@@ -70,6 +81,7 @@ impl BlitzDocument {
             recording: false,
             fragments: HashSet::new(),
             extras: HashMap::new(),
+            utf16_data: HashMap::new(),
         }
     }
 
@@ -82,6 +94,7 @@ impl BlitzDocument {
             recording: false,
             fragments: HashSet::new(),
             extras: HashMap::new(),
+            utf16_data: HashMap::new(),
         }
     }
 
@@ -253,6 +266,51 @@ impl BlitzDocument {
         backing
     }
 
+    /// Creates a text node whose data is `data`
+    /// (<https://dom.spec.whatwg.org/#create-a-text-node>).
+    pub(crate) fn create_text(&mut self, data: &DomString) -> blitz_traits::node_id::NodeId {
+        let backing = self.base.mutate().create_text_node(&data.to_string_lossy());
+        self.set_exact_character_data(backing, data);
+        backing
+    }
+
+    /// Creates a comment whose data is `data`
+    /// (<https://dom.spec.whatwg.org/#create-a-comment-node>).
+    pub(crate) fn create_comment(&mut self, data: &DomString) -> blitz_traits::node_id::NodeId {
+        let backing = self
+            .base
+            .mutate()
+            .create_comment_node(&data.to_string_lossy());
+        self.set_exact_character_data(backing, data);
+        backing
+    }
+
+    /// The `CharacterData` of `id` as UTF-16 code units
+    /// (<https://dom.spec.whatwg.org/#characterdata>).
+    pub(crate) fn character_data(&self, id: blitz_traits::node_id::NodeId) -> DomString {
+        if let Some(stored) = self.utf16_data.get(&id) {
+            return stored.clone();
+        }
+        match self.base.get_node(id).map(|node| &node.data) {
+            Some(NodeData::Text(text)) => DomString::from(text.content.clone()),
+            Some(NodeData::Comment { contents }) => DomString::from(contents.clone()),
+            _ => DomString::default(),
+        }
+    }
+
+    /// Records exact code units when they cannot live in the UTF-8 tree.
+    pub(crate) fn set_exact_character_data(
+        &mut self,
+        id: blitz_traits::node_id::NodeId,
+        data: &DomString,
+    ) {
+        if data.has_unpaired_surrogate() {
+            self.utf16_data.insert(id, data.clone());
+        } else {
+            self.utf16_data.remove(&id);
+        }
+    }
+
     /// Copies the side-table record of `from` onto `to`, then walks both
     /// subtrees in lockstep. `deep_clone_node` copies Blitz data only.
     pub(crate) fn copy_extra_subtree(
@@ -262,6 +320,9 @@ impl BlitzDocument {
     ) {
         if let Some(extra) = self.extras.get(&from).cloned() {
             self.extras.insert(to, extra);
+        }
+        if let Some(data) = self.utf16_data.get(&from).cloned() {
+            self.utf16_data.insert(to, data);
         }
         let from_children: Vec<blitz_traits::node_id::NodeId> = self
             .base

@@ -641,23 +641,13 @@ pub(crate) fn construct_node<'js>(
         "Text" => {
             let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
-            create_node(&ctx, document, |parsed| {
-                parsed
-                    .document
-                    .base
-                    .mutate()
-                    .create_text_node(&data.to_string_lossy())
-            })
+            create_node(&ctx, document, |parsed| parsed.document.create_text(&data))
         }
         "Comment" => {
             let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
             create_node(&ctx, document, |parsed| {
-                parsed
-                    .document
-                    .base
-                    .mutate()
-                    .create_comment_node(&data.to_string_lossy())
+                parsed.document.create_comment(&data)
             })
         }
         "ProcessingInstruction" => {
@@ -685,9 +675,11 @@ pub(crate) fn construct_node<'js>(
             let target_text = target_text.into_owned();
             let document = main_document(&ctx)?;
             create_node(&ctx, document, |parsed| {
-                parsed
+                let id = parsed
                     .document
-                    .create_processing_instruction(target_text, &data_text)
+                    .create_processing_instruction(target_text, &data_text);
+                parsed.document.set_exact_character_data(id, &data);
+                id
             })
         }
         "DocumentFragment" => {
@@ -2338,31 +2330,41 @@ enum EqualKind {
         name: QualName,
         attributes: Vec<(QualName, String)>,
     },
-    Text(String),
-    Comment(String),
+    Text(DomString),
+    Comment(DomString),
     Other,
 }
 
 fn equal_view(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Option<EqualView> {
-    let node = doc.base.get_node(id)?;
-    let kind = match &node.data {
-        NodeData::Document(_) => EqualKind::Document,
-        NodeData::Element(element) => EqualKind::Element {
-            name: element.name.clone(),
-            attributes: element
-                .attrs
-                .iter()
-                .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
-                .collect(),
-        },
-        NodeData::Text(text) => EqualKind::Text(text.content.clone()),
-        NodeData::Comment { contents } => EqualKind::Comment(contents.clone()),
-        NodeData::AnonymousBlock(_) => EqualKind::Other,
+    let extra = doc.extra(id).cloned();
+    let (kind, children) = {
+        let node = doc.base.get_node(id)?;
+        let children = node.children.iter().copied().collect();
+        let kind = match &node.data {
+            NodeData::Document(_) => EqualKind::Document,
+            NodeData::Element(element) => EqualKind::Element {
+                name: element.name.clone(),
+                attributes: element
+                    .attrs
+                    .iter()
+                    .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+                    .collect(),
+            },
+            NodeData::Text(_) => EqualKind::Text(DomString::default()),
+            NodeData::Comment { .. } => EqualKind::Comment(DomString::default()),
+            NodeData::AnonymousBlock(_) => EqualKind::Other,
+        };
+        (kind, children)
+    };
+    let kind = match kind {
+        EqualKind::Text(_) => EqualKind::Text(doc.character_data(id)),
+        EqualKind::Comment(_) => EqualKind::Comment(doc.character_data(id)),
+        other => other,
     };
     Some(EqualView {
-        extra: doc.extra(id).cloned(),
+        extra,
         kind,
-        children: node.children.iter().copied().collect(),
+        children,
     })
 }
 
@@ -3247,18 +3249,16 @@ impl JsNode {
 
     #[qjs(skip)]
     fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
-        let text = data.0.to_string_lossy().into_owned();
         create_node(&ctx, self.handle.0, |parsed| {
-            parsed.document.base.mutate().create_text_node(&text)
+            parsed.document.create_text(&data.0)
         })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
     #[qjs(skip)]
     fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
-        let text = data.0.to_string_lossy().into_owned();
         create_node(&ctx, self.handle.0, |parsed| {
-            parsed.document.base.mutate().create_comment_node(&text)
+            parsed.document.create_comment(&data.0)
         })
     }
 
@@ -3286,7 +3286,9 @@ impl JsNode {
         let text = data.0.to_string_lossy().into_owned();
         let target = target.0;
         create_node(&ctx, self.handle.0, |parsed| {
-            parsed.document.create_processing_instruction(target, &text)
+            let id = parsed.document.create_processing_instruction(target, &text);
+            parsed.document.set_exact_character_data(id, &data.0);
+            id
         })
     }
 
@@ -3317,7 +3319,9 @@ impl JsNode {
         }
         let text = data.0.to_string_lossy().into_owned();
         create_node(&ctx, self.handle.0, |parsed| {
-            parsed.document.create_cdata_section(&text)
+            let id = parsed.document.create_cdata_section(&text);
+            parsed.document.set_exact_character_data(id, &data.0);
+            id
         })
     }
 
@@ -5047,20 +5051,15 @@ impl JsNode {
         if parsed.document.is_doctype(self.handle.0.node) {
             return Ok(None);
         }
-        let data = parsed
+        let is_character_data = parsed
             .document
             .base
             .get_node(self.handle.0.node)
-            .map(|node| &node.data);
-        match data {
-            Some(NodeData::Text(text)) => {
-                dom_string(ctx, &DomString::from(text.content.clone())).map(Some)
-            }
-            Some(NodeData::Comment { contents }) => {
-                dom_string(ctx, &DomString::from(contents.clone())).map(Some)
-            }
-            _ => Ok(None),
+            .is_some_and(|node| matches!(node.data, NodeData::Text(_) | NodeData::Comment { .. }));
+        if is_character_data {
+            return dom_string(ctx, &parsed.document.character_data(self.handle.0.node)).map(Some);
         }
+        Ok(None)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
@@ -5099,18 +5098,22 @@ impl JsNode {
         if parsed.document.is_doctype(self.handle.0.node) {
             return Ok(None);
         }
-        let base = &parsed.document.base;
-        let data = base.get_node(self.handle.0.node).map(|node| &node.data);
-        match data {
-            Some(NodeData::Element(_)) => {
+        let kind = parsed
+            .document
+            .base
+            .get_node(self.handle.0.node)
+            .map(|node| match &node.data {
+                NodeData::Element(_) => 0u8,
+                NodeData::Text(_) | NodeData::Comment { .. } => 1,
+                _ => 2,
+            });
+        match kind {
+            Some(0) => {
                 let text = descendant_text(&parsed.document.base, self.handle.0.node);
                 dom_string(ctx, &text).map(Some)
             }
-            Some(NodeData::Text(text)) => {
-                dom_string(ctx, &DomString::from(text.content.clone())).map(Some)
-            }
-            Some(NodeData::Comment { contents }) => {
-                dom_string(ctx, &DomString::from(contents.clone())).map(Some)
+            Some(1) => {
+                dom_string(ctx, &parsed.document.character_data(self.handle.0.node)).map(Some)
             }
             _ => Ok(None),
         }
@@ -5165,14 +5168,13 @@ impl JsNode {
         if parsed.document.base.root_node().id == self.handle.0.node {
             return Ok(());
         }
-        let text = text.to_string_lossy().into_owned();
         let added = if text.is_empty() {
             Vec::new()
         } else {
-            let text = parsed.document.base.mutate().create_text_node(&text);
+            let node = parsed.document.create_text(&text);
             vec![NodeId {
                 document: parsed.id,
-                node: text,
+                node,
             }]
         };
         replace_all_journaled(&mut parsed, self.handle.0, added);
@@ -8833,11 +8835,7 @@ fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value
             return Err(Exception::throw_type(ctx, "stale node"));
         };
         // https://dom.spec.whatwg.org/#create-a-text-node
-        let blitz = parsed
-            .document
-            .base
-            .mutate()
-            .create_text_node(&new_data.to_string_lossy());
+        let blitz = parsed.document.create_text(&new_data);
         NodeId {
             document: parsed.id,
             node: blitz,
@@ -8864,28 +8862,27 @@ fn whole_text(ctx: &Ctx<'_>, id: NodeId) -> Result<DomString> {
     Ok(world
         .borrow()
         .with_document(id, |parsed| {
-            let base = &parsed.document.base;
             let mut prefix = Vec::new();
-            let mut cursor = sibling(base, id.node, false);
+            let mut cursor = sibling(&parsed.document.base, id.node, false);
             while let Some(current) = cursor {
-                if !is_text_node(base, current) {
+                if !is_text_node(&parsed.document.base, current) {
                     break;
                 }
                 prefix.push(current);
-                cursor = sibling(base, current, false);
+                cursor = sibling(&parsed.document.base, current, false);
             }
             let mut combined = DomString::default();
             for node in prefix.into_iter().rev() {
-                append_text_data(base, node, &mut combined);
+                append_text_data(&parsed.document, node, &mut combined);
             }
-            append_text_data(base, id.node, &mut combined);
-            let mut cursor = sibling(base, id.node, true);
+            append_text_data(&parsed.document, id.node, &mut combined);
+            let mut cursor = sibling(&parsed.document.base, id.node, true);
             while let Some(current) = cursor {
-                if !is_text_node(base, current) {
+                if !is_text_node(&parsed.document.base, current) {
                     break;
                 }
-                append_text_data(base, current, &mut combined);
-                cursor = sibling(base, current, true);
+                append_text_data(&parsed.document, current, &mut combined);
+                cursor = sibling(&parsed.document.base, current, true);
             }
             combined
         })
@@ -8899,9 +8896,12 @@ fn is_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     )
 }
 
-fn append_text_data(base: &blitz_dom::BaseDocument, id: BlitzId, out: &mut DomString) {
-    if let Some(NodeData::Text(text)) = base.get_node(id).map(|node| &node.data) {
-        out.push_str(&text.content);
+fn append_text_data(doc: &crate::documents::BlitzDocument, id: BlitzId, out: &mut DomString) {
+    if matches!(
+        doc.base.get_node(id).map(|node| &node.data),
+        Some(NodeData::Text(_))
+    ) {
+        out.push_dom(&doc.character_data(id));
     }
 }
 

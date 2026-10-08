@@ -66,6 +66,16 @@ impl DomString {
         matches!(self.0, Repr::Empty)
     }
 
+    /// Whether the sequence contains an unpaired surrogate.
+    ///
+    /// Those code units cannot live in a UTF-8 `String`, so `CharacterData`
+    /// keeps them in a side table while the Blitz tree holds the lossy form
+    /// (<https://infra.spec.whatwg.org/#javascript-string-convert>).
+    #[must_use]
+    pub fn has_unpaired_surrogate(&self) -> bool {
+        matches!(self.0, Repr::Utf16(_))
+    }
+
     /// The length in UTF-16 code units.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -220,5 +230,11 @@ mod tests {
         let mut prefix = DomString::from_utf16(vec![0xd800]);
         prefix.push_dom(&DomString::from("x"));
         assert_eq!(&*prefix.units(), &[0xd800, 0x78]);
+    }
+
+    #[test]
+    fn reports_unpaired_surrogates() {
+        assert!(!DomString::from("ab").has_unpaired_surrogate());
+        assert!(DomString::from_utf16(vec![0xd800]).has_unpaired_surrogate());
     }
 }
