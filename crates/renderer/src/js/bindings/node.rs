@@ -3270,7 +3270,7 @@ impl JsNode {
         let value = live_collection(
             &ctx,
             self.handle.0,
-            CollectionKind::ElementsByTag("script".to_owned()),
+            CollectionKind::HtmlScripts,
             Some("HTMLCollection"),
         )?;
         let weak = make_weak(&ctx, value.clone())?;
