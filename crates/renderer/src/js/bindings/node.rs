@@ -6,10 +6,10 @@ use super::{
     WebIdlUnsignedLong, adopt_across_documents, adopt_into_document, ancestor_chain,
     attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
     blur_node, character_data, character_data_offset, child_value, clone_document,
-    clone_within_document, convert_union_nodes_into_node, deref_weak, descendant_text,
-    document_base_url_string, document_is_html, document_is_html_content, document_url_string,
-    dom_string, drain_mutation_journal, element_at_point, element_box, element_click,
-    element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
+    clone_within_document, collection_ids, convert_union_nodes_into_node, deref_weak,
+    descendant_text, document_base_url_string, document_is_html, document_is_html_content,
+    document_url_string, dom_string, drain_mutation_journal, element_at_point, element_box,
+    element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
     fixup_focus_after_removal, focus_node, host, host_node_id, import_attr, import_snapshot,
     import_snapshot_live, is_element, is_focusable, is_main_document, is_real_element,
     live_collection, make_weak, materialize_children, materialize_import, new_detached_attr,
@@ -89,6 +89,9 @@ include!(concat!(env!("OUT_DIR"), "/HTMLOutputElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLParamElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLSlotElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLTemplateElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTableElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTableSectionElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTableRowElement.rs"));
 
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     node_generated::install(ctx)?;
@@ -133,7 +136,10 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_output_element_generated::install(ctx)?;
     html_param_element_generated::install(ctx)?;
     html_slot_element_generated::install(ctx)?;
-    html_template_element_generated::install(ctx)
+    html_template_element_generated::install(ctx)?;
+    html_table_element_generated::install(ctx)?;
+    html_table_section_element_generated::install(ctx)?;
+    html_table_row_element_generated::install(ctx)
 }
 
 fn insertion_tree_nodes(
@@ -9045,6 +9051,92 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
             None => Ok(Value::new_null(ctx.clone())),
         }
     }
+}
+
+impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies
+    fn get_t_bodies(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            ctx,
+            self.handle.0,
+            CollectionKind::TableBodies,
+            Some("HTMLCollection"),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows
+    fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            ctx,
+            self.handle.0,
+            CollectionKind::TableRows,
+            Some("HTMLCollection"),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-table-deleterow
+    fn delete_row(&self, ctx: Ctx<'js>, index: i32) -> Result<()> {
+        delete_table_row(&ctx, self.handle.0, index)
+    }
+}
+
+impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-tbody-rows
+    fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            ctx,
+            self.handle.0,
+            CollectionKind::TableSectionRows,
+            Some("HTMLCollection"),
+        )
+    }
+}
+
+impl<'js> html_table_row_element_generated::HTMLTableRowElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
+    fn get_cells(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            ctx,
+            self.handle.0,
+            CollectionKind::TableRowCells,
+            Some("HTMLCollection"),
+        )
+    }
+}
+
+fn delete_table_row(ctx: &Ctx<'_>, table: NodeId, index: i32) -> Result<()> {
+    let rows = collection_ids(ctx, table, &CollectionKind::TableRows)?;
+    let length = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+    if index < -1 || index >= length {
+        return Err(throw_dom(
+            ctx,
+            "IndexSizeError",
+            "row index is out of range",
+        ));
+    }
+    if index == -1 && rows.is_empty() {
+        return Ok(());
+    }
+    let slot = if index == -1 {
+        rows.len() - 1
+    } else {
+        usize::try_from(index).unwrap_or(0)
+    };
+    let Some(&row) = rows.get(slot) else {
+        return Ok(());
+    };
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(row) else {
+        return Ok(());
+    };
+    let iframes = iframe_containers_in_subtrees(&parsed, &[row]);
+    unlink_journaled(&mut parsed, row);
+    world.destroy_child_navigables(&iframes);
+    drop(parsed);
+    drop(world);
+    fixup_focus_after_removal(ctx, row)?;
+    schedule_mutation_delivery(ctx)
 }
 
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {

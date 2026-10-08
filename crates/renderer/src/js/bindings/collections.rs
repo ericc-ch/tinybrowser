@@ -31,6 +31,19 @@ pub(crate) enum CollectionKind {
     /// skipping fragment backings
     /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
     HtmlScripts,
+    /// `table.tBodies`: HTML `tbody` children of the table
+    /// (<https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies>).
+    TableBodies,
+    /// `table.rows`: `tr` children of the table and of its section children,
+    /// thead then body then tfoot
+    /// (<https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows>).
+    TableRows,
+    /// `thead`/`tbody`/`tfoot`.rows: `tr` children of the section
+    /// (<https://html.spec.whatwg.org/multipage/tables.html#dom-tbody-rows>).
+    TableSectionRows,
+    /// `tr.cells`: `td`/`th` children of the row
+    /// (<https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells>).
+    TableRowCells,
     Static(Vec<Handle>),
 }
 
@@ -66,13 +79,25 @@ impl CollectionQuery {
             | CollectionKind::SelectOptions
             | CollectionKind::SelectedOptions
             | CollectionKind::WindowNamed(_)
-            | CollectionKind::HtmlScripts => self.ids(ctx)?.get(index).copied(),
+            | CollectionKind::HtmlScripts
+            | CollectionKind::TableBodies
+            | CollectionKind::TableRows
+            | CollectionKind::TableSectionRows
+            | CollectionKind::TableRowCells => self.ids(ctx)?.get(index).copied(),
         };
         match id {
             Some(id) => wrap_node(ctx, id),
             None => Ok(Value::new_null(ctx.clone())),
         }
     }
+}
+
+pub(crate) fn collection_ids(
+    ctx: &Ctx<'_>,
+    scope: NodeId,
+    kind: &CollectionKind,
+) -> Result<Vec<NodeId>> {
+    query_ids(ctx, scope, kind)
 }
 
 /// The live ids of `kind` scoped at `scope`, resolved through the agent's
@@ -115,6 +140,10 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
             .collect(),
         CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
         CollectionKind::HtmlScripts => collect_html_scripts(&parsed.document, document, scope.node),
+        CollectionKind::TableBodies => table_bodies(base, document, scope.node),
+        CollectionKind::TableRows => table_rows(base, document, scope.node),
+        CollectionKind::TableSectionRows => table_section_rows(base, document, scope.node),
+        CollectionKind::TableRowCells => table_row_cells(base, document, scope.node),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }
@@ -491,6 +520,61 @@ fn class_attribute(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&str> 
         .map(|attribute| attribute.value.as_str())
 }
 
+fn html_named(base: &blitz_dom::BaseDocument, id: BlitzId, local: &str) -> bool {
+    element_name(base, id)
+        .is_some_and(|name| name.ns == html_namespace() && name.local.as_ref() == local)
+}
+
+fn html_child_elements(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    parent: BlitzId,
+    locals: &[&str],
+) -> Vec<NodeId> {
+    crate::js::world::child_ids(base, document, parent)
+        .into_iter()
+        .filter(|kid| locals.iter().any(|local| html_named(base, kid.node, local)))
+        .collect()
+}
+
+fn table_bodies(base: &blitz_dom::BaseDocument, document: u32, table: BlitzId) -> Vec<NodeId> {
+    html_child_elements(base, document, table, &["tbody"])
+}
+
+fn table_section_rows(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    section: BlitzId,
+) -> Vec<NodeId> {
+    html_child_elements(base, document, section, &["tr"])
+}
+
+fn table_row_cells(base: &blitz_dom::BaseDocument, document: u32, row: BlitzId) -> Vec<NodeId> {
+    html_child_elements(base, document, row, &["td", "th"])
+}
+
+/// `table.rows` lists thead rows, then in-table `tr`/`tbody` rows, then tfoot
+/// rows (<https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows>).
+fn table_rows(base: &blitz_dom::BaseDocument, document: u32, table: BlitzId) -> Vec<NodeId> {
+    let mut head = Vec::new();
+    let mut body = Vec::new();
+    let mut foot = Vec::new();
+    for kid in crate::js::world::child_ids(base, document, table) {
+        if html_named(base, kid.node, "thead") {
+            head.extend(table_section_rows(base, document, kid.node));
+        } else if html_named(base, kid.node, "tfoot") {
+            foot.extend(table_section_rows(base, document, kid.node));
+        } else if html_named(base, kid.node, "tbody") {
+            body.extend(table_section_rows(base, document, kid.node));
+        } else if html_named(base, kid.node, "tr") {
+            body.push(kid);
+        }
+    }
+    head.extend(body);
+    head.extend(foot);
+    head
+}
+
 /// Detaches `target` from its parent, recording the `childList` journal entry
 /// observers deliver. Blitz performs no hierarchy validation here; callers
 /// establish the parent first.
@@ -718,7 +802,11 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
             | CollectionKind::SelectOptions
             | CollectionKind::SelectedOptions
             | CollectionKind::WindowNamed(_)
-            | CollectionKind::HtmlScripts => self.query.ids(ctx)?.len(),
+            | CollectionKind::HtmlScripts
+            | CollectionKind::TableBodies
+            | CollectionKind::TableRows
+            | CollectionKind::TableSectionRows
+            | CollectionKind::TableRowCells => self.query.ids(ctx)?.len(),
         })
     }
 

@@ -537,7 +537,7 @@ fn node_interface_matches(
         "HTMLParamElement" => crate::js::world::is_html_tag(data, "param"),
         "HTMLSlotElement" => crate::js::world::is_html_tag(data, "slot"),
         "HTMLTemplateElement" => crate::js::world::is_html_tag(data, "template"),
-        _ => return None,
+        _ => html_table_interface(data, interface)?,
     })
 }
 
@@ -560,6 +560,22 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
     }
+}
+
+fn html_table_interface(data: Option<&blitz_dom::NodeData>, interface: &str) -> Option<bool> {
+    let tags: &[&str] = match interface {
+        "HTMLTableElement" => &["table"],
+        "HTMLTableCaptionElement" => &["caption"],
+        "HTMLTableColElement" => &["col", "colgroup"],
+        "HTMLTableSectionElement" => &["tbody", "thead", "tfoot"],
+        "HTMLTableRowElement" => &["tr"],
+        "HTMLTableCellElement" => &["td", "th"],
+        _ => return None,
+    };
+    Some(
+        tags.iter()
+            .any(|tag| crate::js::world::is_html_tag(data, tag)),
+    )
 }
 
 /// Whether the JS value is a platform object implementing `interface`. The
