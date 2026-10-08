@@ -1889,8 +1889,16 @@ fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) 
     for step in steps {
         match step {
             InsertionStep::Iframe(id) => {
+                let fire_load = world(ctx)?
+                    .borrow()
+                    .with_document(id, |parsed| {
+                        iframe_fires_initial_load(&parsed.document.base, id.node)
+                    })
+                    .unwrap_or(false);
                 world(ctx)?.borrow_mut().register_frame_for_container(id);
-                super::window::fire_node_load(ctx, id)?;
+                if fire_load {
+                    super::window::fire_node_load(ctx, id)?;
+                }
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
         }
@@ -1901,6 +1909,13 @@ fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) 
 enum InsertionStep {
     Iframe(NodeId),
     Script(NodeId),
+}
+
+/// Initial about:blank iframes fire `load` from insertion steps. An iframe
+/// with `src` or `srcdoc` navigates instead, and that navigation fires `load`
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+fn iframe_fires_initial_load(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    attr(base, node, "src").is_none() && attr(base, node, "srcdoc").is_none()
 }
 
 /// Registers browsing contexts for iframes inserted by markup setters.
@@ -1921,8 +1936,16 @@ fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
     }
     for step in steps {
         if let InsertionStep::Iframe(id) = step {
+            let fire_load = world(ctx)?
+                .borrow()
+                .with_document(id, |parsed| {
+                    iframe_fires_initial_load(&parsed.document.base, id.node)
+                })
+                .unwrap_or(false);
             world(ctx)?.borrow_mut().register_frame_for_container(id);
-            super::window::fire_node_load(ctx, id)?;
+            if fire_load {
+                super::window::fire_node_load(ctx, id)?;
+            }
         }
     }
     Ok(())
