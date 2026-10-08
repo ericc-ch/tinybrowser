@@ -439,7 +439,23 @@ impl Document {
     /// one, so a script sees it in the same task
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
     pub(crate) fn adopt_pending_frames(&mut self) {
-        let created = World::adopt_pending_frames(&self.world);
+        self.adopt_pending_frames_before_node(None);
+    }
+
+    /// Creates browsing contexts for connected `iframe`s that precede `before`
+    /// in tree order, or every remaining iframe when `before` is `None`.
+    ///
+    /// Whole-document parse inserts every iframe before any script runs. A
+    /// real incremental parser would only have inserted iframes that precede
+    /// the current script; src loads that start earlier fire `load` before
+    /// later classic scripts define their onload functions
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+    fn adopt_pending_frames_before(&mut self, before: crate::js::world::NodeId) {
+        self.adopt_pending_frames_before_node(Some(before));
+    }
+
+    fn adopt_pending_frames_before_node(&mut self, before: Option<crate::js::world::NodeId>) {
+        let created = World::adopt_pending_frames(&self.world, before);
         for container in created {
             // The child is loading from this moment on, so this document's
             // `load` event waits for it
@@ -1409,11 +1425,9 @@ impl Document {
             return;
         }
         self.world.borrow_mut().parser_active = false;
-        // A script may query a child frame's window; the browsing context
-        // must exist by then.
-        self.adopt_pending_frames();
         // Microtask checkpoint before scripts run; parser mutations queued
-        // since the last script deliver now.
+        // since the last script deliver now. Parser iframes are adopted in
+        // tree order with scripts, not all at once before the first fetch.
         self.deliver_mutations();
         self.resume_scripts();
     }
@@ -1463,9 +1477,11 @@ impl Document {
             if !self.executed_scripts.insert(id) {
                 continue;
             }
-            // A script may query a child frame's window; the browsing
-            // context must exist by then.
-            self.adopt_pending_frames();
+            // Iframes that precede this script in tree order already have
+            // browsing contexts; later ones wait, matching incremental
+            // insertion
+            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+            self.adopt_pending_frames_before(id);
             // Microtask checkpoint before the script runs; parser
             // mutations queued since the last script deliver now.
             self.deliver_mutations();

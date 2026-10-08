@@ -13,6 +13,7 @@ use std::time::Instant;
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
+    context::EvalOptions,
     function::{Rest, This},
 };
 
@@ -1481,24 +1482,21 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
     }
 }
 
-/// Compiles one event handler content attribute as a `Function` whose
-/// scope is the window global, matching classic script lookup
+/// Compiles one event handler content attribute as a sloppy-mode function
+/// in the window's global script environment, matching classic scripts
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler>).
 ///
-/// `eval` of a function expression uses that script's lexical environment,
-/// so free names in the attribute body would not see `var`/`function`
-/// bindings from page scripts. `new Function` uses the global environment.
+/// Default `eval` is strict and does not see sloppy `var`/`function`
+/// bindings from page scripts.
 pub(crate) fn compile_handler_function<'js>(
     ctx: &Ctx<'js>,
     params: &str,
     body: &str,
 ) -> Result<Function<'js>> {
-    let ctor: Function = ctx.globals().get("Function")?;
-    if params == "event, source, lineno, colno, error" {
-        ctor.call(("event", "source", "lineno", "colno", "error", body))
-    } else {
-        ctor.call((params, body))
-    }
+    let mut options = EvalOptions::default();
+    options.strict = false;
+    let source = format!("(function({params}) {{\n{body}\n}})");
+    ctx.eval_with_options(source, options)
 }
 
 /// Calls a target's `on<type>` handler attribute, if one is assigned

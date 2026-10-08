@@ -1078,9 +1078,9 @@ impl World {
     /// tree entries only. The document and its realm are created later, by
     /// [`World::materialize_frames`], because `QuickJS` forbids entering a new
     /// realm while another realm executes.
-    pub(crate) fn register_pending_frames(&mut self) -> Vec<NodeId> {
+    pub(crate) fn register_pending_frames(&mut self, before: Option<NodeId>) -> Vec<NodeId> {
         let mut created = Vec::new();
-        let containers = self.iframe_containers_in_order();
+        let containers = self.iframe_containers_before(before);
         for container in containers {
             if self.register_frame_for_container(container) {
                 created.push(container);
@@ -1131,8 +1131,11 @@ impl World {
     /// loads. Loading runs the parser, which delivers mutations, which fans
     /// out across live worlds; holding this world's borrow across that
     /// would alias the fan-out borrows and panic the renderer.
-    pub(crate) fn adopt_pending_frames(world_rc: &Rc<RefCell<World>>) -> Vec<NodeId> {
-        let mut created = world_rc.borrow_mut().register_pending_frames();
+    pub(crate) fn adopt_pending_frames(
+        world_rc: &Rc<RefCell<World>>,
+        before: Option<NodeId>,
+    ) -> Vec<NodeId> {
+        let mut created = world_rc.borrow_mut().register_pending_frames(before);
         created.extend(Self::materialize_frames(world_rc));
         created
     }
@@ -1233,12 +1236,24 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
     #[must_use]
     pub(crate) fn iframe_containers_in_order(&self) -> Vec<NodeId> {
+        self.iframe_containers_before(None)
+    }
+
+    /// Connected `iframe`s in tree order that precede `before`, or every
+    /// connected iframe when `before` is `None`.
+    fn iframe_containers_before(&self, before: Option<NodeId>) -> Vec<NodeId> {
         self.with_main_document(|parsed| {
             let base = &parsed.document.base;
             let document = parsed.id;
+            let stop = before
+                .filter(|node| node.document == document)
+                .map(|node| node.node);
             let mut containers = Vec::new();
             let mut stack = vec![base.root_node().id];
             while let Some(id) = stack.pop() {
+                if stop == Some(id) {
+                    break;
+                }
                 if is_iframe_element(base, id) && is_connected(base, id) {
                     containers.push(NodeId { document, node: id });
                 }
