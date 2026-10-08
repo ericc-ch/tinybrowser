@@ -1114,6 +1114,59 @@ impl World {
         created
     }
 
+    /// Creates the initial `about:blank` document for one connected `iframe`
+    /// so `contentDocument` is available in the inserting script
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+    ///
+    /// The nested realm is deferred: `QuickJS` cannot enter a new context while
+    /// the parent script still runs.
+    pub(crate) fn materialize_iframe(world_rc: &Rc<RefCell<World>>, container: NodeId) -> bool {
+        world_rc
+            .borrow_mut()
+            .register_frame_for_container(container);
+        let pending = {
+            let mut world = world_rc.borrow_mut();
+            world
+                .pending_frames
+                .iter()
+                .position(|(_, existing)| *existing == container)
+                .map(|index| world.pending_frames.remove(index))
+        };
+        let Some((frame, container)) = pending else {
+            return world_rc
+                .borrow()
+                .runtime
+                .registry
+                .borrow()
+                .frame_document(container)
+                .is_some();
+        };
+        let (runtime, base_url, init_scripts, viewport) = {
+            let world = world_rc.borrow();
+            (
+                world.runtime.clone(),
+                world.document_url.clone(),
+                Rc::clone(&world.init_scripts),
+                world.viewport_size.get(),
+            )
+        };
+        let mut document = Document::with_shared(frame, &runtime, &init_scripts);
+        document.set_viewport_size(viewport);
+        document.load_about_blank_tree(Some(base_url.as_str()));
+        if let Some(root) = document.document_root() {
+            world_rc
+                .borrow()
+                .registry()
+                .borrow_mut()
+                .set_frame_document(container, root);
+        }
+        world_rc
+            .borrow_mut()
+            .new_frames
+            .push((frame, container, document));
+        true
+    }
+
     /// Loads every registered frame document without holding the world
     /// borrow: pending frames and the base URL are taken first, documents
     /// load unborrowed, and only then are the results published.

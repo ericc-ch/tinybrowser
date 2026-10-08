@@ -542,6 +542,10 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
         "__tb_construct",
         rquickjs::prelude::Func::from(construct_node),
     )?;
+    crate::js::bridge::object(ctx)?.set(
+        "__tb_construct_in_frame",
+        rquickjs::prelude::Func::from(construct_node_in_frame),
+    )?;
     Ok(())
 }
 

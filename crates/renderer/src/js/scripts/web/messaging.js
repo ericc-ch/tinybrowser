@@ -586,6 +586,14 @@ const __tbFrameProxy = frame => {
         // as `this`; `window_world_for_call` resolves the target frame
         // (<https://dom.spec.whatwg.org/#interface-eventtarget>,
         // <https://html.spec.whatwg.org/multipage/window-object.html#the-windowproxy-exotic-object>).
+        // Cross-realm constructors are not callable from this realm. Hand
+        // back a local function that creates the node in the target frame's
+        // document (<https://dom.spec.whatwg.org/#dom-comment-comment>).
+        case 'Comment': case 'Text': case 'DocumentFragment':
+        case 'Document': case 'XMLDocument': case 'ProcessingInstruction':
+          return function() {
+            return host.__tb_construct_in_frame(frame, property, ...arguments);
+          };
         case 'addEventListener':
           return function(type, callback, options) {
             return globalThis.addEventListener.call(proxy, type, callback, options);

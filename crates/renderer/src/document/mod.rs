@@ -269,6 +269,10 @@ pub(crate) struct Document {
     /// Whether init scripts were deferred because the realm was created while
     /// a navigation response was still streaming.
     init_scripts_deferred: bool,
+    /// Skip `QuickJS` realm creation while installing a document. Nested
+    /// iframe insertion runs inside an active realm, and `QuickJS` forbids
+    /// entering another one until that script returns.
+    defer_js: bool,
     active_buffer: Option<String>,
     /// Scripts already executed for the current parse, so a walk resumed
     /// after a `src` fetch does not run them twice.
@@ -354,6 +358,7 @@ impl Document {
             js_timer_slots: HashMap::new(),
             js_epoch: 0,
             init_scripts_deferred: false,
+            defer_js: false,
             active_buffer: None,
             executed_scripts: HashSet::new(),
             parser_eof: true,
@@ -601,6 +606,22 @@ impl Document {
         self.load_html("");
         self.initial_blank = true;
         self.ensure_js_ok();
+    }
+
+    /// Installs the initial `about:blank` tree without creating a realm
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+    ///
+    /// Used when a parent script inserts an `iframe`: the document must exist
+    /// for `contentDocument` in the same task, but `QuickJS` cannot enter a new
+    /// realm until that script returns.
+    pub(crate) fn load_about_blank_tree(&mut self, inherited_url: Option<&str>) {
+        if let Some(url) = inherited_url {
+            self.apply_document_url(url);
+        }
+        self.defer_js = true;
+        self.load_html("");
+        self.defer_js = false;
+        self.initial_blank = true;
     }
 
     /// Whether the frame is still on the document created at insertion.
@@ -1245,6 +1266,9 @@ impl Document {
             // Style resolution and scripts both read the viewport; apply the
             // frame's size before the realm evaluates anything.
             self.apply_viewport();
+            if self.defer_js {
+                return true;
+            }
             self.ensure_js().is_ok()
         } else {
             let document = self.world.borrow_mut().set_document(parsed);

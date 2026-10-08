@@ -12,13 +12,13 @@ use super::{
     element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
     fixup_focus_after_removal, focus_node, host, host_node_id, import_attr, import_snapshot,
     import_snapshot_live, is_element, is_focusable, is_main_document, is_real_element,
-    live_collection, main_document, make_weak, materialize_children, materialize_import,
-    new_detached_attr, qualified_name, rect_object, remove_attribute_sync, required_node, root_of,
+    live_collection, make_weak, materialize_children, materialize_import, new_detached_attr,
+    qualified_name, rect_object, remove_attribute_sync, required_node, root_of,
     schedule_mutation_delivery, select_error, selector_matching_elements, set_attribute_node,
     set_attribute_sync, set_character_data, set_pi_data, sibling, sibling_value, string_value,
     throw_dom, throw_dom_error, touch_attr, tree_order, valid_attribute_local_name,
     valid_element_local_name, validate_and_extract, with_node_data, world, world_for_node,
-    wrap_new_document, wrap_node,
+    wrap_new_document_in_world, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -640,18 +640,64 @@ pub(crate) fn construct_node<'js>(
     name: WebIdlString,
     args: Rest<Value<'js>>,
 ) -> Result<Value<'js>> {
+    let owner = world(&ctx)?;
+    construct_node_in_owner(&ctx, &owner, &name, args)
+}
+
+/// `new iframe.contentWindow.Comment()` from another realm: the constructor
+/// is not callable across `QuickJS` contexts, so the `WindowProxy` hands back a
+/// local wrapper that creates the node in the iframe's document
+/// (<https://dom.spec.whatwg.org/#dom-comment-comment>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and Rest by value"
+)]
+pub(crate) fn construct_node_in_frame<'js>(
+    ctx: Ctx<'js>,
+    frame: f64,
+    name: WebIdlString,
+    args: Rest<Value<'js>>,
+) -> Result<Value<'js>> {
+    if !frame.is_finite() || frame < 0.0 || frame.fract() != 0.0 || frame > f64::from(u32::MAX) {
+        return Err(Exception::throw_type(&ctx, "no document"));
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is range-checked to a non-negative u32 above"
+    )]
+    let frame = crate::protocol::FrameId::new(frame as u64);
+    let current = world(&ctx)?;
+    let Some(owner) = current.borrow().frame_world(frame) else {
+        return Err(Exception::throw_type(&ctx, "no document"));
+    };
+    construct_node_in_owner(&ctx, &owner, &name, args)
+}
+
+fn construct_node_in_owner<'js>(
+    ctx: &Ctx<'js>,
+    owner: &Rc<RefCell<World>>,
+    name: &WebIdlString,
+    args: Rest<Value<'js>>,
+) -> Result<Value<'js>> {
     let mut arguments = args.0.into_iter();
     let first = arguments.next();
+    let document = || {
+        owner
+            .borrow()
+            .main_document_root()
+            .ok_or_else(|| Exception::throw_type(ctx, "no document"))
+    };
     match name.0.as_str() {
         "Text" => {
-            let data = constructor_units(&ctx, first)?;
-            let document = main_document(&ctx)?;
-            create_node(&ctx, document, |parsed| parsed.document.create_text(&data))
+            let data = constructor_units(ctx, first)?;
+            create_node(ctx, document()?, |parsed| {
+                parsed.document.create_text(&data)
+            })
         }
         "Comment" => {
-            let data = constructor_units(&ctx, first)?;
-            let document = main_document(&ctx)?;
-            create_node(&ctx, document, |parsed| {
+            let data = constructor_units(ctx, first)?;
+            create_node(ctx, document()?, |parsed| {
                 parsed.document.create_comment(&data)
             })
         }
@@ -659,27 +705,26 @@ pub(crate) fn construct_node<'js>(
             // https://dom.spec.whatwg.org/#dom-processinginstruction-processinginstruction
             let Some(target_value) = first else {
                 return Err(Exception::throw_type(
-                    &ctx,
+                    ctx,
                     "ProcessingInstruction requires a target",
                 ));
             };
-            let target = DomString::from_utf16(super::webidl_to_units(&ctx, target_value)?);
-            let data = constructor_units(&ctx, arguments.next())?;
+            let target = DomString::from_utf16(super::webidl_to_units(ctx, target_value)?);
+            let data = constructor_units(ctx, arguments.next())?;
             let target_text = target.to_string_lossy();
             if !crate::xml::is_valid_name(&target_text) {
                 return Err(throw_dom(
-                    &ctx,
+                    ctx,
                     "InvalidCharacterError",
                     "target does not match the XML Name production",
                 ));
             }
             let data_text = data.to_string_lossy().into_owned();
             if data_text.contains("?>") {
-                return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
+                return Err(throw_dom(ctx, "InvalidCharacterError", "data contains ?>"));
             }
             let target_text = target_text.into_owned();
-            let document = main_document(&ctx)?;
-            create_node(&ctx, document, |parsed| {
+            create_node(ctx, document()?, |parsed| {
                 let id = parsed
                     .document
                     .create_processing_instruction(target_text, &data_text);
@@ -688,36 +733,39 @@ pub(crate) fn construct_node<'js>(
             })
         }
         "DocumentFragment" => {
-            let document = main_document(&ctx)?;
-            create_node(&ctx, document, |parsed| parsed.document.create_fragment())
+            create_node(ctx, document()?, |parsed| parsed.document.create_fragment())
         }
         "Document" => {
             // The `Document` constructor creates an XML document that still
             // implements `Document`, not `XMLDocument`
             // (<https://dom.spec.whatwg.org/#dom-document-document>).
-            let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
+            let font_ctx = owner.borrow().runtime.font_ctx.clone();
             let mut parsed = crate::Parsed::script("application/xml", font_ctx);
             parsed.xml_document = false;
-            wrap_new_document(&ctx, parsed)
+            wrap_new_document_in_world(ctx, parsed, owner)
         }
         "XMLDocument" => {
             // <https://dom.spec.whatwg.org/#dom-xmldocument-xmldocument>
-            let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
-            wrap_new_document(&ctx, crate::Parsed::script("application/xml", font_ctx))
+            let font_ctx = owner.borrow().runtime.font_ctx.clone();
+            wrap_new_document_in_world(
+                ctx,
+                crate::Parsed::script("application/xml", font_ctx),
+                owner,
+            )
         }
         "HTMLElement" => {
             // https://html.spec.whatwg.org/multipage/custom-elements.html#html-element-constructors
             // During upgrade, the construction stack supplies the existing
             // element rather than allocating a second wrapper.
-            let id = world(&ctx)?
+            let id = world(ctx)?
                 .borrow_mut()
                 .custom_construction
                 .pop()
-                .ok_or_else(|| Exception::throw_type(&ctx, "Illegal constructor"))?;
-            wrap_node(&ctx, id)
+                .ok_or_else(|| Exception::throw_type(ctx, "Illegal constructor"))?;
+            wrap_node(ctx, id)
         }
         other => Err(Exception::throw_type(
-            &ctx,
+            ctx,
             &format!("{other} is not a constructor"),
         )),
     }
@@ -2027,7 +2075,7 @@ fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) 
                         iframe_fires_initial_load(&parsed.document.base, id.node)
                     })
                     .unwrap_or(false);
-                world(ctx)?.borrow_mut().register_frame_for_container(id);
+                World::materialize_iframe(&world(ctx)?, id);
                 if fire_load {
                     super::window::fire_node_load(ctx, id)?;
                 }
@@ -2076,7 +2124,7 @@ fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
                     iframe_fires_initial_load(&parsed.document.base, id.node)
                 })
                 .unwrap_or(false);
-            world(ctx)?.borrow_mut().register_frame_for_container(id);
+            World::materialize_iframe(&world(ctx)?, id);
             if fire_load {
                 super::window::fire_node_load(ctx, id)?;
             }
