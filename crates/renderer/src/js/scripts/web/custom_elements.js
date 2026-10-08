@@ -294,9 +294,6 @@
   }
   host.__tbUpgradeParsedTree = function(root) {
     upgradeFromNodeDocument(root);
-    // The node document's registry may be unreachable from this realm
-    // (`defaultView` null). Fall back to this realm's definitions, which
-    // matches innerHTML invoked as a method of that realm.
     pushReactions();
     try { upgradeTree(root); } finally { popReactions(); }
   };

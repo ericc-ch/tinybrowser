@@ -5257,7 +5257,9 @@ impl JsNode {
     fn set_inner_html(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
         // Adoption by copy leaves a stale handle behind; parse into the live
         // container (https://dom.spec.whatwg.org/#concept-node-adopt).
-        let element = self.handle.0;
+        let element = super::realm_registry(ctx)?
+            .borrow()
+            .live_node_id(self.handle.0);
         let context = with_node_data(ctx, element, |data| match data {
             Some(NodeData::Element(element)) => Some(html_fragment_context(&element.name)),
             _ => None,
