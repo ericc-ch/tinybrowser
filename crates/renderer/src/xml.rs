@@ -57,7 +57,8 @@ fn parse_with_config(
     // `create_pi` stores an empty comment and drops the target and data.
     // A processing instruction is a real node
     // (<https://dom.spec.whatwg.org/#concept-node-pi>). The XML declaration
-    // is not one of those nodes.
+    // is not a node
+    // (<https://www.w3.org/TR/xml/#sec-prolog-dtd>).
     attach_xml_processing_instructions(&mut document, input);
     Parsed {
         id: 0,
@@ -138,7 +139,8 @@ fn intern_mime_essence(essence: String) -> &'static str {
 }
 
 /// Replaces the empty comments the XML sink left for processing
-/// instructions. The XML declaration (`<?xml ...?>`) keeps its placeholder.
+/// instructions. The XML declaration (`<?xml ...?>`) is not a node, so its
+/// placeholder is removed rather than kept as a comment.
 fn attach_xml_processing_instructions(document: &mut crate::documents::BlitzDocument, input: &str) {
     let instructions = scan_xml_processing_instructions(input);
     if instructions.is_empty() {
@@ -152,6 +154,7 @@ fn attach_xml_processing_instructions(document: &mut crate::documents::BlitzDocu
             break;
         };
         if index == 0 && target == "xml" {
+            document.base.mutate().remove_node(hole);
             continue;
         }
         let fresh = document.create_processing_instruction(target, &data);
