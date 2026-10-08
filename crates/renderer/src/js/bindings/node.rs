@@ -1676,6 +1676,18 @@ fn note_connected_move(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     hook.call((wrapped,))
 }
 
+/// Asks the custom-element shim to upgrade elements parsed into `node` using
+/// the node document's registry
+/// (<https://dom.spec.whatwg.org/#concept-create-element>).
+fn upgrade_parsed_tree(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let Ok(hook) = crate::js::bridge::object(ctx)?.get::<_, Function>("__tbUpgradeParsedTree")
+    else {
+        return Ok(());
+    };
+    let wrapped = wrap_node(ctx, node)?;
+    hook.call((wrapped,))
+}
+
 /// Splices an adopted fragment's children into `parent` before `reference`:
 /// one removal record on the fragment plus one addition record on the parent
 /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
@@ -3633,14 +3645,20 @@ impl JsNode {
         reason = "generated getters share one fallible call shape"
     )]
     fn default_view<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        // A document with no browsing context, such as one from DOMParser or
-        // `createDocument`, has no view.
-        let has_view = world(ctx).is_ok_and(|world| world.borrow().is_main_document(self.handle.0));
-        Ok(if has_view {
-            ctx.globals().into_value()
-        } else {
-            Value::new_null(ctx.clone())
-        })
+        // Return this document's browsing-context WindowProxy, not the
+        // calling realm's `globalThis`
+        // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview>).
+        let Ok(owner) = world_for_node(ctx, self.handle.0) else {
+            return Ok(Value::new_null(ctx.clone()));
+        };
+        let owner = owner.borrow();
+        if !owner.is_main_document(self.handle.0) {
+            return Ok(Value::new_null(ctx.clone()));
+        }
+        match owner.window_object() {
+            Some(window) => Ok(window.restore(ctx)?.into_value()),
+            None => Ok(ctx.globals().into_value()),
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
@@ -5284,6 +5302,7 @@ impl JsNode {
             publish_template_maps(ctx, *child)?;
         }
         register_inserted_iframes(ctx, &added)?;
+        upgrade_parsed_tree(ctx, container)?;
         schedule_mutation_delivery(ctx)
     }
 

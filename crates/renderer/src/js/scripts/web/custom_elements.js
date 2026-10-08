@@ -288,6 +288,7 @@
       },
     });
   }
+  host.__tbUpgradeParsedTree = upgradeFromNodeDocument;
 
   // The engine adopts a cross-document node by materializing a copy
   // (<crates/renderer/src/js/bindings/clone.rs>), while Web IDL adoption keeps
