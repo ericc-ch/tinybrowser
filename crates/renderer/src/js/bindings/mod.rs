@@ -755,7 +755,15 @@ pub(super) fn rect_object<'js>(
 /// (<https://dom.spec.whatwg.org/#concept-node-adopt>). A wrapper that lives
 /// in another realm stays where it is: this context cannot update it.
 pub(super) fn retarget_wrapper(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
-    let Some(saved) = world(ctx)?.borrow().shared_wrapper(from) else {
+    // Template-contents maps follow the node even when no wrapper exists
+    // yet, so `template.content` after adopt sees the relocated fragment
+    // (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+    world(ctx)?
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .rekey_wrapper(from, to);
+    let Some(saved) = world(ctx)?.borrow().shared_wrapper(to) else {
         return Ok(());
     };
     let Ok(Some(value)) = deref_weak(ctx, saved) else {
@@ -765,11 +773,6 @@ pub(super) fn retarget_wrapper(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Resul
         return Ok(());
     };
     class.borrow_mut().handle = Handle(to);
-    world(ctx)?
-        .borrow()
-        .registry()
-        .borrow_mut()
-        .rekey_wrapper(from, to);
     Ok(())
 }
 
