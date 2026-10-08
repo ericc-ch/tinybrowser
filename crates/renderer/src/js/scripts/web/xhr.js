@@ -17,6 +17,7 @@ const __tbXhrError = (xhr, data, type) => {
   data.responseURL = '';
   data.responseHeaders = new __tbHeadersConstructor();
   data.responseBytes = host.slots.bytes(0);
+  data.responseDocument = undefined;
   xhr.dispatchEvent(new Event('readystatechange'));
   xhr.dispatchEvent(new ProgressEvent(type));
   xhr.dispatchEvent(new ProgressEvent('loadend'));
@@ -42,7 +43,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
         state: 0, sent: false, method: '', url: '', headers: new __tbHeadersConstructor(),
         responseHeaders: new __tbHeadersConstructor(), responseURL: '', status: 0, responseBytes: host.slots.bytes(0),
         responseType: '', timeout: 0, withCredentials: false, generation: 0,
-        request: null, timer: null, started: 0,
+        request: null, timer: null, started: 0, responseDocument: undefined,
         upload: new XMLHttpRequestUpload(),
     });
   }
@@ -85,9 +86,35 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       try { return JSON.parse(__tbDecodeBytes(data.responseBytes, 'utf-8', false, false)); }
       catch (_) { return null; }
     }
+    if (data.responseType === 'document') return this.responseXML;
     return null;
   }
-  get responseXML() { return null; }
+  get responseXML() {
+    // https://xhr.spec.whatwg.org/#response-xml
+    const data = __tbBrand(this, __tbXhrData);
+    if (data.responseType !== '' && data.responseType !== 'document') return null;
+    if (data.state !== 4) return null;
+    if (data.responseDocument !== undefined) return data.responseDocument;
+    const header = data.overrideMimeType || __tbApply(__tbHeadersGet, data.responseHeaders, ['content-type']) || '';
+    const mime = String(header).split(';')[0].trim().toLowerCase();
+    const xml = mime === 'text/xml' || mime === 'application/xml' || mime === 'application/xhtml+xml'
+      || mime === 'image/svg+xml' || mime.endsWith('+xml');
+    const supported = ['text/html', 'text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'];
+    let type = null;
+    if (xml) type = supported.includes(mime) ? mime : 'application/xml';
+    else if (mime === 'text/html' && data.responseType === 'document') type = 'text/html';
+    if (type === null) {
+      data.responseDocument = null;
+      return null;
+    }
+    try {
+      const source = __tbDecodeBytes(data.responseBytes, 'utf-8', false, false);
+      data.responseDocument = new DOMParser().parseFromString(source, type);
+    } catch (_) {
+      data.responseDocument = null;
+    }
+    return data.responseDocument;
+  }
   // https://xhr.spec.whatwg.org/#the-open()-method
   open(method, url, async = true) {
     const data = __tbBrand(this, __tbXhrData);
@@ -105,6 +132,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     data.responseHeaders = new __tbHeadersConstructor();
     data.responseURL = '';
     data.responseBytes = host.slots.bytes(0);
+    data.responseDocument = undefined;
     data.status = 0;
     if (data.state !== 1) {
       data.state = 1;
@@ -172,6 +200,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       data.responseURL = '';
       data.responseHeaders = new __tbHeadersConstructor();
       data.responseBytes = host.slots.bytes(0);
+      data.responseDocument = undefined;
     }
     if (data.state === 4) data.state = 0;
   }
