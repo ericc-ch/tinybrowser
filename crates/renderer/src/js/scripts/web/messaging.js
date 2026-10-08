@@ -592,7 +592,7 @@ const __tbFrameProxy = frame => {
         case 'Comment': case 'Text': case 'DocumentFragment':
         case 'Document': case 'XMLDocument': case 'ProcessingInstruction':
           return function() {
-            return host.__tb_construct_in_frame(frame, property, ...arguments);
+            return __tbApply(host.__tb_construct_in_frame, globalThis, [frame, property, ...arguments]);
           };
         case 'addEventListener':
           return function(type, callback, options) {

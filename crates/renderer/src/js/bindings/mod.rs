@@ -863,11 +863,18 @@ fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value
     // the realm that happens to create it first. Its prototypes come from the
     // owner realm, so `instanceof` and `getPrototypeOf` stay realm-correct
     // even when a same-site frame reads another frame's DOM.
+    // An iframe document created while a parent script runs has no realm yet,
+    // so the owner world has no brands; use this realm's until that realm
+    // exists (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
     let owner = world(ctx)?.borrow().owner_world(id);
-    let proto = match &owner {
-        Some(owner) => owner.borrow().brand(brand),
-        None => world(ctx)?.borrow().brand(brand),
-    };
+    let proto = owner
+        .as_ref()
+        .and_then(|owner| owner.borrow().brand(brand))
+        .or_else(|| {
+            world(ctx)
+                .ok()
+                .and_then(|current| current.borrow().brand(brand))
+        });
     if let Some(proto) = proto {
         class.set_prototype(Some(&proto.restore(ctx)?))?;
     }
