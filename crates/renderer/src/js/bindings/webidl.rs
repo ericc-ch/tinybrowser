@@ -86,7 +86,9 @@ pub(crate) fn js_string_to_utf8(value: &rquickjs::String<'_>) -> Result<String> 
         Ok(text) => Ok(text),
         Err(_) => {
             let units = value.to_utf16()?;
-            Ok(char::decode_utf16(units).filter_map(Result::ok).collect())
+            Ok(char::decode_utf16(units)
+                .filter_map(|code| code.ok())
+                .collect())
         }
     }
 }
