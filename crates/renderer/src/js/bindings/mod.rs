@@ -762,7 +762,15 @@ pub(super) fn retarget_wrapper(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Resul
     // Template-contents maps follow the node even when no wrapper exists
     // yet, so `template.content` after adopt sees the relocated fragment
     // (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
-    world(ctx)?
+    let world_rc = world(ctx)?;
+    if let Some(source) = world_rc.borrow().owner_world(from) {
+        world_rc
+            .borrow()
+            .registry()
+            .borrow_mut()
+            .stamp_creation_realm(from, &source);
+    }
+    world_rc
         .borrow()
         .registry()
         .borrow_mut()
@@ -859,22 +867,28 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 /// `brand`.
 fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value<'js>> {
     let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
-    // The wrapper belongs to the realm that owns the node's document, not to
-    // the realm that happens to create it first. Its prototypes come from the
-    // owner realm, so `instanceof` and `getPrototypeOf` stay realm-correct
-    // even when a same-site frame reads another frame's DOM.
+    // A node's relevant realm is the one that created it, even after
+    // `adoptNode` changes its node document
+    // (<https://dom.spec.whatwg.org/#concept-node-adopt>,
+    // <https://github.com/whatwg/dom/issues/977>).
     // An iframe document created while a parent script runs has no realm yet,
-    // so the owner world has no brands; use this realm's until that realm
-    // exists (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-    let owner = world(ctx)?.borrow().owner_world(id);
-    let proto = owner
+    // so that world has no brands; use this realm's until that realm exists
+    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+    let world_rc = world(ctx)?;
+    let owner = world_rc.borrow().owner_world(id);
+    if let Some(owner) = owner.as_ref() {
+        world_rc
+            .borrow()
+            .registry()
+            .borrow_mut()
+            .stamp_creation_realm(id, owner);
+    }
+    let creator = world_rc.borrow().registry().borrow().creation_realm(id);
+    let proto = creator
         .as_ref()
-        .and_then(|owner| owner.borrow().brand(brand))
-        .or_else(|| {
-            world(ctx)
-                .ok()
-                .and_then(|current| current.borrow().brand(brand))
-        });
+        .and_then(|creator| creator.borrow().brand(brand))
+        .or_else(|| owner.as_ref().and_then(|owner| owner.borrow().brand(brand)))
+        .or_else(|| world_rc.borrow().brand(brand));
     if let Some(proto) = proto {
         class.set_prototype(Some(&proto.restore(ctx)?))?;
     }

@@ -46,6 +46,11 @@ pub(crate) struct RealmRegistry {
     template_contents: HashMap<NodeId, NodeId>,
     /// Template-contents fragment → host `template` element.
     fragment_hosts: HashMap<NodeId, NodeId>,
+    /// The realm that created each node. Adoption changes the node document
+    /// but not this realm
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>,
+    /// <https://github.com/whatwg/dom/issues/977>).
+    creation_realms: HashMap<NodeId, Weak<RefCell<World>>>,
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
@@ -123,6 +128,8 @@ impl RealmRegistry {
         });
         self.fragment_hosts
             .retain(|fragment, host| fragment.document_id() != id && host.document_id() != id);
+        self.creation_realms
+            .retain(|node, _| node.document_id() != id);
     }
 
     /// The shared wrapper cache entry for `id`, when one exists.
@@ -154,6 +161,21 @@ impl RealmRegistry {
             self.fragment_hosts.insert(to, host);
             self.template_contents.insert(host, to);
         }
+        if let Some(world) = self.creation_realms.remove(&from) {
+            self.creation_realms.insert(to, world);
+        }
+    }
+
+    /// Records the realm that created `id` the first time it is seen.
+    pub(crate) fn stamp_creation_realm(&mut self, id: NodeId, world: &Rc<RefCell<World>>) {
+        self.creation_realms
+            .entry(id)
+            .or_insert_with(|| Rc::downgrade(world));
+    }
+
+    /// The realm that created `id`, while that realm is alive.
+    pub(crate) fn creation_realm(&self, id: NodeId) -> Option<Rc<RefCell<World>>> {
+        self.creation_realms.get(&id).and_then(Weak::upgrade)
     }
 
     pub(crate) fn template_contents(&self, template: NodeId) -> Option<NodeId> {
@@ -190,6 +212,7 @@ impl RealmRegistry {
         self.frames.clear();
         self.wrappers.clear();
         self.frame_documents.clear();
+        self.creation_realms.clear();
     }
 
     fn budget(&self) -> Rc<RefCell<ResourceBudget>> {
