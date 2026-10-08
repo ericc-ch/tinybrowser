@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run WPT against tinybrowser. Builds the debug binary, installs the
-# wptrunner product into WPT's venv, then execs ./wpt run.
+# Run WPT against tinybrowser. Builds the debug binary and installs the
+# wptrunner product into WPT's venv only when those inputs changed, then
+# runs `wpt run`.
 #
 # `tools/wpt/run --score` runs the suite then prints pass rates (`score.py`).
 # `--report FILE` on that path summarizes an existing wptreport without running.
@@ -106,12 +107,39 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+# True when $1 is missing or an input that is compiled into the binary is newer.
+# Docs and the WPT tree are not inputs. `cargo metadata` (via binary-path) is
+# not a build.
+binary_is_stale() {
+  local binary="$1" target_dir newer
+  [[ -x "$binary" ]] || return 0
+  target_dir="$(dirname "$(dirname "$binary")")"
+  newer="$(
+    find "$ROOT" \
+      \( -path "$ROOT/.git" -o -path "$target_dir" -o -path "$ROOT/target" \
+         -o -path "$ROOT/third_party/wpt" -o -path "$ROOT/third_party/blink-cdp" \
+         -o -name node_modules \) -prune -o \
+      -type f \( \
+        -name '*.rs' -o -name '*.js' -o -name '*.idl' -o -name '*.c' -o -name '*.h' \
+        -o -name '*.cc' -o -name '*.cpp' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \
+        -o -name 'build.rs' -o -name 'order.txt' -o -name 'rust-toolchain.toml' \
+        -o -name 'config.toml' \
+      \) -newer "$binary" -print -quit
+  )"
+  [[ -n "$newer" ]]
+}
+
 cd "$ROOT"
 if [[ -n "${TINYBROWSER_BINARY:-}" ]]; then
   BINARY="$TINYBROWSER_BINARY"
 else
-  cargo build -q --offline 2>/dev/null || cargo build -q
   BINARY="$("$ROOT/tools/binary-path")"
+  if binary_is_stale "$BINARY"; then
+    echo "wpt: building tinybrowser" >&2
+    cargo build -q --offline 2>/dev/null || cargo build -q
+  else
+    echo "wpt: binary is current, skipping cargo build" >&2
+  fi
 fi
 if [[ ! -x "$BINARY" ]]; then
   echo "tinybrowser binary not found at $BINARY" >&2
@@ -129,10 +157,16 @@ echo "wpt: $WPT" >&2
 echo "venv: $VENV" >&2
 echo "binary: $BINARY" >&2
 
-# One run at a time: the bootstrap and the editable install both mutate the
-# shared venv. The lock lives in the user cache and is keyed by the venv's
-# real path, so two spellings of one checkout serialize.
-if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" != 1 ]]; then
+# The lock exists because `uv venv` and `uv pip install` mutate this shared
+# venv. Two worktrees installing at once would interleave writes into one
+# environment. A run that does not install does not take it, and an install
+# releases it before tests start, so a second run is not stuck behind the
+# first run's tests (the wait is TINYBROWSER_WPT_LOCK_TIMEOUT, default 1800s).
+acquire_venv_lock() {
+  if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" == 1 ]]; then
+    return 0
+  fi
+  local lock_dir lock lock_timeout
   lock_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tinybrowser"
   mkdir -p "$lock_dir"
   lock="$lock_dir/wpt-$(realpath -m "$VENV" | cksum | cut -d' ' -f1).lock"
@@ -140,34 +174,78 @@ if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" != 1 ]]; then
   if ! flock -n 9; then
     lock_timeout="${TINYBROWSER_WPT_LOCK_TIMEOUT:-1800}"
     [[ "$lock_timeout" =~ ^[0-9]+$ ]] || lock_timeout=1800
-    echo "another WPT run holds $lock; waiting" >&2
+    echo "another WPT install holds $lock; waiting" >&2
     flock -w "$lock_timeout" 9 || {
       echo "timed out waiting for the WPT venv lock" >&2
       exit 1
     }
   fi
-fi
+}
+release_venv_lock() {
+  if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" == 1 ]]; then
+    return 0
+  fi
+  exec 9>&-
+}
 
-# uv owns the venv: `uv venv` creates it, `uv pip` fills it. `--seed` installs
-# pip/setuptools so WPT's working-set check can run; the manifest and wptrunner
-# requirements are installed here so that check finds everything satisfied and
-# WPT never falls back to its own pip path. The editable product adapter is
-# reinstalled every run, so a checkout edit takes effect.
-if ! command -v uv >/dev/null 2>&1; then
-  echo "uv is required to bootstrap the WPT virtualenv" >&2
-  exit 1
-fi
-if [[ ! -x "$VENV/bin/python" ]]; then
-  if [[ -n "${TINYBROWSER_WPT_VENV:-}" ]]; then
-    echo "WPT virtualenv not found at $VENV; TINYBROWSER_WPT_VENV must name one" >&2
+# Hash of everything an install would read. The editable product is included
+# so a checkout edit of tools/wpt still reinstalls.
+venv_stamp_payload() {
+  {
+    if [[ -x "$VENV/bin/python" ]]; then
+      "$VENV/bin/python" -c 'import sys; print(sys.version)'
+    else
+      echo no-python
+    fi
+    sha256sum \
+      "$WPT/tools/manifest/requirements.txt" \
+      "$WPT/tools/wptrunner/requirements.txt" \
+      "$ROOT/tools/wpt/pyproject.toml" \
+      "$ROOT/tools/wpt/"*.py
+  } | sha256sum | awk '{print $1}'
+}
+VENV_STAMP="$VENV/.tinybrowser-wpt-stamp"
+venv_is_current() {
+  [[ -x "$VENV/bin/python" && -f "$VENV_STAMP" ]] || return 1
+  [[ "$(venv_stamp_payload)" == "$(cat "$VENV_STAMP")" ]]
+}
+
+install_venv() {
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "uv is required to bootstrap the WPT virtualenv" >&2
     exit 1
   fi
-  uv venv --seed "$VENV" --python 3.12
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    if [[ -n "${TINYBROWSER_WPT_VENV:-}" ]]; then
+      echo "WPT virtualenv not found at $VENV; TINYBROWSER_WPT_VENV must name one" >&2
+      exit 1
+    fi
+    uv venv --seed "$VENV" --python 3.12
+  fi
+  # uv owns the venv: `uv venv` creates it, `uv pip` fills it. `--seed` installs
+  # pip/setuptools so WPT's working-set check can run; the manifest and wptrunner
+  # requirements are installed here so that check finds everything satisfied and
+  # WPT never falls back to its own pip path.
+  uv pip install --python "$VENV/bin/python" -q \
+    -r "$WPT/tools/manifest/requirements.txt" \
+    -r "$WPT/tools/wptrunner/requirements.txt"
+  uv pip install --python "$VENV/bin/python" -q -e "$ROOT/tools/wpt"
+  venv_stamp_payload > "$VENV_STAMP"
+}
+
+if venv_is_current; then
+  echo "wpt: venv is current, skipping install" >&2
+else
+  acquire_venv_lock
+  # Another run may have finished the install while we waited.
+  if venv_is_current; then
+    echo "wpt: venv is current, skipping install" >&2
+  else
+    echo "wpt: installing WPT virtualenv" >&2
+    install_venv
+  fi
+  release_venv_lock
 fi
-uv pip install --python "$VENV/bin/python" -q \
-  -r "$WPT/tools/manifest/requirements.txt" \
-  -r "$WPT/tools/wptrunner/requirements.txt"
-uv pip install --python "$VENV/bin/python" -q -e "$ROOT/tools/wpt"
 # A standalone `--` separates test paths from wpt options in the documented
 # form. wpt does not need it, and forwarding it would make every later option
 # positional, including the --test-types appended below.
@@ -233,6 +311,67 @@ fi
 if ! has_option --manifest "${args[@]}"; then
   args=(--manifest "$WPT/MANIFEST.json" "${args[@]}")
 fi
+# Current means the last successful run that was allowed to update already
+# walked this checkout: same HEAD, same local edits (ignored files such as
+# the venv do not count), and the same manifest bytes on disk. wptrunner
+# otherwise rewalks the tree on every run (`manifest_update` defaults on).
+manifest_stamp_path() {
+  local key
+  key="$(realpath -m "$1" | cksum | cut -d' ' -f1)"
+  echo "${XDG_CACHE_HOME:-$HOME/.cache}/tinybrowser/wpt-manifest-$key.stamp"
+}
+manifest_token() {
+  local manifest="$1"
+  {
+    git -C "$WPT" rev-parse HEAD
+    git -C "$WPT" diff HEAD --
+    git -C "$WPT" ls-files --others --exclude-standard
+    if [[ -f "$manifest" ]]; then
+      stat -c '%Y %s' "$manifest"
+    else
+      echo missing
+    fi
+  } | sha256sum | awk '{print $1}'
+}
+manifest_is_current() {
+  local manifest="$1" stamp
+  [[ -f "$manifest" ]] || return 1
+  stamp="$(manifest_stamp_path "$manifest")"
+  [[ -f "$stamp" ]] || return 1
+  [[ "$(manifest_token "$manifest")" == "$(<"$stamp")" ]]
+}
+write_manifest_stamp() {
+  local manifest="$1" stamp
+  stamp="$(manifest_stamp_path "$manifest")"
+  mkdir -p "$(dirname "$stamp")"
+  manifest_token "$manifest" > "$stamp"
+}
+manifest_path_from_args() {
+  local index=0 arg path="$WPT/MANIFEST.json"
+  while (( index < ${#args[@]} )); do
+    arg="${args[$index]}"
+    if [[ "$arg" == --manifest=* ]]; then
+      path="${arg#--manifest=}"
+    elif [[ "$arg" == --manifest ]]; then
+      path="${args[$((index + 1))]:-}"
+    fi
+    index=$((index + 1))
+  done
+  printf '%s\n' "$path"
+}
+MANIFEST_PATH="$(manifest_path_from_args)"
+record_manifest_stamp=0
+if has_option --no-manifest-update "${args[@]}"; then
+  :
+elif has_option --manifest-update "${args[@]}"; then
+  record_manifest_stamp=1
+elif manifest_is_current "$MANIFEST_PATH"; then
+  echo "wpt: manifest is current, skipping update" >&2
+  args=(--no-manifest-update "${args[@]}")
+  record_manifest_stamp=1
+else
+  record_manifest_stamp=1
+fi
 if ! has_option --test-types "${args[@]}"; then
   # `--test-types` takes its values with `nargs="*"`, so it must be the last
   # option: a following positional would be consumed as a test type.
@@ -247,4 +386,80 @@ fi
 if ! has_option --ssl-type "${args[@]}"; then
   args=(--ssl-type=openssl "${args[@]}")
 fi
-exec "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}"
+# The product token is inserted immediately before this list. wpt's parser
+# then rejects a test path that follows an option: `--test-types` is
+# nargs='*', so argparse will not take a later positional. Bare paths lead;
+# option values stay with their options.
+reorder_test_paths() {
+  local -a paths=() opts=()
+  local i=0 count=${#args[@]} arg
+  while (( i < count )); do
+    arg="${args[$i]}"
+    if [[ "$arg" != -* || "$arg" == "-" ]]; then
+      paths+=("$arg")
+      i=$((i + 1))
+      continue
+    fi
+    opts+=("$arg")
+    if [[ "$arg" == *=* ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    case "$arg" in
+      --test-types)
+        i=$((i + 1))
+        while (( i < count )); do
+          case "${args[$i]}" in
+            testharness|crashtest|test262|wdspec|print-reftest|aamtest|reftest)
+              opts+=("${args[$i]}")
+              i=$((i + 1))
+              ;;
+            *)
+              break
+              ;;
+          esac
+        done
+        ;;
+      --run-by-dir|--debugger|--chaos|--trace-categories)
+        if (( i + 1 < count )) && [[ "${args[$((i + 1))]}" != -* ]]; then
+          i=$((i + 1))
+          opts+=("${args[$i]}")
+        fi
+        i=$((i + 1))
+        ;;
+      --sauce-tags)
+        i=$((i + 1))
+        while (( i < count )) && [[ "${args[$i]}" != -* ]]; do
+          opts+=("${args[$i]}")
+          i=$((i + 1))
+        done
+        ;;
+      --yes|-y|--install-browser|--install-webdriver|-h|--help|--manifest-update|--no-manifest-update|--manifest-download|--no-manifest-download|-f|--fully-parallel|--no-capture-stdio|--no-fail-on-unexpected|--no-fail-on-unexpected-pass|--no-restart-on-new-group|--list-test-groups|--list-disabled|--list-tests|--list-tests-json|--verify|--stability|--verify-log-full|--verify-no-chaos-mode|--verify-chaos-mode|--verify-no-output-results|--verify-output-results|--skip-timeout|--skip-crash|--enable-webtransport-h3|--no-enable-webtransport-h3|--enable-dns|--no-enable-dns|--default-exclude|--repeat-until-unexpected|--pause-after-test|--no-pause-after-test|--debug-test|--pause-on-unexpected|--no-restart-on-unexpected|--pdb|--leak-check|--no-leak-check|--keep-app-data-directory|--install-fonts|--no-install-fonts|--headless|--no-headless|--suppress-handler-traceback|--no-suppress-handler-traceback|--update-status-on-crash|--no-update-status-on-crash|--debug-build|--release-build|--preload-browser|--no-preload-browser|--disable-e10s|--disable-fission|--reftest-internal|--reftest-external|--enable-mojojs|--enable-swiftshader|--enable-experimental|--no-enable-experimental|--enable-sanitizer|--reuse-window|--kill-safari|--log-mach-verbose|--log-mach-screenshot|--log-mach-no-screenshot|--log-tbpl-compact)
+        i=$((i + 1))
+        ;;
+      *)
+        if (( i + 1 < count )); then
+          i=$((i + 1))
+          opts+=("${args[$i]}")
+        fi
+        i=$((i + 1))
+        ;;
+    esac
+  done
+  args=()
+  if (( ${#paths[@]} )); then
+    args+=("${paths[@]}")
+  fi
+  if (( ${#opts[@]} )); then
+    args+=("${opts[@]}")
+  fi
+}
+reorder_test_paths
+set +e
+"$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}"
+status=$?
+set -e
+if [[ "$status" -eq 0 && "$record_manifest_stamp" -eq 1 ]]; then
+  write_manifest_stamp "$MANIFEST_PATH"
+fi
+exit "$status"

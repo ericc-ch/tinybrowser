@@ -1,9 +1,11 @@
 # WPT harness
 
-`tools/wpt/run` builds the debug binary, installs the wptrunner product into
-WPT's venv, and runs `wpt run` against tinybrowser. It defaults to
-`--test-types testharness crashtest`, enables HTTPS with the wptserve CA, and
-passes `--resolve` maps instead of editing `/etc/hosts`.
+`tools/wpt/run` runs `wpt run` against tinybrowser. It builds the debug
+binary only when that binary is missing or a compiled input is newer, and
+installs the wptrunner product into WPT's venv only when the venv is missing
+or its requirements changed. It defaults to `--test-types testharness
+crashtest`, enables HTTPS with the wptserve CA, and passes `--resolve` maps
+instead of editing `/etc/hosts`.
 
 ```sh
 nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
