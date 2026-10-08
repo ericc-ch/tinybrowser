@@ -574,24 +574,75 @@ fn realm_event<'js>(ctx: &Ctx<'js>, event: JsEvent) -> Result<Class<'js, JsEvent
 /// `document.createEvent(interface)`
 /// (<https://dom.spec.whatwg.org/#dom-document-createevent>).
 ///
-/// The interface name matches ASCII case-insensitively.
+/// The interface name matches ASCII case-insensitively. An interface that is
+/// not in the table, or that is not exposed on this realm, throws
+/// `NotSupportedError`. The event is created uninitialized; its prototype is
+/// the exposed interface's, not the result of calling that constructor.
 pub(crate) fn create_event<'js>(ctx: &Ctx<'js>, interface: &str) -> Result<Value<'js>> {
-    match interface.to_ascii_lowercase().as_str() {
-        "event" | "events" | "htmlevents" => Ok(Class::into_value(realm_event(
-            ctx,
-            JsEvent::uninitialized(),
-        )?)),
-        "customevent" => {
-            let class = realm_event(ctx, JsEvent::uninitialized())?;
-            set_custom_event_prototype(ctx, &class)?;
-            Ok(Class::into_value(class))
-        }
-        _ => Err(bindings::throw_dom(
+    let Some(interface_name) = legacy_event_interface(&interface.to_ascii_lowercase()) else {
+        return Err(bindings::throw_dom(
             ctx,
             "NotSupportedError",
             "the requested event interface is not supported",
-        )),
+        ));
+    };
+    let class = realm_event(ctx, JsEvent::uninitialized())?;
+    if interface_name != "Event" {
+        set_exposed_event_prototype(ctx, &class, interface_name)?;
     }
+    Ok(Class::into_value(class))
+}
+
+/// The `createEvent` interface table
+/// (<https://dom.spec.whatwg.org/#dom-document-createevent>).
+fn legacy_event_interface(interface: &str) -> Option<&'static str> {
+    Some(match interface {
+        "beforeunloadevent" => "BeforeUnloadEvent",
+        "compositionevent" => "CompositionEvent",
+        "customevent" => "CustomEvent",
+        "devicemotionevent" => "DeviceMotionEvent",
+        "deviceorientationevent" => "DeviceOrientationEvent",
+        "dragevent" => "DragEvent",
+        "event" | "events" | "htmlevents" | "svgevents" => "Event",
+        "focusevent" => "FocusEvent",
+        "hashchangeevent" => "HashChangeEvent",
+        "keyboardevent" => "KeyboardEvent",
+        "messageevent" => "MessageEvent",
+        "mouseevent" | "mouseevents" => "MouseEvent",
+        "storageevent" => "StorageEvent",
+        "textevent" => "TextEvent",
+        "touchevent" => "TouchEvent",
+        "uievent" | "uievents" => "UIEvent",
+        _ => return None,
+    })
+}
+
+/// Sets the event's prototype to `window[interface].prototype`.
+///
+/// A missing constructor means the interface is not exposed on the relevant
+/// global (<https://dom.spec.whatwg.org/#dom-document-createevent>).
+fn set_exposed_event_prototype<'js>(
+    ctx: &Ctx<'js>,
+    class: &Class<'js, JsEvent>,
+    interface: &str,
+) -> Result<()> {
+    let ctor: Value = ctx.globals().get(interface)?;
+    let Some(ctor) = ctor.as_object() else {
+        return Err(bindings::throw_dom(
+            ctx,
+            "NotSupportedError",
+            "the requested event interface is not exposed",
+        ));
+    };
+    let proto: Value = ctor.get("prototype")?;
+    let Some(proto) = proto.as_object() else {
+        return Err(bindings::throw_dom(
+            ctx,
+            "NotSupportedError",
+            "the requested event interface is not exposed",
+        ));
+    };
+    class.set_prototype(Some(proto))
 }
 
 fn set_custom_event_prototype<'js>(ctx: &Ctx<'js>, class: &Class<'js, JsEvent>) -> Result<()> {

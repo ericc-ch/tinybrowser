@@ -13,10 +13,10 @@ use super::{
     is_element, is_focusable, is_main_document, live_collection, main_document, make_weak,
     materialize_children, materialize_import, new_detached_attr, qualified_name, rect_object,
     remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
-    set_attribute_node, set_attribute_sync, set_character_data, set_pi_data, sibling,
-    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
-    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
-    world, world_for_node, wrap_new_document, wrap_node,
+    selector_matching_elements, set_attribute_node, set_attribute_sync, set_character_data,
+    set_pi_data, sibling, sibling_value, string_value, throw_dom, throw_dom_error, touch_attr,
+    tree_order, valid_attribute_local_name, valid_element_local_name, validate_and_extract,
+    with_node_data, world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -4931,10 +4931,11 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
+        let selectors = selector_matching_elements(&selectors.0);
         parsed
             .document
             .base
-            .matches_selector(self.handle.0.node, &selectors.0)
+            .matches_selector(self.handle.0.node, &selectors)
             .map_err(|err| select_error(&ctx, &err))
     }
 
@@ -4947,10 +4948,11 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
+            let selectors = selector_matching_elements(&selectors.0);
             parsed
                 .document
                 .base
-                .closest(self.handle.0.node, &selectors.0)
+                .closest(self.handle.0.node, &selectors)
                 .map_err(|err| select_error(&ctx, &err))?
                 .map(|node| NodeId {
                     document: parsed.id,
@@ -7128,6 +7130,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         selectors: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
         let selectors = selectors.to_string()?;
+        let selectors = selector_matching_elements(&selectors);
         // Adoption by copy leaves a stale handle behind; search the live
         // subtree (https://dom.spec.whatwg.org/#concept-node-adopt).
         let scope = self.handle.0;
@@ -7157,6 +7160,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         selectors: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
         let selectors = selectors.to_string()?;
+        let selectors = selector_matching_elements(&selectors);
         // Adoption by copy leaves a stale handle behind; search the live
         // subtree (https://dom.spec.whatwg.org/#concept-node-adopt).
         let scope = self.handle.0;

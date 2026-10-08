@@ -177,3 +177,47 @@ globalThis.InputEvent = class InputEvent extends UIEvent {
   get dataTransfer() { return __tbBrand(this, __tbInputEventData).dataTransfer; }
 };
 Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { value: 'InputEvent', writable: false, enumerable: false, configurable: true });
+
+// Interfaces named by document.createEvent
+// (https://dom.spec.whatwg.org/#dom-document-createevent).
+// createEvent builds an uninitialized Event and sets this prototype; it does
+// not call the constructor, which requires a type.
+function __tbExposeEvent(name, parent) {
+  const ctor = {
+    [name]: class extends parent {
+      constructor(type) {
+        if (arguments.length < 1) {
+          throw new TypeError("Failed to construct '" + name + "': 1 argument required, but only 0 present.");
+        }
+        const init = arguments.length < 2 || arguments[1] == null ? {} : arguments[1];
+        return __tbConstruct(parent, [type, init], new.target);
+      }
+    },
+  }[name];
+  Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+    value: name, writable: false, enumerable: false, configurable: true,
+  });
+  globalThis[name] = ctor;
+}
+__tbExposeEvent('BeforeUnloadEvent', Event);
+__tbExposeEvent('HashChangeEvent', Event);
+__tbExposeEvent('DeviceMotionEvent', Event);
+__tbExposeEvent('DeviceOrientationEvent', Event);
+__tbExposeEvent('CompositionEvent', UIEvent);
+__tbExposeEvent('FocusEvent', UIEvent);
+__tbExposeEvent('TextEvent', UIEvent);
+__tbExposeEvent('TouchEvent', UIEvent);
+__tbExposeEvent('DragEvent', MouseEvent);
+
+// Touch Events extends GlobalEventHandlers with these handlers. createEvent's
+// touch rows run only when the document exposes one
+// (https://w3c.github.io/touch-events/#extensions-to-the-globaleventhandlers-mixin).
+if (typeof Document !== 'undefined') {
+  for (const name of ['ontouchstart', 'ontouchend', 'ontouchmove', 'ontouchcancel']) {
+    Object.defineProperty(Document.prototype, name, {
+      get() { return host.__tbGetNodeHandler(this, name); },
+      set(value) { host.__tbSetNodeHandler(this, name, value); },
+      enumerable: true, configurable: true,
+    });
+  }
+}

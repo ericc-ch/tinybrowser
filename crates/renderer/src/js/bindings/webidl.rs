@@ -1,5 +1,7 @@
 //! `WebIDL` argument conversion helpers.
 
+use std::borrow::Cow;
+
 use super::{adopt_across_documents, throw_dom, world};
 
 use crate::js::world::{JournalEntry, NodeId};
@@ -201,6 +203,125 @@ fn assemble_nodes_into_node(
 /// (<https://dom.spec.whatwg.org/#scope-match-a-selectors-string>).
 pub(crate) fn select_error(ctx: &Ctx<'_>, err: &style_traits::ParseError<'_>) -> rquickjs::Error {
     throw_dom(ctx, "SyntaxError", &format!("{err:?}"))
+}
+
+/// Rewrites `::first-line` and the legacy `:first-line` to `::before`.
+///
+/// Both forms are valid pseudo-elements and match no element
+/// (<https://drafts.csswg.org/css-pseudo/#selectordef-first-line>,
+/// <https://drafts.csswg.org/selectors-4/#pseudo-element-selectors>,
+/// <https://dom.spec.whatwg.org/#scope-match-a-selectors-string>).
+/// The selector parser rejects the name, while it already accepts `::before`
+/// and that pseudo-element likewise matches no element. Strings, comments,
+/// and escapes are left alone so an attribute value is not rewritten.
+pub(crate) fn selector_matching_elements(selectors: &str) -> Cow<'_, str> {
+    if !contains_ascii_ignore_case(selectors, b"first-line") {
+        return Cow::Borrowed(selectors);
+    }
+    let mut out = String::new();
+    let mut index = 0;
+    let mut changed = false;
+    while index < selectors.len() {
+        if let Some(end) = skip_selector_literal(selectors, index) {
+            if changed {
+                out.push_str(&selectors[index..end]);
+            }
+            index = end;
+            continue;
+        }
+        if let Some(end) = first_line_pseudo(selectors, index) {
+            if !changed {
+                out.push_str(&selectors[..index]);
+                changed = true;
+            }
+            out.push_str("::before");
+            index = end;
+            continue;
+        }
+        let Some(next) = selectors[index..].chars().next() else {
+            break;
+        };
+        if changed {
+            out.push(next);
+        }
+        index += next.len_utf8();
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(selectors)
+    }
+}
+
+fn contains_ascii_ignore_case(haystack: &str, needle: &[u8]) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// The end index of a comment, string, or escape starting at `index`, when
+/// one starts there.
+fn skip_selector_literal(selectors: &str, index: usize) -> Option<usize> {
+    let rest = &selectors[index..];
+    if rest.starts_with("/*") {
+        return rest.find("*/").map(|end| index + end + 2);
+    }
+    match rest.chars().next()? {
+        quote @ ('"' | '\'') => Some(end_of_selector_string(selectors, index, quote)),
+        '\\' => {
+            let mut cursor = index + 1;
+            if let Some(escaped) = selectors[cursor..].chars().next() {
+                cursor += escaped.len_utf8();
+            }
+            Some(cursor)
+        }
+        _ => None,
+    }
+}
+
+fn end_of_selector_string(selectors: &str, index: usize, quote: char) -> usize {
+    let mut cursor = index + quote.len_utf8();
+    while cursor < selectors.len() {
+        let Some(character) = selectors[cursor..].chars().next() else {
+            break;
+        };
+        cursor += character.len_utf8();
+        if character == '\\' {
+            if let Some(escaped) = selectors[cursor..].chars().next() {
+                cursor += escaped.len_utf8();
+            }
+            continue;
+        }
+        if character == quote {
+            return cursor;
+        }
+    }
+    selectors.len()
+}
+
+/// The index just after a `:first-line` or `::first-line` pseudo at `index`.
+fn first_line_pseudo(selectors: &str, index: usize) -> Option<usize> {
+    let rest = &selectors.as_bytes()[index..];
+    if !rest.starts_with(b":") {
+        return None;
+    }
+    let colon_len = if rest.starts_with(b"::") { 2 } else { 1 };
+    let name = rest.get(colon_len..)?;
+    let token = b"first-line";
+    if name.len() < token.len() || !name[..token.len()].eq_ignore_ascii_case(token) {
+        return None;
+    }
+    let after = index + colon_len + token.len();
+    let continues = selectors[after..]
+        .chars()
+        .next()
+        .is_some_and(is_css_name_continue);
+    (!continues).then_some(after)
+}
+
+fn is_css_name_continue(character: char) -> bool {
+    character == '\\' || character == '-' || character == '_' || character.is_alphanumeric()
 }
 
 /// Integer conversion from a `double`

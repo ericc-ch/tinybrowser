@@ -91,10 +91,71 @@ fn sniff_encoding(
     if let Some(encoding) = content_type.and_then(charset_from_content_type) {
         return Some((encoding, 0));
     }
+    // An XML document's encoding comes from the XML declaration, then UTF-8.
+    // The HTML prescan and windows-1252 default do not apply
+    // (<https://www.w3.org/TR/xml/#sec-guessing>,
+    // <https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-documents>).
+    if content_type.is_some_and(|header| crate::xml::navigated_content_type(header).is_some()) {
+        return xml_encoding(bytes, eof);
+    }
     if let Some(encoding) = prescan_charset(bytes) {
         return Some((encoding, 0));
     }
     (eof || bytes.len() >= 1024).then_some((encoding_rs::WINDOWS_1252, 0))
+}
+
+/// XML encoding autodetection after a byte-order mark and a transport charset
+/// have already been ruled out
+/// (<https://www.w3.org/TR/xml/#sec-guessing>).
+fn xml_encoding(bytes: &[u8], eof: bool) -> Option<(&'static encoding_rs::Encoding, usize)> {
+    const MARK: &[u8] = b"<?xml";
+    if bytes.len() < MARK.len() && MARK.starts_with(bytes) && !eof {
+        return None;
+    }
+    if !bytes.starts_with(MARK) {
+        return Some((encoding_rs::UTF_8, 0));
+    }
+    let window = &bytes[..bytes.len().min(1024)];
+    let Some(end) = window.windows(2).position(|pair| pair == b"?>") else {
+        if !eof && bytes.len() < 1024 {
+            return None;
+        }
+        return Some((encoding_rs::UTF_8, 0));
+    };
+    let declaration = &window[..end];
+    Some((
+        xml_encoding_attribute(declaration).unwrap_or(encoding_rs::UTF_8),
+        0,
+    ))
+}
+
+fn xml_encoding_attribute(declaration: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let token = b"encoding";
+    let mut index = 0;
+    while index + token.len() <= declaration.len() {
+        if declaration[index..].starts_with(token) {
+            let after = index + token.len();
+            let continues = declaration.get(after).is_some_and(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b':')
+            });
+            if !continues {
+                return encoding_label(&declaration[after..]);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn encoding_label(rest: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let rest = rest.trim_ascii_start();
+    let rest = rest.strip_prefix(b"=")?.trim_ascii_start();
+    let quote = *rest.first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let value = rest.get(1..)?.split(|byte| *byte == quote).next()?;
+    encoding_rs::Encoding::for_label(value)
 }
 
 fn bom_prefix(bytes: &[u8]) -> bool {
