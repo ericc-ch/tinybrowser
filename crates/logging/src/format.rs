@@ -97,11 +97,7 @@ mod tests {
 
     #[test]
     fn newlines_in_messages_stay_on_one_line() {
-        let line = record(
-            Level::Error,
-            "cli",
-            format_args!("bad \"value\" a=b\nnext"),
-        );
+        let line = record(Level::Error, "cli", format_args!("bad \"value\" a=b\nnext"));
         assert_eq!(line.lines().count(), 1, "{line}");
         assert!(line.contains("bad \"value\" a=b\\nnext"), "{line}");
     }

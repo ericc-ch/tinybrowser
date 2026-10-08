@@ -7,8 +7,8 @@ mod providers;
 pub(crate) use blitz::{
     INVALID_BASE_URL, MAX_VIEWPORT_SIDE, blitz_base_url, paint, resolve_until_settled,
 };
-pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 pub(crate) use png::encode_png;
+pub(crate) use providers::{BlitzFetch, CountingHandler, TinyNav, TinyNetProvider, TinyShell};
 
 /// Default object size for an `<img>` without intrinsic dimensions
 /// (<https://html.spec.whatwg.org/multipage/rendering.html#images>).

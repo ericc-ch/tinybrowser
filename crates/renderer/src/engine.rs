@@ -85,8 +85,7 @@ impl Engine {
         };
         let parent_url = parent_document.inherited_url();
         let parent_viewport = parent_document.viewport_size;
-        let mut document =
-            Document::with_shared(frame, &self.runtime, &self.init_scripts);
+        let mut document = Document::with_shared(frame, &self.runtime, &self.init_scripts);
         // A child frame shares the tab's viewport until a content-box-driven
         // size exists; Blitz does not couple iframe layout to the child.
         document.set_viewport_size(parent_viewport);
@@ -159,7 +158,9 @@ impl Engine {
         // A main-frame mount replaces the page-scoped init scripts before the
         // document's realm can run, so the fresh tree sees the current list.
         if frame == FrameId::MAIN {
-            self.init_scripts.borrow_mut().clone_from(&mount.init_scripts);
+            self.init_scripts
+                .borrow_mut()
+                .clone_from(&mount.init_scripts);
         }
         self.remove_descendants(frame);
         self.frame_mut(frame)?.mount(mount)?;
@@ -175,7 +176,9 @@ impl Engine {
     /// [`TabError::UnknownFrame`] when the engine does not host the frame.
     pub fn open_body(&mut self, frame: FrameId, head: &ResponseHead) -> Result<(), TabError> {
         if frame == FrameId::MAIN {
-            self.init_scripts.borrow_mut().clone_from(&head.init_scripts);
+            self.init_scripts
+                .borrow_mut()
+                .clone_from(&head.init_scripts);
         }
         self.remove_descendants(frame);
         let document = self.frame_mut(frame)?;
@@ -581,10 +584,7 @@ impl Engine {
     }
 
     /// Applies iframe connection transitions.
-    fn apply_iframe_lifecycle(
-        &mut self,
-        events: Vec<(FrameId, crate::document::IframeLifecycle)>,
-    ) {
+    fn apply_iframe_lifecycle(&mut self, events: Vec<(FrameId, crate::document::IframeLifecycle)>) {
         for (parent, event) in events {
             match event {
                 crate::document::IframeLifecycle::Inserted(container) => {
@@ -624,10 +624,7 @@ impl Engine {
     }
 
     /// Applies image connection transitions.
-    fn apply_image_lifecycle(
-        &mut self,
-        events: Vec<(FrameId, crate::document::ImageLifecycle)>,
-    ) {
+    fn apply_image_lifecycle(&mut self, events: Vec<(FrameId, crate::document::ImageLifecycle)>) {
         for (parent, event) in events {
             match event {
                 crate::document::ImageLifecycle::Connected(element) => {
@@ -1110,7 +1107,7 @@ impl Engine {
 /// Decodes a `data:` URL into its content type and body bytes, or `None` when
 /// the URL is malformed or its base64 payload is not decodable
 /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
-fn decode_data_url(raw: &str) -> Option<(Option<String>, Vec<u8>)> {
+pub(crate) fn decode_data_url(raw: &str) -> Option<(Option<String>, Vec<u8>)> {
     let rest = raw.strip_prefix("data:")?;
     let (metadata, encoded_body) = rest.split_once(',')?;
     // The body is percent-decoded first; the base64 step then decodes the

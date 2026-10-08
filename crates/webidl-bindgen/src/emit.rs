@@ -1178,9 +1178,7 @@ fn operation_argument_at(
         | ReturnType::Dictionary(_)
         | ReturnType::Enumeration(_)
         | ReturnType::Union(..)
-        | ReturnType::NullableUnion(..) => {
-            converted_argument(argument, variable, &fetch)
-        }
+        | ReturnType::NullableUnion(..) => converted_argument(argument, variable, &fetch),
         ReturnType::String => {
             let conversion = if argument.legacy_null_to_empty {
                 quote! { host::legacy_null_string_argument(params, #index)? }
@@ -1441,7 +1439,9 @@ fn dictionary_field(field: &DictionaryField) -> TokenStream {
             let enum_name = format_ident!("{enum_name}");
             quote! { pub(crate) #rust: #enum_name }
         }
-        DictionaryFieldType::Enumeration { name: enum_name, .. } => {
+        DictionaryFieldType::Enumeration {
+            name: enum_name, ..
+        } => {
             let enum_name = format_ident!("{enum_name}");
             quote! { pub(crate) #rust: Option<#enum_name> }
         }
@@ -1725,7 +1725,10 @@ fn union(union: &Union) -> TokenStream {
                     return host::node_argument(ctx, &value).map(Self::#variant);
                 }
             }),
-            UnionMemberType::Interface { node: false, name: interface } => trials.push(quote! {
+            UnionMemberType::Interface {
+                node: false,
+                name: interface,
+            } => trials.push(quote! {
                 // Non-node platform objects are not exposed by this engine,
                 // so this trial never matches; it keeps the generated union
                 // total without inventing values.
@@ -1821,10 +1824,12 @@ fn union_into_js(union: &Union, name: &proc_macro2::Ident, generic: &TokenStream
     if !convertible {
         return quote! {};
     }
-    let uses_ctx = union
-        .members
-        .iter()
-        .any(|member| matches!(member.type_, UnionMemberType::Boolean | UnionMemberType::Long));
+    let uses_ctx = union.members.iter().any(|member| {
+        matches!(
+            member.type_,
+            UnionMemberType::Boolean | UnionMemberType::Long
+        )
+    });
     let ctx_name = if uses_ctx {
         quote! { ctx }
     } else {

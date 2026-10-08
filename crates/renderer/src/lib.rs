@@ -95,7 +95,6 @@ impl Parsed {
     }
 }
 
-
 /// Parses a full HTML document into a fresh tree.
 ///
 /// Broken markup recovery is html5ever's job (through `blitz-html`).

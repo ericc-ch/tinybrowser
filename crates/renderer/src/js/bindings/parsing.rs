@@ -86,7 +86,11 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         let _ = doctype;
         if let Some(name) = root {
             let document_root = parsed.document.base.root_node().id;
-            let element = parsed.document.base.mutate().create_element(name, Vec::new());
+            let element = parsed
+                .document
+                .base
+                .mutate()
+                .create_element(name, Vec::new());
             parsed
                 .document
                 .base
@@ -104,6 +108,9 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
     ) -> Result<Value<'js>> {
         let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
         let mut parsed = crate::Parsed::script("text/html", font_ctx);
+        // The algorithm appends a doctype named `html` before `html`. Blitz
+        // has no doctype node, so `document.doctype` stays null
+        // (<https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument>).
         let document_root = parsed.document.base.root_node().id;
         let html = parsed
             .document
@@ -120,11 +127,7 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
             .base
             .mutate()
             .create_element(html_element_name("head"), Vec::new());
-        parsed
-            .document
-            .base
-            .mutate()
-            .append_children(html, &[head]);
+        parsed.document.base.mutate().append_children(html, &[head]);
         if let Some(title) = title {
             let title_text = title.to_string()?;
             let title_element = parsed
@@ -139,11 +142,7 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 .append_children(head, &[title_element]);
             // Lone surrogates cannot survive the UTF-8 tree: they become the
             // replacement character at this boundary, a known cutover gap.
-            let text = parsed
-                .document
-                .base
-                .mutate()
-                .create_text_node(&title_text);
+            let text = parsed.document.base.mutate().create_text_node(&title_text);
             parsed
                 .document
                 .base
@@ -155,11 +154,7 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
             .base
             .mutate()
             .create_element(html_element_name("body"), Vec::new());
-        parsed
-            .document
-            .base
-            .mutate()
-            .append_children(html, &[body]);
+        parsed.document.base.mutate().append_children(html, &[body]);
         wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
 }
@@ -222,13 +217,10 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
         // DOMParser documents never render: share fonts, skip UA sheets.
         let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
-        let base = self
-            .url
-            .parse::<url::Url>()
-            .map_or_else(
-                |_| crate::render::INVALID_BASE_URL.to_owned(),
-                |url| crate::render::blitz_base_url(&url),
-            );
+        let base = self.url.parse::<url::Url>().map_or_else(
+            |_| crate::render::INVALID_BASE_URL.to_owned(),
+            |url| crate::render::blitz_base_url(&url),
+        );
         let mut parsed = if content_type == "text/html" {
             let mut parsed = crate::parse_html(
                 &source,

@@ -184,10 +184,7 @@ mod tests {
             "http://127.0.0.1/b.css".to_owned(),
             blitz_traits::net::Bytes::from_static(b"x"),
         );
-        assert_eq!(
-            in_flight.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(in_flight.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

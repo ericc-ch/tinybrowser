@@ -177,9 +177,11 @@ impl Tab {
 fn to_event(event: RendererEvent) -> Event {
     match event {
         RendererEvent::Navigated { url } => Event::Navigated(url),
-        RendererEvent::HistoryUpdated { url, state, replace } => {
-            Event::HistoryUpdated((url, state, replace))
-        }
+        RendererEvent::HistoryUpdated {
+            url,
+            state,
+            replace,
+        } => Event::HistoryUpdated((url, state, replace)),
         RendererEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
         RendererEvent::Load => Event::Load,
         RendererEvent::DomContentLoaded => Event::DomContentLoaded,
@@ -420,7 +422,11 @@ impl WasmServices {
 }
 
 impl NetworkHost for WasmServices {
-    fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> renderer::DialCancellation {
+    fn start_dial(
+        &self,
+        request: DialRequest,
+        completion: DialCompletion,
+    ) -> renderer::DialCancellation {
         // A dial the component cannot shape is not a transport question, so it
         // never reaches the host.
         let shaped = Url::parse(&request.url)
@@ -447,7 +453,9 @@ impl NetworkHost for WasmServices {
         Box::new(move || {
             let pending = {
                 let mut fetches = lock(pending_fetches());
-                let id = fetches.iter().find_map(|(&id, fetch)| (fetch.chain.dial == dial).then_some(id));
+                let id = fetches
+                    .iter()
+                    .find_map(|(&id, fetch)| (fetch.chain.dial == dial).then_some(id));
                 id.and_then(|id| fetches.remove(&id).map(|fetch| (id, fetch)))
             };
             if let Some((id, fetch)) = pending {

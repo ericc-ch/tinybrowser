@@ -99,28 +99,77 @@ impl Document {
     }
 
     pub(in crate::document) fn launch_queued_dials(&mut self) {
-        let queued = std::mem::take(&mut self.queued_dials);
-        for dial in queued {
-            let task_dial = dial.clone();
-            let completed = self.dial_tx.clone();
-            let wake = Arc::clone(&self.wake);
-            let stop = Arc::clone(&self.stop);
-            let request = super::dial::request(&dial);
-            self.in_flight_dials = self.in_flight_dials.saturating_add(1);
-            let cancel = self.services.start_dial(
-                request,
-                Box::new(move |outcome| {
-                    if stop.is_set() {
-                        return;
-                    }
-                    let result = super::dial::complete(&task_dial, outcome);
-                    let _send_result = completed.send(result);
-                    wake.notify_one();
-                }),
-            );
-            if let DialContext::JsFetch { epoch, id } = dial.context {
-                self.fetch_cancellations.insert((epoch, id), cancel);
+        // A `data:` response can itself request more `data:` images. Keep
+        // decoding those before returning so paint does not run with the
+        // fetches still sitting on the channel. Network dials stay async.
+        // Eight passes is the bound for one drain step, so a `data:` cycle
+        // cannot spin inside this call. A chain longer than that stays
+        // queued; the wake below asks the session for another step instead
+        // of waiting for unrelated work.
+        for _ in 0..8 {
+            let queued = std::mem::take(&mut self.queued_dials);
+            if queued.is_empty() {
+                break;
             }
+            let mut completed_data = false;
+            for dial in queued {
+                if dial.url.scheme() == "data" {
+                    completed_data = true;
+                    // Same ceiling as a streamed navigation body. Decoding an
+                    // unbounded `data:` URL would sit entirely in this process.
+                    let raw = dial.url.as_str();
+                    let over_cap =
+                        raw.len() > crate::protocol::MAX_RESPONSE_BODY_BYTES.saturating_mul(2);
+                    match (!over_cap)
+                        .then(|| crate::engine::decode_data_url(raw))
+                        .flatten()
+                    {
+                        Some((content_type, body))
+                            if body.len() <= crate::protocol::MAX_RESPONSE_BODY_BYTES =>
+                        {
+                            self.finish_dial(super::CompletedDial {
+                                context: dial.context,
+                                outcome: crate::protocol::DialOutcome {
+                                    status: 200,
+                                    final_url: dial.url.to_string(),
+                                    content_type,
+                                    headers: Vec::new(),
+                                    body,
+                                },
+                            });
+                        }
+                        _ => self.fail_dial(dial.context),
+                    }
+                    continue;
+                }
+                let task_dial = dial.clone();
+                let completed = self.dial_tx.clone();
+                let wake = Arc::clone(&self.wake);
+                let stop = Arc::clone(&self.stop);
+                let request = super::dial::request(&dial);
+                self.in_flight_dials = self.in_flight_dials.saturating_add(1);
+                let cancel = self.services.start_dial(
+                    request,
+                    Box::new(move |outcome| {
+                        if stop.is_set() {
+                            return;
+                        }
+                        let result = super::dial::complete(&task_dial, outcome);
+                        let _send_result = completed.send(result);
+                        wake.notify_one();
+                    }),
+                );
+                if let DialContext::JsFetch { epoch, id } = dial.context {
+                    self.fetch_cancellations.insert((epoch, id), cancel);
+                }
+            }
+            if !completed_data {
+                break;
+            }
+            self.drain_blitz_fetches();
+        }
+        if !self.queued_dials.is_empty() {
+            self.wake.notify_one();
         }
     }
 
@@ -196,7 +245,10 @@ impl Document {
             let id = self.schedule_timer(timeout.delay);
             self.js_timer_slots.insert(id, timeout.js_id);
         }
-        let fetch_cancels: HashSet<_> = std::mem::take(&mut self.world.borrow_mut().pending_fetch_cancels).into_iter().collect();
+        let fetch_cancels: HashSet<_> =
+            std::mem::take(&mut self.world.borrow_mut().pending_fetch_cancels)
+                .into_iter()
+                .collect();
         self.queued_dials.retain(|dial| !matches!(dial.context, DialContext::JsFetch { id, epoch } if epoch == self.js_epoch && fetch_cancels.contains(&id)));
         for id in &fetch_cancels {
             if let Some(cancel) = self.fetch_cancellations.remove(&(self.js_epoch, *id)) {

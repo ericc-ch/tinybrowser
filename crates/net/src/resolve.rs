@@ -86,7 +86,9 @@ fn parse_rule(spec: &str) -> Result<Rule, NetError> {
     let target = if addr.eq_ignore_ascii_case("fail") {
         Target::Fail
     } else {
-        let ip = addr.parse::<Ipv4Addr>().map_err(|_| invalid_resolve(spec))?;
+        let ip = addr
+            .parse::<Ipv4Addr>()
+            .map_err(|_| invalid_resolve(spec))?;
         Target::Addr(ip)
     };
     Ok(Rule { pattern, target })

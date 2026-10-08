@@ -1,12 +1,9 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
-use super::{
-    LegacyNullString, events, host_node_id, webdriver_element, world_for_node,
-    wrap_node,
-};
+use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for_node, wrap_node};
 
 use markup5ever::{LocalName, Namespace, QualName};
-use rquickjs::{Class, Ctx, Exception, Function, Result, Value, prelude::This};
+use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
 use crate::js::world::EventTargetKey;
 use crate::js::world::{BlitzId, JournalEntry, NodeId, attr, html_namespace, is_connected};
@@ -259,22 +256,10 @@ pub(crate) fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         // A handler may have moved focus; the spec's focus update steps stop
         // when the focused area changed during the blur chain.
         if world.borrow().active_element(document).is_some() {
-            events::fire_trusted(
-                ctx,
-                EventTargetKey::Node(previous),
-                "focusout",
-                true,
-                false,
-            )?;
+            events::fire_trusted(ctx, EventTargetKey::Node(previous), "focusout", true, false)?;
             return Ok(());
         }
-        events::fire_trusted(
-            ctx,
-            EventTargetKey::Node(previous),
-            "focusout",
-            true,
-            false,
-        )?;
+        events::fire_trusted(ctx, EventTargetKey::Node(previous), "focusout", true, false)?;
     }
     // Handlers may have made the target unfocusable; browsers then do not
     // designate or fire on it.
@@ -310,9 +295,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(parsed) = world.document(node) else {
             return Ok(());
         };
-        if is_actually_disabled(&parsed.document.base, node.node)
-            || world.click_in_progress(node)
-        {
+        if is_actually_disabled(&parsed.document.base, node.node) || world.click_in_progress(node) {
             return Ok(());
         }
     }
@@ -328,7 +311,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         // restores it afterwards
         // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior>).
         let previous = legacy_pre_activation(ctx, node)?;
-        let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
+        let event = super::host::instance(ctx, events::JsEvent::uninitialized())?;
         event.borrow().initialize("click".to_owned(), true, true);
         let not_canceled = events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
         if not_canceled {
@@ -570,7 +553,9 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 }
                 Activation::Reset => {
                     if let Ok(function) = form_object.get::<_, Function>("reset")
-                        && function.call::<_, ()>((This(form_object.clone()),)).is_err()
+                        && function
+                            .call::<_, ()>((This(form_object.clone()),))
+                            .is_err()
                     {
                         let _ = ctx.catch();
                     }

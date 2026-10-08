@@ -375,7 +375,9 @@ fn node_or_string_unions_convert_interfaces_before_strings() {
         );
     }
     let node_trial = source.find("node_argument").expect("node trial");
-    let string_trial = source.find("Coerced<rquickjs::String>").expect("string trial");
+    let string_trial = source
+        .find("Coerced<rquickjs::String>")
+        .expect("string trial");
     assert!(
         node_trial < string_trial,
         "interface trial must precede string coercion"
@@ -397,10 +399,7 @@ fn unsupported_unions_fail_the_build() {
             name: "fixture.idl",
             text,
         }];
-        assert!(
-            compile_contracts(&idl, &rust).is_err(),
-            "accepted {text}"
-        );
+        assert!(compile_contracts(&idl, &rust).is_err(), "accepted {text}");
     }
 }
 
@@ -420,7 +419,10 @@ fn unscopable_operations_list_in_unscopables() {
         source.contains("UNSCOPABLES:&[&str]=&[\"append\"]"),
         "missing unscopables table"
     );
-    assert!(source.contains("install_unscopables"), "missing install call");
+    assert!(
+        source.contains("install_unscopables"),
+        "missing install call"
+    );
 }
 
 #[test]
@@ -539,7 +541,10 @@ fn reflect_setter_splits_getter_and_generated_setter() {
     }];
     let bindings = compile_contracts(&idl, &rust).expect("compile reflect setter");
     let source = bindings[0].rust.replace(' ', "");
-    assert!(source.contains("reflect_set_string"), "missing generated setter");
+    assert!(
+        source.contains("reflect_set_string"),
+        "missing generated setter"
+    );
     assert!(
         !source.contains("\"command\""),
         "unimplemented reflect setter member must stay absent"

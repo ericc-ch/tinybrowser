@@ -274,7 +274,10 @@ impl ChannelServices {
         Box::new(move || {
             if let Some(id) = id {
                 let _call = channel.client.call_with(
-                    BrowserCall { assignment, call: ServiceCall::Network(NetworkCall::CancelDial { id }) },
+                    BrowserCall {
+                        assignment,
+                        call: ServiceCall::Network(NetworkCall::CancelDial { id }),
+                    },
                     |_| {},
                 );
             }
@@ -305,7 +308,11 @@ impl AssignmentServices {
 }
 
 impl NetworkHost for AssignmentServices {
-    fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> renderer::DialCancellation {
+    fn start_dial(
+        &self,
+        request: DialRequest,
+        completion: DialCompletion,
+    ) -> renderer::DialCancellation {
         self.channel
             .start_dial(self.assignment, request, completion)
     }

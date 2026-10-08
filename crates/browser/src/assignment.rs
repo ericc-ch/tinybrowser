@@ -142,14 +142,16 @@ impl Assignment {
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|subscriber| match subscriber.try_send((frame, event.clone())) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    saturated = true;
-                    false
-                }
-            });
+            .retain(
+                |subscriber| match subscriber.try_send((frame, event.clone())) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        saturated = true;
+                        false
+                    }
+                },
+            );
         saturated
     }
 }

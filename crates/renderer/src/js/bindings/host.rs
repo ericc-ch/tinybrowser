@@ -13,8 +13,8 @@ use rquickjs::{
 };
 
 use super::{world, world_for_node};
-pub(crate) use crate::js::world::NodeReference;
 use crate::js::world::NodeId;
+pub(crate) use crate::js::world::NodeReference;
 
 pub(crate) type Dispatch = for<'a, 'js> fn(Operation, &Params<'a, 'js>) -> Result<Value<'js>>;
 
@@ -161,9 +161,9 @@ pub(crate) fn install_unscopables(prototype: &Object<'_>, names: &[&str]) -> Res
     let unscopables: Object = if existing.is_undefined() || existing.is_null() {
         Object::new(ctx.clone())?
     } else {
-        existing.into_object().ok_or_else(|| {
-            Exception::throw_internal(ctx, "@@unscopables is not an object")
-        })?
+        existing
+            .into_object()
+            .ok_or_else(|| Exception::throw_internal(ctx, "@@unscopables is not an object"))?
     };
     for name in names {
         unscopables.set(*name, true)?;
@@ -187,8 +187,7 @@ pub(crate) fn reflect_string<'js>(
         .borrow()
         .document(element)
         .and_then(|parsed| {
-            crate::js::world::attr(&parsed.document.base, element.node, name)
-                .map(str::to_owned)
+            crate::js::world::attr(&parsed.document.base, element.node, name).map(str::to_owned)
         })
         .unwrap_or_default();
     rquickjs::String::from_str(ctx.clone(), &value)
@@ -196,11 +195,7 @@ pub(crate) fn reflect_string<'js>(
 
 /// Read a reflected `boolean` attribute: presence of the content attribute
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflect>).
-pub(crate) fn reflect_bool(
-    ctx: &Ctx<'_>,
-    element: NodeId,
-    name: &str,
-) -> Result<bool> {
+pub(crate) fn reflect_bool(ctx: &Ctx<'_>, element: NodeId, name: &str) -> Result<bool> {
     let world = super::world(ctx)?;
     Ok(world.borrow().document(element).is_some_and(|parsed| {
         crate::js::world::attr(&parsed.document.base, element.node, name).is_some()
@@ -452,10 +447,7 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
         "MathMLElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::mathml_namespace())
         }
-        "CharacterData" => matches!(
-            data,
-            Some(NodeData::Text(_) | NodeData::Comment { .. })
-        ),
+        "CharacterData" => matches!(data, Some(NodeData::Text(_) | NodeData::Comment { .. })),
         // Blitz has no doctype, PI, or CDATA nodes.
         "DocumentType" | "ProcessingInstruction" => false,
         // Spec mixins: their members are installed on every including
@@ -469,10 +461,7 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
                     || element.name.ns == crate::js::world::svg_namespace()
                     || element.name.ns == crate::js::world::mathml_namespace()
         ),
-        "ParentNode" => matches!(
-            data,
-            Some(NodeData::Document(_) | NodeData::Element(_))
-        ),
+        "ParentNode" => matches!(data, Some(NodeData::Document(_) | NodeData::Element(_))),
         "ChildNode" => matches!(
             data,
             Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
@@ -501,7 +490,10 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
         "HTMLCanvasElement" => crate::js::world::is_html_tag(data, "canvas"),
         "HTMLBaseElement" => crate::js::world::is_html_tag(data, "base"),
         "HTMLLinkElement" => crate::js::world::is_html_tag(data, "link"),
-        "HTMLMediaElement" => crate::js::world::is_html_tag(data, "audio") || crate::js::world::is_html_tag(data, "video"),
+        "HTMLMediaElement" => {
+            crate::js::world::is_html_tag(data, "audio")
+                || crate::js::world::is_html_tag(data, "video")
+        }
         "HTMLEmbedElement" => crate::js::world::is_html_tag(data, "embed"),
         "HTMLScriptElement" => crate::js::world::is_html_tag(data, "script"),
         "HTMLSourceElement" => crate::js::world::is_html_tag(data, "source"),
@@ -517,11 +509,7 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
     })
 }
 
-pub(crate) fn require_node_interface(
-    ctx: &Ctx<'_>,
-    id: NodeId,
-    interface: &str,
-) -> Result<()> {
+pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str) -> Result<()> {
     // https://webidl.spec.whatwg.org/#es-attributes
     // https://webidl.spec.whatwg.org/#es-operations
     let owner = super::world_for_node(ctx, id)?;

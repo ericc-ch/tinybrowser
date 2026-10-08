@@ -179,7 +179,9 @@ pub(crate) enum Setter {
     /// `[Reflect]`: the setter writes the content attribute through the
     /// shared helper. Like the getter, the trait carries no method. This
     /// also serves `[ReflectURL]`, whose setter reflects plainly.
-    Reflect { content: String },
+    Reflect {
+        content: String,
+    },
     PutForwards {
         target: String,
         /// The attributed type is nullable, so forwarding must no-op when the
@@ -196,10 +198,14 @@ pub(crate) enum GetterMapping {
     /// the `Reflect` value or the lowercase IDL name, following Chromium's
     /// content-attribute key derivation
     /// (`bind_gen/interface.py::_make_reflect_content_attribute_key`).
-    Reflect { content: String },
+    Reflect {
+        content: String,
+    },
     /// `[ReflectURL]`: like `[Reflect]`, but the getter resolves a URL
     /// against the document base.
-    ReflectUrl { content: String },
+    ReflectUrl {
+        content: String,
+    },
 }
 
 #[derive(Debug)]
@@ -259,7 +265,10 @@ pub(crate) enum UnionMemberType {
     /// An interface member. `name` is the IDL interface and `node` says
     /// whether it is `Node` or inherits from it (converted to
     /// `host::NodeReference`) rather than another platform object.
-    Interface { name: String, node: bool },
+    Interface {
+        name: String,
+        node: bool,
+    },
     String,
     Boolean,
     Long,
@@ -300,7 +309,10 @@ pub(crate) struct DictionaryField {
 }
 
 pub(crate) enum DictionaryFieldType {
-    Boolean { default: Option<bool>, required: bool },
+    Boolean {
+        default: Option<bool>,
+        required: bool,
+    },
     Enumeration {
         name: String,
         nullable: bool,
@@ -312,7 +324,9 @@ pub(crate) enum DictionaryFieldType {
     DomString,
     /// An interface- or callback-interface-typed member. Nullable members
     /// map a present null to `None`; anything else must be an object.
-    Interface { nullable: bool },
+    Interface {
+        nullable: bool,
+    },
 }
 
 pub(crate) struct Constant {

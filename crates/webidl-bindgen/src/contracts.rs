@@ -10,8 +10,8 @@ use weedle::types::{IntegerType, NonAnyType, SingleType, Type, UnionMemberType};
 
 use crate::database::Database;
 use crate::model::{
-    self, ArgumentArity, ConstructorArgumentKind, GetterMapping, InterfaceKind,
-    OperationResult, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType,
+    self, ArgumentArity, ConstructorArgumentKind, GetterMapping, InterfaceKind, OperationResult,
+    PropertyGetter, PropertyHooks, PrototypeParent, ReturnType,
 };
 use crate::names::snake_case;
 use crate::{Binding, Error, Source};
@@ -133,11 +133,15 @@ impl Implementation {
         source: &str,
     ) -> Result<(), Error> {
         let named = |payload: &syn::Ident| {
-            classes.get(&payload.to_string()).is_some_and(|name| name == &self.interface)
+            classes
+                .get(&payload.to_string())
+                .is_some_and(|name| name == &self.interface)
         };
         let dedicated = |payload: &syn::Ident| {
             !classes.contains_key(&payload.to_string())
-                && usage.get(&payload.to_string()).is_some_and(|used| *used == 1)
+                && usage
+                    .get(&payload.to_string())
+                    .is_some_and(|used| *used == 1)
         };
         if let Some(found) = std::iter::once(&self.payload)
             .chain(self.payloads.iter().map(|payload| &payload.rust))
@@ -146,8 +150,7 @@ impl Implementation {
             if found > 0 {
                 let elected = self.payloads.remove(found - 1);
                 let previous = std::mem::replace(&mut self.payload, elected.rust);
-                let previous_lifetime =
-                    std::mem::replace(&mut self.lifetime, elected.has_lifetime);
+                let previous_lifetime = std::mem::replace(&mut self.lifetime, elected.has_lifetime);
                 self.payloads.push(model::Payload {
                     rust: previous,
                     has_lifetime: previous_lifetime,
@@ -174,8 +177,7 @@ impl Implementation {
                 .expect("dedicated payload is listed");
             let elected = self.payloads.remove(found - 1);
             let previous = std::mem::replace(&mut self.payload, elected.rust);
-            let previous_lifetime =
-                std::mem::replace(&mut self.lifetime, elected.has_lifetime);
+            let previous_lifetime = std::mem::replace(&mut self.lifetime, elected.has_lifetime);
             self.payloads.push(model::Payload {
                 rust: previous,
                 has_lifetime: previous_lifetime,
@@ -201,12 +203,9 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
     }
     let mut usage: BTreeMap<String, usize> = BTreeMap::new();
     for implementation in implementations.values() {
-        for payload in std::iter::once(&implementation.payload).chain(
-            implementation
-                .payloads
-                .iter()
-                .map(|payload| &payload.rust),
-        ) {
+        for payload in std::iter::once(&implementation.payload)
+            .chain(implementation.payloads.iter().map(|payload| &payload.rust))
+        {
             *usage.entry(payload.to_string()).or_default() += 1;
         }
     }
@@ -219,9 +218,8 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             } else {
                 InterfaceKind::Complete
             };
-            let interface = lower(&database, &implementation, kind).map_err(|error| {
-                Error(format!("{}: {error}", implementation.interface))
-            })?;
+            let interface = lower(&database, &implementation, kind)
+                .map_err(|error| Error(format!("{}: {error}", implementation.interface)))?;
             let syntax = syn::parse2(crate::emit::interface(&interface))
                 .map_err(|error| Error(format!("invalid generated contract: {error}")))?;
             Ok(Binding {
@@ -528,9 +526,10 @@ fn member_name<'a>(member: &InterfaceMember<'a>) -> &'a str {
         InterfaceMember::Const(member) => member.identifier.0,
         InterfaceMember::Constructor(_) => "constructor",
         InterfaceMember::Attribute(member) => member.identifier.0,
-        InterfaceMember::Operation(member) => {
-            member.identifier.as_ref().map_or("<anonymous>", |identifier| identifier.0)
-        }
+        InterfaceMember::Operation(member) => member
+            .identifier
+            .as_ref()
+            .map_or("<anonymous>", |identifier| identifier.0),
         InterfaceMember::Iterable(_)
         | InterfaceMember::AsyncIterable(_)
         | InterfaceMember::Maplike(_)
@@ -557,7 +556,9 @@ fn lower_members(
         let resolved = member;
         match &member.declaration {
             InterfaceMember::Const(member) => {
-                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
+                resolved.validate_scopes().map_err(|error| {
+                    crate::Error(format!("{}: {error}", member_name(&resolved.declaration)))
+                })?;
                 interface.constants.push(model::Constant::parse(member)?);
             }
             InterfaceMember::Constructor(member)
@@ -579,7 +580,9 @@ fn lower_members(
                 else {
                     continue;
                 };
-                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
+                resolved.validate_scopes().map_err(|error| {
+                    crate::Error(format!("{}: {error}", member_name(&resolved.declaration)))
+                })?;
                 remaining.remove(&attribute.rust.to_string());
                 if let Some(model::Setter::Method { rust, .. }) = &attribute.setter {
                     remaining.remove(&rust.to_string());
@@ -616,12 +619,18 @@ fn lower_members(
                 if overload_consumed(member, &remaining) {
                     continue;
                 }
-                let Some((operation, signature, property)) =
-                    lower_operation(database, member, &implementation.methods, &mut interface.unions)?
+                let Some((operation, signature, property)) = lower_operation(
+                    database,
+                    member,
+                    &implementation.methods,
+                    &mut interface.unions,
+                )?
                 else {
                     continue;
                 };
-                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
+                resolved.validate_scopes().map_err(|error| {
+                    crate::Error(format!("{}: {error}", member_name(&resolved.declaration)))
+                })?;
                 remaining.remove(&operation.rust.to_string());
                 if let Some(property) = property {
                     getters.push(property);
@@ -652,9 +661,7 @@ fn lower_members(
 }
 
 /// Reject implementation methods that no IDL member consumed.
-fn ensure_no_extra_methods(
-    remaining: &BTreeMap<String, Method>,
-) -> Result<(), Error> {
+fn ensure_no_extra_methods(remaining: &BTreeMap<String, Method>) -> Result<(), Error> {
     if remaining.is_empty() {
         return Ok(());
     }
@@ -788,9 +795,7 @@ fn dictionary_field_type(
             };
             Ok(model::DictionaryFieldType::Boolean { default, required })
         }
-        Type::Single(SingleType::NonAny(NonAnyType::Sequence(value)))
-            if value.q_mark.is_none() =>
-        {
+        Type::Single(SingleType::NonAny(NonAnyType::Sequence(value))) if value.q_mark.is_none() => {
             let element = &value.type_.generics.body;
             validate_empty_attributes(element.attributes.as_ref())?;
             let is_string = matches!(
@@ -826,7 +831,13 @@ fn dictionary_field_type(
                 Some(weedle::Definition::Enum(_))
             ) =>
         {
-            dictionary_enum_field(database, member, value.type_.0, value.q_mark.is_some(), required)
+            dictionary_enum_field(
+                database,
+                member,
+                value.type_.0,
+                value.q_mark.is_some(),
+                required,
+            )
         }
         Type::Single(SingleType::NonAny(NonAnyType::Identifier(value))) => {
             dictionary_interface_field(database, member, value.type_.0, value.q_mark.is_some())
@@ -847,10 +858,7 @@ fn dictionary_enum_field(
     nullable: bool,
     required: bool,
 ) -> Result<model::DictionaryFieldType, Error> {
-    if !matches!(
-        database.definition(name),
-        Some(weedle::Definition::Enum(_))
-    ) {
+    if !matches!(database.definition(name), Some(weedle::Definition::Enum(_))) {
         return Err(Error(format!(
             "dictionary field type is not supported yet: {}",
             member.identifier.0
@@ -923,7 +931,11 @@ fn dictionary_enum_variant(
         .iter()
         .find(|(keyword, _)| keyword == text)
         .map(|(_, variant)| variant.clone())
-        .ok_or_else(|| Error(format!("unknown {name} keyword in dictionary default: {text}")))
+        .ok_or_else(|| {
+            Error(format!(
+                "unknown {name} keyword in dictionary default: {text}"
+            ))
+        })
 }
 
 fn lower_dictionary(database: &Database<'_>, name: &str) -> Result<model::Dictionary, Error> {
@@ -1095,10 +1107,7 @@ fn lower_indexed_setter(
     if member.modifier.is_some() {
         return Err(Error("indexed setters must not be static".into()));
     }
-    if !matches!(
-        member.return_type,
-        weedle::types::ReturnType::Undefined(_)
-    ) {
+    if !matches!(member.return_type, weedle::types::ReturnType::Undefined(_)) {
         return Err(Error("indexed setters require an undefined result".into()));
     }
     let mut reactions = false;
@@ -1148,7 +1157,9 @@ fn lower_indexed_setter(
         ));
     }
     if interface.indexed_setter.is_some() {
-        return Err(Error("multiple indexed setters are not supported yet".into()));
+        return Err(Error(
+            "multiple indexed setters are not supported yet".into(),
+        ));
     }
     interface.indexed_setter = Some(model::IndexedSetter {
         rust: format_ident!("set_indexed"),
@@ -1361,10 +1372,7 @@ fn union_default(
     type_: &ReturnType,
     argument: &weedle::argument::SingleArgument<'_>,
 ) -> Result<Option<model::UnionDefault>, Error> {
-    let is_union = matches!(
-        type_,
-        ReturnType::Union(..) | ReturnType::NullableUnion(..)
-    );
+    let is_union = matches!(type_, ReturnType::Union(..) | ReturnType::NullableUnion(..));
     let Some(default) = argument.default.as_ref().filter(|_| is_union) else {
         return Ok(None);
     };
@@ -1473,7 +1481,9 @@ fn operation_result(
                     quote! { Option<rquickjs::String<'js>> },
                 )),
                 ReturnType::Boolean => Ok((OperationResult::Boolean, quote! { bool })),
-                ReturnType::PromiseUndefined => Ok((OperationResult::PromiseUndefined, quote! { () })),
+                ReturnType::PromiseUndefined => {
+                    Ok((OperationResult::PromiseUndefined, quote! { () }))
+                }
                 ReturnType::UnsignedShort => Ok((OperationResult::UnsignedShort, quote! { u16 })),
                 ReturnType::Long => Ok((OperationResult::Long, quote! { i32 })),
                 ReturnType::InterfaceSequence => {
@@ -1548,8 +1558,7 @@ fn lower_attribute(
     }
     // `ReflectSetter` reflects on set while the getter stays custom: the
     // implementation provides the getter, the generator owns the setter.
-    if let Some(content) = reflect_setter_content(member.attributes.as_ref(), member.identifier.0)
-    {
+    if let Some(content) = reflect_setter_content(member.attributes.as_ref(), member.identifier.0) {
         return lower_reflect_setter_attribute(database, member, &content, implemented);
     }
     // `ReflectURL` resolves the content attribute against the document base
@@ -1597,9 +1606,9 @@ fn lower_attribute(
         };
     let type_ = match native_type(database, &member.type_.type_, &mut BTreeSet::new())? {
         // Getter dispatch hands a platform object or its null directly to JS.
-        ReturnType::Node
-        | ReturnType::NullableNode
-        | ReturnType::NullableDocumentType => ReturnType::PlatformObject,
+        ReturnType::Node | ReturnType::NullableNode | ReturnType::NullableDocumentType => {
+            ReturnType::PlatformObject
+        }
         // A getter returns its value without conversion, so a union of
         // platform objects passes through as the value or null.
         ReturnType::Union(_, members) | ReturnType::NullableUnion(_, members)
@@ -1610,9 +1619,7 @@ fn lower_attribute(
             ReturnType::PlatformObject
         }
         ReturnType::PromiseUndefined => {
-            return Err(Error(
-                "promise attributes are not supported yet".into(),
-            ));
+            return Err(Error("promise attributes are not supported yet".into()));
         }
         type_ => type_,
     };
@@ -1624,13 +1631,7 @@ fn lower_attribute(
     let result = attribute_result(&type_)?;
     let getter = format_ident!("{getter_name}");
     let mut signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#result>; };
-    let setter = attribute_setter(
-        member,
-        &type_,
-        writable,
-        &setter_name,
-        &mut signature,
-    )?;
+    let setter = attribute_setter(member, &type_, writable, &setter_name, &mut signature)?;
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
         rust: getter,
@@ -1696,9 +1697,7 @@ fn attribute_setter(
         let setter = format_ident!("{setter_name}");
         let parameter = setter_parameter(type_)?;
         *signature = quote! { #signature fn #setter(&self, ctx: &Ctx<'js>, value: #parameter) -> Result<()>; };
-        return Ok(Some(model::Setter::Method {
-            rust: setter,
-        }));
+        return Ok(Some(model::Setter::Method { rust: setter }));
     }
     Ok(put_forwards.map(|target| model::Setter::PutForwards {
         target: target.into(),
@@ -1713,14 +1712,16 @@ fn attribute_setter(
 /// The `[PutForwards]` member name, if the attribute forwards assignment to
 /// it (<https://webidl.spec.whatwg.org/#PutForwards>).
 fn put_forwards_target<'a>(attributes: Option<&ExtendedAttributeList<'a>>) -> Option<&'a str> {
-    attributes?.body.list.iter().find_map(|attribute| match attribute {
-        ExtendedAttribute::Ident(attribute)
-            if attribute.lhs_identifier.0 == "PutForwards" =>
-        {
-            Some(attribute.rhs.0)
-        }
-        _ => None,
-    })
+    attributes?
+        .body
+        .list
+        .iter()
+        .find_map(|attribute| match attribute {
+            ExtendedAttribute::Ident(attribute) if attribute.lhs_identifier.0 == "PutForwards" => {
+                Some(attribute.rhs.0)
+            }
+            _ => None,
+        })
 }
 
 /// The content attribute a `[ReflectURL]` member mirrors: the lowercase
@@ -1817,9 +1818,7 @@ fn lower_reflect_setter_attribute(
         ));
     }
     if member.readonly.is_some() {
-        return Err(Error(
-            "reflect setters require a writable attribute".into(),
-        ));
+        return Err(Error("reflect setters require a writable attribute".into()));
     }
     validate_argument_attributes(member.type_.attributes.as_ref())?;
     if has_attribute(member.attributes.as_ref(), "SameObject")
@@ -1923,14 +1922,10 @@ fn lower_reflect_attribute(
     // Only plain string and boolean reflection so far; the type needs no
     // database lookup, keeping reflected members independent of typedefs.
     let type_ = match &member.type_.type_ {
-        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item)))
-            if item.q_mark.is_none() =>
-        {
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
             ReturnType::String
         }
-        Type::Single(SingleType::NonAny(NonAnyType::Boolean(item)))
-            if item.q_mark.is_none() =>
-        {
+        Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
             ReturnType::Boolean
         }
         _ => return Ok(None),
@@ -1996,9 +1991,7 @@ fn lower_reflect_url_attribute(
     // URL reflection resolves a string against the document base; only
     // `USVString` carries it in-tree.
     let type_ = match &member.type_.type_ {
-        Type::Single(SingleType::NonAny(NonAnyType::USVString(item)))
-            if item.q_mark.is_none() =>
-        {
+        Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none() => {
             ReturnType::UsvString
         }
         _ => return Ok(None),
@@ -2206,10 +2199,7 @@ fn native_type(
         }
         Type::Single(SingleType::NonAny(NonAnyType::FloatingPoint(item)))
             if item.q_mark.is_none()
-                && matches!(
-                    item.type_,
-                    weedle::types::FloatingPointType::Double(_)
-                ) =>
+                && matches!(item.type_, weedle::types::FloatingPointType::Double(_)) =>
         {
             // Restricted `double` rejects NaN and infinities on conversion
             // (<https://webidl.spec.whatwg.org/#es-double>).
@@ -2416,7 +2406,11 @@ fn collect_union_member<'idl>(
             collect_union_members(database, &inner.type_.body.list, members, visited)
         }
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
-            push_union_member(members, format_ident!("DOMString"), model::UnionMemberType::String);
+            push_union_member(
+                members,
+                format_ident!("DOMString"),
+                model::UnionMemberType::String,
+            );
             Ok(())
         }
         Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
@@ -2481,7 +2475,9 @@ fn collect_union_member<'idl>(
                 _ => Err(Error(format!("union member {name} is not supported yet"))),
             }
         }
-        Type::Single(_) => Err(Error(format!("union member is not supported yet: {type_:?}"))),
+        Type::Single(_) => Err(Error(format!(
+            "union member is not supported yet: {type_:?}"
+        ))),
     }
 }
 
@@ -2511,7 +2507,10 @@ fn finish_union(members: Vec<model::UnionMember>, nullable: bool) -> Result<Retu
     }
     // Canonical declaration-independent name, like Chromium's sorted union
     // type names (`UnionType.type_name_without_extended_attributes`).
-    let mut names: Vec<String> = members.iter().map(|member| member.variant.to_string()).collect();
+    let mut names: Vec<String> = members
+        .iter()
+        .map(|member| member.variant.to_string())
+        .collect();
     names.sort_unstable();
     names.dedup();
     let name = names.join("Or");
@@ -2559,10 +2558,7 @@ fn native_interface(database: &Database<'_>, name: &str, nullable: bool) -> Opti
         ("WindowProxy", _) => Some(ReturnType::PlatformObject),
         _ if matches!(
             database.definition(name),
-            Some(
-                weedle::Definition::Interface(_)
-                    | weedle::Definition::CallbackInterface(_)
-            )
+            Some(weedle::Definition::Interface(_) | weedle::Definition::CallbackInterface(_))
         ) =>
         {
             // An interface or callback interface is a platform object carried
@@ -2598,8 +2594,7 @@ fn validate_attribute_attributes(
                 // interface's own shim, as the legacy path also accepts it;
                 // the generator installs the prototype accessor.
                 ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "PutForwards" => {}
-                ExtendedAttribute::String(item)
-                    if item.lhs_identifier.0 == "Reflect" => {}
+                ExtendedAttribute::String(item) if item.lhs_identifier.0 == "Reflect" => {}
                 _ => {
                     return Err(Error(format!(
                         "native attribute semantics are not supported yet: {attribute:?}"

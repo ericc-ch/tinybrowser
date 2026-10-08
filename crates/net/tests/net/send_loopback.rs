@@ -329,9 +329,7 @@ async fn cross_origin_redirect_drops_caller_forbidden_headers() {
     let landing = TestServer::start(|connection| {
         let request = connection.read_request();
         assert_ne!(request.header("host"), Some("evil.example"));
-        assert!(
-            request.header("content-length").is_none() || request.body.is_empty()
-        );
+        assert!(request.header("content-length").is_none() || request.body.is_empty());
         connection
             .write_all(&canned_ok(&[], b"landed"))
             .expect("landing");
@@ -346,7 +344,10 @@ async fn cross_origin_redirect_drops_caller_forbidden_headers() {
         }
     });
     let mut request = Request::new(Method::POST, first.url("/start"));
-    request.headers.insert("Host", "evil.example").expect("host");
+    request
+        .headers
+        .insert("Host", "evil.example")
+        .expect("host");
     request
         .headers
         .insert("Content-Length", "7")
@@ -713,9 +714,7 @@ fn client_hello_alpn(hello: &[u8]) -> Vec<String> {
             while entry < at + list {
                 let len = usize::from(hello[entry]);
                 entry += 1;
-                protocols.push(
-                    String::from_utf8_lossy(&hello[entry..entry + len]).into_owned(),
-                );
+                protocols.push(String::from_utf8_lossy(&hello[entry..entry + len]).into_owned());
                 entry += len;
             }
             return protocols;

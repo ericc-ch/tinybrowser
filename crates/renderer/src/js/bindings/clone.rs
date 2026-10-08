@@ -1,8 +1,6 @@
 //! Node adoption, cloning, and document import.
 
-use super::{
-    TreeError, throw_dom, throw_dom_error, world, world_for_node, wrap_new_document,
-};
+use super::{TreeError, throw_dom, throw_dom_error, world, world_for_node, wrap_new_document};
 
 use crate::documents::BlitzDocument;
 use crate::js::world::{JournalEntry, NodeId};
@@ -49,8 +47,7 @@ pub(crate) fn adopt_across_documents(
         let Some(mut parsed) = source.document_mut(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        detach_for_adopt(&mut parsed.document, node)
-            .map_err(|err| throw_dom_error(ctx, err))?;
+        detach_for_adopt(&mut parsed.document, node).map_err(|err| throw_dom_error(ctx, err))?;
     }
     let target_world = world_for_node(ctx, parent)?;
     let target = target_world.borrow();
@@ -232,9 +229,9 @@ pub(crate) fn import_snapshot(
                 children,
             })
         }
-        NodeData::Text(text) => Some(ImportSnapshot::Text(
-            crate::dom_string::DomString::from(text.content.clone()),
-        )),
+        NodeData::Text(text) => Some(ImportSnapshot::Text(crate::dom_string::DomString::from(
+            text.content.clone(),
+        ))),
         NodeData::Comment { contents } => Some(ImportSnapshot::Comment(
             crate::dom_string::DomString::from(contents.clone()),
         )),
@@ -277,7 +274,10 @@ pub(crate) fn materialize_import(
             attributes,
             children,
         } => {
-            let blitz_id = doc.base.mutate().create_element(name.clone(), attributes.clone());
+            let blitz_id = doc
+                .base
+                .mutate()
+                .create_element(name.clone(), attributes.clone());
             for child in children {
                 let child_id = materialize_import(doc, document, child)?;
                 doc.base

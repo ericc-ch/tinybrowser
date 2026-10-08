@@ -311,7 +311,8 @@ pub(crate) fn is_html_element(
     id: BlitzNodeId,
     local: &str,
 ) -> bool {
-    base.get_node(id).is_some_and(|node| is_html_tag(Some(&node.data), local))
+    base.get_node(id)
+        .is_some_and(|node| is_html_tag(Some(&node.data), local))
 }
 
 /// One DOM node handle owned by the JS world.

@@ -14,7 +14,10 @@ use url::Url;
 pub use webstorage::{STORAGE_QUOTA_BYTES, StorageChange, StorageError};
 
 /// Maximum aggregate bytes retained for one streamed response.
-pub const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
+///
+/// A Wikipedia article is already past 1 MiB. 8 MiB still caps one document
+/// while leaving room for a long page and its streamed chunks.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Renderer-process identity of one frame.
 ///

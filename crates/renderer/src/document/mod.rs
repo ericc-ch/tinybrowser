@@ -201,9 +201,8 @@ pub(crate) struct Document {
     /// Blitz link/form navigations, drained into frame navigations on tick.
     blitz_nav: std::sync::Arc<crate::render::TinyNav>,
     /// Blitz subresource fetches awaiting carrier dials.
-    blitz_fetch_rx: std::sync::mpsc::Receiver<
-        (crate::render::BlitzFetch, crate::render::CountingHandler),
-    >,
+    blitz_fetch_rx:
+        std::sync::mpsc::Receiver<(crate::render::BlitzFetch, crate::render::CountingHandler)>,
     /// Filed Blitz response handlers by fetch id, delivered on completion.
     blitz_handlers: HashMap<u64, crate::render::CountingHandler>,
     /// Request URL for each filed Blitz handler, so an image delivery settles
@@ -457,31 +456,32 @@ impl Document {
         self.url.as_str().to_owned()
     }
 
-    pub(crate) fn take_lifecycle(
-        &mut self,
-    ) -> (Vec<IframeLifecycle>, Vec<ImageLifecycle>) {
-        let (connected, connected_images) = self.world.borrow().with_main_document(|parsed| {
-            let base = &parsed.document.base;
-            let document = parsed.id;
-            let mut containers = Vec::new();
-            let mut images = Vec::new();
-            let mut stack = vec![base.root_node().id];
-            while let Some(id) = stack.pop() {
-                if crate::js::world::is_connected(base, id) {
-                    if crate::js::world::is_iframe_element(base, id) {
-                        containers.push(crate::js::world::NodeId { document, node: id });
+    pub(crate) fn take_lifecycle(&mut self) -> (Vec<IframeLifecycle>, Vec<ImageLifecycle>) {
+        let (connected, connected_images) = self
+            .world
+            .borrow()
+            .with_main_document(|parsed| {
+                let base = &parsed.document.base;
+                let document = parsed.id;
+                let mut containers = Vec::new();
+                let mut images = Vec::new();
+                let mut stack = vec![base.root_node().id];
+                while let Some(id) = stack.pop() {
+                    if crate::js::world::is_connected(base, id) {
+                        if crate::js::world::is_iframe_element(base, id) {
+                            containers.push(crate::js::world::NodeId { document, node: id });
+                        }
+                        if crate::js::world::is_html_element(base, id, "img") {
+                            images.push(crate::js::world::NodeId { document, node: id });
+                        }
                     }
-                    if crate::js::world::is_html_element(base, id, "img") {
-                        images.push(crate::js::world::NodeId { document, node: id });
+                    if let Some(node) = base.get_node(id) {
+                        stack.extend(node.children.iter().rev().copied());
                     }
                 }
-                if let Some(node) = base.get_node(id) {
-                    stack.extend(node.children.iter().rev().copied());
-                }
-            }
-            (containers, images)
-        })
-        .unwrap_or_default();
+                (containers, images)
+            })
+            .unwrap_or_default();
         let shared = self.shared.borrow();
         let known: std::collections::HashSet<crate::js::world::NodeId> = shared
             .tree
@@ -944,12 +944,7 @@ impl Document {
 
     /// Starts a document from a complete response: new realm, the response's
     /// URL, and the whole body.
-    fn load_response_body(
-        &mut self,
-        url: &Url,
-        content_type: Option<&str>,
-        body: &[u8],
-    ) {
+    fn load_response_body(&mut self, url: &Url, content_type: Option<&str>, body: &[u8]) {
         self.begin_response(Some(url), content_type, None);
         self.write_body(body);
         self.end_body();
@@ -1214,14 +1209,10 @@ impl Document {
     /// context (fresh scans cost ~25ms per document).
     fn blitz_config(&self) -> blitz_dom::DocumentConfig {
         blitz_dom::DocumentConfig {
-            net_provider: Some(
-                std::sync::Arc::clone(&self.net_provider)
-                    as std::sync::Arc<dyn blitz_traits::net::NetProvider>,
-            ),
-            navigation_provider: Some(
-                std::sync::Arc::clone(&self.blitz_nav)
-                    as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>,
-            ),
+            net_provider: Some(std::sync::Arc::clone(&self.net_provider)
+                as std::sync::Arc<dyn blitz_traits::net::NetProvider>),
+            navigation_provider: Some(std::sync::Arc::clone(&self.blitz_nav)
+                as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>),
             shell_provider: Some(std::sync::Arc::new(crate::render::TinyShell)),
             base_url: Some(crate::render::blitz_base_url(&self.url)),
             font_ctx: Some(self.shared_font_ctx()),
@@ -1291,11 +1282,15 @@ impl Document {
     pub(crate) fn set_viewport(&mut self, width: u32, height: u32) {
         self.viewport_size = (width, height);
         self.apply_viewport();
-        let world = self.world.borrow();
-        let Some(mut parsed) = world.main_document_mut() else {
-            return;
-        };
-        crate::render::resolve_until_settled(&mut parsed.document.base);
+        {
+            let world = self.world.borrow();
+            if let Some(mut parsed) = world.main_document_mut() {
+                crate::render::resolve_until_settled(&mut parsed.document.base);
+            }
+        }
+        // Viewport changes can flip `matchMedia` results
+        // (<https://drafts.csswg.org/cssom-view/#evaluate-media-queries-and-report-changes>).
+        self.fire_js(|js| js.report_media_changes());
     }
 
     /// Sets the frame's persisted viewport size without touching its current
@@ -1401,10 +1396,7 @@ impl Document {
                     continue;
                 };
                 if crate::js::world::is_html_element(base, id, "script") {
-                    scripts.push(crate::js::world::NodeId {
-                        document,
-                        node: id,
-                    });
+                    scripts.push(crate::js::world::NodeId { document, node: id });
                 }
                 stack.extend(node.children.iter().rev().copied());
             }
@@ -1422,9 +1414,10 @@ impl Document {
             self.deliver_mutations();
             let script = crate::js::script_at(&self.world.borrow(), id);
             match script {
-                Some(crate::js::Script::Classic(
-                    crate::js::ScriptSource::Inline { source, line },
-                )) => {
+                Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline {
+                    source,
+                    line,
+                })) => {
                     let filename = self.url.as_str().to_owned();
                     self.eval_classic(&source, Some(id), line, &filename);
                 }
@@ -1460,7 +1453,9 @@ impl Document {
         let url = self
             .resolve_frame_url(spec)
             .ok_or_else(|| TabError::InvalidUrl { spec: spec.into() })?;
-        if url.scheme() != "http" && url.scheme() != "https" {
+        // `data:` is fetched by decoding the URL, not by a carrier dial
+        // (<https://fetch.spec.whatwg.org/#scheme-fetch>).
+        if url.scheme() != "http" && url.scheme() != "https" && url.scheme() != "data" {
             return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
@@ -1782,7 +1777,9 @@ impl Document {
         };
         let selected = url.as_str().to_owned();
         self.image_selected_src.insert(element, selected.clone());
-        self.world.borrow_mut().begin_image(element, selected.clone());
+        self.world
+            .borrow_mut()
+            .begin_image(element, selected.clone());
         if let Some((width, height)) = self.blitz_image_dims(element) {
             self.image_selected_src.remove(&element);
             self.world
@@ -1798,10 +1795,7 @@ impl Document {
     /// Decoded dimensions Blitz holds for `element`'s current request, if it
     /// decoded one. Blitz decodes synchronously on delivery, so after
     /// [`Self::settle_blitz_layout`] this is settled for every delivered URL.
-    fn blitz_image_dims(
-        &self,
-        element: crate::js::world::NodeId,
-    ) -> Option<(u32, u32)> {
+    fn blitz_image_dims(&self, element: crate::js::world::NodeId) -> Option<(u32, u32)> {
         let world = self.world.borrow();
         let parsed = world.main_document()?;
         let node = parsed.document.base.get_node(element.node)?;
@@ -1829,12 +1823,9 @@ impl Document {
             self.in_flight_images.remove(element);
             let selected = self.image_selected_src.remove(element).unwrap_or_default();
             if let Some((width, height)) = self.blitz_image_dims(*element) {
-                self.world.borrow_mut().store_image_dims(
-                    *element,
-                    width,
-                    height,
-                    selected,
-                );
+                self.world
+                    .borrow_mut()
+                    .store_image_dims(*element, width, height, selected);
                 self.fire_js(|js| js.fire_node_load(*element));
             } else {
                 self.world.borrow_mut().fail_image(*element, selected);
