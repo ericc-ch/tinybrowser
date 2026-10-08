@@ -64,6 +64,7 @@ fn parse_with_config(
         document,
         quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
         content_type,
+        xml_document: true,
         ready_state,
         url: None,
     }

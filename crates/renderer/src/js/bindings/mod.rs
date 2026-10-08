@@ -831,10 +831,10 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
         return wrap_with_brand(ctx, id, brand);
     }
     let brand = with_node_data(ctx, id, |data| match data {
-        Some(NodeData::Document(_)) => Some(if document_is_html_content(ctx, id) {
-            "Document"
-        } else {
+        Some(NodeData::Document(_)) => Some(if document_is_xml_document(ctx, id) {
             "XMLDocument"
+        } else {
+            "Document"
         }),
         Some(NodeData::Element(_)) if is_fragment => Some("DocumentFragment"),
         Some(NodeData::Element(element)) => Some(element_interface(&element.name)),

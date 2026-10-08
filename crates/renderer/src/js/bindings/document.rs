@@ -5,6 +5,16 @@ use crate::js::world::{NodeId, attr, html_namespace};
 
 use rquickjs::Ctx;
 
+/// Whether the document that owns `id` implements `XMLDocument`
+/// (<https://dom.spec.whatwg.org/#xmldocument>).
+pub(crate) fn document_is_xml_document(ctx: &Ctx<'_>, id: NodeId) -> bool {
+    let Ok(world_rc) = world(ctx) else {
+        return false;
+    };
+    let world = world_rc.borrow();
+    world.document(id).is_some_and(|parsed| parsed.xml_document)
+}
+
 /// Whether the document that owns `id` reports `text/html`.
 pub(crate) fn document_is_html_content(ctx: &Ctx<'_>, id: NodeId) -> bool {
     let Ok(world_rc) = world(ctx) else {

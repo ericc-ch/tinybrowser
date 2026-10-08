@@ -64,6 +64,13 @@ pub(crate) struct Parsed {
     pub quirks_mode: QuirksMode,
     /// MIME type this document reports from `document.contentType`.
     pub content_type: &'static str,
+    /// Whether this object implements `XMLDocument`
+    /// (<https://dom.spec.whatwg.org/#xmldocument>).
+    ///
+    /// `new Document()` creates an XML document that is still a `Document`.
+    /// Parsed XML, `new XMLDocument()`, and `createDocument()` use
+    /// `XMLDocument`.
+    pub xml_document: bool,
     /// The document's readiness; parsed documents start at [`ReadyState::Loading`]
     /// while documents created by script start complete
     /// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
@@ -90,6 +97,7 @@ impl Parsed {
             document: BlitzDocument::new(config),
             quirks_mode: QuirksMode::NoQuirks,
             content_type,
+            xml_document: content_type != "text/html",
             ready_state: ReadyState::Complete,
             url: None,
         }
@@ -117,6 +125,7 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
         document,
         quirks_mode,
         content_type: "text/html",
+        xml_document: false,
         ready_state: ReadyState::Loading,
         url: None,
     }

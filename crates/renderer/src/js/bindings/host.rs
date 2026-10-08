@@ -433,6 +433,7 @@ pub(crate) trait SharedClass {
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
     extra: Option<&crate::documents::ExtraNode>,
+    xml_document: bool,
     interface: &str,
 ) -> Option<bool> {
     use crate::documents::ExtraNode;
@@ -446,7 +447,8 @@ fn node_interface_matches(
         // Every node is also an `EventTarget`
         // (<https://dom.spec.whatwg.org/#interface-eventtarget>).
         "Node" | "EventTarget" => data.is_some(),
-        "Document" | "XMLDocument" => matches!(data, Some(NodeData::Document(_))),
+        "Document" => matches!(data, Some(NodeData::Document(_))),
+        "XMLDocument" => matches!(data, Some(NodeData::Document(_))) && xml_document,
         // Blitz has no shadow roots; every fragment is a plain fragment.
         "DocumentFragment" | "ShadowRoot" => {
             matches!(data, Some(NodeData::Element(_)))
@@ -553,7 +555,7 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
         .get_node(id.node)
         .map(|node| &node.data);
     let extra = document.document.extra(id.node);
-    match node_interface_matches(data, extra, interface) {
+    match node_interface_matches(data, extra, document.xml_document, interface) {
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
@@ -580,7 +582,7 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
         .get_node(id.node)
         .map(|node| &node.data);
     let extra = document.document.extra(id.node);
-    node_interface_matches(data, extra, interface) == Some(true)
+    node_interface_matches(data, extra, document.xml_document, interface) == Some(true)
 }
 
 /// The receiver JS object for hand methods that keep it (observer identity

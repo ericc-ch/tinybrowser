@@ -177,7 +177,7 @@ pub(crate) fn clone_within_document(
 /// node in the same arena, so the document node itself is never snapshotted.
 pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
-    let (content_type, quirks_mode, children) = {
+    let (content_type, xml_document, quirks_mode, children) = {
         let world = world_rc.borrow();
         let Some(parsed) = world.document(id) else {
             return Err(Exception::throw_type(ctx, "no document"));
@@ -205,10 +205,16 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
         } else {
             Vec::new()
         };
-        (parsed.content_type, parsed.quirks_mode, children)
+        (
+            parsed.content_type,
+            parsed.xml_document,
+            parsed.quirks_mode,
+            children,
+        )
     };
     let font_ctx = world(ctx)?.borrow().runtime.font_ctx.clone();
     let mut parsed = crate::Parsed::script(content_type, font_ctx);
+    parsed.xml_document = xml_document;
     parsed.quirks_mode = quirks_mode;
     let root = parsed.document.base.root_node().id;
     for child in &children {

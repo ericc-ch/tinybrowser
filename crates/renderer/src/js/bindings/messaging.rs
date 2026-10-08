@@ -316,7 +316,6 @@ fn frame_child_count(ctx: Ctx<'_>, frame: f64) -> Result<f64> {
         return Ok(0.0);
     };
     let world = world(&ctx)?;
-    world.borrow_mut().register_pending_frames();
     let shared = world.borrow().shared();
     let count = shared.borrow().tree.children(FrameId::new(frame)).len();
     Ok(crate::js::js_number(
@@ -336,7 +335,6 @@ fn frame_child(ctx: Ctx<'_>, frame: f64, index: f64) -> Result<Option<f64>> {
         return Ok(None);
     };
     let world = world(&ctx)?;
-    world.borrow_mut().register_pending_frames();
     let shared = world.borrow().shared();
     let Some(child) = shared
         .borrow()
@@ -363,7 +361,6 @@ fn frame_global(ctx: Ctx<'_>, frame: f64) -> Result<Option<Object<'_>>> {
     };
     let frame = FrameId::new(frame);
     let current = world(&ctx)?;
-    current.borrow_mut().register_pending_frames();
     if current.borrow().frame() == frame {
         return Ok(Some(ctx.globals()));
     }
@@ -393,7 +390,6 @@ pub(crate) fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
         return Ok(Value::new_null(ctx));
     };
     let current = world(&ctx)?;
-    current.borrow_mut().register_pending_frames();
     let Some(target) = current.borrow().frame_world(FrameId::new(frame)) else {
         return Ok(Value::new_null(ctx));
     };
