@@ -1,7 +1,7 @@
 # tinybrowser
 
 We are building the smallest and lightest headless browser for AI agents.
-Minimize the shipping binary size (stripped on x86_64); there is no hard cap.
+The goal is to maximize conformance per byte. There is no binary size cap.
 
 In `docs/progress.md`, replace the latest binary size, the latest total, and scored groups only.
 
