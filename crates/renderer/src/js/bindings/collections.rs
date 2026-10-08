@@ -100,9 +100,13 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         CollectionKind::ElementsByTagNs { namespace, local } => {
             collect_by_tag_ns(base, document, scope.node, namespace, local)
         }
-        CollectionKind::ElementsByClass(names) => {
-            collect_by_class(base, document, scope.node, names)
-        }
+        CollectionKind::ElementsByClass(names) => collect_by_class(
+            base,
+            document,
+            scope.node,
+            names,
+            parsed.quirks_mode == markup5ever::interface::QuirksMode::Quirks,
+        ),
         CollectionKind::ElementsByName(name) => collect_by_name(base, document, scope.node, name),
         CollectionKind::SelectOptions => select_options(base, document, scope.node),
         CollectionKind::SelectedOptions => select_options(base, document, scope.node)
@@ -439,6 +443,7 @@ fn collect_by_class(
     document: u32,
     scope: BlitzId,
     names: &str,
+    quirks: bool,
 ) -> Vec<NodeId> {
     let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
     // An empty class set matches nothing
@@ -452,12 +457,38 @@ fn collect_by_class(
             if !super::is_element(base, id) {
                 return false;
             }
-            let classes = attr(base, id, "class").unwrap_or_default();
+            // The class is the no-namespace `class` attribute, not `*:class`
+            // (<https://dom.spec.whatwg.org/#concept-getelementsbyclassname>).
+            let Some(classes) = class_attribute(base, id) else {
+                return false;
+            };
             let tokens: Vec<&str> = classes.split_ascii_whitespace().collect();
-            wanted.iter().all(|want| tokens.contains(want))
+            wanted.iter().all(|want| {
+                tokens.iter().any(|token| {
+                    // Quirks mode compares ASCII-case-insensitively; Unicode
+                    // case folding still does not apply.
+                    if quirks {
+                        token.eq_ignore_ascii_case(want)
+                    } else {
+                        *token == *want
+                    }
+                })
+            })
         })
         .map(|node| NodeId { document, node })
         .collect()
+}
+
+fn class_attribute(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&str> {
+    base.get_node(id)?
+        .data
+        .downcast_element()?
+        .attrs
+        .iter()
+        .find(|attribute| {
+            attribute.name.ns.as_ref().is_empty() && attribute.name.local.as_ref() == "class"
+        })
+        .map(|attribute| attribute.value.as_str())
 }
 
 /// Detaches `target` from its parent, recording the `childList` journal entry
