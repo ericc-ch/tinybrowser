@@ -72,6 +72,11 @@ pub(crate) struct BlitzDocument {
     /// Script elements whose [already started] flag is set
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
     started_scripts: HashSet<blitz_traits::node_id::NodeId>,
+    /// `template` element → template contents fragment
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+    template_contents: HashMap<blitz_traits::node_id::NodeId, blitz_traits::node_id::NodeId>,
+    /// Template-contents fragment → host `template` element.
+    fragment_hosts: HashMap<blitz_traits::node_id::NodeId, blitz_traits::node_id::NodeId>,
 }
 
 impl BlitzDocument {
@@ -86,6 +91,8 @@ impl BlitzDocument {
             extras: HashMap::new(),
             utf16_data: HashMap::new(),
             started_scripts: HashSet::new(),
+            template_contents: HashMap::new(),
+            fragment_hosts: HashMap::new(),
         }
     }
 
@@ -100,6 +107,8 @@ impl BlitzDocument {
             extras: HashMap::new(),
             utf16_data: HashMap::new(),
             started_scripts: HashSet::new(),
+            template_contents: HashMap::new(),
+            fragment_hosts: HashMap::new(),
         }
     }
 
@@ -325,6 +334,64 @@ impl BlitzDocument {
     /// Sets the already-started flag. Returns whether this was the first set.
     pub(crate) fn mark_script_started(&mut self, id: blitz_traits::node_id::NodeId) -> bool {
         self.started_scripts.insert(id)
+    }
+
+    /// Whether `id` is an HTML `template` element.
+    pub(crate) fn is_html_template(&self, id: blitz_traits::node_id::NodeId) -> bool {
+        self.base.get_node(id).is_some_and(|node| {
+            node.data.downcast_element().is_some_and(|element| {
+                element.name.ns == markup5ever::ns!(html)
+                    && element.name.local.as_ref() == "template"
+            })
+        })
+    }
+
+    /// The template contents fragment of a `template` element, if established.
+    pub(crate) fn template_contents(
+        &self,
+        id: blitz_traits::node_id::NodeId,
+    ) -> Option<blitz_traits::node_id::NodeId> {
+        self.template_contents.get(&id).copied()
+    }
+
+    /// Associates `template` with `fragment` as its template contents
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+    pub(crate) fn set_template_contents(
+        &mut self,
+        template: blitz_traits::node_id::NodeId,
+        fragment: blitz_traits::node_id::NodeId,
+    ) {
+        if let Some(previous) = self.template_contents.insert(template, fragment) {
+            self.fragment_hosts.remove(&previous);
+        }
+        self.fragment_hosts.insert(fragment, template);
+    }
+
+    /// Creates the template contents fragment and moves any current children
+    /// of `template` into it. Parser-created templates start with those
+    /// children on the element; they are not descendants of `template`
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+    pub(crate) fn ensure_template_contents(
+        &mut self,
+        template: blitz_traits::node_id::NodeId,
+    ) -> blitz_traits::node_id::NodeId {
+        if let Some(existing) = self.template_contents(template) {
+            return existing;
+        }
+        let fragment = self.create_fragment();
+        let children: Vec<blitz_traits::node_id::NodeId> = self
+            .base
+            .get_node(template)
+            .map(|node| node.children.iter().copied().collect())
+            .unwrap_or_default();
+        for child in &children {
+            self.base.mutate().remove_node(*child);
+        }
+        if !children.is_empty() {
+            self.base.mutate().append_children(fragment, &children);
+        }
+        self.set_template_contents(template, fragment);
+        fragment
     }
 
     /// Copies the side-table record of `from` onto `to`, then walks both

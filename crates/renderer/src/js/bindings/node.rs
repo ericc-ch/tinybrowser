@@ -11,13 +11,14 @@ use super::{
     dom_string, drain_mutation_journal, element_at_point, element_box, element_click,
     element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
     fixup_focus_after_removal, focus_node, host, host_node_id, import_attr, import_snapshot,
-    is_element, is_focusable, is_main_document, is_real_element, live_collection, main_document,
-    make_weak, materialize_children, materialize_import, new_detached_attr, qualified_name,
-    rect_object, remove_attribute_sync, required_node, root_of, schedule_mutation_delivery,
-    select_error, selector_matching_elements, set_attribute_node, set_attribute_sync,
-    set_character_data, set_pi_data, sibling, sibling_value, string_value, throw_dom,
-    throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, valid_element_local_name,
-    validate_and_extract, with_node_data, world, world_for_node, wrap_new_document, wrap_node,
+    import_snapshot_live, is_element, is_focusable, is_main_document, is_real_element,
+    live_collection, main_document, make_weak, materialize_children, materialize_import,
+    new_detached_attr, qualified_name, rect_object, remove_attribute_sync, required_node, root_of,
+    schedule_mutation_delivery, select_error, selector_matching_elements, set_attribute_node,
+    set_attribute_sync, set_character_data, set_pi_data, sibling, sibling_value, string_value,
+    throw_dom, throw_dom_error, touch_attr, tree_order, valid_attribute_local_name,
+    valid_element_local_name, validate_and_extract, with_node_data, world, world_for_node,
+    wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -840,15 +841,260 @@ fn create_element_named<'js>(
     document: NodeId,
     name: QualName,
 ) -> Result<Value<'js>> {
-    // Known gap: Blitz has no template contents, so `<template>` children
-    // live as ordinary element children.
-    create_node(ctx, document, |parsed| {
+    let value = create_node(ctx, document, |parsed| {
         parsed
             .document
             .base
             .mutate()
             .create_element(name, Vec::new())
+    })?;
+    if let Some(id) = host_node_id(ctx, &value) {
+        ensure_template_contents(ctx, id)?;
+    }
+    Ok(value)
+}
+
+/// Establishes template contents for an HTML `template` and returns the
+/// fragment
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+fn ensure_template_contents(ctx: &Ctx<'_>, template: NodeId) -> Result<Option<NodeId>> {
+    let is_template = world_for_node(ctx, template)?
+        .borrow()
+        .document(template)
+        .is_some_and(|parsed| parsed.document.is_html_template(template.node));
+    if !is_template {
+        return Ok(None);
+    }
+    if let Some(existing) = world(ctx)?
+        .borrow()
+        .registry()
+        .borrow()
+        .template_contents(template)
+    {
+        return Ok(Some(existing));
+    }
+    let fragment = {
+        let owner = world_for_node(ctx, template)?;
+        let owner = owner.borrow();
+        let Some(mut parsed) = owner.document_mut(template) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        let node = parsed.document.ensure_template_contents(template.node);
+        NodeId {
+            document: template.document,
+            node,
+        }
+    };
+    world(ctx)?
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .set_template_contents(template, fragment);
+    relocate_template_contents(ctx, template)?;
+    let fragment = world(ctx)?
+        .borrow()
+        .registry()
+        .borrow()
+        .template_contents(template)
+        .unwrap_or(fragment);
+    Ok(Some(fragment))
+}
+
+fn document_root_of(ctx: &Ctx<'_>, id: NodeId) -> Result<NodeId> {
+    let owner = world_for_node(ctx, id)?;
+    let world = owner.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    Ok(NodeId {
+        document: id.document,
+        node: parsed.document.base.root_node().id,
     })
+}
+
+/// The document that owns a `template`'s contents
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#appropriate-template-contents-owner-document>).
+fn appropriate_template_contents_owner(ctx: &Ctx<'_>, node: NodeId) -> Result<NodeId> {
+    let root = document_root_of(ctx, node)?;
+    let world_rc = world_for_node(ctx, root)?;
+    if !world_rc.borrow().is_main_document(root) {
+        return Ok(root);
+    }
+    if let Some(owner) = world_rc
+        .borrow()
+        .registry()
+        .borrow()
+        .template_contents_owner(root.document)
+    {
+        return Ok(owner);
+    }
+    let font_ctx = world_rc.borrow().runtime.font_ctx.clone();
+    let parsed = crate::Parsed::script("text/html", font_ctx);
+    let wrapped = wrap_new_document(ctx, parsed)?;
+    let owner = host_node_id(ctx, &wrapped)
+        .ok_or_else(|| Exception::throw_type(ctx, "template contents owner document"))?;
+    world(ctx)?
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .set_template_contents_owner(root.document, owner);
+    Ok(owner)
+}
+
+/// Moves template contents onto the appropriate owner document
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:adopting-steps>).
+fn relocate_template_contents(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let is_template = world_for_node(ctx, node)?
+        .borrow()
+        .document(node)
+        .is_some_and(|parsed| parsed.document.is_html_template(node.node));
+    if is_template {
+        let owner = appropriate_template_contents_owner(ctx, node)?;
+        if let Some(contents) = world(ctx)?
+            .borrow()
+            .registry()
+            .borrow()
+            .template_contents(node)
+            && contents.document != owner.document
+        {
+            adopt_into_document(ctx, owner, contents)?;
+        }
+        if let Some(contents) = world(ctx)?
+            .borrow()
+            .registry()
+            .borrow()
+            .template_contents(node)
+        {
+            for child in tree_children(ctx, contents)? {
+                relocate_template_contents(ctx, child)?;
+            }
+        }
+    }
+    for child in tree_children(ctx, node)? {
+        relocate_template_contents(ctx, child)?;
+    }
+    Ok(())
+}
+
+fn tree_is_fragment(ctx: &Ctx<'_>, node: NodeId) -> bool {
+    world_for_node(ctx, node)
+        .ok()
+        .and_then(|world| {
+            world
+                .borrow()
+                .document(node)
+                .map(|parsed| parsed.document.is_fragment(node.node))
+        })
+        .unwrap_or(false)
+}
+
+fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> {
+    let owner = world_for_node(ctx, node)?;
+    let world = owner.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok(Vec::new());
+    };
+    Ok(parsed
+        .document
+        .base
+        .get_node(node.node)
+        .map(|candidate| {
+            candidate
+                .children
+                .iter()
+                .copied()
+                .map(|child| NodeId {
+                    document: node.document,
+                    node: child,
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// After a `template` is adopted, its contents follow into the new node
+/// document
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:adopting-steps>).
+fn adopt_template_contents(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    publish_template_maps(ctx, node)?;
+    relocate_template_contents(ctx, node)
+}
+
+fn publish_template_maps(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let (is_template, contents, children) = {
+        let owner = world_for_node(ctx, node)?;
+        let owner = owner.borrow();
+        let Some(parsed) = owner.document(node) else {
+            return Ok(());
+        };
+        let contents = parsed
+            .document
+            .template_contents(node.node)
+            .map(|fragment| NodeId {
+                document: node.document,
+                node: fragment,
+            });
+        let children: Vec<NodeId> = parsed
+            .document
+            .base
+            .get_node(node.node)
+            .map(|candidate| {
+                candidate
+                    .children
+                    .iter()
+                    .copied()
+                    .map(|child| NodeId {
+                        document: node.document,
+                        node: child,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            parsed.document.is_html_template(node.node),
+            contents,
+            children,
+        )
+    };
+    if is_template && let Some(contents) = contents {
+        world(ctx)?
+            .borrow()
+            .registry()
+            .borrow_mut()
+            .set_template_contents(node, contents);
+        let nested: Vec<NodeId> = {
+            let owner = world_for_node(ctx, contents)?;
+            let owner = owner.borrow();
+            owner
+                .document(contents)
+                .map(|parsed| {
+                    parsed
+                        .document
+                        .base
+                        .get_node(contents.node)
+                        .map(|backing| {
+                            backing
+                                .children
+                                .iter()
+                                .copied()
+                                .map(|child| NodeId {
+                                    document: contents.document,
+                                    node: child,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        for child in nested {
+            publish_template_maps(ctx, child)?;
+        }
+    }
+    for child in children {
+        publish_template_maps(ctx, child)?;
+    }
+    Ok(())
 }
 
 #[derive(Trace, rquickjs::JsLifetime)]
@@ -1116,6 +1362,11 @@ fn document_value<'js>(
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
 fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
     if node.document == parent.document {
+        return Ok(node);
+    }
+    // Insert adopts each child of a DocumentFragment, not the fragment
+    // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+    if tree_is_fragment(ctx, node) {
         return Ok(node);
     }
     adopt_across_documents(ctx, parent, node)
@@ -1748,9 +1999,35 @@ fn insert_tree_node_inner(
     deliver: bool,
 ) -> Result<()> {
     let world_rc = world(ctx)?;
+    if tree_is_fragment(ctx, node) && node.document != parent.document {
+        let children = tree_children(ctx, node)?;
+        let mut moved = Vec::with_capacity(children.len());
+        for child in children {
+            moved.push(adopt_across_documents(ctx, parent, child)?);
+        }
+        {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(parent) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            for child in &moved {
+                insert_parsed(&mut parsed, parent, *child, reference);
+            }
+        }
+        for id in &moved {
+            fixup_option_on_insert(ctx, *id)?;
+            fixup_radio_on_insert(ctx, *id)?;
+        }
+        run_html_insertion_steps(ctx, parent, &moved)?;
+        if deliver {
+            schedule_mutation_delivery(ctx)?;
+        }
+        return Ok(());
+    }
     let moved: Vec<NodeId> = {
-        let world = world_rc.borrow();
-        let Some(parsed) = world.document(parent) else {
+        let owner = world_for_node(ctx, node)?;
+        let world = owner.borrow();
+        let Some(parsed) = world.document(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
         if parsed.document.is_fragment(node.node) {
@@ -3587,6 +3864,7 @@ impl JsNode {
         match host::node_argument(&ctx, &node)? {
             NodeReference::Tree(id) => {
                 let adopted = adopt_into_document(&ctx, self.handle.0, id)?;
+                adopt_template_contents(&ctx, adopted)?;
                 schedule_mutation_delivery(&ctx)?;
                 wrap_node(&ctx, adopted)
             }
@@ -3607,20 +3885,21 @@ impl JsNode {
     fn import_node<'js>(&self, ctx: Ctx<'js>, node: Value<'js>, deep: bool) -> Result<Value<'js>> {
         let source_id = required_node(&ctx, &node)?;
         let world_rc = world_for_node(&ctx, self.handle.0)?;
-        let tree = {
+        let is_document = {
             let world = world_rc.borrow();
             let Some(source) = world.document(source_id) else {
                 return Err(Exception::throw_type(&ctx, "stale node"));
             };
-            if source.document.base.root_node().id == source_id.node {
-                return Err(throw_dom(
-                    &ctx,
-                    "NotSupportedError",
-                    "cannot import a document",
-                ));
-            }
-            import_snapshot(&source.document, source_id, deep)
+            source.document.base.root_node().id == source_id.node
         };
+        if is_document {
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "cannot import a document",
+            ));
+        }
+        let tree = import_snapshot_live(&ctx, source_id, deep)?;
         let Some(tree) = tree else {
             return Err(Exception::throw_type(&ctx, "stale node"));
         };
@@ -3632,6 +3911,8 @@ impl JsNode {
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(target);
         drop(world);
+        publish_template_maps(&ctx, id)?;
+        relocate_template_contents(&ctx, id)?;
         wrap_node(&ctx, id)
     }
 
@@ -4926,22 +5207,27 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
     #[qjs(skip)]
     fn inner_html<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let world = world(ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
+        let container = ensure_template_contents(ctx, self.handle.0)?.unwrap_or(self.handle.0);
+        let owner = world_for_node(ctx, container)?;
+        let parsed = owner.borrow();
+        let Some(parsed) = parsed.document(container) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
         let base = &parsed.document.base;
-        let Some(node) = base.get_node(self.handle.0.node) else {
+        let Some(node) = base.get_node(container.node) else {
             return Err(Exception::throw_type(ctx, "stale node"));
         };
-        if node.data.downcast_element().is_none() {
+        if !parsed.document.is_fragment(container.node) && node.data.downcast_element().is_none() {
             return Err(Exception::throw_type(ctx, "innerHTML requires an element"));
         }
-        let markup = if parsed.content_type == "text/html" {
-            serialize_html_children(&parsed.document, self.handle.0.node)
+        let html = world(ctx)?
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|source| source.content_type == "text/html");
+        let markup = if html {
+            serialize_html_children(&parsed.document, container.node)
         } else {
-            serialize_xml_children(&parsed.document, self.handle.0.node)
+            serialize_xml_children(&parsed.document, container.node)
         };
         dom_string(ctx, &markup)
     }
@@ -4998,15 +5284,15 @@ impl JsNode {
             parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx)
         };
 
-        // Known gap: Blitz has no template contents, so `<template>` children
-        // replace as ordinary element children.
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(element) else {
+        let container = ensure_template_contents(ctx, element)?.unwrap_or(element);
+        let owner = world_for_node(ctx, container)?;
+        let world = owner.borrow();
+        let Some(mut parsed) = world.document_mut(container) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        let replacement = materialize_children(&mut parsed.document, element.document, &snapshots)
-            .map_err(|err| throw_dom_error(ctx, err))?;
+        let replacement =
+            materialize_children(&mut parsed.document, container.document, &snapshots)
+                .map_err(|err| throw_dom_error(ctx, err))?;
         let added: Vec<NodeId> = parsed
             .document
             .base
@@ -5022,9 +5308,13 @@ impl JsNode {
                     .collect()
             })
             .unwrap_or_default();
-        replace_all_journaled(&world, &mut parsed, element, added.clone());
+        replace_all_journaled(&world, &mut parsed, container, added.clone());
         drop(parsed);
         drop(world);
+        for child in &added {
+            publish_template_maps(ctx, *child)?;
+            relocate_template_contents(ctx, *child)?;
+        }
         register_inserted_iframes(ctx, &added)?;
         schedule_mutation_delivery(ctx)
     }
@@ -6292,17 +6582,38 @@ impl JsNode {
         if is_document {
             return clone_document(&ctx, self.handle.0, deep);
         }
-        let world = world_rc.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let store = parsed.id;
         // Known gap: form-state cloning (input checkedness/value) has no Blitz
         // equivalent yet; deep clones carry structure only.
-        let clone = clone_within_document(&mut parsed.document, store, self.handle.0, deep)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
+        let live = deep
+            || tree_is_fragment(&ctx, self.handle.0)
+            || world_rc
+                .borrow()
+                .document(self.handle.0)
+                .is_some_and(|parsed| parsed.document.is_html_template(self.handle.0.node));
+        let clone = if live {
+            let snapshot = import_snapshot_live(&ctx, self.handle.0, deep)?
+                .ok_or_else(|| Exception::throw_type(&ctx, "stale node"))?;
+            let owner = world_for_node(&ctx, self.handle.0)?;
+            let world = owner.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let clone = materialize_import(&mut parsed.document, self.handle.0.document, &snapshot)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+            drop(parsed);
+            drop(world);
+            clone
+        } else {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let store = parsed.id;
+            clone_within_document(&mut parsed.document, store, self.handle.0, deep)
+                .map_err(|err| throw_dom_error(&ctx, err))?
+        };
+        publish_template_maps(&ctx, clone)?;
+        relocate_template_contents(&ctx, clone)?;
         wrap_node(&ctx, clone)
     }
 
@@ -8768,9 +9079,10 @@ impl html_slot_element_generated::HTMLSlotElement<'_> for JsNode {}
 impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-template-contents
     fn get_content(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        // Known gap: Blitz has no template contents, so templates expose no
-        // separate content fragment.
-        Ok(Value::new_null(ctx.clone()))
+        match ensure_template_contents(ctx, self.handle.0)? {
+            Some(fragment) => wrap_node(ctx, fragment),
+            None => Ok(Value::new_null(ctx.clone())),
+        }
     }
 }
 

@@ -33,15 +33,9 @@ pub(crate) fn adopt_across_documents(
     // materializes an equivalent detached subtree in the target instead.
     // `deep_clone_node` remains the path for same-document deep clones (see
     // `clone_within_document`).
+    let snapshot = import_snapshot_live(ctx, node, true)?
+        .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?;
     let source_world = world_for_node(ctx, node)?;
-    let snapshot = {
-        let source = source_world.borrow();
-        let Some(parsed) = source.document(node) else {
-            return Err(Exception::throw_type(ctx, "no document"));
-        };
-        import_snapshot(&parsed.document, node, true)
-            .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?
-    };
     {
         let source = source_world.borrow();
         let Some(mut parsed) = source.document_mut(node) else {
@@ -58,8 +52,62 @@ pub(crate) fn adopt_across_documents(
         materialize_import(&mut parsed.document, parent.document, &snapshot)
             .map_err(|err| throw_dom_error(ctx, err))?
     };
+    retarget_template_contents(ctx, node, fresh)?;
     retarget_adopted_subtree(ctx, node, fresh)?;
     Ok(fresh)
+}
+
+/// Template contents are not tree children of the `template` element, so
+/// the subtree retarget walk misses the fragment and its descendants
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+fn retarget_template_contents(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
+    let old_content = world(ctx)?
+        .borrow()
+        .registry()
+        .borrow()
+        .template_contents(from);
+    let old_content = old_content.or_else(|| {
+        world_for_node(ctx, from).ok().and_then(|owner| {
+            owner
+                .borrow()
+                .document(from)
+                .and_then(|parsed| parsed.document.template_contents(from.node))
+                .map(|node| NodeId {
+                    document: from.document,
+                    node,
+                })
+        })
+    });
+    let new_content = world_for_node(ctx, to)?
+        .borrow()
+        .document(to)
+        .and_then(|parsed| parsed.document.template_contents(to.node))
+        .map(|node| NodeId {
+            document: to.document,
+            node,
+        });
+    let new_content = new_content.or_else(|| {
+        world(ctx)
+            .ok()?
+            .borrow()
+            .registry()
+            .borrow()
+            .template_contents(to)
+    });
+    if let (Some(old_content), Some(new_content)) = (old_content, new_content) {
+        retarget_adopted_subtree(ctx, old_content, new_content)?;
+        let content_from = adopted_children(ctx, old_content)?;
+        let content_to = adopted_children(ctx, new_content)?;
+        for (from_child, to_child) in content_from.into_iter().zip(content_to) {
+            retarget_template_contents(ctx, from_child, to_child)?;
+        }
+    }
+    let from_children = adopted_children(ctx, from)?;
+    let to_children = adopted_children(ctx, to)?;
+    for (from_child, to_child) in from_children.into_iter().zip(to_children) {
+        retarget_template_contents(ctx, from_child, to_child)?;
+    }
+    Ok(())
 }
 
 /// [Adopts](https://dom.spec.whatwg.org/#dom-document-adoptnode) `node` into
@@ -196,6 +244,10 @@ pub(crate) fn clone_within_document(
         let snapshot = import_snapshot(doc, id, deep).ok_or(TreeError::Hierarchy)?;
         return materialize_import(doc, doc_id, &snapshot);
     }
+    if doc.is_html_template(id.node) {
+        let snapshot = import_snapshot(doc, id, deep).ok_or(TreeError::Hierarchy)?;
+        return materialize_import(doc, doc_id, &snapshot);
+    }
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
         // Blitz copies element, text, and comment data only. Doctype,
@@ -223,24 +275,21 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
         };
         let children = if deep {
             let root = parsed.document.base.root_node().id;
-            let kids: Vec<blitz_traits::node_id::NodeId> = parsed
+            parsed
                 .document
                 .base
                 .get_node(root)
-                .map(|node| node.children.iter().copied().collect())
-                .unwrap_or_default();
-            kids.into_iter()
-                .filter_map(|kid| {
-                    import_snapshot(
-                        &parsed.document,
-                        NodeId {
+                .map(|node| {
+                    node.children
+                        .iter()
+                        .copied()
+                        .map(|kid| NodeId {
                             document: id.document,
                             node: kid,
-                        },
-                        true,
-                    )
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .collect()
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -251,12 +300,18 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
             children,
         )
     };
+    let mut snapshots = Vec::new();
+    for child in children {
+        if let Some(snapshot) = import_snapshot_live(ctx, child, true)? {
+            snapshots.push(snapshot);
+        }
+    }
     let font_ctx = world(ctx)?.borrow().runtime.font_ctx.clone();
     let mut parsed = crate::Parsed::script(content_type, font_ctx);
     parsed.xml_document = xml_document;
     parsed.quirks_mode = quirks_mode;
     let root = parsed.document.base.root_node().id;
-    for child in &children {
+    for child in &snapshots {
         let child_id = materialize_import(&mut parsed.document, 0, child)
             .map_err(|err| throw_dom_error(ctx, err))?;
         parsed
@@ -273,13 +328,16 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
 /// Doctype, processing instruction, and CDATA are side-table records on a
 /// comment or text backing
 /// (<https://dom.spec.whatwg.org/#concept-node-clone>). Template contents
-/// have no Blitz equivalent; `<template>` children snapshot as ordinary
-/// element children.
+/// snapshot from the associated fragment, not from the element's children
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
 pub(crate) enum ImportSnapshot {
     Element {
         name: QualName,
         attributes: Vec<blitz_dom::Attribute>,
         children: Vec<ImportSnapshot>,
+        /// Children are template contents, not children of the element
+        /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+        template: bool,
     },
     Text(crate::dom_string::DomString),
     Comment(crate::dom_string::DomString),
@@ -373,8 +431,20 @@ pub(crate) fn import_snapshot(
         NodeData::Element(element) => {
             let name = element.name.clone();
             let attributes = element.attrs.iter().cloned().collect();
+            let template = doc.is_html_template(id.node);
+            let child_ids: Vec<_> = if template {
+                doc.template_contents(id.node)
+                    .and_then(|fragment| {
+                        doc.base
+                            .get_node(fragment)
+                            .map(|backing| backing.children.iter().copied().collect())
+                    })
+                    .unwrap_or_else(|| node.children.iter().copied().collect())
+            } else {
+                node.children.iter().copied().collect()
+            };
             let children = if deep {
-                snapshot_children(doc, id.document, node.children.iter().copied())
+                snapshot_children(doc, id.document, child_ids)
             } else {
                 Vec::new()
             };
@@ -382,6 +452,7 @@ pub(crate) fn import_snapshot(
                 name,
                 attributes,
                 children,
+                template,
             })
         }
         NodeData::Text(_) => Some(ImportSnapshot::Text(doc.character_data(id.node))),
@@ -398,6 +469,163 @@ pub(crate) fn import_snapshot(
     }
 }
 
+/// Snapshots `id` using live template-contents maps, so contents that live
+/// in another document still clone
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+pub(crate) fn import_snapshot_live(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    deep: bool,
+) -> Result<Option<ImportSnapshot>> {
+    let contents = world(ctx)?
+        .borrow()
+        .registry()
+        .borrow()
+        .template_contents(id);
+    let kind = live_kind(ctx, id)?;
+    match kind {
+        LiveKind::None => Ok(None),
+        LiveKind::Ready(snapshot) => Ok(Some(snapshot)),
+        LiveKind::Fragment(children) => {
+            let children = if deep {
+                live_snapshot_children(ctx, children)?
+            } else {
+                Vec::new()
+            };
+            Ok(Some(ImportSnapshot::Fragment(children)))
+        }
+        LiveKind::Element {
+            name,
+            attributes,
+            children,
+            template,
+            same_doc_contents,
+            element_children,
+        } => {
+            let children = if !template {
+                children
+            } else if let Some(fragment) = contents {
+                live_child_ids_of(ctx, fragment)?
+            } else {
+                same_doc_contents.unwrap_or(element_children)
+            };
+            let children = if deep {
+                live_snapshot_children(ctx, children)?
+            } else {
+                Vec::new()
+            };
+            Ok(Some(ImportSnapshot::Element {
+                name,
+                attributes,
+                children,
+                template,
+            }))
+        }
+    }
+}
+
+fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
+    let owner = world_for_node(ctx, id)?;
+    let world = owner.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Ok(LiveKind::None);
+    };
+    let doc = &parsed.document;
+    if doc.is_fragment(id.node) {
+        return Ok(LiveKind::Fragment(live_child_ids(doc, id)));
+    }
+    if let Some(extra) = extra_snapshot(doc, id) {
+        return Ok(LiveKind::Ready(extra));
+    }
+    Ok(match doc.base.get_node(id.node).map(|node| &node.data) {
+        Some(NodeData::Element(element)) => {
+            let template = doc.is_html_template(id.node);
+            let same_doc_contents = template
+                .then(|| {
+                    doc.template_contents(id.node).map(|fragment| {
+                        live_child_ids(
+                            doc,
+                            NodeId {
+                                document: id.document,
+                                node: fragment,
+                            },
+                        )
+                    })
+                })
+                .flatten();
+            LiveKind::Element {
+                name: element.name.clone(),
+                attributes: element.attrs.iter().cloned().collect(),
+                children: if template {
+                    Vec::new()
+                } else {
+                    live_child_ids(doc, id)
+                },
+                template,
+                same_doc_contents,
+                element_children: live_child_ids(doc, id),
+            }
+        }
+        Some(NodeData::Text(_)) => {
+            LiveKind::Ready(ImportSnapshot::Text(doc.character_data(id.node)))
+        }
+        Some(NodeData::Comment { .. }) => {
+            LiveKind::Ready(ImportSnapshot::Comment(doc.character_data(id.node)))
+        }
+        Some(NodeData::AnonymousBlock(_)) => LiveKind::Fragment(live_child_ids(doc, id)),
+        Some(NodeData::Document(_)) | None => LiveKind::None,
+    })
+}
+
+enum LiveKind {
+    None,
+    Ready(ImportSnapshot),
+    Fragment(Vec<NodeId>),
+    Element {
+        name: QualName,
+        attributes: Vec<blitz_dom::Attribute>,
+        children: Vec<NodeId>,
+        template: bool,
+        same_doc_contents: Option<Vec<NodeId>>,
+        element_children: Vec<NodeId>,
+    },
+}
+
+fn live_child_ids(doc: &BlitzDocument, id: NodeId) -> Vec<NodeId> {
+    doc.base
+        .get_node(id.node)
+        .map(|node| {
+            node.children
+                .iter()
+                .copied()
+                .map(|child| NodeId {
+                    document: id.document,
+                    node: child,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn live_child_ids_of(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<NodeId>> {
+    let owner = world_for_node(ctx, id)?;
+    let world = owner.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Ok(Vec::new());
+    };
+    Ok(live_child_ids(&parsed.document, id))
+}
+
+fn live_snapshot_children(ctx: &Ctx<'_>, children: Vec<NodeId>) -> Result<Vec<ImportSnapshot>> {
+    let mut snapshots = Vec::new();
+    for child in children {
+        if let Some(snapshot) = import_snapshot_live(ctx, child, true)? {
+            snapshots.push(snapshot);
+        }
+    }
+    Ok(snapshots)
+}
+
 /// Materializes `snapshot` as detached nodes in `doc` for `document`.
 /// Children are appended without journal recording: the parent
 /// is detached and has no observers yet; the eventual insertion records.
@@ -411,16 +639,20 @@ pub(crate) fn materialize_import(
             name,
             attributes,
             children,
+            template,
         } => {
             let blitz_id = doc
                 .base
                 .mutate()
                 .create_element(name.clone(), attributes.clone());
+            let parent = if *template {
+                doc.ensure_template_contents(blitz_id)
+            } else {
+                blitz_id
+            };
             for child in children {
                 let child_id = materialize_import(doc, document, child)?;
-                doc.base
-                    .mutate()
-                    .append_children(blitz_id, &[child_id.node]);
+                doc.base.mutate().append_children(parent, &[child_id.node]);
             }
             Ok(NodeId {
                 document,

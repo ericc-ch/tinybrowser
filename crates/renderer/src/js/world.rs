@@ -40,6 +40,16 @@ pub(crate) struct RealmRegistry {
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
     /// The active child document for each connected iframe container.
     frame_documents: HashMap<NodeId, NodeId>,
+    /// `template` element → template contents fragment, possibly in another
+    /// document after `adoptNode`
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+    template_contents: HashMap<NodeId, NodeId>,
+    /// Template-contents fragment → host `template` element.
+    fragment_hosts: HashMap<NodeId, NodeId>,
+    /// Browsing-context document id → associated template contents owner
+    /// document
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#appropriate-template-contents-owner-document>).
+    template_contents_owners: HashMap<u32, NodeId>,
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
@@ -112,6 +122,13 @@ impl RealmRegistry {
         self.wrappers.retain(|node, _| node.document_id() != id);
         self.frame_documents
             .retain(|_, document| document.document_id() != id);
+        self.template_contents.retain(|template, contents| {
+            template.document_id() != id && contents.document_id() != id
+        });
+        self.fragment_hosts
+            .retain(|fragment, host| fragment.document_id() != id && host.document_id() != id);
+        self.template_contents_owners
+            .retain(|document, owner| *document != id && owner.document_id() != id);
     }
 
     /// The shared wrapper cache entry for `id`, when one exists.
@@ -133,6 +150,35 @@ impl RealmRegistry {
         if let Some(value) = self.wrappers.remove(&from) {
             self.wrappers.insert(to, value);
         }
+        if let Some(contents) = self.template_contents.remove(&from) {
+            self.template_contents.insert(to, contents);
+            if let Some(host) = self.fragment_hosts.get_mut(&contents) {
+                *host = to;
+            }
+        }
+        if let Some(host) = self.fragment_hosts.remove(&from) {
+            self.fragment_hosts.insert(to, host);
+            self.template_contents.insert(host, to);
+        }
+    }
+
+    pub(crate) fn template_contents(&self, template: NodeId) -> Option<NodeId> {
+        self.template_contents.get(&template).copied()
+    }
+
+    pub(crate) fn set_template_contents(&mut self, template: NodeId, fragment: NodeId) {
+        if let Some(previous) = self.template_contents.insert(template, fragment) {
+            self.fragment_hosts.remove(&previous);
+        }
+        self.fragment_hosts.insert(fragment, template);
+    }
+
+    pub(crate) fn template_contents_owner(&self, document: u32) -> Option<NodeId> {
+        self.template_contents_owners.get(&document).copied()
+    }
+
+    pub(crate) fn set_template_contents_owner(&mut self, document: u32, owner: NodeId) {
+        self.template_contents_owners.insert(document, owner);
     }
 
     pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
