@@ -26,6 +26,13 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: path dependency in `crates/webidl-bindgen/Cargo.toml`. Vendored,
   not a submodule, so correctly absent from `.gitmodules`.
 
+- **What**: `fontconfig-parser` 0.5.8, so fontconfig XML and SVG share one
+  `roxmltree`.
+- **Upstream**: vendored source at `third_party/fontconfig-parser` (see
+  `UPSTREAM.md` there). The only change from 0.5.8 is `roxmltree = "0.21.1"`.
+- **Wiring**: `[patch.crates-io]` path entry in the workspace root
+  `Cargo.toml`. Excluded from the workspace, same as `weedle4`.
+
 ## Test data (never ships)
 
 ## Web IDL extracts

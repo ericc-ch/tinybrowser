@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["third_party/rquickjs", "third_party/weedle4"]
+exclude = ["third_party/rquickjs", "third_party/weedle4", "third_party/fontconfig-parser"]
 members = [
     "crates/anyrender-tiny-skia",
     "crates/browser",
@@ -33,6 +33,9 @@ webdriver = { path = "crates/webdriver" }
 webstorage = { path = "crates/webstorage" }
 
 [patch.crates-io]
+# fontconfig-parser 0.5.8 pins roxmltree 0.20; usvg and fontique pin 0.21.
+# The vendored crate is that release with the requirement moved to 0.21.1.
+fontconfig-parser = { path = "third_party/fontconfig-parser" }
 rquickjs = { path = "third_party/rquickjs" }
 rquickjs-core = { path = "third_party/rquickjs/core" }
 rquickjs-macro = { path = "third_party/rquickjs/macro" }
