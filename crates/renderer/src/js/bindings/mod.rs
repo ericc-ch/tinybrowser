@@ -748,6 +748,27 @@ pub(super) fn rect_object<'js>(
     Ok(object)
 }
 
+/// Points `from`'s existing wrapper at `to` and moves the wrapper cache.
+///
+/// `createDocument` adopts a doctype by copying it into the new tree. The
+/// spec keeps the same object, so the wrapper follows the copy
+/// (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>).
+pub(super) fn retarget_wrapper(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
+    let saved = world(ctx)?.borrow().shared_wrapper(from);
+    if let Some(saved) = saved
+        && let Some(value) = deref_weak(ctx, saved)?
+        && let Ok(class) = Class::<JsNode>::from_js(ctx, value)
+    {
+        class.borrow_mut().handle = Handle(to);
+    }
+    world(ctx)?
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .rekey_wrapper(from, to);
+    Ok(())
+}
+
 pub(crate) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
     if let Some(saved) = world_rc.borrow().shared_wrapper(id)
@@ -786,10 +807,25 @@ pub(super) fn wrap_new_document_in_world<'js>(
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
-    let is_fragment = world(ctx)?
-        .borrow()
-        .document(id)
-        .is_some_and(|parsed| parsed.document.is_fragment(id.node));
+    let (is_fragment, extra_brand) = {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(id) else {
+            return Err(Exception::throw_type(ctx, "stale node"));
+        };
+        let brand = match parsed.document.extra(id.node) {
+            Some(crate::documents::ExtraNode::DocumentType { .. }) => Some("DocumentType"),
+            Some(crate::documents::ExtraNode::ProcessingInstruction { .. }) => {
+                Some("ProcessingInstruction")
+            }
+            Some(crate::documents::ExtraNode::CDataSection) => Some("CDATASection"),
+            None => None,
+        };
+        (parsed.document.is_fragment(id.node), brand)
+    };
+    if let Some(brand) = extra_brand {
+        return wrap_with_brand(ctx, id, brand);
+    }
     let brand = with_node_data(ctx, id, |data| match data {
         Some(NodeData::Document(_)) => Some(if document_is_html_content(ctx, id) {
             "Document"
@@ -1118,6 +1154,30 @@ pub(super) fn set_character_data(
     id: NodeId,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
+    // Replacing data on a processing instruction reparses its attribute map
+    // unless the caller already updated the map
+    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
+    set_character_data_inner(ctx, id, data, true)
+}
+
+/// Replaces character data without reparsing a processing instruction's
+/// attribute map. `update data from attributes` passes true for
+/// `piAttributesAlreadyUpdated`
+/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
+pub(super) fn set_pi_data(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    data: &crate::dom_string::DomString,
+) -> Result<()> {
+    set_character_data_inner(ctx, id, data, false)
+}
+
+fn set_character_data_inner(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    data: &crate::dom_string::DomString,
+    reparse_pi: bool,
+) -> Result<()> {
     // Lone surrogates cannot survive the UTF-8 tree: they become the
     // replacement character at this boundary, a known cutover gap.
     let data = data.to_string_lossy().into_owned();
@@ -1164,6 +1224,20 @@ pub(super) fn set_character_data(
             target: id,
             old_value,
         });
+    if reparse_pi && parsed.document.is_processing_instruction(id.node) {
+        let contents = parsed
+            .document
+            .base
+            .get_node(id.node)
+            .and_then(|node| match &node.data {
+                NodeData::Comment { contents } => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let attributes =
+            crate::pseudo_attributes::parse_pseudo_attributes(&contents).unwrap_or_default();
+        parsed.document.set_pi_attributes(id.node, attributes);
+    }
     drop(parsed);
     drop(owner);
     schedule_mutation_delivery(ctx)

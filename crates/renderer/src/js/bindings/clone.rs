@@ -118,6 +118,9 @@ pub(crate) fn clone_within_document(
 ) -> std::result::Result<NodeId, TreeError> {
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
+        // Blitz copies element, text, and comment data only. Doctype,
+        // processing-instruction, and CDATA records live beside the tree.
+        doc.copy_extra_subtree(id.node, cloned);
         return Ok(NodeId {
             document: doc_id,
             node: cloned,
@@ -181,10 +184,11 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
 
 /// Owned snapshot of a subtree for cross-document `importNode`.
 ///
-/// A source tree built by Blitz never contains doctype,
-/// processing-instruction, CDATA, or fragment nodes, so those have no
-/// snapshot variant. Template contents have no Blitz equivalent either;
-/// `<template>` children snapshot as ordinary element children.
+/// Doctype, processing instruction, and CDATA are side-table records on a
+/// comment or text backing
+/// (<https://dom.spec.whatwg.org/#concept-node-clone>). Template contents
+/// have no Blitz equivalent; `<template>` children snapshot as ordinary
+/// element children.
 pub(crate) enum ImportSnapshot {
     Element {
         name: QualName,
@@ -193,6 +197,17 @@ pub(crate) enum ImportSnapshot {
     },
     Text(crate::dom_string::DomString),
     Comment(crate::dom_string::DomString),
+    DocumentType {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
+    ProcessingInstruction {
+        target: String,
+        data: crate::dom_string::DomString,
+        attributes: Vec<(String, String)>,
+    },
+    CData(crate::dom_string::DomString),
     Fragment(Vec<ImportSnapshot>),
 }
 
@@ -202,6 +217,40 @@ pub(crate) fn import_snapshot(
     deep: bool,
 ) -> Option<ImportSnapshot> {
     let node = doc.base.get_node(id.node)?;
+    match doc.extra(id.node) {
+        Some(crate::documents::ExtraNode::DocumentType {
+            name,
+            public_id,
+            system_id,
+        }) => {
+            return Some(ImportSnapshot::DocumentType {
+                name: name.clone(),
+                public_id: public_id.clone(),
+                system_id: system_id.clone(),
+            });
+        }
+        Some(crate::documents::ExtraNode::ProcessingInstruction { target, attributes }) => {
+            let data = match &node.data {
+                NodeData::Comment { contents } => {
+                    crate::dom_string::DomString::from(contents.clone())
+                }
+                _ => crate::dom_string::DomString::default(),
+            };
+            return Some(ImportSnapshot::ProcessingInstruction {
+                target: target.clone(),
+                data,
+                attributes: attributes.clone(),
+            });
+        }
+        Some(crate::documents::ExtraNode::CDataSection) => {
+            let data = match &node.data {
+                NodeData::Text(text) => crate::dom_string::DomString::from(text.content.clone()),
+                _ => crate::dom_string::DomString::default(),
+            };
+            return Some(ImportSnapshot::CData(data));
+        }
+        None => {}
+    }
     match &node.data {
         NodeData::Element(element) => {
             let name = element.name.clone();
@@ -300,6 +349,41 @@ pub(crate) fn materialize_import(
         ImportSnapshot::Comment(data) => {
             let text = data.to_string_lossy().into_owned();
             let blitz_id = doc.base.mutate().create_comment_node(&text);
+            Ok(NodeId {
+                document,
+                node: blitz_id,
+            })
+        }
+        ImportSnapshot::DocumentType {
+            name,
+            public_id,
+            system_id,
+        } => {
+            let blitz_id = doc.create_doctype(name.clone(), public_id.clone(), system_id.clone());
+            Ok(NodeId {
+                document,
+                node: blitz_id,
+            })
+        }
+        ImportSnapshot::ProcessingInstruction {
+            target,
+            data,
+            attributes,
+        } => {
+            let text = data.to_string_lossy().into_owned();
+            let blitz_id = doc.create_processing_instruction(target.clone(), &text);
+            // The stored map wins over a fresh parse so a `setAttribute`
+            // name the grammar rejects still clones
+            // (<https://dom.spec.whatwg.org/#concept-node-clone>).
+            doc.set_pi_attributes(blitz_id, attributes.clone());
+            Ok(NodeId {
+                document,
+                node: blitz_id,
+            })
+        }
+        ImportSnapshot::CData(data) => {
+            let text = data.to_string_lossy().into_owned();
+            let blitz_id = doc.create_cdata_section(&text);
             Ok(NodeId {
                 document,
                 node: blitz_id,

@@ -10,6 +10,35 @@ use std::collections::{HashMap, HashSet};
 use crate::Parsed;
 use crate::js::world::JournalEntry;
 
+/// A node kind Blitz cannot store.
+///
+/// Blitz's tree has element, text, and comment only. Doctype, processing
+/// instruction, and CDATA are real DOM nodes
+/// (<https://dom.spec.whatwg.org/#interface-documenttype>,
+/// <https://dom.spec.whatwg.org/#interface-processinginstruction>,
+/// <https://dom.spec.whatwg.org/#interface-cdatasection>), so each one is a
+/// backing node plus this record. A doctype and a processing instruction back
+/// onto a comment: neither contributes to a parent's descendant text.
+/// CDATA backs onto a text node, because a `CDATASection` is a `Text` node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExtraNode {
+    DocumentType {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
+    ProcessingInstruction {
+        target: String,
+        /// Ordered attribute map. Parsing failures store an empty map; later
+        /// `setAttribute` writes the map directly and reserializes without
+        /// reparsing, so a name the pseudo-attribute grammar rejects (such
+        /// as `$`) still round-trips
+        /// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
+        attributes: Vec<(String, String)>,
+    },
+    CDataSection,
+}
+
 /// A Blitz document plus the side data our engine keeps per document.
 pub(crate) struct BlitzDocument {
     /// The Blitz tree, style, and layout state.
@@ -25,6 +54,10 @@ pub(crate) struct BlitzDocument {
     /// the fragment's children. Membership decides the wrapper prototype
     /// and fragment-only algorithms (serialization, insertion).
     fragments: HashSet<blitz_traits::node_id::NodeId>,
+    /// Doctype, processing-instruction, and CDATA records keyed by the
+    /// backing node's id. The id's slot version dies with the node, so a
+    /// stale entry cannot be mistaken for a new node in the same slot.
+    extras: HashMap<blitz_traits::node_id::NodeId, ExtraNode>,
 }
 
 impl BlitzDocument {
@@ -36,6 +69,7 @@ impl BlitzDocument {
             next_journal_position: 1,
             recording: false,
             fragments: HashSet::new(),
+            extras: HashMap::new(),
         }
     }
 
@@ -47,6 +81,7 @@ impl BlitzDocument {
             next_journal_position: 1,
             recording: false,
             fragments: HashSet::new(),
+            extras: HashMap::new(),
         }
     }
 
@@ -79,6 +114,142 @@ impl BlitzDocument {
         let backing = self.base.mutate().create_element(name, Vec::new());
         self.fragments.insert(backing);
         backing
+    }
+
+    /// The side-table record for `id`, when it is a doctype, processing
+    /// instruction, or CDATA section.
+    pub(crate) fn extra(&self, id: blitz_traits::node_id::NodeId) -> Option<&ExtraNode> {
+        self.extras.get(&id)
+    }
+
+    /// Whether `id` is a document type node.
+    pub(crate) fn is_doctype(&self, id: blitz_traits::node_id::NodeId) -> bool {
+        matches!(self.extras.get(&id), Some(ExtraNode::DocumentType { .. }))
+    }
+
+    /// Whether `id` is a processing instruction.
+    pub(crate) fn is_processing_instruction(&self, id: blitz_traits::node_id::NodeId) -> bool {
+        matches!(
+            self.extras.get(&id),
+            Some(ExtraNode::ProcessingInstruction { .. })
+        )
+    }
+
+    /// Whether `id` is a CDATA section.
+    pub(crate) fn is_cdata(&self, id: blitz_traits::node_id::NodeId) -> bool {
+        matches!(self.extras.get(&id), Some(ExtraNode::CDataSection))
+    }
+
+    /// Creates a document type whose node document is this document.
+    ///
+    /// The backing comment stays empty: a doctype's node value is null and
+    /// its data is the name, public id, and system id
+    /// (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype>).
+    pub(crate) fn create_doctype(
+        &mut self,
+        name: String,
+        public_id: String,
+        system_id: String,
+    ) -> blitz_traits::node_id::NodeId {
+        let backing = self.base.mutate().create_comment_node("");
+        self.extras.insert(
+            backing,
+            ExtraNode::DocumentType {
+                name,
+                public_id,
+                system_id,
+            },
+        );
+        backing
+    }
+
+    /// Creates a processing instruction
+    /// (<https://dom.spec.whatwg.org/#create-a-processing-instruction-node>).
+    ///
+    /// The backing comment holds the data, so character-data operations and
+    /// parent text content keep the comment's rules.
+    pub(crate) fn create_processing_instruction(
+        &mut self,
+        target: String,
+        data: &str,
+    ) -> blitz_traits::node_id::NodeId {
+        let backing = self.base.mutate().create_comment_node(data);
+        // Initialize updates the attribute map from `data`. A parse error
+        // leaves the map empty
+        // (<https://dom.spec.whatwg.org/#processinginstruction-initialize>).
+        let attributes =
+            crate::pseudo_attributes::parse_pseudo_attributes(data).unwrap_or_default();
+        self.extras.insert(
+            backing,
+            ExtraNode::ProcessingInstruction { target, attributes },
+        );
+        backing
+    }
+
+    /// Replaces the ordered attribute map of a processing instruction.
+    ///
+    /// Callers that already updated the map from a `setAttribute`-style
+    /// mutation pass the new map and then replace the data with
+    /// `piAttributesAlreadyUpdated` set, so this write is not parsed again
+    /// (<https://dom.spec.whatwg.org/#concept-cd-replace>).
+    pub(crate) fn set_pi_attributes(
+        &mut self,
+        id: blitz_traits::node_id::NodeId,
+        attributes: Vec<(String, String)>,
+    ) {
+        if let Some(ExtraNode::ProcessingInstruction {
+            attributes: stored, ..
+        }) = self.extras.get_mut(&id)
+        {
+            *stored = attributes;
+        }
+    }
+
+    /// The ordered attribute map of a processing instruction.
+    pub(crate) fn pi_attributes(
+        &self,
+        id: blitz_traits::node_id::NodeId,
+    ) -> Option<&[(String, String)]> {
+        match self.extras.get(&id) {
+            Some(ExtraNode::ProcessingInstruction { attributes, .. }) => Some(attributes),
+            _ => None,
+        }
+    }
+
+    /// Creates a CDATA section
+    /// (<https://dom.spec.whatwg.org/#create-a-cdata-section-node>).
+    ///
+    /// The backing text node is the section's data, so `Text` operations
+    /// (`splitText`, `wholeText`, descendant text) apply.
+    pub(crate) fn create_cdata_section(&mut self, data: &str) -> blitz_traits::node_id::NodeId {
+        let backing = self.base.mutate().create_text_node(data);
+        self.extras.insert(backing, ExtraNode::CDataSection);
+        backing
+    }
+
+    /// Copies the side-table record of `from` onto `to`, then walks both
+    /// subtrees in lockstep. `deep_clone_node` copies Blitz data only.
+    pub(crate) fn copy_extra_subtree(
+        &mut self,
+        from: blitz_traits::node_id::NodeId,
+        to: blitz_traits::node_id::NodeId,
+    ) {
+        if let Some(extra) = self.extras.get(&from).cloned() {
+            self.extras.insert(to, extra);
+        }
+        let from_children: Vec<blitz_traits::node_id::NodeId> = self
+            .base
+            .get_node(from)
+            .map(|node| node.children.iter().copied().collect())
+            .unwrap_or_default();
+        let to_children: Vec<blitz_traits::node_id::NodeId> = self
+            .base
+            .get_node(to)
+            .map(|node| node.children.iter().copied().collect())
+            .unwrap_or_default();
+        for (from_child, to_child) in from_children.into_iter().zip(to_children) {
+            self.copy_extra_subtree(from_child, to_child);
+        }
     }
 }
 

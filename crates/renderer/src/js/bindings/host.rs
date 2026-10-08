@@ -426,8 +426,22 @@ pub(crate) trait SharedClass {
 
 /// Whether `data` implements the named node interface, or `None` when the
 /// name is not one the shared payload can represent.
-fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -> Option<bool> {
+///
+/// `extra` is the side-table kind for a doctype, processing instruction, or
+/// CDATA section. Those back onto a comment or a text node, so the backing
+/// alone would report the wrong interface.
+fn node_interface_matches(
+    data: Option<&blitz_dom::NodeData>,
+    extra: Option<&crate::documents::ExtraNode>,
+    interface: &str,
+) -> Option<bool> {
+    use crate::documents::ExtraNode;
     use blitz_dom::NodeData;
+    let is_doctype = matches!(extra, Some(ExtraNode::DocumentType { .. }));
+    let is_pi = matches!(extra, Some(ExtraNode::ProcessingInstruction { .. }));
+    let is_cdata = matches!(extra, Some(ExtraNode::CDataSection));
+    let is_character_data = matches!(data, Some(NodeData::Text(_)))
+        || (matches!(data, Some(NodeData::Comment { .. })) && !is_doctype);
     Some(match interface {
         // Every node is also an `EventTarget`
         // (<https://dom.spec.whatwg.org/#interface-eventtarget>).
@@ -447,9 +461,14 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
         "MathMLElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::mathml_namespace())
         }
-        "CharacterData" => matches!(data, Some(NodeData::Text(_) | NodeData::Comment { .. })),
-        // Blitz has no doctype, PI, or CDATA nodes.
-        "DocumentType" | "ProcessingInstruction" => false,
+        "CharacterData" => is_character_data,
+        // A CDATA section implements `Text`
+        // (<https://dom.spec.whatwg.org/#interface-cdatasection>).
+        "Text" => matches!(data, Some(NodeData::Text(_))),
+        "CDATASection" => is_cdata,
+        "Comment" => matches!(data, Some(NodeData::Comment { .. })) && !is_doctype && !is_pi,
+        "DocumentType" => is_doctype,
+        "ProcessingInstruction" => is_pi,
         // Spec mixins: their members are installed on every including
         // interface, so the receiver check accepts the union of those kinds.
         // `ElementCSSInlineStyle` is included by the HTML, SVG, and MathML
@@ -462,14 +481,25 @@ fn node_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -
                     || element.name.ns == crate::js::world::mathml_namespace()
         ),
         "ParentNode" => matches!(data, Some(NodeData::Document(_) | NodeData::Element(_))),
-        "ChildNode" => matches!(
-            data,
-            Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
-        ),
-        "NonDocumentTypeChildNode" => matches!(
-            data,
-            Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
-        ),
+        // `ChildNode` includes `DocumentType`, `Element`, and `CharacterData`
+        // (<https://dom.spec.whatwg.org/#interface-childnode>).
+        "ChildNode" => {
+            is_doctype
+                || matches!(
+                    data,
+                    Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
+                )
+        }
+        // `NonDocumentTypeChildNode` includes `Element` and `CharacterData`,
+        // not a doctype
+        // (<https://dom.spec.whatwg.org/#interface-nondocumenttypechildnode>).
+        "NonDocumentTypeChildNode" => {
+            !is_doctype
+                && matches!(
+                    data,
+                    Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
+                )
+        }
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
         "HTMLHyperlinkElementUtils" => {
@@ -522,7 +552,8 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    match node_interface_matches(data, interface) {
+    let extra = document.document.extra(id.node);
+    match node_interface_matches(data, extra, interface) {
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
@@ -548,7 +579,8 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    node_interface_matches(data, interface) == Some(true)
+    let extra = document.document.extra(id.node);
+    node_interface_matches(data, extra, interface) == Some(true)
 }
 
 /// The receiver JS object for hand methods that keep it (observer identity
@@ -652,10 +684,18 @@ pub(crate) fn document_type_argument<'js>(
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    // Known gap (upstream, docs/progress.md): Blitz has no doctype nodes;
-    // no value converts.
-    let _ = super::required_node(ctx, value)?;
-    Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
+    let id = super::required_node(ctx, value)?;
+    let is_doctype = super::world_for_node(ctx, id).is_ok_and(|owner| {
+        owner
+            .borrow()
+            .document(id)
+            .is_some_and(|parsed| parsed.document.is_doctype(id.node))
+    });
+    if is_doctype {
+        Ok(Some(NodeReference::Tree(id)))
+    } else {
+        Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
+    }
 }
 
 pub(crate) fn nullable_string_argument<'js>(

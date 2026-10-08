@@ -1,9 +1,12 @@
 //! `DOMImplementation`, DOM parsing, and serialization.
 
 use super::{
-    NodeContext, throw_dom, validate_and_extract, world, world_for_node, wrap_new_document,
-    wrap_new_document_in_world,
+    NodeContext, create_node, detach_for_adopt, import_snapshot, materialize_import,
+    retarget_wrapper, throw_dom, throw_dom_error, validate_and_extract, world, world_for_node,
+    wrap_new_document, wrap_new_document_in_world, wrap_node,
 };
+
+use crate::js::world::NodeId;
 
 use crate::js::world::Handle;
 
@@ -35,8 +38,8 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         system_id: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
         let name = name.to_string()?;
-        let _ = public_id.to_string()?;
-        let _ = system_id.to_string()?;
+        let public_id = public_id.to_string()?;
+        let system_id = system_id.to_string()?;
         if !valid_doctype_name(&name) {
             return Err(throw_dom(
                 &ctx,
@@ -44,11 +47,10 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 "doctype name contains invalid characters",
             ));
         }
-        Err(throw_dom(
-            &ctx,
-            "HierarchyRequestError",
-            "document type nodes are not supported",
-        ))
+        // https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype
+        create_node(&ctx, self.document.0, |parsed| {
+            parsed.document.create_doctype(name, public_id, system_id)
+        })
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
@@ -81,11 +83,25 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 NodeContext::Element,
             )?)
         };
-        let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
-        let mut parsed = crate::Parsed::script(content_type, font_ctx);
-        let _ = doctype;
+        let world_rc = world_for_node(&ctx, self.document.0)?;
+        let font_ctx = world_rc.borrow().runtime.font_ctx.clone();
+        let parsed = crate::Parsed::script(content_type, font_ctx);
+        // The element is created after the doctype is appended
+        // (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>).
+        let document_root = world_rc.borrow_mut().add_document(parsed);
+        world_rc
+            .borrow()
+            .registry()
+            .borrow_mut()
+            .insert_document(document_root.document_id(), &world_rc);
+        if let Some(super::host::NodeReference::Tree(doctype_id)) = doctype {
+            append_adopted_doctype(&ctx, document_root, doctype_id)?;
+        }
         if let Some(name) = root {
-            let document_root = parsed.document.base.root_node().id;
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(document_root) else {
+                return Err(rquickjs::Exception::throw_type(&ctx, "no document"));
+            };
             let element = parsed
                 .document
                 .base
@@ -95,9 +111,9 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
                 .document
                 .base
                 .mutate()
-                .append_children(document_root, &[element]);
+                .append_children(document_root.node, &[element]);
         }
-        wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
+        wrap_node(&ctx, document_root)
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument
@@ -108,10 +124,17 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
     ) -> Result<Value<'js>> {
         let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
         let mut parsed = crate::Parsed::script("text/html", font_ctx);
-        // The algorithm appends a doctype named `html` before `html`. Blitz
-        // has no doctype node, so `document.doctype` stays null
-        // (<https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument>).
+        // https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument
         let document_root = parsed.document.base.root_node().id;
+        let doctype =
+            parsed
+                .document
+                .create_doctype("html".to_owned(), String::new(), String::new());
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(document_root, &[doctype]);
         let html = parsed
             .document
             .base
@@ -157,6 +180,44 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         parsed.document.base.mutate().append_children(html, &[body]);
         wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
+}
+
+/// Adopts `doctype` into `document` and appends it, retargeting the wrapper
+/// so the caller's object and `document.doctype` are the same node
+/// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+fn append_adopted_doctype(ctx: &Ctx<'_>, document: NodeId, doctype: NodeId) -> Result<()> {
+    let source_world = world_for_node(ctx, doctype)?;
+    let snapshot = {
+        let source = source_world.borrow();
+        let Some(parsed) = source.document(doctype) else {
+            return Err(rquickjs::Exception::throw_type(ctx, "no document"));
+        };
+        import_snapshot(&parsed.document, doctype, true)
+            .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?
+    };
+    {
+        let source = source_world.borrow();
+        let Some(mut parsed) = source.document_mut(doctype) else {
+            return Err(rquickjs::Exception::throw_type(ctx, "no document"));
+        };
+        detach_for_adopt(&mut parsed.document, doctype).map_err(|err| throw_dom_error(ctx, err))?;
+    }
+    let fresh = {
+        let target_world = world_for_node(ctx, document)?;
+        let target = target_world.borrow();
+        let Some(mut parsed) = target.document_mut(document) else {
+            return Err(rquickjs::Exception::throw_type(ctx, "no document"));
+        };
+        let fresh = materialize_import(&mut parsed.document, document.document, &snapshot)
+            .map_err(|err| throw_dom_error(ctx, err))?;
+        parsed
+            .document
+            .base
+            .mutate()
+            .append_children(document.node, &[fresh.node]);
+        fresh
+    };
+    retarget_wrapper(ctx, doctype, fresh)
 }
 
 /// An HTML-namespace qualified name for document construction.

@@ -13,10 +13,10 @@ use super::{
     is_element, is_focusable, is_main_document, live_collection, main_document, make_weak,
     materialize_children, materialize_import, new_detached_attr, qualified_name, rect_object,
     remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
-    set_attribute_node, set_attribute_sync, set_character_data, sibling, sibling_value,
-    string_value, throw_dom, throw_dom_error, touch_attr, tree_order, valid_attribute_local_name,
-    valid_element_local_name, validate_and_extract, with_node_data, world, world_for_node,
-    wrap_new_document, wrap_node,
+    set_attribute_node, set_attribute_sync, set_character_data, set_pi_data, sibling,
+    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
+    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
+    world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -135,6 +135,16 @@ fn insertion_tree_nodes(
     node: NodeReference,
     child: Option<NodeReference>,
 ) -> Result<(NodeId, Option<NodeId>)> {
+    insertion_excluding(ctx, parent, node, child, None)
+}
+
+fn insertion_excluding(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeReference,
+    child: Option<NodeReference>,
+    exclude: Option<BlitzId>,
+) -> Result<(NodeId, Option<NodeId>)> {
     // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
     // https://dom.spec.whatwg.org/#concept-node-replace
     if matches!(child, Some(NodeReference::Attribute { .. })) {
@@ -149,81 +159,146 @@ fn insertion_tree_nodes(
     })?;
     let owner = world_for_node(ctx, parent)?;
     let owner = owner.borrow();
-    let parsed = owner
-        .document(parent)
-        .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
-    let base = &parsed.document.base;
-    // Only documents and elements can be parents. Fragment backings are
-    // plain elements, so fragments are covered by the element case.
-    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
-    let parent_is_document = base.root_node().id == parent.node;
-    if !parent_is_document && !is_element(base, parent.node) {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "parent cannot have children",
-        ));
-    }
+    // One document store backs every tree. Hold one document borrow at a time.
+    let parent_is_document = {
+        let parsed = owner
+            .document(parent)
+            .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
+        let base = &parsed.document.base;
+        // Only documents and elements can be parents. Fragment backings are
+        // plain elements, so fragments are covered by the element case.
+        // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+        let parent_is_document = base.root_node().id == parent.node;
+        if !parent_is_document && !is_element(base, parent.node) {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "parent cannot have children",
+            ));
+        }
+        parent_is_document
+    };
     // The reference child must already be parented here.
     let reference = match child {
         Some(NodeReference::Tree(id)) => Some(id),
         Some(NodeReference::Attribute { .. }) | None => None,
     };
-    // The node itself must be live, resolved in its own document.
-    let node_parsed = owner
-        .document(node)
-        .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
-    let node_base = &node_parsed.document.base;
     // Step 2 runs before the reference-child check (step 3): an ancestor
     // throws HierarchyRequestError even when `child` is not a child of parent.
     // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
-    if node.document == parent.document {
-        ensure_no_cycle(ctx, base, parent.node, node.node)?;
+    {
+        let parsed = owner
+            .document(parent)
+            .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
+        let base = &parsed.document.base;
+        if node.document == parent.document {
+            ensure_no_cycle(ctx, base, parent.node, node.node)?;
+        }
+        if let Some(reference) = reference {
+            ensure_parented(ctx, base, parent, reference)?;
+        }
     }
-    if let Some(reference) = reference {
-        ensure_parented(ctx, base, parent, reference)?;
-    }
-    // A document (any document's root) can never be inserted.
-    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
-    if node_base.root_node().id == node.node {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "a document cannot be inserted",
-        ));
-    }
-    let node_is_fragment = node_parsed.document.is_fragment(node.node);
-    let node_data = node_base
-        .get_node(node.node)
-        .map(|candidate| &candidate.data);
-    let node_is_element = node_data.is_some_and(|data| matches!(data, NodeData::Element(_)));
-    // Only fragments, elements, text, and comments insert.
-    let node_is_text = node_data.is_some_and(|data| matches!(data, NodeData::Text(_)));
-    let node_is_character_data =
-        node_is_text || node_data.is_some_and(|data| matches!(data, NodeData::Comment { .. }));
-    if !node_is_fragment && !node_is_element && !node_is_character_data {
+    // The node itself must be live, resolved in its own document.
+    let inserted = {
+        let node_parsed = owner
+            .document(node)
+            .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
+        // A document (any document's root) can never be inserted.
+        // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+        if node_parsed.document.base.root_node().id == node.node {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "a document cannot be inserted",
+            ));
+        }
+        classify_inserted(&node_parsed.document, node.node)
+    };
+    // Fragments, doctypes, elements, and character data insert.
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity
+    if matches!(inserted, InsertedNode::Other) {
         return Err(throw_dom(
             ctx,
             "HierarchyRequestError",
             "node cannot be inserted",
         ));
     }
-    // The document content model: at most one element child, and no text
-    // directly under the document.
-    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
-    if parent_is_document {
+    // A doctype's parent is a document. Other parents return after that check.
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity
+    if !parent_is_document {
+        if matches!(inserted, InsertedNode::Doctype) {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "doctype parent is not a document",
+            ));
+        }
+        return Ok((node, reference));
+    }
+    {
+        let parsed = owner
+            .document(parent)
+            .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
         ensure_document_content_model(
             ctx,
             &parsed.document,
-            &node_parsed.document,
             parent,
             node,
-            node_is_fragment,
-            node_is_element,
-            node_is_text,
+            reference,
+            exclude,
+            &inserted,
         )?;
     }
     Ok((node, reference))
+}
+
+/// The inserted node's side of ensure pre-insert validity.
+enum InsertedNode {
+    Fragment {
+        elements: usize,
+        has_text: bool,
+    },
+    Element,
+    /// A `Text` node, including a CDATA section.
+    Text,
+    Doctype,
+    /// A comment or processing instruction.
+    CharacterData,
+    Other,
+}
+
+fn classify_inserted(doc: &crate::documents::BlitzDocument, id: BlitzId) -> InsertedNode {
+    if doc.is_doctype(id) {
+        return InsertedNode::Doctype;
+    }
+    if doc.is_fragment(id) {
+        let children: Vec<BlitzId> = doc
+            .base
+            .get_node(id)
+            .map(|fragment| fragment.children.iter().copied().collect())
+            .unwrap_or_default();
+        let elements = children
+            .iter()
+            .filter(|child| {
+                doc.base
+                    .get_node(**child)
+                    .is_some_and(|candidate| candidate.data.downcast_element().is_some())
+                    && !doc.is_fragment(**child)
+            })
+            .count();
+        let has_text = children.iter().any(|child| {
+            doc.base
+                .get_node(*child)
+                .is_some_and(|candidate| matches!(candidate.data, NodeData::Text(_)))
+        });
+        return InsertedNode::Fragment { elements, has_text };
+    }
+    match doc.base.get_node(id).map(|node| &node.data) {
+        Some(NodeData::Element(_)) => InsertedNode::Element,
+        Some(NodeData::Text(_)) => InsertedNode::Text,
+        Some(NodeData::Comment { .. }) => InsertedNode::CharacterData,
+        _ => InsertedNode::Other,
+    }
 }
 
 /// The reference child of an insertion must already be parented at the
@@ -273,77 +348,66 @@ fn ensure_no_cycle(
     Ok(())
 }
 
-/// The document content model for one insertion: at most one element child,
-/// and no text directly under the document
-/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "validity context is eight orthogonal inputs; a params struct would obscure the spec mapping"
-)]
+/// Document parent rules from ensure pre-insert validity, steps after the
+/// non-document early return
+/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity>).
+///
+/// `exclude` is the child `replace` passes in `childrenToExclude`. The node
+/// being inserted is also left out of the parent's child counts: insert
+/// removes it from its old parent before the parent gains it again, and
+/// counting it as both the existing child and the inserted node rejects a
+/// move of the document element.
 fn ensure_document_content_model(
     ctx: &Ctx<'_>,
     doc: &crate::documents::BlitzDocument,
-    node_doc: &crate::documents::BlitzDocument,
     parent: NodeId,
     node: NodeId,
-    node_is_fragment: bool,
-    node_is_element: bool,
-    node_is_text: bool,
+    reference: Option<NodeId>,
+    exclude: Option<BlitzId>,
+    inserted: &InsertedNode,
 ) -> Result<()> {
-    let base = &doc.base;
-    let node_base = &node_doc.base;
-    let fragment_children: Vec<BlitzId> = if node_is_fragment {
-        node_base
-            .get_node(node.node)
-            .map(|fragment| fragment.children.iter().copied().collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if !node_is_fragment && node_is_text {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "text cannot be a child of a document",
-        ));
+    match inserted {
+        // A text node, including a CDATA section, cannot be a document child.
+        InsertedNode::Text => {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "text cannot be a child of a document",
+            ));
+        }
+        // A comment or processing instruction may be a document child.
+        InsertedNode::CharacterData | InsertedNode::Other => return Ok(()),
+        InsertedNode::Fragment { elements, has_text } => {
+            if *elements > 1 || *has_text {
+                return Err(throw_dom(
+                    ctx,
+                    "HierarchyRequestError",
+                    "document content model violated",
+                ));
+            }
+            if *elements == 0 {
+                return Ok(());
+            }
+        }
+        InsertedNode::Element => {}
+        InsertedNode::Doctype => {
+            return ensure_doctype_position(ctx, doc, parent, node, reference, exclude);
+        }
     }
-    if node_is_fragment
-        && fragment_children.iter().any(|child| {
-            node_base
-                .get_node(*child)
-                .is_some_and(|candidate| matches!(candidate.data, NodeData::Text(_)))
-        })
-    {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "text cannot be a child of a document",
-        ));
-    }
-    let inserted_elements = if node_is_fragment {
-        fragment_children
-            .iter()
-            .filter(|child| {
-                node_base
-                    .get_node(**child)
-                    .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-            })
-            .count()
-    } else {
-        usize::from(node_is_element)
-    };
-    let existing_elements = base.get_node(parent.node).map_or(0, |root| {
-        root.children
-            .iter()
-            .filter(|child| {
-                (node.document != parent.document || **child != node.node)
-                    && base
-                        .get_node(**child)
-                        .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-            })
-            .count()
-    });
-    if existing_elements + inserted_elements > 1 {
+    let parent_has_element = parent_has_kind(
+        doc,
+        parent.node,
+        exclude,
+        node.document == parent.document,
+        node.node,
+        true,
+    );
+    let child_id = reference.filter(|child| child.document == parent.document);
+    let doctype_follows =
+        child_id.is_some_and(|child| sibling_kind_follows(doc, parent.node, child.node));
+    let child_is_doctype =
+        child_id.is_some_and(|child| exclude != Some(child.node) && doc.is_doctype(child.node));
+    if parent_has_element || doctype_follows || child_is_doctype {
         return Err(throw_dom(
             ctx,
             "HierarchyRequestError",
@@ -351,6 +415,107 @@ fn ensure_document_content_model(
         ));
     }
     Ok(())
+}
+
+fn ensure_doctype_position(
+    ctx: &Ctx<'_>,
+    doc: &crate::documents::BlitzDocument,
+    parent: NodeId,
+    node: NodeId,
+    reference: Option<NodeId>,
+    exclude: Option<BlitzId>,
+) -> Result<()> {
+    let parent_has_doctype = parent_has_kind(
+        doc,
+        parent.node,
+        exclude,
+        node.document == parent.document,
+        node.node,
+        false,
+    );
+    let child_id = reference.filter(|child| child.document == parent.document);
+    let element_precedes =
+        child_id.is_some_and(|child| sibling_kind_precedes(doc, parent.node, child.node));
+    let parent_has_element = parent_has_kind(
+        doc,
+        parent.node,
+        exclude,
+        node.document == parent.document,
+        node.node,
+        true,
+    );
+    if parent_has_doctype || element_precedes || (child_id.is_none() && parent_has_element) {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "doctype violates the document content model",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `parent` has an element (`element`) or doctype child other than
+/// `inserted` and `exclude`.
+fn parent_has_kind(
+    doc: &crate::documents::BlitzDocument,
+    parent: BlitzId,
+    exclude: Option<BlitzId>,
+    same_document: bool,
+    inserted: BlitzId,
+    element: bool,
+) -> bool {
+    doc.base.get_node(parent).is_some_and(|root| {
+        root.children.iter().any(|child| {
+            !(same_document && *child == inserted)
+                && exclude != Some(*child)
+                && if element {
+                    doc.base
+                        .get_node(*child)
+                        .is_some_and(|candidate| candidate.data.downcast_element().is_some())
+                        && !doc.is_fragment(*child)
+                } else {
+                    doc.is_doctype(*child)
+                }
+        })
+    })
+}
+
+/// Whether a doctype follows `child` among `parent`'s children.
+fn sibling_kind_follows(
+    doc: &crate::documents::BlitzDocument,
+    parent: BlitzId,
+    child: BlitzId,
+) -> bool {
+    let Some(node) = doc.base.get_node(parent) else {
+        return false;
+    };
+    let Some(position) = node.children.iter().position(|kid| *kid == child) else {
+        return false;
+    };
+    node.children
+        .iter()
+        .skip(position + 1)
+        .any(|kid| doc.is_doctype(*kid))
+}
+
+/// Whether an element precedes `child` among `parent`'s children.
+fn sibling_kind_precedes(
+    doc: &crate::documents::BlitzDocument,
+    parent: BlitzId,
+    child: BlitzId,
+) -> bool {
+    let Some(node) = doc.base.get_node(parent) else {
+        return false;
+    };
+    let Some(position) = node.children.iter().position(|kid| *kid == child) else {
+        return false;
+    };
+    node.children.iter().take(position).any(|kid| {
+        doc.base
+            .get_node(*kid)
+            .is_some_and(|candidate| candidate.data.downcast_element().is_some())
+            && !doc.is_fragment(*kid)
+    })
 }
 
 pub(super) fn compare_node_position(
@@ -457,7 +622,8 @@ pub(crate) fn construct_node<'js>(
     name: WebIdlString,
     args: Rest<Value<'js>>,
 ) -> Result<Value<'js>> {
-    let first = args.0.into_iter().next();
+    let mut arguments = args.0.into_iter();
+    let first = arguments.next();
     match name.0.as_str() {
         "Text" => {
             let data = constructor_units(&ctx, first)?;
@@ -479,6 +645,36 @@ pub(crate) fn construct_node<'js>(
                     .base
                     .mutate()
                     .create_comment_node(&data.to_string_lossy())
+            })
+        }
+        "ProcessingInstruction" => {
+            // https://dom.spec.whatwg.org/#dom-processinginstruction-processinginstruction
+            let Some(target_value) = first else {
+                return Err(Exception::throw_type(
+                    &ctx,
+                    "ProcessingInstruction requires a target",
+                ));
+            };
+            let target = DomString::from_utf16(super::webidl_to_units(&ctx, target_value)?);
+            let data = constructor_units(&ctx, arguments.next())?;
+            let target_text = target.to_string_lossy();
+            if !crate::xml::is_valid_name(&target_text) {
+                return Err(throw_dom(
+                    &ctx,
+                    "InvalidCharacterError",
+                    "target does not match the XML Name production",
+                ));
+            }
+            let data_text = data.to_string_lossy().into_owned();
+            if data_text.contains("?>") {
+                return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
+            }
+            let target_text = target_text.into_owned();
+            let document = main_document(&ctx)?;
+            create_node(&ctx, document, |parsed| {
+                parsed
+                    .document
+                    .create_processing_instruction(target_text, &data_text)
             })
         }
         "DocumentFragment" => {
@@ -573,7 +769,7 @@ fn constructor_units<'js>(
 
 /// Creates a detached node in `document`'s tree and wraps it. Detached
 /// creation records no mutation: no observer can watch a node with no parent.
-fn create_node<'js>(
+pub(super) fn create_node<'js>(
     ctx: &Ctx<'js>,
     document: NodeId,
     make: impl FnOnce(&mut crate::Parsed) -> BlitzId,
@@ -1870,49 +2066,114 @@ fn locate_prefix(
     None
 }
 
-/// Structural `isEqualNode`
-/// (<https://dom.spec.whatwg.org/#concept-node-equals>). Blitz has no
-/// doctype, processing-instruction, or CDATA kinds; fragments compare by
-/// their backing's children.
-fn nodes_equal_in(
-    base_a: &blitz_dom::BaseDocument,
-    a: BlitzId,
-    base_b: &blitz_dom::BaseDocument,
-    b: BlitzId,
-) -> bool {
-    let node_a = base_a.get_node(a);
-    let node_b = base_b.get_node(b);
-    let (Some(node_a), Some(node_b)) = (node_a, node_b) else {
-        return false;
+/// One node's equality inputs, copied out so two documents are never borrowed
+/// together (<https://dom.spec.whatwg.org/#concept-node-equals>).
+struct EqualView {
+    extra: Option<crate::documents::ExtraNode>,
+    kind: EqualKind,
+    children: Vec<BlitzId>,
+}
+
+enum EqualKind {
+    Document,
+    Element {
+        name: QualName,
+        attributes: Vec<(QualName, String)>,
+    },
+    Text(String),
+    Comment(String),
+    Other,
+}
+
+fn equal_view(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Option<EqualView> {
+    let node = doc.base.get_node(id)?;
+    let kind = match &node.data {
+        NodeData::Document(_) => EqualKind::Document,
+        NodeData::Element(element) => EqualKind::Element {
+            name: element.name.clone(),
+            attributes: element
+                .attrs
+                .iter()
+                .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+                .collect(),
+        },
+        NodeData::Text(text) => EqualKind::Text(text.content.clone()),
+        NodeData::Comment { contents } => EqualKind::Comment(contents.clone()),
+        NodeData::AnonymousBlock(_) => EqualKind::Other,
     };
-    let equal = match (&node_a.data, &node_b.data) {
-        (NodeData::Document(_), NodeData::Document(_)) => true,
-        (NodeData::Element(left), NodeData::Element(right)) => {
-            left.name == right.name
-                && left.attrs.len() == right.attrs.len()
-                && left.attrs.iter().all(|attribute| {
-                    right.attrs.iter().any(|candidate| {
-                        candidate.name == attribute.name && candidate.value == attribute.value
-                    })
+    Some(EqualView {
+        extra: doc.extra(id).cloned(),
+        kind,
+        children: node.children.iter().copied().collect(),
+    })
+}
+
+fn kinds_equal(left: &EqualKind, right: &EqualKind) -> bool {
+    match (left, right) {
+        (EqualKind::Document, EqualKind::Document) => true,
+        (
+            EqualKind::Element {
+                name: left_name,
+                attributes: left_attributes,
+            },
+            EqualKind::Element {
+                name: right_name,
+                attributes: right_attributes,
+            },
+        ) => {
+            left_name == right_name
+                && left_attributes.len() == right_attributes.len()
+                && left_attributes.iter().all(|attribute| {
+                    right_attributes
+                        .iter()
+                        .any(|candidate| candidate == attribute)
                 })
         }
-        (NodeData::Text(left), NodeData::Text(right)) => left.content == right.content,
-        (NodeData::Comment { contents: left }, NodeData::Comment { contents: right }) => {
-            left == right
-        }
+        (EqualKind::Text(left), EqualKind::Text(right))
+        | (EqualKind::Comment(left), EqualKind::Comment(right)) => left == right,
         _ => false,
+    }
+}
+
+/// Structural `isEqualNode`
+/// (<https://dom.spec.whatwg.org/#concept-node-equals>).
+///
+/// Doctype compares name, public id, and system id. A processing instruction
+/// compares target and data. A CDATA section implements `Text` and
+/// `CDATASection`, so it is not equal to a `Text` node with the same data.
+fn nodes_equal(world: &crate::js::world::World, left: NodeId, right: NodeId) -> bool {
+    let left_view = world
+        .document(left)
+        .and_then(|parsed| equal_view(&parsed.document, left.node));
+    let right_view = world
+        .document(right)
+        .and_then(|parsed| equal_view(&parsed.document, right.node));
+    let (Some(left_view), Some(right_view)) = (left_view, right_view) else {
+        return false;
     };
-    if !equal {
+    if left_view.extra != right_view.extra || !kinds_equal(&left_view.kind, &right_view.kind) {
         return false;
     }
-    if node_a.children.len() != node_b.children.len() {
+    if left_view.children.len() != right_view.children.len() {
         return false;
     }
-    node_a
+    left_view
         .children
-        .iter()
-        .zip(node_b.children.iter())
-        .all(|(left, right)| nodes_equal_in(base_a, *left, base_b, *right))
+        .into_iter()
+        .zip(right_view.children)
+        .all(|(left_child, right_child)| {
+            nodes_equal(
+                world,
+                NodeId {
+                    document: left.document,
+                    node: left_child,
+                },
+                NodeId {
+                    document: right.document,
+                    node: right_child,
+                },
+            )
+        })
 }
 
 /// Serializer output: UTF-16 code units, so a lone surrogate in character
@@ -2064,12 +2325,119 @@ fn serialize_html_element(
     output.push_str(">");
 }
 
+/// HTML fragment serialization for a doctype or processing instruction.
+///
+/// A CDATA section serializes as text in HTML, so this leaves it to the text
+/// arm. A doctype is `<!DOCTYPE name>`
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
+fn serialize_html_extra(
+    doc: &crate::documents::BlitzDocument,
+    id: BlitzId,
+    output: &mut HtmlOutput,
+) -> bool {
+    match doc.extra(id) {
+        Some(crate::documents::ExtraNode::DocumentType { name, .. }) => {
+            output.push_str("<!DOCTYPE ");
+            output.push_str(name);
+            output.push_str(">");
+            true
+        }
+        Some(crate::documents::ExtraNode::ProcessingInstruction { target, .. }) => {
+            serialize_processing_instruction(doc, id, target, output);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// XML serialization for a doctype, processing instruction, or CDATA section
+/// (<https://w3c.github.io/DOM-Parsing/#xml-serializing-a-documenttype-node>,
+/// <https://w3c.github.io/DOM-Parsing/#xml-serializing-a-processinginstruction-node>,
+/// <https://w3c.github.io/DOM-Parsing/#xml-serializing-a-cdatasection-node>).
+fn serialize_xml_extra(
+    doc: &crate::documents::BlitzDocument,
+    id: BlitzId,
+    output: &mut HtmlOutput,
+) -> bool {
+    match doc.extra(id) {
+        Some(crate::documents::ExtraNode::DocumentType {
+            name,
+            public_id,
+            system_id,
+        }) => {
+            output.push_str("<!DOCTYPE ");
+            output.push_str(name);
+            if !public_id.is_empty() {
+                output.push_str(" PUBLIC \"");
+                output.push_str(public_id);
+                output.push_str("\"");
+                if !system_id.is_empty() {
+                    output.push_str(" \"");
+                    output.push_str(system_id);
+                    output.push_str("\"");
+                }
+            } else if !system_id.is_empty() {
+                output.push_str(" SYSTEM \"");
+                output.push_str(system_id);
+                output.push_str("\"");
+            }
+            output.push_str(">");
+            true
+        }
+        Some(crate::documents::ExtraNode::ProcessingInstruction { target, .. }) => {
+            serialize_processing_instruction(doc, id, target, output);
+            true
+        }
+        Some(crate::documents::ExtraNode::CDataSection) => {
+            let data = doc
+                .base
+                .get_node(id)
+                .and_then(|node| match &node.data {
+                    NodeData::Text(text) => Some(text.content.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            output.push_str("<![CDATA[");
+            output.push_str(&data);
+            output.push_str("]]>");
+            true
+        }
+        None => false,
+    }
+}
+
+fn serialize_processing_instruction(
+    doc: &crate::documents::BlitzDocument,
+    id: BlitzId,
+    target: &str,
+    output: &mut HtmlOutput,
+) {
+    let data = doc
+        .base
+        .get_node(id)
+        .and_then(|node| match &node.data {
+            NodeData::Comment { contents } => Some(contents.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    output.push_str("<?");
+    output.push_str(target);
+    if !data.is_empty() {
+        output.push_str(" ");
+        output.push_str(&data);
+    }
+    output.push_str("?>");
+}
+
 fn serialize_html_node(
     doc: &crate::documents::BlitzDocument,
     id: BlitzId,
     parent: Option<&QualName>,
     output: &mut HtmlOutput,
 ) {
+    if serialize_html_extra(doc, id, output) {
+        return;
+    }
     let base = &doc.base;
     let Some(node) = base.get_node(id) else {
         return;
@@ -2210,6 +2578,9 @@ pub(crate) fn serialize_xml_node(
     id: BlitzId,
     output: &mut HtmlOutput,
 ) {
+    if serialize_xml_extra(doc, id, output) {
+        return;
+    }
     let base = &doc.base;
     let Some(node) = base.get_node(id) else {
         return;
@@ -2306,16 +2677,34 @@ impl JsNode {
     }
     #[qjs(skip)]
     fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
-        // Known gap (upstream, docs/progress.md): Blitz has no shadow-root,
-        // doctype, processing-instruction, or CDATA node kinds, so those
-        // brands never instantiate. Fragment backings are elements flagged
-        // in the document's fragment set.
         // https://dom.spec.whatwg.org/#dom-node-nodetype
+        // Doctype, processing instruction, and CDATA are side-table records
+        // on a comment or text backing. Fragment backings are elements
+        // flagged in the document's fragment set. Shadow roots have no Blitz
+        // kind.
         let world = world(ctx)?;
-        let is_fragment = world
-            .borrow()
-            .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.is_fragment(self.handle.0.node));
+        let kind = world.borrow().document(self.handle.0).map(|parsed| {
+            (
+                parsed.document.is_fragment(self.handle.0.node),
+                parsed.document.is_doctype(self.handle.0.node),
+                parsed
+                    .document
+                    .is_processing_instruction(self.handle.0.node),
+                parsed.document.is_cdata(self.handle.0.node),
+            )
+        });
+        let Some((is_fragment, is_doctype, is_pi, is_cdata)) = kind else {
+            return Err(Exception::throw_type(ctx, "stale node"));
+        };
+        if is_doctype {
+            return Ok(10);
+        }
+        if is_pi {
+            return Ok(7);
+        }
+        if is_cdata {
+            return Ok(4);
+        }
         if is_fragment {
             return Ok(11);
         }
@@ -2336,12 +2725,23 @@ impl JsNode {
     fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
         let world = world(ctx)?;
-        if world
-            .borrow()
-            .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.is_fragment(self.handle.0.node))
-        {
-            return rquickjs::String::from_str(ctx.clone(), "#document-fragment");
+        let special = world.borrow().document(self.handle.0).and_then(|parsed| {
+            match parsed.document.extra(self.handle.0.node) {
+                Some(crate::documents::ExtraNode::DocumentType { name, .. }) => Some(name.clone()),
+                Some(crate::documents::ExtraNode::ProcessingInstruction { target, .. }) => {
+                    Some(target.clone())
+                }
+                Some(crate::documents::ExtraNode::CDataSection) => {
+                    Some("#cdata-section".to_owned())
+                }
+                None if parsed.document.is_fragment(self.handle.0.node) => {
+                    Some("#document-fragment".to_owned())
+                }
+                None => None,
+            }
+        });
+        if let Some(name) = special {
+            return rquickjs::String::from_str(ctx.clone(), &name);
         }
         let name = with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(element)) => Ok(element_node_name(&element.name, uppercase)),
@@ -2619,26 +3019,17 @@ impl JsNode {
                 "target does not match the XML Name production",
             ));
         }
-        // `xml`, ASCII case-insensitive, is reserved
-        // (<https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction>).
-        if target.0.eq_ignore_ascii_case("xml") {
-            return Err(throw_dom(
-                &ctx,
-                "InvalidCharacterError",
-                "target must not be xml",
-            ));
-        }
         if data.0.to_string_lossy().contains("?>") {
             return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
         }
-        // Known gap (upstream, docs/progress.md): Blitz has no
-        // processing-instruction node kind, so construction throws instead
-        // of handing back a wrong-kind node.
-        Err(throw_dom(
-            &ctx,
-            "HierarchyRequestError",
-            "processing instructions are not supported",
-        ))
+        // https://dom.spec.whatwg.org/#processinginstruction-initialize
+        // The current algorithm checks the Name production and `?>`. It does
+        // not reject an `xml` target.
+        let text = data.0.to_string_lossy().into_owned();
+        let target = target.0;
+        create_node(&ctx, self.handle.0, |parsed| {
+            parsed.document.create_processing_instruction(target, &text)
+        })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcdatasection
@@ -2648,9 +3039,11 @@ impl JsNode {
         ctx: Ctx<'js>,
         data: WebIdlCodeUnits,
     ) -> Result<Value<'js>> {
-        // CDATA sections cannot exist in HTML documents
-        // (<https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
-        if document_is_html(&ctx, self.handle.0) {
+        // An HTML document is one whose content type is `text/html`. An
+        // XHTML document is an XML document and can have CDATA sections
+        // (<https://dom.spec.whatwg.org/#html-document>,
+        // <https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
+        if document_is_html_content(&ctx, self.handle.0) {
             return Err(throw_dom(
                 &ctx,
                 "NotSupportedError",
@@ -2664,14 +3057,10 @@ impl JsNode {
                 "data contains ]]>",
             ));
         }
-        // Known gap (upstream, docs/progress.md): Blitz has no CDATA section
-        // node kind, so construction throws instead of handing back a
-        // wrong-kind node.
-        Err(throw_dom(
-            &ctx,
-            "HierarchyRequestError",
-            "CDATA sections are not supported",
-        ))
+        let text = data.0.to_string_lossy().into_owned();
+        create_node(&ctx, self.handle.0, |parsed| {
+            parsed.document.create_cdata_section(&text)
+        })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattribute
@@ -2962,9 +3351,25 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-doctype
     #[qjs(skip)]
     fn doctype<'js>(&self, ctx: &Ctx<'js>) -> Value<'js> {
-        // Known gap (upstream, docs/progress.md): Blitz has no doctype node
-        // kind, so documents never have a doctype.
-        Value::new_null(ctx.clone())
+        let found = world(ctx).ok().and_then(|world| {
+            world.borrow().document(self.handle.0).and_then(|parsed| {
+                let root = parsed.document.base.root_node().id;
+                let children: Vec<BlitzId> = parsed
+                    .document
+                    .base
+                    .get_node(root)
+                    .map(|root| root.children.iter().copied().collect())
+                    .unwrap_or_default();
+                children
+                    .into_iter()
+                    .find(|child| parsed.document.is_doctype(*child))
+                    .map(|node| NodeId {
+                        document: parsed.id,
+                        node,
+                    })
+            })
+        });
+        child_value(ctx, found).unwrap_or_else(|_| Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-readyState
@@ -4379,6 +4784,11 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
+        // A doctype's node value is null even though its backing is a comment
+        // (<https://dom.spec.whatwg.org/#dom-node-nodevalue>).
+        if parsed.document.is_doctype(self.handle.0.node) {
+            return Ok(None);
+        }
         let data = parsed
             .document
             .base
@@ -4398,6 +4808,21 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
     #[qjs(skip)]
     fn set_node_value(&self, ctx: &Ctx<'_>, value: Option<rquickjs::String<'_>>) -> Result<()> {
+        // Document, DocumentType, and DocumentFragment ignore the setter
+        // (<https://dom.spec.whatwg.org/#dom-node-nodevalue>).
+        let skip = world(ctx).is_ok_and(|world| {
+            world
+                .borrow()
+                .document(self.handle.0)
+                .is_some_and(|parsed| {
+                    parsed.document.is_doctype(self.handle.0.node)
+                        || parsed.document.is_fragment(self.handle.0.node)
+                        || parsed.document.base.root_node().id == self.handle.0.node
+                })
+        });
+        if skip {
+            return Ok(());
+        }
         let value = match value {
             Some(value) => crate::dom_string::DomString::from_utf16(value.to_utf16()?),
             None => crate::dom_string::DomString::default(),
@@ -4413,6 +4838,9 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
+        if parsed.document.is_doctype(self.handle.0.node) {
+            return Ok(None);
+        }
         let base = &parsed.document.base;
         let data = base.get_node(self.handle.0.node).map(|node| &node.data);
         match data {
@@ -4446,6 +4874,21 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Ok(());
             };
+            // A doctype is not `CharacterData`. Replacing its children with a
+            // text node throws, because a doctype cannot be a parent
+            // (<https://dom.spec.whatwg.org/#dom-node-textcontent>,
+            // <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity>).
+            if parsed.document.is_doctype(self.handle.0.node) {
+                return if text.is_empty() {
+                    Ok(())
+                } else {
+                    Err(throw_dom(
+                        ctx,
+                        "HierarchyRequestError",
+                        "doctype cannot have children",
+                    ))
+                };
+            }
             parsed
                 .document
                 .base
@@ -5252,17 +5695,8 @@ impl JsNode {
             return Ok(false);
         };
         let world = world(&ctx)?;
-        let parsed = world.borrow();
-        let (Some(first), Some(second)) = (parsed.document(self.handle.0), parsed.document(other))
-        else {
-            return Ok(false);
-        };
-        Ok(nodes_equal_in(
-            &first.document.base,
-            self.handle.0.node,
-            &second.document.base,
-            other.node,
-        ))
+        let world = world.borrow();
+        Ok(nodes_equal(&world, self.handle.0, other))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-contains
@@ -5416,7 +5850,11 @@ impl JsNode {
         // detached original instead of following the copy
         // (https://dom.spec.whatwg.org/#concept-node-adopt).
         let parent = self.handle.0;
-        let (node, _) = insertion_tree_nodes(&ctx, parent, node, Some(child))?;
+        // `replace` excludes the child being replaced from the document
+        // content-model counts
+        // (<https://dom.spec.whatwg.org/#concept-node-replace>).
+        let exclude = child.tree().map(|id| id.node);
+        let (node, _) = insertion_excluding(&ctx, parent, node, Some(child), exclude)?;
         let Some(child) = child.tree() else {
             return Err(throw_dom(
                 &ctx,
@@ -7816,28 +8254,192 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        // Known gap: Blitz has no processing-instruction nodes, so the brand
-        // never instantiates and the target reads empty.
-        let _ = self.handle;
-        rquickjs::String::from_str(ctx.clone(), "")
+        let target = pi_target(ctx, self.handle.0);
+        rquickjs::String::from_str(ctx.clone(), &target)
     }
+
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-hasattributes
+    fn has_attributes(&self, ctx: Ctx<'js>) -> Result<bool> {
+        Ok(!pi_attributes(&ctx, self.handle.0)?.is_empty())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-getattributenames
+    fn get_attribute_names(&self, ctx: Ctx<'js>) -> Result<Vec<String>> {
+        Ok(pi_attributes(&ctx, self.handle.0)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-getattribute
+    fn get_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let name = arg_0.to_string()?;
+        match pi_attributes(&ctx, self.handle.0)?
+            .into_iter()
+            .find(|(attribute, _)| attribute == &name)
+        {
+            Some((_, value)) => rquickjs::String::from_str(ctx, &value).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-setattribute
+    fn set_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        let name = arg_0.to_string()?;
+        if !valid_attribute_local_name(&name) {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidCharacterError",
+                "attribute name is not a valid attribute local name",
+            ));
+        }
+        let value = arg_1.to_string()?;
+        let mut attributes = pi_attributes(&ctx, self.handle.0)?;
+        if let Some((_, stored)) = attributes
+            .iter_mut()
+            .find(|(attribute, _)| attribute == &name)
+        {
+            *stored = value;
+        } else {
+            attributes.push((name, value));
+        }
+        write_pi_attributes(&ctx, self.handle.0, attributes)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-removeattribute
+    fn remove_attribute(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<()> {
+        let name = arg_0.to_string()?;
+        let mut attributes = pi_attributes(&ctx, self.handle.0)?;
+        attributes.retain(|(attribute, _)| attribute != &name);
+        write_pi_attributes(&ctx, self.handle.0, attributes)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-toggleattribute
+    fn toggle_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: Option<bool>,
+    ) -> Result<bool> {
+        let name = arg_0.to_string()?;
+        if !valid_attribute_local_name(&name) {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidCharacterError",
+                "attribute name is not a valid attribute local name",
+            ));
+        }
+        let mut attributes = pi_attributes(&ctx, self.handle.0)?;
+        let exists = attributes.iter().any(|(attribute, _)| attribute == &name);
+        if !exists {
+            if arg_1.unwrap_or(true) {
+                attributes.push((name, String::new()));
+                write_pi_attributes(&ctx, self.handle.0, attributes)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if arg_1 == Some(true) {
+            // Present and force is true: the value and the data stay as they are
+            // (<https://dom.spec.whatwg.org/#dom-processinginstruction-toggleattribute>).
+            return Ok(true);
+        }
+        attributes.retain(|(attribute, _)| attribute != &name);
+        write_pi_attributes(&ctx, self.handle.0, attributes)?;
+        Ok(false)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-hasattribute
+    fn has_attribute(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
+        let name = arg_0.to_string()?;
+        Ok(pi_attributes(&ctx, self.handle.0)?
+            .iter()
+            .any(|(attribute, _)| attribute == &name))
+    }
+}
+
+fn pi_target(ctx: &Ctx<'_>, id: NodeId) -> String {
+    let Ok(world) = world(ctx) else {
+        return String::new();
+    };
+    let world = world.borrow();
+    world
+        .document(id)
+        .and_then(|parsed| match parsed.document.extra(id.node) {
+            Some(crate::documents::ExtraNode::ProcessingInstruction { target, .. }) => {
+                Some(target.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn pi_attributes(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<(String, String)>> {
+    let owner = world_for_node(ctx, id)?;
+    Ok(owner
+        .borrow()
+        .document(id)
+        .and_then(|parsed| parsed.document.pi_attributes(id.node).map(<[_]>::to_vec))
+        .unwrap_or_default())
+}
+
+fn write_pi_attributes(ctx: &Ctx<'_>, id: NodeId, attributes: Vec<(String, String)>) -> Result<()> {
+    let data = crate::pseudo_attributes::serialize_pseudo_attributes(&attributes);
+    {
+        let owner = world_for_node(ctx, id)?;
+        let owner = owner.borrow();
+        let Some(mut parsed) = owner.document_mut(id) else {
+            return Ok(());
+        };
+        parsed.document.set_pi_attributes(id.node, attributes);
+    }
+    set_pi_data(ctx, id, &DomString::from(data))
+}
+
+fn doctype_field(ctx: &Ctx<'_>, id: NodeId, field: fn(&str, &str, &str) -> String) -> String {
+    let Ok(world) = world(ctx) else {
+        return String::new();
+    };
+    let world = world.borrow();
+    world
+        .document(id)
+        .and_then(|parsed| match parsed.document.extra(id.node) {
+            Some(crate::documents::ExtraNode::DocumentType {
+                name,
+                public_id,
+                system_id,
+            }) => Some(field(name, public_id, system_id)),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 impl<'js> document_type_generated::DocumentType<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-documenttype-name
     fn get_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        // Blitz has no doctype nodes, so no `DocumentType` ever has a name.
-        rquickjs::String::from_str(ctx.clone(), "")
+        let name = doctype_field(ctx, self.handle.0, |name, _, _| name.to_owned());
+        rquickjs::String::from_str(ctx.clone(), &name)
     }
 
     // https://dom.spec.whatwg.org/#dom-documenttype-publicid
     fn get_public_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        rquickjs::String::from_str(ctx.clone(), "")
+        let public_id = doctype_field(ctx, self.handle.0, |_, public_id, _| public_id.to_owned());
+        rquickjs::String::from_str(ctx.clone(), &public_id)
     }
 
     // https://dom.spec.whatwg.org/#dom-documenttype-systemid
     fn get_system_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        rquickjs::String::from_str(ctx.clone(), "")
+        let system_id = doctype_field(ctx, self.handle.0, |_, _, system_id| system_id.to_owned());
+        rquickjs::String::from_str(ctx.clone(), &system_id)
     }
 }
 
