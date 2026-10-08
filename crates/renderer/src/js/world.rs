@@ -290,6 +290,23 @@ pub(crate) fn attr<'a>(
         .attr(markup5ever::LocalName::from(name))
 }
 
+/// The value of the first attribute whose qualified name is `qualified`.
+///
+/// <https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>
+pub(crate) fn attr_by_qualified_name<'a>(
+    base: &'a blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+    qualified: &str,
+) -> Option<&'a str> {
+    base.get_node(id)?
+        .data
+        .downcast_element()?
+        .attrs
+        .iter()
+        .find(|attribute| crate::names::qualified_name_eq(&attribute.name, qualified))
+        .map(|attribute| attribute.value.as_str())
+}
+
 /// The HTML namespace all HTML elements live in.
 pub(crate) fn html_namespace() -> markup5ever::Namespace {
     markup5ever::ns!(html)
@@ -480,6 +497,8 @@ pub(crate) enum Wrapper {
     StyleDeclaration,
     /// `HTMLElement.dataset`.
     Dataset,
+    /// `Node.childNodes`.
+    ChildNodes,
 }
 
 pub(crate) struct WeakReferences {

@@ -277,6 +277,10 @@ pub(crate) struct Document {
     /// Decoder for a body that is still arriving; `None` when the markup is
     /// already in hand.
     decoder: Option<dial::ResponseDecoder>,
+    /// The response `Content-Type` for the active parser. XML MIME types
+    /// select the XML parser; anything else, including a script's
+    /// `document.open()`, stays HTML.
+    response_content_type: Option<String>,
     classic_fetch_in_flight: bool,
     deferred_modules: Vec<(crate::js::world::NodeId, crate::js::ScriptSource)>,
     stop: Arc<Stop>,
@@ -352,6 +356,7 @@ impl Document {
             parser_eof: true,
             parser_owner: ParserOwner::Carrier,
             decoder: None,
+            response_content_type: None,
             classic_fetch_in_flight: false,
             deferred_modules: Vec::new(),
             stop: Arc::clone(&runtime.stop),
@@ -908,6 +913,7 @@ impl Document {
         self.parser_eof = eof;
         self.decoder = decoder;
         self.parser_owner = owner;
+        self.response_content_type = None;
         self.active_buffer = Some(input.to_owned());
     }
 
@@ -940,6 +946,7 @@ impl Document {
             ParserOwner::Carrier,
             Some(dial::ResponseDecoder::new(content_type.map(str::to_owned))),
         );
+        self.response_content_type = content_type.map(str::to_owned);
     }
 
     /// Starts a document from a complete response: new realm, the response's
@@ -1290,7 +1297,7 @@ impl Document {
         }
         // Viewport changes can flip `matchMedia` results
         // (<https://drafts.csswg.org/cssom-view/#evaluate-media-queries-and-report-changes>).
-        self.fire_js(|js| js.report_media_changes());
+        self.fire_js(super::js::JsRealm::report_media_changes);
     }
 
     /// Sets the frame's persisted viewport size without touching its current
@@ -1346,7 +1353,20 @@ impl Document {
         for chunk in pending {
             buffer.push_str(&chunk);
         }
-        let parsed = crate::parse_html(&buffer, self.blitz_config());
+        // XML MIME types use the XML parser. HTML, and a script's
+        // `document.open()`, do not
+        // (<https://html.spec.whatwg.org/multipage/parsing.html#xml-parser>,
+        // <https://mimesniff.spec.whatwg.org/#xml-mime-type>).
+        let parsed = match self
+            .response_content_type
+            .as_deref()
+            .and_then(crate::xml::navigated_content_type)
+        {
+            Some(content_type) => {
+                crate::xml::parse_navigated(&buffer, content_type, self.blitz_config())
+            }
+            None => crate::parse_html(&buffer, self.blitz_config()),
+        };
         if !self.install_parsed(parsed) {
             self.record_event(RendererEvent::ScriptFailed);
             return;

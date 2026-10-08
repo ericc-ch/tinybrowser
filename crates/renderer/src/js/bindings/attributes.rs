@@ -1039,17 +1039,17 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
         )
     }
 
-    // Supported property names are the attribute qualified names. HTML
-    // elements expose only names that survive ASCII lowercasing, since the
-    // named getter lowercases (Firefox: `nsDOMAttributeMap`). A name that
-    // repeats keeps its first attribute, matching own-property definition
-    // order.
+    // Supported property names are the attribute qualified names. An HTML
+    // element in an HTML document drops names that are not already ASCII
+    // lowercase. A name that repeats keeps its first attribute.
+    // https://dom.spec.whatwg.org/#interface-namednodemap
     fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
         let html = with_node_data(ctx, self.element.0, |data| {
             data.and_then(|data| data.downcast_element())
                 .is_some_and(|element| element.name.ns == js_world::html_namespace())
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+            && super::document::document_is_html_content(ctx, self.element.0);
         let world_rc = world_for_node(ctx, self.element.0)?;
         let world = world_rc.borrow();
         let mut seen = HashSet::new();
@@ -1214,17 +1214,19 @@ fn named_item<'js>(ctx: &Ctx<'js>, element: NodeId, name: &str) -> Result<Value<
     }
 }
 
-/// The DOM local name `name` refers to on `element`: an HTML element coerces
-/// to ASCII lowercase, any other element keeps the name
-/// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
+/// The qualified name `name` matches on `element`.
+///
+/// An element in the HTML namespace whose node document is an HTML document
+/// matches the ASCII-lowercased name. Any other element keeps the name.
+/// <https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>
 pub(super) fn attribute_local_name(ctx: &Ctx<'_>, element: NodeId, name: &str) -> String {
-    // `node.rs` calls this on every `getAttribute`, so a missing document
-    // falls back to the non-HTML spelling instead of throwing.
+    // A missing document falls back to the non-HTML spelling instead of throwing.
     let html = with_node_data(ctx, element, |data| {
         data.and_then(|data| data.downcast_element())
             .is_some_and(|element| element.name.ns == js_world::html_namespace())
     })
-    .unwrap_or(false);
+    .unwrap_or(false)
+        && super::document::document_is_html_content(ctx, element);
     if html {
         name.to_ascii_lowercase()
     } else {
@@ -1361,10 +1363,12 @@ fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Resul
             .document
             .base
             .mutate()
-            .set_attribute(owner.node, name.clone(), &value);
+            .set_attribute(owner.node, name, &value);
         parsed.document.record(JournalEntry::Attributes {
             target: owner,
-            name: qualified_name(&name),
+            // attributeName is the attribute's local name.
+            // https://dom.spec.whatwg.org/#handle-attribute-changes
+            name: snapshot.local.clone(),
             namespace: snapshot.namespace,
             old_value,
         });
@@ -1739,7 +1743,9 @@ pub(crate) fn remove_attribute_sync(
                 .clear_attribute(element.node, name.clone());
             parsed.document.record(JournalEntry::Attributes {
                 target: element,
-                name: qualified_name(name),
+                // attributeName is the attribute's local name.
+                // https://dom.spec.whatwg.org/#handle-attribute-changes
+                name: name.local.as_ref().to_owned(),
                 namespace: name.ns.as_ref().to_owned(),
                 old_value: Some(value.clone()),
             });
@@ -1831,15 +1837,27 @@ pub(crate) fn set_attribute_sync(
                 "attribute target is not an element",
             ));
         };
+        // Match the qualified name, so `setAttribute("foo:bar")` updates the
+        // existing `foo:bar` attribute instead of creating a second one.
+        // https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name
         let name = data
             .attrs
             .iter()
-            .find(|attribute| attribute.name.local.as_ref() == local)
+            .find(|attribute| qualified_name_eq(&attribute.name, local))
             .map_or_else(
-                || QualName::new(None, js_world::html_namespace(), LocalName::from(local)),
+                // setAttribute creates an attribute whose namespace is null.
+                // https://dom.spec.whatwg.org/#concept-element-attributes-set-value
+                || {
+                    QualName::new(
+                        None,
+                        markup5ever::Namespace::from(""),
+                        LocalName::from(local),
+                    )
+                },
                 |attribute| attribute.name.clone(),
             );
-        let old_value = js_world::attr(base, element.node, local).map(ToOwned::to_owned);
+        let old_value =
+            js_world::attr_by_qualified_name(base, element.node, local).map(ToOwned::to_owned);
         (name, old_value)
     };
     let namespace = name.ns.as_ref().to_owned();
@@ -1850,7 +1868,9 @@ pub(crate) fn set_attribute_sync(
         .set_attribute(element.node, name.clone(), value);
     parsed.document.record(JournalEntry::Attributes {
         target: element,
-        name: qualified_name(&name),
+        // attributeName is the attribute's local name.
+        // https://dom.spec.whatwg.org/#handle-attribute-changes
+        name: name.local.as_ref().to_owned(),
         namespace: namespace.clone(),
         old_value,
     });
@@ -2072,7 +2092,9 @@ pub(crate) fn set_attribute_node<'js>(
             })?;
         parsed.document.record(JournalEntry::Attributes {
             target: element,
-            name: state.qualified.clone(),
+            // attributeName is the attribute's local name.
+            // https://dom.spec.whatwg.org/#handle-attribute-changes
+            name: state.local.clone(),
             namespace: state.namespace.clone(),
             old_value,
         });

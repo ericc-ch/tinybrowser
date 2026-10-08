@@ -12,8 +12,10 @@ pub(crate) fn parse_document(
     base_url: String,
     font_ctx: parley::FontContext,
 ) -> Parsed {
-    let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(
+    parse_with_config(
         input,
+        content_type,
+        crate::ReadyState::Complete,
         blitz_dom::DocumentConfig {
             base_url: Some(base_url),
             font_ctx: Some(font_ctx),
@@ -21,16 +23,56 @@ pub(crate) fn parse_document(
             ..blitz_dom::DocumentConfig::default()
         },
     )
-    .into();
+}
+
+/// Parses a navigated XML response with the frame's document config.
+///
+/// XML documents are always no-quirks
+/// (<https://dom.spec.whatwg.org/#concept-document-quirks>).
+pub(crate) fn parse_navigated(
+    input: &str,
+    content_type: &'static str,
+    config: blitz_dom::DocumentConfig,
+) -> Parsed {
+    parse_with_config(input, content_type, crate::ReadyState::Loading, config)
+}
+
+fn parse_with_config(
+    input: &str,
+    content_type: &'static str,
+    ready_state: crate::ReadyState,
+    config: blitz_dom::DocumentConfig,
+) -> Parsed {
+    let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
     let document = crate::documents::BlitzDocument::from_base(base);
     Parsed {
         id: 0,
         document,
         quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
         content_type,
-        ready_state: crate::ReadyState::Complete,
+        ready_state,
         url: None,
     }
+}
+
+/// The document content type when `header` is an XML MIME type, otherwise
+/// `None` so the response stays on the HTML parser.
+///
+/// An XML MIME type has essence `text/xml` or `application/xml`, or a subtype
+/// ending in `+xml` (<https://mimesniff.spec.whatwg.org/#xml-mime-type>).
+pub(crate) fn navigated_content_type(header: &str) -> Option<&'static str> {
+    let essence = header.split(';').next()?.trim().to_ascii_lowercase();
+    let (kind, subtype) = essence.split_once('/')?;
+    if kind.is_empty() || !(subtype == "xml" || subtype.ends_with("+xml")) {
+        return None;
+    }
+    Some(match essence.as_str() {
+        "text/xml" => "text/xml",
+        "application/xhtml+xml" => "application/xhtml+xml",
+        "image/svg+xml" => "image/svg+xml",
+        // `application/xml` and every other XML MIME type.
+        _ => "application/xml",
+    })
 }
 
 /// Whether `name` matches the XML `Name` production

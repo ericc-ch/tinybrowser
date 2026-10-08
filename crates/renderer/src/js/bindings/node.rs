@@ -21,6 +21,7 @@ use super::{
 use rquickjs::function::Rest;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use blitz_dom::NodeData;
@@ -168,14 +169,20 @@ fn insertion_tree_nodes(
         Some(NodeReference::Tree(id)) => Some(id),
         Some(NodeReference::Attribute { .. }) | None => None,
     };
-    if let Some(reference) = reference {
-        ensure_parented(ctx, base, parent, reference)?;
-    }
     // The node itself must be live, resolved in its own document.
     let node_parsed = owner
         .document(node)
         .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
     let node_base = &node_parsed.document.base;
+    // Step 2 runs before the reference-child check (step 3): an ancestor
+    // throws HierarchyRequestError even when `child` is not a child of parent.
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    if node.document == parent.document {
+        ensure_no_cycle(ctx, base, parent.node, node.node)?;
+    }
+    if let Some(reference) = reference {
+        ensure_parented(ctx, base, parent, reference)?;
+    }
     // A document (any document's root) can never be inserted.
     // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
     if node_base.root_node().id == node.node {
@@ -200,11 +207,6 @@ fn insertion_tree_nodes(
             "HierarchyRequestError",
             "node cannot be inserted",
         ));
-    }
-    // A node cannot be inserted into its own subtree.
-    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
-    if node.document == parent.document {
-        ensure_no_cycle(ctx, base, parent.node, node.node)?;
     }
     // The document content model: at most one element child, and no text
     // directly under the document.
@@ -2392,9 +2394,26 @@ impl JsNode {
         child_value(ctx, id)
     }
 
+    // https://dom.spec.whatwg.org/#dom-node-childnodes
     #[qjs(skip)]
     fn child_nodes<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        live_collection(ctx, self.handle.0, CollectionKind::Children, None)
+        // `[SameObject]`: one NodeList per node.
+        let world_rc = world(ctx)?;
+        if let Some(saved) = world_rc
+            .borrow()
+            .wrapper(self.handle.0, Wrapper::ChildNodes)
+            && let Some(value) = deref_weak(ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let value = live_collection(ctx, self.handle.0, CollectionKind::Children, None)?;
+        let weak = make_weak(ctx, value.clone())?;
+        world_rc.borrow_mut().intern_wrapper(
+            self.handle.0,
+            Wrapper::ChildNodes,
+            Persistent::save(ctx, weak),
+        );
+        Ok(value)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-appendchild
@@ -3064,7 +3083,12 @@ impl JsNode {
         let local = attribute_local_name(&ctx, self.handle.0, &name.0);
         let world = world(&ctx)?;
         let found = world.borrow().document(self.handle.0).and_then(|parsed| {
-            attr(&parsed.document.base, self.handle.0.node, &local).map(ToOwned::to_owned)
+            crate::js::world::attr_by_qualified_name(
+                &parsed.document.base,
+                self.handle.0.node,
+                &local,
+            )
+            .map(ToOwned::to_owned)
         });
         match found {
             Some(value) => string_value(&ctx, &value),
@@ -4747,7 +4771,12 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(attr(&parsed.document.base, self.handle.0.node, &local).is_some())
+        Ok(crate::js::world::attr_by_qualified_name(
+            &parsed.document.base,
+            self.handle.0.node,
+            &local,
+        )
+        .is_some())
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributens
@@ -4846,7 +4875,6 @@ impl JsNode {
                         .map(|attribute| attribute.name.clone())
                 })
                 .unwrap_or(name);
-            let qualified = qualified_name(&stored);
             parsed
                 .document
                 .base
@@ -4854,7 +4882,9 @@ impl JsNode {
                 .set_attribute(self.handle.0.node, stored, &value.0);
             parsed.document.record(JournalEntry::Attributes {
                 target: self.handle.0,
-                name: qualified,
+                // attributeName is the attribute's local name.
+                // https://dom.spec.whatwg.org/#handle-attribute-changes
+                name: local.clone(),
                 namespace: namespace.clone(),
                 old_value,
             });
@@ -5054,7 +5084,12 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            attr(&parsed.document.base, self.handle.0.node, &local).is_some()
+            crate::js::world::attr_by_qualified_name(
+                &parsed.document.base,
+                self.handle.0.node,
+                &local,
+            )
+            .is_some()
         };
         let should_exist = force.unwrap_or(!exists);
         if should_exist == exists {
@@ -5754,6 +5789,12 @@ impl<'js> element_generated::Element<'js> for JsNode {
         self.matches(ctx, WebIdlString(arg_0.to_string()?))
     }
 
+    // https://dom.spec.whatwg.org/#dom-element-webkitmatchesselector
+    fn webkit_matches_selector(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
+        // Legacy alias of `matches(selectors)`.
+        self.matches(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
     // https://dom.spec.whatwg.org/#dom-element-closest
     fn closest(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.closest(ctx, WebIdlString(arg_0.to_string()?))
@@ -5791,6 +5832,49 @@ impl<'js> element_generated::Element<'js> for JsNode {
             WebIdlString(arg_0.to_string()?),
             WebIdlString(arg_1.to_string()?),
         )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-insertadjacentelement
+    fn insert_adjacent_element(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let element = require_context_element(&ctx, self.handle.0)?;
+        let node = require_element_argument(&ctx, &arg_1)?;
+        match insert_adjacent(&ctx, element, &arg_0.to_string()?, node)? {
+            Some(node) => wrap_node(&ctx, node),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-insertadjacenttext
+    fn insert_adjacent_text(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        let element = require_context_element(&ctx, self.handle.0)?;
+        let text = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(element) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let node = parsed
+                .document
+                .base
+                .mutate()
+                .create_text_node(&arg_1.to_string()?);
+            NodeId {
+                document: element.document,
+                node,
+            }
+        };
+        insert_adjacent(&ctx, element, &arg_0.to_string()?, text)?;
+        Ok(())
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
@@ -6669,6 +6753,158 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
     }
 }
 
+/// The context object of an `Element` operation.
+fn require_context_element(ctx: &Ctx<'_>, id: NodeId) -> Result<NodeId> {
+    let element = {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        world.document(id).is_some_and(|parsed| {
+            !parsed.document.is_fragment(id.node)
+                && parsed
+                    .document
+                    .base
+                    .get_node(id.node)
+                    .is_some_and(|node| node.data.downcast_element().is_some())
+        })
+    };
+    if element {
+        Ok(id)
+    } else {
+        Err(Exception::throw_type(ctx, "argument is not an Element"))
+    }
+}
+
+/// An `Element` argument
+/// (<https://webidl.spec.whatwg.org/#es-interface>).
+fn require_element_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<NodeId> {
+    let Some(id) = host_node_id(ctx, value) else {
+        return Err(Exception::throw_type(ctx, "argument is not an Element"));
+    };
+    require_context_element(ctx, id)
+}
+
+/// [Insert adjacent](https://dom.spec.whatwg.org/#concept-element-insert-adjacent).
+///
+/// Returns the inserted node, or `None` when `beforebegin` / `afterend` has
+/// no parent.
+fn insert_adjacent(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    where_: &str,
+    node: NodeId,
+) -> Result<Option<NodeId>> {
+    let position = where_.to_ascii_lowercase();
+    let (parent, reference) = match position.as_str() {
+        "beforebegin" => {
+            let Some(parent) = tree_parent(ctx, element)? else {
+                return Ok(None);
+            };
+            (parent, Some(element))
+        }
+        "afterbegin" => {
+            let world = world(ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(element) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            let first = parsed
+                .document
+                .base
+                .get_node(element.node)
+                .and_then(|node| node.children.first().copied())
+                .map(|node| NodeId {
+                    document: element.document,
+                    node,
+                });
+            (element, first)
+        }
+        "beforeend" => (element, None),
+        "afterend" => {
+            let Some(parent) = tree_parent(ctx, element)? else {
+                return Ok(None);
+            };
+            let world = world(ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(element) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            let next = sibling(&parsed.document.base, element.node, true).map(|node| NodeId {
+                document: element.document,
+                node,
+            });
+            (parent, next)
+        }
+        _ => {
+            return Err(throw_dom(ctx, "SyntaxError", "invalid position"));
+        }
+    };
+    let (node, reference) = insertion_tree_nodes(
+        ctx,
+        parent,
+        NodeReference::Tree(node),
+        reference.map(NodeReference::Tree),
+    )?;
+    let node = adopt_node(ctx, parent, node)?;
+    insert_tree_node(ctx, parent, node, reference)?;
+    Ok(Some(node))
+}
+
+/// Node ids among `(Node or DOMString)` arguments, for sibling exclusion
+/// (<https://dom.spec.whatwg.org/#dom-childnode-before>).
+fn argument_node_ids(nodes: &[NodeOrString<'_>]) -> HashSet<BlitzId> {
+    nodes
+        .iter()
+        .filter_map(|node| match node {
+            NodeOrString::Node(reference) => reference.tree().map(|id| id.node),
+            NodeOrString::String(_) => None,
+        })
+        .collect()
+}
+
+/// `id`'s parent, or `None` when it is parentless.
+fn tree_parent(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<NodeId>> {
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    Ok(parsed
+        .document
+        .base
+        .get_node(id.node)
+        .and_then(|node| node.parent)
+        .map(|node| NodeId {
+            document: id.document,
+            node,
+        }))
+}
+
+/// The nearest sibling of `id` in `forward` direction that is not in
+/// `excluded`.
+fn sibling_not_in(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzId,
+    forward: bool,
+    excluded: &HashSet<BlitzId>,
+) -> Option<BlitzId> {
+    let node = base.get_node(id)?;
+    let parent = node.parent?;
+    let siblings = &base.get_node(parent)?.children;
+    let position = siblings.iter().position(|sibling| *sibling == id)?;
+    if forward {
+        siblings[position + 1..]
+            .iter()
+            .copied()
+            .find(|sibling| !excluded.contains(sibling))
+    } else {
+        siblings[..position]
+            .iter()
+            .copied()
+            .rev()
+            .find(|sibling| !excluded.contains(sibling))
+    }
+}
+
 impl<'js> child_node_generated::ChildNode<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-childnode-before
     fn before(
@@ -6676,35 +6912,47 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        // Adoption by copy leaves a stale handle behind; insert beside the
-        // live node (https://dom.spec.whatwg.org/#concept-node-adopt).
-        let reference = self.handle.0;
-        let node = convert_union_nodes_into_node(&ctx, reference, union_nodes(nodes))?;
-        let (parent, reference) = {
+        // Parent and the viable sibling are captured before conversion.
+        // Converting can move `this` into a fragment
+        // (https://dom.spec.whatwg.org/#dom-childnode-before).
+        let target = self.handle.0;
+        let nodes = union_nodes(nodes);
+        let excluded = argument_node_ids(&nodes);
+        let Some(parent) = tree_parent(&ctx, target)? else {
+            return Ok(());
+        };
+        let viable_previous = {
             let world = world(&ctx)?;
             let world = world.borrow();
-            let Some(parsed) = world.document(reference) else {
+            let Some(parsed) = world.document(target) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let Some(parent) = parsed
-                .document
-                .base
-                .get_node(reference.node)
-                .and_then(|node| node.parent)
-                .map(|node| NodeId {
-                    document: reference.document,
-                    node,
-                })
-            else {
-                return Ok(());
+            sibling_not_in(&parsed.document.base, target.node, false, &excluded)
+        };
+        let node = convert_union_nodes_into_node(&ctx, target, nodes)?;
+        let reference = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(parent) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
             };
-            (parent, reference)
+            let base = &parsed.document.base;
+            let child = if let Some(previous) = viable_previous {
+                sibling(base, previous, true)
+            } else {
+                base.get_node(parent.node)
+                    .and_then(|node| node.children.first().copied())
+            };
+            child.map(|node| NodeId {
+                document: parent.document,
+                node,
+            })
         };
         let (node, reference) = insertion_tree_nodes(
             &ctx,
             parent,
             NodeReference::Tree(node),
-            Some(NodeReference::Tree(reference)),
+            reference.map(NodeReference::Tree),
         )?;
         insert_tree_node(&ctx, parent, node, reference)
     }
@@ -6715,33 +6963,28 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        // Adoption by copy leaves a stale handle behind; insert beside the
-        // live node (https://dom.spec.whatwg.org/#concept-node-adopt).
+        // Parent and the viable sibling are captured before conversion.
+        // Converting can move `this` into a fragment
+        // (https://dom.spec.whatwg.org/#dom-childnode-after).
         let target = self.handle.0;
-        let node = convert_union_nodes_into_node(&ctx, target, union_nodes(nodes))?;
-        let (parent, reference) = {
+        let nodes = union_nodes(nodes);
+        let excluded = argument_node_ids(&nodes);
+        let Some(parent) = tree_parent(&ctx, target)? else {
+            return Ok(());
+        };
+        let viable_next = {
             let world = world(&ctx)?;
             let world = world.borrow();
             let Some(parsed) = world.document(target) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let base = &parsed.document.base;
-            let Some(parent) =
-                base.get_node(target.node)
-                    .and_then(|node| node.parent)
-                    .map(|node| NodeId {
-                        document: target.document,
-                        node,
-                    })
-            else {
-                return Ok(());
-            };
-            let reference = sibling(base, target.node, true).map(|node| NodeId {
-                document: target.document,
-                node,
-            });
-            (parent, reference)
+            sibling_not_in(&parsed.document.base, target.node, true, &excluded)
         };
+        let node = convert_union_nodes_into_node(&ctx, target, nodes)?;
+        let reference = viable_next.map(|node| NodeId {
+            document: parent.document,
+            node,
+        });
         let (node, reference) = insertion_tree_nodes(
             &ctx,
             parent,
@@ -6757,49 +7000,56 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        // Adoption by copy leaves a stale handle behind; replace the live
-        // node (https://dom.spec.whatwg.org/#concept-node-adopt).
+        // Parent and the viable sibling are captured before conversion.
+        // A parentless child returns before any node is moved
+        // (https://dom.spec.whatwg.org/#dom-childnode-replacewith).
         let target = self.handle.0;
-        let node = convert_union_nodes_into_node(&ctx, target, union_nodes(nodes))?;
-        let parent = {
+        let nodes = union_nodes(nodes);
+        let excluded = argument_node_ids(&nodes);
+        let Some(parent) = tree_parent(&ctx, target)? else {
+            return Ok(());
+        };
+        let viable_next = {
             let world = world(&ctx)?;
             let world = world.borrow();
             let Some(parsed) = world.document(target) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let Some(parent) = parsed
-                .document
-                .base
-                .get_node(target.node)
-                .and_then(|node| node.parent)
-                .map(|node| NodeId {
-                    document: target.document,
-                    node,
-                })
-            else {
-                return Ok(());
-            };
-            parent
+            sibling_not_in(&parsed.document.base, target.node, true, &excluded)
         };
-        let (node, _) = insertion_tree_nodes(
+        let node = convert_union_nodes_into_node(&ctx, target, nodes)?;
+        if tree_parent(&ctx, target)?.is_some_and(|current| current == parent) {
+            let (node, _) = insertion_tree_nodes(
+                &ctx,
+                parent,
+                NodeReference::Tree(node),
+                Some(NodeReference::Tree(target)),
+            )?;
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(target) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let moved = replace_parsed(&ctx, &mut parsed, parent, node, target);
+            drop(parsed);
+            drop(world);
+            for id in &moved {
+                fixup_option_on_insert(&ctx, *id)?;
+                fixup_radio_on_insert(&ctx, *id)?;
+            }
+            return schedule_mutation_delivery(&ctx);
+        }
+        let reference = viable_next.map(|node| NodeId {
+            document: parent.document,
+            node,
+        });
+        let (node, reference) = insertion_tree_nodes(
             &ctx,
             parent,
             NodeReference::Tree(node),
-            Some(NodeReference::Tree(target)),
+            reference.map(NodeReference::Tree),
         )?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(target) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let moved = replace_parsed(&ctx, &mut parsed, parent, node, target);
-        drop(parsed);
-        drop(world);
-        for id in &moved {
-            fixup_option_on_insert(&ctx, *id)?;
-            fixup_radio_on_insert(&ctx, *id)?;
-        }
-        schedule_mutation_delivery(&ctx)
+        insert_tree_node(&ctx, parent, node, reference)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-remove
