@@ -20,7 +20,7 @@ use crate::js::world::{
 };
 use crate::names::qualified_name_eq;
 
-use rquickjs::{Class, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace};
+use rquickjs::{Class, Ctx, Exception, Object, Persistent, Result, Value, class::Trace};
 
 use super::node::node_generated;
 use crate::js::events::{
@@ -1603,8 +1603,7 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
             } else {
                 "event"
             };
-            let source = format!("(function({params}) {{\n{body}\n}})");
-            match ctx.eval::<Function, _>(source) {
+            match crate::js::events::compile_handler_function(ctx, params, &body) {
                 Ok(compiled) => {
                     object.set(name.as_str(), compiled.clone())?;
                     if forwarded {
