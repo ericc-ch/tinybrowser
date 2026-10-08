@@ -80,7 +80,7 @@
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'URL', 'documentURI', 'baseURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
-    'getElementsByName', 'importNode', 'currentScript', 'scripts', 'activeElement',
+    'getElementsByName', 'importNode', 'currentScript', 'activeElement',
     'elementFromPoint', 'elementsFromPoint', 'defaultView', 'hasFocus'
   ], true);
   const ElementInterface = define('Element', NodeInterface, [
@@ -125,7 +125,7 @@
   const ShadowRootInterface = define('ShadowRoot', DocumentFragmentInterface, [
     'host', 'mode', 'innerHTML', 'activeElement'
   ]);
-  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur', 'innerText'], true);
+  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur'], true);
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
   const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);

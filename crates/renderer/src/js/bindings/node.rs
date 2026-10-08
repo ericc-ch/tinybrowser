@@ -3258,30 +3258,6 @@ impl JsNode {
         Ok(value)
     }
 
-    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
-    #[qjs(get, rename = "scripts")]
-    fn scripts<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world(&ctx)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::Scripts)
-            && let Some(value) = deref_weak(&ctx, saved)?
-        {
-            return Ok(value);
-        }
-        let value = live_collection(
-            &ctx,
-            self.handle.0,
-            CollectionKind::HtmlScripts,
-            Some("HTMLCollection"),
-        )?;
-        let weak = make_weak(&ctx, value.clone())?;
-        world_rc.borrow_mut().intern_wrapper(
-            self.handle.0,
-            Wrapper::Scripts,
-            Persistent::save(&ctx, weak),
-        );
-        Ok(value)
-    }
-
     // https://dom.spec.whatwg.org/#dom-node-appendchild
     #[qjs(skip)]
     fn append_child<'js>(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<Value<'js>> {
@@ -5015,41 +4991,6 @@ impl JsNode {
         drop(world);
         register_inserted_iframes(ctx, &added)?;
         schedule_mutation_delivery(ctx)
-    }
-
-    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
-    #[qjs(get, rename = "innerText")]
-    fn inner_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        match self.text_content(&ctx)? {
-            Some(value) => Ok(value),
-            None => rquickjs::String::from_str(ctx, ""),
-        }
-    }
-
-    // Not-being-rendered innerText replace-all with one text node. Converting
-    // newlines to `br` is the rendered-text-fragment path and a known gap
-    // (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
-    #[qjs(set, rename = "innerText")]
-    fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        let html = world(&ctx)?
-            .borrow()
-            .document(self.handle.0)
-            .is_some_and(|parsed| {
-                parsed
-                    .document
-                    .base
-                    .get_node(self.handle.0.node)
-                    .is_some_and(|node| {
-                        node.data
-                            .downcast_element()
-                            .is_some_and(|element| element.name.ns == html_namespace())
-                    })
-            });
-        if !html {
-            return Ok(());
-        }
-        let string = rquickjs::String::from_str(ctx.clone(), &value.0)?;
-        self.set_text_content(&ctx, Some(string))
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-insertadjacenthtml

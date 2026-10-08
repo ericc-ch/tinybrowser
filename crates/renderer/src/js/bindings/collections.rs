@@ -18,19 +18,12 @@ pub(crate) enum CollectionKind {
     Children,
     ElementChildren,
     ElementsByTag(String),
-    ElementsByTagNs {
-        namespace: String,
-        local: String,
-    },
+    ElementsByTagNs { namespace: String, local: String },
     ElementsByClass(String),
     ElementsByName(String),
     SelectOptions,
     SelectedOptions,
     WindowNamed(String),
-    /// `Document.scripts`: HTML `script` elements in the document tree,
-    /// skipping fragment backings
-    /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
-    HtmlScripts,
     Static(Vec<Handle>),
 }
 
@@ -65,8 +58,7 @@ impl CollectionQuery {
             | CollectionKind::ElementsByName(_)
             | CollectionKind::SelectOptions
             | CollectionKind::SelectedOptions
-            | CollectionKind::WindowNamed(_)
-            | CollectionKind::HtmlScripts => self.ids(ctx)?.get(index).copied(),
+            | CollectionKind::WindowNamed(_) => self.ids(ctx)?.get(index).copied(),
         };
         match id {
             Some(id) => wrap_node(ctx, id),
@@ -110,7 +102,6 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
             .filter(|option| option_selected(base, option.node))
             .collect(),
         CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
-        CollectionKind::HtmlScripts => collect_html_scripts(&parsed.document, document, scope.node),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }
@@ -245,33 +236,6 @@ fn set_select_selected_index(
     for (index, option) in options.into_iter().enumerate() {
         set_option_selected(parsed, option, index == wanted);
     }
-}
-
-/// HTML `script` descendants of `scope`, skipping `DocumentFragment` backings
-/// so detached fragment scripts are not listed on `document.scripts`.
-fn collect_html_scripts(
-    doc: &crate::documents::BlitzDocument,
-    document: u32,
-    scope: BlitzId,
-) -> Vec<NodeId> {
-    let mut order = Vec::new();
-    let mut stack: Vec<BlitzId> = doc
-        .base
-        .get_node(scope)
-        .map(|node| node.children.iter().rev().copied().collect())
-        .unwrap_or_default();
-    while let Some(id) = stack.pop() {
-        if doc.is_fragment(id) {
-            continue;
-        }
-        if crate::js::world::is_html_element(&doc.base, id, "script") {
-            order.push(NodeId { document, node: id });
-        }
-        if let Some(node) = doc.base.get_node(id) {
-            stack.extend(node.children.iter().rev().copied());
-        }
-    }
-    order
 }
 
 fn collect_by_tag(
@@ -634,8 +598,7 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
             | CollectionKind::ElementsByClass(_)
             | CollectionKind::SelectOptions
             | CollectionKind::SelectedOptions
-            | CollectionKind::WindowNamed(_)
-            | CollectionKind::HtmlScripts => self.query.ids(ctx)?.len(),
+            | CollectionKind::WindowNamed(_) => self.query.ids(ctx)?.len(),
         })
     }
 

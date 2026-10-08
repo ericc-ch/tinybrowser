@@ -575,8 +575,6 @@ pub(crate) enum Wrapper {
     Dataset,
     /// `Node.childNodes`.
     ChildNodes,
-    /// `Document.scripts`.
-    Scripts,
 }
 
 pub(crate) struct WeakReferences {
