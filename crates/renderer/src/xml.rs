@@ -3,7 +3,8 @@
 //! Delegates to `blitz-html`'s XML path. Malformed input yields a document
 //! holding a `parsererror` element, matching the HTML XML parsing rules.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::Parsed;
@@ -48,6 +49,11 @@ fn parse_with_config(
     ready_state: crate::ReadyState,
     config: blitz_dom::DocumentConfig,
 ) -> Parsed {
+    // xml5ever does not include internal general entities. Replacement text
+    // is included before the document instance is parsed
+    // (<https://www.w3.org/TR/xml/#included>).
+    let expanded = expand_internal_general_entities(input);
+    let input = expanded.as_ref();
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
     let mut document = crate::documents::BlitzDocument::from_base(base);
     // The XML sink's `append_doctype_to_document` ignores the token. The
@@ -407,6 +413,24 @@ fn push_processing_instruction(found: &mut Vec<(String, String)>, body: &str) {
     found.push((target, data));
 }
 
+fn skip_decl_body(decl: &str) -> usize {
+    let mut quote = None;
+    for (index, character) in decl.char_indices() {
+        if let Some(open) = quote {
+            if character == open {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '>' => return index + character.len_utf8(),
+            _ => {}
+        }
+    }
+    decl.len()
+}
+
 fn skip_markup(rest: &str) -> usize {
     let mut quote = None;
     for (index, character) in rest.char_indices().skip(1) {
@@ -427,6 +451,273 @@ fn skip_markup(rest: &str) -> usize {
 
 fn is_xml_whitespace(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
+}
+
+/// Includes internal general entities in the document instance.
+///
+/// External and parameter entities stay unresolved. Replacement text that
+/// contains markup is spliced into the source so the XML parser builds the
+/// corresponding nodes (<https://www.w3.org/TR/xml/#intern-replacement>).
+fn expand_internal_general_entities(input: &str) -> Cow<'_, str> {
+    let Some((body_start, entities)) = scan_internal_general_entities(input) else {
+        return Cow::Borrowed(input);
+    };
+    if entities.is_empty() {
+        return Cow::Borrowed(input);
+    }
+    let mut output = String::with_capacity(input.len());
+    output.push_str(&input[..body_start]);
+    expand_content(&input[body_start..], &entities, &mut output);
+    Cow::Owned(output)
+}
+
+fn scan_internal_general_entities(input: &str) -> Option<(usize, HashMap<String, String>)> {
+    let doctype = input.find("<!DOCTYPE")?;
+    let after_keyword = doctype + "<!DOCTYPE".len();
+    let mut quote = None;
+    let mut subset_start = None;
+    for (index, character) in input[after_keyword..].char_indices() {
+        if let Some(open) = quote {
+            if character == open {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '[' => {
+                subset_start = Some(after_keyword + index + 1);
+                break;
+            }
+            '>' => return None,
+            _ => {}
+        }
+    }
+    let subset_start = subset_start?;
+    let subset = &input[subset_start..];
+    let mut quote = None;
+    let mut depth = 0usize;
+    let mut end = None;
+    for (index, character) in subset.char_indices() {
+        if let Some(open) = quote {
+            if character == open {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '[' => depth += 1,
+            ']' => {
+                if depth == 0 {
+                    end = Some(index);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let after_bracket = subset_start + end + 1;
+    let mut body_start = after_bracket;
+    while body_start < input.len() {
+        let rest = &input[body_start..];
+        if rest.starts_with('>') {
+            body_start += 1;
+            break;
+        }
+        let Some(next) = rest.chars().next() else {
+            break;
+        };
+        body_start += next.len_utf8();
+    }
+    Some((
+        body_start,
+        parse_internal_general_entities(&input[subset_start..subset_start + end]),
+    ))
+}
+
+fn parse_internal_general_entities(subset: &str) -> HashMap<String, String> {
+    let mut entities = HashMap::new();
+    let mut pos = 0;
+    while pos < subset.len() {
+        let rest = &subset[pos..];
+        if let Some(inside) = rest.strip_prefix("<!--") {
+            match inside.find("-->") {
+                Some(end) => pos += 4 + end + 3,
+                None => break,
+            }
+            continue;
+        }
+        if let Some(decl) = rest.strip_prefix("<!ENTITY") {
+            let (consumed, entity) = parse_general_entity_decl(decl);
+            if let Some((name, value)) = entity {
+                entities.insert(name, value);
+            }
+            pos += "<!ENTITY".len() + consumed;
+            continue;
+        }
+        if rest.starts_with('<') {
+            pos += skip_markup(rest);
+            continue;
+        }
+        let Some(next) = rest.chars().next() else {
+            break;
+        };
+        pos += next.len_utf8();
+    }
+    entities
+}
+
+fn parse_general_entity_decl(decl: &str) -> (usize, Option<(String, String)>) {
+    let consumed = skip_decl_body(decl);
+    let body = &decl[..consumed];
+    let mut chars = body.chars().peekable();
+    while chars.peek().is_some_and(|c| is_xml_whitespace(*c)) {
+        chars.next();
+    }
+    if chars.peek() == Some(&'%') {
+        return (consumed, None);
+    }
+    let mut name = String::new();
+    while let Some(c) = chars.peek().copied() {
+        if is_xml_whitespace(c) {
+            break;
+        }
+        name.push(c);
+        chars.next();
+    }
+    if name.is_empty() || !is_valid_name(&name) {
+        return (consumed, None);
+    }
+    while chars.peek().is_some_and(|c| is_xml_whitespace(*c)) {
+        chars.next();
+    }
+    if matches!(chars.peek(), Some('S' | 'P')) {
+        return (consumed, None);
+    }
+    let Some(quote) = chars.next() else {
+        return (consumed, None);
+    };
+    if quote != '"' && quote != '\'' {
+        return (consumed, None);
+    }
+    let mut value = String::new();
+    for c in chars.by_ref() {
+        if c == quote {
+            return (consumed, Some((name, value)));
+        }
+        value.push(c);
+    }
+    (consumed, None)
+}
+
+fn expand_content(content: &str, entities: &HashMap<String, String>, output: &mut String) {
+    let mut pos = 0;
+    while pos < content.len() {
+        let rest = &content[pos..];
+        if rest.starts_with("<!--")
+            || rest.starts_with("<![CDATA[")
+            || rest.starts_with("<?")
+            || rest.starts_with('<')
+        {
+            let consumed = if rest.starts_with("<!--") {
+                rest.find("-->").map_or(rest.len(), |end| end + 3)
+            } else if rest.starts_with("<![CDATA[") {
+                rest.find("]]>").map_or(rest.len(), |end| end + 3)
+            } else if rest.starts_with("<?") {
+                rest.find("?>").map_or(rest.len(), |end| end + 2)
+            } else {
+                skip_markup(rest)
+            };
+            output.push_str(&rest[..consumed]);
+            pos += consumed;
+            continue;
+        }
+        if rest.starts_with('&') {
+            if let Some((consumed, replacement)) = expand_entity_ref(rest, entities) {
+                output.push_str(&replacement);
+                pos += consumed;
+            } else {
+                output.push('&');
+                pos += 1;
+            }
+            continue;
+        }
+        let next = rest.find(['<', '&']).unwrap_or(rest.len());
+        output.push_str(&rest[..next]);
+        pos += next;
+    }
+}
+
+fn expand_entity_ref(
+    rest: &str,
+    entities: &HashMap<String, String>,
+) -> Option<(usize, String)> {
+    let body = rest.strip_prefix('&')?;
+    if body.starts_with('#') {
+        return None;
+    }
+    let name_end = body.find(';')?;
+    let name = &body[..name_end];
+    if !is_valid_name(name) {
+        return None;
+    }
+    let value = entities.get(name)?;
+    let mut seen = HashSet::new();
+    seen.insert(name.to_owned());
+    Some((
+        name_end + 2,
+        expand_replacement(value, entities, &mut seen),
+    ))
+}
+
+fn expand_replacement(
+    value: &str,
+    entities: &HashMap<String, String>,
+    seen: &mut HashSet<String>,
+) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut pos = 0;
+    while pos < value.len() {
+        let rest = &value[pos..];
+        if let Some(amp) = rest.find('&') {
+            output.push_str(&rest[..amp]);
+            let ref_rest = &rest[amp..];
+            if let Some((consumed, replacement)) = expand_nested_ref(ref_rest, entities, seen) {
+                output.push_str(&replacement);
+                pos += amp + consumed;
+            } else {
+                output.push('&');
+                pos += amp + 1;
+            }
+        } else {
+            output.push_str(rest);
+            break;
+        }
+    }
+    output
+}
+
+fn expand_nested_ref(
+    rest: &str,
+    entities: &HashMap<String, String>,
+    seen: &mut HashSet<String>,
+) -> Option<(usize, String)> {
+    let body = rest.strip_prefix('&')?;
+    if body.starts_with('#') {
+        return None;
+    }
+    let name_end = body.find(';')?;
+    let name = &body[..name_end];
+    if !is_valid_name(name) || !seen.insert(name.to_owned()) {
+        return None;
+    }
+    let value = entities.get(name)?;
+    let expanded = expand_replacement(value, entities, seen);
+    seen.remove(name);
+    Some((name_end + 2, expanded))
 }
 
 /// Whether `name` matches the XML `Name` production
