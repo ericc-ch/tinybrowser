@@ -5135,20 +5135,10 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Ok(());
             };
-            // A doctype is not `CharacterData`. Replacing its children with a
-            // text node throws, because a doctype cannot be a parent
-            // (<https://dom.spec.whatwg.org/#dom-node-textcontent>,
-            // <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity>).
+            // Document and DocumentType ignore the setter
+            // (<https://dom.spec.whatwg.org/#dom-node-textcontent>).
             if parsed.document.is_doctype(self.handle.0.node) {
-                return if text.is_empty() {
-                    Ok(())
-                } else {
-                    Err(throw_dom(
-                        ctx,
-                        "HierarchyRequestError",
-                        "doctype cannot have children",
-                    ))
-                };
+                return Ok(());
             }
             parsed
                 .document
