@@ -7,16 +7,17 @@ use super::{
     attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
     character_data_offset, child_value, clone_document, clone_within_document,
     convert_union_nodes_into_node, deref_weak, descendant_text, document_base_url_string,
-    document_is_html, document_is_html_content, document_url_string, dom_string, element_at_point,
-    element_box, element_click, element_node_name, element_sibling_value, elements_by_tag,
-    find_element_by_id, fixup_focus_after_removal, focus_node, host, host_node_id, import_snapshot,
-    is_element, is_focusable, is_main_document, is_real_element, live_collection, main_document,
-    make_weak, materialize_children, materialize_import, new_detached_attr, qualified_name,
-    rect_object, remove_attribute_sync, required_node, root_of, schedule_mutation_delivery,
-    select_error, selector_matching_elements, set_attribute_node, set_attribute_sync,
-    set_character_data, set_pi_data, sibling, sibling_value, string_value, throw_dom,
-    throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, valid_element_local_name,
-    validate_and_extract, with_node_data, world, world_for_node, wrap_new_document, wrap_node,
+    document_is_html, document_is_html_content, document_url_string, dom_string,
+    drain_mutation_journal, element_at_point, element_box, element_click, element_node_name,
+    element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
+    focus_node, host, host_node_id, import_snapshot, is_element, is_focusable, is_main_document,
+    is_real_element, live_collection, main_document, make_weak, materialize_children,
+    materialize_import, new_detached_attr, qualified_name, rect_object, remove_attribute_sync,
+    required_node, root_of, schedule_mutation_delivery, select_error, selector_matching_elements,
+    set_attribute_node, set_attribute_sync, set_character_data, set_pi_data, sibling,
+    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
+    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
+    world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -29,7 +30,9 @@ use markup5ever::{LocalName, Namespace, QualName};
 
 use crate::dom_string::DomString;
 
-use rquickjs::{Array, Class, Ctx, Exception, Function, Persistent, Result, Value};
+use rquickjs::{
+    Array, Class, Ctx, Exception, Function, Persistent, Result, Value, context::EvalOptions,
+};
 
 use crate::js::events;
 use crate::js::world::World;
@@ -1608,12 +1611,26 @@ fn replace_parsed(
         place_journaled(parsed, parent, node, reference);
         return vec![node];
     }
-    let (previous, next) = siblings_around(
+    // Let referenceChild be child's next sibling. If that is node, use
+    // node's next sibling instead
+    // (<https://dom.spec.whatwg.org/#concept-node-replace>).
+    let previous = siblings_around(
         &parsed.document.base,
         parent.document,
         parent.node,
         old.node,
-    );
+    )
+    .0;
+    let mut reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
+        document: old.document,
+        node: next,
+    });
+    if reference == Some(node) {
+        reference = sibling(&parsed.document.base, node.node, true).map(|next| NodeId {
+            document: node.document,
+            node: next,
+        });
+    }
     let (added, fragment) = if parsed.document.is_fragment(node.node) {
         let moved: Vec<NodeId> = parsed
             .document
@@ -1645,20 +1662,27 @@ fn replace_parsed(
     } else {
         unlink_journaled(parsed, node);
     }
-    for child in &added {
-        parsed
-            .document
-            .base
-            .mutate()
-            .insert_nodes_before(old.node, &[child.node]);
-    }
     parsed.document.base.mutate().remove_node(old.node);
+    for child in &added {
+        match reference {
+            Some(reference) => parsed
+                .document
+                .base
+                .mutate()
+                .insert_nodes_before(reference.node, &[child.node]),
+            None => parsed
+                .document
+                .base
+                .mutate()
+                .append_children(parent.node, &[child.node]),
+        }
+    }
     parsed.document.record(JournalEntry::ChildList {
         target: parent,
         added: added.clone(),
         removed: vec![old],
         previous,
-        next,
+        next: reference,
     });
     added
 }
@@ -1812,9 +1836,109 @@ fn insert_tree_node_inner(
         fixup_option_on_insert(ctx, *id)?;
         fixup_radio_on_insert(ctx, *id)?;
     }
+    // Insertion steps run while parent is connected. Queue mutation records
+    // first so an inserted script can `takeRecords` its own addition
+    // (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:html-element-insertion-steps>,
+    // <https://dom.spec.whatwg.org/#concept-node-insert>).
+    prepare_scripts_after_insert(ctx, parent, &moved)?;
     if deliver {
         schedule_mutation_delivery(ctx)?;
     }
+    Ok(())
+}
+
+/// Runs script insertion and children-changed steps after a tree insert
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:html-element-insertion-steps>,
+/// <https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:css-element-children-changed-steps>).
+fn prepare_scripts_after_insert(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) -> Result<()> {
+    let connected = world(ctx)?.borrow().with_document(parent, |parsed| {
+        crate::js::world::is_connected(&parsed.document.base, parent.node)
+    });
+    if !connected.unwrap_or(false) {
+        return Ok(());
+    }
+    drain_mutation_journal(ctx)?;
+    let mut scripts = Vec::new();
+    {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(parent) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        if crate::js::world::is_html_element(base, parent.node, "script") {
+            scripts.push(parent);
+        }
+        for root in inserted {
+            collect_html_scripts(base, *root, &mut scripts);
+        }
+    }
+    scripts.dedup();
+    for script in scripts {
+        prepare_classic_script(ctx, script)?;
+    }
+    Ok(())
+}
+
+fn collect_html_scripts(base: &blitz_dom::BaseDocument, id: NodeId, out: &mut Vec<NodeId>) {
+    if crate::js::world::is_html_element(base, id.node, "script") {
+        out.push(id);
+    }
+    let children: Vec<BlitzId> = base
+        .get_node(id.node)
+        .map(|node| node.children.iter().copied().collect())
+        .unwrap_or_default();
+    for child in children {
+        collect_html_scripts(
+            base,
+            NodeId {
+                document: id.document,
+                node: child,
+            },
+            out,
+        );
+    }
+}
+
+/// [Prepares](https://html.spec.whatwg.org/multipage/webappapis.html#prepare-the-script-element)
+/// a classic inline script. Empty scripts return without setting already
+/// started. External and module scripts are not prepared here.
+fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    let source = {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(id) else {
+            return Ok(());
+        };
+        if parsed.document.script_already_started(id.node) {
+            return Ok(());
+        }
+        if !crate::js::world::is_connected(&parsed.document.base, id.node) {
+            return Ok(());
+        }
+        match crate::js::script_at(&world, id) {
+            Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline {
+                source, ..
+            })) => source,
+            _ => return Ok(()),
+        }
+    };
+    if source.is_empty() {
+        return Ok(());
+    }
+    {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        if let Some(mut parsed) = world.document_mut(id) {
+            parsed.document.mark_script_started(id.node);
+        }
+    }
+    let previous = world(ctx)?.borrow().current_script;
+    world(ctx)?.borrow_mut().current_script = Some(id);
+    let mut options = EvalOptions::default();
+    options.strict = false;
+    let _: rquickjs::Result<Value> = ctx.eval_with_options(source, options);
+    world(ctx)?.borrow_mut().current_script = previous;
     Ok(())
 }
 
@@ -6128,6 +6252,7 @@ impl JsNode {
             fixup_option_on_insert(&ctx, *id)?;
             fixup_radio_on_insert(&ctx, *id)?;
         }
+        prepare_scripts_after_insert(&ctx, parent, &moved)?;
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }

@@ -69,6 +69,9 @@ pub(crate) struct BlitzDocument {
     /// holds the code units while the backing node keeps the lossy UTF-8
     /// form for layout and serialization.
     utf16_data: HashMap<blitz_traits::node_id::NodeId, DomString>,
+    /// Script elements whose [already started] flag is set
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
+    started_scripts: HashSet<blitz_traits::node_id::NodeId>,
 }
 
 impl BlitzDocument {
@@ -82,6 +85,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             extras: HashMap::new(),
             utf16_data: HashMap::new(),
+            started_scripts: HashSet::new(),
         }
     }
 
@@ -95,6 +99,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             extras: HashMap::new(),
             utf16_data: HashMap::new(),
+            started_scripts: HashSet::new(),
         }
     }
 
@@ -309,6 +314,17 @@ impl BlitzDocument {
         } else {
             self.utf16_data.remove(&id);
         }
+    }
+
+    /// Whether `id` has already started as a script
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
+    pub(crate) fn script_already_started(&self, id: blitz_traits::node_id::NodeId) -> bool {
+        self.started_scripts.contains(&id)
+    }
+
+    /// Sets the already-started flag. Returns whether this was the first set.
+    pub(crate) fn mark_script_started(&mut self, id: blitz_traits::node_id::NodeId) -> bool {
+        self.started_scripts.insert(id)
     }
 
     /// Copies the side-table record of `from` onto `to`, then walks both

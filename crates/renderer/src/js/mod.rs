@@ -1222,21 +1222,17 @@ fn javascript_mime(typ: Option<&str>) -> bool {
 }
 
 fn element_text(base: &blitz_dom::BaseDocument, id: crate::js::world::BlitzId) -> String {
+    // Script source is the node's [child text content], not descendant text
+    // (<https://dom.spec.whatwg.org/#concept-child-text-content>,
+    // <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
     let mut text = String::new();
-    let mut stack: Vec<_> = base
+    let children = base
         .get_node(id)
-        .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
+        .map(|node| node.children.iter().copied().collect::<Vec<_>>())
         .unwrap_or_default();
-    while let Some(child) = stack.pop() {
-        let Some(node) = base.get_node(child) else {
-            continue;
-        };
-        match &node.data {
-            blitz_dom::NodeData::Text(data) => text.push_str(&data.content),
-            blitz_dom::NodeData::Element(_) => {
-                stack.extend(node.children.iter().rev().copied());
-            }
-            _ => {}
+    for child in children {
+        if let Some(blitz_dom::NodeData::Text(data)) = base.get_node(child).map(|node| &node.data) {
+            text.push_str(&data.content);
         }
     }
     text

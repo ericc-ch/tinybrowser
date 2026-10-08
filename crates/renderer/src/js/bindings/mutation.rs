@@ -291,6 +291,20 @@ fn deliver_observer(delivery: &Ctx<'_>, observer: ReadyObserver) {
 /// node must not retroactively pull an earlier mutation into a different
 /// observer (`<https://dom.spec.whatwg.org/#queue-a-mutation-record>` picks
 /// interested observers when the mutation is queued).
+/// Moves queued journal entries into observer record queues without
+/// scheduling the notify microtask. Insertion steps that run scripts need
+/// the records visible to `takeRecords` first
+/// (<https://dom.spec.whatwg.org/#queue-a-mutation-record>).
+pub(crate) fn drain_mutation_journal(ctx: &Ctx<'_>) -> Result<()> {
+    let runtime = world(ctx)?.borrow().runtime.clone();
+    runtime
+        .registry
+        .borrow_mut()
+        .observers
+        .drain(&mut runtime.documents.borrow_mut());
+    Ok(())
+}
+
 pub(crate) fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
     // https://dom.spec.whatwg.org/#queue-a-mutation-observer-microtask
     let (runtime, pristine) = {
