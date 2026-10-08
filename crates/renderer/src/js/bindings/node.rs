@@ -1244,6 +1244,25 @@ pub(super) fn siblings_around(
 /// node with no parent is already detached; that is a no-op. The removal
 /// keeps its own `childList` record, so a move reads as removed plus added
 /// (<https://dom.spec.whatwg.org/#concept-node-remove>).
+fn iframe_containers_in_subtrees(parsed: &crate::Parsed, roots: &[NodeId]) -> Vec<NodeId> {
+    let mut containers = Vec::new();
+    for root in roots {
+        let mut stack = vec![root.node];
+        while let Some(id) = stack.pop() {
+            if is_iframe_element(&parsed.document.base, id) {
+                containers.push(NodeId {
+                    document: root.document,
+                    node: id,
+                });
+            }
+            if let Some(node) = parsed.document.base.get_node(id) {
+                stack.extend(node.children.iter().rev().copied());
+            }
+        }
+    }
+    containers
+}
+
 fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
     let document = target.document;
     let (parent, previous, next) = {
@@ -1703,7 +1722,7 @@ fn replace_parsed(
 /// fragment then records one empty childList on the fragment (the insert
 /// algorithm always queues that record). The parent gets one combined
 /// childList for the swap.
-fn replace_all_with_node(parsed: &mut crate::Parsed, parent: NodeId, node: NodeId) {
+fn replace_all_with_node(world: &World, parsed: &mut crate::Parsed, parent: NodeId, node: NodeId) {
     let added = if parsed.document.is_fragment(node.node) {
         let moved: Vec<NodeId> = parsed
             .document
@@ -1734,14 +1753,19 @@ fn replace_all_with_node(parsed: &mut crate::Parsed, parent: NodeId, node: NodeI
     } else {
         vec![node]
     };
-    replace_all_journaled(parsed, parent, added);
+    replace_all_journaled(world, parsed, parent, added);
 }
 
 /// Replaces every child of `parent` with `added`: standing children detach
 /// silently and one record carries the swap. Replacing with the same
 /// contents is silent
 /// (<https://dom.spec.whatwg.org/#concept-node-replace-all>).
-fn replace_all_journaled(parsed: &mut crate::Parsed, parent: NodeId, added: Vec<NodeId>) {
+fn replace_all_journaled(
+    world: &World,
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    added: Vec<NodeId>,
+) {
     let removed: Vec<NodeId> = parsed
         .document
         .base
@@ -1756,9 +1780,11 @@ fn replace_all_journaled(parsed: &mut crate::Parsed, parent: NodeId, added: Vec<
                 .collect()
         })
         .unwrap_or_default();
+    let iframes = iframe_containers_in_subtrees(parsed, &removed);
     for kid in &removed {
         parsed.document.base.mutate().remove_node(kid.node);
     }
+    world.destroy_child_navigables(&iframes);
     for child in &added {
         // Insert adopts: a node with a parent is removed first, and that
         // removal is not suppressed
@@ -4063,7 +4089,7 @@ impl JsNode {
                 node: text,
             }]
         };
-        replace_all_journaled(&mut parsed, self.handle.0, added);
+        replace_all_journaled(&world, &mut parsed, self.handle.0, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -4668,7 +4694,7 @@ impl JsNode {
                 node: text,
             }]
         };
-        replace_all_journaled(&mut parsed, self.handle.0, added);
+        replace_all_journaled(&world, &mut parsed, self.handle.0, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
@@ -5010,7 +5036,7 @@ impl JsNode {
                     .collect()
             })
             .unwrap_or_default();
-        replace_all_journaled(&mut parsed, element, added.clone());
+        replace_all_journaled(&world, &mut parsed, element, added.clone());
         drop(parsed);
         drop(world);
         register_inserted_iframes(ctx, &added)?;
@@ -5411,7 +5437,7 @@ impl JsNode {
                 node,
             }]
         };
-        replace_all_journaled(&mut parsed, self.handle.0, added);
+        replace_all_journaled(&world, &mut parsed, self.handle.0, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -5545,7 +5571,7 @@ impl JsNode {
                 node: text,
             }]
         };
-        replace_all_journaled(&mut parsed, title, added);
+        replace_all_journaled(&world, &mut parsed, title, added);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
@@ -6326,7 +6352,9 @@ impl JsNode {
                 "child is not a child of this node",
             ));
         }
+        let iframes = iframe_containers_in_subtrees(&parsed, &[child]);
         unlink_journaled(&mut parsed, child);
+        world.destroy_child_navigables(&iframes);
         drop(parsed);
         drop(world);
         fixup_focus_after_removal(&ctx, child)?;
@@ -7594,7 +7622,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         let Some(mut parsed) = world.document_mut(parent) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        replace_all_with_node(&mut parsed, parent, node);
+        replace_all_with_node(&world, &mut parsed, parent, node);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
@@ -7995,7 +8023,9 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
                 "a document cannot be removed",
             ));
         }
+        let iframes = iframe_containers_in_subtrees(&parsed, &[self.handle.0]);
         unlink_journaled(&mut parsed, self.handle.0);
+        world.destroy_child_navigables(&iframes);
         drop(parsed);
         drop(world);
         fixup_focus_after_removal(&ctx, self.handle.0)?;

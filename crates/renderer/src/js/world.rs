@@ -1153,6 +1153,20 @@ impl World {
             .frame_for_container(container)
     }
 
+    /// Destroys the child navigable of each `iframe` container.
+    ///
+    /// HTML iframe [removing steps] run destroy-a-child-navigable and do not
+    /// fire `pagehide`/`unload` synchronously
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-removing-steps>).
+    pub(crate) fn destroy_child_navigables(&self, containers: &[NodeId]) {
+        let mut shared = self.runtime.shared.borrow_mut();
+        for container in containers {
+            if let Some(frame) = shared.tree.frame_for_container(*container) {
+                shared.tree.remove(frame);
+            }
+        }
+    }
+
     /// The serialized origin of this realm's document
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     pub(crate) fn origin_string(&self) -> String {

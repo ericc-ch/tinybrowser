@@ -128,27 +128,25 @@ fn collect_html_scripts(
     document: u32,
     scope: BlitzId,
 ) -> Vec<NodeId> {
-    let start = doc
-        .base
-        .get_node(scope)
-        .and_then(|node| {
-            node.children
-                .iter()
-                .copied()
-                .find(|child| super::is_element(&doc.base, *child) && !doc.is_fragment(*child))
-        })
-        .unwrap_or(scope);
+    let document_element = doc.base.get_node(scope).and_then(|node| {
+        node.children
+            .iter()
+            .copied()
+            .find(|child| super::is_element(&doc.base, *child) && !doc.is_fragment(*child))
+    });
     let mut order = Vec::new();
     let mut stack: Vec<BlitzId> = doc
         .base
-        .get_node(start)
+        .get_node(scope)
         .map(|node| node.children.iter().rev().copied().collect())
         .unwrap_or_default();
     while let Some(id) = stack.pop() {
         if doc.is_fragment(id) {
             continue;
         }
-        if crate::js::world::is_html_element(&doc.base, id, "script") {
+        if crate::js::world::is_html_element(&doc.base, id, "script")
+            && script_is_in_document_tree(doc, id, document_element)
+        {
             order.push(NodeId { document, node: id });
         }
         if let Some(node) = doc.base.get_node(id) {
@@ -156,6 +154,32 @@ fn collect_html_scripts(
         }
     }
     order
+}
+
+/// A document script is a descendant of the document element and not of a
+/// fragment backing. Fragment backings may sit under the synthetic root or
+/// even under `html` in the Blitz tree; they are not in the document tree
+/// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
+fn script_is_in_document_tree(
+    doc: &crate::documents::BlitzDocument,
+    mut id: BlitzId,
+    document_element: Option<BlitzId>,
+) -> bool {
+    let Some(document_element) = document_element else {
+        return false;
+    };
+    loop {
+        if id == document_element {
+            return true;
+        }
+        if doc.is_fragment(id) {
+            return false;
+        }
+        match doc.base.get_node(id).and_then(|node| node.parent) {
+            Some(parent) => id = parent,
+            None => return false,
+        }
+    }
 }
 
 /// Descendant Blitz ids of `scope` in tree order, excluding `scope` itself.
