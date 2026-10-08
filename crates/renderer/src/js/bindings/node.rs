@@ -36,7 +36,7 @@ use crate::js::world::World;
 
 use crate::js::world::{
     BlitzId, DocumentStreamCommand, Handle, JournalEntry, NodeId, NodeReference, Wrapper, attr,
-    html_namespace, is_connected, svg_namespace,
+    child_ids, html_namespace, is_connected, svg_namespace,
 };
 
 use crate::ReadyState;
@@ -147,6 +147,17 @@ fn insertion_excluding(
     child: Option<NodeReference>,
     exclude: Option<BlitzId>,
 ) -> Result<(NodeId, Option<NodeId>)> {
+    let excluded: Vec<BlitzId> = exclude.into_iter().collect();
+    insertion_excluding_children(ctx, parent, node, child, &excluded)
+}
+
+fn insertion_excluding_children(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeReference,
+    child: Option<NodeReference>,
+    excluded: &[BlitzId],
+) -> Result<(NodeId, Option<NodeId>)> {
     // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
     // https://dom.spec.whatwg.org/#concept-node-replace
     if matches!(child, Some(NodeReference::Attribute { .. })) {
@@ -247,7 +258,7 @@ fn insertion_excluding(
             parent,
             node,
             reference,
-            exclude,
+            excluded,
             &inserted,
         )?;
     }
@@ -354,18 +365,19 @@ fn ensure_no_cycle(
 /// non-document early return
 /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity>).
 ///
-/// `exclude` is the child `replace` passes in `childrenToExclude`. The node
-/// being inserted is also left out of the parent's child counts: insert
-/// removes it from its old parent before the parent gains it again, and
-/// counting it as both the existing child and the inserted node rejects a
-/// move of the document element.
+/// `excluded` is `childrenToExclude`: `replace` passes the replaced child,
+/// `replaceChildren` passes the parent's current children. The node being
+/// inserted is also left out of the parent's child counts: insert removes it
+/// from its old parent before the parent gains it again, and counting it as
+/// both the existing child and the inserted node rejects a move of the
+/// document element.
 fn ensure_document_content_model(
     ctx: &Ctx<'_>,
     doc: &crate::documents::BlitzDocument,
     parent: NodeId,
     node: NodeId,
     reference: Option<NodeId>,
-    exclude: Option<BlitzId>,
+    excluded: &[BlitzId],
     inserted: &InsertedNode,
 ) -> Result<()> {
     match inserted {
@@ -393,13 +405,13 @@ fn ensure_document_content_model(
         }
         InsertedNode::Element => {}
         InsertedNode::Doctype => {
-            return ensure_doctype_position(ctx, doc, parent, node, reference, exclude);
+            return ensure_doctype_position(ctx, doc, parent, node, reference, excluded);
         }
     }
     let parent_has_element = parent_has_kind(
         doc,
         parent.node,
-        exclude,
+        excluded,
         node.document == parent.document,
         node.node,
         true,
@@ -408,7 +420,7 @@ fn ensure_document_content_model(
     let doctype_follows =
         child_id.is_some_and(|child| sibling_kind_follows(doc, parent.node, child.node));
     let child_is_doctype =
-        child_id.is_some_and(|child| exclude != Some(child.node) && doc.is_doctype(child.node));
+        child_id.is_some_and(|child| !excluded.contains(&child.node) && doc.is_doctype(child.node));
     if parent_has_element || doctype_follows || child_is_doctype {
         return Err(throw_dom(
             ctx,
@@ -425,12 +437,12 @@ fn ensure_doctype_position(
     parent: NodeId,
     node: NodeId,
     reference: Option<NodeId>,
-    exclude: Option<BlitzId>,
+    excluded: &[BlitzId],
 ) -> Result<()> {
     let parent_has_doctype = parent_has_kind(
         doc,
         parent.node,
-        exclude,
+        excluded,
         node.document == parent.document,
         node.node,
         false,
@@ -441,7 +453,7 @@ fn ensure_doctype_position(
     let parent_has_element = parent_has_kind(
         doc,
         parent.node,
-        exclude,
+        excluded,
         node.document == parent.document,
         node.node,
         true,
@@ -457,19 +469,18 @@ fn ensure_doctype_position(
 }
 
 /// Whether `parent` has an element (`element`) or doctype child other than
-/// `inserted` and `exclude`.
+/// `inserted` and the `excluded` children.
 fn parent_has_kind(
     doc: &crate::documents::BlitzDocument,
     parent: BlitzId,
-    exclude: Option<BlitzId>,
+    excluded: &[BlitzId],
     same_document: bool,
     inserted: BlitzId,
     element: bool,
 ) -> bool {
     doc.base.get_node(parent).is_some_and(|root| {
         root.children.iter().any(|child| {
-            !(same_document && *child == inserted)
-                && exclude != Some(*child)
+            !(excluded.contains(child) || same_document && *child == inserted)
                 && if element {
                     doc.base
                         .get_node(*child)
@@ -1660,6 +1671,47 @@ fn replace_parsed(
     added
 }
 
+/// Replace all with `node` within `parent`
+/// (<https://dom.spec.whatwg.org/#concept-node-replace-all>).
+///
+/// Children of `parent` are removed with observers suppressed. Inserting a
+/// fragment then records one empty childList on the fragment (the insert
+/// algorithm always queues that record). The parent gets one combined
+/// childList for the swap.
+fn replace_all_with_node(parsed: &mut crate::Parsed, parent: NodeId, node: NodeId) {
+    let added = if parsed.document.is_fragment(node.node) {
+        let moved: Vec<NodeId> = parsed
+            .document
+            .base
+            .get_node(node.node)
+            .map(|backing| {
+                backing
+                    .children
+                    .iter()
+                    .map(|child| NodeId {
+                        document: node.document,
+                        node: *child,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for child in &moved {
+            parsed.document.base.mutate().remove_node(child.node);
+        }
+        parsed.document.record(JournalEntry::ChildList {
+            target: node,
+            added: Vec::new(),
+            removed: moved.clone(),
+            previous: None,
+            next: None,
+        });
+        moved
+    } else {
+        vec![node]
+    };
+    replace_all_journaled(parsed, parent, added);
+}
+
 /// Replaces every child of `parent` with `added`: standing children detach
 /// silently and one record carries the swap. Replacing with the same
 /// contents is silent
@@ -1683,6 +1735,10 @@ fn replace_all_journaled(parsed: &mut crate::Parsed, parent: NodeId, added: Vec<
         parsed.document.base.mutate().remove_node(kid.node);
     }
     for child in &added {
+        // Insert adopts: a node with a parent is removed first, and that
+        // removal is not suppressed
+        // (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+        unlink_journaled(parsed, *child);
         parsed
             .document
             .base
@@ -1703,11 +1759,29 @@ fn replace_all_journaled(parsed: &mut crate::Parsed, parent: NodeId, added: Vec<
 /// Inserts the adopted `node` into `parent` before `reference`, expanding
 /// fragments, journaling the move, and running the insertion fixups. The
 /// caller owns validity and adoption.
+pub(super) fn insert_converted_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<()> {
+    // Convert-nodes-into-a-node appends each node to a fragment. Records
+    // queue here; delivery waits for the caller so observers see every
+    // removal together
+    // (<https://dom.spec.whatwg.org/#convert-nodes-into-a-node>).
+    insert_tree_node_inner(ctx, parent, node, None, false)
+}
+
 fn insert_tree_node(
     ctx: &Ctx<'_>,
     parent: NodeId,
     node: NodeId,
     reference: Option<NodeId>,
+) -> Result<()> {
+    insert_tree_node_inner(ctx, parent, node, reference, true)
+}
+
+fn insert_tree_node_inner(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeId,
+    reference: Option<NodeId>,
+    deliver: bool,
 ) -> Result<()> {
     let world_rc = world(ctx)?;
     let moved: Vec<NodeId> = {
@@ -1746,7 +1820,10 @@ fn insert_tree_node(
         fixup_option_on_insert(ctx, *id)?;
         fixup_radio_on_insert(ctx, *id)?;
     }
-    schedule_mutation_delivery(ctx)
+    if deliver {
+        schedule_mutation_delivery(ctx)?;
+    }
+    Ok(())
 }
 
 /// An inserted selected option clears a single-select owner's other options
@@ -7259,46 +7336,33 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         ctx: Ctx<'js>,
         nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
     ) -> Result<()> {
-        // Adoption by copy leaves a stale handle behind; replace the live
-        // parent's children
-        // (https://dom.spec.whatwg.org/#concept-node-adopt).
+        // Convert nodes first: append to a fragment records each removal from
+        // a previous parent. Then ensure pre-insert validity with this node's
+        // current children excluded, then replace all.
+        // https://dom.spec.whatwg.org/#convert-nodes-into-a-node
+        // https://github.com/whatwg/dom/issues/1045
         let parent = self.handle.0;
         let node = convert_union_nodes_into_node(&ctx, parent, union_nodes(nodes))?;
-        let (node, _) = insertion_tree_nodes(&ctx, parent, NodeReference::Tree(node), None)?;
+        let excluded = {
+            let world = world(&ctx)?;
+            world
+                .borrow()
+                .with_document(parent, |parsed| {
+                    child_ids(&parsed.document.base, parent.document, parent.node)
+                        .into_iter()
+                        .map(|child| child.node)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let (node, _) =
+            insertion_excluding_children(&ctx, parent, NodeReference::Tree(node), None, &excluded)?;
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(parent) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let added = if parsed.document.is_fragment(node.node) {
-            let moved: Vec<NodeId> = parsed
-                .document
-                .base
-                .get_node(node.node)
-                .map(|backing| {
-                    backing
-                        .children
-                        .iter()
-                        .map(|child| NodeId {
-                            document: node.document,
-                            node: *child,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            parsed.document.record(JournalEntry::ChildList {
-                target: node,
-                added: Vec::new(),
-                removed: moved.clone(),
-                previous: None,
-                next: None,
-            });
-            moved
-        } else {
-            unlink_journaled(&mut parsed, node);
-            vec![node]
-        };
-        replace_all_journaled(&mut parsed, parent, added);
+        replace_all_with_node(&mut parsed, parent, node);
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)

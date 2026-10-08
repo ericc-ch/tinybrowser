@@ -2,9 +2,10 @@
 
 use std::borrow::Cow;
 
+use super::node::insert_converted_node;
 use super::{adopt_across_documents, throw_dom, world};
 
-use crate::js::world::{JournalEntry, NodeId};
+use crate::js::world::NodeId;
 
 use rquickjs::{Ctx, Exception, Function, Object, Result, Value};
 
@@ -141,15 +142,15 @@ fn assemble_nodes_into_node(
             *id = adopt_across_documents(ctx, document, *id)?;
         }
     }
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(document) else {
-        return Err(Exception::throw_type(ctx, "no document"));
-    };
     if pieces.len() == 1 {
         return match pieces.pop() {
             Some(Piece::Node(id)) => Ok(id),
             Some(Piece::Text(text)) => {
+                let world = world(ctx)?;
+                let world = world.borrow();
+                let Some(mut parsed) = world.document_mut(document) else {
+                    return Err(Exception::throw_type(ctx, "no document"));
+                };
                 let node = parsed.document.base.mutate().create_text_node(&text);
                 Ok(NodeId {
                     document: document.document,
@@ -159,14 +160,29 @@ fn assemble_nodes_into_node(
             None => Err(Exception::throw_internal(ctx, "empty node list")),
         };
     }
-    let fragment = NodeId {
-        document: document.document,
-        node: parsed.document.create_fragment(),
+    let fragment = {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(document) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        NodeId {
+            document: document.document,
+            node: parsed.document.create_fragment(),
+        }
     };
+    // Each node is appended to the fragment
+    // (<https://dom.spec.whatwg.org/#convert-nodes-into-a-node>), which
+    // removes it from its previous parent and records that removal.
     for piece in pieces {
         let id = match piece {
             Piece::Node(id) => id,
             Piece::Text(text) => {
+                let world = world(ctx)?;
+                let world = world.borrow();
+                let Some(mut parsed) = world.document_mut(document) else {
+                    return Err(Exception::throw_type(ctx, "no document"));
+                };
                 let node = parsed.document.base.mutate().create_text_node(&text);
                 NodeId {
                     document: document.document,
@@ -174,27 +190,7 @@ fn assemble_nodes_into_node(
                 }
             }
         };
-        let previous = parsed
-            .document
-            .base
-            .get_node(fragment.node)
-            .and_then(|node| node.children.last().copied())
-            .map(|node| NodeId {
-                document: document.document,
-                node,
-            });
-        parsed
-            .document
-            .base
-            .mutate()
-            .append_children(fragment.node, &[id.node]);
-        parsed.document.record(JournalEntry::ChildList {
-            target: fragment,
-            added: vec![id],
-            removed: Vec::new(),
-            previous,
-            next: None,
-        });
+        insert_converted_node(ctx, fragment, id)?;
     }
     Ok(fragment)
 }
