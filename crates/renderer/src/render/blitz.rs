@@ -66,10 +66,7 @@ pub(crate) fn render_html(html: &str, width: u32, height: u32) -> Result<RgbaIma
 /// own executor and paints with [`paint`] once this returns true (or its own
 /// deadline hits, painting whatever settled).
 #[cfg(test)]
-pub(crate) fn resolve_frame(
-    base: &mut blitz_dom::BaseDocument,
-    net: &TinyNetProvider,
-) -> bool {
+pub(crate) fn resolve_frame(base: &mut blitz_dom::BaseDocument, net: &TinyNetProvider) -> bool {
     resolve_until_settled(base);
     !base.has_pending_critical_resources() && net.in_flight() == 0
 }
@@ -125,8 +122,8 @@ fn over_white(red: u8, green: u8, blue: u8, alpha: u8) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::{paint, render_html, resolve_frame};
-    use blitz_traits::net::NetHandler;
     use crate::render::providers::{TinyNetProvider, TinyShell};
+    use blitz_traits::net::NetHandler;
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -196,15 +193,13 @@ mod tests {
             // Deliver every queued fetch the way the document would: read
             // the CSS over plain TCP and hand the bytes to the handler.
             while let Ok((fetch, handler)) = rx.try_recv() {
-                let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
-                    .expect("css server");
+                let mut stream =
+                    std::net::TcpStream::connect(("127.0.0.1", port)).expect("css server");
                 let request = format!(
                     "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
                     fetch.url.path()
                 );
-                stream
-                    .write_all(request.as_bytes())
-                    .expect("css request");
+                stream.write_all(request.as_bytes()).expect("css request");
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).expect("css body");
                 let body = response

@@ -11,13 +11,13 @@
 //! Browser and tab state live in bounded Tokio owner tasks.
 
 mod actor;
-mod history;
 mod assignment;
 mod broadcast;
 mod browser;
 pub mod child;
 mod context;
 mod exchange;
+mod history;
 mod link;
 mod manager;
 mod network;

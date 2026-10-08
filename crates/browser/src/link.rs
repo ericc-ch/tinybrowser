@@ -3,8 +3,8 @@
 //! One private platform channel per renderer, length-prefixed frames, async
 //! reader and writer tasks, and oneshot replies. The handle stays value-only.
 
-use std::io;
 use std::collections::HashMap;
+use std::io;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -578,7 +578,17 @@ async fn route_service_call(
             let worker_kill = context.kill.clone();
             let mut kill = context.kill.subscribe();
             let (cancel_tx, cancel_rx) = watch::channel(false);
-            context.dials.lock().unwrap_or_else(PoisonError::into_inner).insert(id, ActiveDial { assignment: assignment_id, cancel: cancel_tx });
+            context
+                .dials
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    id,
+                    ActiveDial {
+                        assignment: assignment_id,
+                        cancel: cancel_tx,
+                    },
+                );
             let dials = context.dials.clone();
             tokio::spawn(async move {
                 let outcome = tokio::select! {
@@ -586,7 +596,10 @@ async fn route_service_call(
                     _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
                     result = worker_network.dial_request(&request, &initiator, cancel_rx) => result,
                 };
-                dials.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+                dials
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
                 if responder
                     .reply(id, ServiceReply::Dial(outcome))
                     .await
@@ -597,7 +610,12 @@ async fn route_service_call(
             });
         }
         ServiceCall::Network(NetworkCall::CancelDial { id: target }) => {
-            if let Some(dial) = context.dials.lock().unwrap_or_else(PoisonError::into_inner).get(&target) {
+            if let Some(dial) = context
+                .dials
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&target)
+            {
                 if dial.assignment != assignment_id {
                     return Err(RendererViolation);
                 }
@@ -1239,6 +1257,14 @@ async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
-        _ = child.wait() => {}
+        status = child.wait() => match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                logging::error!(target: "browser::link", "renderer exited: {status}");
+            }
+            Err(error) => {
+                logging::error!(target: "browser::link", "renderer wait failed: {error}");
+            }
+        },
     }
 }

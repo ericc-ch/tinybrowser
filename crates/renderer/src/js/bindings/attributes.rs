@@ -1,9 +1,9 @@
 //! Attribute, class, and handler-attribute objects and plumbing.
 
 use super::{
-    FromJs, OptString, WebIdlString, child_value, deref_weak, make_weak,
-    qualified_name, realm_registry, schedule_mutation_delivery, string_value, throw_dom,
-    with_node_data, world, world_for_node, wrap_node,
+    FromJs, OptString, WebIdlString, child_value, deref_weak, make_weak, qualified_name,
+    realm_registry, schedule_mutation_delivery, string_value, throw_dom, with_node_data, world,
+    world_for_node, wrap_node,
 };
 
 use std::cell::RefCell;
@@ -246,9 +246,10 @@ fn validate_token_pair(ctx: &Ctx<'_>, old: &str, new: &str) -> Result<()> {
 /// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
 fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()> {
     if tokens.is_empty()
-        && world(ctx)?.borrow().document(id).is_none_or(|parsed| {
-            js_world::attr(&parsed.document.base, id.node, "class").is_none()
-        })
+        && world(ctx)?
+            .borrow()
+            .document(id)
+            .is_none_or(|parsed| js_world::attr(&parsed.document.base, id.node, "class").is_none())
     {
         return Ok(());
     }
@@ -347,12 +348,7 @@ impl<'js> event_target_generated::EventTarget<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
-    fn dispatch_event(
-        &self,
-        ctx: Ctx<'js>,
-        _this: Object<'js>,
-        event: Value<'js>,
-    ) -> Result<bool> {
+    fn dispatch_event(&self, ctx: Ctx<'js>, _this: Object<'js>, event: Value<'js>) -> Result<bool> {
         let state = attr_state(&ctx, self.scope.0, self.id)?;
         let home = attr_context(&ctx, self.scope.0, self.id)?;
         let event = Class::<JsEvent>::from_js(&home, event)?;
@@ -804,11 +800,7 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
-    fn set_node_value(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_node_value(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         self.set_node_value(ctx, value)
     }
 
@@ -818,11 +810,7 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-textcontent
-    fn set_text_content(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_text_content(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         self.set_text_content(ctx, value)
     }
 
@@ -864,11 +852,7 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-contains
-    fn contains(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: Option<super::host::NodeReference>,
-    ) -> Result<bool> {
+    fn contains(&self, ctx: Ctx<'js>, arg_0: Option<super::host::NodeReference>) -> Result<bool> {
         self.contains(ctx, arg_0)
     }
 
@@ -920,11 +904,7 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-appendchild
-    fn append_child(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: super::host::NodeReference,
-    ) -> Result<Value<'js>> {
+    fn append_child(&self, ctx: Ctx<'js>, arg_0: super::host::NodeReference) -> Result<Value<'js>> {
         self.append_child(ctx, arg_0)
     }
 
@@ -939,11 +919,7 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-removechild
-    fn remove_child(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: super::host::NodeReference,
-    ) -> Result<Value<'js>> {
+    fn remove_child(&self, ctx: Ctx<'js>, arg_0: super::host::NodeReference) -> Result<Value<'js>> {
         self.remove_child(ctx, arg_0)
     }
 }
@@ -1014,11 +990,7 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditem
-    fn get_named_item(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn get_named_item(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.get_named_item(ctx, arg_0)
     }
 
@@ -1037,31 +1009,19 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditem
-    fn set_named_item(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: Value<'js>,
-    ) -> Result<Value<'js>> {
+    fn set_named_item(&self, ctx: Ctx<'js>, arg_0: Value<'js>) -> Result<Value<'js>> {
         let attr = AttrArgument::from_value(&arg_0)?;
         self.set_named_item(ctx, attr)
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditemns
-    fn set_named_item_ns(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: Value<'js>,
-    ) -> Result<Value<'js>> {
+    fn set_named_item_ns(&self, ctx: Ctx<'js>, arg_0: Value<'js>) -> Result<Value<'js>> {
         let attr = AttrArgument::from_value(&arg_0)?;
         self.set_named_item_ns(ctx, attr)
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditem
-    fn remove_named_item(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn remove_named_item(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         self.remove_named_item(ctx, WebIdlString(arg_0.to_string()?))
     }
 
@@ -1158,7 +1118,11 @@ impl JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditem
-    fn get_named_item<'js>(&self, ctx: Ctx<'js>, name: rquickjs::String<'js>) -> Result<Value<'js>> {
+    fn get_named_item<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        name: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
         named_item(&ctx, self.element.0, &name.to_string()?)
     }
 
@@ -1690,9 +1654,10 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     // A detached `iframe` has no browsing context yet; insertion reads the
     // current attribute, so queueing here would navigate it twice. The same
     // is true of `<img>`: connection starts the fetch.
-    let connected = world.borrow().document(element).is_some_and(|parsed| {
-        js_world::is_connected(&parsed.document.base, element.node)
-    });
+    let connected = world
+        .borrow()
+        .document(element)
+        .is_some_and(|parsed| js_world::is_connected(&parsed.document.base, element.node));
     if !connected {
         return Ok(());
     }
@@ -1971,8 +1936,7 @@ fn locate_namespace(
                             && attribute.name.local.as_ref() == prefix
                     }
                     None => {
-                        attribute.name.prefix.is_none()
-                            && attribute.name.local.as_ref() == "xmlns"
+                        attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns"
                     }
                 };
                 if declaration {

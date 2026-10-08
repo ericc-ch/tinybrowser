@@ -50,10 +50,26 @@ struct Target {
     filter: Option<Arc<Filter>>,
 }
 
+/// What one [`PaintScene::pop_layer`] undoes.
+///
+/// Blitz pairs every [`PaintScene::push_clip_layer`] and
+/// [`PaintScene::push_layer`] with [`PaintScene::pop_layer`]. A clip that
+/// stays active after pop intersects every later draw, so the first small
+/// background image hides the rest of the page.
+enum StackItem {
+    /// A mask pushed onto the current target. `applied` is false when the
+    /// mask could not be built, so pop does not remove an older clip.
+    Clip { applied: bool },
+    /// A child pixmap pushed by [`PaintScene::push_layer`].
+    Layer,
+}
+
 /// Painter drawing an [`anyrender`] scene into a [`tiny_skia`] pixmap.
 pub struct TinySkiaScenePainter {
     transform: SkiaXform,
     targets: Vec<Target>,
+    /// Push order of clips and child pixmaps. Pop undoes the top item.
+    stack: Vec<StackItem>,
     /// Converted image for the in-progress image fill. A [`tiny_skia`]
     /// `Pattern` borrows its pixels, so the pixmap lives here instead of a
     /// local; draw code reaches it through disjoint field borrows.
@@ -76,6 +92,7 @@ impl TinySkiaScenePainter {
                 clips: Vec::new(),
                 filter: None,
             }],
+            stack: Vec::new(),
             image_scratch: None,
         }
     }
@@ -161,13 +178,9 @@ impl TinySkiaScenePainter {
             return false;
         };
         let clip = target.clips.last();
-        target.pixmap.fill_path(
-            path,
-            &paint,
-            convert_fill_rule(style),
-            transform,
-            clip,
-        );
+        target
+            .pixmap
+            .fill_path(path, &paint, convert_fill_rule(style), transform, clip);
         true
     }
 }
@@ -220,7 +233,12 @@ fn convert_shape(shape: &impl Shape) -> Option<Path> {
             PathEl::MoveTo(point) => builder.move_to(point.x as f32, point.y as f32),
             PathEl::LineTo(point) => builder.line_to(point.x as f32, point.y as f32),
             PathEl::QuadTo(first, second) => {
-                builder.quad_to(first.x as f32, first.y as f32, second.x as f32, second.y as f32);
+                builder.quad_to(
+                    first.x as f32,
+                    first.y as f32,
+                    second.x as f32,
+                    second.y as f32,
+                );
             }
             PathEl::CurveTo(first, second, third) => builder.cubic_to(
                 first.x as f32,
@@ -264,7 +282,10 @@ fn convert_stops(stops: &peniko::ColorStops) -> Option<Vec<tiny_skia::GradientSt
 /// draw through [`TinySkiaScenePainter::fill_image`], which needs the
 /// scratch pixmap; anywhere else (strokes, glyphs) they read as transparent
 /// like `Resource`/`Custom`, which carry no pixels by definition.
-fn convert_brush(brush: &PaintRef<'_>, brush_transform: Option<Affine>) -> tiny_skia::Shader<'static> {
+fn convert_brush(
+    brush: &PaintRef<'_>,
+    brush_transform: Option<Affine>,
+) -> tiny_skia::Shader<'static> {
     use tiny_skia::Shader;
     match brush {
         Paint::Solid(color) => Shader::SolidColor(convert_color(*color)),
@@ -426,9 +447,7 @@ fn layer_blur_sigma(filter: Option<&Filter>) -> Option<f32> {
         return None;
     };
     match &node.effect {
-        FilterEffect::GaussianBlur(blur) if blur.std_deviation > 0.0 => {
-            Some(blur.std_deviation)
-        }
+        FilterEffect::GaussianBlur(blur) if blur.std_deviation > 0.0 => Some(blur.std_deviation),
         _ => None,
     }
 }
@@ -465,7 +484,9 @@ fn image_to_pixmap(
     height: u32,
 ) -> Option<Pixmap> {
     use peniko::{ImageAlphaType, ImageFormat};
-    let pixels = usize::try_from(width).ok()?.checked_mul(usize::try_from(height).ok()?)?;
+    let pixels = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
     let len = pixels.checked_mul(4)?;
     if data.len() != len {
         return None;
@@ -550,6 +571,7 @@ impl PaintScene for TinySkiaScenePainter {
             clips: Vec::new(),
             filter: None,
         });
+        self.stack.clear();
         self.image_scratch = None;
         self.transform = SkiaXform::identity();
     }
@@ -570,10 +592,7 @@ impl PaintScene for TinySkiaScenePainter {
             let canvas = &self.targets[0].pixmap;
             (canvas.width(), canvas.height())
         };
-        let parent = self
-            .targets
-            .last()
-            .and_then(|target| target.clips.last());
+        let parent = self.targets.last().and_then(|target| target.clips.last());
         let mask = push_mask(width, height, parent, clip, transform);
         let paint = PixmapPaint {
             opacity: alpha.clamp(0.0, 1.0),
@@ -586,6 +605,7 @@ impl PaintScene for TinySkiaScenePainter {
             clips: mask.map_or_else(Vec::new, |mask| vec![mask]),
             filter,
         });
+        self.stack.push(StackItem::Layer);
     }
 
     fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
@@ -594,19 +614,28 @@ impl PaintScene for TinySkiaScenePainter {
             let canvas = &self.targets[0].pixmap;
             (canvas.width(), canvas.height())
         };
-        let parent = self
-            .targets
-            .last()
-            .and_then(|target| target.clips.last());
+        let parent = self.targets.last().and_then(|target| target.clips.last());
         let Some(mask) = push_mask(width, height, parent, clip, transform) else {
+            self.stack.push(StackItem::Clip { applied: false });
             return;
         };
         if let Some(target) = self.targets.last_mut() {
             target.clips.push(mask);
         }
+        self.stack.push(StackItem::Clip { applied: true });
     }
 
     fn pop_layer(&mut self) {
+        match self.stack.pop() {
+            Some(StackItem::Clip { applied: true }) => {
+                if let Some(target) = self.targets.last_mut() {
+                    target.clips.pop();
+                }
+                return;
+            }
+            Some(StackItem::Clip { applied: false }) | None => return,
+            Some(StackItem::Layer) => {}
+        }
         if self.targets.len() <= 1 {
             return;
         }
@@ -629,7 +658,6 @@ impl PaintScene for TinySkiaScenePainter {
             None,
         );
     }
-
 
     fn stroke<'a>(
         &mut self,
@@ -737,8 +765,7 @@ impl PaintScene for TinySkiaScenePainter {
                 continue;
             };
             let mut pen = GlyphPen::new();
-            let settings =
-                DrawSettings::unhinted(skrifa::instance::Size::new(font_size), location);
+            let settings = DrawSettings::unhinted(skrifa::instance::Size::new(font_size), location);
             if outline.draw(settings, &mut pen).is_err() {
                 continue;
             }
@@ -853,12 +880,10 @@ mod tests {
             color: DynamicColor::from(BLUE),
         });
         let gradient = Gradient {
-            kind: GradientKind::Linear(
-                peniko::LinearGradientPosition::new(
-                    kurbo::Point::new(0.0, 0.0),
-                    kurbo::Point::new(40.0, 0.0),
-                ),
-            ),
+            kind: GradientKind::Linear(peniko::LinearGradientPosition::new(
+                kurbo::Point::new(0.0, 0.0),
+                kurbo::Point::new(40.0, 0.0),
+            )),
             extend: Extend::Pad,
             stops,
             ..Default::default()
@@ -874,7 +899,10 @@ mod tests {
         let left = pixel(&painter, 2, 5);
         let right = pixel(&painter, 37, 5);
         assert!(left[0] > 200 && left[3] == 255, "left is red: {left:?}");
-        assert!(right[2] > 200 && right[3] == 255, "right is blue: {right:?}");
+        assert!(
+            right[2] > 200 && right[3] == 255,
+            "right is blue: {right:?}"
+        );
     }
 
     #[test]
@@ -891,6 +919,14 @@ mod tests {
         painter.pop_layer();
         assert_eq!(pixel(&painter, 5, 20), [255, 0, 0, 255]);
         assert_eq!(pixel(&painter, 20, 20), [0, 0, 0, 0]);
+        painter.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            RED,
+            None,
+            &Rect::new(0.0, 0.0, 40.0, 40.0),
+        );
+        assert_eq!(pixel(&painter, 20, 20), [255, 0, 0, 255]);
     }
 
     #[test]
@@ -960,7 +996,9 @@ mod tests {
     #[test]
     fn straight_image_premultiplies() {
         let brush = image_brush(
-            vec![255, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 255, 255, 255],
+            vec![
+                255, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 255, 255, 255,
+            ],
             2,
             2,
             peniko::ImageFormat::Rgba8,
@@ -981,12 +1019,7 @@ mod tests {
 
     #[test]
     fn bgra_image_swaps_channels() {
-        let brush = image_brush(
-            vec![255, 0, 0, 255],
-            1,
-            1,
-            peniko::ImageFormat::Bgra8,
-        );
+        let brush = image_brush(vec![255, 0, 0, 255], 1, 1, peniko::ImageFormat::Bgra8);
         let mut painter = TinySkiaScenePainter::new(2, 2);
         painter.fill(
             Fill::NonZero,
@@ -1028,10 +1061,7 @@ mod tests {
         // Just outside the shape the blur leaves a partial pixel; a sharp
         // fill would leave it transparent.
         let edge = pixel(&painter, 7, 20)[3];
-        assert!(
-            edge > 0 && edge < 255,
-            "soft shadow edge, got alpha {edge}"
-        );
+        assert!(edge > 0 && edge < 255, "soft shadow edge, got alpha {edge}");
         // Far away stays clean.
         assert_eq!(pixel(&painter, 0, 0)[3], 0);
     }
@@ -1065,5 +1095,3 @@ mod tests {
         );
     }
 }
-
-

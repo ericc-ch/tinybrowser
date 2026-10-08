@@ -1,8 +1,6 @@
 //! Live node collections (`NodeList`, `HTMLCollection`).
 
-use super::{
-    install_collections_js, live_collection, world, wrap_node,
-};
+use super::{install_collections_js, live_collection, world, wrap_node};
 
 use rquickjs::{
     Atom, Ctx, Exception, Object, Result, Value,
@@ -97,17 +95,13 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         CollectionKind::ElementsByClass(names) => {
             collect_by_class(base, document, scope.node, names)
         }
-        CollectionKind::ElementsByName(name) => {
-            collect_by_name(base, document, scope.node, name)
-        }
+        CollectionKind::ElementsByName(name) => collect_by_name(base, document, scope.node, name),
         CollectionKind::SelectOptions => select_options(base, document, scope.node),
         CollectionKind::SelectedOptions => select_options(base, document, scope.node)
             .into_iter()
             .filter(|option| option_selected(base, option.node))
             .collect(),
-        CollectionKind::WindowNamed(name) => {
-            collect_window_named(base, document, scope.node, name)
-        }
+        CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }
@@ -139,17 +133,12 @@ fn element_name(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&QualName
 /// `option` elements in its subtree, in tree order; optgroup nesting is
 /// covered because the walk descends.
 fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
-    element_name(base, id).is_some_and(|name| {
-        name.ns == html_namespace() && name.local.as_ref() == "option"
-    })
+    element_name(base, id)
+        .is_some_and(|name| name.ns == html_namespace() && name.local.as_ref() == "option")
 }
 
 /// A select's options: the `option` elements in its subtree, in tree order.
-fn select_options(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    select: BlitzId,
-) -> Vec<NodeId> {
+fn select_options(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> Vec<NodeId> {
     descendants(base, select)
         .into_iter()
         .filter(|&id| is_option_element(base, id))
@@ -165,11 +154,7 @@ fn option_selected(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
 
 /// The index of the first selected option, or `-1`
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
-fn select_selected_index(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    select: BlitzId,
-) -> i32 {
+fn select_selected_index(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> i32 {
     select_options(base, document, select)
         .iter()
         .position(|option| option_selected(base, option.node))
@@ -402,7 +387,10 @@ fn detach_node(parsed: &mut crate::Parsed, target: NodeId) {
     };
     parsed.document.base.mutate().remove_node(target.node);
     if let Some(parent) = parent {
-        let target_parent = NodeId { document, node: parent };
+        let target_parent = NodeId {
+            document,
+            node: parent,
+        };
         parsed.document.record(JournalEntry::ChildList {
             target: target_parent,
             added: Vec::new(),
@@ -445,8 +433,9 @@ fn insert_node_before(parsed: &mut crate::Parsed, reference: NodeId, child: Node
     let (parent, previous) = {
         let base = &parsed.document.base;
         let parent = base.get_node(reference.node).and_then(|node| node.parent);
-        let previous =
-            parent.and_then(|parent| super::node::siblings_around(base, document, parent, reference.node).0);
+        let previous = parent.and_then(|parent| {
+            super::node::siblings_around(base, document, parent, reference.node).0
+        });
         (parent, previous)
     };
     let Some(parent) = parent else {
@@ -458,7 +447,10 @@ fn insert_node_before(parsed: &mut crate::Parsed, reference: NodeId, child: Node
         .mutate()
         .insert_nodes_before(reference.node, &[child.node]);
     parsed.document.record(JournalEntry::ChildList {
-        target: NodeId { document, node: parent },
+        target: NodeId {
+            document,
+            node: parent,
+        },
         added: vec![child],
         removed: Vec::new(),
         previous,
@@ -487,7 +479,10 @@ fn replace_node(parsed: &mut crate::Parsed, old: NodeId, new: NodeId) {
         .mutate()
         .replace_node_with(old.node, &[new.node]);
     parsed.document.record(JournalEntry::ChildList {
-        target: NodeId { document, node: parent },
+        target: NodeId {
+            document,
+            node: parent,
+        },
         added: vec![new],
         removed: vec![old],
         previous,
@@ -498,7 +493,11 @@ fn replace_node(parsed: &mut crate::Parsed, old: NodeId, new: NodeId) {
 /// Creates a blank `option` element for a growing options collection.
 fn create_option_element(parsed: &mut crate::Parsed, document: u32) -> NodeId {
     let name = QualName::new(None, html_namespace(), LocalName::from("option"));
-    let node = parsed.document.base.mutate().create_element(name, Vec::new());
+    let node = parsed
+        .document
+        .base
+        .mutate()
+        .create_element(name, Vec::new());
     NodeId { document, node }
 }
 
@@ -697,10 +696,10 @@ impl JsOptionsCollection {
         element: html_options_collection_generated::HTMLOptGroupElementOrHTMLOptionElement,
         before: Option<html_options_collection_generated::HTMLElementOrLong>,
     ) -> Result<()> {
+        use super::host::NodeReference;
         use html_options_collection_generated::{
             HTMLElementOrLong, HTMLOptGroupElementOrHTMLOptionElement,
         };
-        use super::host::NodeReference;
         let select = self.query.scope.0;
         // The union conversion already brand-checks the element, so only a
         // tree node arrives here.
@@ -759,9 +758,10 @@ impl JsOptionsCollection {
         let Some(target) = target else {
             return Ok(());
         };
-        let owner = registry.borrow().owner_world(select).ok_or_else(|| {
-            Exception::throw_internal(ctx, "missing JS world")
-        })?;
+        let owner = registry
+            .borrow()
+            .owner_world(select)
+            .ok_or_else(|| Exception::throw_internal(ctx, "missing JS world"))?;
         let owner = owner.borrow();
         let Some(mut parsed) = owner.document_mut(select) else {
             return Ok(());
@@ -802,7 +802,6 @@ impl JsOptionsCollection {
     }
 }
 impl<'js> html_options_collection_generated::HTMLOptionsCollection<'js> for JsOptionsCollection {
-
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length
     fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
         self.query.ids(ctx).map(|ids| ids.len())
@@ -816,11 +815,7 @@ impl<'js> html_options_collection_generated::HTMLOptionsCollection<'js> for JsOp
     }
 
     // https://dom.spec.whatwg.org/#dom-htmlcollection-nameditem
-    fn named_item(
-        &self,
-        ctx: Ctx<'js>,
-        arg_0: rquickjs::String<'js>,
-    ) -> Result<Value<'js>> {
+    fn named_item(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> {
         named_item(&ctx, &self.query, &arg_0.to_string()?)
     }
 
@@ -876,7 +871,6 @@ impl<'js> html_options_collection_generated::HTMLOptionsCollection<'js> for JsOp
         append_collection_option(&ctx, select, option)
     }
 
-
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-remove
     fn remove(&self, ctx: Ctx<'js>, arg_0: i32) -> Result<()> {
         self.remove(ctx, arg_0)
@@ -895,20 +889,32 @@ impl<'js> html_options_collection_generated::HTMLOptionsCollection<'js> for JsOp
 
 fn require_option_element<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<NodeId> {
     let Some(option) = super::host_node_id(ctx, value) else {
-        return Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"));
+        return Err(Exception::throw_type(
+            ctx,
+            "option must be an HTMLOptionElement",
+        ));
     };
     let registry = super::realm_registry(ctx)?;
     let Some(owner) = registry.borrow().owner_world(option) else {
-        return Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"));
+        return Err(Exception::throw_type(
+            ctx,
+            "option must be an HTMLOptionElement",
+        ));
     };
     let owner = owner.borrow();
     let Some(parsed) = owner.document(option) else {
-        return Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"));
+        return Err(Exception::throw_type(
+            ctx,
+            "option must be an HTMLOptionElement",
+        ));
     };
     if is_option_element(&parsed.document.base, option.node) {
         Ok(option)
     } else {
-        Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"))
+        Err(Exception::throw_type(
+            ctx,
+            "option must be an HTMLOptionElement",
+        ))
     }
 }
 
@@ -1167,10 +1173,8 @@ fn append_collection_option(ctx: &Ctx<'_>, select: NodeId, option: NodeId) -> Re
 }
 
 pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
-    crate::js::bridge::object(ctx)?
-        .set("__tbWindowNamedValue", Func::from(window_named_value))?;
-    crate::js::bridge::object(ctx)?
-        .set("__tbWindowNamedHas", Func::from(window_named_has))?;
+    crate::js::bridge::object(ctx)?.set("__tbWindowNamedValue", Func::from(window_named_value))?;
+    crate::js::bridge::object(ctx)?.set("__tbWindowNamedHas", Func::from(window_named_has))?;
     crate::js::bridge::evaluate(ctx, install_collections_js(ctx)?)?;
     Ok(())
 }
@@ -1289,8 +1293,8 @@ fn named_keys(ctx: &Ctx<'_>, ids: &[NodeId]) -> Result<Vec<String>> {
             {
                 keys.push(element_id.to_owned());
             }
-            let exposes_name = element_name(base, id.node)
-                .is_some_and(|qual| qual.ns == html_namespace());
+            let exposes_name =
+                element_name(base, id.node).is_some_and(|qual| qual.ns == html_namespace());
             if exposes_name
                 && let Some(element_name) = attr(base, id.node, "name")
                 && !element_name.is_empty()

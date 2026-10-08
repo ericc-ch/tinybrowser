@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use weedle::interface::{InterfaceMember, Special, StringifierOrInheritOrStatic, StringifierOrStatic};
+use weedle::interface::{
+    InterfaceMember, Special, StringifierOrInheritOrStatic, StringifierOrStatic,
+};
 use weedle::mixin::MixinMember;
 use weedle::{Definition, Definitions, Parse};
 
@@ -319,14 +321,16 @@ impl<'idl> Database<'idl> {
                 let Definition::PartialInterfaceMixin(partial) = partial else {
                     return Err(Error(format!("invalid partial mixin {name}")));
                 };
-                members.extend(partial.members.body.iter().map(|member| Member {
-                    declaration: mixin_member(member),
-                    scopes: definition
-                        .attributes
-                        .iter()
-                        .chain(partial.attributes.iter())
-                        .cloned()
-                        .collect(),
+                members.extend(partial.members.body.iter().map(|member| {
+                    Member {
+                        declaration: mixin_member(member),
+                        scopes: definition
+                            .attributes
+                            .iter()
+                            .chain(partial.attributes.iter())
+                            .cloned()
+                            .collect(),
+                    }
                 }));
             }
         }

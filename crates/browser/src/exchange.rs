@@ -913,7 +913,8 @@ impl<C, OR, N, IR> BlockingClient<C, OR, N, IR> {
         body: C,
         callback: impl FnOnce(Result<IR, Error>) + Send + 'static,
     ) -> Option<RequestId> {
-        self.start(body, BlockingPending::Callback(Box::new(callback))).ok()
+        self.start(body, BlockingPending::Callback(Box::new(callback)))
+            .ok()
     }
 
     pub(crate) fn deliver(&self, id: RequestId, body: IR) {

@@ -169,14 +169,10 @@ impl fmt::Display for TreeError {
 /// (<https://dom.spec.whatwg.org/#dom-domerror> naming).
 pub(crate) fn throw_dom_error(ctx: &Ctx<'_>, err: TreeError) -> rquickjs::Error {
     match err {
-        TreeError::Hierarchy => {
-            throw_dom(ctx, "HierarchyRequestError", &err.to_string())
-        }
+        TreeError::Hierarchy => throw_dom(ctx, "HierarchyRequestError", &err.to_string()),
         TreeError::NotFound => throw_dom(ctx, "NotFoundError", &err.to_string()),
         // Programming errors, not web-visible DOM exceptions.
-        TreeError::Stale => {
-            Exception::throw_type(ctx, &err.to_string())
-        }
+        TreeError::Stale => Exception::throw_type(ctx, &err.to_string()),
     }
 }
 
@@ -399,9 +395,9 @@ impl<'js> rquickjs::FromJs<'js> for LegacyNullString {
 
 impl<'js> rquickjs::FromJs<'js> for WebIdlCodeUnits {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        Ok(Self(crate::dom_string::DomString::from_utf16(webidl_to_units(
-            ctx, value,
-        )?)))
+        Ok(Self(crate::dom_string::DomString::from_utf16(
+            webidl_to_units(ctx, value)?,
+        )))
     }
 }
 
@@ -790,9 +786,10 @@ pub(super) fn wrap_new_document_in_world<'js>(
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
-    let is_fragment = world(ctx)?.borrow().document(id).is_some_and(|parsed| {
-        parsed.document.is_fragment(id.node)
-    });
+    let is_fragment = world(ctx)?
+        .borrow()
+        .document(id)
+        .is_some_and(|parsed| parsed.document.is_fragment(id.node));
     let brand = with_node_data(ctx, id, |data| match data {
         Some(NodeData::Document(_)) => Some(if document_is_html_content(ctx, id) {
             "Document"
@@ -1084,7 +1081,11 @@ pub(super) fn with_node_data<T>(
         return Err(Exception::throw_type(ctx, "no document"));
     };
     Ok(read(
-        parsed.document.base.get_node(id.node).map(|node| &node.data),
+        parsed
+            .document
+            .base
+            .get_node(id.node)
+            .map(|node| &node.data),
     ))
 }
 
@@ -1132,9 +1133,7 @@ pub(super) fn set_character_data(
         };
         match &node.data {
             NodeData::Text(text) => crate::dom_string::DomString::from(text.content.clone()),
-            NodeData::Comment { contents } => {
-                crate::dom_string::DomString::from(contents.clone())
-            }
+            NodeData::Comment { contents } => crate::dom_string::DomString::from(contents.clone()),
             _ => return Ok(()),
         }
     };
@@ -1149,9 +1148,8 @@ pub(super) fn set_character_data(
             }
             NodeData::Comment { .. } => {
                 base.snapshot_node(id.node);
-                if let Some(NodeData::Comment { contents }) = base
-                    .get_node_mut(id.node)
-                    .map(|node| &mut node.data)
+                if let Some(NodeData::Comment { contents }) =
+                    base.get_node_mut(id.node).map(|node| &mut node.data)
                 {
                     contents.clear();
                     contents.push_str(&data);
@@ -1160,12 +1158,12 @@ pub(super) fn set_character_data(
             _ => return Ok(()),
         }
     }
-    parsed.document.record(
-        crate::js::world::JournalEntry::CharacterData {
+    parsed
+        .document
+        .record(crate::js::world::JournalEntry::CharacterData {
             target: id,
             old_value,
-        },
-    );
+        });
     drop(parsed);
     drop(owner);
     schedule_mutation_delivery(ctx)
@@ -1221,7 +1219,9 @@ pub(super) fn sibling(
     if forward {
         siblings.get(position + 1).copied()
     } else {
-        position.checked_sub(1).and_then(|index| siblings.get(index).copied())
+        position
+            .checked_sub(1)
+            .and_then(|index| siblings.get(index).copied())
     }
 }
 
@@ -1334,7 +1334,6 @@ pub(super) fn descendant_text(
     }
     text
 }
-
 
 /// Which context a qualified name is validated in
 /// (<https://dom.spec.whatwg.org/#validate-and-extract> steps 6 and 7).
@@ -1514,7 +1513,6 @@ pub(super) fn live_collection<'js>(
     }
 }
 
-
 pub(super) fn is_element(base: &blitz_dom::BaseDocument, id: super::world::BlitzId) -> bool {
     base.get_node(id)
         .is_some_and(|node| matches!(node.data, NodeData::Element(_)))
@@ -1528,7 +1526,10 @@ pub(super) fn is_real_element(
 }
 
 /// The root of the tree `id` participates in (itself when detached).
-pub(super) fn root_of(base: &blitz_dom::BaseDocument, id: super::world::BlitzId) -> super::world::BlitzId {
+pub(super) fn root_of(
+    base: &blitz_dom::BaseDocument,
+    id: super::world::BlitzId,
+) -> super::world::BlitzId {
     let mut root = id;
     while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
         root = parent;
@@ -1646,8 +1647,8 @@ mod realm_tests {
 
     use super::{world, wrap_node};
     use crate::document::Stop;
-    use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::js::world::NodeId;
+    use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::messaging::Shared;
     use crate::protocol::{
         BrowserServices, BrowsingContextHost, DialCompletion, DialRequest, FrameId, MessagingHost,

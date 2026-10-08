@@ -59,7 +59,17 @@ pub(crate) fn install_location<'js>(
     globals: &Object<'js>,
     world: &Rc<RefCell<World>>,
 ) -> Result<()> {
-    enum Component { Pathname, Href, Search, Hash, Origin, Protocol, Host, Hostname, Port }
+    enum Component {
+        Pathname,
+        Href,
+        Search,
+        Hash,
+        Origin,
+        Protocol,
+        Host,
+        Hostname,
+        Port,
+    }
     let components = [
         ("pathname", Component::Pathname),
         ("href", Component::Href),
@@ -74,24 +84,34 @@ pub(crate) fn install_location<'js>(
     let location = Object::new(ctx.clone())?;
     for (name, component) in components {
         let owner = Rc::clone(world);
-        location.prop(name, Accessor::new_get(move || {
-            let owner = owner.borrow();
-            let url = &owner.document_url;
-            match component {
-                Component::Pathname => url.path().to_owned(),
-                Component::Href => url.as_str().to_owned(),
-                Component::Search => url.query().filter(|query| !query.is_empty()).map_or_else(String::new, |query| format!("?{query}")),
-                Component::Hash => url.fragment().filter(|fragment| !fragment.is_empty()).map_or_else(String::new, |fragment| format!("#{fragment}")),
-                Component::Origin => url.origin().ascii_serialization(),
-                Component::Protocol => format!("{}:", url.scheme()),
-                Component::Host => match url.port() {
-                    Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
-                    None => url.host_str().unwrap_or_default().to_owned(),
-                },
-                Component::Hostname => url.host_str().unwrap_or_default().to_owned(),
-                Component::Port => url.port().map_or_else(String::new, |port| port.to_string()),
-            }
-        }).enumerable())?;
+        location.prop(
+            name,
+            Accessor::new_get(move || {
+                let owner = owner.borrow();
+                let url = &owner.document_url;
+                match component {
+                    Component::Pathname => url.path().to_owned(),
+                    Component::Href => url.as_str().to_owned(),
+                    Component::Search => url
+                        .query()
+                        .filter(|query| !query.is_empty())
+                        .map_or_else(String::new, |query| format!("?{query}")),
+                    Component::Hash => url
+                        .fragment()
+                        .filter(|fragment| !fragment.is_empty())
+                        .map_or_else(String::new, |fragment| format!("#{fragment}")),
+                    Component::Origin => url.origin().ascii_serialization(),
+                    Component::Protocol => format!("{}:", url.scheme()),
+                    Component::Host => match url.port() {
+                        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+                        None => url.host_str().unwrap_or_default().to_owned(),
+                    },
+                    Component::Hostname => url.host_str().unwrap_or_default().to_owned(),
+                    Component::Port => url.port().map_or_else(String::new, |port| port.to_string()),
+                }
+            })
+            .enumerable(),
+        )?;
     }
     globals.set("location", location)?;
     Ok(())
@@ -105,10 +125,7 @@ pub(crate) fn install_location<'js>(
 /// current realm's window; any other non-object receiver is an illegal
 /// invocation
 /// (<https://webidl.spec.whatwg.org/#es-operations>).
-fn window_world_for_call<'js>(
-    ctx: &Ctx<'js>,
-    this: &Value<'js>,
-) -> Result<Rc<RefCell<World>>> {
+fn window_world_for_call<'js>(ctx: &Ctx<'js>, this: &Value<'js>) -> Result<Rc<RefCell<World>>> {
     if this.is_undefined() || this.is_null() {
         return world(ctx);
     }

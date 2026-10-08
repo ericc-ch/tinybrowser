@@ -15,8 +15,12 @@ use url::Url;
 /// Default per-call fetch timeout on a [`TabNetworkHandle`].
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on a navigation body.
-pub(crate) const NAV_BODY_LIMIT: usize = 1_048_576;
+/// Upper bound on one body carried inside a JSON control reply.
+///
+/// A top-level navigation document streams under
+/// [`renderer::MAX_RESPONSE_BODY_BYTES`]. This limit is the control reply,
+/// including a child frame whose response is returned in that reply.
+pub(crate) const CONTROL_BODY_LIMIT: usize = 1_048_576;
 
 /// One completed navigation dial.
 pub(crate) struct NavOutcome {
@@ -199,7 +203,10 @@ impl TabNetworkHandle {
             let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
             // https://fetch.spec.whatwg.org/#forbidden-method
             if request.kind == DialKind::JsFetch
-                && matches!(method.as_str().to_ascii_uppercase().as_str(), "CONNECT" | "TRACE" | "TRACK")
+                && matches!(
+                    method.as_str().to_ascii_uppercase().as_str(),
+                    "CONNECT" | "TRACE" | "TRACK"
+                )
             {
                 return Err(DialFailure::Connect);
             }
@@ -248,7 +255,7 @@ impl TabNetworkHandle {
             let body = if request.read_body {
                 response
                     .into_body()
-                    .bytes(NAV_BODY_LIMIT)
+                    .bytes(CONTROL_BODY_LIMIT)
                     .await
                     .map_err(|error| dial_failure(&error))?
             } else {

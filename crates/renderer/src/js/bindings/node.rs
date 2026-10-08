@@ -3,20 +3,19 @@
 use super::{
     AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap, JsTokenList,
     LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits, WebIdlString,
-    WebIdlUnsignedLong, adopt_across_documents, ancestor_chain, attached_attr_id,
-    attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node,
-    character_data, character_data_offset, child_value, clone_document, clone_within_document,
-    convert_union_nodes_into_node, deref_weak, descendant_text,
-    document_base_url_string, document_is_html, document_is_html_content, document_url_string,
-    dom_string, element_at_point, element_box, element_click, element_node_name,
-    element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
-    focus_node, host, host_node_id, import_snapshot, is_element, is_focusable,
-    is_main_document, live_collection, main_document, make_weak, materialize_children,
-    materialize_import, new_detached_attr, qualified_name,
-    rect_object, remove_attribute_sync, required_node, root_of, schedule_mutation_delivery,
-    select_error, set_attribute_node, set_attribute_sync, set_character_data, sibling,
-    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
-    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data, world, world_for_node,
+    WebIdlUnsignedLong, adopt_across_documents, ancestor_chain, attached_attr_id, attr_owner,
+    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
+    character_data_offset, child_value, clone_document, clone_within_document,
+    convert_union_nodes_into_node, deref_weak, descendant_text, document_base_url_string,
+    document_is_html, document_is_html_content, document_url_string, dom_string, element_at_point,
+    element_box, element_click, element_node_name, element_sibling_value, elements_by_tag,
+    find_element_by_id, fixup_focus_after_removal, focus_node, host, host_node_id, import_snapshot,
+    is_element, is_focusable, is_main_document, live_collection, main_document, make_weak,
+    materialize_children, materialize_import, new_detached_attr, qualified_name, rect_object,
+    remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
+    set_attribute_node, set_attribute_sync, set_character_data, sibling, sibling_value,
+    string_value, throw_dom, throw_dom_error, touch_attr, tree_order, valid_attribute_local_name,
+    valid_element_local_name, validate_and_extract, with_node_data, world, world_for_node,
     wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
@@ -292,63 +291,63 @@ fn ensure_document_content_model(
     let base = &doc.base;
     let node_base = &node_doc.base;
     let fragment_children: Vec<BlitzId> = if node_is_fragment {
+        node_base
+            .get_node(node.node)
+            .map(|fragment| fragment.children.iter().copied().collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !node_is_fragment && node_is_text {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "text cannot be a child of a document",
+        ));
+    }
+    if node_is_fragment
+        && fragment_children.iter().any(|child| {
             node_base
-                .get_node(node.node)
-                .map(|fragment| fragment.children.iter().copied().collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if !node_is_fragment && node_is_text {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "text cannot be a child of a document",
-            ));
-        }
-        if node_is_fragment
-            && fragment_children.iter().any(|child| {
+                .get_node(*child)
+                .is_some_and(|candidate| matches!(candidate.data, NodeData::Text(_)))
+        })
+    {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "text cannot be a child of a document",
+        ));
+    }
+    let inserted_elements = if node_is_fragment {
+        fragment_children
+            .iter()
+            .filter(|child| {
                 node_base
-                    .get_node(*child)
-                    .is_some_and(|candidate| matches!(candidate.data, NodeData::Text(_)))
+                    .get_node(**child)
+                    .is_some_and(|candidate| candidate.data.downcast_element().is_some())
             })
-        {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "text cannot be a child of a document",
-            ));
-        }
-        let inserted_elements = if node_is_fragment {
-            fragment_children
-                .iter()
-                .filter(|child| {
-                    node_base
+            .count()
+    } else {
+        usize::from(node_is_element)
+    };
+    let existing_elements = base.get_node(parent.node).map_or(0, |root| {
+        root.children
+            .iter()
+            .filter(|child| {
+                (node.document != parent.document || **child != node.node)
+                    && base
                         .get_node(**child)
                         .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-                })
-                .count()
-        } else {
-            usize::from(node_is_element)
-        };
-        let existing_elements = base.get_node(parent.node).map_or(0, |root| {
-            root.children
-                .iter()
-                .filter(|child| {
-                    (node.document != parent.document || **child != node.node)
-                        && base
-                            .get_node(**child)
-                            .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-                })
-                .count()
-        });
-        if existing_elements + inserted_elements > 1 {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "a document can have only one element child",
-            ));
-        }
+            })
+            .count()
+    });
+    if existing_elements + inserted_elements > 1 {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "a document can have only one element child",
+        ));
+    }
     Ok(())
 }
 
@@ -743,7 +742,12 @@ fn fragment_base_url(ctx: &Ctx<'_>, id: NodeId) -> (String, parley::FontContext)
                 )
             })
         })
-        .unwrap_or_else(|| (crate::render::INVALID_BASE_URL.to_owned(), parley::FontContext::default()))
+        .unwrap_or_else(|| {
+            (
+                crate::render::INVALID_BASE_URL.to_owned(),
+                parley::FontContext::default(),
+            )
+        })
 }
 
 /// Parses `markup` as an HTML fragment in `context` and snapshots the
@@ -828,15 +832,13 @@ fn current_body_child(
         candidate.children.iter().find_map(|child| {
             let node = base.get_node(*child)?;
             match &node.data {
-                NodeData::Element(element) => {
-                    (element.name.ns == html_namespace()
-                        && (element.name.local.as_ref() == "body"
-                            || element.name.local.as_ref() == "frameset"))
-                        .then_some(NodeId {
-                            document: parsed.id,
-                            node: *child,
-                        })
-                }
+                NodeData::Element(element) => (element.name.ns == html_namespace()
+                    && (element.name.local.as_ref() == "body"
+                        || element.name.local.as_ref() == "frameset"))
+                    .then_some(NodeId {
+                        document: parsed.id,
+                        node: *child,
+                    }),
                 _ => None,
             }
         })
@@ -2201,7 +2203,11 @@ fn serialize_xml_element(
     output.push_str(">");
 }
 
-pub(crate) fn serialize_xml_node(doc: &crate::documents::BlitzDocument, id: BlitzId, output: &mut HtmlOutput) {
+pub(crate) fn serialize_xml_node(
+    doc: &crate::documents::BlitzDocument,
+    id: BlitzId,
+    output: &mut HtmlOutput,
+) {
     let base = &doc.base;
     let Some(node) = base.get_node(id) else {
         return;
@@ -2227,7 +2233,10 @@ pub(crate) fn serialize_xml_node(doc: &crate::documents::BlitzDocument, id: Blit
 }
 
 /// XML-serializes the children of `parent`.
-pub(crate) fn serialize_xml_children(doc: &crate::documents::BlitzDocument, parent: BlitzId) -> DomString {
+pub(crate) fn serialize_xml_children(
+    doc: &crate::documents::BlitzDocument,
+    parent: BlitzId,
+) -> DomString {
     let base = &doc.base;
     let mut output = HtmlOutput(Vec::new());
     if let Some(node) = base.get_node(parent) {
@@ -2267,11 +2276,7 @@ fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
         return Ok(None);
     }
     let world = world(ctx)?;
-    Ok(world
-        .borrow()
-        .images
-        .get(&id)
-        .copied())
+    Ok(world.borrow().images.get(&id).copied())
 }
 
 /// Current viewport offset for `id`'s document.
@@ -2337,9 +2342,7 @@ impl JsNode {
             return rquickjs::String::from_str(ctx.clone(), "#document-fragment");
         }
         let name = with_node_data(ctx, self.handle.0, |data| match data {
-            Some(NodeData::Element(element)) => {
-                Ok(element_node_name(&element.name, uppercase))
-            }
+            Some(NodeData::Element(element)) => Ok(element_node_name(&element.name, uppercase)),
             Some(NodeData::Text(_)) => Ok("#text".into()),
             Some(NodeData::Comment { .. }) => Ok("#comment".into()),
             Some(NodeData::Document(_)) => Ok("#document".into()),
@@ -2801,8 +2804,8 @@ impl JsNode {
         {
             return Ok(value);
         }
-        let value = Class::instance(
-            ctx.clone(),
+        let value = host::instance(
+            ctx,
             JsImplementation {
                 document: self.handle,
             },
@@ -2857,9 +2860,7 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(ctx, "stale node"));
             };
-            document_first_child(&parsed, |data| {
-                matches!(data, NodeData::Element(_))
-            })
+            document_first_child(&parsed, |data| matches!(data, NodeData::Element(_)))
         };
         let Some(root_element) = root_element else {
             return Err(throw_dom(
@@ -2935,9 +2936,7 @@ impl JsNode {
     #[qjs(skip)]
     fn document_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         document_value(ctx, self.handle.0, |parsed| {
-            document_first_child(parsed, |data| {
-                matches!(data, NodeData::Element(_))
-            })
+            document_first_child(parsed, |data| matches!(data, NodeData::Element(_)))
         })
     }
 
@@ -3336,9 +3335,12 @@ impl JsNode {
     #[qjs(skip)]
     fn reset_form(&self, ctx: Ctx<'_>) -> Result<()> {
         let owner = world_for_node(&ctx, self.handle.0)?;
-        let is_form = owner.borrow().document(self.handle.0).is_some_and(|parsed| {
-            crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "form")
-        });
+        let is_form = owner
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| {
+                crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "form")
+            });
         if !is_form {
             return Err(throw_dom(
                 &ctx,
@@ -3429,9 +3431,8 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(0.0);
         };
-        if document_first_child(&parsed, |data| {
-            matches!(data, NodeData::Element(_))
-        }) == Some(self.handle.0)
+        if document_first_child(&parsed, |data| matches!(data, NodeData::Element(_)))
+            == Some(self.handle.0)
         {
             Ok(parsed.document.base.viewport_scroll().x)
         } else {
@@ -3446,9 +3447,8 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let is_root = document_first_child(&parsed, |data| {
-            matches!(data, NodeData::Element(_))
-        }) == Some(self.handle.0);
+        let is_root = document_first_child(&parsed, |data| matches!(data, NodeData::Element(_)))
+            == Some(self.handle.0);
         if !is_root {
             return Ok(());
         }
@@ -3468,9 +3468,8 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(0.0);
         };
-        if document_first_child(&parsed, |data| {
-            matches!(data, NodeData::Element(_))
-        }) == Some(self.handle.0)
+        if document_first_child(&parsed, |data| matches!(data, NodeData::Element(_)))
+            == Some(self.handle.0)
         {
             Ok(parsed.document.base.viewport_scroll().y)
         } else {
@@ -3485,9 +3484,8 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let is_root = document_first_child(&parsed, |data| {
-            matches!(data, NodeData::Element(_))
-        }) == Some(self.handle.0);
+        let is_root = document_first_child(&parsed, |data| matches!(data, NodeData::Element(_)))
+            == Some(self.handle.0);
         if !is_root {
             return Ok(());
         }
@@ -3529,9 +3527,10 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(document_first_child(&parsed, |data| {
-            matches!(data, NodeData::Element(_))
-        }) == Some(self.handle.0))
+        Ok(
+            document_first_child(&parsed, |data| matches!(data, NodeData::Element(_)))
+                == Some(self.handle.0),
+        )
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientwidth
@@ -3545,7 +3544,9 @@ impl JsNode {
             )]
             return Ok(cssom_round(width as f32));
         }
-        Ok(cssom_round(self.layout_metric(ctx, blitz_dom::Node::client_width)?))
+        Ok(cssom_round(
+            self.layout_metric(ctx, blitz_dom::Node::client_width)?,
+        ))
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientheight
@@ -3883,9 +3884,12 @@ impl JsNode {
     #[qjs(skip)]
     fn complete(&self, ctx: Ctx<'_>) -> Result<bool> {
         let owner = world_for_node(&ctx, self.handle.0)?;
-        let is_img = owner.borrow().document(self.handle.0).is_some_and(|parsed| {
-            crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "img")
-        });
+        let is_img = owner
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| {
+                crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "img")
+            });
         if !is_img {
             return Ok(false);
         }
@@ -3900,11 +3904,9 @@ impl JsNode {
         if world.image_broken.contains(&self.handle.0) {
             return Ok(true);
         }
-        let src = world
-            .document(self.handle.0)
-            .and_then(|parsed| {
-                attr(&parsed.document.base, self.handle.0.node, "src").map(str::to_owned)
-            });
+        let src = world.document(self.handle.0).and_then(|parsed| {
+            attr(&parsed.document.base, self.handle.0.node, "src").map(str::to_owned)
+        });
         if src.as_deref().is_none_or(str::is_empty) {
             return Ok(true);
         }
@@ -3915,9 +3917,12 @@ impl JsNode {
     #[qjs(skip)]
     fn current_src(&self, ctx: Ctx<'_>) -> Result<String> {
         let owner = world_for_node(&ctx, self.handle.0)?;
-        let is_img = owner.borrow().document(self.handle.0).is_some_and(|parsed| {
-            crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "img")
-        });
+        let is_img = owner
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| {
+                crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "img")
+            });
         if !is_img {
             return Ok(String::new());
         }
@@ -4053,7 +4058,13 @@ impl JsNode {
             serialize_html_outer(&parsed.document, self.handle.0.node, &name, &attributes)
         } else {
             let mut output = HtmlOutput(Vec::new());
-            serialize_xml_element(&parsed.document, self.handle.0.node, &name, &attributes, &mut output);
+            serialize_xml_element(
+                &parsed.document,
+                self.handle.0.node,
+                &name,
+                &attributes,
+                &mut output,
+            );
             output.finish()
         };
         dom_string(ctx, &markup)
@@ -4066,16 +4077,17 @@ impl JsNode {
         // container (https://dom.spec.whatwg.org/#concept-node-adopt).
         let element = self.handle.0;
         let context = with_node_data(ctx, element, |data| match data {
-            Some(NodeData::Element(element)) => {
-                Some(html_fragment_context(&element.name))
-            }
+            Some(NodeData::Element(element)) => Some(html_fragment_context(&element.name)),
             _ => None,
         })?
         .ok_or_else(|| {
             Exception::throw_type(ctx, "innerHTML requires an element or shadow root")
         })?;
 
-        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, element); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
+        let snapshots = {
+            let (base_url, font_ctx) = fragment_base_url(ctx, element);
+            parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx)
+        };
 
         // Known gap: Blitz has no template contents, so `<template>` children
         // replace as ordinary element children.
@@ -4126,13 +4138,14 @@ impl JsNode {
         // live container (https://dom.spec.whatwg.org/#concept-node-adopt).
         let element = self.handle.0;
         let context = with_node_data(&ctx, element, |data| match data {
-            Some(NodeData::Element(element)) => {
-                Some(html_fragment_context(&element.name))
-            }
+            Some(NodeData::Element(element)) => Some(html_fragment_context(&element.name)),
             _ => None,
         })?
         .ok_or_else(|| Exception::throw_type(&ctx, "insertAdjacentHTML requires an element"))?;
-        let snapshots = { let (base_url, font_ctx) = fragment_base_url(&ctx, element); parse_html_fragment_snapshots(&text.0, &context, &base_url, font_ctx) };
+        let snapshots = {
+            let (base_url, font_ctx) = fragment_base_url(&ctx, element);
+            parse_html_fragment_snapshots(&text.0, &context, &base_url, font_ctx)
+        };
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(element) else {
@@ -4231,7 +4244,10 @@ impl JsNode {
                 );
             (parent, context)
         };
-        let snapshots = { let (base_url, font_ctx) = fragment_base_url(ctx, element); parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx) };
+        let snapshots = {
+            let (base_url, font_ctx) = fragment_base_url(ctx, element);
+            parse_html_fragment_snapshots(&value.0, &context, &base_url, font_ctx)
+        };
 
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(element) else {
@@ -4613,9 +4629,7 @@ impl JsNode {
     fn tag_name(&self, ctx: &Ctx<'_>) -> Result<String> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
         with_node_data(ctx, self.handle.0, |data| match data {
-            Some(NodeData::Element(element)) => {
-                element_node_name(&element.name, uppercase)
-            }
+            Some(NodeData::Element(element)) => element_node_name(&element.name, uppercase),
             _ => String::new(),
         })
     }
@@ -4624,9 +4638,7 @@ impl JsNode {
     #[qjs(skip)]
     fn local_name(&self, ctx: &Ctx<'_>) -> Result<String> {
         with_node_data(ctx, self.handle.0, |data| match data {
-            Some(NodeData::Element(element)) => {
-                element.name.local.to_string()
-            }
+            Some(NodeData::Element(element)) => element.name.local.to_string(),
             _ => String::new(),
         })
     }
@@ -6714,13 +6726,13 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let base = &parsed.document.base;
-            let Some(parent) = base
-                .get_node(target.node)
-                .and_then(|node| node.parent)
-                .map(|node| NodeId {
-                    document: target.document,
-                    node,
-                })
+            let Some(parent) =
+                base.get_node(target.node)
+                    .and_then(|node| node.parent)
+                    .map(|node| NodeId {
+                        document: target.document,
+                        node,
+                    })
             else {
                 return Ok(());
             };
@@ -7429,8 +7441,10 @@ type RenderingContext<'js> =
 impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width
     fn get_width(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        Ok(usize::try_from(canvas_dimension(ctx, self.handle.0, "width", 300))
-            .unwrap_or(usize::MAX))
+        Ok(
+            usize::try_from(canvas_dimension(ctx, self.handle.0, "width", 300))
+                .unwrap_or(usize::MAX),
+        )
     }
 
     fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
@@ -7439,8 +7453,10 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height
     fn get_height(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        Ok(usize::try_from(canvas_dimension(ctx, self.handle.0, "height", 150))
-            .unwrap_or(usize::MAX))
+        Ok(
+            usize::try_from(canvas_dimension(ctx, self.handle.0, "height", 150))
+                .unwrap_or(usize::MAX),
+        )
     }
 
     fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {

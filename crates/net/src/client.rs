@@ -338,7 +338,11 @@ impl Agent {
 
         loop {
             // https://fetch.spec.whatwg.org/#http-fetch
-            if request.same_origin.as_ref().is_some_and(|origin| url.origin() != *origin) {
+            if request
+                .same_origin
+                .as_ref()
+                .is_some_and(|origin| url.origin() != *origin)
+            {
                 return Err(NetError::Protocol(ProtocolError::RejectedRequest));
             }
             if budget.is_expired() {

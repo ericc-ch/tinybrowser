@@ -81,7 +81,9 @@ impl<'ast> Visit<'ast> for Discovery<'_, '_, '_> {
                     let line = self
                         .source
                         .get(..call.span.start as usize)
-                        .map_or(0, |prefix| prefix.bytes().filter(|byte| *byte == b'\n').count() + 1);
+                        .map_or(0, |prefix| {
+                            prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+                        });
                     self.error = Some(Error(format!("line {line}: {error}")));
                 }
             }
@@ -369,7 +371,10 @@ fn arguments(arguments: &[weedle::argument::Argument<'_>]) -> Result<(usize, Str
                     )) => {}
                     _ => return Err(Error("JS string defaults require string arguments".into())),
                 }
-                format!("{present} && args[{index}] !== undefined ? {converted} : {:?}", default.0)
+                format!(
+                    "{present} && args[{index}] !== undefined ? {converted} : {:?}",
+                    default.0
+                )
             }
             _ => return Err(Error("JS argument optionality is not supported yet".into())),
         };

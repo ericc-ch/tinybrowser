@@ -4,6 +4,83 @@
   delete host.__tbWindowNamedValue;
   delete host.__tbWindowNamedHas;
   const native = globalThis.NodeList.prototype;
+  // Value iterators for `iterable<T>`
+  // (<https://webidl.spec.whatwg.org/#es-iterable>). `@@iterator` is the
+  // same function object as `values`. `forEach` re-reads the original
+  // `length` getter each step so a live list observes mutations, and the
+  // value comes from the original `item` rather than a page replacement
+  // (<https://webidl.spec.whatwg.org/#es-forEach>).
+  function installValueIterable(ctor) {
+    const proto = ctor.prototype;
+    const lengthGet = Object.getOwnPropertyDescriptor(proto, 'length').get;
+    const item = proto.item;
+    const iteratorPrototype = Object.create(Object.prototype);
+    Object.defineProperty(iteratorPrototype, Symbol.toStringTag, {
+      value: ctor.name + ' Iterator', writable: false, enumerable: false, configurable: true,
+    });
+    iteratorPrototype[Symbol.iterator] = function() { return this; };
+    function brand(collection) {
+      if (!(collection instanceof ctor)) throw new TypeError('Illegal invocation');
+      return collection;
+    }
+    function lengthOf(collection) {
+      return __tbApply(lengthGet, collection, []);
+    }
+    function valueAt(collection, index) {
+      return __tbApply(item, collection, [index]);
+    }
+    function iterator(next) {
+      const object = Object.create(iteratorPrototype);
+      object.next = next;
+      return object;
+    }
+    function values() {
+      const collection = brand(this);
+      let index = 0;
+      return iterator(function() {
+        if (index >= lengthOf(collection)) return { value: undefined, done: true };
+        return { value: valueAt(collection, index++), done: false };
+      });
+    }
+    function keys() {
+      const collection = brand(this);
+      let index = 0;
+      return iterator(function() {
+        if (index >= lengthOf(collection)) return { value: undefined, done: true };
+        return { value: index++, done: false };
+      });
+    }
+    function entries() {
+      const collection = brand(this);
+      let index = 0;
+      return iterator(function() {
+        if (index >= lengthOf(collection)) return { value: undefined, done: true };
+        const current = index++;
+        return { value: [current, valueAt(collection, current)], done: false };
+      });
+    }
+    function forEach(callback, thisArg) {
+      const collection = brand(this);
+      if (typeof callback !== 'function') throw new TypeError('not a function');
+      for (let index = 0; index < lengthOf(collection); index++) {
+        __tbApply(callback, thisArg, [valueAt(collection, index), index, collection]);
+      }
+    }
+    for (const [name, value] of [['values', values], ['keys', keys], ['entries', entries], ['forEach', forEach]]) {
+      Object.defineProperty(proto, name, {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+    }
+    Object.defineProperty(proto, Symbol.iterator, {
+      value: values,
+      writable: true,
+      configurable: true,
+    });
+  }
+  installValueIterable(globalThis.NodeList);
+  installValueIterable(globalThis.DOMTokenList);
+  // `NamedNodeMap` and `HTMLCollection` are not `iterable<>` in the DOM IDL.
+  // The iterator below is the existing indexed walk those callers already use.
   function values() {
     let index = 0;
     const collection = this;
@@ -15,17 +92,7 @@
       [Symbol.iterator]: function() { return this; }
     };
   }
-  Object.defineProperty(native, Symbol.iterator, {
-    value: values,
-    writable: true,
-    configurable: true,
-  });
   Object.defineProperty(globalThis.NamedNodeMap.prototype, Symbol.iterator, {
-    value: values,
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(globalThis.DOMTokenList.prototype, Symbol.iterator, {
     value: values,
     writable: true,
     configurable: true,

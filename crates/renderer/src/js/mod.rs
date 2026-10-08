@@ -365,6 +365,21 @@ impl JsRealm {
         })
     }
 
+    /// Tells the page shim to dispatch `change` on `MediaQueryList`s whose
+    /// result flipped (<https://drafts.csswg.org/cssom-view/#evaluate-media-queries-and-report-changes>).
+    pub(crate) fn report_media_changes(&self) -> Result<(), JsError> {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
+            self.context.with(|ctx| {
+                let host = bridge::object(&ctx)?;
+                let Some(func) = host.get::<_, Option<Function>>("__tbReportMediaChanges")? else {
+                    return Ok(());
+                };
+                func.call::<_, ()>(())?;
+                Ok(())
+            })
+        })
+    }
+
     pub(crate) fn finish_js_fetch(
         &self,
         js_id: i32,
@@ -1158,9 +1173,7 @@ pub(crate) fn script_at(world: &World, id: crate::js::world::NodeId) -> Option<S
         },
     };
     let typ = crate::js::world::attr(base, id.node, "type");
-    if typ
-        .is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module"))
-    {
+    if typ.is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module")) {
         Some(Script::Module(source))
     } else {
         javascript_mime(typ).then_some(Script::Classic(source))

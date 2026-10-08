@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
 use renderer::{
-    DialFailure, FrameId, HistorySnapshot, Mount, RemoteValue, RendererEvent, ResourceLimit,
-    TabError,
+    DialFailure, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue,
+    RendererEvent, ResourceLimit, TabError,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -24,7 +24,7 @@ use crate::assignment::Assignment;
 use crate::exchange::{self, RequestId, ServerInput};
 use crate::history::SessionHistory;
 use crate::manager::RendererProcessManager;
-use crate::network::{NAV_BODY_LIMIT, NavOutcome, TabNetworkHandle, dial_failure};
+use crate::network::{NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
 
 const EVENT_SUBSCRIBER_CAPACITY: usize = 256;
@@ -36,6 +36,17 @@ const DELIVERY_CAPACITY: usize = 256;
 const MAX_WAITERS: usize = 256;
 const MAX_SUBSCRIBERS: usize = 256;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A URL safe to write in a log: no userinfo, query, or fragment.
+fn log_url(url: &Url) -> String {
+    let mut logged = url.clone();
+    if logged.set_username("").is_ok() {
+        let _ = logged.set_password(None);
+    }
+    logged.set_query(None);
+    logged.set_fragment(None);
+    logged.to_string()
+}
 
 /// Identity of one tab in a [`crate::Browser`] registry.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -689,7 +700,9 @@ impl Tab {
             viewport: renderer::DEFAULT_VIEWPORT,
             init_scripts: Vec::new(),
             next_init_script: 1,
-            history: SessionHistory::new(Url::parse("about:blank").expect("about:blank is a valid URL")),
+            history: SessionHistory::new(
+                Url::parse("about:blank").expect("about:blank is a valid URL"),
+            ),
             traversal: None,
             document_loaded: false,
             navigation_failed: false,
@@ -813,15 +826,21 @@ impl Tab {
             match body.read_chunk().await {
                 Ok(Some(chunk)) => {
                     received = received.saturating_add(chunk.len());
-                    if received > NAV_BODY_LIMIT {
+                    if received > MAX_RESPONSE_BODY_BYTES {
                         let _ = stream.abort(DialFailure::Limit).await;
                         self.drop_renderer();
-                        return Err(renderer_unavailable("navigation body exceeds limit"));
+                        return Err(renderer_unavailable(&format!(
+                            "navigation body exceeds {MAX_RESPONSE_BODY_BYTES} bytes ({received} received)"
+                        )));
                     }
-                    if let Err(error) = stream.write(chunk).await {
-                        drop(stream);
-                        self.drop_renderer();
-                        return Err(error);
+                    // One HTTP frame can be larger than the IPC body chunk.
+                    // The buffered mount already splits; this path must too.
+                    for piece in chunk.chunks(crate::wire::channel::MAX_BODY_CHUNK_BYTES) {
+                        if let Err(error) = stream.write(piece.to_vec()).await {
+                            drop(stream);
+                            self.drop_renderer();
+                            return Err(error);
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -959,21 +978,30 @@ impl Tab {
         if !active {
             return;
         }
+        let url = self.nav.as_ref().map(|nav| nav.url.clone());
         self.dial_cancel = None;
         self.dial_guard = None;
         self.nav = None;
-        if let Ok(outcome) = result {
-            let mounted = self.commit_navigation(outcome).await;
-            self.record_event(if mounted {
-                TabEvent::Navigated
-            } else {
-                TabEvent::NavigationFailed
-            })
-            .await;
-        } else {
-            self.traversal = None;
-            self.navigation_failed = true;
-            self.record_event(TabEvent::NavigationFailed).await;
+        match result {
+            Ok(outcome) => {
+                let mounted = self.commit_navigation(outcome).await;
+                self.record_event(if mounted {
+                    TabEvent::Navigated
+                } else {
+                    TabEvent::NavigationFailed
+                })
+                .await;
+            }
+            Err(failure) => {
+                logging::error!(
+                    target: "browser::tab",
+                    "navigation dial failed for {}: {failure:?}",
+                    url.as_ref().map(log_url).as_deref().unwrap_or("unknown")
+                );
+                self.traversal = None;
+                self.navigation_failed = true;
+                self.record_event(TabEvent::NavigationFailed).await;
+            }
         }
     }
 
@@ -982,6 +1010,11 @@ impl Tab {
         let site = Site::for_url(&outcome.final_url).unwrap_or_else(|| Site::opaque(self.id));
         let mut history = self.history.clone();
         if !history.navigate(outcome.final_url.clone(), self.traversal.take()) {
+            logging::error!(
+                target: "browser::tab",
+                "navigation rejected by history for {}",
+                log_url(&outcome.final_url)
+            );
             self.navigation_failed = true;
             return false;
         }
@@ -993,11 +1026,15 @@ impl Tab {
             viewport: Some(self.viewport),
             init_scripts: self.init_scripts.clone(),
         };
-        if self
+        if let Err(error) = self
             .mount_stream(&site, outcome.status, mount, outcome.body)
             .await
-            .is_err()
         {
+            logging::error!(
+                target: "browser::tab",
+                "navigation mount failed for {}: {error}",
+                log_url(&outcome.final_url)
+            );
             self.navigation_failed = true;
             return false;
         }
@@ -1031,9 +1068,14 @@ impl Tab {
             RendererEvent::DomContentLoaded => {
                 self.record_event(TabEvent::DomContentLoaded).await;
             }
-            RendererEvent::HistoryUpdated { url, state, replace } => {
+            RendererEvent::HistoryUpdated {
+                url,
+                state,
+                replace,
+            } => {
                 if let Ok(url) = Url::parse(url)
-                    && url.origin() == self.document_url.origin() {
+                    && url.origin() == self.document_url.origin()
+                {
                     self.history.update(url.clone(), state.clone(), *replace);
                     self.document_url = url;
                     self.record_event(TabEvent::SameDocumentNavigation).await;
@@ -1062,14 +1104,16 @@ impl Tab {
         let url = url.to_string();
         let state = state.map(str::to_owned);
         if same_document {
-            let result = self.renderer_request(RendererCommand::HistoryTraverse {
-                url: url.clone(),
-                history: HistorySnapshot {
-                    state,
-                    index,
-                    length: self.history.snapshot().length,
-                },
-            }).await;
+            let result = self
+                .renderer_request(RendererCommand::HistoryTraverse {
+                    url: url.clone(),
+                    history: HistorySnapshot {
+                        state,
+                        index,
+                        length: self.history.snapshot().length,
+                    },
+                })
+                .await;
             if matches!(result, Ok(Reply::Unit(Ok(())))) {
                 self.history.traverse_same_document(index);
                 if let Ok(url) = Url::parse(&url) {
@@ -1464,7 +1508,8 @@ impl TabOperation for RemoveInitScript {
 
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
-        tab.init_scripts.retain(|(script_id, _)| *script_id != self.id);
+        tab.init_scripts
+            .retain(|(script_id, _)| *script_id != self.id);
         let result = if tab.renderer.is_some() {
             tab.renderer_request(RendererCommand::RemoveInitScript { id: self.id })
                 .await
@@ -1767,7 +1812,11 @@ async fn fail_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, error: &Tab
 async fn resolve_frame_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, frame: FrameId) {
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
-        if waiter.source.as_ref().is_some_and(|(wait_frame, _)| *wait_frame == frame) {
+        if waiter
+            .source
+            .as_ref()
+            .is_some_and(|(wait_frame, _)| *wait_frame == frame)
+        {
             let _result = server
                 .reply(waiter.id, TabReply::RunUntilJs(Ok(false)))
                 .await;

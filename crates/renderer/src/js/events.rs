@@ -390,12 +390,7 @@ impl<'js> event_target_generated::EventTarget<'js> for JsEventTarget {
     }
 
     // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
-    fn dispatch_event(
-        &self,
-        ctx: Ctx<'js>,
-        this: Object<'js>,
-        event: Value<'js>,
-    ) -> Result<bool> {
+    fn dispatch_event(&self, ctx: Ctx<'js>, this: Object<'js>, event: Value<'js>) -> Result<bool> {
         register_standalone(&ctx, self.id, &this)?;
         let event = Class::<JsEvent>::from_js(&ctx, event)?;
         dispatch_event(&ctx, EventTargetKey::Standalone(self.id), &event)
@@ -451,19 +446,16 @@ impl<'js> event_target_generated::EventTarget<'js> for JsNode {
         )
     }
 
-    fn dispatch_event(
-        &self,
-        ctx: Ctx<'js>,
-        _this: Object<'js>,
-        event: Value<'js>,
-    ) -> Result<bool> {
+    fn dispatch_event(&self, ctx: Ctx<'js>, _this: Object<'js>, event: Value<'js>) -> Result<bool> {
         let event = Class::<JsEvent>::from_js(&ctx, event)?;
         dispatch_event(&ctx, EventTargetKey::Node(self.node_id()), &event)
     }
 }
 
 /// The `addEventListener` options union as parsed listener options.
-pub(crate) fn listener_options(options: event_target_generated::AddEventListenerOptionsOrBoolean) -> ListenerOptions {
+pub(crate) fn listener_options(
+    options: event_target_generated::AddEventListenerOptionsOrBoolean,
+) -> ListenerOptions {
     match options {
         event_target_generated::AddEventListenerOptionsOrBoolean::Boolean(capture) => {
             ListenerOptions {
@@ -486,7 +478,9 @@ pub(crate) fn listener_options(options: event_target_generated::AddEventListener
 
 /// `removeEventListener` reads only `capture`
 /// (<https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>).
-pub(crate) fn remove_capture(options: event_target_generated::BooleanOrEventListenerOptions) -> bool {
+pub(crate) fn remove_capture(
+    options: event_target_generated::BooleanOrEventListenerOptions,
+) -> bool {
     match options {
         event_target_generated::BooleanOrEventListenerOptions::Boolean(capture) => capture,
         event_target_generated::BooleanOrEventListenerOptions::EventListenerOptions(options) => {
@@ -572,18 +566,23 @@ fn register_standalone<'js>(ctx: &Ctx<'js>, id: u64, target: &Object<'js>) -> Re
     Ok(())
 }
 
+/// An event whose prototype is this realm's, not the runtime's cached one.
+fn realm_event<'js>(ctx: &Ctx<'js>, event: JsEvent) -> Result<Class<'js, JsEvent>> {
+    bindings::host::instance(ctx, event)
+}
+
 /// `document.createEvent(interface)`
 /// (<https://dom.spec.whatwg.org/#dom-document-createevent>).
 ///
 /// The interface name matches ASCII case-insensitively.
 pub(crate) fn create_event<'js>(ctx: &Ctx<'js>, interface: &str) -> Result<Value<'js>> {
     match interface.to_ascii_lowercase().as_str() {
-        "event" | "events" | "htmlevents" => Ok(Class::into_value(Class::instance(
-            ctx.clone(),
+        "event" | "events" | "htmlevents" => Ok(Class::into_value(realm_event(
+            ctx,
             JsEvent::uninitialized(),
         )?)),
         "customevent" => {
-            let class = Class::instance(ctx.clone(), JsEvent::uninitialized())?;
+            let class = realm_event(ctx, JsEvent::uninitialized())?;
             set_custom_event_prototype(ctx, &class)?;
             Ok(Class::into_value(class))
         }
@@ -622,9 +621,11 @@ pub(crate) fn construct_custom_event<'js>(
         ));
     };
     let typ = bindings::webidl_to_string(&ctx, typ)?;
-    let init = args.next().unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+    let init = args
+        .next()
+        .unwrap_or_else(|| Value::new_undefined(ctx.clone()));
     let init = event_generated::EventInit::from_object(&ctx, &init)?;
-    let class = Class::instance(ctx.clone(), JsEvent::from_init(typ, &init))?;
+    let class = realm_event(&ctx, JsEvent::from_init(typ, &init))?;
     set_custom_event_prototype(&ctx, &class)?;
     Ok(Class::into_value(class))
 }
@@ -889,7 +890,7 @@ pub(crate) fn fire_trusted(
     bubbles: bool,
     cancelable: bool,
 ) -> Result<()> {
-    let event = Class::instance(ctx.clone(), JsEvent::trusted(typ, bubbles, cancelable))?;
+    let event = realm_event(ctx, JsEvent::trusted(typ, bubbles, cancelable))?;
     dispatch(ctx, target, &event, None)?;
     Ok(())
 }
@@ -897,7 +898,7 @@ pub(crate) fn fire_trusted(
 /// Fires `popstate` with the deserialized state for the activated entry.
 /// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-popstateevent-interface>
 pub(crate) fn fire_trusted_popstate<'js>(ctx: &Ctx<'js>, state: Value<'js>) -> Result<()> {
-    let event = Class::instance(ctx.clone(), JsEvent::trusted("popstate", false, false))?;
+    let event = realm_event(ctx, JsEvent::trusted("popstate", false, false))?;
     if let Some(prototype) = bindings::world(ctx)?.borrow().brand("PopStateEvent") {
         event.set_prototype(Some(&prototype.restore(ctx)?))?;
     }
@@ -910,7 +911,7 @@ pub(crate) fn fire_trusted_popstate<'js>(ctx: &Ctx<'js>, state: Value<'js>) -> R
 /// caller can run the activation behavior
 /// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
 pub(crate) fn fire_trusted_click(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<bool> {
-    let event = Class::instance(ctx.clone(), JsEvent::trusted("click", true, true))?;
+    let event = realm_event(ctx, JsEvent::trusted("click", true, true))?;
     dispatch(ctx, target, &event, None)
 }
 

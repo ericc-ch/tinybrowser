@@ -104,7 +104,11 @@ pub(crate) fn convert_union_nodes_into_node<'js>(
                 let Some(id) = reference.tree() else {
                     // The union trial only admits tree nodes, matching
                     // insertion below, which rejects attribute references.
-                    return Err(throw_dom(ctx, "HierarchyRequestError", "attributes cannot be inserted"));
+                    return Err(throw_dom(
+                        ctx,
+                        "HierarchyRequestError",
+                        "attributes cannot be inserted",
+                    ));
                 };
                 pieces.push(Piece::Node(id));
             }
@@ -161,11 +165,7 @@ fn assemble_nodes_into_node(
         let id = match piece {
             Piece::Node(id) => id,
             Piece::Text(text) => {
-                let node = parsed
-                    .document
-                    .base
-                    .mutate()
-                    .create_text_node(&text);
+                let node = parsed.document.base.mutate().create_text_node(&text);
                 NodeId {
                     document: document.document,
                     node,

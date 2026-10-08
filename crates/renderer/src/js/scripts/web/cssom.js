@@ -244,11 +244,96 @@
     return negated ? !matches : matches;
   };
   const __tbMediaQueryList = (text) => __tbSplitMedia(String(text), ',').some(__tbMediaQuery);
+  // `MediaQueryList` is an `EventTarget` with the legacy listener pair
+  // (<https://drafts.csswg.org/cssom-view/#mediaquerylist>). The constructor
+  // is captured here so a page-replaced `EventTarget` cannot build the list.
+  const __tbMediaSlots = host.slots('MediaQueryList');
+  const __tbMediaLists = [];
+  const __tbEventTarget = globalThis.EventTarget;
+  const __tbEvent = globalThis.Event;
+  const __tbAddEventListener = __tbEventTarget.prototype.addEventListener;
+  const __tbRemoveEventListener = __tbEventTarget.prototype.removeEventListener;
+  const __tbDispatchEvent = __tbEventTarget.prototype.dispatchEvent;
+  function MediaQueryList() {
+    throw new TypeError('Illegal constructor');
+  }
+  MediaQueryList.prototype = Object.create(__tbEventTarget.prototype, {
+    constructor: { value: MediaQueryList, writable: true, configurable: true },
+  });
+  Object.defineProperty(MediaQueryList.prototype, Symbol.toStringTag, {
+    value: 'MediaQueryList', writable: false, enumerable: false, configurable: true,
+  });
+  function __tbMediaBrand(list) {
+    const slot = __tbMediaSlots.get(list);
+    if (!slot) throw new TypeError('Illegal invocation');
+    return slot;
+  }
+  Object.defineProperty(MediaQueryList.prototype, 'media', {
+    get() { return __tbMediaBrand(this).media; },
+    enumerable: true, configurable: true,
+  });
+  Object.defineProperty(MediaQueryList.prototype, 'matches', {
+    get() { return __tbMediaQueryList(__tbMediaBrand(this).media); },
+    enumerable: true, configurable: true,
+  });
+  function __tbMediaAddListener(callback) {
+    const list = this;
+    __tbMediaBrand(list);
+    if (callback == null) return;
+    __tbApply(__tbAddEventListener, list, ['change', callback]);
+  }
+  function __tbMediaRemoveListener(callback) {
+    const list = this;
+    __tbMediaBrand(list);
+    if (callback == null) return;
+    __tbApply(__tbRemoveEventListener, list, ['change', callback]);
+  }
+  Object.defineProperty(MediaQueryList.prototype, 'addListener', {
+    value: __tbMediaAddListener, writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(MediaQueryList.prototype, 'removeListener', {
+    value: __tbMediaRemoveListener, writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(MediaQueryList.prototype, 'onchange', {
+    get() { return __tbMediaBrand(this).onchange; },
+    set(value) {
+      const slot = __tbMediaBrand(this);
+      if (value != null && typeof value !== 'function') throw new TypeError('not a function');
+      const next = typeof value === 'function' ? value : null;
+      if (slot.onchange) __tbApply(__tbRemoveEventListener, this, ['change', slot.onchange]);
+      slot.onchange = next;
+      if (next) __tbApply(__tbAddEventListener, this, ['change', next]);
+    },
+    enumerable: true, configurable: true,
+  });
+  function __tbReportMediaChanges() {
+    for (const list of __tbMediaLists) {
+      const slot = __tbMediaSlots.get(list);
+      if (!slot) continue;
+      const matches = __tbMediaQueryList(slot.media);
+      if (matches === slot.matches) continue;
+      slot.matches = matches;
+      const event = new __tbEvent('change');
+      Object.defineProperty(event, 'media', { value: slot.media });
+      Object.defineProperty(event, 'matches', { value: matches });
+      __tbApply(__tbDispatchEvent, list, [event]);
+    }
+  }
+  host.__tbReportMediaChanges = __tbReportMediaChanges;
+  Object.defineProperty(globalThis, 'MediaQueryList', {
+    value: MediaQueryList, writable: true, configurable: true,
+  });
   Object.defineProperty(globalThis, 'matchMedia', {
     value: function(media) {
-      return {
-        media: String(media), matches: __tbMediaQueryList(media),
-      };
+      const query = String(media);
+      const list = __tbConstruct(__tbEventTarget, [], MediaQueryList);
+      __tbMediaSlots.set(list, {
+        media: query,
+        matches: __tbMediaQueryList(query),
+        onchange: null,
+      });
+      __tbMediaLists.push(list);
+      return list;
     },
     writable: true, configurable: true,
   });
