@@ -1357,15 +1357,22 @@ impl Document {
         // `document.open()`, do not
         // (<https://html.spec.whatwg.org/multipage/parsing.html#xml-parser>,
         // <https://mimesniff.spec.whatwg.org/#xml-mime-type>).
-        let parsed = match self
+        let parsed = if let Some(content_type) = self
             .response_content_type
             .as_deref()
             .and_then(crate::xml::navigated_content_type)
         {
-            Some(content_type) => {
-                crate::xml::parse_navigated(&buffer, content_type, self.blitz_config())
+            crate::xml::parse_navigated(&buffer, content_type, self.blitz_config())
+        } else {
+            let mut parsed = crate::parse_html(&buffer, self.blitz_config());
+            // A non-XML response still records its MIME type on the
+            // document. Images, style sheets, and plain text in a frame
+            // parse as HTML wrapping, but `contentType` is the type
+            // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-document-content-type>).
+            if let Some(header) = self.response_content_type.as_deref() {
+                parsed.content_type = crate::xml::document_content_type(header);
             }
-            None => crate::parse_html(&buffer, self.blitz_config()),
+            parsed
         };
         if !self.install_parsed(parsed) {
             self.record_event(RendererEvent::ScriptFailed);

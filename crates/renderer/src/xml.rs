@@ -3,7 +3,12 @@
 //! Delegates to `blitz-html`'s XML path. Malformed input yields a document
 //! holding a `parsererror` element, matching the HTML XML parsing rules.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use crate::Parsed;
+
+static MIME_ESSENCES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
 
 /// Parses `input` as an XML document with the given content type.
 pub(crate) fn parse_document(
@@ -82,6 +87,53 @@ pub(crate) fn navigated_content_type(header: &str) -> Option<&'static str> {
         // `application/xml` and every other XML MIME type.
         _ => "application/xml",
     })
+}
+
+/// The [document's content type] from a navigated response's `Content-Type`.
+///
+/// XML MIME types keep the values [`navigated_content_type`] already
+/// interned. Other essences are interned so `Document.contentType` can
+/// report them without changing `Parsed::content_type` off `&'static str`.
+///
+/// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-document-content-type>
+/// <https://html.spec.whatwg.org/multipage/dom.html#dom-document-contenttype>
+pub(crate) fn document_content_type(header: &str) -> &'static str {
+    if let Some(xml) = navigated_content_type(header) {
+        return xml;
+    }
+    let essence = header
+        .split(';')
+        .next()
+        .unwrap_or(header)
+        .trim()
+        .to_ascii_lowercase();
+    if essence.is_empty() {
+        return "application/octet-stream";
+    }
+    match essence.as_str() {
+        "text/html" => "text/html",
+        "text/css" => "text/css",
+        "text/plain" => "text/plain",
+        "image/jpeg" => "image/jpeg",
+        "image/png" => "image/png",
+        "image/gif" => "image/gif",
+        "image/bmp" => "image/bmp",
+        "application/octet-stream" => "application/octet-stream",
+        _ => intern_mime_essence(essence),
+    }
+}
+
+fn intern_mime_essence(essence: String) -> &'static str {
+    let mut guard = MIME_ESSENCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let interned = guard.get_or_insert_with(HashSet::new);
+    if let Some(existing) = interned.get(essence.as_str()) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(essence.into_boxed_str());
+    interned.insert(leaked);
+    leaked
 }
 
 /// Replaces the empty comments the XML sink left for processing
