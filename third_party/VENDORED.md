@@ -13,8 +13,8 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: `[patch.crates-io]` path entries in the workspace root
   `Cargo.toml`; the rquickjs tree is its own workspace excluded from the
   tinybrowser workspace.
-- **Pinned revisions**: `third_party/rquickjs` at `d73fbda`, nested
-  `sys/quickjs` at `712757e` (check `git submodule status`).
+- **Pinned revisions**: `third_party/rquickjs` at `50b403e`, nested
+  `sys/quickjs` at `8feb526` (check `git submodule status`).
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here.
