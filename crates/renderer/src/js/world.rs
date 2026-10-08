@@ -46,10 +46,6 @@ pub(crate) struct RealmRegistry {
     template_contents: HashMap<NodeId, NodeId>,
     /// Template-contents fragment → host `template` element.
     fragment_hosts: HashMap<NodeId, NodeId>,
-    /// Browsing-context document id → associated template contents owner
-    /// document
-    /// (<https://html.spec.whatwg.org/multipage/scripting.html#appropriate-template-contents-owner-document>).
-    template_contents_owners: HashMap<u32, NodeId>,
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
@@ -127,8 +123,6 @@ impl RealmRegistry {
         });
         self.fragment_hosts
             .retain(|fragment, host| fragment.document_id() != id && host.document_id() != id);
-        self.template_contents_owners
-            .retain(|document, owner| *document != id && owner.document_id() != id);
     }
 
     /// The shared wrapper cache entry for `id`, when one exists.
@@ -171,14 +165,6 @@ impl RealmRegistry {
             self.fragment_hosts.remove(&previous);
         }
         self.fragment_hosts.insert(fragment, template);
-    }
-
-    pub(crate) fn template_contents_owner(&self, document: u32) -> Option<NodeId> {
-        self.template_contents_owners.get(&document).copied()
-    }
-
-    pub(crate) fn set_template_contents_owner(&mut self, document: u32, owner: NodeId) {
-        self.template_contents_owners.insert(document, owner);
     }
 
     pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {

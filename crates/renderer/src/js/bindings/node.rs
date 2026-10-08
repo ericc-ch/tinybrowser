@@ -890,90 +890,7 @@ fn ensure_template_contents(ctx: &Ctx<'_>, template: NodeId) -> Result<Option<No
         .registry()
         .borrow_mut()
         .set_template_contents(template, fragment);
-    relocate_template_contents(ctx, template)?;
-    let fragment = world(ctx)?
-        .borrow()
-        .registry()
-        .borrow()
-        .template_contents(template)
-        .unwrap_or(fragment);
     Ok(Some(fragment))
-}
-
-fn document_root_of(ctx: &Ctx<'_>, id: NodeId) -> Result<NodeId> {
-    let owner = world_for_node(ctx, id)?;
-    let world = owner.borrow();
-    let Some(parsed) = world.document(id) else {
-        return Err(Exception::throw_type(ctx, "no document"));
-    };
-    Ok(NodeId {
-        document: id.document,
-        node: parsed.document.base.root_node().id,
-    })
-}
-
-/// The document that owns a `template`'s contents
-/// (<https://html.spec.whatwg.org/multipage/scripting.html#appropriate-template-contents-owner-document>).
-fn appropriate_template_contents_owner(ctx: &Ctx<'_>, node: NodeId) -> Result<NodeId> {
-    let root = document_root_of(ctx, node)?;
-    let world_rc = world_for_node(ctx, root)?;
-    if !world_rc.borrow().is_main_document(root) {
-        return Ok(root);
-    }
-    if let Some(owner) = world_rc
-        .borrow()
-        .registry()
-        .borrow()
-        .template_contents_owner(root.document)
-    {
-        return Ok(owner);
-    }
-    let font_ctx = world_rc.borrow().runtime.font_ctx.clone();
-    let parsed = crate::Parsed::script("text/html", font_ctx);
-    let wrapped = wrap_new_document(ctx, parsed)?;
-    let owner = host_node_id(ctx, &wrapped)
-        .ok_or_else(|| Exception::throw_type(ctx, "template contents owner document"))?;
-    world(ctx)?
-        .borrow()
-        .registry()
-        .borrow_mut()
-        .set_template_contents_owner(root.document, owner);
-    Ok(owner)
-}
-
-/// Moves template contents onto the appropriate owner document
-/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:adopting-steps>).
-fn relocate_template_contents(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
-    let is_template = world_for_node(ctx, node)?
-        .borrow()
-        .document(node)
-        .is_some_and(|parsed| parsed.document.is_html_template(node.node));
-    if is_template {
-        let owner = appropriate_template_contents_owner(ctx, node)?;
-        if let Some(contents) = world(ctx)?
-            .borrow()
-            .registry()
-            .borrow()
-            .template_contents(node)
-            && contents.document != owner.document
-        {
-            adopt_into_document(ctx, owner, contents)?;
-        }
-        if let Some(contents) = world(ctx)?
-            .borrow()
-            .registry()
-            .borrow()
-            .template_contents(node)
-        {
-            for child in tree_children(ctx, contents)? {
-                relocate_template_contents(ctx, child)?;
-            }
-        }
-    }
-    for child in tree_children(ctx, node)? {
-        relocate_template_contents(ctx, child)?;
-    }
-    Ok(())
 }
 
 fn tree_is_fragment(ctx: &Ctx<'_>, node: NodeId) -> bool {
@@ -1016,8 +933,7 @@ fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> {
 /// document
 /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:adopting-steps>).
 fn adopt_template_contents(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
-    publish_template_maps(ctx, node)?;
-    relocate_template_contents(ctx, node)
+    publish_template_maps(ctx, node)
 }
 
 fn publish_template_maps(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
@@ -3912,7 +3828,6 @@ impl JsNode {
         drop(target);
         drop(world);
         publish_template_maps(&ctx, id)?;
-        relocate_template_contents(&ctx, id)?;
         wrap_node(&ctx, id)
     }
 
@@ -5313,7 +5228,6 @@ impl JsNode {
         drop(world);
         for child in &added {
             publish_template_maps(ctx, *child)?;
-            relocate_template_contents(ctx, *child)?;
         }
         register_inserted_iframes(ctx, &added)?;
         schedule_mutation_delivery(ctx)
@@ -6613,7 +6527,6 @@ impl JsNode {
                 .map_err(|err| throw_dom_error(&ctx, err))?
         };
         publish_template_maps(&ctx, clone)?;
-        relocate_template_contents(&ctx, clone)?;
         wrap_node(&ctx, clone)
     }
 
