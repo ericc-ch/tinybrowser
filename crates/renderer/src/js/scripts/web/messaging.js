@@ -579,6 +579,25 @@ const __tbFrameProxy = frame => {
       switch (property) {
         case 'postMessage':
           return postMessage;
+        // Host EventTarget methods live on each realm's window object. A
+        // WindowProxy get that forwards to another realm's global does not
+        // yield a callable from this realm, so `contentWindow.addEventListener`
+        // was not a function. Bind the current realm's methods with the proxy
+        // as `this`; `window_world_for_call` resolves the target frame
+        // (<https://dom.spec.whatwg.org/#interface-eventtarget>,
+        // <https://html.spec.whatwg.org/multipage/window-object.html#the-windowproxy-exotic-object>).
+        case 'addEventListener':
+          return function(type, callback, options) {
+            return globalThis.addEventListener.call(proxy, type, callback, options);
+          };
+        case 'removeEventListener':
+          return function(type, callback, options) {
+            return globalThis.removeEventListener.call(proxy, type, callback, options);
+          };
+        case 'dispatchEvent':
+          return function(event) {
+            return globalThis.dispatchEvent.call(proxy, event);
+          };
         case 'parent': {
           const parent = host.__tbFrameParent(frame);
           return parent == null ? proxy : __tbFrameProxy(parent);
@@ -622,6 +641,7 @@ const __tbFrameProxy = frame => {
       switch (property) {
         case 'postMessage': case 'parent': case 'top': case 'window': case 'self':
         case 'frames': case 'length': case 'closed': case 'document':
+        case 'addEventListener': case 'removeEventListener': case 'dispatchEvent':
           return true;
       }
       const sameOrigin = host.__tbFrameGlobal(frame);
