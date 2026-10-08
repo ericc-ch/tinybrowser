@@ -353,6 +353,71 @@ pub(crate) fn is_html_element(
         .is_some_and(|node| is_html_tag(Some(&node.data), local))
 }
 
+/// First element in tree order whose `id` content attribute is `id`.
+/// An empty ID matches nothing
+/// (<https://dom.spec.whatwg.org/#concept-id>,
+/// <https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid>).
+pub(crate) fn first_element_with_id(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    id: &str,
+) -> Option<NodeId> {
+    if id.is_empty() {
+        return None;
+    }
+    let mut stack = vec![base.root_node().id];
+    while let Some(current) = stack.pop() {
+        let Some(node) = base.get_node(current) else {
+            continue;
+        };
+        if node.data.downcast_element().is_some_and(|element| {
+            element
+                .attr(markup5ever::LocalName::from("id"))
+                .is_some_and(|value| value == id)
+        }) {
+            return Some(NodeId {
+                document,
+                node: current,
+            });
+        }
+        stack.extend(node.children.iter().rev().copied());
+    }
+    None
+}
+
+/// [Reset the form owner](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner)
+/// lookup used by `form` IDL getters: a `form` content attribute names the
+/// first matching `form` in tree order when the control is in a document;
+/// otherwise the nearest ancestor `form` is used.
+///
+/// If the attribute is set but does not identify a `form`, this still falls
+/// through to the ancestor (the spec's `new-form` steps). Chromium leaves the
+/// owner null in that case; the spec algorithm is the one that applies here.
+pub(crate) fn form_owner_of(
+    base: &blitz_dom::BaseDocument,
+    document: u32,
+    node: BlitzId,
+) -> Option<NodeId> {
+    if let Some(form_id) = attr(base, node, "form")
+        && is_connected(base, node)
+        && let Some(found) = first_element_with_id(base, document, form_id)
+        && is_html_element(base, found.node, "form")
+    {
+        return Some(found);
+    }
+    let mut cursor = base.get_node(node).and_then(|target| target.parent);
+    while let Some(current) = cursor {
+        if is_html_element(base, current, "form") {
+            return Some(NodeId {
+                document,
+                node: current,
+            });
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    None
+}
+
 /// One DOM node handle owned by the JS world.
 #[derive(Clone, Copy, rquickjs::JsLifetime)]
 pub(crate) struct Handle(pub(crate) NodeId);
@@ -953,49 +1018,49 @@ impl World {
     /// realm while another realm executes.
     pub(crate) fn register_pending_frames(&mut self) -> Vec<NodeId> {
         let mut created = Vec::new();
-        let has_iframes = self
-            .with_main_document(|parsed| {
-                let base = &parsed.document.base;
-                let mut stack = vec![base.root_node().id];
-                while let Some(id) = stack.pop() {
-                    if is_iframe_element(base, id) && is_connected(base, id) {
-                        return true;
-                    }
-                    if let Some(node) = base.get_node(id) {
-                        stack.extend(node.children.iter().rev().copied());
-                    }
-                }
-                false
-            })
-            .unwrap_or(false);
-        if !has_iframes {
-            return created;
-        }
         let containers = self.iframe_containers_in_order();
         for container in containers {
-            if self
-                .runtime
-                .shared
-                .borrow()
-                .tree
-                .frame_for_container(container)
-                .is_some()
-            {
-                continue;
+            if self.register_frame_for_container(container) {
+                created.push(container);
             }
-            if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
-                return created;
-            }
-            let frame = {
-                let mut shared = self.runtime.shared.borrow_mut();
-                let frame = shared.allocate_frame();
-                shared.tree.add(self.frame, frame, container);
-                frame
-            };
-            self.pending_frames.push((frame, container));
-            created.push(container);
         }
         created
+    }
+
+    /// Creates a browsing context for one connected `iframe` if it does not
+    /// already have one
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+    ///
+    /// Allocates the frame identity only. The nested document is created
+    /// later, by [`World::materialize_frames`].
+    pub(crate) fn register_frame_for_container(&mut self, container: NodeId) -> bool {
+        if self
+            .runtime
+            .shared
+            .borrow()
+            .tree
+            .frame_for_container(container)
+            .is_some()
+        {
+            return false;
+        }
+        let eligible = self
+            .with_document(container, |parsed| {
+                let base = &parsed.document.base;
+                is_iframe_element(base, container.node) && is_connected(base, container.node)
+            })
+            .unwrap_or(false);
+        if !eligible || self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
+            return false;
+        }
+        let frame = {
+            let mut shared = self.runtime.shared.borrow_mut();
+            let frame = shared.allocate_frame();
+            shared.tree.add(self.frame, frame, container);
+            frame
+        };
+        self.pending_frames.push((frame, container));
+        true
     }
 
     /// Creates the documents and realms for every registered frame.

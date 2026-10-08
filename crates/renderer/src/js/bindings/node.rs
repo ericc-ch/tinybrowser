@@ -39,7 +39,8 @@ use crate::js::world::World;
 
 use crate::js::world::{
     BlitzId, DocumentStreamCommand, Handle, JournalEntry, NodeId, NodeReference, Wrapper, attr,
-    child_ids, html_namespace, is_connected, svg_namespace,
+    child_ids, form_owner_of, html_namespace, is_connected, is_html_element, is_iframe_element,
+    svg_namespace,
 };
 
 use crate::ReadyState;
@@ -1840,25 +1841,29 @@ fn insert_tree_node_inner(
     // first so an inserted script can `takeRecords` its own addition
     // (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:html-element-insertion-steps>,
     // <https://dom.spec.whatwg.org/#concept-node-insert>).
-    prepare_scripts_after_insert(ctx, parent, &moved)?;
+    run_html_insertion_steps(ctx, parent, &moved)?;
     if deliver {
         schedule_mutation_delivery(ctx)?;
     }
     Ok(())
 }
 
-/// Runs script insertion and children-changed steps after a tree insert
+/// HTML insertion and script children-changed steps after a tree insert, in
+/// tree order: an earlier script must not observe a later iframe's browsing
+/// context, and an earlier iframe must already have one
 /// (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:html-element-insertion-steps>,
-/// <https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:css-element-children-changed-steps>).
-fn prepare_scripts_after_insert(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) -> Result<()> {
+/// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>,
+/// <https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:css-element-children-changed-steps>,
+/// <https://dom.spec.whatwg.org/#concept-node-insert>).
+fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) -> Result<()> {
     let connected = world(ctx)?.borrow().with_document(parent, |parsed| {
-        crate::js::world::is_connected(&parsed.document.base, parent.node)
+        is_connected(&parsed.document.base, parent.node)
     });
     if !connected.unwrap_or(false) {
         return Ok(());
     }
     drain_mutation_journal(ctx)?;
-    let mut scripts = Vec::new();
+    let mut steps = Vec::new();
     {
         let world = world(ctx)?;
         let world = world.borrow();
@@ -1866,30 +1871,69 @@ fn prepare_scripts_after_insert(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeI
             return Ok(());
         };
         let base = &parsed.document.base;
-        if crate::js::world::is_html_element(base, parent.node, "script") {
-            scripts.push(parent);
+        if is_html_element(base, parent.node, "script") {
+            steps.push(InsertionStep::Script(parent));
         }
         for root in inserted {
-            collect_html_scripts(base, *root, &mut scripts);
+            collect_html_insertion_steps(base, *root, &mut steps);
         }
     }
-    scripts.dedup();
-    for script in scripts {
-        prepare_classic_script(ctx, script)?;
+    for step in steps {
+        match step {
+            InsertionStep::Iframe(id) => {
+                world(ctx)?.borrow_mut().register_frame_for_container(id);
+            }
+            InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
+        }
     }
     Ok(())
 }
 
-fn collect_html_scripts(base: &blitz_dom::BaseDocument, id: NodeId, out: &mut Vec<NodeId>) {
-    if crate::js::world::is_html_element(base, id.node, "script") {
-        out.push(id);
+enum InsertionStep {
+    Iframe(NodeId),
+    Script(NodeId),
+}
+
+/// Registers browsing contexts for iframes inserted by markup setters.
+/// Those paths skip script insertion steps (innerHTML must not run scripts)
+/// but still create iframe browsing contexts
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
+    let mut steps = Vec::new();
+    {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        for root in inserted {
+            let Some(parsed) = world.document(*root) else {
+                continue;
+            };
+            collect_html_insertion_steps(&parsed.document.base, *root, &mut steps);
+        }
+    }
+    for step in steps {
+        if let InsertionStep::Iframe(id) = step {
+            world(ctx)?.borrow_mut().register_frame_for_container(id);
+        }
+    }
+    Ok(())
+}
+
+fn collect_html_insertion_steps(
+    base: &blitz_dom::BaseDocument,
+    id: NodeId,
+    out: &mut Vec<InsertionStep>,
+) {
+    if is_html_element(base, id.node, "script") {
+        out.push(InsertionStep::Script(id));
+    } else if is_iframe_element(base, id.node) {
+        out.push(InsertionStep::Iframe(id));
     }
     let children: Vec<BlitzId> = base
         .get_node(id.node)
         .map(|node| node.children.iter().copied().collect())
         .unwrap_or_default();
     for child in children {
-        collect_html_scripts(
+        collect_html_insertion_steps(
             base,
             NodeId {
                 document: id.document,
@@ -2166,24 +2210,6 @@ fn select_value_in(base: &blitz_dom::BaseDocument, document: u32, select: BlitzI
         }
     }
     String::new()
-}
-
-/// The form owner of a control: its nearest ancestor `form` element. Blitz
-/// keeps no parser-associated form owner, so controls outside a form ancestor
-/// have no owner here (a known cutover gap)
-/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
-fn form_owner_of(base: &blitz_dom::BaseDocument, document: u32, node: BlitzId) -> Option<NodeId> {
-    let mut cursor = base.get_node(node).and_then(|target| target.parent);
-    while let Some(current) = cursor {
-        if crate::js::world::is_html_element(base, current, "form") {
-            return Some(NodeId {
-                document,
-                node: current,
-            });
-        }
-        cursor = base.get_node(current).and_then(|target| target.parent);
-    }
-    None
 }
 
 /// A control's value length in UTF-16 code units, the basis selection
@@ -3004,24 +3030,23 @@ pub(crate) fn serialize_xml_children(
     output.finish()
 }
 
-/// Whether `id` is an HTML `iframe` or `frame` container, registering any
-/// pending browsing contexts before the caller looks its frame up. A script
-/// may have appended the container in this same task, so the browsing context
-/// is registered first; its realm follows at the next non-JS turn
-/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+/// Whether `id` is an HTML `iframe` or `frame` container.
+///
+/// The getter does not create a browsing context: that is the iframe
+/// element's insertion steps, which run in tree order with script insertion
+/// steps so an earlier script cannot observe a later sibling's
+/// `contentWindow`
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow>,
+/// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
 /// `frame` shares the lookup: the engine has no frameset navigation pipeline,
 /// so no frame document ever exists yet and the callers below return null,
 /// matching the pre-migration binary.
 fn iframe_frame(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
     let owner = world_for_node(ctx, id)?;
-    let is_frame = owner.borrow().document(id).is_some_and(|parsed| {
-        crate::js::world::is_html_element(&parsed.document.base, id.node, "iframe")
-            || crate::js::world::is_html_element(&parsed.document.base, id.node, "frame")
-    });
-    if is_frame {
-        world(ctx)?.borrow_mut().register_pending_frames();
-    }
-    Ok(is_frame)
+    Ok(owner.borrow().document(id).is_some_and(|parsed| {
+        is_html_element(&parsed.document.base, id.node, "iframe")
+            || is_html_element(&parsed.document.base, id.node, "frame")
+    }))
 }
 
 fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
@@ -4928,9 +4953,10 @@ impl JsNode {
                     .collect()
             })
             .unwrap_or_default();
-        replace_all_journaled(&mut parsed, element, added);
+        replace_all_journaled(&mut parsed, element, added.clone());
         drop(parsed);
         drop(world);
+        register_inserted_iframes(ctx, &added)?;
         schedule_mutation_delivery(ctx)
     }
 
@@ -5005,14 +5031,15 @@ impl JsNode {
                 let parent = parent.ok_or_else(|| {
                     throw_dom(&ctx, "NoModificationAllowedError", "element has no parent")
                 })?;
-                for child in moved {
-                    place_journaled(&mut parsed, parent, child, Some(element));
+                for child in &moved {
+                    place_journaled(&mut parsed, parent, *child, Some(element));
                 }
             }
-            _ => place_adjacent_rest(&ctx, &mut parsed, position.as_str(), element, moved)?,
+            _ => place_adjacent_rest(&ctx, &mut parsed, position.as_str(), element, moved.clone())?,
         }
         drop(parsed);
         drop(world);
+        register_inserted_iframes(&ctx, &moved)?;
         schedule_mutation_delivery(&ctx)
     }
 
@@ -5071,9 +5098,10 @@ impl JsNode {
         let replacement = materialize_children(&mut parsed.document, element.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
         let target = element;
-        replace_parsed(ctx, &mut parsed, parent, replacement, target);
+        let added = replace_parsed(ctx, &mut parsed, parent, replacement, target);
         drop(parsed);
         drop(world);
+        register_inserted_iframes(ctx, &added)?;
         schedule_mutation_delivery(ctx)
     }
 
@@ -6252,7 +6280,7 @@ impl JsNode {
             fixup_option_on_insert(&ctx, *id)?;
             fixup_radio_on_insert(&ctx, *id)?;
         }
-        prepare_scripts_after_insert(&ctx, parent, &moved)?;
+        run_html_insertion_steps(&ctx, parent, &moved)?;
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }

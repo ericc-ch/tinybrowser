@@ -15,7 +15,9 @@
 //! into the tree.
 
 use super::{descendant_text, host_node_id, world, world_for_node};
-use crate::js::world::{BlitzId, JournalEntry, NodeId, attr, html_namespace, is_html_element};
+use crate::js::world::{
+    BlitzId, JournalEntry, NodeId, attr, form_owner_of, html_namespace, is_html_element,
+};
 use crate::js::{FrameNavigation, World};
 use blitz_dom::{BaseDocument, NodeData};
 use markup5ever::{LocalName, Namespace, QualName};
@@ -226,7 +228,7 @@ fn collect_pending_entries(
             document,
             node: current,
         };
-        if form_owner(base, document, current) != Some(form) {
+        if form_owner_of(base, document, current) != Some(form) {
             continue;
         }
         let Some(control_name) = attr(base, current, "name") else {
@@ -262,25 +264,6 @@ fn collect_pending_entries(
         ));
     }
     pending
-}
-
-/// The form owner of a control: its nearest ancestor `form` element.
-/// The `form=""` content-attribute association is a known gap: Blitz keeps no
-/// control-to-form registry the bindings can read, so only the ancestor rule
-/// applies
-/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
-fn form_owner(base: &BaseDocument, document: u32, node: BlitzId) -> Option<NodeId> {
-    let mut cursor = base.get_node(node).and_then(|target| target.parent);
-    while let Some(current) = cursor {
-        if is_html_element(base, current, "form") {
-            return Some(NodeId {
-                document,
-                node: current,
-            });
-        }
-        cursor = base.get_node(current).and_then(|target| target.parent);
-    }
-    None
 }
 
 /// Whether `node` is disabled: its own `disabled` attribute, or for an

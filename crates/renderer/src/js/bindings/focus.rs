@@ -6,7 +6,9 @@ use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
 use crate::js::world::EventTargetKey;
-use crate::js::world::{BlitzId, JournalEntry, NodeId, attr, html_namespace, is_connected};
+use crate::js::world::{
+    BlitzId, JournalEntry, NodeId, attr, form_owner_of, html_namespace, is_connected,
+};
 
 /// The node-removal focus fixup: when the document's focused area is inside
 /// a removed subtree, clear it without firing events
@@ -216,26 +218,6 @@ fn radio_group_checked(
     radio_group(base, document, node)
         .into_iter()
         .find(|member| attr(base, member.node, "checked").is_some())
-}
-
-/// The nearest ancestor `form` element. Blitz models no parser-associated
-/// form owner (the `form` attribute and its scoping are known cutover gaps),
-/// so controls outside a form ancestor have no owner here.
-fn form_owner(base: &blitz_dom::BaseDocument, node: BlitzId) -> Option<BlitzId> {
-    let mut cursor = base.get_node(node).and_then(|tree| tree.parent);
-    while let Some(id) = cursor {
-        let is_form = base
-            .get_node(id)
-            .and_then(|tree| tree.data.downcast_element())
-            .is_some_and(|element| {
-                element.name.ns == html_namespace() && element.name.local.as_ref() == "form"
-            });
-        if is_form {
-            return Some(id);
-        }
-        cursor = base.get_node(id).and_then(|tree| tree.parent);
-    }
-    None
 }
 
 /// Moves focus to `node`. The previously focused area is cleared before the
@@ -522,10 +504,7 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             },
             _ => Activation::None,
         };
-        let form = form_owner(base, node.node).map(|form| NodeId {
-            document: node.document,
-            node: form,
-        });
+        let form = form_owner_of(base, node.document, node.node);
         (activation, form)
     };
     match activation {
