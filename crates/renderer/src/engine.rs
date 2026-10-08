@@ -84,9 +84,8 @@ impl Engine {
     /// Returns whether any frame was adopted, so the reconcile loop runs again
     /// before the engine sleeps.
     fn adopt_pending_frames(&mut self) -> bool {
-        for document in self.frames.values_mut() {
-            document.adopt_pending_frames();
-        }
+        // Frames are materialized in tree order with scripts. Scanning every
+        // document here would start parser `src` loads too early.
         let mut adopted = false;
         let mut batch = Vec::new();
         loop {
