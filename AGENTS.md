@@ -1,7 +1,7 @@
 # tinybrowser
 
 We are building the smallest and lightest headless browser for AI agents.
-The goal is to maximize conformance per byte. There is no binary size cap.
+The goal is to maximize conformance per byte.
 
 In `docs/progress.md`, replace the latest binary size, the latest total, and scored groups only.
 
