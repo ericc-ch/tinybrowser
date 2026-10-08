@@ -51,6 +51,10 @@ pub(crate) struct RealmRegistry {
     /// (<https://dom.spec.whatwg.org/#concept-node-adopt>,
     /// <https://github.com/whatwg/dom/issues/977>).
     creation_realms: HashMap<NodeId, Weak<RefCell<World>>>,
+    /// Adopted node ids follow the destination copy so live collections still
+    /// rooted at the pre-adopt handle walk the live tree
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    adopted_ids: HashMap<NodeId, NodeId>,
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
@@ -130,6 +134,8 @@ impl RealmRegistry {
             .retain(|fragment, host| fragment.document_id() != id && host.document_id() != id);
         self.creation_realms
             .retain(|node, _| node.document_id() != id);
+        self.adopted_ids
+            .retain(|from, to| from.document_id() != id && to.document_id() != id);
     }
 
     /// The shared wrapper cache entry for `id`, when one exists.
@@ -148,6 +154,9 @@ impl RealmRegistry {
     /// wrapper so the caller's object is the adopted node
     /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
     pub(crate) fn rekey_wrapper(&mut self, from: NodeId, to: NodeId) {
+        if from != to {
+            self.adopted_ids.insert(from, to);
+        }
         if let Some(value) = self.wrappers.remove(&from) {
             self.wrappers.insert(to, value);
         }
@@ -176,6 +185,19 @@ impl RealmRegistry {
     /// The realm that created `id`, while that realm is alive.
     pub(crate) fn creation_realm(&self, id: NodeId) -> Option<Rc<RefCell<World>>> {
         self.creation_realms.get(&id).and_then(Weak::upgrade)
+    }
+
+    /// The current id of a node that may have been adopted since `id` was
+    /// captured.
+    pub(crate) fn live_node_id(&self, mut id: NodeId) -> NodeId {
+        let mut seen = HashSet::new();
+        while let Some(&next) = self.adopted_ids.get(&id) {
+            if !seen.insert(id) {
+                break;
+            }
+            id = next;
+        }
+        id
     }
 
     pub(crate) fn template_contents(&self, template: NodeId) -> Option<NodeId> {
@@ -213,6 +235,7 @@ impl RealmRegistry {
         self.wrappers.clear();
         self.frame_documents.clear();
         self.creation_realms.clear();
+        self.adopted_ids.clear();
     }
 
     fn budget(&self) -> Rc<RefCell<ResourceBudget>> {

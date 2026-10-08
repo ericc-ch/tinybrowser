@@ -17,7 +17,13 @@ use std::collections::HashSet;
 pub(crate) enum CollectionKind {
     Children,
     ElementChildren,
-    ElementsByTag(String),
+    /// `getElementsByTagName`. `html_document` is root's node document type
+    /// at collection creation
+    /// (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
+    ElementsByTag {
+        name: String,
+        html_document: bool,
+    },
     ElementsByTagNs {
         namespace: String,
         local: String,
@@ -72,7 +78,7 @@ impl CollectionQuery {
             }
             CollectionKind::Children
             | CollectionKind::ElementChildren
-            | CollectionKind::ElementsByTag(_)
+            | CollectionKind::ElementsByTag { .. }
             | CollectionKind::ElementsByTagNs { .. }
             | CollectionKind::ElementsByClass(_)
             | CollectionKind::ElementsByName(_)
@@ -106,6 +112,7 @@ pub(crate) fn collection_ids(
 /// attributes off `ElementData`.
 fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<NodeId>> {
     let registry = super::realm_registry(ctx)?;
+    let scope = registry.borrow().live_node_id(scope);
     let Some(owner) = registry.borrow().owner_world(scope) else {
         return Ok(Vec::new());
     };
@@ -121,7 +128,10 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
             .into_iter()
             .filter(|kid| super::is_element(base, kid.node))
             .collect(),
-        CollectionKind::ElementsByTag(name) => collect_by_tag(base, document, scope.node, name),
+        CollectionKind::ElementsByTag {
+            name,
+            html_document,
+        } => collect_by_tag(base, document, scope.node, name, *html_document),
         CollectionKind::ElementsByTagNs { namespace, local } => {
             collect_by_tag_ns(base, document, scope.node, namespace, local)
         }
@@ -364,10 +374,13 @@ fn collect_by_tag(
     document: u32,
     scope: BlitzId,
     name: &str,
+    html_document: bool,
 ) -> Vec<NodeId> {
-    // In an HTML document, an HTML-namespace element matches the queried
-    // name ASCII-lowercased; other elements match the name exactly
-    // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
+    // HTML documents ASCII-lowercase the query against HTML-namespace
+    // names; XML documents (including XHTML) match qualified names
+    // exactly. The HTML-document flag is captured when the collection is
+    // created, so adopting the root into another document does not change
+    // the filter (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
     let lowered = name.to_ascii_lowercase();
     descendants(base, scope)
         .into_iter()
@@ -376,7 +389,7 @@ fn collect_by_tag(
                 return false;
             };
             name == "*"
-                || if qual.ns == html_namespace() {
+                || if html_document && qual.ns == html_namespace() {
                     qualified_name_eq(qual, &lowered)
                 } else {
                     qualified_name_eq(qual, name)
@@ -770,11 +783,12 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
     // https://dom.spec.whatwg.org/#dom-nodelist-length
     fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
         let registry = super::realm_registry(ctx)?;
-        let Some(world) = registry.borrow().owner_world(self.query.scope.0) else {
+        let scope = registry.borrow().live_node_id(self.query.scope.0);
+        let Some(world) = registry.borrow().owner_world(scope) else {
             return Ok(0);
         };
         let world = world.borrow();
-        let Some(parsed) = world.document(self.query.scope.0) else {
+        let Some(parsed) = world.document(scope) else {
             return Ok(0);
         };
         Ok(match &self.query.kind {
@@ -782,12 +796,12 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
             CollectionKind::Children => parsed
                 .document
                 .base
-                .get_node(self.query.scope.0.node)
+                .get_node(scope.node)
                 .map_or(0, |node| node.children.len()),
             CollectionKind::ElementsByName(name) => {
                 let base = &parsed.document.base;
                 let name = name.clone();
-                descendants(base, self.query.scope.0.node)
+                descendants(base, scope.node)
                     .into_iter()
                     .filter(|&id| {
                         super::is_element(base, id)
@@ -796,7 +810,7 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
                     .count()
             }
             CollectionKind::ElementChildren
-            | CollectionKind::ElementsByTag(_)
+            | CollectionKind::ElementsByTag { .. }
             | CollectionKind::ElementsByTagNs { .. }
             | CollectionKind::ElementsByClass(_)
             | CollectionKind::SelectOptions

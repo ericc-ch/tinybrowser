@@ -1578,7 +1578,10 @@ pub(super) fn elements_by_tag<'js>(
     live_collection(
         ctx,
         scope,
-        CollectionKind::ElementsByTag(name.to_owned()),
+        CollectionKind::ElementsByTag {
+            name: name.to_owned(),
+            html_document: document_is_html_content(ctx, scope),
+        },
         Some("HTMLCollection"),
     )
 }
