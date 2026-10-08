@@ -608,6 +608,9 @@ pub(crate) struct World {
     /// observers through the union drain.
     owned: HashSet<u32>,
     pub document_url: Url,
+    /// Document referrer policy from a `meta name=referrer` insertion
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+    pub(crate) referrer_policy: String,
     pub(crate) history: crate::protocol::HistorySnapshot,
     pub(crate) pending_history: Vec<crate::protocol::RendererEvent>,
     pub pending_cancels: Vec<i32>,
@@ -767,6 +770,7 @@ impl World {
             document: None,
             owned: HashSet::new(),
             document_url,
+            referrer_policy: String::new(),
             history: crate::protocol::HistorySnapshot::default(),
             pending_history: Vec::new(),
             pending_cancels: Vec::new(),
@@ -825,6 +829,7 @@ impl World {
         let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
+        self.referrer_policy.clear();
         self.current_script = None;
         self.custom_construction.clear();
         self.listeners.clear();

@@ -228,6 +228,12 @@ impl TabNetworkHandle {
                     .insert(name, value.as_bytes())
                     .map_err(|_| DialFailure::Connect)?;
             }
+            if let Some(referrer) = &request.referrer {
+                outbound
+                    .headers
+                    .insert("Referer", referrer.as_bytes())
+                    .map_err(|_| DialFailure::Connect)?;
+            }
             if !request.body.is_empty() {
                 outbound.body = Some(request.body.clone());
             }

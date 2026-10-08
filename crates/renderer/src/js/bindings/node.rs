@@ -1927,6 +1927,7 @@ fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) 
                 }
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
+            InsertionStep::MetaReferrer(id) => apply_meta_referrer(ctx, id),
         }
     }
     Ok(())
@@ -1935,6 +1936,7 @@ fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) 
 enum InsertionStep {
     Iframe(NodeId),
     Script(NodeId),
+    MetaReferrer(NodeId),
 }
 
 /// Initial about:blank iframes fire `load` from insertion steps. An iframe
@@ -1986,6 +1988,8 @@ fn collect_html_insertion_steps(
         out.push(InsertionStep::Script(id));
     } else if is_iframe_element(base, id.node) {
         out.push(InsertionStep::Iframe(id));
+    } else if is_html_element(base, id.node, "meta") {
+        out.push(InsertionStep::MetaReferrer(id));
     }
     let children: Vec<BlitzId> = base
         .get_node(id.node)
@@ -2000,6 +2004,50 @@ fn collect_html_insertion_steps(
             },
             out,
         );
+    }
+}
+
+/// `meta name=referrer` insertion steps set the document's policy
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>,
+/// <https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-meta>).
+fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
+    let policy = {
+        let world = world(ctx);
+        let Ok(world) = world else {
+            return;
+        };
+        let world = world.borrow();
+        let Some(parsed) = world.document(id) else {
+            return;
+        };
+        let base = &parsed.document.base;
+        let name = crate::js::world::attr(base, id.node, "name").unwrap_or_default();
+        if !name.eq_ignore_ascii_case("referrer") {
+            return;
+        }
+        parse_referrer_policy(crate::js::world::attr(base, id.node, "content").unwrap_or_default())
+    };
+    let Some(policy) = policy else {
+        return;
+    };
+    let Ok(world) = world(ctx) else {
+        return;
+    };
+    world.borrow_mut().referrer_policy = policy;
+}
+
+fn parse_referrer_policy(content: &str) -> Option<String> {
+    let token = content.trim().to_ascii_lowercase();
+    match token.as_str() {
+        "never" | "no-referrer" => Some("no-referrer".to_owned()),
+        "no-referrer-when-downgrade"
+        | "origin"
+        | "origin-when-cross-origin"
+        | "same-origin"
+        | "strict-origin"
+        | "strict-origin-when-cross-origin"
+        | "unsafe-url" => Some(token),
+        _ => None,
     }
 }
 

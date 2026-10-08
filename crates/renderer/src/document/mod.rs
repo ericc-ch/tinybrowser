@@ -109,6 +109,8 @@ pub(crate) struct QueuedDial {
     /// `Content-Type` for `body`, when there is one.
     pub(crate) content_type: Option<String>,
     pub(crate) headers: Vec<(String, String)>,
+    /// Browser-generated `Referer` URL. `None` omits the header.
+    pub(crate) referrer: Option<String>,
 }
 
 impl QueuedDial {
@@ -122,6 +124,7 @@ impl QueuedDial {
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
+            referrer: None,
         }
     }
 }
@@ -584,6 +587,7 @@ impl Document {
             body,
             content_type,
             headers: Vec::new(),
+            referrer: None,
         });
     }
 

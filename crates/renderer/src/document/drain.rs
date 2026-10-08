@@ -283,6 +283,7 @@ impl Document {
                     body: fetch.body,
                     content_type: fetch.content_type,
                     headers: fetch.headers,
+                    referrer: fetch.referrer,
                 });
             } else {
                 self.record_event(RendererEvent::FetchFailed);

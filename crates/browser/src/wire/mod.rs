@@ -559,6 +559,7 @@ mod tests {
                         body: Vec::new(),
                         content_type: None,
                         headers: Vec::new(),
+                        referrer: None,
                     })),
                 },
             },

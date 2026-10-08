@@ -186,6 +186,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         body: dial.body.clone(),
         content_type: dial.content_type.clone(),
         headers: dial.headers.clone(),
+        referrer: dial.referrer.clone(),
     }
 }
 

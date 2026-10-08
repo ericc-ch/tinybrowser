@@ -374,6 +374,10 @@ pub struct DialRequest {
     /// Author-supplied request headers, in insertion order.
     #[serde(default)]
     pub headers: Vec<(String, String)>,
+    /// Browser-generated `Referer` URL. `None` omits the header
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    #[serde(default)]
+    pub referrer: Option<String>,
 }
 
 fn default_dial_method() -> String {

@@ -203,6 +203,11 @@ const __tbPageRequestBody = async body => {
 };
 const __tbQueuePageRequest = (url, method, body, headers, callback) => {
   const id = ++host.__tb_fetchSeq;
+  // Snapshot the document referrer at `fetch()` time. Body extraction is
+  // async, so a later `meta name=referrer` insertion would otherwise apply
+  // to this request
+  // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+  const referrer = host.__tbReferrer();
   host.__tb_fetchCbs[id] = function(status, bytes, finalUrl, contentType, responseHeaders) {
     delete host.__tb_fetchCbs[id];
     callback(status, bytes, finalUrl, contentType, responseHeaders);
@@ -211,7 +216,7 @@ const __tbQueuePageRequest = (url, method, body, headers, callback) => {
     if (!host.__tb_fetchCbs[id]) return;
     const type = __tbApply(__tbHeadersGet, headers, ['content-type']) === null ? payload.type : null;
     const fields = __tbArray.map(__tbBrand(headers, __tbHeadersData), entry => [entry[0], entry[1]]);
-    host.__queueFetch(url, id, method, payload.bytes, type, fields);
+    host.__queueFetch(url, id, method, payload.bytes, type, fields, referrer);
   }, () => {
     const done = host.__tb_fetchCbs[id];
     if (done) done(0, new Uint8Array(), '', '', []);

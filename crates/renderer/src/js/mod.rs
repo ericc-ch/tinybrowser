@@ -147,6 +147,7 @@ pub(crate) struct PendingJsFetch {
     pub body: Vec<u8>,
     pub content_type: Option<String>,
     pub headers: Vec<(String, String)>,
+    pub referrer: Option<String>,
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -819,6 +820,14 @@ impl JsRealm {
                     .push(js_id);
             }),
         )?;
+        let referrer_world = world.clone();
+        bridge::object(ctx)?.set(
+            "__tbReferrer",
+            Func::from(move || {
+                let world = referrer_world.borrow();
+                fetch_referrer(&world)
+            }),
+        )?;
         bridge::object(ctx)?.set(
             "__queueFetch",
             Func::from(
@@ -827,7 +836,8 @@ impl JsRealm {
                       method: String,
                       body: Vec<u8>,
                       content_type: Option<String>,
-                      headers: Vec<Vec<String>>| {
+                      headers: Vec<Vec<String>>,
+                      referrer: Option<String>| {
                     let headers = headers
                         .into_iter()
                         .map(|field| match field.as_slice() {
@@ -842,6 +852,7 @@ impl JsRealm {
                         body,
                         content_type,
                         headers,
+                        referrer,
                     });
                     Ok::<(), rquickjs::Error>(())
                 },
@@ -1245,6 +1256,18 @@ struct ClearInterrupt<'a> {
 impl Drop for ClearInterrupt<'_> {
     fn drop(&mut self) {
         self.runtime.set_interrupt_handler(None);
+    }
+}
+
+/// `Referer` for a page `fetch()` at call time
+/// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+fn fetch_referrer(world: &World) -> Option<String> {
+    if world.referrer_policy.eq_ignore_ascii_case("no-referrer")
+        || world.referrer_policy.eq_ignore_ascii_case("never")
+    {
+        None
+    } else {
+        Some(world.document_url.to_string())
     }
 }
 
