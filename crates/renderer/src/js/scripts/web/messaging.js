@@ -589,8 +589,7 @@ const __tbFrameProxy = frame => {
         // Cross-realm constructors are not callable from this realm. Hand
         // back a local function that creates the node in the target frame's
         // document (<https://dom.spec.whatwg.org/#dom-comment-comment>).
-        case 'Comment': case 'Text': case 'DocumentFragment':
-        case 'Document': case 'XMLDocument': case 'ProcessingInstruction':
+        case 'Comment': case 'Text':
           return function() {
             return __tbApply(host.__tb_construct_in_frame, globalThis, [frame, property, ...arguments]);
           };
