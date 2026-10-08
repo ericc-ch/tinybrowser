@@ -12,8 +12,8 @@ use super::{
     element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
     fixup_focus_after_removal, focus_node, host, host_node_id, import_attr, import_snapshot,
     import_snapshot_live, is_element, is_focusable, is_main_document, is_real_element,
-    live_collection, make_weak, materialize_children, materialize_import, new_detached_attr,
-    qualified_name, rect_object, remove_attribute_sync, required_node, root_of,
+    js_string_to_utf8, live_collection, make_weak, materialize_children, materialize_import,
+    new_detached_attr, qualified_name, rect_object, remove_attribute_sync, required_node, root_of,
     schedule_mutation_delivery, select_error, selector_matching_elements, set_attribute_node,
     set_attribute_sync, set_character_data, set_pi_data, sibling, sibling_value, string_value,
     throw_dom, throw_dom_error, touch_attr, tree_order, valid_attribute_local_name,
@@ -7240,7 +7240,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
 
     // https://dom.spec.whatwg.org/#dom-element-id
     fn set_id(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        self.set_id(ctx, WebIdlString(value.to_string()?))
+        self.set_id(ctx, WebIdlString(js_string_to_utf8(&value)?))
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classname
@@ -7283,7 +7283,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         self.set_attribute(
             ctx,
             WebIdlString(arg_0.to_string()?),
-            WebIdlString(arg_1.to_string()?),
+            WebIdlString(js_string_to_utf8(&arg_1)?),
         )
     }
 

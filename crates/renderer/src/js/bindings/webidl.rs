@@ -73,6 +73,24 @@ pub(crate) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result
     webidl_to_js_string(ctx, value)?.to_string()
 }
 
+/// UTF-8 for attributes that feed selector matching.
+///
+/// Unpaired surrogates cannot live in a Rust `String`. Replacing them with
+/// U+FFFD would make an `id` match a CSS escape that the CSS parser also
+/// turns into U+FFFD
+/// (<https://drafts.csswg.org/css-syntax/#consume-escaped-code-point>).
+/// Dropping those code units keeps the two distinct
+/// (<https://infra.spec.whatwg.org/#javascript-string-convert>).
+pub(crate) fn js_string_to_utf8(value: &rquickjs::String<'_>) -> Result<String> {
+    match value.to_string() {
+        Ok(text) => Ok(text),
+        Err(_) => {
+            let units = value.to_utf16()?;
+            Ok(char::decode_utf16(units).filter_map(Result::ok).collect())
+        }
+    }
+}
+
 /// `DOMString` conversion keeping every UTF-16 code unit
 /// (<https://webidl.spec.whatwg.org/#es-DOMString>), for character data that
 /// may contain unpaired surrogates.
