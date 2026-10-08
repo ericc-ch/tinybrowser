@@ -36,6 +36,54 @@
   Object.defineProperty(globalThis, 'CSSStyleSheet', {
     value: CSSStyleSheet, writable: true, configurable: true,
   });
+  // Associated CSS style sheet for `<style>` and `<link rel=stylesheet>`
+  // (<https://drafts.csswg.org/cssom/#associated-css-style-sheet>,
+  // <https://html.spec.whatwg.org/multipage/semantics.html#the-style-element:create-a-css-style-sheet>,
+  // <https://html.spec.whatwg.org/multipage/semantics.html#the-link-element:create-a-css-style-sheet>).
+  // Created while the element is connected so an earlier script in the same
+  // insert can observe `sheet` after the style/link node's insertion steps
+  // and before that script's post-connection steps.
+  const __tbSheets = new WeakMap();
+  function __tbStyleRuleCount(element) {
+    const text = String(element.textContent ?? '');
+    let count = 0;
+    for (const block of text.split('}')) {
+      if (block.includes('{')) count += 1;
+    }
+    return count;
+  }
+  function __tbAssociatedSheet(element) {
+    let sheet = __tbSheets.get(element);
+    if (sheet !== undefined) return sheet;
+    const cssRules = {};
+    Object.defineProperty(cssRules, 'length', {
+      get() { return __tbStyleRuleCount(element); },
+      enumerable: true,
+      configurable: true,
+    });
+    sheet = new CSSStyleSheet();
+    sheet.cssRules = cssRules;
+    __tbSheets.set(element, sheet);
+    return sheet;
+  }
+  Object.defineProperty(globalThis.HTMLStyleElement.prototype, 'sheet', {
+    get() {
+      if (!this.isConnected) return null;
+      return __tbAssociatedSheet(this);
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(globalThis.HTMLLinkElement.prototype, 'sheet', {
+    get() {
+      if (!this.isConnected) return null;
+      const rel = String(this.rel ?? this.getAttribute('rel') ?? '').toLowerCase();
+      if (!rel.split(/\s+/).includes('stylesheet')) return null;
+      return __tbAssociatedSheet(this);
+    },
+    enumerable: true,
+    configurable: true,
+  });
   Object.defineProperty(globalThis, 'CSS', {
     value: Object.freeze({
       // https://drafts.csswg.org/cssom/#dom-css-escape
