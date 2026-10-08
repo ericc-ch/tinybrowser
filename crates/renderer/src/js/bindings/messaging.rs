@@ -64,6 +64,11 @@ pub(crate) fn install_messaging(ctx: &Ctx<'_>) -> Result<()> {
         "__tbFrameRegistered",
         rquickjs::prelude::Func::from(frame_registered),
     )?;
+    globals.set("__tbFrameName", rquickjs::prelude::Func::from(frame_name))?;
+    globals.set(
+        "__tbSetFrameName",
+        rquickjs::prelude::Func::from(set_frame_name),
+    )?;
     Ok(())
 }
 
@@ -407,6 +412,35 @@ pub(crate) fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
         Some(root) => wrap_node(&ctx, root),
         None => Ok(Value::new_null(ctx)),
     }
+}
+
+/// The browsing context name of `frame` (`window.name`)
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_name(ctx: Ctx<'_>, frame: f64) -> Result<String> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(String::new());
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    Ok(shared.borrow().tree.name(FrameId::new(frame)).to_owned())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn set_frame_name(ctx: Ctx<'_>, frame: f64, name: String) -> Result<()> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(());
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    shared.borrow_mut().tree.set_name(FrameId::new(frame), name);
+    Ok(())
 }
 
 /// Whether `frame` has a browsing context, even when its realm is not

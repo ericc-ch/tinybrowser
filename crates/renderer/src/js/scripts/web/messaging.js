@@ -628,6 +628,7 @@ const __tbFrameProxy = frame => {
         case 'window': case 'self': case 'frames': return proxy;
         case 'length': return host.__tbFrameChildCount(frame);
         case 'closed': return !host.__tbFrameRegistered(frame);
+        case 'name': return host.__tbFrameName(frame);
         case Symbol.toStringTag: return 'Window';
         case 'document': return host.__tbFrameDocument(frame);
       }
@@ -645,6 +646,10 @@ const __tbFrameProxy = frame => {
       return sameOrigin[property];
     },
     set(target, property, value) {
+      if (property === 'name') {
+        host.__tbSetFrameName(frame, String(value));
+        return true;
+      }
       const sameOrigin = host.__tbFrameGlobal(frame);
       if (sameOrigin == null) {
         if (host.__tbFrameRegistered(frame)) {
@@ -659,7 +664,7 @@ const __tbFrameProxy = frame => {
     has(target, property) {
       switch (property) {
         case 'postMessage': case 'parent': case 'top': case 'window': case 'self':
-        case 'frames': case 'length': case 'closed': case 'document':
+        case 'frames': case 'length': case 'closed': case 'document': case 'name':
         case 'addEventListener': case 'removeEventListener': case 'dispatchEvent':
           return true;
       }
@@ -902,6 +907,12 @@ Object.defineProperty(globalThis, 'top', {
     const top = host.__tbFrameTop(__tbFrameId);
     return top === __tbFrameId ? globalThis : __tbFrameProxy(top);
   },
+  configurable: true, enumerable: true,
+});
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name
+Object.defineProperty(globalThis, 'name', {
+  get() { return host.__tbFrameName(__tbFrameId); },
+  set(value) { host.__tbSetFrameName(__tbFrameId, String(value)); },
   configurable: true, enumerable: true,
 });
 

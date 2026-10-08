@@ -1138,10 +1138,20 @@ impl World {
         if !eligible || self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
             return false;
         }
+        let name = self
+            .with_document(container, |parsed| {
+                attr(&parsed.document.base, container.node, "name")
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .unwrap_or_default();
         let frame = {
             let mut shared = self.runtime.shared.borrow_mut();
             let frame = shared.allocate_frame();
             shared.tree.add(self.frame, frame, container);
+            if !name.is_empty() {
+                shared.tree.set_name(frame, name);
+            }
             frame
         };
         self.pending_frames.push((frame, container));
@@ -1252,14 +1262,6 @@ impl World {
     /// Takes the child frames this realm created for the engine to adopt.
     pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, NodeId, Document)> {
         std::mem::take(&mut self.new_frames)
-    }
-
-    /// The frame's connected `iframe` containers in tree order, which is what
-    /// orders the frame's child browsing contexts
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
-    #[must_use]
-    pub(crate) fn iframe_containers_in_order(&self) -> Vec<NodeId> {
-        self.iframe_containers_before(None)
     }
 
     /// Connected `iframe`s in tree order that precede `before`, or every

@@ -552,7 +552,6 @@ impl Engine {
             self.apply_image_lifecycle(image_lifecycle);
             self.apply_navigations(navigations);
             self.apply_streams(streams);
-            self.reorder_frames();
             self.apply_deliveries(deliveries);
             let fired_load = self.fire_ready_frame_loads();
             if !had_work && !fired_load {
@@ -863,38 +862,6 @@ impl Engine {
                     document.mark_frame_load_pending(container);
                 }
             }
-        }
-    }
-
-    /// Reorders each frame's children to the tree order of their containers.
-    ///
-    /// A same-document `iframe` move is not a connection transition
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
-    fn reorder_frames(&mut self) {
-        let parents: Vec<FrameId> = self
-            .frames
-            .keys()
-            .copied()
-            .filter(|frame| {
-                !self
-                    .runtime
-                    .shared
-                    .borrow()
-                    .tree
-                    .children(*frame)
-                    .is_empty()
-            })
-            .collect();
-        for parent in parents {
-            let Some(document) = self.frames.get_mut(&parent) else {
-                continue;
-            };
-            let containers = document.iframe_containers_in_order();
-            self.runtime
-                .shared
-                .borrow_mut()
-                .tree
-                .reorder(parent, &containers);
         }
     }
 

@@ -35,12 +35,18 @@ pub(crate) const PAYLOAD_VERSION: &str = "tb1:";
 pub(crate) struct FrameTree {
     /// Each frame's parent browsing context.
     parents: HashMap<FrameId, FrameId>,
-    /// Each frame's direct children, in container tree order.
+    /// Each frame's direct children, in browsing-context creation order.
+    /// `moveBefore` does not recreate a child navigable, so this order does
+    /// not follow a later container move
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
     children: HashMap<FrameId, Vec<FrameId>>,
     /// Each child frame's owning `iframe`.
     containers: HashMap<FrameId, NodeId>,
     /// Reverse of `containers`, for `contentWindow`.
     owners: HashMap<NodeId, FrameId>,
+    /// Browsing context names (`window.name`)
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
+    names: HashMap<FrameId, String>,
 }
 
 impl FrameTree {
@@ -56,6 +62,17 @@ impl FrameTree {
         self.containers.insert(child, container);
         self.owners.insert(container, child);
         self.children.entry(parent).or_default().push(child);
+        self.names.entry(child).or_default();
+    }
+
+    /// The browsing context name of `frame`.
+    pub(crate) fn name(&self, frame: FrameId) -> &str {
+        self.names.get(&frame).map_or("", String::as_str)
+    }
+
+    /// Sets the browsing context name of `frame`.
+    pub(crate) fn set_name(&mut self, frame: FrameId, name: String) {
+        self.names.insert(frame, name);
     }
 
     /// Removes one frame and returns its `(parent, container)`.
@@ -67,6 +84,7 @@ impl FrameTree {
         self.children.remove(&child);
         let container = self.containers.remove(&child)?;
         self.owners.remove(&container);
+        self.names.remove(&child);
         Some((parent, container))
     }
 
@@ -79,7 +97,7 @@ impl FrameTree {
         self.parents.get(&frame).copied()
     }
 
-    /// The direct children of `frame`, in container tree order.
+    /// The direct children of `frame`, in browsing-context creation order.
     pub(crate) fn children(&self, frame: FrameId) -> &[FrameId] {
         self.children.get(&frame).map_or(&[], Vec::as_slice)
     }
@@ -92,30 +110,6 @@ impl FrameTree {
     /// The child frame of `container`, when its browsing context exists.
     pub(crate) fn frame_for_container(&self, container: NodeId) -> Option<FrameId> {
         self.owners.get(&container).copied()
-    }
-
-    /// Reorders `parent`'s children to match the tree order of their
-    /// containers; containers the caller no longer declares keep their place
-    /// at the end.
-    pub(crate) fn reorder(&mut self, parent: FrameId, containers: &[NodeId]) {
-        let Some(children) = self.children.get_mut(&parent) else {
-            return;
-        };
-        let mut ordered: Vec<FrameId> = Vec::with_capacity(children.len());
-        for container in containers {
-            if let Some(frame) = self.owners.get(container)
-                && children.contains(frame)
-                && !ordered.contains(frame)
-            {
-                ordered.push(*frame);
-            }
-        }
-        for child in children.iter() {
-            if !ordered.contains(child) {
-                ordered.push(*child);
-            }
-        }
-        *children = ordered;
     }
 }
 

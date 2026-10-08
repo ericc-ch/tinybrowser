@@ -425,14 +425,6 @@ impl Document {
         self.world.borrow().object_url_type(url)
     }
 
-    /// The frame's connected `iframe` containers in tree order, which is what
-    /// orders the frame's child browsing contexts
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
-    #[must_use]
-    pub(crate) fn iframe_containers_in_order(&self) -> Vec<crate::js::world::NodeId> {
-        self.world.borrow().iframe_containers_in_order()
-    }
-
     /// Creates the browsing context of every connected `iframe` that lacks
     /// one, so a script sees it in the same task
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
@@ -1940,7 +1932,20 @@ impl Document {
         if !self.pending_frame_loads.remove(&container) {
             return false;
         }
-        self.fire_node_load(container);
+        // Src-less iframes already fire `load` from insertion steps
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+        let already_fired = self
+            .world
+            .borrow()
+            .with_document(container, |parsed| {
+                crate::js::world::attr(&parsed.document.base, container.node, "src").is_none()
+                    && crate::js::world::attr(&parsed.document.base, container.node, "srcdoc")
+                        .is_none()
+            })
+            .unwrap_or(false);
+        if !already_fired {
+            self.fire_node_load(container);
+        }
         self.maybe_fire_load();
         true
     }
