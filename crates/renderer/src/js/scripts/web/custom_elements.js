@@ -5,6 +5,10 @@
   const constructors = new __tbPrivateMap();
   const upgraded = host.slots();
   const connected = host.slots();
+  // Subtree roots passed through `move`, so their childList records are not
+  // connection transitions
+  // (<https://dom.spec.whatwg.org/#move>).
+  const atomicMoves = host.slots();
   const pending = new __tbPrivateMap();
   let definitionRunning = false;
   const enqueueReaction = host.__tbEnqueueCustomReaction;
@@ -78,6 +82,28 @@
       invoke(element, 'connectedCallback', []);
     });
   }
+
+  // https://dom.spec.whatwg.org/#move
+  // https://html.spec.whatwg.org/multipage/custom-elements.html#enqueue-a-custom-element-callback-reaction
+  function noteConnectedMove(node) {
+    atomicMoves.add(node);
+    visitElements(node, function(element) {
+      if (!upgraded.has(element) || !isConnected(element)) return;
+      const callbacks = definitions.get(localNameOf(element))?.callbacks;
+      if (!callbacks) return;
+      if (typeof callbacks.connectedMoveCallback === 'function') {
+        enqueueReaction(element, callbacks.connectedMoveCallback, []);
+        return;
+      }
+      if (typeof callbacks.disconnectedCallback === 'function') {
+        enqueueReaction(element, callbacks.disconnectedCallback, []);
+      }
+      if (typeof callbacks.connectedCallback === 'function') {
+        enqueueReaction(element, callbacks.connectedCallback, []);
+      }
+    });
+  }
+  host.__tbNoteConnectedMove = noteConnectedMove;
 
   function notifyDisconnected(root) {
     visitElements(root, function(element) {
@@ -300,11 +326,17 @@
       if (record.type === 'childList') {
         const removed = record.removedNodes;
         for (let index = 0, length = nativeApply(listLengthGetter, removed, []); index < length; ++index) {
-          notifyDisconnected(nativeApply(listItem, removed, [index]));
+          const node = nativeApply(listItem, removed, [index]);
+          if (atomicMoves.has(node)) continue;
+          notifyDisconnected(node);
         }
         const added = record.addedNodes;
         for (let index = 0, length = nativeApply(listLengthGetter, added, []); index < length; ++index) {
           const node = nativeApply(listItem, added, [index]);
+          if (atomicMoves.has(node)) {
+            atomicMoves.delete(node);
+            continue;
+          }
           upgradeTree(node);
           notifyConnected(node);
         }

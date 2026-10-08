@@ -1327,6 +1327,185 @@ fn insert_parsed(
     place_journaled(parsed, parent, node, reference);
 }
 
+/// The `child` argument of `move`, after `moveBefore` rewrites a self-reference
+/// to the node's next sibling
+/// (<https://dom.spec.whatwg.org/#dom-parentnode-movebefore>).
+enum MoveTarget {
+    /// `child` is null, so the node is appended.
+    End,
+    /// Insert before this child of the destination.
+    Before(NodeId),
+    /// An attribute, which is never parented.
+    Unparented,
+}
+
+/// `ParentNode.moveBefore` (<https://dom.spec.whatwg.org/#dom-parentnode-movebefore>).
+///
+/// `move` is a separate primitive from insert and remove: it does not adopt,
+/// and it does not run the insertion or removing steps
+/// (<https://dom.spec.whatwg.org/#move>). Live ranges, node iterators, and
+/// shadow-tree slot assignment are absent here, so those loops are empty.
+fn move_before_node(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeReference,
+    child: Option<NodeReference>,
+) -> Result<()> {
+    let node = node
+        .tree()
+        .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "attributes cannot be moved"))?;
+    let target = match child {
+        None => MoveTarget::End,
+        Some(NodeReference::Attribute { .. }) => MoveTarget::Unparented,
+        Some(NodeReference::Tree(child)) if child == node => {
+            let world = world(ctx)?;
+            let next = world.borrow().with_document(node, |parsed| {
+                sibling(&parsed.document.base, node.node, true).map(|next| NodeId {
+                    document: node.document,
+                    node: next,
+                })
+            });
+            next.flatten().map_or(MoveTarget::End, MoveTarget::Before)
+        }
+        Some(NodeReference::Tree(child)) => MoveTarget::Before(child),
+    };
+    ensure_can_move(ctx, parent, node, &target)?;
+    {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(parent) else {
+            return Err(Exception::throw_type(ctx, "stale parent"));
+        };
+        let reference = match target {
+            MoveTarget::Before(child) => Some(child),
+            MoveTarget::End | MoveTarget::Unparented => None,
+        };
+        unlink_journaled(&mut parsed, node);
+        place_journaled(&mut parsed, parent, node, reference);
+    }
+    let connected = world(ctx)?
+        .borrow()
+        .with_document(node, |parsed| {
+            is_connected(&parsed.document.base, node.node)
+        })
+        .unwrap_or(false);
+    if connected {
+        // Custom-element move reactions, not the insertion/removing steps.
+        // https://dom.spec.whatwg.org/#move
+        // https://html.spec.whatwg.org/multipage/custom-elements.html#enqueue-a-custom-element-callback-reaction
+        note_connected_move(ctx, node)?;
+    }
+    schedule_mutation_delivery(ctx)
+}
+
+/// Preconditions of `move` (<https://dom.spec.whatwg.org/#move>).
+fn ensure_can_move(ctx: &Ctx<'_>, parent: NodeId, node: NodeId, target: &MoveTarget) -> Result<()> {
+    if node.document != parent.document {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "move crosses shadow-including roots",
+        ));
+    }
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(parent) else {
+        return Err(Exception::throw_type(ctx, "stale parent"));
+    };
+    let doc = &parsed.document;
+    let base = &doc.base;
+    if root_of(base, parent.node) != root_of(base, node.node) {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "move crosses shadow-including roots",
+        ));
+    }
+    // No shadow hosts, so a host-including inclusive ancestor is an inclusive
+    // ancestor (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
+    ensure_no_cycle(ctx, base, parent.node, node.node)?;
+    let reference = match target {
+        MoveTarget::Before(child) => {
+            if child.document != parent.document {
+                return Err(throw_dom(
+                    ctx,
+                    "NotFoundError",
+                    "reference is not a child of parent",
+                ));
+            }
+            ensure_parented(ctx, base, parent, *child)?;
+            Some(*child)
+        }
+        MoveTarget::Unparented => {
+            return Err(throw_dom(ctx, "NotFoundError", "attributes have no parent"));
+        }
+        MoveTarget::End => None,
+    };
+    let kind = classify_inserted(doc, node.node);
+    let movable = matches!(
+        kind,
+        InsertedNode::Element | InsertedNode::Text | InsertedNode::CharacterData
+    );
+    if !movable {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "node cannot be moved",
+        ));
+    }
+    let parent_is_document = base.root_node().id == parent.node;
+    if parent_is_document && matches!(kind, InsertedNode::Text) {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "text cannot be a child of a document",
+        ));
+    }
+    if parent_is_document && matches!(kind, InsertedNode::Element) {
+        let has_element = base.get_node(parent.node).is_some_and(|root| {
+            root.children
+                .iter()
+                .any(|child| super::is_real_element(doc, *child))
+        });
+        let child_is_doctype = reference.is_some_and(|child| doc.is_doctype(child.node));
+        let doctype_follows =
+            reference.is_some_and(|child| sibling_kind_follows(doc, parent.node, child.node));
+        if has_element || child_is_doctype || doctype_follows {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "a document can have only one element child",
+            ));
+        }
+    }
+    // The root and ancestor checks make this parent exist. The spec asserts
+    // it (<https://dom.spec.whatwg.org/#move>).
+    if base
+        .get_node(node.node)
+        .and_then(|candidate| candidate.parent)
+        .is_none()
+    {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "node has no parent",
+        ));
+    }
+    Ok(())
+}
+
+/// Asks the custom-element shim to enqueue `connectedMoveCallback` for `node`
+/// and its descendants. The shim also suppresses the removal/insertion
+/// reactions those mutation records would otherwise produce.
+fn note_connected_move(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let Ok(hook) = crate::js::bridge::object(ctx)?.get::<_, Function>("__tbNoteConnectedMove")
+    else {
+        return Ok(());
+    };
+    let wrapped = wrap_node(ctx, node)?;
+    hook.call((wrapped,))
+}
+
 /// Splices an adopted fragment's children into `parent` before `reference`:
 /// one removal record on the fragment plus one addition record on the parent
 /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
@@ -7121,6 +7300,16 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-movebefore
+    fn move_before(
+        &self,
+        ctx: Ctx<'js>,
+        node: NodeReference,
+        child: Option<NodeReference>,
+    ) -> Result<()> {
+        move_before_node(&ctx, self.handle.0, node, child)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
