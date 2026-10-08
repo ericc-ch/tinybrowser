@@ -106,7 +106,12 @@ impl Parsed {
 pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Parsed {
     let quirks_mode = sniff_quirks_mode(input);
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_html(input, config).into();
-    let document = BlitzDocument::from_base(base);
+    let mut document = BlitzDocument::from_base(base);
+    // Blitz's HTML sink ignores the doctype token (`drop_doctype` and an
+    // empty `append_doctype_to_document`). The initial insertion mode still
+    // appends that one doctype
+    // (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>).
+    attach_leading_doctype(&mut document, input, false);
     Parsed {
         id: 0,
         document,
@@ -138,4 +143,195 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
     } else {
         QuirksMode::LimitedQuirks
     }
+}
+
+/// A doctype the parser dropped, plus how many document children precede it.
+struct LeadingDoctype {
+    name: String,
+    public_id: String,
+    system_id: String,
+    nodes_before: usize,
+}
+
+/// Inserts the preamble doctype Blitz's sink discarded.
+pub(crate) fn attach_leading_doctype(document: &mut BlitzDocument, input: &str, xml: bool) {
+    let Some(found) = scan_leading_doctype(input, xml) else {
+        return;
+    };
+    document.insert_doctype_child(
+        found.name,
+        found.public_id,
+        found.system_id,
+        found.nodes_before,
+    );
+}
+
+/// The doctype from the initial insertion mode, when the source has one
+/// before the first element.
+///
+/// HTML matches `<!DOCTYPE` case-insensitively and lowercases the name.
+/// XML matches the production case-sensitively and also counts processing
+/// instructions, which the XML sink inserts as empty comments
+/// (<https://www.w3.org/TR/xml/#NT-doctypedecl>).
+fn scan_leading_doctype(input: &str, xml: bool) -> Option<LeadingDoctype> {
+    let mut scan = PreambleScan { input, pos: 0 };
+    scan.skip_bom();
+    let mut nodes_before = 0;
+    loop {
+        scan.skip_whitespace();
+        if scan.consume_comment() {
+            nodes_before += 1;
+            continue;
+        }
+        if xml && scan.consume_processing_instruction() {
+            nodes_before += 1;
+            continue;
+        }
+        return scan.read_doctype(xml, nodes_before);
+    }
+}
+
+struct PreambleScan<'a> {
+    input: &'a str,
+    pos: usize,
+}
+
+impl PreambleScan<'_> {
+    fn rest(&self) -> &str {
+        &self.input[self.pos..]
+    }
+
+    fn skip_bom(&mut self) {
+        if self.rest().starts_with('\u{feff}') {
+            self.pos += '\u{feff}'.len_utf8();
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(c) = self.rest().chars().next() {
+            if !is_preamble_whitespace(c) {
+                break;
+            }
+            self.pos += c.len_utf8();
+        }
+    }
+
+    fn consume_comment(&mut self) -> bool {
+        if !self.rest().starts_with("<!--") {
+            return false;
+        }
+        let Some(end) = self.rest()[4..].find("-->") else {
+            return false;
+        };
+        self.pos += 4 + end + 3;
+        true
+    }
+
+    fn consume_processing_instruction(&mut self) -> bool {
+        if !self.rest().starts_with("<?") {
+            return false;
+        }
+        let Some(end) = self.rest()[2..].find("?>") else {
+            return false;
+        };
+        self.pos += 2 + end + 2;
+        true
+    }
+
+    fn starts_with_keyword(&self, keyword: &str, ignore_ascii_case: bool) -> bool {
+        let rest = self.rest();
+        if rest.len() < keyword.len() {
+            return false;
+        }
+        if ignore_ascii_case {
+            rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+        } else {
+            &rest[..keyword.len()] == keyword
+        }
+    }
+
+    fn read_doctype(&mut self, xml: bool, nodes_before: usize) -> Option<LeadingDoctype> {
+        if !self.starts_with_keyword("<!DOCTYPE", !xml) {
+            return None;
+        }
+        let after = self.rest()[9..].chars().next()?;
+        if !is_preamble_whitespace(after) {
+            return None;
+        }
+        self.pos += 9;
+        self.skip_whitespace();
+        let name = self.read_name(!xml);
+        self.skip_whitespace();
+        let (public_id, system_id) = self.read_ids(xml);
+        Some(LeadingDoctype {
+            name,
+            public_id,
+            system_id,
+            nodes_before,
+        })
+    }
+
+    fn read_name(&mut self, lowercase: bool) -> String {
+        let mut name = String::new();
+        while let Some(c) = self.rest().chars().next() {
+            if c == '>' || is_preamble_whitespace(c) {
+                break;
+            }
+            self.pos += c.len_utf8();
+            if lowercase && c.is_ascii_uppercase() {
+                name.push(c.to_ascii_lowercase());
+            } else {
+                name.push(c);
+            }
+        }
+        name
+    }
+
+    fn read_ids(&mut self, xml: bool) -> (String, String) {
+        if self.consume_keyword("PUBLIC", !xml) {
+            self.skip_whitespace();
+            let public_id = self.read_quoted().unwrap_or_default();
+            self.skip_whitespace();
+            let system_id = self.read_quoted().unwrap_or_default();
+            (public_id, system_id)
+        } else if self.consume_keyword("SYSTEM", !xml) {
+            self.skip_whitespace();
+            (String::new(), self.read_quoted().unwrap_or_default())
+        } else {
+            (String::new(), String::new())
+        }
+    }
+
+    fn consume_keyword(&mut self, keyword: &str, ignore_ascii_case: bool) -> bool {
+        if !self.starts_with_keyword(keyword, ignore_ascii_case) {
+            return false;
+        }
+        let boundary = self.rest()[keyword.len()..].chars().next();
+        if boundary.is_some_and(|c| !is_preamble_whitespace(c) && c != '>') {
+            return false;
+        }
+        self.pos += keyword.len();
+        true
+    }
+
+    fn read_quoted(&mut self) -> Option<String> {
+        let quote = self.rest().chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        self.pos += quote.len_utf8();
+        let mut value = String::new();
+        while let Some(c) = self.rest().chars().next() {
+            self.pos += c.len_utf8();
+            if c == quote {
+                return Some(value);
+            }
+            value.push(c);
+        }
+        Some(value)
+    }
+}
+
+fn is_preamble_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{000c}' | '\r' | ' ')
 }

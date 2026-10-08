@@ -750,17 +750,21 @@ pub(super) fn rect_object<'js>(
 
 /// Points `from`'s existing wrapper at `to` and moves the wrapper cache.
 ///
-/// `createDocument` adopts a doctype by copying it into the new tree. The
-/// spec keeps the same object, so the wrapper follows the copy
-/// (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>).
+/// Adoption copies the node into the destination tree. The spec keeps the
+/// same object, so a wrapper this realm can see follows the copy
+/// (<https://dom.spec.whatwg.org/#concept-node-adopt>). A wrapper that lives
+/// in another realm stays where it is: this context cannot update it.
 pub(super) fn retarget_wrapper(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
-    let saved = world(ctx)?.borrow().shared_wrapper(from);
-    if let Some(saved) = saved
-        && let Some(value) = deref_weak(ctx, saved)?
-        && let Ok(class) = Class::<JsNode>::from_js(ctx, value)
-    {
-        class.borrow_mut().handle = Handle(to);
-    }
+    let Some(saved) = world(ctx)?.borrow().shared_wrapper(from) else {
+        return Ok(());
+    };
+    let Ok(Some(value)) = deref_weak(ctx, saved) else {
+        return Ok(());
+    };
+    let Ok(class) = Class::<JsNode>::from_js(ctx, value) else {
+        return Ok(());
+    };
+    class.borrow_mut().handle = Handle(to);
     world(ctx)?
         .borrow()
         .registry()

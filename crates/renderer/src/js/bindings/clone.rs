@@ -15,9 +15,9 @@ use rquickjs::{Ctx, Exception, Result, Value};
 /// and an equivalent subtree materializes in the target
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
 ///
-/// The known deviation is wrapper identity: `NodeId` is arena-scoped, so
-/// pre-existing wrappers still point at the detached original instead of
-/// following the adoption the way a single-arena engine would.
+/// Blitz ids are per-tree, so the copy is a different id. Wrappers this realm
+/// already holds follow that copy, including descendants, so
+/// `parent.appendChild(node)` leaves `node.parentNode === parent`.
 pub(crate) fn adopt_across_documents(
     ctx: &Ctx<'_>,
     parent: NodeId,
@@ -49,14 +49,55 @@ pub(crate) fn adopt_across_documents(
         };
         detach_for_adopt(&mut parsed.document, node).map_err(|err| throw_dom_error(ctx, err))?;
     }
-    let target_world = world_for_node(ctx, parent)?;
-    let target = target_world.borrow();
-    let Some(mut parsed) = target.document_mut(parent) else {
+    let fresh = {
+        let target_world = world_for_node(ctx, parent)?;
+        let target = target_world.borrow();
+        let Some(mut parsed) = target.document_mut(parent) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        materialize_import(&mut parsed.document, parent.document, &snapshot)
+            .map_err(|err| throw_dom_error(ctx, err))?
+    };
+    retarget_adopted_subtree(ctx, node, fresh)?;
+    Ok(fresh)
+}
+
+/// Points wrappers for `from` and its descendants at the copied subtree `to`.
+///
+/// The two trees match child for child because `to` was materialized from a
+/// deep snapshot of `from`. Each lookup borrows one document: the store is a
+/// single `RefCell`.
+fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
+    super::retarget_wrapper(ctx, from, to)?;
+    let from_children = adopted_children(ctx, from)?;
+    let to_children = adopted_children(ctx, to)?;
+    for (from_child, to_child) in from_children.into_iter().zip(to_children) {
+        retarget_adopted_subtree(ctx, from_child, to_child)?;
+    }
+    Ok(())
+}
+
+fn adopted_children(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<NodeId>> {
+    let owner = world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let Some(parsed) = owner.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    let fresh = materialize_import(&mut parsed.document, parent.document, &snapshot)
-        .map_err(|err| throw_dom_error(ctx, err))?;
-    Ok(fresh)
+    Ok(parsed
+        .document
+        .base
+        .get_node(id.node)
+        .map(|node| {
+            node.children
+                .iter()
+                .copied()
+                .map(|child| NodeId {
+                    document: id.document,
+                    node: child,
+                })
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Detaches `id` from its parent for adoption, recording the removal.

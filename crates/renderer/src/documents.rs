@@ -163,6 +163,32 @@ impl BlitzDocument {
         backing
     }
 
+    /// Inserts a doctype as document child `index`, or at the end when the
+    /// parsed tree has fewer children.
+    ///
+    /// The HTML and XML parsers drop the doctype token. The caller recovered
+    /// it from the source preamble and passes the number of document children
+    /// that precede it.
+    pub(crate) fn insert_doctype_child(
+        &mut self,
+        name: String,
+        public_id: String,
+        system_id: String,
+        index: usize,
+    ) {
+        let id = self.create_doctype(name, public_id, system_id);
+        let root = self.base.root_node().id;
+        let anchor = self
+            .base
+            .get_node(root)
+            .and_then(|root| root.children.get(index).copied());
+        if let Some(anchor) = anchor {
+            self.base.mutate().insert_nodes_before(anchor, &[id]);
+        } else {
+            self.base.mutate().append_children(root, &[id]);
+        }
+    }
+
     /// Creates a processing instruction
     /// (<https://dom.spec.whatwg.org/#create-a-processing-instruction-node>).
     ///

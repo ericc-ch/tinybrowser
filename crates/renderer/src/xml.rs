@@ -44,7 +44,16 @@ fn parse_with_config(
     config: blitz_dom::DocumentConfig,
 ) -> Parsed {
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
-    let document = crate::documents::BlitzDocument::from_base(base);
+    let mut document = crate::documents::BlitzDocument::from_base(base);
+    // The XML sink's `append_doctype_to_document` ignores the token. The
+    // document type declaration is still a child of the document
+    // (<https://www.w3.org/TR/xml/#NT-doctypedecl>).
+    crate::attach_leading_doctype(&mut document, input, true);
+    // `create_pi` stores an empty comment and drops the target and data.
+    // A processing instruction is a real node
+    // (<https://dom.spec.whatwg.org/#concept-node-pi>). The XML declaration
+    // is not one of those nodes.
+    attach_xml_processing_instructions(&mut document, input);
     Parsed {
         id: 0,
         document,
@@ -73,6 +82,133 @@ pub(crate) fn navigated_content_type(header: &str) -> Option<&'static str> {
         // `application/xml` and every other XML MIME type.
         _ => "application/xml",
     })
+}
+
+/// Replaces the empty comments the XML sink left for processing
+/// instructions. The XML declaration (`<?xml ...?>`) keeps its placeholder.
+fn attach_xml_processing_instructions(document: &mut crate::documents::BlitzDocument, input: &str) {
+    let instructions = scan_xml_processing_instructions(input);
+    if instructions.is_empty() {
+        return;
+    }
+    let mut holes = Vec::new();
+    collect_pi_holes(document, document.base.root_node().id, &mut holes);
+    let mut holes = holes.into_iter();
+    for (index, (target, data)) in instructions.into_iter().enumerate() {
+        let Some(hole) = holes.next() else {
+            break;
+        };
+        if index == 0 && target == "xml" {
+            continue;
+        }
+        let fresh = document.create_processing_instruction(target, &data);
+        document.base.mutate().replace_node_with(hole, &[fresh]);
+    }
+}
+
+fn collect_pi_holes(
+    document: &crate::documents::BlitzDocument,
+    id: blitz_traits::node_id::NodeId,
+    holes: &mut Vec<blitz_traits::node_id::NodeId>,
+) {
+    let is_hole = document.extra(id).is_none()
+        && document.base.get_node(id).is_some_and(|node| {
+            matches!(
+                &node.data,
+                blitz_dom::NodeData::Comment { contents } if contents.is_empty()
+            )
+        });
+    if is_hole {
+        holes.push(id);
+    }
+    let children: Vec<_> = document
+        .base
+        .get_node(id)
+        .map(|node| node.children.iter().copied().collect())
+        .unwrap_or_default();
+    for child in children {
+        collect_pi_holes(document, child, holes);
+    }
+}
+
+fn scan_xml_processing_instructions(input: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut pos = 0;
+    while pos < input.len() {
+        let rest = &input[pos..];
+        if let Some(inside) = rest.strip_prefix("<!--") {
+            match inside.find("-->") {
+                Some(end) => pos += 4 + end + 3,
+                None => break,
+            }
+            continue;
+        }
+        if let Some(inside) = rest.strip_prefix("<![CDATA[") {
+            match inside.find("]]>") {
+                Some(end) => pos += 9 + end + 3,
+                None => break,
+            }
+            continue;
+        }
+        if let Some(inside) = rest.strip_prefix("<?") {
+            match inside.find("?>") {
+                Some(end) => {
+                    push_processing_instruction(&mut found, &inside[..end]);
+                    pos += 2 + end + 2;
+                }
+                None => break,
+            }
+            continue;
+        }
+        if rest.starts_with('<') {
+            pos += skip_markup(rest);
+            continue;
+        }
+        let Some(next) = rest.chars().next() else {
+            break;
+        };
+        pos += next.len_utf8();
+    }
+    found
+}
+
+fn push_processing_instruction(found: &mut Vec<(String, String)>, body: &str) {
+    let mut target = String::new();
+    let mut chars = body.chars();
+    for character in chars.by_ref() {
+        if is_xml_whitespace(character) {
+            break;
+        }
+        target.push(character);
+    }
+    if target.is_empty() {
+        return;
+    }
+    let data: String = chars.collect();
+    let data = data.trim_start_matches(is_xml_whitespace).to_owned();
+    found.push((target, data));
+}
+
+fn skip_markup(rest: &str) -> usize {
+    let mut quote = None;
+    for (index, character) in rest.char_indices().skip(1) {
+        if let Some(open) = quote {
+            if character == open {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '>' => return index + character.len_utf8(),
+            _ => {}
+        }
+    }
+    rest.len()
+}
+
+fn is_xml_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
 /// Whether `name` matches the XML `Name` production

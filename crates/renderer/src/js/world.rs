@@ -126,8 +126,8 @@ impl RealmRegistry {
 
     /// Moves the shared wrapper cache entry from `from` to `to`.
     ///
-    /// Adoption copies the node into another tree. `createDocument` retargets
-    /// the existing wrapper so `doc.doctype === doctype` still holds
+    /// Adoption copies the node into another tree and retargets the existing
+    /// wrapper so the caller's object is the adopted node
     /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
     pub(crate) fn rekey_wrapper(&mut self, from: NodeId, to: NodeId) {
         if let Some(value) = self.wrappers.remove(&from) {
