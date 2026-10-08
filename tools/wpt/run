@@ -372,6 +372,14 @@ elif manifest_is_current "$MANIFEST_PATH"; then
 else
   record_manifest_stamp=1
 fi
+# url/ on this 4-core machine, 49 tests, no --fully-parallel: 1 process
+# 51s, 2 processes 39s, 4 processes 29–31s, 8 processes 28s. 8 did not
+# beat 4. --fully-parallel keeps wpt's own process count: that mode puts
+# every test in its own group, and restart_on_new_group then starts a
+# browser per test.
+if ! has_option --processes "${args[@]}" && ! has_option --fully-parallel "${args[@]}" && ! has_option -f "${args[@]}"; then
+  args+=(--processes 4)
+fi
 if ! has_option --test-types "${args[@]}"; then
   # `--test-types` takes its values with `nargs="*"`, so it must be the last
   # option: a following positional would be consumed as a test type.
