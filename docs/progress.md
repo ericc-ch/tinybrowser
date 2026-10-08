@@ -320,4 +320,5 @@ Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail clo
 - `blitz-dom` exposes only the viewport scroll offset, no per-element scroll-container offset API.
 - `blitz-dom` owns document language internally with no metadata setter, so a response `Content-Language` is not applied.
 - `blitz-html` always parses scripting-disabled (`noscript` as markup); scripting-enabled `noscript`-as-text diverges.
+- `blitz-dom-0.3.0-beta.2/src/stylo.rs:433` `NonTSPseudoClass::PlaceholderShown` is hardcoded `false`, so `:placeholder-shown` never matches and placeholder text does not paint (observed: Wikipedia's "Search Wikipedia").
 - Pre-existing `main` crashes, out of scope: `dom/nodes/Document-characterSet-normalization-1.html`, `Document-characterSet-normalization-2.html`, `Document-createElement-namespace.html`.

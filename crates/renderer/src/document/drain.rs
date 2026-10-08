@@ -102,8 +102,10 @@ impl Document {
         // A `data:` response can itself request more `data:` images. Keep
         // decoding those before returning so paint does not run with the
         // fetches still sitting on the channel. Network dials stay async.
-        // Eight passes is the bound for one drain step; anything still queued
-        // is launched on the next step, so a `data:` cycle cannot spin here.
+        // Eight passes is the bound for one drain step, so a `data:` cycle
+        // cannot spin inside this call. A chain longer than that stays
+        // queued; the wake below asks the session for another step instead
+        // of waiting for unrelated work.
         for _ in 0..8 {
             let queued = std::mem::take(&mut self.queued_dials);
             if queued.is_empty() {
@@ -165,6 +167,9 @@ impl Document {
                 break;
             }
             self.drain_blitz_fetches();
+        }
+        if !self.queued_dials.is_empty() {
+            self.wake.notify_one();
         }
     }
 
