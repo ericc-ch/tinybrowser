@@ -1,0 +1,22 @@
+[package]
+name = "fontconfig-parser"
+version = "0.5.8"
+edition = "2018"
+license = "MIT"
+documentation = "https://docs.rs/fontconfig-parser"
+description = "fontconfig file parser in pure Rust"
+repository = "https://github.com/Riey/fontconfig-parser"
+homepage = "https://github.com/Riey/fontconfig-parser"
+readme = "README.md"
+categories = ["parser-implementations"]
+keywords = ["fontconfig"]
+
+[features]
+serialize = ["serde"]
+
+[dependencies]
+log = { version = "0.4", optional = true }
+# Upstream 0.5.8 requires 0.20.0. usvg and fontique require 0.21.1.
+# This requirement is the only change from that release. See UPSTREAM.md.
+roxmltree = "0.21.1"
+serde = { version = "1", optional = true, features = ["derive"] }
