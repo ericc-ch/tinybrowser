@@ -28,7 +28,7 @@ use crate::documents::DocumentStore;
 use crate::js::{
     DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime,
 };
-use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
+use crate::messaging::{Delivery, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError};
 use crate::storage::PendingStorageEvent;
 
@@ -76,27 +76,6 @@ impl Engine {
             js_runtime,
             init_scripts,
         }
-    }
-
-    fn create_frame(&mut self, parent: FrameId, container: crate::js::world::NodeId) -> FrameId {
-        let frame = self.runtime.shared.borrow_mut().allocate_frame();
-        let Some(parent_document) = self.frames.get(&parent) else {
-            return frame;
-        };
-        let parent_url = parent_document.inherited_url();
-        let parent_viewport = parent_document.viewport_size;
-        let mut document = Document::with_shared(frame, &self.runtime, &self.init_scripts);
-        // A child frame shares the tab's viewport until a content-box-driven
-        // size exists; Blitz does not couple iframe layout to the child.
-        document.set_viewport_size(parent_viewport);
-        document.load_about_blank(Some(&parent_url));
-        self.frames.insert(frame, document);
-        self.runtime
-            .shared
-            .borrow_mut()
-            .tree
-            .add(parent, frame, container);
-        frame
     }
 
     /// Adopts every child frame the realms created for themselves (an `iframe`
@@ -585,37 +564,8 @@ impl Engine {
 
     /// Applies iframe connection transitions.
     fn apply_iframe_lifecycle(&mut self, events: Vec<(FrameId, crate::document::IframeLifecycle)>) {
-        for (parent, event) in events {
+        for (_parent, event) in events {
             match event {
-                crate::document::IframeLifecycle::Inserted(container) => {
-                    if self
-                        .runtime
-                        .shared
-                        .borrow()
-                        .tree
-                        .frame_for_container(container)
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
-                        continue;
-                    }
-                    let child = self.create_frame(parent, container);
-                    let src = self
-                        .frames
-                        .get(&parent)
-                        .and_then(|document| document.frame_src(container));
-                    self.navigate_frame(
-                        child,
-                        container,
-                        src.as_deref().unwrap_or(""),
-                        "GET",
-                        &[],
-                        None,
-                    );
-                    self.publish_frame_document(container, child);
-                }
                 crate::document::IframeLifecycle::Removed(container) => {
                     self.remove_subtree(container);
                 }

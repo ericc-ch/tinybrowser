@@ -148,8 +148,6 @@ enum ParserOwner {
 
 /// A connection transition for one `iframe` container in this document.
 pub(crate) enum IframeLifecycle {
-    /// A connected container with no child frame yet.
-    Inserted(crate::js::world::NodeId),
     /// A container whose frame is gone or disconnected.
     Removed(crate::js::world::NodeId),
 }
@@ -522,11 +520,9 @@ impl Document {
         let connected_set: std::collections::HashSet<crate::js::world::NodeId> =
             connected.iter().copied().collect();
         let mut iframe_events = Vec::new();
-        for container in &connected {
-            if !known.contains(container) {
-                iframe_events.push(IframeLifecycle::Inserted(*container));
-            }
-        }
+        // Insertion is World::adopt_pending_frames / materialize_iframe in
+        // tree order with scripts. Scanning connected iframes here would
+        // start parser `src` loads before preceding classic scripts run.
         for container in &known {
             if !connected_set.contains(container) {
                 iframe_events.push(IframeLifecycle::Removed(*container));
