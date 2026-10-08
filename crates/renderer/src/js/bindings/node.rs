@@ -49,6 +49,7 @@ include!(concat!(env!("OUT_DIR"), "/HTMLElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/SVGElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/MathMLElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/CharacterData.rs"));
+include!(concat!(env!("OUT_DIR"), "/Text.rs"));
 include!(concat!(env!("OUT_DIR"), "/DocumentType.rs"));
 include!(concat!(env!("OUT_DIR"), "/ProcessingInstruction.rs"));
 include!(concat!(env!("OUT_DIR"), "/ParentNode.rs"));
@@ -93,6 +94,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     svg_element_generated::install(ctx)?;
     math_ml_element_generated::install(ctx)?;
     character_data_generated::install(ctx)?;
+    text_generated::install(ctx)?;
     document_type_generated::install(ctx)?;
     processing_instruction_generated::install(ctx)?;
     parent_node_generated::install(ctx)?;
@@ -8723,6 +8725,124 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
             self.handle.0,
             &crate::dom_string::DomString::from_utf16(units),
         )
+    }
+}
+
+impl<'js> text_generated::Text<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-text-splittext
+    fn split_text(&self, ctx: Ctx<'js>, offset: u32) -> Result<Value<'js>> {
+        split_text_node(&ctx, self.handle.0, offset)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-text-wholetext
+    fn get_whole_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        dom_string(ctx, &whole_text(ctx, self.handle.0)?)
+    }
+}
+
+/// Splits a `Text` node at `offset`
+/// (<https://dom.spec.whatwg.org/#concept-text-split>).
+///
+/// The new node is always a `Text` node, including when `id` is a
+/// `CDATASection`. Live ranges are absent, so those loops are empty.
+fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
+    let units = character_data(ctx, id)?.units().into_owned();
+    let offset = character_data_offset(ctx, offset, units.len())?;
+    let new_data = DomString::from_utf16(units[offset..].to_vec());
+    let (parent, next) = world(ctx)?
+        .borrow()
+        .with_document(id, |parsed| {
+            let base = &parsed.document.base;
+            let parent = base
+                .get_node(id.node)
+                .and_then(|node| node.parent)
+                .map(|node| NodeId {
+                    document: id.document,
+                    node,
+                });
+            let next = sibling(base, id.node, true).map(|node| NodeId {
+                document: id.document,
+                node,
+            });
+            (parent, next)
+        })
+        .unwrap_or((None, None));
+    let new_id = {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(id) else {
+            return Err(Exception::throw_type(ctx, "stale node"));
+        };
+        // https://dom.spec.whatwg.org/#create-a-text-node
+        let blitz = parsed
+            .document
+            .base
+            .mutate()
+            .create_text_node(&new_data.to_string_lossy());
+        NodeId {
+            document: parsed.id,
+            node: blitz,
+        }
+    };
+    if let Some(parent) = parent {
+        // https://dom.spec.whatwg.org/#concept-node-insert
+        insert_tree_node(ctx, parent, new_id, next)?;
+    }
+    let mut kept = units;
+    kept.drain(offset..);
+    // https://dom.spec.whatwg.org/#concept-cd-replace
+    set_character_data(ctx, id, &DomString::from_utf16(kept))?;
+    wrap_node(ctx, new_id)
+}
+
+/// Concatenates the data of the contiguous `Text` nodes of `id`, in tree
+/// order (<https://dom.spec.whatwg.org/#contiguous-text-nodes>).
+///
+/// A `CDATASection` is a `Text` node, so it stays in the run. A comment or
+/// element sibling ends it.
+fn whole_text(ctx: &Ctx<'_>, id: NodeId) -> Result<DomString> {
+    let world = world(ctx)?;
+    Ok(world
+        .borrow()
+        .with_document(id, |parsed| {
+            let base = &parsed.document.base;
+            let mut prefix = Vec::new();
+            let mut cursor = sibling(base, id.node, false);
+            while let Some(current) = cursor {
+                if !is_text_node(base, current) {
+                    break;
+                }
+                prefix.push(current);
+                cursor = sibling(base, current, false);
+            }
+            let mut combined = DomString::default();
+            for node in prefix.into_iter().rev() {
+                append_text_data(base, node, &mut combined);
+            }
+            append_text_data(base, id.node, &mut combined);
+            let mut cursor = sibling(base, id.node, true);
+            while let Some(current) = cursor {
+                if !is_text_node(base, current) {
+                    break;
+                }
+                append_text_data(base, current, &mut combined);
+                cursor = sibling(base, current, true);
+            }
+            combined
+        })
+        .unwrap_or_default())
+}
+
+fn is_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
+    matches!(
+        base.get_node(id).map(|node| &node.data),
+        Some(NodeData::Text(_))
+    )
+}
+
+fn append_text_data(base: &blitz_dom::BaseDocument, id: BlitzId, out: &mut DomString) {
+    if let Some(NodeData::Text(text)) = base.get_node(id).map(|node| &node.data) {
+        out.push_str(&text.content);
     }
 }
 
