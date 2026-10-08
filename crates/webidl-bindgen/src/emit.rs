@@ -502,8 +502,7 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
 }
 
 struct SetterTokens {
-    define_value: proc_macro2::Ident,
-    define_is_data: proc_macro2::Ident,
+    define_descriptor: proc_macro2::Ident,
     indexed_define: TokenStream,
     set_receiver: proc_macro2::Ident,
     set_value: proc_macro2::Ident,
@@ -515,8 +514,7 @@ impl SetterTokens {
     fn parse(setter: Option<&crate::model::IndexedSetter>) -> Self {
         let Some(setter) = setter else {
             return Self {
-                define_value: format_ident!("_value"),
-                define_is_data: format_ident!("_is_data"),
+                define_descriptor: format_ident!("_descriptor"),
                 indexed_define: quote! {
                     if crate::js::bindings::array_index(&name).is_some() {
                         return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
@@ -544,13 +542,13 @@ impl SetterTokens {
             quote! { #call }
         };
         Self {
-            define_value: format_ident!("value"),
-            define_is_data: format_ident!("is_data"),
+            define_descriptor: format_ident!("descriptor"),
             indexed_define: quote! {
                 if let Some(index) = crate::js::bindings::array_index(&name) {
-                    if !is_data {
+                    if !descriptor.is_data_descriptor() {
                         return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
                     }
+                    let value = descriptor.value.clone().unwrap_or_else(|| Value::new_undefined(ctx.clone()));
                     #call
                     return Ok(rquickjs::class::ExoticDefineResult::Handled(true));
                 }
@@ -609,8 +607,7 @@ fn indexed_hooks_with_tokens(
     // Indexed properties are writable only when an indexed setter exists
     // (<https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty>).
     let writable = tokens.writable;
-    let define_value = &tokens.define_value;
-    let define_is_data = &tokens.define_is_data;
+    let define_descriptor = &tokens.define_descriptor;
     let indexed_define = &tokens.indexed_define;
     let set_receiver = &tokens.set_receiver;
     let set_value = &tokens.set_value;
@@ -662,7 +659,7 @@ fn indexed_hooks_with_tokens(
         // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty
         fn exotic_define_own_property(
             #define_receiver: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
-            atom: rquickjs::Atom<'js>, #define_value: Value<'js>, #define_is_data: bool,
+            atom: rquickjs::Atom<'js>, #define_descriptor: rquickjs::class::PropertyDefinition<'js>,
         ) -> Result<rquickjs::class::ExoticDefineResult> {
             let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else {
                 return Ok(rquickjs::class::ExoticDefineResult::Fallthrough);
