@@ -80,7 +80,7 @@
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'URL', 'documentURI', 'baseURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
-    'getElementsByName', 'importNode', 'currentScript', 'scripts', 'activeElement',
+    'getElementsByName', 'importNode', 'adoptNode', 'currentScript', 'scripts', 'activeElement',
     'elementFromPoint', 'elementsFromPoint', 'defaultView', 'hasFocus'
   ], true);
   const ElementInterface = define('Element', NodeInterface, [

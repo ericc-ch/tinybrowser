@@ -3,21 +3,21 @@
 use super::{
     AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap, JsTokenList,
     LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits, WebIdlString,
-    WebIdlUnsignedLong, adopt_across_documents, ancestor_chain, attached_attr_id, attr_owner,
-    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
-    character_data_offset, child_value, clone_document, clone_within_document,
-    convert_union_nodes_into_node, deref_weak, descendant_text, document_base_url_string,
-    document_is_html, document_is_html_content, document_url_string, dom_string,
-    drain_mutation_journal, element_at_point, element_box, element_click, element_node_name,
-    element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
-    focus_node, host, host_node_id, import_snapshot, is_element, is_focusable, is_main_document,
-    is_real_element, live_collection, main_document, make_weak, materialize_children,
-    materialize_import, new_detached_attr, qualified_name, rect_object, remove_attribute_sync,
-    required_node, root_of, schedule_mutation_delivery, select_error, selector_matching_elements,
-    set_attribute_node, set_attribute_sync, set_character_data, set_pi_data, sibling,
-    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
-    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
-    world, world_for_node, wrap_new_document, wrap_node,
+    WebIdlUnsignedLong, adopt_across_documents, adopt_into_document, ancestor_chain,
+    attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
+    blur_node, character_data, character_data_offset, child_value, clone_document,
+    clone_within_document, convert_union_nodes_into_node, deref_weak, descendant_text,
+    document_base_url_string, document_is_html, document_is_html_content, document_url_string,
+    dom_string, drain_mutation_journal, element_at_point, element_box, element_click,
+    element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
+    fixup_focus_after_removal, focus_node, host, host_node_id, import_attr, import_snapshot,
+    is_element, is_focusable, is_main_document, is_real_element, live_collection, main_document,
+    make_weak, materialize_children, materialize_import, new_detached_attr, qualified_name,
+    rect_object, remove_attribute_sync, required_node, root_of, schedule_mutation_delivery,
+    select_error, selector_matching_elements, set_attribute_node, set_attribute_sync,
+    set_character_data, set_pi_data, sibling, sibling_value, string_value, throw_dom,
+    throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, valid_element_local_name,
+    validate_and_extract, with_node_data, world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -1111,42 +1111,6 @@ fn document_value<'js>(
     child_value(ctx, found)
 }
 
-/// Snapshots `id` for cross-document moves, preserving fragment backings as
-/// fragments. `import_snapshot` reads a backing as its plain backing element;
-/// fragments must snapshot as their children instead, or adoption would
-/// insert a stray `div`.
-fn snapshot_for_adopt(
-    doc: &crate::documents::BlitzDocument,
-    id: NodeId,
-    deep: bool,
-) -> Option<ImportSnapshot> {
-    if doc.is_fragment(id.node) {
-        if !deep {
-            return Some(ImportSnapshot::Fragment(Vec::new()));
-        }
-        let children: Vec<BlitzId> = doc
-            .base
-            .get_node(id.node)
-            .map(|backing| backing.children.iter().copied().collect())
-            .unwrap_or_default();
-        let children = children
-            .into_iter()
-            .filter_map(|child| {
-                import_snapshot(
-                    doc,
-                    NodeId {
-                        document: id.document,
-                        node: child,
-                    },
-                    true,
-                )
-            })
-            .collect();
-        return Some(ImportSnapshot::Fragment(children));
-    }
-    import_snapshot(doc, id, deep)
-}
-
 /// Same-document insert returns `node`. A node from another document adopts
 /// into the parent's document, preserving fragment backings as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
@@ -1154,58 +1118,7 @@ fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
     if node.document == parent.document {
         return Ok(node);
     }
-    let source_is_fragment = {
-        let source_world = world_for_node(ctx, node)?;
-        let source = source_world.borrow();
-        let Some(parsed) = source.document(node) else {
-            return Err(Exception::throw_type(ctx, "no document"));
-        };
-        parsed.document.is_fragment(node.node)
-    };
-    if !source_is_fragment {
-        return adopt_across_documents(ctx, parent, node);
-    }
-    let source_world = world_for_node(ctx, node)?;
-    let snapshots = {
-        let source = source_world.borrow();
-        let Some(parsed) = source.document(node) else {
-            return Err(Exception::throw_type(ctx, "no document"));
-        };
-        let children: Vec<BlitzId> = parsed
-            .document
-            .base
-            .get_node(node.node)
-            .map(|backing| backing.children.iter().copied().collect())
-            .unwrap_or_default();
-        children
-            .into_iter()
-            .filter_map(|child| {
-                import_snapshot(
-                    &parsed.document,
-                    NodeId {
-                        document: node.document,
-                        node: child,
-                    },
-                    true,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    {
-        let source = source_world.borrow();
-        let Some(mut parsed) = source.document_mut(node) else {
-            return Err(Exception::throw_type(ctx, "no document"));
-        };
-        unlink_journaled(&mut parsed, node);
-    }
-    let target_world = world_for_node(ctx, parent)?;
-    let target = target_world.borrow();
-    let Some(mut parsed) = target.document_mut(parent) else {
-        return Err(Exception::throw_type(ctx, "no document"));
-    };
-    let fresh = materialize_children(&mut parsed.document, parent.document, &snapshots)
-        .map_err(|err| throw_dom_error(ctx, err))?;
-    Ok(fresh)
+    adopt_across_documents(ctx, parent, node)
 }
 
 /// Siblings around `child` within `parent`, for the mutation journal.
@@ -2583,6 +2496,7 @@ struct EqualView {
 
 enum EqualKind {
     Document,
+    Fragment,
     Element {
         name: QualName,
         attributes: Vec<(QualName, String)>,
@@ -2597,19 +2511,23 @@ fn equal_view(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Option<Equa
     let (kind, children) = {
         let node = doc.base.get_node(id)?;
         let children = node.children.iter().copied().collect();
-        let kind = match &node.data {
-            NodeData::Document(_) => EqualKind::Document,
-            NodeData::Element(element) => EqualKind::Element {
-                name: element.name.clone(),
-                attributes: element
-                    .attrs
-                    .iter()
-                    .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
-                    .collect(),
-            },
-            NodeData::Text(_) => EqualKind::Text(DomString::default()),
-            NodeData::Comment { .. } => EqualKind::Comment(DomString::default()),
-            NodeData::AnonymousBlock(_) => EqualKind::Other,
+        let kind = if doc.is_fragment(id) {
+            EqualKind::Fragment
+        } else {
+            match &node.data {
+                NodeData::Document(_) => EqualKind::Document,
+                NodeData::Element(element) => EqualKind::Element {
+                    name: element.name.clone(),
+                    attributes: element
+                        .attrs
+                        .iter()
+                        .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+                        .collect(),
+                },
+                NodeData::Text(_) => EqualKind::Text(DomString::default()),
+                NodeData::Comment { .. } => EqualKind::Comment(DomString::default()),
+                NodeData::AnonymousBlock(_) => EqualKind::Other,
+            }
         };
         (kind, children)
     };
@@ -2627,7 +2545,9 @@ fn equal_view(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Option<Equa
 
 fn kinds_equal(left: &EqualKind, right: &EqualKind) -> bool {
     match (left, right) {
-        (EqualKind::Document, EqualKind::Document) => true,
+        (EqualKind::Document, EqualKind::Document) | (EqualKind::Fragment, EqualKind::Fragment) => {
+            true
+        }
         (
             EqualKind::Element {
                 name: left_name,
@@ -2638,12 +2558,17 @@ fn kinds_equal(left: &EqualKind, right: &EqualKind) -> bool {
                 attributes: right_attributes,
             },
         ) => {
+            // Elements compare namespace, prefix, and local name. Each
+            // attribute compares namespace, local name, and value — not
+            // prefix (<https://dom.spec.whatwg.org/#concept-node-equals>).
             left_name == right_name
                 && left_attributes.len() == right_attributes.len()
-                && left_attributes.iter().all(|attribute| {
-                    right_attributes
-                        .iter()
-                        .any(|candidate| candidate == attribute)
+                && left_attributes.iter().all(|(name, value)| {
+                    right_attributes.iter().any(|(candidate_name, candidate)| {
+                        candidate_name.ns == name.ns
+                            && candidate_name.local == name.local
+                            && candidate == value
+                    })
                 })
         }
         (EqualKind::Text(left), EqualKind::Text(right))
@@ -3656,6 +3581,19 @@ impl JsNode {
         attr_wrapper(&ctx, id)
     }
 
+    // https://dom.spec.whatwg.org/#dom-document-adoptnode
+    #[qjs(rename = "adoptNode")]
+    fn document_adopt_node<'js>(&self, ctx: Ctx<'js>, node: Value<'js>) -> Result<Value<'js>> {
+        match host::node_argument(&ctx, &node)? {
+            NodeReference::Tree(id) => {
+                let adopted = adopt_into_document(&ctx, self.handle.0, id)?;
+                schedule_mutation_delivery(&ctx)?;
+                wrap_node(&ctx, adopted)
+            }
+            NodeReference::Attribute { scope, id } => import_attr(&ctx, self.handle.0, scope, id),
+        }
+    }
+
     // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
     #[qjs(skip)]
     fn create_document_fragment<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
@@ -3681,7 +3619,7 @@ impl JsNode {
                     "cannot import a document",
                 ));
             }
-            snapshot_for_adopt(&source.document, source_id, deep)
+            import_snapshot(&source.document, source_id, deep)
         };
         let Some(tree) = tree else {
             return Err(Exception::throw_type(&ctx, "stale node"));
@@ -6163,6 +6101,13 @@ impl JsNode {
                             NodeData::Text(data) => Some(data.content.clone()),
                             _ => None,
                         });
+                // Exclusive Text nodes only: CDATA sections use a text
+                // backing plus an extra record, and must not merge or drop
+                // (<https://dom.spec.whatwg.org/#dom-node-normalize>).
+                if parsed.document.is_cdata(kid) {
+                    merged = None;
+                    continue;
+                }
                 let Some(content) = content else {
                     merged = None;
                     continue;
@@ -7443,11 +7388,13 @@ impl<'js> document_generated::Document<'js> for JsNode {
                 !options.self_only
             }
         };
-        let node = match arg_0 {
-            NodeReference::Tree(id) => wrap_node(&ctx, id)?,
-            NodeReference::Attribute { id, .. } => attr_wrapper(&ctx, id)?,
-        };
-        self.import_node(ctx, node, deep)
+        match arg_0 {
+            NodeReference::Tree(id) => {
+                let node = wrap_node(&ctx, id)?;
+                self.import_node(ctx, node, deep)
+            }
+            NodeReference::Attribute { scope, id } => import_attr(&ctx, self.handle.0, scope, id),
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-open

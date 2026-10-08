@@ -1479,6 +1479,28 @@ pub(crate) fn attr_wrapper<'js>(ctx: &Ctx<'js>, id: u64) -> Result<Value<'js>> {
     Ok(value)
 }
 
+/// [Imports](https://dom.spec.whatwg.org/#dom-document-importnode) an `Attr`
+/// into `target_document` as a new detached attribute.
+pub(crate) fn import_attr<'js>(
+    ctx: &Ctx<'js>,
+    target_document: NodeId,
+    scope: NodeId,
+    id: u64,
+) -> Result<Value<'js>> {
+    let state = attr_state(ctx, scope, id)?;
+    let value = attr_value(ctx, scope, id)?;
+    let clone = new_detached_attr(
+        ctx,
+        target_document,
+        state.namespace,
+        state.prefix,
+        state.local,
+        state.qualified,
+    )?;
+    set_attr_value(ctx, target_document, clone, value)?;
+    attr_wrapper(ctx, clone)
+}
+
 /// Creates a detached `Attr` identity; attaches via `setAttributeNode`.
 pub(crate) fn new_detached_attr(
     ctx: &Ctx<'_>,

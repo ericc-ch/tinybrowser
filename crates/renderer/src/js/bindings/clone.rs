@@ -62,6 +62,36 @@ pub(crate) fn adopt_across_documents(
     Ok(fresh)
 }
 
+/// [Adopts](https://dom.spec.whatwg.org/#dom-document-adoptnode) `node` into
+/// `document`. A document throws; a same-document node is only removed from
+/// its parent.
+pub(crate) fn adopt_into_document(ctx: &Ctx<'_>, document: NodeId, node: NodeId) -> Result<NodeId> {
+    let is_document = {
+        let owner = world_for_node(ctx, node)?;
+        owner
+            .borrow()
+            .document(node)
+            .is_some_and(|parsed| parsed.document.base.root_node().id == node.node)
+    };
+    if is_document {
+        return Err(throw_dom(
+            ctx,
+            "NotSupportedError",
+            "cannot adopt a document",
+        ));
+    }
+    if node.document == document.document {
+        let owner = world_for_node(ctx, node)?;
+        let owner = owner.borrow();
+        let Some(mut parsed) = owner.document_mut(node) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        detach_for_adopt(&mut parsed.document, node).map_err(|err| throw_dom_error(ctx, err))?;
+        return Ok(node);
+    }
+    adopt_across_documents(ctx, document, node)
+}
+
 /// Points wrappers for `from` and its descendants at the copied subtree `to`.
 ///
 /// The two trees match child for child because `to` was materialized from a
@@ -157,6 +187,15 @@ pub(crate) fn clone_within_document(
     id: NodeId,
     deep: bool,
 ) -> std::result::Result<NodeId, TreeError> {
+    // Fragment backings are ordinary `div` elements in the arena. Blitz
+    // `deep_clone_node` would copy that element without the fragment set,
+    // so `cloneNode` would return an `HTMLDivElement` (nodeType 1) instead
+    // of a `DocumentFragment` (nodeType 11)
+    // (<https://dom.spec.whatwg.org/#concept-node-clone>).
+    if doc.is_fragment(id.node) {
+        let snapshot = import_snapshot(doc, id, deep).ok_or(TreeError::Hierarchy)?;
+        return materialize_import(doc, doc_id, &snapshot);
+    }
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
         // Blitz copies element, text, and comment data only. Doctype,
@@ -308,6 +347,24 @@ pub(crate) fn import_snapshot(
     id: NodeId,
     deep: bool,
 ) -> Option<ImportSnapshot> {
+    // Fragment backings must snapshot as fragments, not as their `div`
+    // element. Import and adopt would otherwise insert a stray element
+    // (<https://dom.spec.whatwg.org/#concept-node-clone>).
+    if doc.is_fragment(id.node) {
+        let children = if deep {
+            snapshot_children(
+                doc,
+                id.document,
+                doc.base
+                    .get_node(id.node)
+                    .map(|backing| backing.children.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+        } else {
+            Vec::new()
+        };
+        return Some(ImportSnapshot::Fragment(children));
+    }
     if let Some(extra) = extra_snapshot(doc, id) {
         return Some(extra);
     }
