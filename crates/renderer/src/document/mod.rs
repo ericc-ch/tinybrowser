@@ -282,6 +282,9 @@ pub(crate) struct Document {
     /// Decoder for a body that is still arriving; `None` when the markup is
     /// already in hand.
     decoder: Option<dial::ResponseDecoder>,
+    /// Encoding sniffed for the current response, reported as
+    /// `document.characterSet`.
+    character_set: &'static str,
     /// The response `Content-Type` for the active parser. XML MIME types
     /// select the XML parser; anything else, including a script's
     /// `document.open()`, stays HTML.
@@ -362,6 +365,7 @@ impl Document {
             parser_eof: true,
             parser_owner: ParserOwner::Carrier,
             decoder: None,
+            character_set: "UTF-8",
             response_content_type: None,
             classic_fetch_in_flight: false,
             deferred_modules: Vec::new(),
@@ -643,10 +647,13 @@ impl Document {
         body: &[u8],
     ) {
         self.load_response_body(url, content_type, body);
-        // Every frame has a window; make sure the realm exists even when the
-        // document never runs a script, so a parent can set properties on it
+        // Nested frames skip a realm until a script or `contentWindow` needs
+        // one. Encoding-label maps create one iframe per label; installing a
+        // QuickJS context for each scriptless document stalls those tests
         // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
-        self.ensure_js_ok();
+        if self.shared.borrow().tree.parent(self.frame).is_none() {
+            self.ensure_js_ok();
+        }
     }
 
     /// Runs a `javascript:` frame URL's script in the frame's realm, replacing
@@ -1014,7 +1021,8 @@ impl Document {
     /// Ends a body: flushes the decoder and lets the parser finish.
     pub(crate) fn end_body(&mut self) {
         if let Some(decoder) = self.decoder.take() {
-            let text = decoder.finish();
+            let (text, encoding) = decoder.finish();
+            self.character_set = encoding;
             self.write_text(&text);
         }
         self.parser_eof = true;
@@ -1227,6 +1235,9 @@ impl Document {
         // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
         let previous = self.world.borrow().current_script;
         self.world.borrow_mut().current_script = element;
+        if !self.ensure_js_ok() {
+            return;
+        }
         self.fire_js(|js| js.eval_classic_script(source, base_line, filename));
         self.world.borrow_mut().current_script = previous;
         self.adopt_js_work();
@@ -1272,7 +1283,7 @@ impl Document {
             // Style resolution and scripts both read the viewport; apply the
             // frame's size before the realm evaluates anything.
             self.apply_viewport();
-            if self.defer_js {
+            if self.defer_js || self.shared.borrow().tree.parent(self.frame).is_some() {
                 return true;
             }
             self.ensure_js().is_ok()
@@ -1396,9 +1407,13 @@ impl Document {
             .as_deref()
             .and_then(crate::xml::navigated_content_type)
         {
-            crate::xml::parse_navigated(&buffer, content_type, self.blitz_config())
+            let mut parsed =
+                crate::xml::parse_navigated(&buffer, content_type, self.blitz_config());
+            parsed.character_set = self.character_set;
+            parsed
         } else {
             let mut parsed = crate::parse_html(&buffer, self.blitz_config());
+            parsed.character_set = self.character_set;
             // A non-XML response still records its MIME type on the
             // document. Images, style sheets, and plain text in a frame
             // parse as HTML wrapping, but `contentType` is the type
@@ -1461,6 +1476,9 @@ impl Document {
             }
             scripts
         };
+        if !scripts.is_empty() && !self.ensure_js_ok() {
+            return false;
+        }
         for id in scripts {
             if !self.executed_scripts.insert(id) {
                 continue;

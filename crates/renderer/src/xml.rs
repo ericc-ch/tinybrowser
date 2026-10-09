@@ -80,6 +80,7 @@ fn parse_with_config(
         xml_document: true,
         ready_state,
         url: None,
+        character_set: "UTF-8",
     }
 }
 
@@ -651,10 +652,7 @@ fn expand_content(content: &str, entities: &HashMap<String, String>, output: &mu
     }
 }
 
-fn expand_entity_ref(
-    rest: &str,
-    entities: &HashMap<String, String>,
-) -> Option<(usize, String)> {
+fn expand_entity_ref(rest: &str, entities: &HashMap<String, String>) -> Option<(usize, String)> {
     let body = rest.strip_prefix('&')?;
     if body.starts_with('#') {
         return None;
@@ -667,10 +665,7 @@ fn expand_entity_ref(
     let value = entities.get(name)?;
     let mut seen = HashSet::new();
     seen.insert(name.to_owned());
-    Some((
-        name_end + 2,
-        expand_replacement(value, entities, &mut seen),
-    ))
+    Some((name_end + 2, expand_replacement(value, entities, &mut seen)))
 }
 
 fn expand_replacement(

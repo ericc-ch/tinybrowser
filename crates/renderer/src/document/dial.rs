@@ -10,6 +10,7 @@ pub(crate) struct ResponseDecoder {
     content_type: Option<String>,
     pending: Vec<u8>,
     decoder: Option<encoding_rs::Decoder>,
+    encoding: Option<&'static encoding_rs::Encoding>,
 }
 
 impl ResponseDecoder {
@@ -18,6 +19,7 @@ impl ResponseDecoder {
             content_type,
             pending: Vec::new(),
             decoder: None,
+            encoding: None,
         }
     }
 
@@ -31,6 +33,7 @@ impl ResponseDecoder {
         else {
             return String::new();
         };
+        self.encoding = Some(encoding);
         let mut decoder = encoding.new_decoder_without_bom_handling();
         let output = decode_chunk(&mut decoder, &self.pending[bom_len..], false);
         self.pending.clear();
@@ -38,15 +41,24 @@ impl ResponseDecoder {
         output
     }
 
-    pub(crate) fn finish(mut self) -> String {
+    pub(crate) fn finish(mut self) -> (String, &'static str) {
         if let Some(decoder) = &mut self.decoder {
-            return decode_chunk(decoder, &[], true);
+            let name = character_set_name(self.encoding.unwrap_or(encoding_rs::UTF_8));
+            return (decode_chunk(decoder, &[], true), name);
         }
         let (encoding, bom_len) = sniff_encoding(&self.pending, self.content_type.as_deref(), true)
             .unwrap_or((encoding_rs::WINDOWS_1252, 0));
+        let name = character_set_name(encoding);
         let mut decoder = encoding.new_decoder_without_bom_handling();
-        decode_chunk(&mut decoder, &self.pending[bom_len..], true)
+        (
+            decode_chunk(&mut decoder, &self.pending[bom_len..], true),
+            name,
+        )
     }
+}
+
+fn character_set_name(encoding: &'static encoding_rs::Encoding) -> &'static str {
+    encoding.name()
 }
 
 fn decode_chunk(decoder: &mut encoding_rs::Decoder, bytes: &[u8], last: bool) -> String {
@@ -99,9 +111,22 @@ fn sniff_encoding(
         return xml_encoding(bytes, eof);
     }
     if let Some(encoding) = prescan_charset(bytes) {
-        return Some((encoding, 0));
+        return Some((html_meta_encoding(encoding), 0));
     }
     (eof || bytes.len() >= 1024).then_some((encoding_rs::WINDOWS_1252, 0))
+}
+
+/// Labels from `<meta charset>` that the encoding spec names, remapped the
+/// way HTML's "getting an encoding" step does
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#concept-encoding-get>).
+fn html_meta_encoding(encoding: &'static encoding_rs::Encoding) -> &'static encoding_rs::Encoding {
+    if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE {
+        encoding_rs::UTF_8
+    } else if encoding == encoding_rs::X_USER_DEFINED {
+        encoding_rs::WINDOWS_1252
+    } else {
+        encoding
+    }
 }
 
 /// XML encoding autodetection after a byte-order mark and a transport charset

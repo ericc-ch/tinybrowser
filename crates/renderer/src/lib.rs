@@ -79,6 +79,9 @@ pub(crate) struct Parsed {
     /// such as a `DOMParser` result
     /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
     pub url: Option<String>,
+    /// The encoding name `document.characterSet` reports
+    /// (<https://encoding.spec.whatwg.org/#dom-document-characterset>).
+    pub character_set: &'static str,
 }
 
 impl Parsed {
@@ -100,6 +103,7 @@ impl Parsed {
             xml_document: content_type != "text/html",
             ready_state: ReadyState::Complete,
             url: None,
+            character_set: "UTF-8",
         }
     }
 }
@@ -128,6 +132,7 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
         xml_document: false,
         ready_state: ReadyState::Loading,
         url: None,
+        character_set: "UTF-8",
     }
 }
 

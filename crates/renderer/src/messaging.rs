@@ -18,9 +18,11 @@ use crate::protocol::FrameId;
 /// Handle every realm holds to the renderer-process shared state.
 pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
 
-/// Most child frames one renderer process will host; the main frame is
-/// not counted.
-pub(crate) const MAX_FRAMES: usize = 64;
+/// Child frames one renderer process will host; the main frame is not
+/// counted. Encoding-label WPT files create one iframe per label, so this
+/// has to clear the largest `dom/nodes` charset map
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#navigable>).
+pub(crate) const MAX_FRAMES: usize = 256;
 
 /// Prefix every payload carries; a payload from another build (or a future
 /// worker boundary) is refused instead of misdecoded.
@@ -28,8 +30,8 @@ pub(crate) const PAYLOAD_VERSION: &str = "tb1:";
 
 /// The browsing context tree of one tab.
 ///
-/// `children` order is the tree order of the frames' `iframe` containers,
-/// which is what `window.length` and the indexed getter expose
+/// `children` order is browsing-context creation order, which is what
+/// `window.length` and the indexed getter expose
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
 #[derive(Default)]
 pub(crate) struct FrameTree {

@@ -2174,6 +2174,18 @@ fn iframe_fires_initial_load(base: &blitz_dom::BaseDocument, node: BlitzId) -> b
     attr(base, node, "src").is_none() && attr(base, node, "srcdoc").is_none()
 }
 
+fn document_character_set(ctx: &Ctx<'_>, id: NodeId) -> &'static str {
+    world(ctx)
+        .ok()
+        .and_then(|world| {
+            world
+                .borrow()
+                .document(id)
+                .map(|parsed| parsed.character_set)
+        })
+        .unwrap_or("UTF-8")
+}
+
 /// Registers browsing contexts for iframes inserted by markup setters.
 /// Those paths skip script insertion steps (innerHTML must not run scripts)
 /// but still create iframe browsing contexts
@@ -4239,8 +4251,8 @@ impl JsNode {
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
-    fn character_set(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
-        Ok("UTF-8")
+    fn character_set(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok(document_character_set(ctx, self.handle.0))
     }
 
     #[qjs(skip)]
@@ -4248,8 +4260,8 @@ impl JsNode {
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
-    fn charset(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
-        Ok("UTF-8")
+    fn charset(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok(document_character_set(ctx, self.handle.0))
     }
 
     #[qjs(skip)]
@@ -4257,8 +4269,8 @@ impl JsNode {
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
-    fn input_encoding(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
-        Ok("UTF-8")
+    fn input_encoding(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok(document_character_set(ctx, self.handle.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-contenttype
