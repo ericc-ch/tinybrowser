@@ -20,7 +20,9 @@ pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
 
 /// Child frames one renderer process will host; the main frame is not
 /// counted. Encoding-label WPT files create one iframe per label, so this
-/// has to clear the largest `dom/nodes` charset map
+/// has to clear the largest `dom/nodes` charset map. Realms are deferred
+/// for scriptless nested documents, so an idle frame costs a `Document`
+/// without a JS heap; the cap bounds documents, not realms
 /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#navigable>).
 pub(crate) const MAX_FRAMES: usize = 256;
 
@@ -30,17 +32,17 @@ pub(crate) const PAYLOAD_VERSION: &str = "tb1:";
 
 /// The browsing context tree of one tab.
 ///
-/// `children` order is browsing-context creation order, which is what
-/// `window.length` and the indexed getter expose
-/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+/// `children` order is container tree order, which is what `window.length`
+/// and the indexed getter expose: a script-inserted `iframe` placed before
+/// an existing one sorts earlier, and a `moveBefore` re-sorts the moved
+/// frame with its new siblings
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>,
+/// <https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
 #[derive(Default)]
 pub(crate) struct FrameTree {
     /// Each frame's parent browsing context.
     parents: HashMap<FrameId, FrameId>,
-    /// Each frame's direct children, in browsing-context creation order.
-    /// `moveBefore` does not recreate a child navigable, so this order does
-    /// not follow a later container move
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    /// Each frame's direct children, in container tree order.
     children: HashMap<FrameId, Vec<FrameId>>,
     /// Each child frame's owning `iframe`.
     containers: HashMap<FrameId, NodeId>,
@@ -58,13 +60,47 @@ impl FrameTree {
         self.containers.len()
     }
 
-    /// Adds `child` under `parent`, owned by `container`.
-    pub(crate) fn add(&mut self, parent: FrameId, child: FrameId, container: NodeId) {
+    /// Adds `child` under `parent`, owned by `container`, sorting before
+    /// `before` (or last when `None`) so the siblings match container tree
+    /// order rather than creation order.
+    pub(crate) fn add(
+        &mut self,
+        parent: FrameId,
+        child: FrameId,
+        container: NodeId,
+        before: Option<FrameId>,
+    ) {
         self.parents.insert(child, parent);
         self.containers.insert(child, container);
         self.owners.insert(container, child);
-        self.children.entry(parent).or_default().push(child);
+        let siblings = self.children.entry(parent).or_default();
+        match before.and_then(|target| siblings.iter().position(|frame| *frame == target)) {
+            Some(index) => siblings.insert(index, child),
+            None => siblings.push(child),
+        }
         self.names.entry(child).or_default();
+    }
+
+    /// Re-sorts an existing child before `before` (or last when `None`)
+    /// after its container moved. A missing child or target degrades to a
+    /// no-op or an end push, never a loss.
+    pub(crate) fn reposition(&mut self, child: FrameId, before: Option<FrameId>) {
+        let mut parent = None;
+        for (candidate, siblings) in self.children.iter_mut() {
+            if let Some(position) = siblings.iter().position(|frame| *frame == child) {
+                siblings.remove(position);
+                parent = Some(*candidate);
+                break;
+            }
+        }
+        let Some(parent) = parent else {
+            return;
+        };
+        let siblings = self.children.entry(parent).or_default();
+        match before.and_then(|target| siblings.iter().position(|frame| *frame == target)) {
+            Some(index) => siblings.insert(index, child),
+            None => siblings.push(child),
+        }
     }
 
     /// The browsing context name of `frame`.
@@ -99,7 +135,7 @@ impl FrameTree {
         self.parents.get(&frame).copied()
     }
 
-    /// The direct children of `frame`, in browsing-context creation order.
+    /// The direct children of `frame`, in container tree order.
     pub(crate) fn children(&self, frame: FrameId) -> &[FrameId] {
         self.children.get(&frame).map_or(&[], Vec::as_slice)
     }

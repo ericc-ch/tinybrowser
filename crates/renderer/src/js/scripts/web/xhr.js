@@ -1,6 +1,10 @@
 // https://xhr.spec.whatwg.org/#the-xmlhttprequest-interface
 const __tbXhrData = host.slots('tinybrowser.xhr');
 const __tbXhrBlobConstructor = globalThis.Blob;
+// Captured at realm init: `DOMParser` is installed before the web bundle
+// evaluates, and pages may replace the globals afterwards.
+const __tbXhrDOMParser = DOMParser;
+const __tbXhrParseFromString = DOMParser.prototype.parseFromString;
 const __tbXhrCancel = data => {
   data.generation++;
   __tbCancelPageRequest(data.request);
@@ -92,27 +96,44 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   get responseXML() {
     // https://xhr.spec.whatwg.org/#response-xml
     const data = __tbBrand(this, __tbXhrData);
-    if (data.responseType !== '' && data.responseType !== 'document') return null;
+    if (data.responseType !== '' && data.responseType !== 'document') {
+      throw new DOMException('Not a document response', 'InvalidStateError');
+    }
     if (data.state !== 4) return null;
     if (data.responseDocument !== undefined) return data.responseDocument;
     const header = data.overrideMimeType || __tbApply(__tbHeadersGet, data.responseHeaders, ['content-type']) || '';
-    const mime = String(header).split(';')[0].trim().toLowerCase();
+    const essence = __tbApply(__tbStringTrim, __tbApply(__tbStringSplit, __tbIDLString(header), [';'])[0], []);
+    const mime = __tbApply(__tbStringToLowerCase, essence, []);
     const xml = mime === 'text/xml' || mime === 'application/xml' || mime === 'application/xhtml+xml'
-      || mime === 'image/svg+xml' || mime.endsWith('+xml');
+      || mime === 'image/svg+xml' || __tbApply(__tbStringEndsWith, mime, ['+xml']);
     const supported = ['text/html', 'text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'];
     let type = null;
-    if (xml) type = supported.includes(mime) ? mime : 'application/xml';
+    if (xml) type = __tbArray.indexOf(supported, mime) !== -1 ? mime : 'application/xml';
     else if (mime === 'text/html' && data.responseType === 'document') type = 'text/html';
     if (type === null) {
       data.responseDocument = null;
       return null;
     }
+    let source;
     try {
-      const source = __tbDecodeBytes(data.responseBytes, 'utf-8', false, false);
-      data.responseDocument = new DOMParser().parseFromString(source, type);
+      // Decoded the way navigations decode: BOM, then the transport charset
+      // or the XML declaration, then UTF-8. Fatal: undecodable bytes mean no
+      // document, not replacement text.
+      source = host.__tbDecodeXmlResponse(__tbToLatin1(data.responseBytes), header);
     } catch (_) {
       data.responseDocument = null;
+      return null;
     }
+    let parsed;
+    try {
+      parsed = __tbApply(__tbXhrParseFromString, __tbConstruct(__tbXhrDOMParser, []), [source, type]);
+    } catch (_) {
+      parsed = null;
+    }
+    // An empty body parses to no document element; anything else the parser
+    // accepts is the document. (Malformed-XML detection needs sink errors
+    // blitz-html does not expose yet; see the parsererror note in xml.rs.)
+    data.responseDocument = parsed !== null && parsed.documentElement !== null ? parsed : null;
     return data.responseDocument;
   }
   // https://xhr.spec.whatwg.org/#the-open()-method

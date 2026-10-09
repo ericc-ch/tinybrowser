@@ -774,6 +774,33 @@ impl JsRealm {
             world
                 .borrow_mut()
                 .intern_brand("PopStateEvent", Persistent::save(&ctx, prototype));
+            // The `createEvent` interfaces, captured before page script can
+            // replace the globals. Missing entries stay missing: the legacy
+            // lookup below reports them as unexposed.
+            for name in [
+                "BeforeUnloadEvent",
+                "CompositionEvent",
+                "CustomEvent",
+                "DeviceMotionEvent",
+                "DeviceOrientationEvent",
+                "DragEvent",
+                "FocusEvent",
+                "HashChangeEvent",
+                "KeyboardEvent",
+                "MessageEvent",
+                "MouseEvent",
+                "StorageEvent",
+                "TextEvent",
+                "TouchEvent",
+                "UIEvent",
+            ] {
+                if let Ok(ctor) = ctx.globals().get::<_, Object>(name) {
+                    world
+                        .borrow_mut()
+                        .event_ctors
+                        .insert(name.to_owned(), Persistent::save(&ctx, ctor));
+                }
+            }
             Ok(())
         })
     }
@@ -1275,7 +1302,7 @@ fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
     )
 }
 
-fn referrer_for_policy(
+pub(crate) fn referrer_for_policy(
     policy: &str,
     document_url: &Url,
     request_url: &str,

@@ -618,23 +618,31 @@ fn legacy_event_interface(interface: &str) -> Option<&'static str> {
     })
 }
 
-/// Sets the event's prototype to `window[interface].prototype`.
+/// Sets the event's prototype to the realm's own interface prototype.
 ///
-/// A missing constructor means the interface is not exposed on the relevant
-/// global (<https://dom.spec.whatwg.org/#dom-document-createevent>).
+/// The pinned constructor captured at install decides: a page that replaced
+/// `window[interface]` must not stamp its own prototype onto the event. A
+/// missing pin (or a missing `prototype` on it) means the interface is not
+/// exposed on the relevant global
+/// (<https://dom.spec.whatwg.org/#dom-document-createevent>).
 fn set_exposed_event_prototype<'js>(
     ctx: &Ctx<'js>,
     class: &Class<'js, JsEvent>,
     interface: &str,
 ) -> Result<()> {
-    let ctor: Value = ctx.globals().get(interface)?;
-    let Some(ctor) = ctor.as_object() else {
+    let pinned = bindings::world(ctx)?
+        .borrow()
+        .event_ctors
+        .get(interface)
+        .cloned();
+    let Some(pinned) = pinned else {
         return Err(bindings::throw_dom(
             ctx,
             "NotSupportedError",
             "the requested event interface is not exposed",
         ));
     };
+    let ctor = pinned.restore(ctx)?;
     let proto: Value = ctor.get("prototype")?;
     let Some(proto) = proto.as_object() else {
         return Err(bindings::throw_dom(
@@ -647,9 +655,7 @@ fn set_exposed_event_prototype<'js>(
 }
 
 fn set_custom_event_prototype<'js>(ctx: &Ctx<'js>, class: &Class<'js, JsEvent>) -> Result<()> {
-    let ctor: Object = ctx.globals().get("CustomEvent")?;
-    let proto: Object = ctor.get("prototype")?;
-    class.set_prototype(Some(&proto))
+    set_exposed_event_prototype(ctx, class, "CustomEvent")
 }
 
 /// The `new CustomEvent(type, eventInitDict)` constructor, called from the
@@ -1487,15 +1493,35 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler>).
 ///
 /// Default `eval` is strict and does not see sloppy `var`/`function`
-/// bindings from page scripts.
+/// bindings from page scripts. Like `new Function` (and like classic
+/// scripts in this engine, which enforces no CSP), compilation is
+/// unconditional: there is no `script-src` gate to consult.
+/// Parameter names are validated identifiers, so callers cannot inject
+/// signature text through this interpolation.
 pub(crate) fn compile_handler_function<'js>(
     ctx: &Ctx<'js>,
-    params: &str,
+    params: &[&str],
     body: &str,
 ) -> Result<Function<'js>> {
+    for param in params {
+        let mut characters = param.chars();
+        let valid = match characters.next() {
+            Some(first) if first == '_' || first == '$' || first.is_ascii_alphabetic() => characters
+                .all(|character| {
+                    character == '_' || character == '$' || character.is_ascii_alphanumeric()
+                }),
+            _ => false,
+        };
+        if !valid {
+            return Err(Exception::throw_type(
+                ctx,
+                "event handler parameter is not an identifier",
+            ));
+        }
+    }
     let mut options = EvalOptions::default();
     options.strict = false;
-    let source = format!("(function({params}) {{\n{body}\n}})");
+    let source = format!("(function({}) {{\n{body}\n}})", params.join(", "));
     ctx.eval_with_options(source, options)
 }
 
@@ -1523,9 +1549,9 @@ fn call_handler_attribute<'js>(
         // the spec's five arguments, not the usual single event argument
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
         let params = if typ == "error" {
-            "event, source, lineno, colno, error"
+            &["event", "source", "lineno", "colno", "error"] as &[&str]
         } else {
-            "event"
+            &["event"] as &[&str]
         };
         match compile_handler_function(ctx, params, &source) {
             Ok(compiled) => {

@@ -40,12 +40,6 @@ pub(crate) struct RealmRegistry {
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
     /// The active child document for each connected iframe container.
     frame_documents: HashMap<NodeId, NodeId>,
-    /// `template` element → template contents fragment, possibly in another
-    /// document after `adoptNode`
-    /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
-    template_contents: HashMap<NodeId, NodeId>,
-    /// Template-contents fragment → host `template` element.
-    fragment_hosts: HashMap<NodeId, NodeId>,
     /// The realm that created each node. Adoption changes the node document
     /// but not this realm
     /// (<https://dom.spec.whatwg.org/#concept-node-adopt>,
@@ -127,11 +121,6 @@ impl RealmRegistry {
         self.wrappers.retain(|node, _| node.document_id() != id);
         self.frame_documents
             .retain(|_, document| document.document_id() != id);
-        self.template_contents.retain(|template, contents| {
-            template.document_id() != id && contents.document_id() != id
-        });
-        self.fragment_hosts
-            .retain(|fragment, host| fragment.document_id() != id && host.document_id() != id);
         self.creation_realms
             .retain(|node, _| node.document_id() != id);
         self.adopted_ids
@@ -160,16 +149,6 @@ impl RealmRegistry {
         if let Some(value) = self.wrappers.remove(&from) {
             self.wrappers.insert(to, value);
         }
-        if let Some(contents) = self.template_contents.remove(&from) {
-            self.template_contents.insert(to, contents);
-            if let Some(host) = self.fragment_hosts.get_mut(&contents) {
-                *host = to;
-            }
-        }
-        if let Some(host) = self.fragment_hosts.remove(&from) {
-            self.fragment_hosts.insert(to, host);
-            self.template_contents.insert(host, to);
-        }
         if let Some(world) = self.creation_realms.remove(&from) {
             self.creation_realms.insert(to, world);
         }
@@ -188,27 +167,28 @@ impl RealmRegistry {
     }
 
     /// The current id of a node that may have been adopted since `id` was
-    /// captured.
-    pub(crate) fn live_node_id(&self, mut id: NodeId) -> NodeId {
-        let mut seen = HashSet::new();
+    /// captured. Chains compress on read: repeated adopts of one wrapper
+    /// would otherwise walk a link per generation on every live-collection
+    /// query, and entries only shrink on document death. Cycles break the
+    /// walk and skip compression; they cannot arise (rekey targets are
+    /// freshly materialized ids), so the guard is structural.
+    pub(crate) fn live_node_id(&mut self, mut id: NodeId) -> NodeId {
+        let mut path = Vec::new();
+        let mut cyclic = false;
         while let Some(&next) = self.adopted_ids.get(&id) {
-            if !seen.insert(id) {
+            if path.contains(&id) {
+                cyclic = true;
                 break;
             }
+            path.push(id);
             id = next;
         }
-        id
-    }
-
-    pub(crate) fn template_contents(&self, template: NodeId) -> Option<NodeId> {
-        self.template_contents.get(&template).copied()
-    }
-
-    pub(crate) fn set_template_contents(&mut self, template: NodeId, fragment: NodeId) {
-        if let Some(previous) = self.template_contents.insert(template, fragment) {
-            self.fragment_hosts.remove(&previous);
+        if !cyclic {
+            for stale in path {
+                self.adopted_ids.insert(stale, id);
+            }
         }
-        self.fragment_hosts.insert(fragment, template);
+        id
     }
 
     pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
@@ -476,12 +456,19 @@ pub(crate) fn form_owner_of(
     document: u32,
     node: BlitzId,
 ) -> Option<NodeId> {
-    if let Some(form_id) = attr(base, node, "form")
-        && is_connected(base, node)
-        && let Some(found) = first_element_with_id(base, document, form_id)
-        && is_html_element(base, found.node, "form")
-    {
-        return Some(found);
+    // Reset-the-form-owner: a present `form` attribute on a connected
+    // element is authoritative. A miss (unknown or empty ID) leaves the
+    // owner null — it does not fall through to the ancestor, and neither
+    // does Chromium nor WPT `form_attribute.html`
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
+    if attr(base, node, "form").is_some() && is_connected(base, node) {
+        let form_id = attr(base, node, "form").unwrap_or_default();
+        if let Some(found) = first_element_with_id(base, document, form_id)
+            && is_html_element(base, found.node, "form")
+        {
+            return Some(found);
+        }
+        return None;
     }
     let mut cursor = base.get_node(node).and_then(|target| target.parent);
     while let Some(current) = cursor {
@@ -769,6 +756,11 @@ pub(crate) struct World {
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_reflect_set: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
+    /// The realm's own event-interface constructors, captured after the web
+    /// bundle installs them and before page script runs. `createEvent` uses
+    /// these, never `globals[interface]`: a page that replaces the global
+    /// must not stamp its own prototype onto the event.
+    pub(crate) event_ctors: HashMap<String, Persistent<Object<'static>>>,
     pub(crate) weak_references: Option<WeakReferences>,
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
@@ -892,6 +884,7 @@ impl World {
             pristine_boolean: None,
             pristine_reflect_set: None,
             pristine_queue_microtask: None,
+            event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
             images: HashMap::new(),
@@ -1153,10 +1146,13 @@ impl World {
                     .to_owned()
             })
             .unwrap_or_default();
+        // `window[i]` sorts by container tree order: the new frame goes
+        // before the first following sibling that already has one.
+        let before = self.frame_sort_before(container);
         let frame = {
             let mut shared = self.runtime.shared.borrow_mut();
             let frame = shared.allocate_frame();
-            shared.tree.add(self.frame, frame, container);
+            shared.tree.add(self.frame, frame, container, before);
             if !name.is_empty() {
                 shared.tree.set_name(frame, name);
             }
@@ -1164,6 +1160,36 @@ impl World {
         };
         self.pending_frames.push((frame, container));
         true
+    }
+
+    /// The frame that sorts immediately after `container`'s frame among its
+    /// parent's children: the first following sibling container that already
+    /// has a frame, if any. Both insertion and `moveBefore` sort through
+    /// this, so `window[i]` follows container tree order
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
+    pub(crate) fn frame_sort_before(&self, container: NodeId) -> Option<FrameId> {
+        let (document, parent) = self.with_document(container, |parsed| {
+            parsed
+                .document
+                .base
+                .get_node(container.node)
+                .and_then(|node| node.parent)
+                .map(|parent| (parsed.id, parent))
+        })??;
+        let children = self.with_document(container, |parsed| {
+            child_ids(&parsed.document.base, document, parent)
+        })?;
+        let mut seen = false;
+        for child in children {
+            if child.node == container.node {
+                seen = true;
+                continue;
+            }
+            if seen && let Some(frame) = self.frame_for_container(child) {
+                return Some(frame);
+            }
+        }
+        None
     }
 
     /// Creates the documents and realms for every registered frame.
@@ -1783,6 +1809,7 @@ impl World {
         self.pristine_boolean = None;
         self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
+        self.event_ctors.clear();
         self.weak_references = None;
         self.deliver_mutations_fn = None;
         self.bridge = None;

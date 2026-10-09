@@ -19,6 +19,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     host.set("__tbUtf8Encode", Func::from(utf8_encode))?;
     host.set("__tbEncodeInto", Func::from(encode_into))?;
     host.set("__tbDecode", Func::from(decode))?;
+    host.set("__tbDecodeXmlResponse", Func::from(decode_xml_response))?;
     host.set("__tbDecoderInit", Func::from(decoder_init))?;
     host.set("__tbDecoderDecode", Func::from(decoder_decode))?;
     host.set("__tbDecoderFree", Func::from(decoder_free))?;
@@ -91,6 +92,27 @@ fn decode<'js>(
         encoding.new_decoder_with_bom_removal()
     };
     decode_loop(&mut decoder, &bytes, fatal, true)
+        .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
+}
+
+/// Decodes a complete XML response body the way navigations decode one:
+/// BOM, then the transport charset or the XML declaration, then UTF-8.
+/// Fatal: undecodable bytes mean there is no document, so failure throws
+/// instead of substituting replacement characters
+/// (<https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-documents>,
+/// <https://xhr.spec.whatwg.org/#response-xml>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn decode_xml_response<'js>(ctx: Ctx<'js>, source: String, content_type: String) -> Result<String> {
+    let bytes = bytes_from_latin1(&source)
+        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+    let header = (!content_type.trim().is_empty()).then_some(content_type.as_str());
+    let (encoding, bom_len) = crate::document::dial::sniff_encoding(&bytes, header, true)
+        .unwrap_or((encoding_rs::UTF_8, 0));
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    decode_loop(&mut decoder, bytes.get(bom_len..).unwrap_or(&[]), true, true)
         .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
 }
 

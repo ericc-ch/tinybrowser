@@ -258,10 +258,11 @@ has_option() {
   done
   return 1
 }
-# The test types wpt knows, in one place. Verified against
+# The test types wpt knows, in one place, in `wpttest.enabled_tests` sort
+# order so the drift check below compares equal strings. Verified against
 # wptrunner/wpttest.py `enabled_tests` at runtime (below) when --test-types
 # is passed; the check warns instead of breaking the run.
-KNOWN_TEST_TYPES="testharness crashtest test262 wdspec print-reftest aamtest reftest"
+KNOWN_TEST_TYPES="aamtest crashtest print-reftest reftest test262 testharness wdspec"
 is_known_test_type() {
   local candidate="$1" known
   for known in $KNOWN_TEST_TYPES; do

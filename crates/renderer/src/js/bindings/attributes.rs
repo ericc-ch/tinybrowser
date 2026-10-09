@@ -1599,9 +1599,9 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
             // usual single event argument
             // (<https://html.spec.whatwg.org/multipage/webappapis.html#the-event-handler-processing-algorithm>).
             let params = if name == "onerror" {
-                "event, source, lineno, colno, error"
+                &["event", "source", "lineno", "colno", "error"] as &[&str]
             } else {
-                "event"
+                &["event"] as &[&str]
             };
             match crate::js::events::compile_handler_function(ctx, params, &body) {
                 Ok(compiled) => {

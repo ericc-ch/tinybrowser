@@ -113,7 +113,7 @@ pub(crate) fn collection_ids(
 /// attributes off `ElementData`.
 fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<NodeId>> {
     let registry = super::realm_registry(ctx)?;
-    let scope = registry.borrow().live_node_id(scope);
+    let scope = registry.borrow_mut().live_node_id(scope);
     let Some(owner) = registry.borrow().owner_world(scope) else {
         return Ok(Vec::new());
     };
@@ -567,8 +567,11 @@ fn table_row_cells(base: &blitz_dom::BaseDocument, document: u32, row: BlitzId) 
     html_child_elements(base, document, row, &["td", "th"])
 }
 
-/// `table.rows` lists thead rows, then in-table `tr`/`tbody` rows, then tfoot
-/// rows (<https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows>).
+/// `table.rows` lists `thead` rows first, then in-table `tr`/`tbody` rows,
+/// then `tfoot` rows, each group in tree order. This groups by parent kind:
+/// unlike `tHead`/`tFoot` (first child only), every `thead`/`tfoot` child
+/// contributes to its group
+/// (<https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows>).
 fn table_rows(base: &blitz_dom::BaseDocument, document: u32, table: BlitzId) -> Vec<NodeId> {
     let mut head = Vec::new();
     let mut body = Vec::new();
@@ -784,7 +787,7 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
     // https://dom.spec.whatwg.org/#dom-nodelist-length
     fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
         let registry = super::realm_registry(ctx)?;
-        let scope = registry.borrow().live_node_id(self.query.scope.0);
+        let scope = registry.borrow_mut().live_node_id(self.query.scope.0);
         let Some(world) = registry.borrow().owner_world(scope) else {
             return Ok(0);
         };

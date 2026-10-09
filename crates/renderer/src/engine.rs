@@ -774,6 +774,20 @@ impl Engine {
                     .get(&parent)
                     .and_then(|document| Url::parse(document.document_url()).ok())
                     .unwrap_or_else(|| url.clone());
+                // Top-level navigations send the source document's referrer
+                // like subresource requests do; without this every
+                // navigation is a no-referrer navigation regardless of
+                // policy
+                // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+                let referrer = self.frames.get(&parent).and_then(|document| {
+                    let world = document.world();
+                    let world = world.borrow();
+                    crate::js::referrer_for_policy(
+                        &world.referrer_policy,
+                        &world.document_url,
+                        url.as_str(),
+                    )
+                });
                 if let Some(document) = self.frames.get_mut(&child) {
                     document.navigate_to(
                         url,
@@ -781,6 +795,7 @@ impl Engine {
                         method.to_owned(),
                         body.to_vec(),
                         content_type.map(str::to_owned),
+                        referrer,
                     );
                 }
             }
@@ -982,15 +997,23 @@ impl Engine {
         // burst. A handful of navigated HTML frames still get a realm
         // before `load` so `contentDocument` wrappers have prototypes
         // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
+        //
+        // The count is global, not per parent: sharding the same iframes
+        // across parents must not flip realm creation.
         const EAGER_FRAME_REALM_CAP: usize = 8;
-        let mut fired = false;
         let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
+        let total_pending: usize = frame_ids
+            .iter()
+            .filter_map(|parent| self.frames.get(parent))
+            .map(|document| document.pending_frame_loads().len())
+            .sum();
+        let eager_realm = total_pending <= EAGER_FRAME_REALM_CAP;
+        let mut fired = false;
         for parent in frame_ids {
             let Some(document) = self.frames.get(&parent) else {
                 continue;
             };
             let pending = document.pending_frame_loads();
-            let eager_realm = pending.len() <= EAGER_FRAME_REALM_CAP;
             for container in pending {
                 let Some(child) = self
                     .runtime

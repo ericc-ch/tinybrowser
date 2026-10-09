@@ -759,9 +759,6 @@ pub(super) fn rect_object<'js>(
 /// (<https://dom.spec.whatwg.org/#concept-node-adopt>). A wrapper that lives
 /// in another realm stays where it is: this context cannot update it.
 pub(super) fn retarget_wrapper(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
-    // Template-contents maps follow the node even when no wrapper exists
-    // yet, so `template.content` after adopt sees the relocated fragment
-    // (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
     let world_rc = world(ctx)?;
     if let Some(source) = world_rc.borrow().owner_world(from) {
         world_rc
@@ -826,25 +823,14 @@ pub(super) fn wrap_new_document_in_world<'js>(
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
-    let (is_fragment, extra_brand) = {
+    let is_fragment = {
         let world = world(ctx)?;
         let world = world.borrow();
         let Some(parsed) = world.document(id) else {
             return Err(Exception::throw_type(ctx, "stale node"));
         };
-        let brand = match parsed.document.extra(id.node) {
-            Some(crate::documents::ExtraNode::DocumentType { .. }) => Some("DocumentType"),
-            Some(crate::documents::ExtraNode::ProcessingInstruction { .. }) => {
-                Some("ProcessingInstruction")
-            }
-            Some(crate::documents::ExtraNode::CDataSection) => Some("CDATASection"),
-            None => None,
-        };
-        (parsed.document.is_fragment(id.node), brand)
+        parsed.document.is_fragment(id.node)
     };
-    if let Some(brand) = extra_brand {
-        return wrap_with_brand(ctx, id, brand);
-    }
     let brand = with_node_data(ctx, id, |data| match data {
         Some(NodeData::Document(_)) => Some(if document_is_xml_document(ctx, id) {
             "XMLDocument"
@@ -1180,38 +1166,15 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
 
 /// [Replaces data](https://dom.spec.whatwg.org/#concept-cd-replace) on a
 /// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
+///
+/// The tree stores UTF-8, so lone surrogates land as the replacement
+/// character (see `docs/progress.md`); the algorithms otherwise operate on
+/// UTF-16 code units.
 pub(super) fn set_character_data(
     ctx: &Ctx<'_>,
     id: NodeId,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    // Replacing data on a processing instruction reparses its attribute map
-    // unless the caller already updated the map
-    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
-    set_character_data_inner(ctx, id, data, true)
-}
-
-/// Replaces character data without reparsing a processing instruction's
-/// attribute map. `update data from attributes` passes true for
-/// `piAttributesAlreadyUpdated`
-/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
-pub(super) fn set_pi_data(
-    ctx: &Ctx<'_>,
-    id: NodeId,
-    data: &crate::dom_string::DomString,
-) -> Result<()> {
-    set_character_data_inner(ctx, id, data, false)
-}
-
-fn set_character_data_inner(
-    ctx: &Ctx<'_>,
-    id: NodeId,
-    data: &crate::dom_string::DomString,
-    reparse_pi: bool,
-) -> Result<()> {
-    // Blitz's tree is UTF-8. Unpaired surrogates stay in the side table
-    // so [replace data] still operates on UTF-16 code units
-    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
     let utf8 = data.to_string_lossy().into_owned();
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
@@ -1249,27 +1212,12 @@ fn set_character_data_inner(
             _ => return Ok(()),
         }
     }
-    parsed.document.set_exact_character_data(id.node, data);
     parsed
         .document
         .record(crate::js::world::JournalEntry::CharacterData {
             target: id,
             old_value,
         });
-    if reparse_pi && parsed.document.is_processing_instruction(id.node) {
-        let contents = parsed
-            .document
-            .base
-            .get_node(id.node)
-            .and_then(|node| match &node.data {
-                NodeData::Comment { contents } => Some(contents.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let attributes =
-            crate::pseudo_attributes::parse_pseudo_attributes(&contents).unwrap_or_default();
-        parsed.document.set_pi_attributes(id.node, attributes);
-    }
     drop(parsed);
     drop(owner);
     schedule_mutation_delivery(ctx)

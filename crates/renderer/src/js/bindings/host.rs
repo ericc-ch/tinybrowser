@@ -427,22 +427,16 @@ pub(crate) trait SharedClass {
 /// Whether `data` implements the named node interface, or `None` when the
 /// name is not one the shared payload can represent.
 ///
-/// `extra` is the side-table kind for a doctype, processing instruction, or
-/// CDATA section. Those back onto a comment or a text node, so the backing
-/// alone would report the wrong interface.
+/// Doctype, processing-instruction, and CDATA nodes cannot exist (see
+/// `docs/progress.md`), so those interfaces never match.
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
-    extra: Option<&crate::documents::ExtraNode>,
     xml_document: bool,
     interface: &str,
 ) -> Option<bool> {
-    use crate::documents::ExtraNode;
     use blitz_dom::NodeData;
-    let is_doctype = matches!(extra, Some(ExtraNode::DocumentType { .. }));
-    let is_pi = matches!(extra, Some(ExtraNode::ProcessingInstruction { .. }));
-    let is_cdata = matches!(extra, Some(ExtraNode::CDataSection));
-    let is_character_data = matches!(data, Some(NodeData::Text(_)))
-        || (matches!(data, Some(NodeData::Comment { .. })) && !is_doctype);
+    let is_character_data =
+        matches!(data, Some(NodeData::Text(_) | NodeData::Comment { .. }));
     Some(match interface {
         // Every node is also an `EventTarget`
         // (<https://dom.spec.whatwg.org/#interface-eventtarget>).
@@ -464,13 +458,9 @@ fn node_interface_matches(
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::mathml_namespace())
         }
         "CharacterData" => is_character_data,
-        // A CDATA section implements `Text`
-        // (<https://dom.spec.whatwg.org/#interface-cdatasection>).
         "Text" => matches!(data, Some(NodeData::Text(_))),
-        "CDATASection" => is_cdata,
-        "Comment" => matches!(data, Some(NodeData::Comment { .. })) && !is_doctype && !is_pi,
-        "DocumentType" => is_doctype,
-        "ProcessingInstruction" => is_pi,
+        "CDATASection" | "DocumentType" | "ProcessingInstruction" => false,
+        "Comment" => matches!(data, Some(NodeData::Comment { .. })),
         // Spec mixins: their members are installed on every including
         // interface, so the receiver check accepts the union of those kinds.
         // `ElementCSSInlineStyle` is included by the HTML, SVG, and MathML
@@ -484,23 +474,22 @@ fn node_interface_matches(
         ),
         "ParentNode" => matches!(data, Some(NodeData::Document(_) | NodeData::Element(_))),
         // `ChildNode` includes `DocumentType`, `Element`, and `CharacterData`
-        // (<https://dom.spec.whatwg.org/#interface-childnode>).
+        // (<https://dom.spec.whatwg.org/#interface-childnode>). No doctype
+        // nodes exist, so this is elements and character data.
         "ChildNode" => {
-            is_doctype
-                || matches!(
-                    data,
-                    Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
-                )
+            matches!(
+                data,
+                Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
+            )
         }
         // `NonDocumentTypeChildNode` includes `Element` and `CharacterData`,
         // not a doctype
         // (<https://dom.spec.whatwg.org/#interface-nondocumenttypechildnode>).
         "NonDocumentTypeChildNode" => {
-            !is_doctype
-                && matches!(
-                    data,
-                    Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
-                )
+            matches!(
+                data,
+                Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
+            )
         }
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
@@ -554,8 +543,7 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    let extra = document.document.extra(id.node);
-    match node_interface_matches(data, extra, document.xml_document, interface) {
+    match node_interface_matches(data, document.xml_document, interface) {
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
@@ -597,8 +585,7 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    let extra = document.document.extra(id.node);
-    node_interface_matches(data, extra, document.xml_document, interface) == Some(true)
+    node_interface_matches(data, document.xml_document, interface) == Some(true)
 }
 
 /// The receiver JS object for hand methods that keep it (observer identity
@@ -702,18 +689,10 @@ pub(crate) fn document_type_argument<'js>(
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    let id = super::required_node(ctx, value)?;
-    let is_doctype = super::world_for_node(ctx, id).is_ok_and(|owner| {
-        owner
-            .borrow()
-            .document(id)
-            .is_some_and(|parsed| parsed.document.is_doctype(id.node))
-    });
-    if is_doctype {
-        Ok(Some(NodeReference::Tree(id)))
-    } else {
-        Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
-    }
+    // No doctype nodes exist (see `docs/progress.md`): any non-null value
+    // fails conversion.
+    let _ = super::required_node(ctx, value)?;
+    Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
 }
 
 pub(crate) fn nullable_string_argument<'js>(

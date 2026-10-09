@@ -89,7 +89,7 @@ fn decode_chunk(decoder: &mut encoding_rs::Decoder, bytes: &[u8], last: bool) ->
 
 // https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm
 // https://encoding.spec.whatwg.org/#concept-encoding-get
-fn sniff_encoding(
+pub(crate) fn sniff_encoding(
     bytes: &[u8],
     content_type: Option<&str>,
     eof: bool,
@@ -134,6 +134,24 @@ fn html_meta_encoding(encoding: &'static encoding_rs::Encoding) -> &'static enco
 /// (<https://www.w3.org/TR/xml/#sec-guessing>).
 fn xml_encoding(bytes: &[u8], eof: bool) -> Option<(&'static encoding_rs::Encoding, usize)> {
     const MARK: &[u8] = b"<?xml";
+    // UTF-16 without a BOM announces itself with null bytes. UCS-4 and
+    // EBCDIC patterns have no codec here, so only the two UTF-16 patterns
+    // are detected
+    // (<https://www.w3.org/TR/xml/#sec-guessing>).
+    const BE: &[u8] = &[0x00, 0x3C, 0x00, 0x3F];
+    const LE: &[u8] = &[0x3C, 0x00, 0x3F, 0x00];
+    if bytes.len() < 4
+        && !eof
+        && (MARK.starts_with(bytes) || BE.starts_with(bytes) || LE.starts_with(bytes))
+    {
+        return None;
+    }
+    if bytes.starts_with(BE) {
+        return Some((encoding_rs::UTF_16BE, 0));
+    }
+    if bytes.starts_with(LE) {
+        return Some((encoding_rs::UTF_16LE, 0));
+    }
     if bytes.len() < MARK.len() && MARK.starts_with(bytes) && !eof {
         return None;
     }
@@ -160,10 +178,16 @@ fn xml_encoding_attribute(declaration: &[u8]) -> Option<&'static encoding_rs::En
     while index + token.len() <= declaration.len() {
         if declaration[index..].starts_with(token) {
             let after = index + token.len();
+            // The token must stand alone on both sides: `fooencoding=` and
+            // `version="encoding"` are not the declaration. The declaration
+            // always starts with `<?xml`, so index 0 cannot match.
+            let preceded = index
+                .checked_sub(1)
+                .is_some_and(|before| declaration[before].is_ascii_whitespace());
             let continues = declaration.get(after).is_some_and(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b':')
             });
-            if !continues {
+            if preceded && !continues {
                 return encoding_label(&declaration[after..]);
             }
         }

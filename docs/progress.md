@@ -309,7 +309,9 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail closed as known-fails.
 
 - `blitz-dom-0.3.0-beta.2/src/document.rs:1086` `resolve_url` panics on unresolvable relative refs (observed: `foo.jpg` against `data:text/css` base). Upstream `main` still panics the same way.
-- `blitz-dom` has no PI / CDATA / doctype node kinds; parsing drops the doctype. Our surface stays simple: `createProcessingInstruction` / `createCDATASection` throw, `document.doctype` reads null, doctype arguments are dropped. These fail as known-fails.
+- `blitz-dom` has no PI / CDATA / doctype node kinds; parsing drops the doctype. Our surface stays simple: `createProcessingInstruction` / `createCDATASection` / `createDocumentType` throw `NotSupportedError` (after spec argument validation), `document.doctype` reads null, doctype arguments are dropped, `template.content` is an empty fragment. These fail as known-fails.
+- `blitz-html`'s XML sink drops processing-instruction data (empty comments remain), drops `xmlns` attributes after binding them, and has no internal-entity support; sink parse errors stay internal, so no `parsererror` document exists and XHR `responseXML` cannot detect malformed XML. Not reconstructed; fails as known-fails.
+- `blitz-dom` stores text as UTF-8, so lone surrogates in `CharacterData`, attributes, and titles read back as U+FFFD. No side table preserves them; fails as known-fails.
 - `blitz-dom` has no shadow DOM: no shadow roots, `attachShadow` never hosts, `ShadowRoot` brand never instantiates, `getComposedRanges` / composed options are no-ops.
 - `blitz-dom` has no template contents: `<template>` children live as ordinary element children.
 - `blitz-dom` keeps no form-control state: no dirty value flag, checkedness, selectedness, or indeterminate slots; values read from content attributes and descendant text, `select` events have no producer, form-state cloning carries structure only.

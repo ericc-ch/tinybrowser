@@ -112,7 +112,7 @@
   const CDATASectionInterface = define('CDATASection', TextInterface, []);
   const ProcessingInstructionInterface = define('ProcessingInstruction', CharacterDataInterface, [
     'target'
-  ], true);
+  ]);
   const CommentInterface = define('Comment', CharacterDataInterface, [], true);
   const DocumentTypeInterface = define('DocumentType', NodeInterface, [
     'remove', 'before', 'after', 'replaceWith', 'name', 'publicId', 'systemId'

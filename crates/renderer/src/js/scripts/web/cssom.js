@@ -43,17 +43,32 @@
   // Created while the element is connected so an earlier script in the same
   // insert can observe `sheet` after the style/link node's insertion steps
   // and before that script's post-connection steps.
+  //
+  // `cssRules` is a length-only stub: WPT pins `sheet` and
+  // `cssRules.length`, not indexed rules, and real `CSSRule` objects need
+  // the style engine's parsed rules. The brace count approximates top-level
+  // style rules (nested at-rules, braces in strings/comments/URLs, and
+  // `@import` miscount); indexed access stays `undefined` until the stub is
+  // replaced with the real list.
   const __tbSheets = new WeakMap();
+  // Captured at realm init: the sheet getters brand-check against it, and
+  // pages may replace the global afterwards.
+  const __tbCssomElement = Element;
+  const __tbCssomBrand = value => {
+    if (!(value instanceof __tbCssomElement)) throw new TypeError('Illegal invocation');
+    return value;
+  };
   function __tbStyleRuleCount(element) {
-    const text = String(element.textContent ?? '');
+    const text = __tbIDLString(element.textContent ?? '');
     let count = 0;
-    for (const block of text.split('}')) {
-      if (block.includes('{')) count += 1;
+    for (const block of __tbApply(__tbStringSplit, text, ['}'])) {
+      if (__tbApply(__tbStringIncludes, block, ['{'])) count += 1;
     }
     return count;
   }
   function __tbAssociatedSheet(element) {
-    let sheet = __tbSheets.get(element);
+    __tbCssomBrand(element);
+    let sheet = __tbApply(__tbWeakMapGet, __tbSheets, [element]);
     if (sheet !== undefined) return sheet;
     const cssRules = {};
     Object.defineProperty(cssRules, 'length', {
@@ -63,11 +78,12 @@
     });
     sheet = new CSSStyleSheet();
     sheet.cssRules = cssRules;
-    __tbSheets.set(element, sheet);
+    __tbApply(__tbWeakMapSet, __tbSheets, [element, sheet]);
     return sheet;
   }
   Object.defineProperty(globalThis.HTMLStyleElement.prototype, 'sheet', {
     get() {
+      __tbCssomBrand(this);
       if (!this.isConnected) return null;
       return __tbAssociatedSheet(this);
     },
@@ -76,9 +92,11 @@
   });
   Object.defineProperty(globalThis.HTMLLinkElement.prototype, 'sheet', {
     get() {
+      __tbCssomBrand(this);
       if (!this.isConnected) return null;
-      const rel = String(this.rel ?? this.getAttribute('rel') ?? '').toLowerCase();
-      if (!rel.split(/\s+/).includes('stylesheet')) return null;
+      const rel = __tbApply(__tbStringToLowerCase, __tbIDLString(this.rel ?? this.getAttribute('rel') ?? ''), []);
+      const tokens = __tbApply(__tbStringSplit, rel, [/\s+/]);
+      if (__tbArray.indexOf(tokens, 'stylesheet') === -1) return null;
       return __tbAssociatedSheet(this);
     },
     enumerable: true,

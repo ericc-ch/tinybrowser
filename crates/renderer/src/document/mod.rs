@@ -25,7 +25,7 @@ use crate::protocol::{
     BrowserServices, DialOutcome, FrameId, Mount, RendererEvent, ScriptFailure, TabError,
 };
 
-mod dial;
+pub(crate) mod dial;
 mod drain;
 mod intern;
 
@@ -586,6 +586,7 @@ impl Document {
         method: String,
         body: Vec<u8>,
         content_type: Option<String>,
+        referrer: Option<String>,
     ) {
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
@@ -600,7 +601,7 @@ impl Document {
             body,
             content_type,
             headers: Vec::new(),
-            referrer: None,
+            referrer,
         });
     }
 
@@ -656,11 +657,18 @@ impl Document {
         }
     }
 
-    /// Runs a `javascript:` frame URL's script in the frame's realm, replacing
-    /// the frame's document with the inherited blank first
+    /// Runs one `javascript:` frame URL's script in the frame's current realm,
+    /// replacing the document only when the result is a string. A void
+    /// result leaves the document (and its realm) untouched; the script
+    /// observes the page's own state, not a fresh blank realm
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
     pub(crate) fn load_javascript_frame(&mut self, inherited_url: Option<&str>, script: &str) {
-        self.load_about_blank(inherited_url);
+        if let Some(url) = inherited_url {
+            self.apply_document_url(url);
+        }
+        if self.js.is_none() {
+            self.ensure_js_ok();
+        }
         self.eval_frame_script(script);
     }
 
@@ -953,6 +961,11 @@ impl Document {
         self.parser_owner = owner;
         self.response_content_type = None;
         self.active_buffer = Some(input.to_owned());
+        // A new parse starts undecided: without this an `about:blank` or
+        // `document.open()` document inherits the previous response's
+        // charset, and `document.characterSet` lies. The response decoder,
+        // when one exists, reports the real charset at EOF.
+        self.character_set = "UTF-8";
     }
 
     /// Starts a document from a network response: a new realm, the response's
@@ -1428,6 +1441,11 @@ impl Document {
             let mut parsed =
                 crate::xml::parse_navigated(&buffer, content_type, self.blitz_config());
             parsed.character_set = self.character_set;
+            // The parser needs the XML kind; `contentType` reports the
+            // actual essence (`application/atom+xml`, not `application/xml`).
+            if let Some(header) = self.response_content_type.as_deref() {
+                parsed.content_type = crate::xml::document_content_type(header);
+            }
             parsed
         } else {
             let mut parsed = crate::parse_html(&buffer, self.blitz_config());

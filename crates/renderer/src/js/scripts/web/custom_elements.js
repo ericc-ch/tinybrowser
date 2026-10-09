@@ -277,7 +277,12 @@
     if (!document) return;
     const view = nativeApply(defaultViewGetter, document, []);
     const foreign = view && view.customElements;
-    if (foreign && typeof foreign.upgrade === 'function') {
+    // Same registry as this realm: the Rust setter path already upgraded
+    // this root through the host hook, so a second walk is pure cost.
+    // (A foreign registry without definitions cannot be detected — there is
+    // no enumeration API — so genuinely cross-realm roots always walk.)
+    if (!foreign || foreign === globalThis.customElements) return;
+    if (typeof foreign.upgrade === 'function') {
       foreign.upgrade(root);
     }
   }
