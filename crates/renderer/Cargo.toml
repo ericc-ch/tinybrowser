@@ -13,6 +13,11 @@ webstorage = { workspace = true }
 # Parser QualNames flow into Blitz as one type, no conversion layer.
 markup5ever = "=0.39.0"
 encoding_rs = "0.8"
+# Already in Cargo.lock and the shipping binary: usvg (`data-url`), url
+# (`percent-encoding`), net (`base64`). Direct deps so renderer can call them.
+data-url = "0.3"
+percent-encoding = "2"
+base64 = "0.23"
 # Web Crypto entropy must come from the operating system, never the JS PRNG.
 getrandom = "0.4"
 # ECMA-402 formatting uses a locale-filtered ICU4X blob generated for the

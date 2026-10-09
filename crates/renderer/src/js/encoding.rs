@@ -1,11 +1,15 @@
 //! Encoding Standard codecs for the JS shims.
 //!
 //! `encoding_rs` already owns labels, UTF-8, UTF-16, and the legacy tables.
-//! The JS `TextEncoder` / `TextDecoder` surfaces stay in script; these host
-//! functions are the crate calls those shims used to reimplement.
+//! The JS `TextEncoder` / `TextDecoder` / `atob` / `btoa` surfaces stay in
+//! script; these host functions are the crate calls those shims used to
+//! reimplement.
 //!
 //! <https://encoding.spec.whatwg.org/#interface-textdecoder>
+//! <https://infra.spec.whatwg.org/#forgiving-base64-decode>
+//! <https://html.spec.whatwg.org/multipage/webappapis.html#atob>
 
+use base64::Engine as _;
 use encoding_rs::{CoderResult, DecoderResult, Encoding};
 use rquickjs::{Ctx, Exception, Object, Result, TypedArray, Value, prelude::Func};
 
@@ -15,6 +19,9 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     host.set("__tbUtf8Encode", Func::from(utf8_encode))?;
     host.set("__tbEncodeInto", Func::from(encode_into))?;
     host.set("__tbDecode", Func::from(decode))?;
+    host.set("__tbAtob", Func::from(atob))?;
+    host.set("__tbBtoa", Func::from(btoa))?;
+    host.set("__tbBase64Encode", Func::from(base64_encode))?;
     Ok(())
 }
 
@@ -87,6 +94,39 @@ fn decode<'js>(
     result.set("text", text)?;
     result.set("remainder", latin1_from_bytes(&remainder))?;
     Ok(result)
+}
+
+/// Forgiving-base64 decode of an isomorphic string
+/// (<https://infra.spec.whatwg.org/#forgiving-base64-decode>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn atob(input: String) -> Option<String> {
+    let bytes = bytes_from_latin1(&input)?;
+    let decoded = data_url::forgiving_base64::decode_to_vec(&bytes).ok()?;
+    Some(latin1_from_bytes(&decoded))
+}
+
+/// Latin-1-only `btoa`
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#atob>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn btoa(input: String) -> Option<String> {
+    let bytes = bytes_from_latin1(&input)?;
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Standard base64 of isomorphic-latin1 bytes, for `FileReader` data URLs.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn base64_encode(source: String) -> Option<String> {
+    let bytes = bytes_from_latin1(&source)?;
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 struct DecodeFailure;

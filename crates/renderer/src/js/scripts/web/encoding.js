@@ -100,54 +100,18 @@ globalThis.TextDecoder = class TextDecoder {
 };
 Object.defineProperty(globalThis.TextDecoder.prototype, Symbol.toStringTag, { value: 'TextDecoder', writable: false, enumerable: false, configurable: true });
 // https://html.spec.whatwg.org/multipage/webappapis.html#atob
-const __tbBase64Table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-const __tbBase64Encode = bytes => {
-  let text = '';
-  for (let index = 0; index < bytes.length; index += 3) {
-    const first = bytes[index];
-    const second = index + 1 < bytes.length ? bytes[index + 1] : null;
-    const third = index + 2 < bytes.length ? bytes[index + 2] : null;
-    text += __tbBase64Table[first >> 2];
-    text += __tbBase64Table[((first & 3) << 4) | (second === null ? 0 : second >> 4)];
-    text += second === null ? '=' : __tbBase64Table[((second & 15) << 2) | (third === null ? 0 : third >> 6)];
-    text += third === null ? '=' : __tbBase64Table[third & 63];
-  }
-  return text;
-};
+const __tbBase64Encode = bytes => host.__tbBase64Encode(__tbToLatin1(bytes));
 globalThis.btoa = function(input) {
-  input = String(input);
-  for (let index = 0; index < input.length; index++) {
-    if (input.charCodeAt(index) > 0xff) {
-      throw new DOMException('The string to be encoded contains characters outside of the Latin1 range.', 'InvalidCharacterError');
-    }
+  const encoded = host.__tbBtoa(String(input));
+  if (encoded === null || encoded === undefined) {
+    throw new DOMException('The string to be encoded contains characters outside of the Latin1 range.', 'InvalidCharacterError');
   }
-  const bytes = new Uint8Array(input.length);
-  for (let index = 0; index < input.length; index++) bytes[index] = input.charCodeAt(index);
-  return __tbBase64Encode(bytes);
+  return encoded;
 };
 globalThis.atob = function(input) {
-  const cleaned = String(input).replace(/[\t\n\f\r ]/g, '');
-  // Forgiving-base64 strips padding only when the stripped length is a
-  // multiple of four; `ab=` is an error, not `ab`
-  // (<https://infra.spec.whatwg.org/#forgiving-base64-decode>).
-  let body = cleaned;
-  if (body.length % 4 === 0) {
-    if (body.endsWith('==')) body = body.slice(0, -2);
-    else if (body.endsWith('=')) body = body.slice(0, -1);
-  }
-  if (/[^A-Za-z0-9+/]/.test(body) || body.length % 4 === 1) {
+  const decoded = host.__tbAtob(String(input));
+  if (decoded === null || decoded === undefined) {
     throw new DOMException('The string to be decoded is not correctly encoded.', 'InvalidCharacterError');
   }
-  let text = '';
-  let buffer = 0;
-  let bits = 0;
-  for (const character of body) {
-    buffer = (buffer << 6) | __tbBase64Table.indexOf(character);
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      text += String.fromCharCode((buffer >> bits) & 0xff);
-    }
-  }
-  return text;
+  return decoded;
 };
