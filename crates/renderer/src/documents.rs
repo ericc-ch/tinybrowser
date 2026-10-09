@@ -23,10 +23,10 @@ pub(crate) struct BlitzDocument {
     /// Whether any observer watches this document; unobserved mutations are
     /// not recorded.
     recording: bool,
-    /// Fragment backings: Blitz has no fragment node kind, so a
-    /// `DocumentFragment` is a detached backing element whose children are
-    /// the fragment's children. Membership decides the wrapper prototype
-    /// and fragment-only algorithms (serialization, insertion).
+    /// Fragment backings: detached backing elements (for `createDocumentFragment`)
+    /// plus real `Fragment` nodes in the Blitz tree (such as template
+    /// contents). Membership decides the wrapper prototype and fragment-only
+    /// algorithms (serialization, insertion).
     fragments: HashSet<blitz_traits::node_id::NodeId>,
     /// Processing-instruction attribute maps, keyed by node id. The id's
     /// slot version dies with the node, so a stale entry cannot be mistaken

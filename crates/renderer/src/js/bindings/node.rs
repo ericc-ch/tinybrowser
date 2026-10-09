@@ -148,7 +148,7 @@ fn insertion_tree_nodes(
     node: NodeReference,
     child: Option<NodeReference>,
 ) -> Result<(NodeId, Option<NodeId>)> {
-    insertion_excluding(ctx, parent, node, child, None)
+    insertion_excluding_children(ctx, parent, node, child, &[])
 }
 
 /// Validates and stages one insertion, leaving `exclude` out of the
@@ -161,8 +161,10 @@ fn insertion_excluding(
     child: Option<NodeReference>,
     exclude: Option<BlitzId>,
 ) -> Result<(NodeId, Option<NodeId>)> {
-    let excluded: Vec<BlitzId> = exclude.into_iter().collect();
-    insertion_excluding_children(ctx, parent, node, child, &excluded)
+    match exclude {
+        Some(id) => insertion_excluding_children(ctx, parent, node, child, &[id]),
+        None => insertion_excluding_children(ctx, parent, node, child, &[]),
+    }
 }
 
 /// Validates one insertion against an explicit exclusion set.
@@ -318,23 +320,51 @@ fn classify_inserted(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Inse
             .get_node(id)
             .map(|fragment| fragment.children.iter().copied().collect())
             .unwrap_or_default();
-        let elements = children
-            .iter()
-            .filter(|child| {
-                doc.base
-                    .get_node(**child)
+        // Flatten nested fragments: insertion splices fragment children, so a
+        // fragment holding a nested fragment with two elements still inserts
+        // two elements.
+        // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+        fn fragment_shape(
+            doc: &crate::documents::BlitzDocument,
+            id: BlitzId,
+            elements: &mut usize,
+            has_text: &mut bool,
+        ) {
+            let kids: Vec<BlitzId> = doc
+                .base
+                .get_node(id)
+                .map(|n| n.children.iter().copied().collect())
+                .unwrap_or_default();
+            for child in kids {
+                if doc.is_fragment(child)
+                    || doc.base.get_node(child).is_some_and(|n| {
+                        matches!(n.data, NodeData::Fragment { .. })
+                    })
+                {
+                    fragment_shape(doc, child, elements, has_text);
+                    continue;
+                }
+                if doc
+                    .base
+                    .get_node(child)
                     .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-                    && !doc.is_fragment(**child)
-            })
-            .count();
-        let has_text = children.iter().any(|child| {
-            doc.base.get_node(*child).is_some_and(|candidate| {
-                matches!(
-                    candidate.data,
-                    NodeData::Text(_) | NodeData::CDataSection { .. }
-                )
-            })
-        });
+                {
+                    *elements += 1;
+                }
+                if doc.base.get_node(child).is_some_and(|candidate| {
+                    matches!(
+                        candidate.data,
+                        NodeData::Text(_) | NodeData::CDataSection { .. }
+                    )
+                }) {
+                    *has_text = true;
+                }
+            }
+        }
+        let mut elements = 0;
+        let mut has_text = false;
+        fragment_shape(doc, id, &mut elements, &mut has_text);
+        let _ = children;
         return InsertedNode::Fragment { elements, has_text };
     }
     match doc.base.get_node(id).map(|node| &node.data) {
@@ -432,7 +462,15 @@ fn ensure_document_content_model(
             ));
         }
         // A comment or processing instruction may be a document child.
-        InsertedNode::CharacterData | InsertedNode::Other => return Ok(()),
+        // `Other` (documents, anonymous blocks) already threw above.
+        InsertedNode::CharacterData => return Ok(()),
+        InsertedNode::Other => {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "node cannot be inserted",
+            ));
+        }
         InsertedNode::Fragment { elements, has_text } => {
             if *elements > 1 || *has_text {
                 return Err(throw_dom(
@@ -451,7 +489,9 @@ fn ensure_document_content_model(
         }
     }
     let parent_has_element = parent_has_element(doc, parent.node, excluded, node.document == parent.document, node.node);
-    let child_id = reference.filter(|child| child.document == parent.document);
+    // Validated by `ensure_parented` above: same-document or absent.
+    let child_id = reference;
+    debug_assert!(child_id.is_none_or(|child| child.document == parent.document));
     let doctype_follows =
         child_id.is_some_and(|child| sibling_doctype_follows(doc, parent.node, child.node));
     let child_is_doctype =
@@ -1109,8 +1149,7 @@ fn parse_html_fragment_snapshots(
         .get_node(context_id)
         .map(|node| match &node.data {
             blitz_dom::NodeData::Element(element)
-                if element.name.ns == crate::js::world::html_namespace()
-                    && element.name.local.as_ref() == "template" =>
+                if crate::js::world::is_template_tag(&element.name) =>
             {
                 element
                     .template_contents
@@ -3280,7 +3319,7 @@ fn push_escaped_xml_attribute(output: &mut HtmlOutput, value: &str) {
 /// Whether `name` is an HTML `template` element, whose serializable
 /// children live in its template contents fragment.
 fn is_html_template_name(name: &QualName) -> bool {
-    name.ns == crate::js::world::html_namespace() && name.local.as_ref() == "template"
+    crate::js::world::is_template_tag(name)
 }
 
 fn serialize_xml_element(
@@ -5297,8 +5336,7 @@ impl JsNode {
             .data
             .downcast_element()
             .filter(|element| {
-                element.name.ns == crate::js::world::html_namespace()
-                    && element.name.local.as_ref() == "template"
+                crate::js::world::is_template_tag(&element.name)
             })
             .and_then(|element| element.template_contents)
             .map(|fragment| NodeId {
@@ -5386,8 +5424,7 @@ impl JsNode {
                     .get_node(container.node)
                     .and_then(|node| node.data.downcast_element())
                     .filter(|element| {
-                        element.name.ns == crate::js::world::html_namespace()
-                            && element.name.local.as_ref() == "template"
+                        crate::js::world::is_template_tag(&element.name)
                     })
                     .and_then(|element| element.template_contents)
             })
@@ -9631,8 +9668,9 @@ impl<'js> text_generated::Text<'js> for JsNode {
 /// Splits a `Text` node at `offset`
 /// (<https://dom.spec.whatwg.org/#concept-text-split>).
 ///
-/// The new node is always a `Text` node, including when `id` is a
-/// `CDATASection`. Live ranges are absent, so those loops are empty.
+/// The new node is always a `Text` node per the split-a-Text-node steps,
+/// even when `id` is a `CDATASection` (which inherits `Text`). Live ranges
+/// are absent, so those loops are empty.
 fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
     let units = character_data(ctx, id)?.units().into_owned();
     let offset = character_data_offset(ctx, offset, units.len())?;
@@ -9716,12 +9754,13 @@ fn whole_text(ctx: &Ctx<'_>, id: NodeId) -> Result<DomString> {
         .unwrap_or_default())
 }
 
-/// Whether `id` is a text node (exclusive: never a CDATA section, which
-/// cannot exist).
+/// Whether `id` is a text node for `wholeText`: `Text` or `CDATASection`,
+/// both in the contiguous run
+/// (<https://dom.spec.whatwg.org/#contiguous-text-nodes>).
 fn is_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     matches!(
         base.get_node(id).map(|node| &node.data),
-        Some(NodeData::Text(_))
+        Some(NodeData::Text(_) | NodeData::CDataSection { .. })
     )
 }
 
@@ -9730,7 +9769,7 @@ fn is_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
 fn append_text_data(doc: &crate::documents::BlitzDocument, id: BlitzId, out: &mut DomString) {
     if matches!(
         doc.base.get_node(id).map(|node| &node.data),
-        Some(NodeData::Text(_))
+        Some(NodeData::Text(_) | NodeData::CDataSection { .. })
     ) {
         out.push_dom(&doc.character_data(id));
     }

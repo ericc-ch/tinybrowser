@@ -39,12 +39,12 @@
       staticLengths.set(list, length);
     };
   }
-  // Value iterators for `iterable<T>`
+  // Value iterators for `iterable<T>` on `DOMTokenList`
   // (<https://webidl.spec.whatwg.org/#es-iterable>). `@@iterator` is the
-  // same function object as `values`. `forEach` re-reads the original
-  // `length` getter each step so a live list observes mutations, and the
-  // value comes from the original `item` rather than a page replacement
-  // (<https://webidl.spec.whatwg.org/#es-forEach>).
+  // same function object as `values`. `NodeList` instead shares
+  // `Array.prototype` iteration: under the length-tamper tests an own
+  // `length` and `Array` iteration intentionally disagree (static `item()`
+  // serves tampered entries while iteration honors the live length).
   function installValueIterable(ctor) {
     const proto = ctor.prototype;
     const lengthGet = Object.getOwnPropertyDescriptor(proto, 'length').get;

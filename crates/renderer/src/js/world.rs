@@ -169,9 +169,10 @@ impl RealmRegistry {
     /// The current id of a node that may have been adopted since `id` was
     /// captured. Chains compress on read: repeated adopts of one wrapper
     /// would otherwise walk a link per generation on every live-collection
-    /// query, and entries only shrink on document death. Cycles break the
-    /// walk and skip compression; they cannot arise (rekey targets are
-    /// freshly materialized ids), so the guard is structural.
+    /// query, and entries only shrink on document death. A cycle returns the
+    /// entry point uncompressed (wrong id, loudly visible as a stale wrapper)
+    /// rather than looping; rekey targets are freshly materialized ids, so
+    /// cycles should not arise outside double-adopt races under test.
     pub(crate) fn live_node_id(&mut self, mut id: NodeId) -> NodeId {
         let mut path = Vec::new();
         let mut cyclic = false;
@@ -347,16 +348,29 @@ pub(crate) fn child_ids(
     })
 }
 
+/// The value of the first attribute of `id` matching `match_name`.
+fn attr_find<'a>(
+    base: &'a blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+    match_name: impl Fn(&markup5ever::QualName) -> bool,
+) -> Option<&'a str> {
+    base.get_node(id)?
+        .data
+        .downcast_element()?
+        .attrs
+        .iter()
+        .find(|attribute| match_name(&attribute.name))
+        .map(|attribute| attribute.value.as_str())
+}
+
 /// The value of the attribute named `name` on `id`, when it is an element.
 pub(crate) fn attr<'a>(
     base: &'a blitz_dom::BaseDocument,
     id: BlitzNodeId,
     name: &str,
 ) -> Option<&'a str> {
-    base.get_node(id)?
-        .data
-        .downcast_element()?
-        .attr(markup5ever::LocalName::from(name))
+    let local = markup5ever::LocalName::from(name);
+    attr_find(base, id, |qualified| qualified.local == local)
 }
 
 /// The value of the first attribute whose qualified name is `qualified`.
@@ -367,13 +381,22 @@ pub(crate) fn attr_by_qualified_name<'a>(
     id: BlitzNodeId,
     qualified: &str,
 ) -> Option<&'a str> {
-    base.get_node(id)?
-        .data
-        .downcast_element()?
-        .attrs
-        .iter()
-        .find(|attribute| crate::names::qualified_name_eq(&attribute.name, qualified))
-        .map(|attribute| attribute.value.as_str())
+    attr_find(base, id, |name| {
+        crate::names::qualified_name_eq(name, qualified)
+    })
+}
+
+/// Whether `local` is an event-handler content attribute name (`on*` with a
+/// non-empty lowercase/digit type). HTML parsing lowercases attribute names,
+/// so `ONCLICK` arrives as `onclick`; the single spelling here keeps the
+/// realm-need walk and handler compilation in agreement.
+pub(crate) fn is_handler_attribute_name(local: &str) -> bool {
+    local.strip_prefix("on").is_some_and(|typ| {
+        !typ.is_empty()
+            && typ
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+    })
 }
 
 /// The HTML namespace all HTML elements live in.
@@ -399,6 +422,13 @@ pub(crate) fn is_html_tag(data: Option<&blitz_dom::NodeData>, local: &str) -> bo
         }
         _ => false,
     }
+}
+
+/// Whether `name` is the HTML `template` tag: the only element with template
+/// contents
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+pub(crate) fn is_template_tag(name: &markup5ever::QualName) -> bool {
+    name.ns == html_namespace() && name.local.as_ref() == "template"
 }
 
 /// Whether `node` is an HTML element named `local`.
@@ -461,8 +491,9 @@ pub(crate) fn form_owner_of(
     // owner null — it does not fall through to the ancestor, and neither
     // does Chromium nor WPT `form_attribute.html`
     // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
-    if attr(base, node, "form").is_some() && is_connected(base, node) {
-        let form_id = attr(base, node, "form").unwrap_or_default();
+    if let Some(form_id) = attr(base, node, "form")
+        && is_connected(base, node)
+    {
         if let Some(found) = first_element_with_id(base, document, form_id)
             && is_html_element(base, found.node, "form")
         {

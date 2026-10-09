@@ -7,10 +7,9 @@
 //! (<https://www.w3.org/TR/xml-stylesheet/#dt-parsing>). A parse error leaves
 //! the map empty.
 //!
-//! Reserialization escapes `&`, then `<`, then `>`, then `"`. HTML
-//! `outerHTML` does not escape `<` or `>` in attribute values, so a value
-//! such as `axx>` or `some<>` will not match that test's `outerHTML` slice.
-//! The processing-instruction algorithm is the one that applies here.
+//! Reserialization escapes `&`, then `<`, then `>`, then `"` per the
+//! processing-instruction update-data-from-attributes algorithm
+//! (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
 
 use crate::xml::{is_name_char, is_name_start};
 

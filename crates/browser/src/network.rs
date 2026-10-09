@@ -229,10 +229,15 @@ impl TabNetworkHandle {
                     .map_err(|_| DialFailure::Connect)?;
             }
             if let Some(referrer) = &request.referrer {
-                outbound
-                    .headers
-                    .insert("Referer", referrer.as_bytes())
-                    .map_err(|_| DialFailure::Connect)?;
+                // Defense in depth: the renderer computes this per
+                // `referrer_for_policy`, but the network boundary re-validates
+                // so a compromised renderer cannot leak a cross-origin `Referer`.
+                if is_safe_referrer(referrer, &request.url) {
+                    outbound
+                        .headers
+                        .insert("Referer", referrer.as_bytes())
+                        .map_err(|_| DialFailure::Connect)?;
+                }
             }
             if !request.body.is_empty() {
                 outbound.body = Some(request.body.clone());
@@ -419,6 +424,28 @@ fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
         .get("content-type")
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .map(str::to_owned)
+}
+
+/// Network-boundary `Referer` check: same-origin, or cross-origin only to a
+/// trustworthy (https/loopback) target without downgrade. The renderer already
+/// applies the policy; this keeps a compromised renderer from leaking.
+fn is_safe_referrer(referrer: &str, request_url: &str) -> bool {
+    let (Ok(from), Ok(to)) = (Url::parse(referrer), Url::parse(request_url)) else {
+        return false;
+    };
+    if !matches!(from.scheme(), "http" | "https") {
+        return false;
+    }
+    let same_origin = from.scheme() == to.scheme()
+        && from.host_str() == to.host_str()
+        && from.port_or_known_default() == to.port_or_known_default();
+    if same_origin {
+        return true;
+    }
+    if from.scheme() == "https" && matches!(to.scheme(), "http" | "ws") {
+        return false;
+    }
+    matches!(to.scheme(), "https" | "wss")
 }
 
 #[cfg(test)]

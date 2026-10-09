@@ -6,10 +6,14 @@ const {
 const __tbApply = Reflect.apply;
 const __tbConstruct = Reflect.construct;
 const __tbDefineProperty = Object.defineProperty;
+const __tbGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const __tbGetPrototypeOf = Object.getPrototypeOf;
 const __tbOwnKeys = Reflect.ownKeys;
 const __tbSetPrototypeOf = Object.setPrototypeOf;
 const __tbObjectCreate = Object.create;
+const __tbObjectPrototype = Object.prototype;
+const __tbStringCtor = String;
+const __tbNumberCtor = Number;
 const __tbJsonParse = JSON.parse;
 const __tbJsonStringify = JSON.stringify;
 const __tbIteratorSymbol = Symbol.iterator;

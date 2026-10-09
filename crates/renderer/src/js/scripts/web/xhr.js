@@ -1,10 +1,15 @@
 // https://xhr.spec.whatwg.org/#the-xmlhttprequest-interface
 const __tbXhrData = host.slots('tinybrowser.xhr');
 const __tbXhrBlobConstructor = globalThis.Blob;
-// Captured at realm init: `DOMParser` is installed before the web bundle
-// evaluates, and pages may replace the globals afterwards.
+// Captured at realm init: the native `DOMParser` class and its prototype
+// method are installed by `bindings::install` before the web bundle
+// evaluates (`bindings/mod.rs` runs before `js/mod.rs`), and pages may
+// replace the globals afterwards.
 const __tbXhrDOMParser = DOMParser;
 const __tbXhrParseFromString = DOMParser.prototype.parseFromString;
+// One helper for the `responseDocument` sentinel discipline: `undefined`
+// means uncached (not yet computed), `null` means cached-empty.
+const __tbXhrResetDocument = (data, value) => { data.responseDocument = value; };
 const __tbXhrCancel = data => {
   data.generation++;
   __tbCancelPageRequest(data.request);
@@ -21,7 +26,7 @@ const __tbXhrError = (xhr, data, type) => {
   data.responseURL = '';
   data.responseHeaders = new __tbHeadersConstructor();
   data.responseBytes = host.slots.bytes(0);
-  data.responseDocument = undefined;
+  __tbXhrResetDocument(data, undefined);
   xhr.dispatchEvent(new Event('readystatechange'));
   xhr.dispatchEvent(new ProgressEvent(type));
   xhr.dispatchEvent(new ProgressEvent('loadend'));
@@ -111,7 +116,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     if (xml) type = __tbArray.indexOf(supported, mime) !== -1 ? mime : 'application/xml';
     else if (mime === 'text/html' && data.responseType === 'document') type = 'text/html';
     if (type === null) {
-      data.responseDocument = null;
+      __tbXhrResetDocument(data, null);
       return null;
     }
     let source;
@@ -121,7 +126,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       // document, not replacement text.
       source = host.__tbDecodeXmlResponse(__tbToLatin1(data.responseBytes), header);
     } catch (_) {
-      data.responseDocument = null;
+      __tbXhrResetDocument(data, null);
       return null;
     }
     let parsed;
@@ -156,7 +161,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     data.responseHeaders = new __tbHeadersConstructor();
     data.responseURL = '';
     data.responseBytes = host.slots.bytes(0);
-    data.responseDocument = undefined;
+    __tbXhrResetDocument(data, undefined);
     data.status = 0;
     if (data.state !== 1) {
       data.state = 1;
@@ -224,7 +229,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       data.responseURL = '';
       data.responseHeaders = new __tbHeadersConstructor();
       data.responseBytes = host.slots.bytes(0);
-      data.responseDocument = undefined;
+      __tbXhrResetDocument(data, undefined);
     }
     if (data.state === 4) data.state = 0;
   }

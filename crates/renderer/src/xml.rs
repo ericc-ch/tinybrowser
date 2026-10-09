@@ -1,12 +1,12 @@
 //! XML parsing for `DOMParser`'s XML MIME types.
 //!
-//! Delegates to `blitz-html`'s XML path, which now keeps real doctype and
-//! processing-instruction nodes. Still missing upstream: parse-error
-//! exposure (so no `parsererror` document yet), `xmlns` attributes
-//! (stripped by xml5ever's namespace processing before the sink sees them),
-//! internal-entity expansion (xml5ever has none), and CDATA section nodes on
-//! parse (CDATA content arrives as text). Each is noted in
-//! `docs/progress.md`.
+//! Delegates to `blitz-html`'s XML path, which keeps real doctype,
+//! processing-instruction, CDATA, and `xmlns` nodes and expands internal
+//! general entities up front. Well-formedness violations drain into a
+//! `parsererror` document below. Entity expansion covers internal general
+//! entities only: undefined or external references fail closed to
+//! `parsererror`; attribute-value references expand; duplicate declarations
+//! keep the first; `NDATA` declarations never expand.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -55,10 +55,9 @@ pub(crate) fn parse_navigated(
 }
 
 /// Parses `input` with the shared XML configuration: the sink keeps real
-/// doctype and processing-instruction nodes, while xmlns attributes and
-/// entity definitions stay upstream gaps (see `docs/progress.md`). A
-/// non-well-formed input yields a `parsererror` document instead of the
-/// partial tree
+/// doctype, processing-instruction, CDATA, and `xmlns` nodes, with internal
+/// entities expanded up front. A non-well-formed input yields a `parsererror`
+/// document instead of the partial tree
 /// (<https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-documents>).
 fn parse_with_config(
     input: &str,
@@ -66,9 +65,8 @@ fn parse_with_config(
     ready_state: crate::ReadyState,
     config: blitz_dom::DocumentConfig,
 ) -> Parsed {
-    // The sink keeps real doctype and processing-instruction nodes. What it
-    // cannot see (xmlns attributes, stripped by xml5ever before the sink)
-    // stays missing; see `docs/progress.md`.
+    // The sink keeps real doctype, processing-instruction, CDATA, and xmlns
+    // nodes, with internal entities expanded up front.
     let font_ctx = config.font_ctx.clone().unwrap_or_default();
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
     let mut document = crate::documents::BlitzDocument::from_base(base);
@@ -87,6 +85,10 @@ fn parse_with_config(
         xml_document: true,
         ready_state,
         url: None,
+        // `&str` input is already decoded: DOMParser keeps UTF-8 (correct).
+        // Navigated responses overwrite this from the sniffed decoder in
+        // `document/mod.rs`, so a future "fix" unifying the two breaks
+        // `document.characterSet`.
         character_set: "UTF-8",
     }
 }
@@ -185,9 +187,11 @@ fn intern_mime_essence(essence: String) -> &'static str {
     // Past the cap, unknown essences report as the generic binary type;
     // every essence the specs name is a fixed static above and unaffected.
     const MAX_INTERNED_ESSENCES: usize = 1024;
-    let mut guard = MIME_ESSENCES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = MIME_ESSENCES.lock().unwrap_or_else(|poisoned| {
+        // A panicking parser thread must not leave attacker-influenced state
+        // behind silently: recover the guard and keep serving from it.
+        poisoned.into_inner()
+    });
     let interned = guard.get_or_insert_with(HashSet::new);
     if let Some(existing) = interned.get(essence.as_str()) {
         return existing;

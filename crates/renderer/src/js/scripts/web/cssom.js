@@ -53,29 +53,24 @@
   const __tbSheets = new WeakMap();
   // Captured at realm init: the sheet getters brand-check against it, and
   // pages may replace the global afterwards.
-  const __tbCssomElement = Element;
   const __tbCssomBrand = value => {
-    if (!(value instanceof __tbCssomElement)) throw new TypeError('Illegal invocation');
+    // Realm-agnostic: cross-realm elements fail `instanceof` against this
+    // realm's `Element`, so check the node kind instead. A forged
+    // `{nodeType: 1}` passes here but the Rust `require_interface("Element")`
+    // rejects it authoritatively (page prototypes never grant brand).
+    if ((value === null || (typeof value !== 'object' && typeof value !== 'function'))
+      || value.nodeType !== 1) throw new TypeError('Illegal invocation');
     return value;
   };
-  function __tbStyleRuleCount(element) {
-    const text = __tbIDLString(element.textContent ?? '');
-    let count = 0;
-    for (const block of __tbApply(__tbStringSplit, text, ['}'])) {
-      if (__tbApply(__tbStringIncludes, block, ['{'])) count += 1;
-    }
-    return count;
-  }
   function __tbAssociatedSheet(element) {
     __tbCssomBrand(element);
     let sheet = __tbApply(__tbWeakMapGet, __tbSheets, [element]);
     if (sheet !== undefined) return sheet;
-    const cssRules = {};
-    Object.defineProperty(cssRules, 'length', {
-      get() { return __tbStyleRuleCount(element); },
-      enumerable: true,
-      configurable: true,
-    });
+    // Honest stub: the engine exposes no parsed rule list yet, so `cssRules`
+    // is empty rather than a brace-count guess (nested at-rules, strings,
+    // comments, URLs, and `@import` all miscount). Fails honestly per the
+    // no-workaround policy until real rules are wired.
+    const cssRules = { length: 0 };
     sheet = new CSSStyleSheet();
     sheet.cssRules = cssRules;
     __tbApply(__tbWeakMapSet, __tbSheets, [element, sheet]);

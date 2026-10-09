@@ -25,8 +25,7 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: `[patch.crates-io]` path entries for `blitz-dom`,
   `blitz-html`, `blitz-paint`, and `blitz-traits`; its own workspace excluded
   from the tinybrowser workspace.
-- **Pinned revision**: `third_party/blitz` at `67edf20` (`master`, matching
-  crates.io `0.3.0-beta.2`; check `git submodule status`).
+- **Pinned revision**: `third_party/blitz` at `41074d7` (`master`; check `git submodule status`).
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here. Push before pinning.
@@ -37,8 +36,8 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: a `[patch.crates-io]` path entry for `xml5ever` only. It builds
   against registry markup5ever so the atom/tendril/TreeSink type family stays
   unified; the workspace's own markup5ever/tendril/web_atoms copies are unused.
-- **Pinned revision**: `third_party/html5ever` at the `0.39.0` base plus fork
-  fixes (`master`; check `git submodule status`).
+- **Pinned revision**: `third_party/html5ever` at `02ecdaa` (`master`, from the
+  `0.39.0` base; check `git submodule status`).
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here. Push before pinning.

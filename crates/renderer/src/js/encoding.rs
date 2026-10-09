@@ -101,6 +101,11 @@ fn decode<'js>(
 /// instead of substituting replacement characters
 /// (<https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-documents>,
 /// <https://xhr.spec.whatwg.org/#response-xml>).
+///
+/// `source` is the isomorphic Latin-1 projection of the raw response bytes
+/// (`__tbToLatin1(responseBytes)`): every byte 0-255 maps 1:1, so
+/// `bytes_from_latin1` round-trips losslessly and fatal decoding below sees
+/// the true bytes.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"

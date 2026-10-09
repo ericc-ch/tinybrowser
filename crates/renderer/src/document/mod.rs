@@ -444,12 +444,6 @@ impl Document {
     /// the current script; src loads that start earlier fire `load` before
     /// later classic scripts define their onload functions
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-    fn adopt_pending_frames_before(&mut self, before: crate::js::world::NodeId) {
-        self.adopt_pending_frames_before_node(Some(before));
-    }
-
-    /// Adopts the pending frames at or after `before`, so scripts run
-    /// with the browsing contexts that precede them and later ones wait.
     fn adopt_pending_frames_before_node(&mut self, before: Option<crate::js::world::NodeId>) {
         let created = World::adopt_pending_frames(&self.world, before);
         for container in created {
@@ -1525,7 +1519,7 @@ impl Document {
             // browsing contexts; later ones wait, matching incremental
             // insertion
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-            self.adopt_pending_frames_before(id);
+            self.adopt_pending_frames_before_node(Some(id));
             // Microtask checkpoint before the script runs; parser
             // mutations queued since the last script deliver now.
             self.deliver_mutations();
@@ -2050,17 +2044,7 @@ fn html_needs_realm(parsed: &crate::Parsed) -> bool {
             if element.attrs.iter().any(|attribute| {
                 attribute.name.prefix.as_ref().is_none()
                     && attribute.name.ns.as_ref().is_empty()
-                    && attribute
-                        .name
-                        .local
-                        .as_ref()
-                        .strip_prefix("on")
-                        .is_some_and(|typ| {
-                            !typ.is_empty()
-                                && typ.chars().all(|character| {
-                                    character.is_ascii_lowercase() || character.is_ascii_digit()
-                                })
-                        })
+                    && crate::js::world::is_handler_attribute_name(attribute.name.local.as_ref())
             }) {
                 return true;
             }

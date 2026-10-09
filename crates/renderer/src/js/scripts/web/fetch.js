@@ -208,6 +208,9 @@ const __tbQueuePageRequest = (url, method, body, headers, callback) => {
   // to this request. The request URL goes along: the policy (same-origin,
   // downgrade) is decided against it
   // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+  // Edge case: `new Request(url)` stores no referrer, so `fetch(req)` uses
+  // fetch-time (not construction-time) policy; construction-time state is a
+  // known gap.
   const referrer = host.__tbReferrer(url);
   host.__tb_fetchCbs[id] = function(status, bytes, finalUrl, contentType, responseHeaders) {
     delete host.__tb_fetchCbs[id];

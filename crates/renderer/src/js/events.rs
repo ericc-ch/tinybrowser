@@ -1494,8 +1494,9 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
 ///
 /// Default `eval` is strict and does not see sloppy `var`/`function`
 /// bindings from page scripts. Like `new Function` (and like classic
-/// scripts in this engine, which enforces no CSP), compilation is
-/// unconditional: there is no `script-src` gate to consult.
+/// scripts in this engine, which enforces no CSP yet -- tracked gap, not an
+/// intentional bypass), compilation is unconditional: there is no
+/// `script-src` gate to consult.
 /// Parameter names are validated identifiers, so callers cannot inject
 /// signature text through this interpolation.
 pub(crate) fn compile_handler_function<'js>(

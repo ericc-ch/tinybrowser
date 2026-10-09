@@ -92,39 +92,48 @@ pub(crate) fn adopt_into_document(ctx: &Ctx<'_>, document: NodeId, node: NodeId)
 /// deep snapshot of `from`. Each lookup borrows one document: the store is a
 /// single `RefCell`.
 fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
-    super::retarget_wrapper(ctx, from, to)?;
-    // A template's contents fragment follows its host: retarget it so a
-    // previously fetched `content` wrapper keeps pointing at live content.
-    let contents = |id: NodeId| {
-        world_for_node(ctx, id).ok().and_then(|owner| {
-            let owner = owner.borrow();
-            owner.document(id).and_then(|parsed| {
-                parsed
-                    .document
-                    .base
-                    .get_node(id.node)
-                    .and_then(|node| node.data.downcast_element())
-                    .filter(|element| {
-                        element.name.ns == crate::js::world::html_namespace()
-                            && element.name.local.as_ref() == "template"
-                    })
-                    .and_then(|element| element.template_contents)
-                    .map(|fragment| NodeId {
-                        document: id.document,
-                        node: fragment,
-                    })
+    // Iterative to bound the Rust stack on adversarial deep trees; each pair
+    // is checked for child-count agreement because snapshot filtering can
+    // drop unsnapshotable nodes and `zip` would otherwise misalign siblings.
+    let mut stack = vec![(from, to)];
+    while let Some((from, to)) = stack.pop() {
+        super::retarget_wrapper(ctx, from, to)?;
+        // A template's contents fragment follows its host: retarget it so a
+        // previously fetched `content` wrapper keeps pointing at live content.
+        let contents = |id: NodeId| {
+            world_for_node(ctx, id).ok().and_then(|owner| {
+                let owner = owner.borrow();
+                owner.document(id).and_then(|parsed| {
+                    parsed
+                        .document
+                        .base
+                        .get_node(id.node)
+                        .and_then(|node| node.data.downcast_element())
+                        .filter(|element| {
+                            crate::js::world::is_template_tag(&element.name)
+                        })
+                        .and_then(|element| element.template_contents)
+                        .map(|fragment| NodeId {
+                            document: id.document,
+                            node: fragment,
+                        })
+                })
             })
-        })
-    };
-    if let Some(from_contents) = contents(from)
-        && let Some(to_contents) = contents(to)
-    {
-        super::retarget_wrapper(ctx, from_contents, to_contents)?;
-    }
-    let from_children = adopted_children(ctx, from)?;
-    let to_children = adopted_children(ctx, to)?;
-    for (from_child, to_child) in from_children.into_iter().zip(to_children) {
-        retarget_adopted_subtree(ctx, from_child, to_child)?;
+        };
+        if let Some(from_contents) = contents(from)
+            && let Some(to_contents) = contents(to)
+        {
+            super::retarget_wrapper(ctx, from_contents, to_contents)?;
+        }
+        let from_children = adopted_children(ctx, from)?;
+        let to_children = adopted_children(ctx, to)?;
+        if from_children.len() != to_children.len() {
+            return Err(Exception::throw_type(
+                ctx,
+                "adopted subtree shape diverged",
+            ));
+        }
+        stack.extend(from_children.into_iter().zip(to_children).collect::<Vec<_>>());
     }
     Ok(())
 }
@@ -144,8 +153,7 @@ fn adopted_children(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<NodeId>> {
         .get_node(id.node)
         .map(|node| {
             if let Some(element) = node.data.downcast_element()
-                && element.name.ns == crate::js::world::html_namespace()
-                && element.name.local.as_ref() == "template"
+                && crate::js::world::is_template_tag(&element.name)
                 && let Some(fragment) = element.template_contents
             {
                 return parsed
@@ -345,7 +353,7 @@ pub(crate) enum ImportSnapshot {
 /// template contents fragment
 /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
 fn is_html_template(name: &QualName) -> bool {
-    name.ns == crate::js::world::html_namespace() && name.local.as_ref() == "template"
+    crate::js::world::is_template_tag(name)
 }
 
 /// Deep-snapshots `children` for cross-document cloning.

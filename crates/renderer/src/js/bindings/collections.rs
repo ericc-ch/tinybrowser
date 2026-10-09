@@ -173,12 +173,6 @@ fn collect_html_scripts(
     document: u32,
     scope: BlitzId,
 ) -> Vec<NodeId> {
-    let document_element = doc.base.get_node(scope).and_then(|node| {
-        node.children
-            .iter()
-            .copied()
-            .find(|child| super::is_element(&doc.base, *child) && !doc.is_fragment(*child))
-    });
     let mut order = Vec::new();
     let mut stack: Vec<BlitzId> = doc
         .base
@@ -190,7 +184,7 @@ fn collect_html_scripts(
             continue;
         }
         if crate::js::world::is_html_element(&doc.base, id, "script")
-            && script_is_in_document(doc, id, document_element)
+            && script_is_in_document(doc, id)
         {
             order.push(NodeId { document, node: id });
         }
@@ -201,8 +195,8 @@ fn collect_html_scripts(
     order
 }
 
-/// A document script is connected: descendant of the document element, not of
-/// a fragment backing, and marked in-document by insertion.
+/// A document script is connected: marked in-document by insertion and
+/// ancestor-connected to the document root without crossing a fragment.
 ///
 /// Fragment children can sit under `body` in the Blitz parent chain without
 /// having run insertion steps. Parent-chain connectedness would count them;
@@ -210,14 +204,7 @@ fn collect_html_scripts(
 /// already in the document
 /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>,
 /// <https://dom.spec.whatwg.org/#connected>).
-fn script_is_in_document(
-    doc: &crate::documents::BlitzDocument,
-    mut id: BlitzId,
-    document_element: Option<BlitzId>,
-) -> bool {
-    let Some(document_element) = document_element else {
-        return false;
-    };
+fn script_is_in_document(doc: &crate::documents::BlitzDocument, mut id: BlitzId) -> bool {
     if !doc
         .base
         .get_node(id)
@@ -225,8 +212,9 @@ fn script_is_in_document(
     {
         return false;
     }
+    let root = doc.base.root_node().id;
     loop {
-        if id == document_element {
+        if id == root {
             return true;
         }
         if doc.is_fragment(id) {

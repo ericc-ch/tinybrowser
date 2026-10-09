@@ -119,7 +119,10 @@ if [[ -n "${TINYBROWSER_BINARY:-}" ]]; then
 else
   BINARY="$("$ROOT/tools/binary-path")"
   echo "wpt: building tinybrowser (cargo no-ops when fresh)" >&2
-  cargo build -q --offline 2>/dev/null || cargo build -q
+  cargo build -q --offline 2>/dev/null || cargo build -q || {
+    echo "wpt: cargo build failed; refusing to run against a stale binary" >&2
+    exit 1
+  }
 fi
 if [[ ! -x "$BINARY" ]]; then
   echo "tinybrowser binary not found at $BINARY" >&2

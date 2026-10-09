@@ -454,16 +454,30 @@ fn node_interface_matches(
             matches!(data, Some(NodeData::Fragment { .. }))
                 || (matches!(data, Some(NodeData::Element(_))) && is_fragment)
         }
+        _ if is_fragment => {
+            // A fragment is only `Node`, `EventTarget`, `DocumentFragment`,
+            // and `ParentNode`: every Element-family and ChildNode check below
+            // is false for backings and real fragments alike. `ParentNode` is
+            // matched below.
+            matches!(interface, "ParentNode")
+        }
         "ShadowRoot" => false,
-        "Element" => matches!(data, Some(NodeData::Element(_))),
+        // `DocumentFragment` implements neither `Element` nor `ChildNode`:
+        // fragment backings are plain elements under the hood, so every
+        // Element-family check below excludes them
+        // (<https://dom.spec.whatwg.org/#interface-documentfragment>).
+        "Element" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
         "HTMLElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
+                && !is_fragment
         }
         "SVGElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::svg_namespace())
+                && !is_fragment
         }
         "MathMLElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::mathml_namespace())
+                && !is_fragment
         }
         "CharacterData" => is_character_data,
         // A CDATA section implements `Text`
@@ -480,31 +494,36 @@ fn node_interface_matches(
         // interface, so the receiver check accepts the union of those kinds.
         // `ElementCSSInlineStyle` is included by the HTML, SVG, and MathML
         // element interfaces.
-        "ElementCSSInlineStyle" => matches!(
-            data,
-            Some(NodeData::Element(element))
+        "ElementCSSInlineStyle" => {
+            matches!(
+                data,
+                Some(NodeData::Element(element))
                 if element.name.ns == crate::js::world::html_namespace()
                     || element.name.ns == crate::js::world::svg_namespace()
                     || element.name.ns == crate::js::world::mathml_namespace()
-        ),
+            ) && !is_fragment
+        }
         "ParentNode" => matches!(
             data,
             Some(NodeData::Document(_) | NodeData::Element(_) | NodeData::Fragment { .. })
         ),
         // `ChildNode` includes `DocumentType`, `Element`, and `CharacterData`
-        // (<https://dom.spec.whatwg.org/#interface-childnode>).
+        // (<https://dom.spec.whatwg.org/#interface-childnode>), but never a
+        // `DocumentFragment`.
         "ChildNode" => {
-            is_character_data
-                || matches!(
-                    data,
-                    Some(NodeData::Element(_) | NodeData::Doctype { .. })
-                )
+            !is_fragment
+                && (is_character_data
+                    || matches!(
+                        data,
+                        Some(NodeData::Element(_) | NodeData::Doctype { .. })
+                    ))
         }
         // `NonDocumentTypeChildNode` includes `Element` and `CharacterData`,
-        // not a doctype
+        // not a doctype or a fragment
         // (<https://dom.spec.whatwg.org/#interface-nondocumenttypechildnode>).
         "NonDocumentTypeChildNode" => {
-            is_character_data || matches!(data, Some(NodeData::Element(_)))
+            !is_fragment
+                && (is_character_data || matches!(data, Some(NodeData::Element(_))))
         }
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.

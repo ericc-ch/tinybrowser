@@ -999,9 +999,12 @@ impl Engine {
         // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
         //
         // The count is global, not per parent: sharding the same iframes
-        // across parents must not flip realm creation.
+        // across parents must not flip realm creation. Sorted for
+        // determinism: without it the first-N cutoff depends on HashMap order
+        // and scheduling, silently changing `instanceof` realms run to run.
         const EAGER_FRAME_REALM_CAP: usize = 8;
-        let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
+        let mut frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
+        frame_ids.sort();
         let total_pending: usize = frame_ids
             .iter()
             .filter_map(|parent| self.frames.get(parent))

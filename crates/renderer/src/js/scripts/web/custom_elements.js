@@ -28,17 +28,17 @@
   const getAttribute = Element.prototype.getAttribute;
   const getAttributeNS = Element.prototype.getAttributeNS;
   const hasAttribute = Element.prototype.hasAttribute;
-  const localNameGetter = Object.getOwnPropertyDescriptor(Element.prototype, 'localName').get;
-  const connectedGetter = Object.getOwnPropertyDescriptor(Node.prototype, 'isConnected').get;
-  const nodeTypeGetter = Object.getOwnPropertyDescriptor(Node.prototype, 'nodeType').get;
-  const firstChildGetter = Object.getOwnPropertyDescriptor(Node.prototype, 'firstChild').get;
-  const nextSiblingGetter = Object.getOwnPropertyDescriptor(Node.prototype, 'nextSibling').get;
-  const shadowRootGetter = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot').get;
-  const listLengthGetter = Object.getOwnPropertyDescriptor(NodeList.prototype, 'length').get;
+  const localNameGetter = __tbGetOwnPropertyDescriptor(Element.prototype, 'localName').get;
+  const connectedGetter = __tbGetOwnPropertyDescriptor(Node.prototype, 'isConnected').get;
+  const nodeTypeGetter = __tbGetOwnPropertyDescriptor(Node.prototype, 'nodeType').get;
+  const firstChildGetter = __tbGetOwnPropertyDescriptor(Node.prototype, 'firstChild').get;
+  const nextSiblingGetter = __tbGetOwnPropertyDescriptor(Node.prototype, 'nextSibling').get;
+  const shadowRootGetter = __tbGetOwnPropertyDescriptor(Element.prototype, 'shadowRoot').get;
+  const listLengthGetter = __tbGetOwnPropertyDescriptor(NodeList.prototype, 'length').get;
   const listItem = NodeList.prototype.item;
-  const recordGetters = Object.create(null);
+  const recordGetters = __tbObjectCreate(null);
   for (const name of ['type', 'target', 'removedNodes', 'addedNodes', 'attributeName', 'attributeNamespace', 'oldValue']) {
-    recordGetters[name] = Object.getOwnPropertyDescriptor(MutationRecord.prototype, name).get;
+    recordGetters[name] = __tbGetOwnPropertyDescriptor(MutationRecord.prototype, name).get;
   }
 
   function localNameOf(element) {
@@ -114,8 +114,10 @@
   }
 
   function validName(name) {
-    return typeof name === 'string' && name.includes('-') &&
-      name === name.toLowerCase() && /^[a-z][.0-9_a-z\-]*$/.test(name);
+    // Pinned string primitives: a page overriding `String.prototype`
+    // before `define()` runs must not change validation.
+    return typeof name === 'string' && __tbApply(__tbStringIncludes, name, ['-']) &&
+      name === __tbApply(__tbStringToLowerCase, name, []) && /^[a-z][.0-9_a-z\-]*$/.test(name);
   }
 
   function invoke(element, name, args) {
@@ -152,7 +154,7 @@
       // Parser-created wrappers intern as `HTMLElement`. Point them at the
       // definition's prototype so `instanceof` matches the node document's
       // constructor (<https://html.spec.whatwg.org/multipage/custom-elements.html#upgrades>).
-      Object.setPrototypeOf(element, definition.constructor.prototype);
+      __tbSetPrototypeOf(element, definition.constructor.prototype);
       for (const name of definition.observed) {
         if (nativeApply(hasAttribute, element, [name])) {
           invoke(element, 'attributeChangedCallback', [name, null, nativeApply(getAttribute, element, [name]), null]);
@@ -248,10 +250,10 @@
   }
 
   const registry = new CustomElementRegistry();
-  Object.defineProperty(globalThis, 'CustomElementRegistry', {
+  __tbDefineProperty(globalThis, 'CustomElementRegistry', {
     value: CustomElementRegistry, writable: true, configurable: true,
   });
-  Object.defineProperty(globalThis, 'customElements', {
+  __tbDefineProperty(globalThis, 'customElements', {
     value: registry, writable: false, configurable: true,
   });
 
@@ -269,9 +271,9 @@
   // innerHTML creates elements for the node document, not the setter's realm
   // (<https://dom.spec.whatwg.org/#concept-create-element>,
   // <https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
-  const ownerDocumentGetter = Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument').get;
-  const defaultViewGetter = Object.getOwnPropertyDescriptor(Document.prototype, 'defaultView').get;
-  const innerHTML = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+  const ownerDocumentGetter = __tbGetOwnPropertyDescriptor(Node.prototype, 'ownerDocument').get;
+  const defaultViewGetter = __tbGetOwnPropertyDescriptor(Document.prototype, 'defaultView').get;
+  const innerHTML = __tbGetOwnPropertyDescriptor(Element.prototype, 'innerHTML');
   function upgradeFromNodeDocument(root) {
     const document = nativeApply(ownerDocumentGetter, root, []);
     if (!document) return;
@@ -287,7 +289,7 @@
     }
   }
   if (innerHTML && innerHTML.set) {
-    Object.defineProperty(Element.prototype, 'innerHTML', {
+    __tbDefineProperty(Element.prototype, 'innerHTML', {
       configurable: true,
       enumerable: innerHTML.enumerable,
       get: innerHTML.get,
@@ -326,8 +328,8 @@
       try { for (const node of inserted) upgradeTree(node); } finally { popReactions(); }
       return result;
     };
-    Object.defineProperty(insertion, 'length', { value: native.length });
-    Object.defineProperty(insertion, 'name', { value: native.name });
+    __tbDefineProperty(insertion, 'length', { value: native.length });
+    __tbDefineProperty(insertion, 'name', { value: native.name });
     Node.prototype[name] = insertion;
   }
 

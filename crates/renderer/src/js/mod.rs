@@ -36,9 +36,12 @@ pub(crate) use world::World;
 use crate::document::Stop;
 
 /// Shared QuickJS heap cap. Forty live subframe realms need more than
-/// 32MB (measured: script execution wedges past ~24 XML realms at 32MB, an
-/// allocation failure surfacing as a generic exception). 256MB still bounds
-/// a malicious page while fitting MAX_FRAMES-scale bursts.
+/// 32MB (measured: `Document-createElement-namespace.html`, 40 parallel
+/// iframes, wedges past ~24 XML realms at 32MB with an allocation failure
+/// surfacing as a generic QuickJS exception; green at 256MB). 256MB still
+/// bounds a malicious page while fitting MAX_FRAMES-scale bursts. A
+/// per-realm budget would isolate better; the shared heap is the current
+/// QuickJS shape (see `SharedRuntime`).
 const MAX_RUNTIME_MEMORY: usize = 256 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
@@ -1331,7 +1334,10 @@ pub(crate) fn referrer_for_policy(
     if !matches!(document_url.scheme(), "http" | "https") {
         return None;
     }
-    let request = Url::parse(request_url).ok()?;
+    // Same-origin relative fetches (`fetch("api")`) resolve against the
+    // document; parsing standalone would drop the `Referer` even under
+    // `unsafe-url`.
+    let request = document_url.join(request_url).ok()?;
     let downgrade =
         document_url.scheme() == "https" && matches!(request.scheme(), "http" | "ws");
     let same_origin = document_url.scheme() == request.scheme()

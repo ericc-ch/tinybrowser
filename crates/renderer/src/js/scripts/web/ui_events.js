@@ -36,7 +36,7 @@ const __tbMouseEventConstructor = globalThis.MouseEvent = class MouseEvent exten
     const event = __tbConstruct(__tbUIEventConstructor, [type, init], new.target);
     // `long` members convert with `ToNumber`, not truthiness: `"5"` is 5
     // (<https://w3c.github.io/uievents/#dom-mouseevent-clientx>).
-    const toLong = value => { const n = Number(value); return Number.isNaN(n) ? 0 : Math.trunc(n); };
+    const toLong = value => { const n = __tbNumberCtor(value); return Number.isNaN(n) ? 0 : Math.trunc(n); };
     const button = init.button === undefined ? 0 : toLong(init.button);
     __tbMouseEventData.set(event, {
         screenX: init.screenX === undefined ? 0 : toLong(init.screenX),
@@ -62,12 +62,16 @@ const __tbMouseEventConstructor = globalThis.MouseEvent = class MouseEvent exten
   get buttons() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).buttons; }
   get relatedTarget() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).relatedTarget; }
   getModifierState(key) {
-    return { Alt: !!this.altKey, Control: !!this.ctrlKey, Meta: !!this.metaKey, Shift: !!this.shiftKey }[String(key)] || false;
+    return { Alt: !!this.altKey, Control: !!this.ctrlKey, Meta: !!this.metaKey, Shift: !!this.shiftKey }[__tbStringCtor(key)] || false;
   }
 };
 Object.defineProperty(globalThis.MouseEvent.prototype, Symbol.toStringTag, { value: 'MouseEvent', writable: false, enumerable: false, configurable: true });
 
 const __tbPointerEventData = host.slots('tinybrowser.pointerevent.data');
+// Strict `__tbBrand` (not lazy `__tbEventEntry` like the `__tbExposeEvent`
+// siblings): `createEvent` never produces Pointer/Wheel/Input events, so no
+// uninitialized-entry path needs the lazy default. Keep strict on any
+// consistency refactor.
 globalThis.PointerEvent = class PointerEvent extends MouseEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
@@ -79,8 +83,8 @@ globalThis.PointerEvent = class PointerEvent extends MouseEvent {
         pointerId: init.pointerId === undefined ? 1 : init.pointerId,
         // An explicit 0 is a valid width, not a missing one
         // (<https://w3c.github.io/pointerevents/#dom-pointerevent-width>).
-        width: init.width === undefined ? 1 : Number(init.width),
-        height: init.height === undefined ? 1 : Number(init.height),
+        width: init.width === undefined ? 1 : __tbNumberCtor(init.width),
+        height: init.height === undefined ? 1 : __tbNumberCtor(init.height),
         pressure: init.pressure === undefined ? 0 : init.pressure,
         tangentialPressure: init.tangentialPressure || 0,
         tiltX: init.tiltX || 0, tiltY: init.tiltY || 0, twist: init.twist || 0,
@@ -136,10 +140,10 @@ globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
     }
     init = init || {};
     const event = __tbConstruct(__tbUIEventConstructor, [type, init], new.target);
-    const key = init.key === undefined ? '' : String(init.key);
+    const key = init.key === undefined ? '' : __tbStringCtor(init.key);
     __tbKeyboardEventData.set(event, {
         key: key,
-        code: init.code === undefined ? '' : String(init.code),
+        code: init.code === undefined ? '' : __tbStringCtor(init.code),
         location: init.location || 0,
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
         altKey: !!init.altKey, metaKey: !!init.metaKey,
@@ -161,7 +165,7 @@ globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
   get keyCode() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).keyCode; }
   get charCode() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).charCode; }
   getModifierState(key) {
-    return { Alt: !!this.altKey, Control: !!this.ctrlKey, Meta: !!this.metaKey, Shift: !!this.shiftKey }[String(key)] || false;
+    return { Alt: !!this.altKey, Control: !!this.ctrlKey, Meta: !!this.metaKey, Shift: !!this.shiftKey }[__tbStringCtor(key)] || false;
   }
 };
 Object.defineProperty(globalThis.KeyboardEvent.prototype, Symbol.toStringTag, { value: 'KeyboardEvent', writable: false, enumerable: false, configurable: true });
@@ -176,7 +180,7 @@ globalThis.InputEvent = class InputEvent extends UIEvent {
     const event = __tbConstruct(__tbUIEventConstructor, [type, init], new.target);
     __tbInputEventData.set(event, {
         data: init.data === undefined ? null : init.data,
-        inputType: init.inputType === undefined ? '' : String(init.inputType),
+        inputType: init.inputType === undefined ? '' : __tbStringCtor(init.inputType),
         isComposing: !!init.isComposing,
         dataTransfer: init.dataTransfer || null,
     });
@@ -198,6 +202,10 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
 // still throw: only actual `Event` instances, checked against the pristine
 // constructor, are initialized.
 const __tbEventEntry = (event, data, fresh) => {
+  // Defined here but consumed lazily by `messaging.js` (evaluated earlier
+  // per `order.txt`): every call site runs post-init, so no TDZ. A future
+  // move to `primordials.js` next to `__tbEventConstructor` would remove the
+  // invisible cross-file dependency.
   const entry = data.get(event);
   if (entry !== undefined) return entry;
   if (!(event instanceof __tbEventConstructor)) throw new TypeError('Illegal invocation');
@@ -205,7 +213,7 @@ const __tbEventEntry = (event, data, fresh) => {
   data.set(event, initialized);
   return initialized;
 };
-const __tbEventString = value => (value === undefined ? '' : String(value));
+const __tbEventString = value => (value === undefined ? '' : __tbStringCtor(value));
 function __tbExposeEvent(name, parent, data, fresh, read, members) {
   const ctor = {
     [name]: class extends parent {
@@ -247,6 +255,15 @@ __tbExposeEvent('BeforeUnloadEvent', __tbEventConstructor, __tbBeforeUnloadEvent
   () => ({ returnValue: '' }),
   init => ({ returnValue: __tbEventString(init.returnValue) }),
   ['returnValue']);
+// `returnValue` is read-write per spec (all other exposed members are
+// read-only): a setter on the prototype writing the slot entry
+// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#the-beforeunloadevent-interface>).
+__tbDefineProperty(globalThis.BeforeUnloadEvent.prototype, 'returnValue', {
+  __proto__: null,
+  get() { return __tbEventEntry(this, __tbBeforeUnloadEventData, () => ({ returnValue: '' })).returnValue; },
+  set(value) { __tbEventEntry(this, __tbBeforeUnloadEventData, () => ({ returnValue: '' })).returnValue = __tbEventString(value); },
+  enumerable: true, configurable: true,
+});
 __tbExposeEvent('HashChangeEvent', __tbEventConstructor, host.slots('tinybrowser.hashchangeevent.data'),
   () => ({ oldURL: '', newURL: '' }),
   init => ({ oldURL: __tbEventString(init.oldURL), newURL: __tbEventString(init.newURL) }),
@@ -257,15 +274,15 @@ __tbExposeEvent('DeviceMotionEvent', __tbEventConstructor, host.slots('tinybrows
     acceleration: init.acceleration || null,
     accelerationIncludingGravity: init.accelerationIncludingGravity || null,
     rotationRate: init.rotationRate || null,
-    interval: init.interval === undefined ? 0 : Number(init.interval),
+    interval: init.interval === undefined ? 0 : __tbNumberCtor(init.interval),
   }),
   ['acceleration', 'accelerationIncludingGravity', 'rotationRate', 'interval']);
 __tbExposeEvent('DeviceOrientationEvent', __tbEventConstructor, host.slots('tinybrowser.deviceorientationevent.data'),
   () => ({ alpha: null, beta: null, gamma: null, absolute: false }),
   init => ({
-    alpha: init.alpha === undefined ? null : Number(init.alpha),
-    beta: init.beta === undefined ? null : Number(init.beta),
-    gamma: init.gamma === undefined ? null : Number(init.gamma),
+    alpha: init.alpha === undefined ? null : __tbNumberCtor(init.alpha),
+    beta: init.beta === undefined ? null : __tbNumberCtor(init.beta),
+    gamma: init.gamma === undefined ? null : __tbNumberCtor(init.gamma),
     absolute: !!init.absolute,
   }),
   ['alpha', 'beta', 'gamma', 'absolute']);

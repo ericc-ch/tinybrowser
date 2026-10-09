@@ -181,6 +181,10 @@ fn xml_encoding(bytes: &[u8], eof: bool) -> Option<(&'static encoding_rs::Encodi
 /// Encoding Standard label. Matches the token standalone on both sides so
 /// `fooencoding=` or a quoted occurrence does not count
 /// (<https://www.w3.org/TR/xml/#NT-EncodingDecl>).
+///
+/// Bounded: the declaration window is capped at 1024 bytes above, so the
+/// byte-wise scan is at most ~1M comparisons per parse. Unknown labels fall
+/// back to UTF-8 at the call site.
 fn xml_encoding_attribute(declaration: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     let token = b"encoding";
     let mut index = 0;

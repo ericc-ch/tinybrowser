@@ -18,10 +18,11 @@
     const proto = Object.create(parent ? parent.prototype : Object.prototype);
     for (const member of members) {
       const descriptor = Object.getOwnPropertyDescriptor(native, member);
-      if (descriptor) {
-        descriptor.configurable = true;
-        Object.defineProperty(proto, member, descriptor);
-      }
+      // Members implemented in script (not on the native wrapper prototype)
+      // are installed separately; only copy what the native provides.
+      if (descriptor === undefined) continue;
+      descriptor.configurable = true;
+      Object.defineProperty(proto, member, descriptor);
     }
     Object.defineProperty(ctor, 'name', { value: name, configurable: true });
     Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
