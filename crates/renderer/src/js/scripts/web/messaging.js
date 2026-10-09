@@ -1,5 +1,8 @@
 // https://html.spec.whatwg.org/multipage/web-messaging.html#messageevent
 const __tbMessageEventData = host.slots('tinybrowser.messageevent.data');
+const __tbFreshMessageEvent = () => ({
+  data: null, origin: '', lastEventId: '', source: null, ports: __tbFreeze([]),
+});
 const __tbMessageEventConstructor = globalThis.MessageEvent = class MessageEvent extends Event {
   constructor(type, init) {
     const eventInit = init === undefined ? {} : Object(init);
@@ -9,15 +12,15 @@ const __tbMessageEventConstructor = globalThis.MessageEvent = class MessageEvent
         origin: eventInit.origin === undefined ? '' : String(eventInit.origin),
         lastEventId: eventInit.lastEventId === undefined ? '' : String(eventInit.lastEventId),
         source: eventInit.source === undefined ? null : eventInit.source,
-        ports: eventInit.ports === undefined ? Object.freeze([]) : Object.freeze(Array.from(eventInit.ports)),
+        ports: eventInit.ports === undefined ? __tbFreeze([]) : __tbFreeze(__tbArrayFrom(eventInit.ports)),
     });
     return event;
   }
-  get data() { return __tbBrand(this, __tbMessageEventData).data; }
-  get origin() { return __tbBrand(this, __tbMessageEventData).origin; }
-  get lastEventId() { return __tbBrand(this, __tbMessageEventData).lastEventId; }
-  get source() { return __tbBrand(this, __tbMessageEventData).source; }
-  get ports() { return __tbBrand(this, __tbMessageEventData).ports; }
+  get data() { return __tbEventEntry(this, __tbMessageEventData, __tbFreshMessageEvent).data; }
+  get origin() { return __tbEventEntry(this, __tbMessageEventData, __tbFreshMessageEvent).origin; }
+  get lastEventId() { return __tbEventEntry(this, __tbMessageEventData, __tbFreshMessageEvent).lastEventId; }
+  get source() { return __tbEventEntry(this, __tbMessageEventData, __tbFreshMessageEvent).source; }
+  get ports() { return __tbEventEntry(this, __tbMessageEventData, __tbFreshMessageEvent).ports; }
 };
 Object.defineProperty(globalThis.MessageEvent.prototype, Symbol.toStringTag, { value: 'MessageEvent', writable: false, enumerable: false, configurable: true });
 // ── cross-realm structured serialization ───────────────────────────────
@@ -574,49 +577,28 @@ const __tbFrameProxy = frame => {
       throw error;
     }
   };
+  // Same-origin-only members are built once per target realm: proxy gets
+  // keep identity (`contentWindow.addEventListener ===
+  // contentWindow.addEventListener`), and rebuilding when the target global
+  // changes keeps prototypes and methods from going stale across navigations.
+  const proxyCache = __tbObjectCreate(null);
+  const cachedMember = (key, targetGlobal, make) => {
+    const entry = proxyCache[key];
+    if (entry !== undefined && entry.global === targetGlobal) return entry.fn;
+    const fn = make();
+    proxyCache[key] = { global: targetGlobal, fn };
+    return fn;
+  };
   const handler = {
     get(target, property) {
+      // Cross-origin-safe window properties only; everything else needs the
+      // target realm below. In particular `name`, `document`, the node
+      // constructors, and the EventTarget methods are not cross-origin
+      // accessible, so a navigated-away child no longer leaks them
+      // (<https://html.spec.whatwg.org/multipage/browsers.html#crossoriginproperties-(-o-)>).
       switch (property) {
         case 'postMessage':
           return postMessage;
-        // Host EventTarget methods live on each realm's window object. A
-        // WindowProxy get that forwards to another realm's global does not
-        // yield a callable from this realm, so `contentWindow.addEventListener`
-        // was not a function. Bind the current realm's methods with the proxy
-        // as `this`; `window_world_for_call` resolves the target frame
-        // (<https://dom.spec.whatwg.org/#interface-eventtarget>,
-        // <https://html.spec.whatwg.org/multipage/window-object.html#the-windowproxy-exotic-object>).
-        // Cross-realm constructors are not callable from this realm. Hand
-        // back a local function that creates the node in the target frame's
-        // document (<https://dom.spec.whatwg.org/#dom-comment-comment>).
-        case 'Comment': case 'Text': {
-          // Cross-realm constructors are not callable. A local wrapper
-          // constructs in the target document; its prototype is the target
-          // realm's so `instanceof contentWindow.Comment` holds
-          // (<https://dom.spec.whatwg.org/#dom-comment-comment>).
-          const ctor = function() {
-            return __tbApply(host.__tb_construct_in_frame, globalThis, [frame, property, ...arguments]);
-          };
-          const sameOrigin = host.__tbFrameGlobal(frame);
-          const original = sameOrigin == null ? undefined : sameOrigin[property];
-          const proto = (original && original.prototype)
-            || (globalThis[property] && globalThis[property].prototype);
-          if (proto) ctor.prototype = proto;
-          Object.defineProperty(ctor, 'name', { value: property, configurable: true });
-          return ctor;
-        }
-        case 'addEventListener':
-          return function(type, callback, options) {
-            return globalThis.addEventListener.call(proxy, type, callback, options);
-          };
-        case 'removeEventListener':
-          return function(type, callback, options) {
-            return globalThis.removeEventListener.call(proxy, type, callback, options);
-          };
-        case 'dispatchEvent':
-          return function(event) {
-            return globalThis.dispatchEvent.call(proxy, event);
-          };
         case 'parent': {
           const parent = host.__tbFrameParent(frame);
           return parent == null ? proxy : __tbFrameProxy(parent);
@@ -628,9 +610,7 @@ const __tbFrameProxy = frame => {
         case 'window': case 'self': case 'frames': return proxy;
         case 'length': return host.__tbFrameChildCount(frame);
         case 'closed': return !host.__tbFrameRegistered(frame);
-        case 'name': return host.__tbFrameName(frame);
         case Symbol.toStringTag: return 'Window';
-        case 'document': return host.__tbFrameDocument(frame);
       }
       const sameOrigin = host.__tbFrameGlobal(frame);
       if (sameOrigin == null) {
@@ -643,13 +623,56 @@ const __tbFrameProxy = frame => {
         }
         crossOrigin();
       }
+      switch (property) {
+        case 'name': return host.__tbFrameName(frame);
+        case 'document': return host.__tbFrameDocument(frame);
+        // Cross-realm constructors are not callable from this realm. Hand
+        // back a local function that creates the node in the target frame's
+        // document; its prototype is the target realm's so `instanceof
+        // contentWindow.Comment` holds
+        // (<https://dom.spec.whatwg.org/#dom-comment-comment>).
+        case 'Comment': case 'Text': return cachedMember(property, sameOrigin, () => {
+          const ctor = function() {
+            return __tbApply(host.__tb_construct_in_frame, globalThis, [frame, property, ...arguments]);
+          };
+          const original = sameOrigin[property];
+          const proto = original && original.prototype;
+          if (proto) ctor.prototype = proto;
+          __tbDefineProperty(ctor, 'name', { value: property, configurable: true });
+          return ctor;
+        });
+        // Host EventTarget methods live on each realm's window object. A
+        // WindowProxy get that forwards to another realm's global does not
+        // yield a callable from this realm, so `contentWindow.addEventListener`
+        // was not a function. Bind the target realm's own method (captured
+        // once, never the caller realm's clobberable global) with the proxy
+        // as `this`; `window_world_for_call` resolves the target frame
+        // (<https://dom.spec.whatwg.org/#interface-eventtarget>,
+        // <https://html.spec.whatwg.org/multipage/window-object.html#the-windowproxy-exotic-object>).
+        case 'addEventListener': return cachedMember(property, sameOrigin, () => {
+          const method = sameOrigin.addEventListener;
+          return function(type, callback, options) {
+            return __tbApply(method, proxy, [type, callback, options]);
+          };
+        });
+        case 'removeEventListener': return cachedMember(property, sameOrigin, () => {
+          const method = sameOrigin.removeEventListener;
+          return function(type, callback, options) {
+            return __tbApply(method, proxy, [type, callback, options]);
+          };
+        });
+        case 'dispatchEvent': return cachedMember(property, sameOrigin, () => {
+          const method = sameOrigin.dispatchEvent;
+          return function(event) {
+            return __tbApply(method, proxy, [event]);
+          };
+        });
+      }
       return sameOrigin[property];
     },
     set(target, property, value) {
-      if (property === 'name') {
-        host.__tbSetFrameName(frame, String(value));
-        return true;
-      }
+      // Writes need the target realm too: a cross-origin `name` set must not
+      // reach the stored name.
       const sameOrigin = host.__tbFrameGlobal(frame);
       if (sameOrigin == null) {
         if (host.__tbFrameRegistered(frame)) {
@@ -658,18 +681,29 @@ const __tbFrameProxy = frame => {
         }
         crossOrigin();
       }
+      if (property === 'name') {
+        host.__tbSetFrameName(frame, String(value));
+        return true;
+      }
       sameOrigin[property] = value;
       return true;
     },
     has(target, property) {
       switch (property) {
         case 'postMessage': case 'parent': case 'top': case 'window': case 'self':
-        case 'frames': case 'length': case 'closed': case 'document': case 'name':
-        case 'addEventListener': case 'removeEventListener': case 'dispatchEvent':
+        case 'frames': case 'length': case 'closed':
           return true;
       }
       const sameOrigin = host.__tbFrameGlobal(frame);
-      if (sameOrigin != null) return property in sameOrigin;
+      if (sameOrigin != null) {
+        switch (property) {
+          case 'name': case 'document': case 'Comment': case 'Text':
+          case 'addEventListener': case 'removeEventListener': case 'dispatchEvent':
+            return true;
+          default:
+            return property in sameOrigin;
+        }
+      }
       const pending = __tbFramePendingSets[frame];
       return pending !== undefined && property in pending;
     },
@@ -678,11 +712,15 @@ const __tbFrameProxy = frame => {
       // it, so the plain object prototype stands in
       // (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-getprototypeof>).
       const sameOrigin = host.__tbFrameGlobal(frame);
-      return sameOrigin == null ? globalThis.Object.prototype : globalThis.Object.getPrototypeOf(sameOrigin);
+      // `Object.prototype` itself is non-writable and non-configurable, and
+      // bare `Object` is the pinned load-time lexical, so this is safe.
+      return sameOrigin == null
+        ? Object.prototype
+        : __tbApply(__tbGetPrototypeOf, null, [sameOrigin]);
     },
     ownKeys() {
       const sameOrigin = host.__tbFrameGlobal(frame);
-      return sameOrigin == null ? [] : globalThis.Reflect.ownKeys(sameOrigin);
+      return sameOrigin == null ? [] : __tbApply(__tbOwnKeys, null, [sameOrigin]);
     },
     getOwnPropertyDescriptor() { return undefined; },
   };
@@ -1193,10 +1231,9 @@ Object.defineProperty(globalThis, 'name', {
 
   // https://html.spec.whatwg.org/multipage/webstorage.html#the-storageevent-interface
   const eventData = host.slots('tinybrowser.storageevent.data');
+  const freshStorageEvent = () => ({ key: null, oldValue: null, newValue: null, url: '', storageArea: null });
   function dataOf(event) {
-    const data = event == null ? undefined : eventData.get(event);
-    if (data === undefined) throw new TypeError('Illegal invocation');
-    return data;
+    return __tbEventEntry(event, eventData, freshStorageEvent);
   }
   function nullableString(value) {
     return value === undefined || value === null ? null : String(value);

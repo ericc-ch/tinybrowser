@@ -5,6 +5,7 @@
 // spec's properties.
 
 const __tbUIEventData = host.slots('tinybrowser.uievent.data');
+const __tbFreshUIEvent = () => ({ view: null, detail: 0 });
 const __tbUIEventConstructor = globalThis.UIEvent = class UIEvent extends Event {
   constructor(type, init) {
     if (arguments.length < 1) {
@@ -15,12 +16,17 @@ const __tbUIEventConstructor = globalThis.UIEvent = class UIEvent extends Event 
     __tbUIEventData.set(event, { view: init.view || null, detail: init.detail || 0 });
     return event;
   }
-  get view() { return __tbBrand(this, __tbUIEventData).view; }
-  get detail() { return __tbBrand(this, __tbUIEventData).detail; }
+  get view() { return __tbEventEntry(this, __tbUIEventData, __tbFreshUIEvent).view; }
+  get detail() { return __tbEventEntry(this, __tbUIEventData, __tbFreshUIEvent).detail; }
 };
 Object.defineProperty(globalThis.UIEvent.prototype, Symbol.toStringTag, { value: 'UIEvent', writable: false, enumerable: false, configurable: true });
 
 const __tbMouseEventData = host.slots('tinybrowser.mouseevent.data');
+const __tbFreshMouseEvent = () => ({
+  screenX: 0, screenY: 0, clientX: 0, clientY: 0,
+  ctrlKey: false, shiftKey: false, altKey: false, metaKey: false,
+  button: 0, buttons: 0, relatedTarget: null,
+});
 const __tbMouseEventConstructor = globalThis.MouseEvent = class MouseEvent extends UIEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
@@ -44,17 +50,17 @@ const __tbMouseEventConstructor = globalThis.MouseEvent = class MouseEvent exten
     });
     return event;
   }
-  get screenX() { return __tbBrand(this, __tbMouseEventData).screenX; }
-  get screenY() { return __tbBrand(this, __tbMouseEventData).screenY; }
-  get clientX() { return __tbBrand(this, __tbMouseEventData).clientX; }
-  get clientY() { return __tbBrand(this, __tbMouseEventData).clientY; }
-  get ctrlKey() { return __tbBrand(this, __tbMouseEventData).ctrlKey; }
-  get shiftKey() { return __tbBrand(this, __tbMouseEventData).shiftKey; }
-  get altKey() { return __tbBrand(this, __tbMouseEventData).altKey; }
-  get metaKey() { return __tbBrand(this, __tbMouseEventData).metaKey; }
-  get button() { return __tbBrand(this, __tbMouseEventData).button; }
-  get buttons() { return __tbBrand(this, __tbMouseEventData).buttons; }
-  get relatedTarget() { return __tbBrand(this, __tbMouseEventData).relatedTarget; }
+  get screenX() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).screenX; }
+  get screenY() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).screenY; }
+  get clientX() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).clientX; }
+  get clientY() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).clientY; }
+  get ctrlKey() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).ctrlKey; }
+  get shiftKey() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).shiftKey; }
+  get altKey() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).altKey; }
+  get metaKey() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).metaKey; }
+  get button() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).button; }
+  get buttons() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).buttons; }
+  get relatedTarget() { return __tbEventEntry(this, __tbMouseEventData, __tbFreshMouseEvent).relatedTarget; }
   getModifierState(key) {
     return { Alt: !!this.altKey, Control: !!this.ctrlKey, Meta: !!this.metaKey, Shift: !!this.shiftKey }[String(key)] || false;
   }
@@ -118,6 +124,11 @@ globalThis.WheelEvent = class WheelEvent extends MouseEvent {
 Object.defineProperty(globalThis.WheelEvent.prototype, Symbol.toStringTag, { value: 'WheelEvent', writable: false, enumerable: false, configurable: true });
 
 const __tbKeyboardEventData = host.slots('tinybrowser.keyboardevent.data');
+const __tbFreshKeyboardEvent = () => ({
+  key: '', code: '', location: 0,
+  ctrlKey: false, shiftKey: false, altKey: false, metaKey: false,
+  repeat: false, isComposing: false, keyCode: 0, charCode: 0,
+});
 globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
   constructor(type, init) {
     if (arguments.length < 1) {
@@ -138,17 +149,17 @@ globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
     });
     return event;
   }
-  get key() { return __tbBrand(this, __tbKeyboardEventData).key; }
-  get code() { return __tbBrand(this, __tbKeyboardEventData).code; }
-  get location() { return __tbBrand(this, __tbKeyboardEventData).location; }
-  get ctrlKey() { return __tbBrand(this, __tbKeyboardEventData).ctrlKey; }
-  get shiftKey() { return __tbBrand(this, __tbKeyboardEventData).shiftKey; }
-  get altKey() { return __tbBrand(this, __tbKeyboardEventData).altKey; }
-  get metaKey() { return __tbBrand(this, __tbKeyboardEventData).metaKey; }
-  get repeat() { return __tbBrand(this, __tbKeyboardEventData).repeat; }
-  get isComposing() { return __tbBrand(this, __tbKeyboardEventData).isComposing; }
-  get keyCode() { return __tbBrand(this, __tbKeyboardEventData).keyCode; }
-  get charCode() { return __tbBrand(this, __tbKeyboardEventData).charCode; }
+  get key() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).key; }
+  get code() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).code; }
+  get location() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).location; }
+  get ctrlKey() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).ctrlKey; }
+  get shiftKey() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).shiftKey; }
+  get altKey() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).altKey; }
+  get metaKey() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).metaKey; }
+  get repeat() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).repeat; }
+  get isComposing() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).isComposing; }
+  get keyCode() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).keyCode; }
+  get charCode() { return __tbEventEntry(this, __tbKeyboardEventData, __tbFreshKeyboardEvent).charCode; }
   getModifierState(key) {
     return { Alt: !!this.altKey, Control: !!this.ctrlKey, Meta: !!this.metaKey, Shift: !!this.shiftKey }[String(key)] || false;
   }
@@ -181,8 +192,21 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
 // Interfaces named by document.createEvent
 // (https://dom.spec.whatwg.org/#dom-document-createevent).
 // createEvent builds an uninitialized Event and sets this prototype; it does
-// not call the constructor, which requires a type.
-function __tbExposeEvent(name, parent) {
+// not call the constructor, which requires a type. Getters below therefore
+// initialize uninitialized events with their spec defaults on first read
+// (real events constructed with `new` already carry entries). Non-events
+// still throw: only actual `Event` instances, checked against the pristine
+// constructor, are initialized.
+const __tbEventEntry = (event, data, fresh) => {
+  const entry = data.get(event);
+  if (entry !== undefined) return entry;
+  if (!(event instanceof __tbEventConstructor)) throw new TypeError('Illegal invocation');
+  const initialized = fresh();
+  data.set(event, initialized);
+  return initialized;
+};
+const __tbEventString = value => (value === undefined ? '' : String(value));
+function __tbExposeEvent(name, parent, data, fresh, read, members) {
   const ctor = {
     [name]: class extends parent {
       constructor(type) {
@@ -190,24 +214,86 @@ function __tbExposeEvent(name, parent) {
           throw new TypeError("Failed to construct '" + name + "': 1 argument required, but only 0 present.");
         }
         const init = arguments.length < 2 || arguments[1] == null ? {} : arguments[1];
-        return __tbConstruct(parent, [type, init], new.target);
+        const event = __tbConstruct(parent, [type, init], new.target);
+        data.set(event, read(init));
+        return event;
       }
     },
   }[name];
-  Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+  for (const member of members) {
+    const key = member;
+    __tbDefineProperty(ctor.prototype, key, {
+      __proto__: null,
+      get() { return __tbEventEntry(this, data, fresh)[key]; },
+      enumerable: true, configurable: true,
+    });
+  }
+  __tbDefineProperty(ctor.prototype, Symbol.toStringTag, {
     value: name, writable: false, enumerable: false, configurable: true,
   });
-  globalThis[name] = ctor;
+  // WebIDL interface objects are non-enumerable on the global
+  // (<https://webidl.spec.whatwg.org/#interface-object>).
+  __tbDefineProperty(globalThis, name, {
+    __proto__: null,
+    value: ctor, writable: true, enumerable: false, configurable: true,
+  });
 }
-__tbExposeEvent('BeforeUnloadEvent', Event);
-__tbExposeEvent('HashChangeEvent', Event);
-__tbExposeEvent('DeviceMotionEvent', Event);
-__tbExposeEvent('DeviceOrientationEvent', Event);
-__tbExposeEvent('CompositionEvent', UIEvent);
-__tbExposeEvent('FocusEvent', UIEvent);
-__tbExposeEvent('TextEvent', UIEvent);
-__tbExposeEvent('TouchEvent', UIEvent);
-__tbExposeEvent('DragEvent', MouseEvent);
+// Each exposed interface: its slot map, a fresh-defaults factory (fresh
+// objects per event, so TouchEvent lists never alias), an init-dictionary
+// reader, and the member names exposed as getters
+// (<https://w3c.github.io/uievents/>, <https://w3c.github.io/touch-events/>).
+const __tbBeforeUnloadEventData = host.slots('tinybrowser.beforeunloadevent.data');
+__tbExposeEvent('BeforeUnloadEvent', __tbEventConstructor, __tbBeforeUnloadEventData,
+  () => ({ returnValue: '' }),
+  init => ({ returnValue: __tbEventString(init.returnValue) }),
+  ['returnValue']);
+__tbExposeEvent('HashChangeEvent', __tbEventConstructor, host.slots('tinybrowser.hashchangeevent.data'),
+  () => ({ oldURL: '', newURL: '' }),
+  init => ({ oldURL: __tbEventString(init.oldURL), newURL: __tbEventString(init.newURL) }),
+  ['oldURL', 'newURL']);
+__tbExposeEvent('DeviceMotionEvent', __tbEventConstructor, host.slots('tinybrowser.devicemotionevent.data'),
+  () => ({ acceleration: null, accelerationIncludingGravity: null, rotationRate: null, interval: 0 }),
+  init => ({
+    acceleration: init.acceleration || null,
+    accelerationIncludingGravity: init.accelerationIncludingGravity || null,
+    rotationRate: init.rotationRate || null,
+    interval: init.interval === undefined ? 0 : Number(init.interval),
+  }),
+  ['acceleration', 'accelerationIncludingGravity', 'rotationRate', 'interval']);
+__tbExposeEvent('DeviceOrientationEvent', __tbEventConstructor, host.slots('tinybrowser.deviceorientationevent.data'),
+  () => ({ alpha: null, beta: null, gamma: null, absolute: false }),
+  init => ({
+    alpha: init.alpha === undefined ? null : Number(init.alpha),
+    beta: init.beta === undefined ? null : Number(init.beta),
+    gamma: init.gamma === undefined ? null : Number(init.gamma),
+    absolute: !!init.absolute,
+  }),
+  ['alpha', 'beta', 'gamma', 'absolute']);
+__tbExposeEvent('CompositionEvent', __tbUIEventConstructor, host.slots('tinybrowser.compositionevent.data'),
+  () => ({ data: '' }),
+  init => ({ data: __tbEventString(init.data) }),
+  ['data']);
+__tbExposeEvent('FocusEvent', __tbUIEventConstructor, host.slots('tinybrowser.focusevent.data'),
+  () => ({ relatedTarget: null }),
+  init => ({ relatedTarget: init.relatedTarget || null }),
+  ['relatedTarget']);
+__tbExposeEvent('TextEvent', __tbUIEventConstructor, host.slots('tinybrowser.textevent.data'),
+  () => ({ data: '' }),
+  init => ({ data: __tbEventString(init.data) }),
+  ['data']);
+__tbExposeEvent('TouchEvent', __tbUIEventConstructor, host.slots('tinybrowser.touchevent.data'),
+  () => ({ touches: [], targetTouches: [], changedTouches: [], altKey: false, metaKey: false, ctrlKey: false, shiftKey: false }),
+  init => ({
+    touches: init.touches || [],
+    targetTouches: init.targetTouches || [],
+    changedTouches: init.changedTouches || [],
+    altKey: !!init.altKey, metaKey: !!init.metaKey, ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
+  }),
+  ['touches', 'targetTouches', 'changedTouches', 'altKey', 'metaKey', 'ctrlKey', 'shiftKey']);
+__tbExposeEvent('DragEvent', __tbMouseEventConstructor, host.slots('tinybrowser.dragevent.data'),
+  () => ({ dataTransfer: null }),
+  init => ({ dataTransfer: init.dataTransfer || null }),
+  ['dataTransfer']);
 
 // Touch Events extends GlobalEventHandlers with these handlers. createEvent's
 // touch rows run only when the document exposes one
