@@ -2,27 +2,10 @@ const __tbUrlSlots = host.slots('URL');
 const __tbParamsSlots = host.slots('URLSearchParams');
 const __tbUrlState = value => __tbBrand(value, __tbUrlSlots);
 const __tbParamsState = value => __tbBrand(value, __tbParamsSlots);
-host.__tbUSVString = value => {
-  value = String(value);
-  let out = '';
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        out += value[index] + value[index + 1];
-        index++;
-      } else {
-        out += '\uFFFD';
-      }
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      out += '\uFFFD';
-    } else {
-      out += value[index];
-    }
-  }
-  return out;
-};
+// Single USVString conversion, shared with the IDL bindings: lone
+// surrogates become U+FFFD and Symbols throw, per WebIDL
+// (<https://webidl.spec.whatwg.org/#es-USVString>).
+host.__tbUSVString = __tbIDLUSVString;
 
 // URL decomposition components; indexes match `js/url_parts.rs`
 // (<https://html.spec.whatwg.org/multipage/links.html#url-decomposition-idl-attributes>).

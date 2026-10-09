@@ -40,6 +40,10 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
     )?;
     globals.set("__tbEncodeForm", rquickjs::prelude::Func::from(encode_form))?;
     globals.set(
+        "__tbUrlEncodeForm",
+        rquickjs::prelude::Func::from(urlencode_form),
+    )?;
+    globals.set(
         "__tbEncodingName",
         rquickjs::prelude::Func::from(encoding_name),
     )?;
@@ -586,6 +590,16 @@ pub(super) fn encode_form(text: String, label: String) -> String {
         encoding_rs::Encoding::for_label(label.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
     let (bytes, _, _) = encoding.encode(&text);
     bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
+/// Percent-encodes `text` for form submission: Encoding Standard `encode`
+/// in `label`, then the urlencoded byte serializer over those bytes
+/// (<https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer>).
+pub(super) fn urlencode_form(text: String, label: String) -> String {
+    let encoding =
+        encoding_rs::Encoding::for_label(label.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    let (bytes, _, _) = encoding.encode(&text);
+    url::form_urlencoded::byte_serialize(bytes.as_ref()).collect()
 }
 
 /// The host half of the `input.files` setter: records the assigned file list so

@@ -18,6 +18,8 @@ encoding_rs = "0.8"
 data-url = "0.3"
 percent-encoding = "2"
 base64 = "0.23"
+# MIME parsing rides with stylo; the document charset sniff uses it.
+mime = "0.3"
 # Web Crypto entropy must come from the operating system, never the JS PRNG.
 getrandom = "0.4"
 # ECMA-402 formatting uses a locale-filtered ICU4X blob generated for the
