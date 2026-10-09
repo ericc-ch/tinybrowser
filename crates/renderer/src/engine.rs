@@ -1107,6 +1107,10 @@ impl Engine {
 /// Decodes a `data:` URL into its content type and body bytes, or `None` when
 /// the URL is malformed or its base64 payload is not decodable
 /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
+///
+/// Handrolled: `data-url`, `percent-encoding`, and `base64` are already in
+/// the graph, but promoting them into renderer grew the stripped
+/// `./tools/release` binary.
 pub(crate) fn decode_data_url(raw: &str) -> Option<(Option<String>, Vec<u8>)> {
     let rest = raw.strip_prefix("data:")?;
     let (metadata, encoded_body) = rest.split_once(',')?;

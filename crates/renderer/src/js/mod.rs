@@ -7,6 +7,7 @@
 mod bindings;
 mod blob;
 mod bridge;
+mod encoding;
 mod events;
 mod intl;
 mod modules;
@@ -762,6 +763,7 @@ impl JsRealm {
             install_window_host_functions(&ctx, &world)?;
             install_history_host_functions(&ctx, &world)?;
             url_parts::install(&ctx)?;
+            encoding::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
             reactions::install(&ctx)?;
             bridge::evaluate(&ctx, install_web_apis_js(&ctx)?)?;
