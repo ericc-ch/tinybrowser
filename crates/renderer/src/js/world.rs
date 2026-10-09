@@ -43,6 +43,10 @@ pub(crate) struct RealmRegistry {
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
+    /// `TextDecoder` session ids, allocated across every world and frame so
+    /// a freed id can never alias a live session, even if a finalizer runs
+    /// under another realm.
+    next_decoder: u64,
 }
 
 pub(crate) struct PrivateSlots {
@@ -55,6 +59,12 @@ impl RealmRegistry {
     pub(crate) fn allocate_remote(&mut self) -> u64 {
         self.next_remote = self.next_remote.saturating_add(1);
         self.next_remote
+    }
+
+    /// The next process-unique `TextDecoder` session id.
+    pub(crate) fn allocate_decoder(&mut self) -> u64 {
+        self.next_decoder = self.next_decoder.saturating_add(1);
+        self.next_decoder
     }
 }
 
@@ -513,6 +523,13 @@ pub(crate) struct World {
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
     input_files: HashMap<NodeId, Vec<Persistent<Value<'static>>>>,
+    /// Streaming `TextDecoder` sessions, keyed by platform id. The decoder
+    /// object buffers partial sequences internally across `decode()` calls,
+    /// exactly as the Encoding Standard's streaming decoder does; the entry
+    /// dies with the realm, and `FinalizationRegistry` frees it earlier when
+    /// the engine runs the callback
+    /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
+    pub(crate) decoders: HashMap<u64, DecoderSession>,
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
@@ -586,6 +603,34 @@ pub(crate) struct World {
     pub(crate) image_broken: HashSet<NodeId>,
 }
 
+/// One streaming `TextDecoder` session: the decoder plus what recreates it.
+/// A `last=true` call ends the decoder (`encoding_rs` panics on reuse), so
+/// every non-streaming `decode()` replaces it with a fresh one. `carry`
+/// holds input bytes past a fatal error for the next call: the error itself
+/// is consumed, but the queue behind it is not.
+pub(crate) struct DecoderSession {
+    pub(crate) decoder: encoding_rs::Decoder,
+    pub(crate) encoding: &'static encoding_rs::Encoding,
+    pub(crate) ignore_bom: bool,
+    pub(crate) carry: Vec<u8>,
+}
+
+impl DecoderSession {
+    pub(crate) fn fresh(encoding: &'static encoding_rs::Encoding, ignore_bom: bool) -> Self {
+        let decoder = if ignore_bom {
+            encoding.new_decoder_without_bom_handling()
+        } else {
+            encoding.new_decoder_with_bom_removal()
+        };
+        Self {
+            decoder,
+            encoding,
+            ignore_bom,
+            carry: Vec::new(),
+        }
+    }
+}
+
 impl Drop for World {
     fn drop(&mut self) {
         let object_bytes = self
@@ -633,6 +678,7 @@ impl World {
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
             input_files: HashMap::new(),
+            decoders: HashMap::new(),
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
@@ -694,6 +740,9 @@ impl World {
         self.clear_images();
         self.remote_ids.clear();
         self.remote_nodes.clear();
+        // Sessions die with the realm: a navigation must not inherit a
+        // half-fed decoder.
+        self.decoders.clear();
         // Navigation replaces the document's element handlers with it, but the
         // realm keeps its window object, so window-scoped handlers survive:
         // the old document's `onload` must not fire in the new document

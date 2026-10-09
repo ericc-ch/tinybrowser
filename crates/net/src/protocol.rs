@@ -59,12 +59,16 @@ impl HeaderMap {
     ///
     /// [`HeaderError::InvalidName`] when `name` is empty or not an HTTP token.
     /// [`HeaderError::InvalidValue`] when `value` contains a CTL byte other than TAB.
+    ///
+    /// Validation uses `hyper`'s `HeaderName` / `HeaderValue` parsers, the same
+    /// checks already applied when the map is written to the wire
+    /// (<https://httpwg.org/specs/rfc9110.html#field.names>).
     pub fn insert(&mut self, name: &str, value: impl Into<Vec<u8>>) -> Result<(), HeaderError> {
-        if name.is_empty() || !name.chars().all(is_token_char) {
+        if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
             return Err(HeaderError::InvalidName(name.into()));
         }
         let value = value.into();
-        if value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+        if hyper::header::HeaderValue::from_bytes(&value).is_err() {
             return Err(HeaderError::InvalidValue(
                 String::from_utf8_lossy(&value).into_owned().into(),
             ));

@@ -2,27 +2,10 @@ const __tbUrlSlots = host.slots('URL');
 const __tbParamsSlots = host.slots('URLSearchParams');
 const __tbUrlState = value => __tbBrand(value, __tbUrlSlots);
 const __tbParamsState = value => __tbBrand(value, __tbParamsSlots);
-host.__tbUSVString = value => {
-  value = String(value);
-  let out = '';
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        out += value[index] + value[index + 1];
-        index++;
-      } else {
-        out += '\uFFFD';
-      }
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      out += '\uFFFD';
-    } else {
-      out += value[index];
-    }
-  }
-  return out;
-};
+// Single USVString conversion, shared with the IDL bindings: lone
+// surrogates become U+FFFD and Symbols throw, per WebIDL
+// (<https://webidl.spec.whatwg.org/#es-USVString>).
+host.__tbUSVString = __tbIDLUSVString;
 
 // URL decomposition components; indexes match `js/url_parts.rs`
 // (<https://html.spec.whatwg.org/multipage/links.html#url-decomposition-idl-attributes>).
@@ -105,7 +88,7 @@ globalThis.URL = class URL {
 };
 globalThis.URL.createObjectURL = function(blob) {
   const data = __tbBrand(blob, __tbBlobData, 'value is not a Blob');
-  const text = __tbUtf8Decode(data.bytes, false, true).text;
+  const text = __tbUtf8Decode(data.bytes);
   const url = host.__tbCreateObjectURL(text, data.type);
   if (url == null) throw new RangeError('object URL budget exceeded');
   return url;
@@ -144,36 +127,24 @@ globalThis.URLSearchParams = class URLSearchParams {
     if (init !== null && typeof init === 'object') {
       if (typeof init[Symbol.iterator] === 'function') {
         for (const pair of init) {
-          const values = Array.from(pair);
+          const values = __tbArrayFrom(pair);
           if (values.length !== 2) throw new TypeError('parameter pair must contain two values');
           __tbArray.push(__tbParamsState(this).pairs, [host.__tbUSVString(values[0]), host.__tbUSVString(values[1])]);
         }
       } else {
-        for (const name of Object.keys(init)) {
+        for (const name of __tbObjectKeys(init)) {
           __tbArray.push(__tbParamsState(this).pairs, [host.__tbUSVString(name), host.__tbUSVString(init[name])]);
         }
       }
       return;
     }
     var input = host.__tbUSVString(init === undefined ? '' : init);
-    if (input.charAt(0) === '?') input = input.slice(1);
+    if (input[0] === '?') input = __tbApply(__tbStringSlice, input, [1]);
     if (!input) return;
-    const decode = value => {
-      value = value.replace(/\+/g, ' ');
-      try { return decodeURIComponent(value); }
-      catch (_) { return value.replace(/%([0-9a-f]{2})/gi, (_m, hex) => String.fromCharCode(parseInt(hex, 16))); }
-    };
-    for (const item of input.split('&')) {
-      // The `application/x-www-form-urlencoded` parser drops empty items
-      // (<https://url.spec.whatwg.org/#urlencoded-parsing>).
-      if (item === '') continue;
-      const separator = item.indexOf('=');
-      const name = separator < 0 ? item : item.slice(0, separator);
-      const value = separator < 0 ? '' : item.slice(separator + 1);
-      __tbArray.push(__tbParamsState(this).pairs, [
-        decode(name),
-        decode(value)
-      ]);
+    // The `application/x-www-form-urlencoded` parser drops empty items
+    // (<https://url.spec.whatwg.org/#urlencoded-parsing>).
+    for (const pair of host.__tbParseParams(input)) {
+      __tbArray.push(__tbParamsState(this).pairs, [pair[0], pair[1]]);
     }
   }
   get size() { return __tbParamsState(this).pairs.length; }
@@ -258,11 +229,9 @@ globalThis.URLSearchParams = class URLSearchParams {
     }
   }
   toString() {
-    const encode = value => encodeURIComponent(value)
-      .replace(/%20/g, '+')
-      .replace(/[!'()~]/g, character =>
-        '%' + character.charCodeAt(0).toString(16).toUpperCase());
-    return __tbArray.join(__tbArray.map(__tbParamsState(this).pairs, pair => encode(pair[0]) + '=' + encode(pair[1])), '&');
+    // The `application/x-www-form-urlencoded` serializer
+    // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
+    return host.__tbSerializeParams(__tbParamsState(this).pairs);
   }
   [Symbol.iterator]() { return this.entries(); }
 };

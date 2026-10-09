@@ -55,6 +55,13 @@ __tbArray.iterator = array => {
   };
 };
 const __tbUint8Array = Uint8Array;
+// Pinned statics and methods the shims call with attacker-controlled input:
+// the constructors stay reachable for pages to replace.
+const __tbArrayFrom = Array.from;
+const __tbObjectKeys = Object.keys;
+const __tbIsArrayBufferView = ArrayBuffer.isView;
+const __tbStringSlice = String.prototype.slice;
+const __tbStringToLowerCase = String.prototype.toLowerCase;
 const __tbMapConstructor = Map;
 const __tbMapGet = Map.prototype.get;
 const __tbMapSet = Map.prototype.set;
@@ -114,6 +121,10 @@ const __tbPrivateSet = function() {
   return __tbFreeze(facade);
 };
 const __tbBytesCopy = (bytes, start = 0, end = bytes.length) => {
+  // Clamp: an over-long end must not zero-pad (a chunked bridge once turned
+  // a 1-byte tail into 4096 bytes of NULs).
+  if (end > bytes.length) end = bytes.length;
+  if (start > end) start = end;
   const result = new __tbUint8Array(end - start);
   for (let index = start; index < end; index++) result[index - start] = bytes[index];
   return result;

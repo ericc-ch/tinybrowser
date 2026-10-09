@@ -809,19 +809,7 @@
   // application/x-www-form-urlencoded over the encoded bytes: unreserved bytes
   // stay, a space becomes `+`, everything else is percent-encoded
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
-  const UNRESERVED = byte =>
-    (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A) ||
-    (byte >= 0x61 && byte <= 0x7A) || byte === 0x2A || byte === 0x2D ||
-    byte === 0x2E || byte === 0x5F;
-  const percentEncode = bytes => {
-    let out = '';
-    for (const byte of bytes) {
-      if (byte === 0x20) out += '+';
-      else if (UNRESERVED(byte)) out += String.fromCharCode(byte);
-      else out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
-    }
-    return out;
-  };
+  const urlEncodeByte = (text, label) => host.__tbUrlEncodeForm(toWellFormed(String(text)), label);
   // A `File`/`Blob` entry serializes as its file name
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
   const entryValueString = value =>
@@ -833,9 +821,7 @@
     for (const entry of formData) {
       const name = String(entry[0]).replace(/\r\n|\r|\n/g, '\r\n');
       const value = entryValueString(entry[1]).replace(/\r\n|\r|\n/g, '\r\n');
-      parts.push(
-        `${percentEncode(charsetBytes(name, label))}=${percentEncode(charsetBytes(value, label))}`,
-      );
+      parts.push(`${urlEncodeByte(name, label)}=${urlEncodeByte(value, label)}`);
     }
     return parts.join('&');
   };
@@ -860,11 +846,12 @@
   // byte, so file bytes survive unchanged while text is UTF-8 encoded first.
   const encoder = new TextEncoder();
   const toLatin1 = bytes => {
-    let text = '';
-    for (let index = 0; index < bytes.length; index++) {
-      text += String.fromCharCode(bytes[index]);
+    // Chunked: per-byte `+=` is quadratic on large multipart bodies.
+    const parts = __tbPrivateArray();
+    for (let start = 0; start < bytes.length; start += 4096) {
+      __tbArray.push(parts, __tbApply(__tbIDLFromCharCode, null, __tbBytesCopy(bytes, start, start + 4096)));
     }
-    return text;
+    return __tbArray.join(parts, '');
   };
   const concatBytes = chunks => {
     let total = 0;

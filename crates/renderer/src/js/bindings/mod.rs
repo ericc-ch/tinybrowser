@@ -12,7 +12,7 @@ mod collections;
 mod document;
 mod exceptions;
 mod focus;
-mod forms;
+pub(crate) mod forms;
 pub(crate) mod host;
 mod messaging;
 mod mutation;

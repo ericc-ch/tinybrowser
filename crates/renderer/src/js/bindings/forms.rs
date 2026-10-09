@@ -40,6 +40,10 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
     )?;
     globals.set("__tbEncodeForm", rquickjs::prelude::Func::from(encode_form))?;
     globals.set(
+        "__tbUrlEncodeForm",
+        rquickjs::prelude::Func::from(urlencode_form),
+    )?;
+    globals.set(
         "__tbEncodingName",
         rquickjs::prelude::Func::from(encoding_name),
     )?;
@@ -50,14 +54,25 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Strips ASCII whitespace, the only whitespace the Encoding Standard's
+/// label matching removes
+/// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
+pub(crate) fn trim_label(label: &str) -> &str {
+    label.trim_matches(['\t', '\n', '\x0C', '\r', ' '])
+}
+
 /// Resolves an encoding label to its canonical name, or `null`
 /// (<https://encoding.spec.whatwg.org/#names-and-labels>).
+///
+/// The `replacement` encoding is never returned: getting an encoding
+/// rejects it (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 pub(super) fn encoding_name(label: String) -> Option<String> {
-    encoding_rs::Encoding::for_label(label.trim().as_bytes())
+    encoding_rs::Encoding::for_label(trim_label(&label).as_bytes())
+        .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .map(|encoding| encoding.name().to_owned())
 }
 
@@ -573,6 +588,15 @@ fn push_file_entries<'js>(
     Ok(())
 }
 
+/// The submission encoding for a resolved label: the same ASCII-trimmed,
+/// `replacement`-rejecting resolution as every other label entry, falling
+/// back to UTF-8 because the caller passes an already-resolved name.
+fn submission_encoding(label: &str) -> &'static encoding_rs::Encoding {
+    encoding_rs::Encoding::for_label(trim_label(label).as_bytes())
+        .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
+        .unwrap_or(encoding_rs::UTF_8)
+}
+
 /// Encodes `text` in the form's submission encoding, returning a Latin-1
 /// string of the encoded bytes. A character the encoding cannot represent
 /// becomes a numeric character reference, per the Encoding Standard's
@@ -582,10 +606,16 @@ fn push_file_entries<'js>(
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 pub(super) fn encode_form(text: String, label: String) -> String {
-    let encoding =
-        encoding_rs::Encoding::for_label(label.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
-    let (bytes, _, _) = encoding.encode(&text);
+    let (bytes, _, _) = submission_encoding(&label).encode(&text);
     bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
+/// Percent-encodes `text` for form submission: Encoding Standard `encode`
+/// in `label`, then the urlencoded byte serializer over those bytes
+/// (<https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer>).
+pub(super) fn urlencode_form(text: String, label: String) -> String {
+    let (bytes, _, _) = submission_encoding(&label).encode(&text);
+    url::form_urlencoded::byte_serialize(bytes.as_ref()).collect()
 }
 
 /// The host half of the `input.files` setter: records the assigned file list so

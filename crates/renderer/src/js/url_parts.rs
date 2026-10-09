@@ -36,7 +36,38 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
             set_part(&spec, &base, part, &value)
         }),
     )?;
+    super::bridge::object(ctx)?.set(
+        "__tbParseParams",
+        Func::from(|input: String| parse_params(&input)),
+    )?;
+    super::bridge::object(ctx)?.set(
+        "__tbSerializeParams",
+        Func::from(|pairs: Vec<Vec<String>>| serialize_params(&pairs)),
+    )?;
     Ok(())
+}
+
+/// Runs the `application/x-www-form-urlencoded` parser over `input`
+/// (<https://url.spec.whatwg.org/#concept-urlencoded-parser>).
+///
+/// Pairs cross as two-element arrays: plain tuples have no `rquickjs`
+/// conversion impls.
+fn parse_params(input: &str) -> Vec<Vec<String>> {
+    url::form_urlencoded::parse(input.as_bytes())
+        .into_owned()
+        .map(|(name, value)| vec![name, value])
+        .collect()
+}
+
+/// Runs the `application/x-www-form-urlencoded` serializer over `pairs`
+/// (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
+fn serialize_params(pairs: &[Vec<String>]) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.extend_pairs(pairs.iter().filter_map(|pair| {
+        let (name, rest) = pair.split_first()?;
+        Some((name.as_str(), rest.first().map_or("", String::as_str)))
+    }));
+    serializer.finish()
 }
 
 /// The decomposition components of `spec` resolved against `base`, or `None`

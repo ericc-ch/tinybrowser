@@ -772,7 +772,7 @@ impl Engine {
             "data" => {
                 if let Some((content_type, body)) = decode_data_url(url.as_str()) {
                     if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_frame_response(&url, content_type.as_deref(), &body);
+                        document.load_frame_response(&url, Some(content_type.as_str()), &body);
                     }
                 } else {
                     // A malformed data URL fails the navigation; the frame
@@ -1104,79 +1104,24 @@ impl Engine {
     }
 }
 
-/// Decodes a `data:` URL into its content type and body bytes, or `None` when
+/// Decodes a `data:` URL into its MIME type and body bytes, or `None` when
 /// the URL is malformed or its base64 payload is not decodable
 /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
-pub(crate) fn decode_data_url(raw: &str) -> Option<(Option<String>, Vec<u8>)> {
-    let rest = raw.strip_prefix("data:")?;
-    let (metadata, encoded_body) = rest.split_once(',')?;
-    // The body is percent-decoded first; the base64 step then decodes the
-    // isomorphic (byte-per-code-point) view of those bytes
-    // (<https://fetch.spec.whatwg.org/#data-urls>).
-    let body = percent_decode_bytes(encoded_body);
-    let (content_type, is_base64) = match metadata_without_base64(metadata) {
-        Some(content_type) => (content_type, true),
-        None => (metadata, false),
-    };
-    let decoded = if is_base64 {
-        decode_base64(&isomorphic_decode(&body))?
-    } else {
-        body
-    };
-    let content_type = (!content_type.is_empty()).then(|| content_type.to_owned());
-    Some((content_type, decoded))
-}
-
-/// The metadata without a trailing `;base64` marker (ASCII case-insensitive,
-/// spaces allowed before it), when present
-/// (<https://fetch.spec.whatwg.org/#data-urls>).
-fn metadata_without_base64(metadata: &str) -> Option<&str> {
-    let (prefix, name) = metadata.split_at(metadata.len().checked_sub(6)?);
-    if !name.eq_ignore_ascii_case("base64") {
-        return None;
-    }
-    prefix.trim_end_matches(' ').strip_suffix(';')
-}
-
-/// Isomorphic decode: each byte becomes the code point with the same value
-/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
-fn isomorphic_decode(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| char::from(*byte)).collect()
-}
-
-/// Percent-decodes an ASCII URL component; indices outside `%XX` are kept.
-fn percent_decode_bytes(source: &str) -> Vec<u8> {
-    let bytes = source.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) =
-                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
-        {
-            output.push((high << 4) | low);
-            index += 3;
-            continue;
-        }
-        output.push(bytes[index]);
-        index += 1;
-    }
-    output
+///
+/// An empty MIME defaults to `text/plain;charset=US-ASCII`, as the Fetch
+/// processor requires; every success carries a MIME, so callers never see
+/// `None` content types from this function.
+pub(crate) fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
+    let url = data_url::DataUrl::process(raw).ok()?;
+    let (body, _fragment) = url.decode_to_vec().ok()?;
+    Some((url.mime_type().to_string(), body))
 }
 
 /// Decodes a URL into its UTF-8 text, percent-escapes included.
 fn percent_decode(source: &str) -> String {
-    String::from_utf8_lossy(&percent_decode_bytes(source)).into_owned()
-}
-
-fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    percent_encoding::percent_decode_str(source)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// Capture surface sides: at least 1 and at most the painter cap. A capture
@@ -1191,46 +1136,6 @@ fn capture_sides(width: u32, height: u32) -> Result<(u32, u32), TabError> {
         width.min(crate::render::MAX_VIEWPORT_SIDE),
         height.min(crate::render::MAX_VIEWPORT_SIDE),
     ))
-}
-
-/// Forgiving-base64 decode, the shape Fetch's data URL processor requires:
-/// whitespace is ignored, a length divisible by four drops trailing padding,
-/// a remainder of one is a failure, and any other character fails
-/// (<https://infra.spec.whatwg.org/#forgiving-base64-decode>).
-fn decode_base64(source: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut lookup = [0xff_u8; 256];
-    for (value, byte) in TABLE.iter().enumerate() {
-        lookup[*byte as usize] = u8::try_from(value).unwrap_or(0);
-    }
-    let cleaned: Vec<u8> = source
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
-    let body = if cleaned.len().is_multiple_of(4) {
-        let mut end = cleaned.len();
-        while end > 0 && cleaned[end - 1] == b'=' {
-            end -= 1;
-        }
-        &cleaned[..end]
-    } else {
-        &cleaned[..]
-    };
-    if body.len() % 4 == 1 || body.iter().any(|byte| lookup[*byte as usize] == 0xff) {
-        return None;
-    }
-    let mut output = Vec::with_capacity(body.len() / 4 * 3);
-    let mut buffer = 0_u32;
-    let mut bits = 0_u32;
-    for byte in body {
-        buffer = (buffer << 6) | u32::from(lookup[*byte as usize]);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push(((buffer >> bits) & 0xff) as u8);
-        }
-    }
-    Some(output)
 }
 
 impl Drop for Engine {
