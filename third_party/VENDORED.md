@@ -19,6 +19,18 @@ exception is the JS engine forks below, which do ship.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here.
 
+- **What**: the maintained Blitz fork tinybrowser builds against.
+- **Upstream**: <https://github.com/ericc-ch/blitz> at `third_party/blitz`
+  (upstream `https://github.com/DioxusLabs/blitz`).
+- **Wiring**: `[patch.crates-io]` path entries for `blitz-dom`,
+  `blitz-html`, `blitz-paint`, and `blitz-traits`; its own workspace excluded
+  from the tinybrowser workspace.
+- **Pinned revision**: `third_party/blitz` at `67edf20` (`master`, matching
+  crates.io `0.3.0-beta.2`; check `git submodule status`).
+- **Fresh clones**: `git submodule update --init --recursive`.
+- **Update**: pull upstream inside the submodule, push the fork branch there,
+  then bump the submodule pointer here. Push before pinning.
+
 ## Vendored crates (ship in the binary)
 
 - **What**: the `weedle4` WebIDL parser tinybrowser's bindgen builds against.

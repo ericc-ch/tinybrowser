@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["third_party/rquickjs", "third_party/weedle4", "third_party/fontconfig-parser"]
+exclude = ["third_party/rquickjs", "third_party/weedle4", "third_party/fontconfig-parser", "third_party/blitz"]
 members = [
     "crates/anyrender-tiny-skia",
     "crates/browser",
@@ -36,6 +36,10 @@ webstorage = { path = "crates/webstorage" }
 # fontconfig-parser 0.5.8 pins roxmltree 0.20; usvg and fontique pin 0.21.
 # The vendored crate is that release with the requirement moved to 0.21.1.
 fontconfig-parser = { path = "third_party/fontconfig-parser" }
+blitz-dom = { path = "third_party/blitz/packages/blitz-dom" }
+blitz-html = { path = "third_party/blitz/packages/blitz-html" }
+blitz-paint = { path = "third_party/blitz/packages/blitz-paint" }
+blitz-traits = { path = "third_party/blitz/packages/blitz-traits" }
 rquickjs = { path = "third_party/rquickjs" }
 rquickjs-core = { path = "third_party/rquickjs/core" }
 rquickjs-macro = { path = "third_party/rquickjs/macro" }

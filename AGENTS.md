@@ -31,6 +31,11 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
     `third_party/rquickjs` submodule (recursive) and wired in via
     `[patch.crates-io]` path entries. It is its own workspace, excluded from
     the tinybrowser workspace, so its lint config stays separate.
+  - Blitz fork `github.com/ericc-ch/blitz`. Checked out as the
+    `third_party/blitz` submodule and wired in via `[patch.crates-io]` path
+    entries for `blitz-dom`, `blitz-html`, `blitz-paint`, and `blitz-traits`.
+    It is its own workspace, excluded from the tinybrowser workspace, so its
+    lint config stays separate.
   - Pull upstream inside the submodule, push the fork branch there, then bump
     the submodule pointer in tinybrowser. Push before pinning: a pointer to
     an unpushed commit breaks every other checkout at init time (`not our

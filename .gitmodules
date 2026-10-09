@@ -4,3 +4,6 @@
 [submodule "third_party/rquickjs"]
 	path = third_party/rquickjs
 	url = https://github.com/ericc-ch/rquickjs.git
+[submodule "third_party/blitz"]
+	path = third_party/blitz
+	url = https://github.com/ericc-ch/blitz.git
