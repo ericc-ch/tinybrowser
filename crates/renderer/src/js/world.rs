@@ -749,6 +749,13 @@ pub(crate) struct World {
     /// does not resurrect the element's content attribute
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
     cleared_handlers: HashSet<(Option<NodeId>, String)>,
+    /// Containers whose insertion steps already fired `load` (src-less
+    /// iframes). A later container navigation clears the entry when it
+    /// starts, so that navigation's own `load` still fires; `finish_frame_load`
+    /// consumes whatever remains instead of re-reading the current `src` and
+    /// `srcdoc` attributes
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+    pub(crate) insertion_load_fired: HashSet<NodeId>,
     /// Stable `WebDriver` element ids for nodes, and the reverse lookup.
     remote_ids: HashMap<NodeId, u64>,
     remote_nodes: HashMap<u64, NodeId>,
@@ -878,6 +885,7 @@ impl World {
             bridge: None,
             handler_attributes: HashMap::new(),
             cleared_handlers: HashSet::new(),
+            insertion_load_fired: HashSet::new(),
             remote_ids: HashMap::new(),
             remote_nodes: HashMap::new(),
             pristine_number: None,

@@ -1,12 +1,17 @@
 # WPT harness
 
 `tools/wpt/run` runs `wpt run` against tinybrowser. It builds the debug
-binary only when that binary is missing or a compiled input is newer, and
-installs the wptrunner product into WPT's venv only when the venv is missing
-or its requirements changed. It defaults `--processes` to the CPU count
-(unless `--processes` or `--fully-parallel` is set), `--test-types testharness crashtest`, enables
-HTTPS with the wptserve CA, and passes `--resolve` maps instead of editing
-`/etc/hosts`.
+binary through cargo on every run (cargo's fingerprint no-ops when fresh),
+and installs the wptrunner product into WPT's venv only when the venv is
+missing or its stamp changed: the stamp covers the requirements files,
+`tools/wpt/*.py`, and the worktree root (one shared venv serves every
+worktree). The manifest walk is skipped with `--no-manifest-update` when the
+checkout state and manifest bytes match the last walked run. It defaults
+`--processes` to the CPU count capped at 8 (unless `--processes`,
+`--fully-parallel`, or `-f` is set), `--test-types testharness crashtest`,
+enables HTTPS with the wptserve CA, and passes `--resolve` maps instead of
+editing `/etc/hosts`. `TINYBROWSER_BINARY` uses a prebuilt binary as-is with
+no freshness check (it says so on stderr).
 
 ```sh
 nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
@@ -56,7 +61,8 @@ In `docs/progress.md`, replace the latest total and scored groups only.
 | reftest | Screenshot comparison through the WebDriver screenshot route; the engine has no chrome, so the outer window equals the inner 800x600 viewport. |
 | HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. |
-| Parallel processes | CPU count unless the command sets `--processes` or `--fully-parallel`. Each process gets its own browser and ports. `--fully-parallel` is separate: every test is its own group, so the browser restarts per test. |
+| Parallel processes | CPU count capped at 8 unless the command sets `--processes`, `--fully-parallel`, or `-f`. Each process gets its own browser and ports. `--fully-parallel`/`-f` is separate: every test is its own group, so the browser restarts per test. The count actually used is echoed as `wpt: processes N`. |
+| Skips and locks | The venv install holds the shared-venv lock only around an install that is still needed, then releases it before tests; a run that skips the install takes no lock. A run that lets wpt rewrite the shared manifest holds a manifest lock for the whole invocation; `--no-manifest-update` runs stay parallel. Runs passing `--install-browser`, `--install-webdriver`, `--manifest-download`, or `--install-fonts` hold the venv lock throughout, since wpt itself then writes into the venv. Test paths are moved before options (`--test-types` is `nargs='*'`, so a path after it would be swallowed); a first literal `--` separator is stripped. |
 
 ## Blocked on engine capabilities
 

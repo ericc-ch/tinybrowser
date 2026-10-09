@@ -1276,10 +1276,16 @@ impl Document {
 
     /// Nested HTML without scripts defers a realm: encoding-label WPT files
     /// create one iframe per label, and installing `QuickJS` in each stalls
-    /// those tests. XML documents and HTML with scripts still get a realm
+    /// those tests. Inline event handler content attributes need a realm too
+    /// (`<body onload=...>`, `<img onerror=...>` compile into handler
+    /// functions), as do registered init scripts, which evaluate in every
+    /// new realm. XML documents always get a realm
     /// (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
     fn skip_nested_html_realm(&self, parsed: &crate::Parsed) -> bool {
-        if parsed.xml_document || html_has_script(parsed) {
+        if parsed.xml_document || html_needs_realm(parsed) {
+            return false;
+        }
+        if !self.world.borrow().init_scripts.borrow().is_empty() {
             return false;
         }
         self.shared.borrow().tree.parent(self.frame).is_some()
@@ -1537,6 +1543,13 @@ impl Document {
                 None => {}
             }
         }
+        // The walk finished without starting a blocking fetch: every script
+        // has run, so the iframes after the last one (or all of them, when
+        // there are no scripts) get browsing contexts now. Deferred modules
+        // and `DOMContentLoaded` handlers must already see them; leaving
+        // adoption to `fire_document_end` puts it after `DOMContentLoaded`
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+        self.adopt_pending_frames();
         false
     }
 
@@ -1962,17 +1975,15 @@ impl Document {
         if !self.pending_frame_loads.remove(&container) {
             return false;
         }
-        // Src-less iframes already fire `load` from insertion steps
+        // A src-less iframe already fired `load` from its insertion steps;
+        // that firing is recorded per container, not re-read from the current
+        // attributes, so a later navigation reusing the container still fires
         // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
         let already_fired = self
             .world
-            .borrow()
-            .with_document(container, |parsed| {
-                crate::js::world::attr(&parsed.document.base, container.node, "src").is_none()
-                    && crate::js::world::attr(&parsed.document.base, container.node, "srcdoc")
-                        .is_none()
-            })
-            .unwrap_or(false);
+            .borrow_mut()
+            .insertion_load_fired
+            .remove(&container);
         if !already_fired {
             self.fire_node_load(container);
         }
@@ -1982,6 +1993,11 @@ impl Document {
 
     /// Drops a container that went away before its child finished loading.
     pub(crate) fn cancel_frame_load(&mut self, container: crate::js::world::NodeId) {
+        let _ = self
+            .world
+            .borrow_mut()
+            .insertion_load_fired
+            .remove(&container);
         if self.pending_frame_loads.remove(&container) {
             self.maybe_fire_load();
         }
@@ -1996,16 +2012,40 @@ impl Document {
     }
 }
 
-fn html_has_script(parsed: &crate::Parsed) -> bool {
+/// Whether parsed HTML needs a realm: a `script` element or any event
+/// handler content attribute (`on*`, same predicate as attribute-set
+/// compilation in `bindings/attributes.rs`). The walk is iterative so deep
+/// documents cannot overflow the stack.
+fn html_needs_realm(parsed: &crate::Parsed) -> bool {
     let base = &parsed.document.base;
     let mut stack = vec![base.root_node().id];
     while let Some(id) = stack.pop() {
+        let Some(node) = base.get_node(id) else {
+            continue;
+        };
         if crate::js::world::is_html_element(base, id, "script") {
             return true;
         }
-        if let Some(node) = base.get_node(id) {
-            stack.extend(node.children.iter().rev().copied());
+        if let Some(element) = node.data.downcast_element() {
+            if element.attrs.iter().any(|attribute| {
+                attribute.name.prefix.as_ref().is_none()
+                    && attribute.name.ns.as_ref().is_empty()
+                    && attribute
+                        .name
+                        .local
+                        .as_ref()
+                        .strip_prefix("on")
+                        .is_some_and(|typ| {
+                            !typ.is_empty()
+                                && typ.chars().all(|character| {
+                                    character.is_ascii_lowercase() || character.is_ascii_digit()
+                                })
+                        })
+            }) {
+                return true;
+            }
         }
+        stack.extend(node.children.iter().rev().copied());
     }
     false
 }

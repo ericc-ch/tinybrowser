@@ -2096,6 +2096,7 @@ fn run_html_insertion_steps(ctx: &Ctx<'_>, parent: NodeId, inserted: &[NodeId]) 
                 World::materialize_iframe(&world(ctx)?, id);
                 if fire_load {
                     super::window::fire_node_load(ctx, id)?;
+                    let _ = world(ctx)?.borrow_mut().insertion_load_fired.insert(id);
                 }
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
@@ -2213,6 +2214,7 @@ fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
             World::materialize_iframe(&world(ctx)?, id);
             if fire_load {
                 super::window::fire_node_load(ctx, id)?;
+                let _ = world(ctx)?.borrow_mut().insertion_load_fired.insert(id);
             }
         }
     }

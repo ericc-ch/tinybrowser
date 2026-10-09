@@ -794,9 +794,16 @@ impl Engine {
 
     /// Records a frame load so the parent's `load` event waits for it
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+    /// A later container navigation supersedes the insertion firing, so the
+    /// recorded entry is cleared: the navigation's own `load` must fire.
     fn mark_frame_load_pending(&mut self, container: crate::js::world::NodeId, parent: FrameId) {
         if let Some(document) = self.frames.get_mut(&parent) {
             document.mark_frame_load_pending(container);
+            let _ = document
+                .world()
+                .borrow_mut()
+                .insertion_load_fired
+                .remove(&container);
         }
     }
 

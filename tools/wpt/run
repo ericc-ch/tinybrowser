@@ -169,9 +169,12 @@ release_venv_lock() {
 }
 
 # Hash of everything an install would read. The editable product is included
-# so a checkout edit of tools/wpt still reinstalls.
+# so a checkout edit of tools/wpt still reinstalls. `$ROOT` is included
+# because one shared venv serves every worktree: without it worktree B would
+# trust a stamp worktree A's adapter wrote and test against A's product code.
 venv_stamp_payload() {
   {
+    printf 'root %s\n' "$ROOT"
     if [[ -x "$VENV/bin/python" ]]; then
       "$VENV/bin/python" -c 'import sys; print(sys.version)'
     else
@@ -352,6 +355,15 @@ write_manifest_stamp() {
   stamp="$(manifest_stamp_path "$manifest")"
   mkdir -p "$(dirname "$stamp")"
   manifest_token "$manifest" > "$stamp"
+}
+# True when this run let wpt (re)walk the manifest and the result parses:
+# test outcomes do not matter, so a failing run still records its walk
+# instead of rewalking on every iteration. A torn manifest (crashed walk)
+# is never stamped.
+manifest_is_walked() {
+  local manifest="$1"
+  (( manifest_locked == 1 )) || return 1
+  "$VENV/bin/python" -c 'import json,sys; json.load(open(sys.argv[1]))' "$manifest" 2>/dev/null
 }
 manifest_path_from_args() {
   local index=0 arg path="$WPT/MANIFEST.json"
@@ -537,10 +549,24 @@ if has_option --processes "${args[@]}"; then
   done
 fi
 set +e
-"$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}"
+if (( record_manifest_stamp == 0 )) && (( manifest_locked == 0 )) && (( venv_held_for_run == 0 )); then
+  # Fast path: nothing to record and nothing to serialize. `exec` restores
+  # direct signal delivery to the runner (a signal to the wrapper hits python,
+  # wptserve, and the browsers instead of stranding them behind bash).
+  exec "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}"
+fi
+# Slow path: a manifest walk and/or venv writes happen under this wrapper,
+# so bash stays parent and forwards signals to the runner explicitly.
+child=0
+trap 'if (( child )); then kill -TERM "$child" 2>/dev/null; fi' TERM INT HUP
+"$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}" &
+child=$!
+wait "$child"
 status=$?
+child=0
+trap - TERM INT HUP
 set -e
-if [[ "$status" -eq 0 && "$record_manifest_stamp" -eq 1 ]]; then
+if (( record_manifest_stamp == 1 )) && manifest_is_walked "$MANIFEST_PATH"; then
   write_manifest_stamp "$MANIFEST_PATH"
 fi
 if (( venv_held_for_run )); then
