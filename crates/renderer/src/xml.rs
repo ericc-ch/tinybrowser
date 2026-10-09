@@ -459,6 +459,18 @@ fn is_xml_whitespace(character: char) -> bool {
 /// External and parameter entities stay unresolved. Replacement text that
 /// contains markup is spliced into the source so the XML parser builds the
 /// corresponding nodes (<https://www.w3.org/TR/xml/#intern-replacement>).
+/// Billion-laughs protection: entity expansion is bounded three ways.
+/// Declaration count caps HashMap memory; depth caps the call stack
+/// (`expand_replacement` recurses per nesting level); the byte budget caps
+/// total output (a doubling chain otherwise turns kilobytes into gigabytes).
+/// Inputs are already capped at 8MB (`MAX_RESPONSE_BODY_BYTES`), so 32MB of
+/// expansion covers every legitimate document several times over.
+/// Exhaustion degrades gracefully: references stay literal text.
+const MAX_ENTITY_DECLS: usize = 10_000;
+const MAX_ENTITY_DEPTH: usize = 64;
+const MAX_EXPANDED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ENTITY_OVERHEAD: usize = 1024;
+
 fn expand_internal_general_entities(input: &str) -> Cow<'_, str> {
     let Some((body_start, entities)) = scan_internal_general_entities(input) else {
         return Cow::Borrowed(input);
@@ -468,7 +480,8 @@ fn expand_internal_general_entities(input: &str) -> Cow<'_, str> {
     }
     let mut output = String::with_capacity(input.len());
     output.push_str(&input[..body_start]);
-    expand_content(&input[body_start..], &entities, &mut output);
+    let mut budget = MAX_EXPANDED_BYTES;
+    expand_content(&input[body_start..], &entities, &mut output, &mut budget);
     Cow::Owned(output)
 }
 
@@ -554,7 +567,11 @@ fn parse_internal_general_entities(subset: &str) -> HashMap<String, String> {
         if let Some(decl) = rest.strip_prefix("<!ENTITY") {
             let (consumed, entity) = parse_general_entity_decl(decl);
             if let Some((name, value)) = entity {
-                entities.insert(name, value);
+                // Beyond the cap further declarations are ignored: their
+                // references stay literal, exactly like undefined entities.
+                if entities.len() < MAX_ENTITY_DECLS {
+                    entities.insert(name, value);
+                }
             }
             pos += "<!ENTITY".len() + consumed;
             continue;
@@ -614,7 +631,22 @@ fn parse_general_entity_decl(decl: &str) -> (usize, Option<(String, String)>) {
     (consumed, None)
 }
 
-fn expand_content(content: &str, entities: &HashMap<String, String>, output: &mut String) {
+/// Copies `text` into `output` while budget remains. Returns false when the
+/// budget ran out, telling the caller to copy the rest literally and stop
+/// expanding.
+fn push_budgeted(output: &mut String, text: &str, budget: &mut usize) -> bool {
+    let take = (*budget).min(text.len());
+    output.push_str(&text[..take]);
+    *budget -= take;
+    take == text.len()
+}
+
+fn expand_content(
+    content: &str,
+    entities: &HashMap<String, String>,
+    output: &mut String,
+    budget: &mut usize,
+) {
     let mut pos = 0;
     while pos < content.len() {
         let rest = &content[pos..];
@@ -632,27 +664,43 @@ fn expand_content(content: &str, entities: &HashMap<String, String>, output: &mu
             } else {
                 skip_markup(rest)
             };
-            output.push_str(&rest[..consumed]);
+            if !push_budgeted(output, &rest[..consumed], budget) {
+                // Budget gone: the rest of the document passes through
+                // unexpanded rather than growing without bound.
+                output.push_str(&content[pos + consumed..]);
+                return;
+            }
             pos += consumed;
             continue;
         }
         if rest.starts_with('&') {
-            if let Some((consumed, replacement)) = expand_entity_ref(rest, entities) {
-                output.push_str(&replacement);
+            if let Some(consumed) = expand_entity_ref(rest, entities, output, budget, 0) {
                 pos += consumed;
             } else {
-                output.push('&');
+                if !push_budgeted(output, "&", budget) {
+                    output.push_str(&content[pos + 1..]);
+                    return;
+                }
                 pos += 1;
             }
             continue;
         }
         let next = rest.find(['<', '&']).unwrap_or(rest.len());
-        output.push_str(&rest[..next]);
+        if !push_budgeted(output, &rest[..next], budget) {
+            output.push_str(&content[pos + next..]);
+            return;
+        }
         pos += next;
     }
 }
 
-fn expand_entity_ref(rest: &str, entities: &HashMap<String, String>) -> Option<(usize, String)> {
+fn expand_entity_ref(
+    rest: &str,
+    entities: &HashMap<String, String>,
+    output: &mut String,
+    budget: &mut usize,
+    depth: usize,
+) -> Option<usize> {
     let body = rest.strip_prefix('&')?;
     if body.starts_with('#') {
         return None;
@@ -662,57 +710,82 @@ fn expand_entity_ref(rest: &str, entities: &HashMap<String, String>) -> Option<(
     if !is_valid_name(name) {
         return None;
     }
-    let value = entities.get(name)?;
+    let value = entities.get(name)?.clone();
     let mut seen = HashSet::new();
     seen.insert(name.to_owned());
-    Some((name_end + 2, expand_replacement(value, entities, &mut seen)))
+    expand_replacement(&value, entities, output, budget, &mut seen, depth);
+    Some(name_end + 2)
 }
 
 fn expand_replacement(
     value: &str,
     entities: &HashMap<String, String>,
+    output: &mut String,
+    budget: &mut usize,
     seen: &mut HashSet<String>,
-) -> String {
-    let mut output = String::with_capacity(value.len());
+    depth: usize,
+) {
+    // The value is cloned at the call site so `entities` is never borrowed
+    // while `output` grows; replacement text only ever appends.
     let mut pos = 0;
     while pos < value.len() {
+        if *budget == 0 {
+            return;
+        }
         let rest = &value[pos..];
         if let Some(amp) = rest.find('&') {
-            output.push_str(&rest[..amp]);
+            if !push_budgeted(output, &rest[..amp], budget) {
+                return;
+            }
             let ref_rest = &rest[amp..];
-            if let Some((consumed, replacement)) = expand_nested_ref(ref_rest, entities, seen) {
-                output.push_str(&replacement);
+            if let Some(consumed) =
+                expand_nested_ref(ref_rest, entities, output, budget, seen, depth)
+            {
                 pos += amp + consumed;
             } else {
-                output.push('&');
+                if !push_budgeted(output, "&", budget) {
+                    return;
+                }
                 pos += amp + 1;
             }
         } else {
-            output.push_str(rest);
+            push_budgeted(output, rest, budget);
             break;
         }
     }
-    output
 }
 
 fn expand_nested_ref(
     rest: &str,
     entities: &HashMap<String, String>,
+    output: &mut String,
+    budget: &mut usize,
     seen: &mut HashSet<String>,
-) -> Option<(usize, String)> {
+    depth: usize,
+) -> Option<usize> {
     let body = rest.strip_prefix('&')?;
     if body.starts_with('#') {
         return None;
     }
     let name_end = body.find(';')?;
     let name = &body[..name_end];
-    if !is_valid_name(name) || !seen.insert(name.to_owned()) {
+    // Depth caps the call stack; the `seen` set still rejects cycles below it.
+    // The budget covers output bytes (via `push_budgeted`), but each nested
+    // expansion also costs traversal work (HashSet insert/remove plus string
+    // allocation per reference), so every expansion prepays a flat overhead:
+    // without it an attacker trades bounded output for unbounded CPU.
+    if *budget == 0
+        || depth >= MAX_ENTITY_DEPTH
+        || !is_valid_name(name)
+        || !seen.insert(name.to_owned())
+    {
         return None;
     }
-    let value = entities.get(name)?;
-    let expanded = expand_replacement(value, entities, seen);
+    *budget = budget.saturating_sub(MAX_ENTITY_OVERHEAD);
+    let value = entities.get(name)?.clone();
+    expand_replacement(&value, entities, output, budget, seen, depth + 1);
     seen.remove(name);
-    Some((name_end + 2, expanded))
+    Some(name_end + 2)
 }
 
 /// Whether `name` matches the XML `Name` production
@@ -735,4 +808,64 @@ pub(crate) fn is_name_start(character: char) -> bool {
 pub(crate) fn is_name_char(character: char) -> bool {
     is_name_start(character)
         || matches!(character, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_EXPANDED_BYTES, expand_internal_general_entities};
+
+    fn doctype_with(decls: &str, body: &str) -> String {
+        format!("<!DOCTYPE r [{decls}]><r>{body}</r>")
+    }
+
+    #[test]
+    fn legitimate_entities_still_expand() {
+        let input = doctype_with("<!ENTITY name \"world\">", "hello &name;!");
+        let expanded = expand_internal_general_entities(&input);
+        assert!(
+            expanded.contains("hello world!"),
+            "unexpected expansion: {expanded:?}"
+        );
+    }
+
+    #[test]
+    fn entity_cycles_stay_literal() {
+        let input = doctype_with(
+            "<!ENTITY a \"&b;\"><!ENTITY b \"&a;\">",
+            "&a;",
+        );
+        let expanded = expand_internal_general_entities(&input);
+        assert!(
+            expanded.len() < 1024,
+            "cycle exploded: {} bytes",
+            expanded.len()
+        );
+    }
+
+    // Ten doubling levels turn ~100 bytes into ~100KB legitimately; without
+    // a budget the same shape at depth 30+ exhausts memory (billion laughs).
+    #[test]
+    fn exponential_entity_chain_stays_bounded() {
+        let mut decls = String::from("<!ENTITY a0 \"x\">");
+        for level in 1..30 {
+            decls.push_str(&format!(
+                "<!ENTITY a{level} \"&a{};&a{};\">",
+                level - 1,
+                level - 1
+            ));
+        }
+        let input = doctype_with(&decls, "&a29;");
+        let start = std::time::Instant::now();
+        let expanded = expand_internal_general_entities(&input);
+        let elapsed = start.elapsed();
+        assert!(
+            expanded.len() <= input.len() + MAX_EXPANDED_BYTES,
+            "expansion escaped the budget: {} bytes",
+            expanded.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "expansion took too long: {elapsed:?}"
+        );
+    }
 }

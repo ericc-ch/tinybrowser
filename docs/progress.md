@@ -89,7 +89,6 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 | `document-picture-in-picture/` | 4.5% |
 | `document-policy/` | 0.0% |
 | `dom/` | 30.2% |
-| `dom/nodes/` (slice) | 78.5% |
 | `domparsing/` | 27.0% |
 | `domxpath/` | 5.9% |
 | `dpub-aam/` | 0.0% |

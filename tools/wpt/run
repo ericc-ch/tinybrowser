@@ -107,39 +107,19 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-# True when $1 is missing or an input that is compiled into the binary is newer.
-# Docs and the WPT tree are not inputs. `cargo metadata` (via binary-path) is
-# not a build.
-binary_is_stale() {
-  local binary="$1" target_dir newer
-  [[ -x "$binary" ]] || return 0
-  target_dir="$(dirname "$(dirname "$binary")")"
-  newer="$(
-    find "$ROOT" \
-      \( -path "$ROOT/.git" -o -path "$target_dir" -o -path "$ROOT/target" \
-         -o -path "$ROOT/third_party/wpt" -o -path "$ROOT/third_party/blink-cdp" \
-         -o -name node_modules \) -prune -o \
-      -type f \( \
-        -name '*.rs' -o -name '*.js' -o -name '*.idl' -o -name '*.c' -o -name '*.h' \
-        -o -name '*.cc' -o -name '*.cpp' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \
-        -o -name 'build.rs' -o -name 'order.txt' -o -name 'rust-toolchain.toml' \
-        -o -name 'config.toml' \
-      \) -newer "$binary" -print -quit
-  )"
-  [[ -n "$newer" ]]
-}
-
+# `cargo build` decides freshness itself: its fingerprint tracks every compiled
+# input (sources, `include_str!`/`include_bytes!` data, Cargo files, RUSTFLAGS,
+# the toolchain) and no-ops when fresh. No hand-rolled extension/mtime gate on
+# top: one reimplemented this worse (it missed data files, deletions, env
+# changes, and shared target dirs) and it is gone.
 cd "$ROOT"
 if [[ -n "${TINYBROWSER_BINARY:-}" ]]; then
   BINARY="$TINYBROWSER_BINARY"
+  echo "wpt: using prebuilt TINYBROWSER_BINARY without a freshness check: $BINARY" >&2
 else
   BINARY="$("$ROOT/tools/binary-path")"
-  if binary_is_stale "$BINARY"; then
-    echo "wpt: building tinybrowser" >&2
-    cargo build -q --offline 2>/dev/null || cargo build -q
-  else
-    echo "wpt: binary is current, skipping cargo build" >&2
-  fi
+  echo "wpt: building tinybrowser (cargo no-ops when fresh)" >&2
+  cargo build -q --offline 2>/dev/null || cargo build -q
 fi
 if [[ ! -x "$BINARY" ]]; then
   echo "tinybrowser binary not found at $BINARY" >&2
@@ -169,7 +149,7 @@ acquire_venv_lock() {
   local lock_dir lock lock_timeout
   lock_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tinybrowser"
   mkdir -p "$lock_dir"
-  lock="$lock_dir/wpt-$(realpath -m "$VENV" | cksum | cut -d' ' -f1).lock"
+  lock="$lock_dir/wpt-$(realpath -m "$VENV" | sha256sum | cut -c1-16).lock"
   exec 9>"$lock"
   if ! flock -n 9; then
     lock_timeout="${TINYBROWSER_WPT_LOCK_TIMEOUT:-1800}"
@@ -259,10 +239,30 @@ for arg in "$@"; do
   args+=("$arg")
 done
 has_option() {
+  # Exact, `opt=value`, or unambiguous-prefix abbreviation: wpt's argparse
+  # parser runs with allow_abbrev, so `--proc 2` already means `--processes`.
+  # Treating an ambiguous-or-unknown prefix as present is the safe direction:
+  # we skip injecting our default and wpt itself errors loudly on ambiguity.
   local option="$1" arg
   shift
   for arg in "$@"; do
-    [[ "$arg" == "$option" || "$arg" == "$option="* ]] && return 0
+    if [[ "$arg" == "$option" || "$arg" == "$option="* ]]; then
+      return 0
+    fi
+    if [[ "$option" == --* && "$arg" == --* && "$arg" != *=* && ${#arg} -ge 4 && "$option" == "$arg"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+# The test types wpt knows, in one place. Verified against
+# wptrunner/wpttest.py `enabled_tests` at runtime (below) when --test-types
+# is passed; the check warns instead of breaking the run.
+KNOWN_TEST_TYPES="testharness crashtest test262 wdspec print-reftest aamtest reftest"
+is_known_test_type() {
+  local candidate="$1" known
+  for known in $KNOWN_TEST_TYPES; do
+    [[ "$candidate" == "$known" ]] && return 0
   done
   return 1
 }
@@ -279,20 +279,17 @@ if has_option --test-types "${args[@]}"; then
     if [[ "$arg" == "--test-types" ]]; then
       test_types+=("$arg")
       index=$((index + 1))
-      while (( index < count )); do
-        case "${args[$index]}" in
-          # Keep in sync with wpttest.enabled_tests
-          # (tools/wptrunner/wptrunner/wpttest.py).
-          testharness|crashtest|test262|wdspec|print-reftest|aamtest|reftest)
-            test_types+=("${args[$index]}")
-            index=$((index + 1))
-            ;;
-          *)
-            break
-            ;;
-        esac
+      while (( index < count )) && is_known_test_type "${args[$index]}"; do
+        test_types+=("${args[$index]}")
+        index=$((index + 1))
       done
-      continue
+      # Fall through: whatever follows (an unknown type name or a test path)
+      # is handled as a normal argument below, so a typo stays visible to wpt
+      # instead of being silently dropped.
+      if (( index >= count )); then
+        continue
+      fi
+      arg="${args[$index]}"
     fi
     reordered+=("$arg")
     index=$((index + 1))
@@ -312,22 +309,28 @@ if ! has_option --manifest "${args[@]}"; then
   args=(--manifest "$WPT/MANIFEST.json" "${args[@]}")
 fi
 # Current means the last successful run that was allowed to update already
-# walked this checkout: same HEAD, same local edits (ignored files such as
-# the venv do not count), and the same manifest bytes on disk. wptrunner
-# otherwise rewalks the tree on every run (`manifest_update` defaults on).
+# walked this checkout: same HEAD, same tracked modifications by content
+# (binary assets included), same untracked files by name and content, and the
+# same manifest bytes on disk. wptrunner otherwise rewalks the tree on every
+# run (`manifest_update` defaults on).
 manifest_stamp_path() {
   local key
-  key="$(realpath -m "$1" | cksum | cut -d' ' -f1)"
+  key="$(realpath -m "$1" | sha256sum | cut -c1-16)"
   echo "${XDG_CACHE_HOME:-$HOME/.cache}/tinybrowser/wpt-manifest-$key.stamp"
 }
+# The worktree state hashed by content. `git status` names every change
+# (including deletions and renames, which have no content to hash); the two
+# `xargs` lines hash the contents of modified and untracked files, so binary
+# assets count by bytes, not by a `Binary files differ` placeholder.
 manifest_token() {
   local manifest="$1"
   {
-    git -C "$WPT" rev-parse HEAD
-    git -C "$WPT" diff HEAD --
-    git -C "$WPT" ls-files --others --exclude-standard
+    printf 'rev %s\n' "$(git -C "$WPT" rev-parse HEAD 2>/dev/null || echo no-git)"
+    git -C "$WPT" status --porcelain=v1 --untracked-files=all 2>/dev/null || echo no-git-status
+    git -C "$WPT" diff HEAD --name-only -z 2>/dev/null | (cd "$WPT" && xargs -0 -r sha256sum 2>/dev/null || true)
+    git -C "$WPT" ls-files --others --exclude-standard -z 2>/dev/null | (cd "$WPT" && xargs -0 -r sha256sum 2>/dev/null || true)
     if [[ -f "$manifest" ]]; then
-      stat -c '%Y %s' "$manifest"
+      sha256sum "$manifest"
     else
       echo missing
     fi
@@ -336,12 +339,16 @@ manifest_token() {
 manifest_is_current() {
   local manifest="$1" stamp
   [[ -f "$manifest" ]] || return 1
+  # Without a git revision every tree looks alike; always rewalk instead of
+  # trusting a stamp that cannot tell checkouts apart.
+  git -C "$WPT" rev-parse HEAD >/dev/null 2>&1 || return 1
   stamp="$(manifest_stamp_path "$manifest")"
   [[ -f "$stamp" ]] || return 1
   [[ "$(manifest_token "$manifest")" == "$(<"$stamp")" ]]
 }
 write_manifest_stamp() {
   local manifest="$1" stamp
+  git -C "$WPT" rev-parse HEAD >/dev/null 2>&1 || return 0
   stamp="$(manifest_stamp_path "$manifest")"
   mkdir -p "$(dirname "$stamp")"
   manifest_token "$manifest" > "$stamp"
@@ -353,7 +360,11 @@ manifest_path_from_args() {
     if [[ "$arg" == --manifest=* ]]; then
       path="${arg#--manifest=}"
     elif [[ "$arg" == --manifest ]]; then
-      path="${args[$((index + 1))]:-}"
+      if (( index + 1 >= ${#args[@]} )); then
+        echo "wpt: --manifest needs a value" >&2
+        exit 1
+      fi
+      path="${args[$((index + 1))]}"
     fi
     index=$((index + 1))
   done
@@ -383,6 +394,11 @@ if ! has_option --processes "${args[@]}" && ! has_option --fully-parallel "${arg
   if ! [[ "$processes" =~ ^[1-9][0-9]*$ ]]; then
     processes=1
   fi
+  # Unbounded browsers OOM shared/CI boxes and stop helping past a point
+  # (4 CPUs: 4 procs ~30s, 8 procs ~28s). Explicit --processes still wins.
+  if (( processes > 8 )); then
+    processes=8
+  fi
   args+=(--processes "$processes")
 fi
 if ! has_option --test-types "${args[@]}"; then
@@ -399,10 +415,11 @@ fi
 if ! has_option --ssl-type "${args[@]}"; then
   args=(--ssl-type=openssl "${args[@]}")
 fi
-# The product token is inserted immediately before this list. wpt's parser
-# then rejects a test path that follows an option: `--test-types` is
+# wpt's parser rejects a test path that follows an option: `--test-types` is
 # nargs='*', so argparse will not take a later positional. Bare paths lead;
-# option values stay with their options.
+# option values stay with their options. Unknown options are treated as
+# valueless: their would-be value stays a positional where wpt rejects it
+# loudly, instead of an option being swallowed silently.
 reorder_test_paths() {
   local -a paths=() opts=()
   local i=0 count=${#args[@]} arg
@@ -421,16 +438,9 @@ reorder_test_paths() {
     case "$arg" in
       --test-types)
         i=$((i + 1))
-        while (( i < count )); do
-          case "${args[$i]}" in
-            testharness|crashtest|test262|wdspec|print-reftest|aamtest|reftest)
-              opts+=("${args[$i]}")
-              i=$((i + 1))
-              ;;
-            *)
-              break
-              ;;
-          esac
+        while (( i < count )) && is_known_test_type "${args[$i]}"; do
+          opts+=("${args[$i]}")
+          i=$((i + 1))
         done
         ;;
       --run-by-dir|--debugger|--chaos|--trace-categories)
@@ -451,7 +461,10 @@ reorder_test_paths() {
         i=$((i + 1))
         ;;
       *)
-        if (( i + 1 < count )); then
+        # Unknown option: only take a value when it cannot be another option.
+        # A genuine `-`-leading value is rare; swallowing an option is silent
+        # corruption (it vanishes and its slot becomes a test path).
+        if (( i + 1 < count )) && [[ "${args[$((i + 1))]}" == "-" || "${args[$((i + 1))]}" != -* ]]; then
           i=$((i + 1))
           opts+=("${args[$i]}")
         fi
@@ -468,6 +481,61 @@ reorder_test_paths() {
   fi
 }
 reorder_test_paths
+# Warn when our test-type list drifts from wpt's own (only when it matters).
+# Never breaks the run: worst case the reorder above treats a new type as a
+# path, which wpt rejects loudly.
+if has_option --test-types "${args[@]}"; then
+  actual_types="$("$VENV/bin/python" -c 'import sys; sys.path.insert(0, "tools/wptrunner"); from wptrunner import wpttest; print(" ".join(sorted(wpttest.enabled_tests)))' 2>/dev/null || true)"
+  if [[ -n "$actual_types" && "$actual_types" != "$KNOWN_TEST_TYPES" ]]; then
+    echo "wpt: KNOWN_TEST_TYPES drifts from wpttest.enabled_tests ($actual_types); update tools/wpt/run" >&2
+  fi
+fi
+# The manifest walk below rewrites the shared MANIFEST.json. Runs that skip
+# the walk (--no-manifest-update) take no lock and stay parallel; a run that
+# will walk holds a manifest lock across the invocation so two stale runs
+# cannot rewrite it concurrently.
+manifest_locked=0
+acquire_manifest_lock() {
+  if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" == 1 ]]; then
+    return 0
+  fi
+  local lock_dir lock
+  lock_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tinybrowser"
+  mkdir -p "$lock_dir"
+  lock="$lock_dir/wpt-manifest-$(realpath -m "$MANIFEST_PATH" | sha256sum | cut -c1-16).lock"
+  exec 8>"$lock"
+  flock 8
+  manifest_locked=1
+}
+release_manifest_lock() {
+  if (( manifest_locked )); then
+    exec 8>&-
+    manifest_locked=0
+  fi
+}
+if ! has_option --no-manifest-update "${args[@]}"; then
+  acquire_manifest_lock
+fi
+# Flags that make wpt itself write into the shared venv must hold the venv
+# lock for the whole run, not just the install: otherwise an unlocked run's
+# writes interleave with another run's `uv pip install`.
+venv_held_for_run=0
+if has_option --install-browser "${args[@]}" || has_option --install-webdriver "${args[@]}" \
+  || has_option --manifest-download "${args[@]}" || has_option --install-fonts "${args[@]}"; then
+  acquire_venv_lock
+  venv_held_for_run=1
+fi
+if has_option --processes "${args[@]}"; then
+  for (( i = 0; i < ${#args[@]}; i++ )); do
+    if [[ "${args[$i]}" == --processes ]]; then
+      echo "wpt: processes ${args[$((i + 1))]:-?}" >&2
+      break
+    elif [[ "${args[$i]}" == --processes=* ]]; then
+      echo "wpt: processes ${args[$i]#--processes=}" >&2
+      break
+    fi
+  done
+fi
 set +e
 "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}"
 status=$?
@@ -475,4 +543,8 @@ set -e
 if [[ "$status" -eq 0 && "$record_manifest_stamp" -eq 1 ]]; then
   write_manifest_stamp "$MANIFEST_PATH"
 fi
+if (( venv_held_for_run )); then
+  release_venv_lock
+fi
+release_manifest_lock
 exit "$status"

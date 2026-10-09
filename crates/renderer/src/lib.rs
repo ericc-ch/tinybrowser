@@ -253,14 +253,18 @@ impl PreambleScan<'_> {
     }
 
     fn starts_with_keyword(&self, keyword: &str, ignore_ascii_case: bool) -> bool {
-        let rest = self.rest();
+        // Byte comparison: the keywords are ASCII, but `rest` may hold a
+        // multibyte character whose bytes straddle `keyword.len()`. Slicing
+        // `&str` there panics; bytes never do
+        // (<https://doc.rust-lang.org/std/primitive.str.html#method.get>).
+        let rest = self.rest().as_bytes();
         if rest.len() < keyword.len() {
             return false;
         }
         if ignore_ascii_case {
-            rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+            rest[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
         } else {
-            &rest[..keyword.len()] == keyword
+            rest.starts_with(keyword.as_bytes())
         }
     }
 
@@ -268,7 +272,7 @@ impl PreambleScan<'_> {
         if !self.starts_with_keyword("<!DOCTYPE", !xml) {
             return None;
         }
-        let after = self.rest()[9..].chars().next()?;
+        let after = self.rest().get(9..)?.chars().next()?;
         if !is_preamble_whitespace(after) {
             return None;
         }
@@ -320,7 +324,10 @@ impl PreambleScan<'_> {
         if !self.starts_with_keyword(keyword, ignore_ascii_case) {
             return false;
         }
-        let boundary = self.rest()[keyword.len()..].chars().next();
+        let boundary = self
+            .rest()
+            .get(keyword.len()..)
+            .and_then(|after| after.chars().next());
         if boundary.is_some_and(|c| !is_preamble_whitespace(c) && c != '>') {
             return false;
         }
@@ -348,4 +355,43 @@ impl PreambleScan<'_> {
 
 fn is_preamble_whitespace(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\u{000c}' | '\r' | ' ')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QuirksMode, scan_leading_doctype, sniff_quirks_mode};
+
+    // The preamble scanner slices near attacker-controlled bytes. Every
+    // input below once panicked (or risked panicking) on a non-char-boundary
+    // byte index; none may panic, whatever they return.
+    #[test]
+    fn preamble_scan_never_panics_on_partial_or_multibyte_input() {
+        let inputs = [
+            "",
+            "<",
+            "<!DOC",
+            "<!DOCTYPE",
+            "<!DOCTYPE ",
+            "<!DOCTYPE a",
+            "<!DOCTYPE a SYSTE",
+            "<!DOCTYPE a SYSTE\u{e9}>",
+            "<!DOCTYPE a PUBLI\u{e9}\">",
+            "<ab>\u{65e5}\u{672c}\u{8a9e}</ab>",
+            "<!DOCTYPE \u{65e5}\u{672c}\u{8a9e}>",
+            "\u{feff}<!DOCTYPE html>",
+            "<!-- unterminated",
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\"",
+            "<?\u{65e5}?>",
+            "<!\u{e9}DOCTYPE html>",
+        ];
+        for input in inputs {
+            let _ = sniff_quirks_mode(input);
+            let _ = scan_leading_doctype(input, false);
+            let _ = scan_leading_doctype(input, true);
+            // Quirks is the only mode the exact-`html` production escapes.
+            if input == "\u{feff}<!DOCTYPE html>" {
+                assert_eq!(sniff_quirks_mode(input), QuirksMode::NoQuirks);
+            }
+        }
+    }
 }

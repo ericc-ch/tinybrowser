@@ -205,9 +205,10 @@ const __tbQueuePageRequest = (url, method, body, headers, callback) => {
   const id = ++host.__tb_fetchSeq;
   // Snapshot the document referrer at `fetch()` time. Body extraction is
   // async, so a later `meta name=referrer` insertion would otherwise apply
-  // to this request
+  // to this request. The request URL goes along: the policy (same-origin,
+  // downgrade) is decided against it
   // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-  const referrer = host.__tbReferrer();
+  const referrer = host.__tbReferrer(url);
   host.__tb_fetchCbs[id] = function(status, bytes, finalUrl, contentType, responseHeaders) {
     delete host.__tb_fetchCbs[id];
     callback(status, bytes, finalUrl, contentType, responseHeaders);

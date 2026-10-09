@@ -823,9 +823,9 @@ impl JsRealm {
         let referrer_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbReferrer",
-            Func::from(move || {
+            Func::from(move |request_url: String| {
                 let world = referrer_world.borrow();
-                fetch_referrer(&world)
+                fetch_referrer(&world, &request_url)
             }),
         )?;
         bridge::object(ctx)?.set(
@@ -1261,13 +1261,77 @@ impl Drop for ClearInterrupt<'_> {
 
 /// `Referer` for a page `fetch()` at call time
 /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-fn fetch_referrer(world: &World) -> Option<String> {
-    if world.referrer_policy.eq_ignore_ascii_case("no-referrer")
-        || world.referrer_policy.eq_ignore_ascii_case("never")
-    {
-        None
+/// The `Referer` header for a request to `request_url`, decided from the
+/// document's referrer policy
+/// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+/// Credentials and fragments never leave; local-scheme (`about:`, `blob:`,
+/// `data:`) documents send nothing; an empty policy means
+/// `strict-origin-when-cross-origin`.
+fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
+    referrer_for_policy(
+        &world.referrer_policy,
+        &world.document_url,
+        request_url,
+    )
+}
+
+fn referrer_for_policy(
+    policy: &str,
+    document_url: &Url,
+    request_url: &str,
+) -> Option<String> {
+    let policy = if policy.is_empty() {
+        "strict-origin-when-cross-origin"
     } else {
-        Some(world.document_url.to_string())
+        policy
+    };
+    if policy.eq_ignore_ascii_case("no-referrer") || policy.eq_ignore_ascii_case("never") {
+        return None;
+    }
+    if !matches!(document_url.scheme(), "http" | "https") {
+        return None;
+    }
+    let request = Url::parse(request_url).ok()?;
+    let downgrade =
+        document_url.scheme() == "https" && matches!(request.scheme(), "http" | "ws");
+    let same_origin = document_url.scheme() == request.scheme()
+        && document_url.host_str() == request.host_str()
+        && document_url.port_or_known_default() == request.port_or_known_default();
+    // The source with credentials and fragment stripped, for the full-URL
+    // policies.
+    let mut stripped = document_url.clone();
+    let _ = stripped.set_username("");
+    let _ = stripped.set_password(None);
+    stripped.set_fragment(None);
+    // The source's origin, for the origin-only policies.
+    let origin = document_url.origin().ascii_serialization();
+    if policy.eq_ignore_ascii_case("unsafe-url") {
+        Some(stripped.to_string())
+    } else if policy.eq_ignore_ascii_case("origin") {
+        Some(origin)
+    } else if policy.eq_ignore_ascii_case("same-origin") {
+        same_origin.then(|| stripped.to_string())
+    } else if policy.eq_ignore_ascii_case("origin-when-cross-origin") {
+        Some(if same_origin {
+            stripped.to_string()
+        } else {
+            origin
+        })
+    } else if policy.eq_ignore_ascii_case("strict-origin") {
+        (!downgrade).then(|| origin)
+    } else if policy.eq_ignore_ascii_case("no-referrer-when-downgrade") {
+        (!downgrade).then(|| stripped.to_string())
+    } else {
+        // `strict-origin-when-cross-origin` and anything unrecognized: the
+        // strict default. Unknown tokens fail closed to the default rather
+        // than leaking the full URL.
+        if downgrade {
+            None
+        } else if same_origin {
+            Some(stripped.to_string())
+        } else {
+            Some(origin)
+        }
     }
 }
 
@@ -1391,4 +1455,71 @@ fn millis(delay: f64) -> u32 {
 /// so a value that cannot be numbered exactly is not addressable at all.
 pub(crate) fn js_number(id: u64) -> f64 {
     u32::try_from(id).map_or(f64::NAN, f64::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::referrer_for_policy;
+    use url::Url;
+
+    fn referrer(policy: &str, document: &str, request: &str) -> Option<String> {
+        referrer_for_policy(
+            policy,
+            &Url::parse(document).expect("document url"),
+            request,
+        )
+    }
+
+    // The policy matrix of
+    // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>.
+    #[test]
+    fn referrer_policy_matrix() {
+        let doc = "https://user:pass@example.com:8443/path?q=1#frag";
+        // Default (empty) is strict-origin-when-cross-origin.
+        assert_eq!(
+            referrer("", doc, "https://example.com:8443/other"),
+            Some("https://example.com:8443/path?q=1".to_owned())
+        );
+        assert_eq!(
+            referrer("", doc, "https://other.test/x"),
+            Some("https://example.com:8443".to_owned())
+        );
+        assert_eq!(referrer("", doc, "http://example.com:8443/x"), None);
+        // Credentials and fragments never leave, under any policy.
+        assert_eq!(
+            referrer("unsafe-url", doc, "https://other.test/x"),
+            Some("https://example.com:8443/path?q=1".to_owned())
+        );
+        assert_eq!(
+            referrer("origin", doc, "https://other.test/x"),
+            Some("https://example.com:8443".to_owned())
+        );
+        assert_eq!(
+            referrer("same-origin", doc, "https://example.com:8443/other"),
+            Some("https://example.com:8443/path?q=1".to_owned())
+        );
+        assert_eq!(
+            referrer("same-origin", doc, "https://other.test/x"),
+            None
+        );
+        assert_eq!(
+            referrer("origin-when-cross-origin", doc, "https://other.test/x"),
+            Some("https://example.com:8443".to_owned())
+        );
+        assert_eq!(
+            referrer("no-referrer", doc, "https://example.com:8443/other"),
+            None
+        );
+        assert_eq!(
+            referrer("no-referrer-when-downgrade", doc, "http://example.com/x"),
+            None
+        );
+        // Local-scheme documents send nothing.
+        assert_eq!(
+            referrer("unsafe-url", "about:blank", "https://other.test/x"),
+            None
+        );
+        // Unparseable request URLs send nothing rather than leaking.
+        assert_eq!(referrer("", doc, "http://["), None);
+    }
 }
