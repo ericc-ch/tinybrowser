@@ -1245,11 +1245,11 @@ impl World {
         for (frame, container) in pending {
             let mut document = Document::with_shared(frame, &runtime, &init_scripts);
             // Frames created from parsed markup share the tab's viewport too.
-            document.set_viewport_size(viewport);
-            // Parser `iframe`s navigate after adopt; skip a realm on the
-            // initial about:blank the way script insertion already does
+            // This path runs before page script, so the realm can exist for
+            // `contentWindow` in the following classic script
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-            document.load_about_blank_tree(Some(base_url.as_str()));
+            document.set_viewport_size(viewport);
+            document.load_about_blank(Some(base_url.as_str()));
             loaded.push((frame, container, document));
             created.push(container);
         }

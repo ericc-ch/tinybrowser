@@ -647,11 +647,11 @@ impl Document {
         body: &[u8],
     ) {
         self.load_response_body(url, content_type, body);
-        // Nested frames skip a realm until a script or `contentWindow` needs
-        // one. Encoding-label maps create one iframe per label; installing a
-        // QuickJS context for each scriptless document stalls those tests
+        // Nested HTML documents without scripts skip a realm at parse;
+        // `fire_ready_frame_loads` creates one when the parent is not in the
+        // encoding-label burst
         // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
-        if self.shared.borrow().tree.parent(self.frame).is_none() {
+        if self.js.is_none() && self.shared.borrow().tree.parent(self.frame).is_none() {
             self.ensure_js_ok();
         }
     }
@@ -1082,7 +1082,7 @@ impl Document {
 
     /// Ensures the frame's realm exists, recording a failed script when it
     /// cannot be created.
-    fn ensure_js_ok(&mut self) -> bool {
+    pub(crate) fn ensure_js_ok(&mut self) -> bool {
         if self.ensure_js().is_err() {
             self.record_event(RendererEvent::ScriptFailed);
             return false;
@@ -1274,16 +1274,28 @@ impl Document {
         self.world.borrow().runtime.font_ctx.clone()
     }
 
+    /// Nested HTML without scripts defers a realm: encoding-label WPT files
+    /// create one iframe per label, and installing `QuickJS` in each stalls
+    /// those tests. XML documents and HTML with scripts still get a realm
+    /// (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
+    fn skip_nested_html_realm(&self, parsed: &crate::Parsed) -> bool {
+        if parsed.xml_document || html_has_script(parsed) {
+            return false;
+        }
+        self.shared.borrow().tree.parent(self.frame).is_some()
+    }
+
     /// Installs `parsed` as the active document and registers it, reporting
     /// whether a realm owns it afterwards.
     fn install_parsed(&mut self, parsed: Parsed) -> bool {
         if self.js.is_none() {
+            let skip_js = self.defer_js || self.skip_nested_html_realm(&parsed);
             let document = self.world.borrow_mut().replace_document(parsed);
             self.register_document(document);
             // Style resolution and scripts both read the viewport; apply the
             // frame's size before the realm evaluates anything.
             self.apply_viewport();
-            if self.defer_js || self.shared.borrow().tree.parent(self.frame).is_some() {
+            if skip_js {
                 return true;
             }
             self.ensure_js().is_ok()
@@ -1982,6 +1994,20 @@ impl Document {
         }
         self.events.push(event);
     }
+}
+
+fn html_has_script(parsed: &crate::Parsed) -> bool {
+    let base = &parsed.document.base;
+    let mut stack = vec![base.root_node().id];
+    while let Some(id) = stack.pop() {
+        if crate::js::world::is_html_element(base, id, "script") {
+            return true;
+        }
+        if let Some(node) = base.get_node(id) {
+            stack.extend(node.children.iter().rev().copied());
+        }
+    }
+    false
 }
 
 impl From<crate::js::JsError> for TabError {
