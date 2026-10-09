@@ -268,6 +268,7 @@ pub(crate) fn selector_matching_elements(selectors: &str) -> Cow<'_, str> {
     }
 }
 
+/// ASCII case-insensitive substring search over the raw bytes.
 fn contains_ascii_ignore_case(haystack: &str, needle: &[u8]) -> bool {
     haystack
         .as_bytes()
@@ -295,6 +296,8 @@ fn skip_selector_literal(selectors: &str, index: usize) -> Option<usize> {
     }
 }
 
+/// The index just past a quoted string starting at `index`, or the end
+/// of input when the string never closes.
 fn end_of_selector_string(selectors: &str, index: usize, quote: char) -> usize {
     let mut cursor = index + quote.len_utf8();
     while cursor < selectors.len() {
@@ -335,6 +338,9 @@ fn first_line_pseudo(selectors: &str, index: usize) -> Option<usize> {
     (!continues).then_some(after)
 }
 
+/// Whether `character` continues a CSS identifier: backslash, hyphen,
+/// underscore, or alphanumeric
+/// (<https://drafts.csswg.org/css-syntax/#ident-token-diagram>).
 fn is_css_name_continue(character: char) -> bool {
     character == '\\' || character == '-' || character == '_' || character.is_alphanumeric()
 }

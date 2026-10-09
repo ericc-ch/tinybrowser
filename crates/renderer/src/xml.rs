@@ -45,6 +45,10 @@ pub(crate) fn parse_navigated(
     parse_with_config(input, content_type, crate::ReadyState::Loading, config)
 }
 
+/// Parses `input` with the shared XML configuration: entity definitions,
+/// doctype, processing instructions, and xmlns attributes arrive as the
+/// sink leaves them (see `docs/progress.md`), and the document records the
+/// given content type and readiness.
 fn parse_with_config(
     input: &str,
     content_type: &'static str,
@@ -122,6 +126,8 @@ pub(crate) fn document_content_type(header: &str) -> &'static str {
     }
 }
 
+/// Interns an arbitrary MIME essence for `Parsed::content_type`, which is
+/// `&'static str`.
 fn intern_mime_essence(essence: String) -> &'static str {
     // Bounded interning: essences arrive from response `Content-Type`
     // headers, so an unbounded table is a memory leak on attacker input.
@@ -154,13 +160,13 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
     }
 }
 
-// https://www.w3.org/TR/xml/#NT-NameStartChar
+/// https://www.w3.org/TR/xml/#NT-NameStartChar
 pub(crate) fn is_name_start(character: char) -> bool {
     matches!(character, ':' | 'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}')
         || ('\u{10000}'..='\u{EFFFF}').contains(&character)
 }
 
-// https://www.w3.org/TR/xml/#NT-NameChar
+/// https://www.w3.org/TR/xml/#NT-NameChar
 pub(crate) fn is_name_char(character: char) -> bool {
     is_name_start(character)
         || matches!(character, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')

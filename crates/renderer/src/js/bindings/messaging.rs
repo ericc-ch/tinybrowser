@@ -415,6 +415,7 @@ pub(crate) fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
 }
 
 /// The browsing context name of `frame` (`window.name`)
+/// The browsing context name of `frame` for `window.name`
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
 #[allow(
     clippy::needless_pass_by_value,
@@ -429,6 +430,8 @@ fn frame_name(ctx: Ctx<'_>, frame: f64) -> Result<String> {
     Ok(shared.borrow().tree.name(FrameId::new(frame)).to_owned())
 }
 
+/// Sets the browsing context name of `frame` for `window.name`
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes Ctx and owned arguments by value"

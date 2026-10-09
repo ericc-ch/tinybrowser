@@ -41,6 +41,8 @@ impl ResponseDecoder {
         output
     }
 
+    /// Flushes the decoder at EOF, returning the remaining text and the
+    /// sniffed charset name for `document.characterSet`.
     pub(crate) fn finish(mut self) -> (String, &'static str) {
         if let Some(decoder) = &mut self.decoder {
             let name = character_set_name(self.encoding.unwrap_or(encoding_rs::UTF_8));
@@ -57,6 +59,7 @@ impl ResponseDecoder {
     }
 }
 
+/// The canonical name `document.characterSet` reports for `encoding`.
 fn character_set_name(encoding: &'static encoding_rs::Encoding) -> &'static str {
     encoding.name()
 }
@@ -87,8 +90,10 @@ fn decode_chunk(decoder: &mut encoding_rs::Decoder, bytes: &[u8], last: bool) ->
     }
 }
 
-// https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm
-// https://encoding.spec.whatwg.org/#concept-encoding-get
+/// The response encoding from BOM, transport charset, declaration or
+/// prescan, with the bytes already consumed
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm>,
+/// <https://encoding.spec.whatwg.org/#concept-encoding-get>).
 pub(crate) fn sniff_encoding(
     bytes: &[u8],
     content_type: Option<&str>,
@@ -172,6 +177,10 @@ fn xml_encoding(bytes: &[u8], eof: bool) -> Option<(&'static encoding_rs::Encodi
     ))
 }
 
+/// The `encoding` pseudo-attribute of an XML declaration, resolved as an
+/// Encoding Standard label. Matches the token standalone on both sides so
+/// `fooencoding=` or a quoted occurrence does not count
+/// (<https://www.w3.org/TR/xml/#NT-EncodingDecl>).
 fn xml_encoding_attribute(declaration: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     let token = b"encoding";
     let mut index = 0;
@@ -196,6 +205,9 @@ fn xml_encoding_attribute(declaration: &[u8]) -> Option<&'static encoding_rs::En
     None
 }
 
+/// The encoding name after `encoding=`: optional whitespace, `=`, a
+/// quoted label resolved as an Encoding Standard label
+/// (<https://www.w3.org/TR/xml/#NT-EncodingDecl>).
 fn encoding_label(rest: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     let rest = rest.trim_ascii_start();
     let rest = rest.strip_prefix(b"=")?.trim_ascii_start();

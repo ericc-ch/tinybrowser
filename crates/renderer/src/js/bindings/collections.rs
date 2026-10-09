@@ -99,6 +99,7 @@ impl CollectionQuery {
     }
 }
 
+/// The live ids backing one named collection rooted at `scope`.
 pub(crate) fn collection_ids(
     ctx: &Ctx<'_>,
     scope: NodeId,
@@ -522,6 +523,7 @@ fn collect_by_class(
         .collect()
 }
 
+/// The `class` attribute value of an element, if it has one.
 fn class_attribute(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&str> {
     base.get_node(id)?
         .data
@@ -534,11 +536,13 @@ fn class_attribute(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&str> 
         .map(|attribute| attribute.value.as_str())
 }
 
+/// Whether `id` is an HTML element named `local`.
 fn html_named(base: &blitz_dom::BaseDocument, id: BlitzId, local: &str) -> bool {
     element_name(base, id)
         .is_some_and(|name| name.ns == html_namespace() && name.local.as_ref() == local)
 }
 
+/// The HTML child elements of `parent` named in `locals`, in tree order.
 fn html_child_elements(
     base: &blitz_dom::BaseDocument,
     document: u32,
@@ -551,10 +555,13 @@ fn html_child_elements(
         .collect()
 }
 
+/// The `tbody` children of `table`
+/// (<https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies>).
 fn table_bodies(base: &blitz_dom::BaseDocument, document: u32, table: BlitzId) -> Vec<NodeId> {
     html_child_elements(base, document, table, &["tbody"])
 }
 
+/// The `tr` children of one table section.
 fn table_section_rows(
     base: &blitz_dom::BaseDocument,
     document: u32,
@@ -563,6 +570,8 @@ fn table_section_rows(
     html_child_elements(base, document, section, &["tr"])
 }
 
+/// The `td`/`th` children of one table row
+/// (<https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells>).
 fn table_row_cells(base: &blitz_dom::BaseDocument, document: u32, row: BlitzId) -> Vec<NodeId> {
     html_child_elements(base, document, row, &["td", "th"])
 }

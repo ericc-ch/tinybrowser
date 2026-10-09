@@ -550,6 +550,8 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
     }
 }
 
+/// Whether table `data` implements one of the HTML table element
+/// interfaces, matched by tag name.
 fn html_table_interface(data: Option<&blitz_dom::NodeData>, interface: &str) -> Option<bool> {
     let tags: &[&str] = match interface {
         "HTMLTableElement" => &["table"],

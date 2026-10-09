@@ -448,6 +448,8 @@ impl Document {
         self.adopt_pending_frames_before_node(Some(before));
     }
 
+    /// Adopts the pending frames at or after `before`, so scripts run
+    /// with the browsing contexts that precede them and later ones wait.
     fn adopt_pending_frames_before_node(&mut self, before: Option<crate::js::world::NodeId>) {
         let created = World::adopt_pending_frames(&self.world, before);
         for container in created {

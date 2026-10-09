@@ -68,8 +68,8 @@ impl DomString {
 
     /// Whether the sequence contains an unpaired surrogate.
     ///
-    /// Those code units cannot live in a UTF-8 `String`, so `CharacterData`
-    /// keeps them in a side table while the Blitz tree holds the lossy form
+    /// Whether the string holds code units the UTF-8 tree cannot keep.
+    /// Those read back as the replacement character (see `docs/progress.md`)
     /// (<https://infra.spec.whatwg.org/#javascript-string-convert>).
     #[must_use]
     pub fn has_unpaired_surrogate(&self) -> bool {

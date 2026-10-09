@@ -101,6 +101,7 @@ fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<(
     Ok(())
 }
 
+/// The live children of an adopted node for wrapper retargeting.
 fn adopted_children(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<NodeId>> {
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
@@ -275,6 +276,7 @@ pub(crate) enum ImportSnapshot {
 }
 
 
+/// Deep-snapshots `children` for cross-document cloning.
 fn snapshot_children(
     doc: &BlitzDocument,
     document: u32,
@@ -389,6 +391,9 @@ pub(crate) fn import_snapshot_live(
     }
 }
 
+/// Classifies one live node for snapshotting: fragments snapshot as
+/// fragments, elements with their name/attributes/children, text and
+/// comments as character data.
 fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
     let owner = world_for_node(ctx, id)?;
     let world = owner.borrow();
@@ -429,6 +434,7 @@ enum LiveKind {
     },
 }
 
+/// The live children of `id` as cross-document handles.
 fn live_child_ids(doc: &BlitzDocument, id: NodeId) -> Vec<NodeId> {
     doc.base
         .get_node(id.node)
@@ -445,6 +451,7 @@ fn live_child_ids(doc: &BlitzDocument, id: NodeId) -> Vec<NodeId> {
         .unwrap_or_default()
 }
 
+/// Deep-snapshots live `children` through their owning realms.
 fn live_snapshot_children(ctx: &Ctx<'_>, children: Vec<NodeId>) -> Result<Vec<ImportSnapshot>> {
     let mut snapshots = Vec::new();
     for child in children {

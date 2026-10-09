@@ -1302,6 +1302,10 @@ fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
     )
 }
 
+/// The pure policy decision behind [`fetch_referrer`], split out so unit
+/// tests need no `World`: credentials and fragments never leave,
+/// local-scheme documents send nothing, unknown tokens fail closed to the
+/// strict default.
 pub(crate) fn referrer_for_policy(
     policy: &str,
     document_url: &Url,
@@ -1489,6 +1493,8 @@ mod tests {
     use super::referrer_for_policy;
     use url::Url;
 
+    /// The referrer for one policy/document/request triple, without a
+    /// `World`, so the matrix stays a pure unit test.
     fn referrer(policy: &str, document: &str, request: &str) -> Option<String> {
         referrer_for_policy(
             policy,

@@ -151,6 +151,9 @@ fn insertion_tree_nodes(
     insertion_excluding(ctx, parent, node, child, None)
 }
 
+/// Validates and stages one insertion, leaving `exclude` out of the
+/// parent's child counts so `replaceChildren` validates against the
+/// parent without its current children.
 fn insertion_excluding(
     ctx: &Ctx<'_>,
     parent: NodeId,
@@ -162,6 +165,8 @@ fn insertion_excluding(
     insertion_excluding_children(ctx, parent, node, child, &excluded)
 }
 
+/// Validates one insertion against an explicit exclusion set.
+/// [`insertion_excluding`] covers the single-exclusion callers.
 fn insertion_excluding_children(
     ctx: &Ctx<'_>,
     parent: NodeId,
@@ -282,6 +287,10 @@ enum InsertedNode {
     Other,
 }
 
+/// The inserted node's side of ensure pre-insert validity: fragments
+/// report their shape, elements/text/comments report their kind, anything
+/// else cannot be inserted
+/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
 fn classify_inserted(doc: &crate::documents::BlitzDocument, id: BlitzId) -> InsertedNode {
     if doc.is_fragment(id) {
         let children: Vec<BlitzId> = doc
@@ -548,6 +557,9 @@ pub(crate) fn construct_node<'js>(
 /// is not callable across `QuickJS` contexts, so the `WindowProxy` hands back a
 /// local wrapper that creates the node in the iframe's document
 /// (<https://dom.spec.whatwg.org/#dom-comment-comment>).
+/// Constructs `name` in `frame`'s document for cross-realm `new
+/// contentWindow.Comment` and friends. Only constructible interfaces build;
+/// anything else throws.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes Ctx and Rest by value"
@@ -574,6 +586,8 @@ pub(crate) fn construct_node_in_frame<'js>(
     construct_node_in_owner(&ctx, &owner, &name, args)
 }
 
+/// The shared construction backend: allocates in `owner`'s document and
+/// wraps for the calling realm.
 fn construct_node_in_owner<'js>(
     ctx: &Ctx<'js>,
     owner: &Rc<RefCell<World>>,
@@ -768,6 +782,8 @@ fn create_element_named<'js>(
     Ok(value)
 }
 
+/// Whether `node` is a `DocumentFragment` backing (a detached element
+/// flagged in the document's fragment set, never a stray `div`).
 fn tree_is_fragment(ctx: &Ctx<'_>, node: NodeId) -> bool {
     world_for_node(ctx, node)
         .ok()
@@ -780,6 +796,7 @@ fn tree_is_fragment(ctx: &Ctx<'_>, node: NodeId) -> bool {
         .unwrap_or(false)
 }
 
+/// The tree children of `node` as cross-document handles.
 fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> {
     let owner = world_for_node(ctx, node)?;
     let world = owner.borrow();
@@ -1735,6 +1752,7 @@ fn insert_tree_node(
     insert_tree_node_inner(ctx, parent, node, reference, true)
 }
 
+/// Inserts an adopted tree node, recording journal entries for observers.
 fn insert_tree_node_inner(
     ctx: &Ctx<'_>,
     parent: NodeId,
@@ -1894,6 +1912,8 @@ fn clear_nonce_on_connect(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
     Ok(())
 }
 
+/// The HTML, SVG, and MathML elements under `id` whose `nonce` content
+/// attribute clears on browsing-context connection.
 fn collect_nonce_elements(base: &blitz_dom::BaseDocument, id: NodeId, out: &mut Vec<NodeId>) {
     if let Some(element) = base
         .get_node(id.node)
@@ -1937,6 +1957,8 @@ fn iframe_fires_initial_load(base: &blitz_dom::BaseDocument, node: BlitzId) -> b
     attr(base, node, "src").is_none() && attr(base, node, "srcdoc").is_none()
 }
 
+/// The character set of `id`'s document for encoding-aware APIs, UTF-8
+/// when the node has no document.
 fn document_character_set(ctx: &Ctx<'_>, id: NodeId) -> &'static str {
     world(ctx)
         .ok()
@@ -1983,6 +2005,8 @@ fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
     Ok(())
 }
 
+/// The insertion steps an inserted subtree owes, in tree order: iframe
+/// contexts, classic scripts, and referrer-policy updates.
 fn collect_html_insertion_steps(
     base: &blitz_dom::BaseDocument,
     id: NodeId,
@@ -2040,6 +2064,8 @@ fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
     world.borrow_mut().referrer_policy = policy;
 }
 
+/// A referrer-policy `content` value normalized to its canonical token,
+/// or `None` when the value names no policy.
 fn parse_referrer_policy(content: &str) -> Option<String> {
     let token = content.trim().to_ascii_lowercase();
     match token.as_str() {
@@ -2484,6 +2510,9 @@ fn locate_namespace(
     locate_element_namespace(doc, node, prefix)
 }
 
+/// [Locates a namespace](https://dom.spec.whatwg.org/#locate-a-namespace)
+/// for `prefix` from `node`, switching on the node's interface: fragments
+/// and doctypes have none, documents defer to their element.
 fn locate_element_namespace(
     doc: &crate::documents::BlitzDocument,
     id: NodeId,
@@ -2547,6 +2576,8 @@ fn locate_prefix(
     locate_element_prefix(doc, node, namespace)
 }
 
+/// [Locates a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
+/// for `namespace` from `node`, mirroring the namespace lookup by kind.
 fn locate_element_prefix(
     doc: &crate::documents::BlitzDocument,
     id: NodeId,
@@ -2596,6 +2627,8 @@ enum EqualKind {
     Other,
 }
 
+/// The comparison view of `id` for `isEqualNode`: its kind (with live
+/// character data) and its children.
 fn equal_view(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Option<EqualView> {
     let (kind, children) = {
         let node = doc.base.get_node(id)?;
@@ -2631,6 +2664,8 @@ fn equal_view(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Option<Equa
     })
 }
 
+/// Whether two comparison kinds match: attributes compare on namespace,
+/// local name, and value, never prefix.
 fn kinds_equal(left: &EqualKind, right: &EqualKind) -> bool {
     match (left, right) {
         (EqualKind::Document, EqualKind::Document) | (EqualKind::Fragment, EqualKind::Fragment) => {
@@ -3544,7 +3579,7 @@ impl JsNode {
         attr_wrapper(&ctx, id)
     }
 
-    // https://dom.spec.whatwg.org/#dom-document-adoptnode
+    /// https://dom.spec.whatwg.org/#dom-document-adoptnode
     #[qjs(rename = "adoptNode")]
     fn document_adopt_node<'js>(&self, ctx: Ctx<'js>, node: Value<'js>) -> Result<Value<'js>> {
         match host::node_argument(&ctx, &node)? {
@@ -3857,7 +3892,7 @@ impl JsNode {
         Ok(Value::new_null(ctx.clone()))
     }
 
-    // https://encoding.spec.whatwg.org/#dom-document-characterset
+    /// https://encoding.spec.whatwg.org/#dom-document-characterset
     #[qjs(skip)]
     #[allow(
         clippy::unnecessary_wraps,
@@ -4454,7 +4489,7 @@ impl JsNode {
         })?))
     }
 
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     #[qjs(skip)]
     fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let form = {
@@ -4985,7 +5020,7 @@ impl JsNode {
         schedule_mutation_delivery(ctx)
     }
 
-    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
     #[qjs(get, rename = "innerText")]
     fn inner_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         match self.text_content(&ctx)? {
@@ -4994,9 +5029,9 @@ impl JsNode {
         }
     }
 
-    // Not-being-rendered innerText replace-all with one text node. Converting
-    // newlines to `br` is the rendered-text-fragment path and a known gap
-    // (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
+    /// Not-being-rendered innerText replace-all with one text node. Converting
+    /// newlines to `br` is the rendered-text-fragment path and a known gap
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
     #[qjs(set, rename = "innerText")]
     fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
         let html = world(&ctx)?
@@ -6695,7 +6730,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         self.matches(ctx, WebIdlString(arg_0.to_string()?))
     }
 
-    // https://dom.spec.whatwg.org/#dom-element-webkitmatchesselector
+    /// https://dom.spec.whatwg.org/#dom-element-webkitmatchesselector
     fn webkit_matches_selector(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
         // Legacy alias of `matches(selectors)`.
         self.matches(ctx, WebIdlString(arg_0.to_string()?))
@@ -6740,7 +6775,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         )
     }
 
-    // https://dom.spec.whatwg.org/#dom-element-insertadjacentelement
+    /// https://dom.spec.whatwg.org/#dom-element-insertadjacentelement
     fn insert_adjacent_element(
         &self,
         ctx: Ctx<'js>,
@@ -6755,7 +6790,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-element-insertadjacenttext
+    /// https://dom.spec.whatwg.org/#dom-element-insertadjacenttext
     fn insert_adjacent_text(
         &self,
         ctx: Ctx<'js>,
@@ -7146,19 +7181,19 @@ impl<'js> document_generated::Document<'js> for JsNode {
         rquickjs::String::from_str(ctx.clone(), &mode)
     }
 
-    // https://encoding.spec.whatwg.org/#dom-document-characterset
+    /// https://encoding.spec.whatwg.org/#dom-document-characterset
     fn get_character_set(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let set = self.character_set(ctx)?;
         rquickjs::String::from_str(ctx.clone(), set)
     }
 
-    // https://encoding.spec.whatwg.org/#dom-document-charset
+    /// https://encoding.spec.whatwg.org/#dom-document-charset
     fn get_charset(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let set = self.charset(ctx)?;
         rquickjs::String::from_str(ctx.clone(), set)
     }
 
-    // https://encoding.spec.whatwg.org/#dom-document-inputencoding
+    /// https://encoding.spec.whatwg.org/#dom-document-inputencoding
     fn get_input_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let encoding = self.input_encoding(ctx)?;
         rquickjs::String::from_str(ctx.clone(), encoding)
@@ -7578,7 +7613,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         schedule_mutation_delivery(&ctx)
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-movebefore
+    /// https://dom.spec.whatwg.org/#dom-parentnode-movebefore
     fn move_before(
         &self,
         ctx: Ctx<'js>,
@@ -8084,7 +8119,7 @@ impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
 impl html_opt_group_element_generated::HTMLOptGroupElement<'_> for JsNode {}
 
 impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -8118,7 +8153,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
 }
 
 impl<'js> html_field_set_element_generated::HTMLFieldSetElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -8156,7 +8191,7 @@ impl<'js> html_select_element_generated::HTMLSelectElement<'js> for JsNode {
         self.selected_options(ctx.clone())
     }
 
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -8225,7 +8260,7 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
         self.set_selection_direction(ctx.clone(), WebIdlString(value.to_string()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -8242,7 +8277,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
         self.set_checked(ctx.clone(), value)
     }
 
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -8432,7 +8467,7 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 }
 
 impl<'js> html_option_element_generated::HTMLOptionElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -8713,14 +8748,14 @@ impl html_meta_element_generated::HTMLMetaElement<'_> for JsNode {}
 impl html_map_element_generated::HTMLMapElement<'_> for JsNode {}
 
 impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
 }
 
 impl<'js> html_output_element_generated::HTMLOutputElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -8750,7 +8785,7 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
 }
 
 impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies
+    /// https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies
     fn get_t_bodies(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -8760,7 +8795,7 @@ impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows
+    /// https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows
     fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -8770,14 +8805,14 @@ impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/tables.html#dom-table-deleterow
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-table-deleterow>
     fn delete_row(&self, ctx: Ctx<'js>, index: i32) -> Result<()> {
         delete_table_row(&ctx, self.handle.0, index)
     }
 }
 
 impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/tables.html#dom-tbody-rows
+    /// https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
     fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -8789,7 +8824,7 @@ impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for
 }
 
 impl<'js> html_table_row_element_generated::HTMLTableRowElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
+    /// https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
     fn get_cells(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -8800,6 +8835,9 @@ impl<'js> html_table_row_element_generated::HTMLTableRowElement<'js> for JsNode 
     }
 }
 
+/// Removes the `index`th row of `table` in `table.rows` order; `-1` is the
+/// last row. Out-of-range indexes throw `IndexSizeError`
+/// (<https://html.spec.whatwg.org/multipage/tables.html#dom-table-deleterow>).
 fn delete_table_row(ctx: &Ctx<'_>, table: NodeId, index: i32) -> Result<()> {
     let rows = collection_ids(ctx, table, &CollectionKind::TableRows)?;
     let length = i32::try_from(rows.len()).unwrap_or(i32::MAX);
@@ -8837,25 +8875,25 @@ fn delete_table_row(ctx: &Ctx<'_>, table: NodeId, index: i32) -> Result<()> {
 
 
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
-    // No processing-instruction nodes exist (see `docs/progress.md`), so
-    // these getters report the empty state and the setters validate names
-    // without storing anything.
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-target
+    /// No processing-instruction nodes exist (see `docs/progress.md`), so
+    /// these getters report the empty state and the setters validate names
+    /// without storing anything.
+    /// <https://dom.spec.whatwg.org/#dom-processinginstruction-target>
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         rquickjs::String::from_str(ctx.clone(), "")
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-hasattributes
+    /// <https://dom.spec.whatwg.org/#dom-processinginstruction-hasattributes>
     fn has_attributes(&self, _ctx: Ctx<'js>) -> Result<bool> {
         Ok(false)
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-getattributenames
+    /// https://dom.spec.whatwg.org/#dom-processinginstruction-getattributenames
     fn get_attribute_names(&self, _ctx: Ctx<'js>) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-getattribute
+    /// https://dom.spec.whatwg.org/#dom-processinginstruction-getattribute
     fn get_attribute(
         &self,
         _ctx: Ctx<'js>,
@@ -8864,7 +8902,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
         Ok(None)
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-setattribute
+    /// https://dom.spec.whatwg.org/#dom-processinginstruction-setattribute
     fn set_attribute(
         &self,
         ctx: Ctx<'js>,
@@ -8882,7 +8920,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
         Ok(())
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-removeattribute
+    /// https://dom.spec.whatwg.org/#dom-processinginstruction-removeattribute
     fn remove_attribute(
         &self,
         _ctx: Ctx<'js>,
@@ -8891,7 +8929,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
         Ok(())
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-toggleattribute
+    /// https://dom.spec.whatwg.org/#dom-processinginstruction-toggleattribute
     fn toggle_attribute(
         &self,
         ctx: Ctx<'js>,
@@ -8909,7 +8947,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
         Ok(false)
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-hasattribute
+    /// https://dom.spec.whatwg.org/#dom-processinginstruction-hasattribute
     fn has_attribute(&self, _ctx: Ctx<'js>, _arg_0: rquickjs::String<'js>) -> Result<bool> {
         Ok(false)
     }
@@ -9024,12 +9062,12 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
 }
 
 impl<'js> text_generated::Text<'js> for JsNode {
-    // https://dom.spec.whatwg.org/#dom-text-splittext
+    /// https://dom.spec.whatwg.org/#dom-text-splittext
     fn split_text(&self, ctx: Ctx<'js>, offset: u32) -> Result<Value<'js>> {
         split_text_node(&ctx, self.handle.0, offset)
     }
 
-    // https://dom.spec.whatwg.org/#dom-text-wholetext
+    /// https://dom.spec.whatwg.org/#dom-text-wholetext
     fn get_whole_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         dom_string(ctx, &whole_text(ctx, self.handle.0)?)
     }
@@ -9123,6 +9161,8 @@ fn whole_text(ctx: &Ctx<'_>, id: NodeId) -> Result<DomString> {
         .unwrap_or_default())
 }
 
+/// Whether `id` is a text node (exclusive: never a CDATA section, which
+/// cannot exist).
 fn is_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     matches!(
         base.get_node(id).map(|node| &node.data),
@@ -9130,6 +9170,8 @@ fn is_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     )
 }
 
+/// Appends `id`'s data to `out` when it is a text node, for `wholeText`
+/// (<https://dom.spec.whatwg.org/#dom-text-wholetext>).
 fn append_text_data(doc: &crate::documents::BlitzDocument, id: BlitzId, out: &mut DomString) {
     if matches!(
         doc.base.get_node(id).map(|node| &node.data),
