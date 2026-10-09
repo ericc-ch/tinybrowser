@@ -36,6 +36,11 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
     entries for `blitz-dom`, `blitz-html`, `blitz-paint`, and `blitz-traits`.
     It is its own workspace, excluded from the tinybrowser workspace, so its
     lint config stays separate.
+  - xml5ever fork `github.com/ericc-ch/html5ever` (Servo's parser monorepo).
+    Checked out as the `third_party/html5ever` submodule and wired in via a
+    `[patch.crates-io]` path entry for `xml5ever` only: it builds against
+    registry markup5ever so the atom/tendril/TreeSink types stay unified.
+    Excluded from the tinybrowser workspace all the same.
   - Pull upstream inside the submodule, push the fork branch there, then bump
     the submodule pointer in tinybrowser. Push before pinning: a pointer to
     an unpushed commit breaks every other checkout at init time (`not our

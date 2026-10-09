@@ -16,13 +16,18 @@ use crate::Parsed;
 static MIME_ESSENCES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
 
 /// Parses `input` as an XML document with the given content type.
+///
+/// Used only by `DOMParser`, whose results are plain `Document`s, never
+/// `XMLDocument`s
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+/// Navigated XML goes through `parse_navigated` and keeps the XML kind.
 pub(crate) fn parse_document(
     input: &str,
     content_type: &'static str,
     base_url: String,
     font_ctx: parley::FontContext,
 ) -> Parsed {
-    parse_with_config(
+    let mut parsed = parse_with_config(
         input,
         content_type,
         crate::ReadyState::Complete,
@@ -32,7 +37,9 @@ pub(crate) fn parse_document(
             ua_stylesheets: Some(Vec::new()),
             ..blitz_dom::DocumentConfig::default()
         },
-    )
+    );
+    parsed.xml_document = false;
+    parsed
 }
 
 /// Parses a navigated XML response with the frame's document config.
@@ -86,7 +93,9 @@ fn parse_with_config(
 
 /// Builds the `parsererror` document for a non-well-formed XML input: an
 /// XML document of the same content type whose document element is a single
-/// `parsererror` element describing the failure.
+/// `parsererror` element in the Mozilla parsererror namespace describing
+/// the failure
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
 fn parser_error_document(
     content_type: &'static str,
     ready_state: crate::ReadyState,
@@ -96,7 +105,13 @@ fn parser_error_document(
     let mut parsed = crate::Parsed::script(content_type, font_ctx);
     parsed.xml_document = true;
     parsed.ready_state = ready_state;
-    let name = markup5ever::QualName::new(None, markup5ever::ns!(), markup5ever::LocalName::from("parsererror"));
+    let name = markup5ever::QualName::new(
+        None,
+        markup5ever::Namespace::from(
+            "http://www.mozilla.org/newlayout/xml/parsererror.xml",
+        ),
+        markup5ever::LocalName::from("parsererror"),
+    );
     let root = parsed.document.base.root_node().id;
     let element = parsed.document.base.mutate().create_element(name, Vec::new());
     parsed.document.base.mutate().append_children(root, &[element]);

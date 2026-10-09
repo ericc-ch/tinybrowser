@@ -31,6 +31,18 @@ exception is the JS engine forks below, which do ship.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here. Push before pinning.
 
+- **What**: the maintained xml5ever fork tinybrowser parses XML with.
+- **Upstream**: <https://github.com/ericc-ch/html5ever> at
+  `third_party/html5ever` (upstream `https://github.com/servo/html5ever`).
+- **Wiring**: a `[patch.crates-io]` path entry for `xml5ever` only. It builds
+  against registry markup5ever so the atom/tendril/TreeSink type family stays
+  unified; the workspace's own markup5ever/tendril/web_atoms copies are unused.
+- **Pinned revision**: `third_party/html5ever` at the `0.39.0` base plus fork
+  fixes (`master`; check `git submodule status`).
+- **Fresh clones**: `git submodule update --init --recursive`.
+- **Update**: pull upstream inside the submodule, push the fork branch there,
+  then bump the submodule pointer here. Push before pinning.
+
 ## Vendored crates (ship in the binary)
 
 - **What**: the `weedle4` WebIDL parser tinybrowser's bindgen builds against.

@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["third_party/rquickjs", "third_party/weedle4", "third_party/fontconfig-parser", "third_party/blitz"]
+exclude = ["third_party/rquickjs", "third_party/weedle4", "third_party/fontconfig-parser", "third_party/blitz", "third_party/html5ever"]
 members = [
     "crates/anyrender-tiny-skia",
     "crates/browser",
@@ -40,6 +40,9 @@ blitz-dom = { path = "third_party/blitz/packages/blitz-dom" }
 blitz-html = { path = "third_party/blitz/packages/blitz-html" }
 blitz-paint = { path = "third_party/blitz/packages/blitz-paint" }
 blitz-traits = { path = "third_party/blitz/packages/blitz-traits" }
+# The xml5ever parser fork. It builds against registry markup5ever so the
+# whole graph shares one atom/tendril/TreeSink type family.
+xml5ever = { path = "third_party/html5ever/xml5ever" }
 rquickjs = { path = "third_party/rquickjs" }
 rquickjs-core = { path = "third_party/rquickjs/core" }
 rquickjs-macro = { path = "third_party/rquickjs/macro" }

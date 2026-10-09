@@ -67,8 +67,10 @@ pub(crate) struct Parsed {
     /// Whether this object implements `XMLDocument`
     /// (<https://dom.spec.whatwg.org/#xmldocument>).
     ///
-    /// `new Document()` creates an XML document that is still a `Document`.
-    /// Parsed XML, `new XMLDocument()`, and `createDocument()` use
+    /// `new Document()` and `DOMParser` create XML documents that are still
+    /// plain `Document`s
+    /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+    /// Navigated XML, `new XMLDocument()`, and `createDocument()` use
     /// `XMLDocument`.
     pub xml_document: bool,
     /// The document's readiness; parsed documents start at [`ReadyState::Loading`]
