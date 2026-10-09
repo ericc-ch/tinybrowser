@@ -158,22 +158,10 @@ globalThis.URLSearchParams = class URLSearchParams {
     var input = host.__tbUSVString(init === undefined ? '' : init);
     if (input.charAt(0) === '?') input = input.slice(1);
     if (!input) return;
-    const decode = value => {
-      value = value.replace(/\+/g, ' ');
-      try { return decodeURIComponent(value); }
-      catch (_) { return value.replace(/%([0-9a-f]{2})/gi, (_m, hex) => String.fromCharCode(parseInt(hex, 16))); }
-    };
-    for (const item of input.split('&')) {
-      // The `application/x-www-form-urlencoded` parser drops empty items
-      // (<https://url.spec.whatwg.org/#urlencoded-parsing>).
-      if (item === '') continue;
-      const separator = item.indexOf('=');
-      const name = separator < 0 ? item : item.slice(0, separator);
-      const value = separator < 0 ? '' : item.slice(separator + 1);
-      __tbArray.push(__tbParamsState(this).pairs, [
-        decode(name),
-        decode(value)
-      ]);
+    // The `application/x-www-form-urlencoded` parser drops empty items
+    // (<https://url.spec.whatwg.org/#urlencoded-parsing>).
+    for (const pair of host.__tbParseParams(input)) {
+      __tbArray.push(__tbParamsState(this).pairs, [pair[0], pair[1]]);
     }
   }
   get size() { return __tbParamsState(this).pairs.length; }
@@ -258,11 +246,9 @@ globalThis.URLSearchParams = class URLSearchParams {
     }
   }
   toString() {
-    const encode = value => encodeURIComponent(value)
-      .replace(/%20/g, '+')
-      .replace(/[!'()~]/g, character =>
-        '%' + character.charCodeAt(0).toString(16).toUpperCase());
-    return __tbArray.join(__tbArray.map(__tbParamsState(this).pairs, pair => encode(pair[0]) + '=' + encode(pair[1])), '&');
+    // The `application/x-www-form-urlencoded` serializer
+    // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
+    return host.__tbSerializeParams(__tbParamsState(this).pairs);
   }
   [Symbol.iterator]() { return this.entries(); }
 };
