@@ -651,10 +651,7 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
         if node.data.downcast_element().is_some() {
             let position = node.absolute_position(0.0, 0.0);
             let size = node.final_layout().size;
-            let visible = node.primary_styles().is_none_or(|styles| {
-                use style::properties::generated::longhands::visibility::computed_value::T as Visibility;
-                styles.get_inherited_box().visibility == Visibility::Visible
-            });
+            let visible = node.is_visible();
             boxes.push(crate::render::NodeBox {
                 node: NodeId {
                     document: document.document,
