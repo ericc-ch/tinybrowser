@@ -1,10 +1,11 @@
 //! Live node collections (`NodeList`, `HTMLCollection`).
 
-use super::{install_collections_js, live_collection, world, wrap_node};
+use super::{install_collections_js, live_collection, world, world_for_node, wrap_node};
 
 use rquickjs::{
-    Atom, Ctx, Exception, Object, Result, Value,
+    Atom, Ctx, Exception, Function, Object, Result, Value,
     class::{ExoticSetResult, Trace},
+    object::Property,
     prelude::Func,
 };
 
@@ -1392,6 +1393,36 @@ fn append_collection_option(ctx: &Ctx<'_>, select: NodeId, option: NodeId) -> Re
     drop(owner);
     super::mutation::schedule_mutation_delivery(ctx)?;
     Ok(())
+}
+
+/// A static `NodeList` snapshot as an ordinary object on `NodeList.prototype`.
+/// Own indexed properties match legacy platform objects without an indexed
+/// setter: enumerable, configurable, and not writable
+/// (<https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty>).
+pub(super) fn static_node_list<'js>(
+    ctx: &Ctx<'js>,
+    scope: NodeId,
+    handles: &[Handle],
+) -> Result<Value<'js>> {
+    let prototype = world_for_node(ctx, scope)?
+        .borrow()
+        .brand("NodeList")
+        .ok_or_else(|| Exception::throw_internal(ctx, "NodeList prototype missing"))?;
+    let list = Object::new(ctx.clone())?;
+    list.set_prototype(Some(&prototype.restore(ctx)?))?;
+    for (index, handle) in handles.iter().enumerate() {
+        list.prop(
+            index.to_string(),
+            Property::from(wrap_node(ctx, handle.0)?)
+                .enumerable()
+                .configurable(),
+        )?;
+    }
+    let length = u32::try_from(handles.len())
+        .map_err(|_| Exception::throw_range(ctx, "NodeList length too large"))?;
+    let finish: Function = crate::js::bridge::object(ctx)?.get("__tbFinishStaticNodeList")?;
+    let (): () = finish.call((list.clone(), length))?;
+    Ok(list.into_value())
 }
 
 pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {

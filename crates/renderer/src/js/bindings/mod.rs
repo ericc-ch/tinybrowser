@@ -1600,11 +1600,14 @@ pub(super) fn live_collection<'js>(
         kind,
     };
     match brand {
-        None => Ok(Class::into_value(host::instance_for_node(
-            ctx,
-            scope,
-            JsNodeList { query },
-        )?)),
+        None => match &query.kind {
+            CollectionKind::Static(handles) => static_node_list(ctx, scope, handles),
+            _ => Ok(Class::into_value(host::instance_for_node(
+                ctx,
+                scope,
+                JsNodeList { query },
+            )?)),
+        },
         Some("HTMLCollection") => Ok(Class::into_value(host::instance_for_node(
             ctx,
             scope,

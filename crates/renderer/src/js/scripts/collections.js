@@ -4,6 +4,41 @@
   delete host.__tbWindowNamedValue;
   delete host.__tbWindowNamedHas;
   const native = globalThis.NodeList.prototype;
+  // Static snapshots (`querySelectorAll`, mutation records) are ordinary
+  // objects with this prototype so indexed and `length` reads stay in JS.
+  // Live lists remain exotic platform objects
+  // (<https://dom.spec.whatwg.org/#interface-nodelist>,
+  // <https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty>).
+  {
+    const lengthDesc = Object.getOwnPropertyDescriptor(native, 'length');
+    const nativeLength = lengthDesc.get;
+    const nativeItem = native.item;
+    const staticLengths = host.slots();
+    Object.defineProperty(native, 'length', {
+      get: function() {
+        const length = staticLengths.get(this);
+        if (length !== undefined) return length;
+        return __tbApply(nativeLength, this, []);
+      },
+      enumerable: lengthDesc.enumerable,
+      configurable: lengthDesc.configurable,
+    });
+    Object.defineProperty(native, 'item', {
+      value: function item(index) {
+        if (staticLengths.get(this) !== undefined) {
+          const value = this[index >>> 0];
+          return value === undefined ? null : value;
+        }
+        return __tbApply(nativeItem, this, arguments);
+      },
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    host.__tbFinishStaticNodeList = function(list, length) {
+      staticLengths.set(list, length);
+    };
+  }
   // Value iterators for `iterable<T>`
   // (<https://webidl.spec.whatwg.org/#es-iterable>). `@@iterator` is the
   // same function object as `values`. `forEach` re-reads the original
