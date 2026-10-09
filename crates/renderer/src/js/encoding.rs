@@ -105,20 +105,25 @@ fn decode<'js>(
 )]
 fn decoder_init<'js>(ctx: Ctx<'js>, label: String, ignore_bom: bool) -> Result<u64> {
     let encoding = resolve_label(&ctx, &label)?;
-    let world = super::bindings::world(&ctx)?;
-    let mut world = world.borrow_mut();
-    let id = world.next_decoder;
-    world.next_decoder = world.next_decoder.wrapping_add(1);
-    world
-        .decoders
-        .insert(id, super::world::DecoderSession::fresh(encoding, ignore_bom));
+    let world_rc = super::bindings::world(&ctx)?;
+    let id = world_rc
+        .borrow()
+        .runtime
+        .registry
+        .borrow_mut()
+        .allocate_decoder();
+    world_rc.borrow_mut().decoders.insert(
+        id,
+        super::world::DecoderSession::fresh(encoding, ignore_bom),
+    );
     Ok(id)
 }
 
 /// Decodes `source` through session `id`, keeping the decoder's buffered
 /// tail for the next call when `stream` is true. A fatal error throws but
-/// leaves the consumed position where it is, so later calls continue after
-/// the error (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
+/// the bytes behind the error stay queued in `carry`, so later calls
+/// continue after the error
+/// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
@@ -132,20 +137,35 @@ fn decoder_decode<'js>(
 ) -> Result<String> {
     let bytes = bytes_from_latin1(&source)
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
-    let world = super::bindings::world(&ctx)?;
-    let mut world = world.borrow_mut();
+    let world_rc = super::bindings::world(&ctx)?;
+    let mut world = world_rc.borrow_mut();
     let Some(session) = world.decoders.get_mut(&id) else {
-        return Err(Exception::throw_internal(&ctx, "The decoder is closed."));
+        return Err(Exception::throw_type(&ctx, "The decoder is closed."));
     };
-    let result = decode_loop(&mut session.decoder, &bytes, fatal, !stream);
-    if !stream {
-        // `last=true` ends the decoder, which must never run again; the next
-        // call starts a fresh session with the same encoding and BOM mode.
-        let fresh =
-            super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
-        session.decoder = fresh.decoder;
+    let mut input = std::mem::take(&mut session.carry);
+    input.extend_from_slice(&bytes);
+    let result = decode_loop(&mut session.decoder, &input, fatal, !stream);
+    match result {
+        Ok(text) => {
+            if !stream {
+                // `last=true` ends the decoder, which must never run again;
+                // the next call starts a fresh session with the same encoding
+                // and BOM mode.
+                *session = super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
+            }
+            Ok(text)
+        }
+        Err(failure) => {
+            if stream {
+                // The error itself is consumed; the unprocessed queue behind
+                // it carries forward.
+                session.carry = input[failure.consumed..].to_vec();
+            } else {
+                *session = super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
+            }
+            Err(Exception::throw_type(&ctx, "The encoded data was not valid."))
+        }
     }
-    result.map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
 }
 
 /// Drops session `id`. Best-effort: after realm teardown there is no world
@@ -226,7 +246,11 @@ fn latin1_bytes<'js>(ctx: &Ctx<'js>, input: Value<'js>) -> Result<Option<Vec<u8>
     Ok(Some(bytes))
 }
 
-struct DecodeFailure;
+struct DecodeFailure {
+    /// Bytes consumed when the failure surfaced, so a streaming session can
+    /// retain the unprocessed queue behind the error.
+    consumed: usize,
+}
 
 /// Runs `decoder` over `input`, growing the output until the input is
 /// consumed. The caller owns how the decoder persists: one-shot callers pass
@@ -252,7 +276,9 @@ fn decode_loop(
             read += consumed;
             match result {
                 DecoderResult::InputEmpty => break,
-                DecoderResult::Malformed(_, _) => return Err(DecodeFailure),
+                DecoderResult::Malformed(_, _) => {
+                    return Err(DecodeFailure { consumed: read });
+                }
                 DecoderResult::OutputFull => {
                     reserve_output(decoder, &mut output, input.len().saturating_sub(read));
                 }

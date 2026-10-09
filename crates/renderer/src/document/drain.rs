@@ -132,7 +132,7 @@ impl Document {
                                 outcome: crate::protocol::DialOutcome {
                                     status: 200,
                                     final_url: dial.url.to_string(),
-                                    content_type,
+                                    content_type: Some(content_type),
                                     headers: Vec::new(),
                                     body,
                                 },

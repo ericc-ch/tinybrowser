@@ -588,6 +588,15 @@ fn push_file_entries<'js>(
     Ok(())
 }
 
+/// The submission encoding for a resolved label: the same ASCII-trimmed,
+/// `replacement`-rejecting resolution as every other label entry, falling
+/// back to UTF-8 because the caller passes an already-resolved name.
+fn submission_encoding(label: &str) -> &'static encoding_rs::Encoding {
+    encoding_rs::Encoding::for_label(trim_label(label).as_bytes())
+        .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
+        .unwrap_or(encoding_rs::UTF_8)
+}
+
 /// Encodes `text` in the form's submission encoding, returning a Latin-1
 /// string of the encoded bytes. A character the encoding cannot represent
 /// becomes a numeric character reference, per the Encoding Standard's
@@ -597,9 +606,7 @@ fn push_file_entries<'js>(
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 pub(super) fn encode_form(text: String, label: String) -> String {
-    let encoding =
-        encoding_rs::Encoding::for_label(label.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
-    let (bytes, _, _) = encoding.encode(&text);
+    let (bytes, _, _) = submission_encoding(&label).encode(&text);
     bytes.iter().map(|&byte| char::from(byte)).collect()
 }
 
@@ -607,9 +614,7 @@ pub(super) fn encode_form(text: String, label: String) -> String {
 /// in `label`, then the urlencoded byte serializer over those bytes
 /// (<https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer>).
 pub(super) fn urlencode_form(text: String, label: String) -> String {
-    let encoding =
-        encoding_rs::Encoding::for_label(label.trim().as_bytes()).unwrap_or(encoding_rs::UTF_8);
-    let (bytes, _, _) = encoding.encode(&text);
+    let (bytes, _, _) = submission_encoding(&label).encode(&text);
     url::form_urlencoded::byte_serialize(bytes.as_ref()).collect()
 }
 

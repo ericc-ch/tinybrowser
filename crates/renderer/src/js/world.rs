@@ -43,6 +43,10 @@ pub(crate) struct RealmRegistry {
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
+    /// `TextDecoder` session ids, allocated across every world and frame so
+    /// a freed id can never alias a live session, even if a finalizer runs
+    /// under another realm.
+    next_decoder: u64,
 }
 
 pub(crate) struct PrivateSlots {
@@ -55,6 +59,12 @@ impl RealmRegistry {
     pub(crate) fn allocate_remote(&mut self) -> u64 {
         self.next_remote = self.next_remote.saturating_add(1);
         self.next_remote
+    }
+
+    /// The next process-unique `TextDecoder` session id.
+    pub(crate) fn allocate_decoder(&mut self) -> u64 {
+        self.next_decoder = self.next_decoder.saturating_add(1);
+        self.next_decoder
     }
 }
 
@@ -520,7 +530,6 @@ pub(crate) struct World {
     /// the engine runs the callback
     /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
     pub(crate) decoders: HashMap<u64, DecoderSession>,
-    pub(crate) next_decoder: u64,
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
@@ -596,11 +605,14 @@ pub(crate) struct World {
 
 /// One streaming `TextDecoder` session: the decoder plus what recreates it.
 /// A `last=true` call ends the decoder (`encoding_rs` panics on reuse), so
-/// every non-streaming `decode()` replaces it with a fresh one.
+/// every non-streaming `decode()` replaces it with a fresh one. `carry`
+/// holds input bytes past a fatal error for the next call: the error itself
+/// is consumed, but the queue behind it is not.
 pub(crate) struct DecoderSession {
     pub(crate) decoder: encoding_rs::Decoder,
     pub(crate) encoding: &'static encoding_rs::Encoding,
     pub(crate) ignore_bom: bool,
+    pub(crate) carry: Vec<u8>,
 }
 
 impl DecoderSession {
@@ -614,6 +626,7 @@ impl DecoderSession {
             decoder,
             encoding,
             ignore_bom,
+            carry: Vec::new(),
         }
     }
 }
@@ -666,7 +679,6 @@ impl World {
             image_updates: Vec::new(),
             input_files: HashMap::new(),
             decoders: HashMap::new(),
-            next_decoder: 0,
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
@@ -728,6 +740,9 @@ impl World {
         self.clear_images();
         self.remote_ids.clear();
         self.remote_nodes.clear();
+        // Sessions die with the realm: a navigation must not inherit a
+        // half-fed decoder.
+        self.decoders.clear();
         // Navigation replaces the document's element handlers with it, but the
         // realm keeps its window object, so window-scoped handlers survive:
         // the old document's `onload` must not fire in the new document

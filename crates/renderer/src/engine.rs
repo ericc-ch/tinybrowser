@@ -772,7 +772,7 @@ impl Engine {
             "data" => {
                 if let Some((content_type, body)) = decode_data_url(url.as_str()) {
                     if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_frame_response(&url, content_type.as_deref(), &body);
+                        document.load_frame_response(&url, Some(content_type.as_str()), &body);
                     }
                 } else {
                     // A malformed data URL fails the navigation; the frame
@@ -1109,11 +1109,12 @@ impl Engine {
 /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
 ///
 /// An empty MIME defaults to `text/plain;charset=US-ASCII`, as the Fetch
-/// processor requires; callers treat the value as the response MIME.
-pub(crate) fn decode_data_url(raw: &str) -> Option<(Option<String>, Vec<u8>)> {
+/// processor requires; every success carries a MIME, so callers never see
+/// `None` content types from this function.
+pub(crate) fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
     let url = data_url::DataUrl::process(raw).ok()?;
     let (body, _fragment) = url.decode_to_vec().ok()?;
-    Some((Some(url.mime_type().to_string()), body))
+    Some((url.mime_type().to_string(), body))
 }
 
 /// Decodes a URL into its UTF-8 text, percent-escapes included.

@@ -137,10 +137,28 @@ pub(in crate::document) fn complete(
     Ok(CompletedDial { context, outcome })
 }
 
+/// The response charset: the MIME type's `charset` parameter resolved as an
+/// Encoding Standard label
+/// (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>,
+/// <https://encoding.spec.whatwg.org/#concept-encoding-get>).
 fn charset_from_content_type(content_type: &str) -> Option<&'static encoding_rs::Encoding> {
-    let mime: mime::Mime = content_type.parse().ok()?;
-    let charset = mime.get_param(mime::CHARSET)?;
-    encoding_rs::Encoding::for_label(charset.as_str().as_bytes())
+    if let Ok(mime) = content_type.parse::<mime::Mime>() {
+        if let Some(charset) = mime.get_param(mime::CHARSET) {
+            return encoding_rs::Encoding::for_label(charset.as_str().as_bytes());
+        }
+        return None;
+    }
+    // `mime` fails the whole parse on a parameter without `=`; the charset
+    // after it is still usable, so fall back to a tolerant scan rather than
+    // mis-decoding a labeled response.
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let label = value.trim().trim_matches(['\'', '"']);
+        encoding_rs::Encoding::for_label(label.as_bytes())
+    })
 }
 
 fn prescan_charset(body: &[u8]) -> Option<&'static encoding_rs::Encoding> {

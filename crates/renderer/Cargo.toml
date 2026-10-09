@@ -13,8 +13,10 @@ webstorage = { workspace = true }
 # Parser QualNames flow into Blitz as one type, no conversion layer.
 markup5ever = "=0.39.0"
 encoding_rs = "0.8"
-# Already in Cargo.lock and the shipping binary: usvg (`data-url`), url
-# (`percent-encoding`), net (`base64`). Direct deps so renderer can call them.
+# Already in Cargo.lock and the shipping binary. Direct deps so renderer can
+# call them: `data-url` for engine data URLs and `atob`,
+# `percent-encoding` for `javascript:` URL decoding, `base64` for `btoa` and
+# FileReader encoding, `mime` for the document charset sniff.
 data-url = "0.3"
 percent-encoding = "2"
 base64 = "0.23"
