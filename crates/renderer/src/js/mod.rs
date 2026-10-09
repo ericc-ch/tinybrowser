@@ -1349,8 +1349,9 @@ pub(crate) fn referrer_for_policy(
     let _ = stripped.set_username("");
     let _ = stripped.set_password(None);
     stripped.set_fragment(None);
-    // The source's origin, for the origin-only policies.
-    let origin = document_url.origin().ascii_serialization();
+    // The source's origin, serialized as a URL: always with the `/` path,
+    // as browsers send it (`Referer: https://example.com/`).
+    let origin = format!("{}/", document_url.origin().ascii_serialization());
     if policy.eq_ignore_ascii_case("unsafe-url") {
         Some(stripped.to_string())
     } else if policy.eq_ignore_ascii_case("origin") {
@@ -1530,7 +1531,7 @@ mod tests {
         );
         assert_eq!(
             referrer("", doc, "https://other.test/x"),
-            Some("https://example.com:8443".to_owned())
+            Some("https://example.com:8443/".to_owned())
         );
         assert_eq!(referrer("", doc, "http://example.com:8443/x"), None);
         // Credentials and fragments never leave, under any policy.
@@ -1540,7 +1541,7 @@ mod tests {
         );
         assert_eq!(
             referrer("origin", doc, "https://other.test/x"),
-            Some("https://example.com:8443".to_owned())
+            Some("https://example.com:8443/".to_owned())
         );
         assert_eq!(
             referrer("same-origin", doc, "https://example.com:8443/other"),
@@ -1552,7 +1553,7 @@ mod tests {
         );
         assert_eq!(
             referrer("origin-when-cross-origin", doc, "https://other.test/x"),
-            Some("https://example.com:8443".to_owned())
+            Some("https://example.com:8443/".to_owned())
         );
         assert_eq!(
             referrer("no-referrer", doc, "https://example.com:8443/other"),

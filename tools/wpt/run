@@ -183,11 +183,13 @@ venv_stamp_payload() {
     else
       echo no-python
     fi
+    # Requirements and identity only: the adapter install is editable, so
+    # `tools/wpt/*.py` edits take effect without a reinstall (hashing them
+    # would serialize every adapter edit behind the venv lock for nothing).
     sha256sum \
       "$WPT/tools/manifest/requirements.txt" \
       "$WPT/tools/wptrunner/requirements.txt" \
-      "$ROOT/tools/wpt/pyproject.toml" \
-      "$ROOT/tools/wpt/"*.py
+      "$ROOT/tools/wpt/pyproject.toml"
   } | sha256sum | awk '{print $1}'
 }
 VENV_STAMP="$VENV/.tinybrowser-wpt-stamp"
@@ -438,7 +440,7 @@ fi
 # loudly, instead of an option being swallowed silently.
 reorder_test_paths() {
   local -a paths=() opts=()
-  local i=0 count=${#args[@]} arg
+  local i=0 count=${#args[@]} arg types_start
   while (( i < count )); do
     arg="${args[$i]}"
     if [[ "$arg" != -* || "$arg" == "-" ]]; then
@@ -454,10 +456,19 @@ reorder_test_paths() {
     case "$arg" in
       --test-types)
         i=$((i + 1))
+        types_start=${#opts[@]}
         while (( i < count )) && is_known_test_type "${args[$i]}"; do
           opts+=("${args[$i]}")
           i=$((i + 1))
         done
+        # A typo (`--test-types testharnes dom/nodes`) leaves a bare token
+        # that wpt would misread as a path. Typeless values are always a
+        # mistake here, so say so loudly instead of running the wrong set.
+        if (( ${#opts[@]} == types_start )) && (( i < count )) \
+          && [[ "${args[$i]}" != -* && "${args[$i]}" != */* && "${args[$i]}" != *.* ]]; then
+          echo "wpt: unknown --test-types value '${args[$i]}'; expected one of: $KNOWN_TEST_TYPES" >&2
+          exit 1
+        fi
         ;;
       --run-by-dir|--debugger|--chaos|--trace-categories)
         if (( i + 1 < count )) && [[ "${args[$((i + 1))]}" != -* ]]; then
@@ -487,6 +498,29 @@ reorder_test_paths() {
         i=$((i + 1))
         ;;
     esac
+  done
+  # A hand-maintained flag list rots: a new boolean wpt flag missing from
+  # the `case` above falls into `*`, which swallows the next test path as
+  # its value and the run silently covers nothing. Fail loudly when an
+  # option slot holds something path-shaped instead. Known path-valued
+  # flags (and their values) are skipped.
+  local skip_next=0 opt
+  for opt in ${opts[@]+"${opts[@]}"}; do
+    if (( skip_next )); then
+      skip_next=0
+      continue
+    fi
+    case "$opt" in
+      --metadata|--manifest|--run-by-dir|--debugger|--chaos|--trace-categories)
+        skip_next=1
+        continue
+        ;;
+      --metadata=*|--manifest=*|--processes=*) continue;;
+    esac
+    if [[ "$opt" == */* ]]; then
+      echo "wpt: option value '$opt' looks like a test path swallowed by an unknown flag; update reorder_test_paths" >&2
+      exit 1
+    fi
   done
   args=()
   if (( ${#paths[@]} )); then
@@ -561,16 +595,45 @@ if (( record_manifest_stamp == 0 )) && (( manifest_locked == 0 )) && (( venv_hel
 fi
 # Slow path: a manifest walk and/or venv writes happen under this wrapper,
 # so bash stays parent and forwards signals to the runner explicitly.
+# The manifest mtime gates the stamp below: only a run that actually
+# rewrote MANIFEST.json may record it, so a run that died in argparse (old
+# file still parses) never stamps the edited tree against the old manifest.
+manifest_mtime_before="$(stat -c %Y "$MANIFEST_PATH" 2>/dev/null || echo 0)"
 child=0
-trap 'if (( child )); then kill -TERM "$child" 2>/dev/null; fi' TERM INT HUP
-"$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}" &
+interrupted=0
+forward_signal() {
+  interrupted=1
+  if (( child )); then
+    kill -"$1" "$child" 2>/dev/null
+  fi
+}
+trap 'forward_signal TERM' TERM
+trap 'forward_signal HUP' HUP
+# INT forwards as INT (not TERM) so wpt gets its KeyboardInterrupt cleanup.
+# The subshell restores the default INT handler first: bash starts async
+# children with SIGINT ignored, which python would otherwise inherit.
+trap 'forward_signal INT' INT
+( trap - INT; exec "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}" ) 8>&- 9>&- &
 child=$!
 wait "$child"
 status=$?
+# `wait` returns at once when a trapped signal arrives, before the TERM/INT
+# lands: keep waiting until the child is really gone, or the manifest lock
+# below is released while wptserve and the browsers still run.
+while kill -0 "$child" 2>/dev/null; do
+  wait "$child"
+  status=$?
+done
 child=0
 trap - TERM INT HUP
 set -e
-if (( record_manifest_stamp == 1 )) && manifest_is_walked "$MANIFEST_PATH"; then
+# Lock fds stay with the wrapper: children inheriting them would hold the
+# flock past this process (the lock belongs to the open file description,
+# so one orphaned browser blocks every later run).
+manifest_mtime_after="$(stat -c %Y "$MANIFEST_PATH" 2>/dev/null || echo 0)"
+if (( interrupted == 0 && record_manifest_stamp == 1 )) \
+  && [[ "$manifest_mtime_after" != "$manifest_mtime_before" ]] \
+  && manifest_is_walked "$MANIFEST_PATH"; then
   write_manifest_stamp "$MANIFEST_PATH"
 fi
 if (( venv_held_for_run )); then

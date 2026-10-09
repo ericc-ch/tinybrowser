@@ -161,10 +161,7 @@ fn insertion_excluding(
     child: Option<NodeReference>,
     exclude: Option<BlitzId>,
 ) -> Result<(NodeId, Option<NodeId>)> {
-    match exclude {
-        Some(id) => insertion_excluding_children(ctx, parent, node, child, &[id]),
-        None => insertion_excluding_children(ctx, parent, node, child, &[]),
-    }
+    insertion_excluding_children(ctx, parent, node, child, exclude.as_slice())
 }
 
 /// Validates one insertion against an explicit exclusion set.
@@ -309,39 +306,23 @@ enum InsertedNode {
 fn classify_inserted(doc: &crate::documents::BlitzDocument, id: BlitzId) -> InsertedNode {
     // Fragment backings (flagged elements) and real `Fragment` nodes both
     // splice their children on insertion.
-    let is_fragment = doc.is_fragment(id)
-        || doc
-            .base
-            .get_node(id)
-            .is_some_and(|node| matches!(node.data, NodeData::Fragment { .. }));
-    if is_fragment {
-        let children: Vec<BlitzId> = doc
-            .base
-            .get_node(id)
-            .map(|fragment| fragment.children.iter().copied().collect())
-            .unwrap_or_default();
+    if doc.is_fragment(id) {
         // Flatten nested fragments: insertion splices fragment children, so a
         // fragment holding a nested fragment with two elements still inserts
-        // two elements.
+        // two elements. Iterative: fragment nesting is not depth-limited.
         // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-        fn fragment_shape(
-            doc: &crate::documents::BlitzDocument,
-            id: BlitzId,
-            elements: &mut usize,
-            has_text: &mut bool,
-        ) {
+        let mut elements = 0;
+        let mut has_text = false;
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
             let kids: Vec<BlitzId> = doc
                 .base
-                .get_node(id)
+                .get_node(current)
                 .map(|n| n.children.iter().copied().collect())
                 .unwrap_or_default();
             for child in kids {
-                if doc.is_fragment(child)
-                    || doc.base.get_node(child).is_some_and(|n| {
-                        matches!(n.data, NodeData::Fragment { .. })
-                    })
-                {
-                    fragment_shape(doc, child, elements, has_text);
+                if doc.is_fragment(child) {
+                    stack.push(child);
                     continue;
                 }
                 if doc
@@ -349,7 +330,7 @@ fn classify_inserted(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Inse
                     .get_node(child)
                     .is_some_and(|candidate| candidate.data.downcast_element().is_some())
                 {
-                    *elements += 1;
+                    elements += 1;
                 }
                 if doc.base.get_node(child).is_some_and(|candidate| {
                     matches!(
@@ -357,14 +338,10 @@ fn classify_inserted(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Inse
                         NodeData::Text(_) | NodeData::CDataSection { .. }
                     )
                 }) {
-                    *has_text = true;
+                    has_text = true;
                 }
             }
         }
-        let mut elements = 0;
-        let mut has_text = false;
-        fragment_shape(doc, id, &mut elements, &mut has_text);
-        let _ = children;
         return InsertedNode::Fragment { elements, has_text };
     }
     match doc.base.get_node(id).map(|node| &node.data) {
@@ -462,8 +439,11 @@ fn ensure_document_content_model(
             ));
         }
         // A comment or processing instruction may be a document child.
-        // `Other` (documents, anonymous blocks) already threw above.
         InsertedNode::CharacterData => return Ok(()),
+        // Unreachable: `Other` throws above for every parent before this
+        // runs. Kept as defense-in-depth so that removing that check fails
+        // closed (HierarchyRequestError) rather than admitting documents or
+        // anonymous blocks as document children.
         InsertedNode::Other => {
             return Err(throw_dom(
                 ctx,
@@ -489,9 +469,10 @@ fn ensure_document_content_model(
         }
     }
     let parent_has_element = parent_has_element(doc, parent.node, excluded, node.document == parent.document, node.node);
-    // Validated by `ensure_parented` above: same-document or absent.
-    let child_id = reference;
-    debug_assert!(child_id.is_none_or(|child| child.document == parent.document));
+    // `ensure_parented` above guarantees same-document-or-absent, but the
+    // filter stays: in release builds a bypassed check must degrade to
+    // append-at-end, never to cross-document slot reads.
+    let child_id = reference.filter(|child| child.document == parent.document);
     let doctype_follows =
         child_id.is_some_and(|child| sibling_doctype_follows(doc, parent.node, child.node));
     let child_is_doctype =
@@ -3143,10 +3124,8 @@ fn serialize_html_element(
     let children: Vec<BlitzId> = base
         .get_node(id)
         .map(|node| {
-            if is_html_template_name(name) {
-                node.data
-                    .downcast_element()
-                    .and_then(|element| element.template_contents)
+            if crate::js::world::is_template_tag(name) {
+                crate::js::world::template_contents(base, id)
                     .and_then(|fragment| {
                         base.get_node(fragment)
                             .map(|backing| backing.children.iter().copied().collect())
@@ -3316,11 +3295,6 @@ fn push_escaped_xml_attribute(output: &mut HtmlOutput, value: &str) {
 /// children. Known gap: namespace prefix synthesis is skipped; the stored
 /// qualified name is used as-is
 /// (<https://w3c.github.io/DOM-Parsing/#xml-serialization>).
-/// Whether `name` is an HTML `template` element, whose serializable
-/// children live in its template contents fragment.
-fn is_html_template_name(name: &QualName) -> bool {
-    crate::js::world::is_template_tag(name)
-}
 
 fn serialize_xml_element(
     doc: &crate::documents::BlitzDocument,
@@ -3342,10 +3316,8 @@ fn serialize_xml_element(
     let children: Vec<BlitzId> = base
         .get_node(id)
         .map(|node| {
-            if is_html_template_name(name) {
-                node.data
-                    .downcast_element()
-                    .and_then(|element| element.template_contents)
+            if crate::js::world::is_template_tag(name) {
+                crate::js::world::template_contents(base, id)
                     .and_then(|fragment| {
                         base.get_node(fragment)
                             .map(|backing| backing.children.iter().copied().collect())
@@ -5332,13 +5304,7 @@ impl JsNode {
         // innerHTML on a template reads its template contents, not its
         // (empty) children
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
-        let container = node
-            .data
-            .downcast_element()
-            .filter(|element| {
-                crate::js::world::is_template_tag(&element.name)
-            })
-            .and_then(|element| element.template_contents)
+        let container = crate::js::world::template_contents(&parsed.document.base, container.node)
             .map(|fragment| NodeId {
                 document: container.document,
                 node: fragment,
@@ -5418,15 +5384,7 @@ impl JsNode {
             .borrow()
             .document(container)
             .and_then(|parsed| {
-                parsed
-                    .document
-                    .base
-                    .get_node(container.node)
-                    .and_then(|node| node.data.downcast_element())
-                    .filter(|element| {
-                        crate::js::world::is_template_tag(&element.name)
-                    })
-                    .and_then(|element| element.template_contents)
+                crate::js::world::template_contents(&parsed.document.base, container.node)
             })
             .map(|fragment| NodeId {
                 document: container.document,
@@ -5579,6 +5537,18 @@ impl JsNode {
         drop(parsed);
         drop(world);
         register_inserted_iframes(&ctx, &moved)?;
+        // Custom elements in parsed markup upgrade, like the innerHTML and
+        // outerHTML paths below.
+        upgrade_parsed_tree(
+            &ctx,
+            if needs_parent {
+                parent.ok_or_else(|| {
+                    throw_dom(&ctx, "NoModificationAllowedError", "element has no parent")
+                })?
+            } else {
+                element
+            },
+        )?;
         schedule_mutation_delivery(&ctx)
     }
 
@@ -5641,6 +5611,7 @@ impl JsNode {
         drop(parsed);
         drop(world);
         register_inserted_iframes(ctx, &added)?;
+        upgrade_parsed_tree(ctx, parent)?;
         schedule_mutation_delivery(ctx)
     }
 

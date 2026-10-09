@@ -114,10 +114,10 @@
   }
 
   function validName(name) {
-    // Pinned string primitives: a page overriding `String.prototype`
-    // before `define()` runs must not change validation.
+    // Pinned primitives: a page overriding `String.prototype` or
+    // `RegExp.prototype` before `define()` runs must not change validation.
     return typeof name === 'string' && __tbApply(__tbStringIncludes, name, ['-']) &&
-      name === __tbApply(__tbStringToLowerCase, name, []) && /^[a-z][.0-9_a-z\-]*$/.test(name);
+      name === __tbApply(__tbStringToLowerCase, name, []) && __tbApply(__tbRegExpTest, /^[a-z][.0-9_a-z\-]*$/, [name]);
   }
 
   function invoke(element, name, args) {
@@ -211,7 +211,7 @@
           }
           if (callbacks.attributeChangedCallback !== undefined) {
             const attributes = constructor.observedAttributes;
-            if (attributes !== undefined) observed = arrayFrom(attributes, value => String(value));
+            if (attributes !== undefined) observed = arrayFrom(attributes, value => __tbStringCtor(value));
           }
         } finally {
           definitionRunning = false;
@@ -250,6 +250,9 @@
   }
 
   const registry = new CustomElementRegistry();
+  // Captured: `customElements` is configurable, so a page can replace the
+  // global and the same-realm check must not read it live.
+  const __tbCustomElementsRegistry = registry;
   __tbDefineProperty(globalThis, 'CustomElementRegistry', {
     value: CustomElementRegistry, writable: true, configurable: true,
   });
@@ -281,9 +284,11 @@
     const foreign = view && view.customElements;
     // Same registry as this realm: the Rust setter path already upgraded
     // this root through the host hook, so a second walk is pure cost.
+    // Compared against the realm-init capture, not the live global, so a
+    // page replacing `globalThis.customElements` cannot lie either way.
     // (A foreign registry without definitions cannot be detected — there is
     // no enumeration API — so genuinely cross-realm roots always walk.)
-    if (!foreign || foreign === globalThis.customElements) return;
+    if (!foreign || foreign === __tbCustomElementsRegistry) return;
     if (typeof foreign.upgrade === 'function') {
       foreign.upgrade(root);
     }

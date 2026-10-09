@@ -8,7 +8,7 @@ const __tbMessageEventConstructor = globalThis.MessageEvent = class MessageEvent
     const eventInit = init === undefined ? {} : Object(init);
     const event = __tbConstruct(__tbEventConstructor, [String(type), eventInit], new.target);
     __tbMessageEventData.set(event, {
-        data: Object.prototype.hasOwnProperty.call(eventInit, 'data') ? eventInit.data : null,
+        data: __tbApply(__tbHasOwnProperty, eventInit, ['data']) ? eventInit.data : null,
         origin: eventInit.origin === undefined ? '' : String(eventInit.origin),
         lastEventId: eventInit.lastEventId === undefined ? '' : String(eventInit.lastEventId),
         source: eventInit.source === undefined ? null : eventInit.source,
@@ -631,7 +631,7 @@ const __tbFrameProxy = frame => {
           // intentional for the polling pattern (`child.document` becomes
           // defined at realm init), not a spec gate.
           const pending = __tbFramePendingSets[frame];
-          if (pending !== undefined && Object.prototype.hasOwnProperty.call(pending, property)) {
+          if (pending !== undefined && __tbApply(__tbHasOwnProperty, pending, [property])) {
             return pending[property];
           }
           return undefined;
@@ -682,7 +682,7 @@ const __tbFrameProxy = frame => {
         crossOrigin();
       }
       if (property === 'name') {
-        host.__tbSetFrameName(frame, String(value));
+        host.__tbSetFrameName(frame, __tbStringCtor(value));
         return true;
       }
       if (property === '__proto__') {
@@ -959,7 +959,7 @@ Object.defineProperty(globalThis, 'top', {
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name
 Object.defineProperty(globalThis, 'name', {
   get() { return host.__tbFrameName(__tbFrameId); },
-  set(value) { host.__tbSetFrameName(__tbFrameId, String(value)); },
+  set(value) { host.__tbSetFrameName(__tbFrameId, __tbStringCtor(value)); },
   configurable: true, enumerable: true,
 });
 

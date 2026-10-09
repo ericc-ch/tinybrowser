@@ -68,9 +68,9 @@ impl DomString {
 
     /// Whether the sequence contains an unpaired surrogate.
     ///
-    /// Whether the string holds code units the UTF-8 tree cannot keep.
-    /// Those read back as the replacement character (see `docs/progress.md`)
-    /// (<https://infra.spec.whatwg.org/#javascript-string-convert>).
+    /// The UTF-8 tree cannot hold these, so they read back as U+FFFD
+    /// (see `docs/progress.md`,
+    /// <https://infra.spec.whatwg.org/#javascript-string-convert>).
     #[must_use]
     pub fn has_unpaired_surrogate(&self) -> bool {
         matches!(self.0, Repr::Utf16(_))

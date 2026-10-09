@@ -13,7 +13,6 @@ use std::time::Instant;
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
-    context::EvalOptions,
     function::{Rest, This},
 };
 
@@ -495,7 +494,23 @@ pub(crate) fn install_event_target_bridge(ctx: &Ctx<'_>) -> Result<()> {
         "__tbDispatchTargetTrusted",
         rquickjs::prelude::Func::from(dispatch_trusted_bridge),
     )?;
+    // Forge-proof event brand check for the script getters: prototype-chain
+    // walks (`instanceof`) pass for `Object.create(MouseEvent.prototype)`,
+    // but only genuine events (native or constructed through the shared
+    // native prototype) convert to `Class<JsEvent>`.
+    super::bridge::object(ctx)?.set(
+        "__tbIsEvent",
+        rquickjs::prelude::Func::from(is_event_bridge),
+    )?;
     Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn is_event_bridge<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<bool> {
+    Ok(Class::<JsEvent>::from_js(&ctx, value).is_ok())
 }
 
 #[allow(
@@ -1492,38 +1507,31 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
 /// in the window's global script environment, matching classic scripts
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler>).
 ///
-/// Default `eval` is strict and does not see sloppy `var`/`function`
-/// bindings from page scripts. Like `new Function` (and like classic
-/// scripts in this engine, which enforces no CSP yet -- tracked gap, not an
-/// intentional bypass), compilation is unconditional: there is no
-/// `script-src` gate to consult.
-/// Parameter names are validated identifiers, so callers cannot inject
-/// signature text through this interpolation.
+/// Compiled through the pinned `Function` constructor, the way `new
+/// Function(params, body)` does: params and body stay separate inputs, so a
+/// `}` in the attribute value is a syntax error (null handler), not an
+/// escape from a string-interpolated wrapper. The constructor is captured
+/// at realm init because handlers compile on demand, after page code may
+/// have replaced the global. Like classic scripts in this engine (which
+/// enforces no CSP yet -- tracked gap, not an intentional bypass),
+/// compilation is unconditional.
 pub(crate) fn compile_handler_function<'js>(
     ctx: &Ctx<'js>,
     params: &[&str],
     body: &str,
 ) -> Result<Function<'js>> {
-    for param in params {
-        let mut characters = param.chars();
-        let valid = match characters.next() {
-            Some(first) if first == '_' || first == '$' || first.is_ascii_alphabetic() => characters
-                .all(|character| {
-                    character == '_' || character == '$' || character.is_ascii_alphanumeric()
-                }),
-            _ => false,
-        };
-        if !valid {
-            return Err(Exception::throw_type(
-                ctx,
-                "event handler parameter is not an identifier",
-            ));
-        }
-    }
-    let mut options = EvalOptions::default();
-    options.strict = false;
-    let source = format!("(function({}) {{\n{body}\n}})", params.join(", "));
-    ctx.eval_with_options(source, options)
+    let bridge = super::bridge::object(ctx)?;
+    let constructor: Object = bridge.get("__tb_function")?;
+    let Some(constructor) = constructor.as_constructor() else {
+        return Err(Exception::throw_internal(
+            ctx,
+            "Function constructor is not constructible",
+        ));
+    };
+    // One params argument plus the body: `new Function("event", body)`.
+    // The constructor parses the params list itself, so no identifier
+    // validation is needed here (every caller passes literals regardless).
+    constructor.construct((params.join(","), body.to_owned()))
 }
 
 /// Calls a target's `on<type>` handler attribute, if one is assigned

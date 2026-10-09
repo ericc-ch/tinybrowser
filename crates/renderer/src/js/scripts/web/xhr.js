@@ -136,11 +136,15 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       parsed = null;
     }
     // An empty body parses to no document element; a `parsererror`
-    // document element means the body was not well-formed, so there is no
-    // document either (<https://xhr.spec.whatwg.org/#document-response>).
-    // Anything else the parser accepts is the document.
+    // document element in the parsererror namespace means the body was not
+    // well-formed, so there is no document either
+    // (<https://xhr.spec.whatwg.org/#document-response>). The namespace
+    // check matters: a well-formed `<parsererror/>` response is a valid
+    // document, not a failure. Anything else the parser accepts is the
+    // document.
     if (parsed !== null && parsed.documentElement !== null
-      && parsed.documentElement.localName === 'parsererror') parsed = null;
+      && parsed.documentElement.localName === 'parsererror'
+      && parsed.documentElement.namespaceURI === 'http://www.mozilla.org/newlayout/xml/parsererror.xml') parsed = null;
     data.responseDocument = parsed !== null && parsed.documentElement !== null ? parsed : null;
     return data.responseDocument;
   }

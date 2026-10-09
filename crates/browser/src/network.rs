@@ -426,9 +426,12 @@ fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Network-boundary `Referer` check: same-origin, or cross-origin only to a
-/// trustworthy (https/loopback) target without downgrade. The renderer already
-/// applies the policy; this keeps a compromised renderer from leaking.
+/// Network-boundary `Referer` check: rejects only a true downgrade (https
+/// referrer to an http/ws target) or a referrer that is not a stripped
+/// http(s) URL. The cross-origin send decision belongs to the renderer's
+/// `referrer_for_policy`; this layer must not second-guess it (an http to
+/// http cross-origin `Referer` is legitimate under several policies, and
+/// WPT servers are plain http).
 fn is_safe_referrer(referrer: &str, request_url: &str) -> bool {
     let (Ok(from), Ok(to)) = (Url::parse(referrer), Url::parse(request_url)) else {
         return false;
@@ -436,16 +439,10 @@ fn is_safe_referrer(referrer: &str, request_url: &str) -> bool {
     if !matches!(from.scheme(), "http" | "https") {
         return false;
     }
-    let same_origin = from.scheme() == to.scheme()
-        && from.host_str() == to.host_str()
-        && from.port_or_known_default() == to.port_or_known_default();
-    if same_origin {
-        return true;
-    }
     if from.scheme() == "https" && matches!(to.scheme(), "http" | "ws") {
         return false;
     }
-    matches!(to.scheme(), "https" | "wss")
+    true
 }
 
 #[cfg(test)]
@@ -479,6 +476,20 @@ mod tests {
             TabNetworkHandle::acquire(&permits, Instant::now() + Duration::from_millis(50))
                 .await
                 .expect("permit after release");
+    }
+
+    #[test]
+    fn unsafe_referrer_survives_plain_http_cross_origin() {
+        // WPT servers are plain http: an http referrer to another http
+        // origin must keep its header; only a true downgrade is dropped.
+        assert!(is_safe_referrer("http://a.test/page", "http://b.test/other"));
+        assert!(is_safe_referrer(
+            "https://a.test/page",
+            "https://b.test/other"
+        ));
+        assert!(!is_safe_referrer("https://a.test/page", "http://b.test/other"));
+        assert!(!is_safe_referrer("data:text/plain,x", "http://b.test/other"));
+        assert!(!is_safe_referrer("not a url", "http://b.test/other"));
     }
 
     #[test]

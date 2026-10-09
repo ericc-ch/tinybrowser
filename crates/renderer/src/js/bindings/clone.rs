@@ -92,9 +92,11 @@ pub(crate) fn adopt_into_document(ctx: &Ctx<'_>, document: NodeId, node: NodeId)
 /// deep snapshot of `from`. Each lookup borrows one document: the store is a
 /// single `RefCell`.
 fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<()> {
-    // Iterative to bound the Rust stack on adversarial deep trees; each pair
-    // is checked for child-count agreement because snapshot filtering can
-    // drop unsnapshotable nodes and `zip` would otherwise misalign siblings.
+    // Iterative to bound the Rust stack on adversarial deep trees. On a
+    // child-count mismatch (snapshot filtering can drop unsnapshotable
+    // nodes) that subtree is skipped, not thrown: throwing here would leave
+    // the already-detached source and materialized copy half-retargeted
+    // with no rollback, while `zip` would misalign every following sibling.
     let mut stack = vec![(from, to)];
     while let Some((from, to)) = stack.pop() {
         super::retarget_wrapper(ctx, from, to)?;
@@ -104,19 +106,12 @@ fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<(
             world_for_node(ctx, id).ok().and_then(|owner| {
                 let owner = owner.borrow();
                 owner.document(id).and_then(|parsed| {
-                    parsed
-                        .document
-                        .base
-                        .get_node(id.node)
-                        .and_then(|node| node.data.downcast_element())
-                        .filter(|element| {
-                            crate::js::world::is_template_tag(&element.name)
-                        })
-                        .and_then(|element| element.template_contents)
-                        .map(|fragment| NodeId {
+                    crate::js::world::template_contents(&parsed.document.base, id.node).map(
+                        |fragment| NodeId {
                             document: id.document,
                             node: fragment,
-                        })
+                        },
+                    )
                 })
             })
         };
@@ -127,13 +122,9 @@ fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<(
         }
         let from_children = adopted_children(ctx, from)?;
         let to_children = adopted_children(ctx, to)?;
-        if from_children.len() != to_children.len() {
-            return Err(Exception::throw_type(
-                ctx,
-                "adopted subtree shape diverged",
-            ));
+        if from_children.len() == to_children.len() {
+            stack.extend(from_children.into_iter().zip(to_children));
         }
-        stack.extend(from_children.into_iter().zip(to_children).collect::<Vec<_>>());
     }
     Ok(())
 }
@@ -349,13 +340,6 @@ pub(crate) enum ImportSnapshot {
 }
 
 
-/// Whether `name` is an HTML `template` element, whose children live in its
-/// template contents fragment
-/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
-fn is_html_template(name: &QualName) -> bool {
-    crate::js::world::is_template_tag(name)
-}
-
 /// Deep-snapshots `children` for cross-document cloning.
 fn snapshot_children(
     doc: &BlitzDocument,
@@ -409,7 +393,7 @@ pub(crate) fn import_snapshot(
             // as element children: snapshot from the contents
             // (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
             let children = if deep {
-                if is_html_template(&name) {
+                if crate::js::world::is_template_tag(&name) {
                     doc.base
                         .get_node(id.node)
                         .and_then(|node| node.data.downcast_element())
@@ -526,7 +510,7 @@ fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
     Ok(match doc.base.get_node(id.node).map(|node| &node.data) {
         Some(NodeData::Element(element)) => {
             // Template children live in the contents fragment.
-            let children = if is_html_template(&element.name) {
+            let children = if crate::js::world::is_template_tag(&element.name) {
                 element
                     .template_contents
                     .map(|fragment| {
@@ -637,7 +621,7 @@ pub(crate) fn materialize_import(
                 .create_element(name.clone(), attributes.clone());
             // Template children materialize into the fresh element's
             // contents fragment, which creation already established.
-            let parent = if is_html_template(name) {
+            let parent = if crate::js::world::is_template_tag(name) {
                 doc.base
                     .mutate()
                     .ensure_template_contents(blitz_id)

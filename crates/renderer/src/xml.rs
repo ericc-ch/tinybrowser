@@ -15,6 +15,12 @@ use crate::Parsed;
 
 static MIME_ESSENCES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
 
+/// The namespace of the `parsererror` document element, shared by the
+/// document builder here and the XHR `responseXML` failure check (which must
+/// compare namespace, not just the local name: a well-formed `<parsererror/>`
+/// response is a valid document, not a failure).
+pub(crate) const PARSERERROR_NS: &str = "http://www.mozilla.org/newlayout/xml/parsererror.xml";
+
 /// Parses `input` as an XML document with the given content type.
 ///
 /// Used only by `DOMParser`, whose results are plain `Document`s, never
@@ -27,19 +33,18 @@ pub(crate) fn parse_document(
     base_url: String,
     font_ctx: parley::FontContext,
 ) -> Parsed {
-    let mut parsed = parse_with_config(
+    parse_with_config(
         input,
         content_type,
         crate::ReadyState::Complete,
+        false,
         blitz_dom::DocumentConfig {
             base_url: Some(base_url),
             font_ctx: Some(font_ctx),
             ua_stylesheets: Some(Vec::new()),
             ..blitz_dom::DocumentConfig::default()
         },
-    );
-    parsed.xml_document = false;
-    parsed
+    )
 }
 
 /// Parses a navigated XML response with the frame's document config.
@@ -51,7 +56,7 @@ pub(crate) fn parse_navigated(
     content_type: &'static str,
     config: blitz_dom::DocumentConfig,
 ) -> Parsed {
-    parse_with_config(input, content_type, crate::ReadyState::Loading, config)
+    parse_with_config(input, content_type, crate::ReadyState::Loading, true, config)
 }
 
 /// Parses `input` with the shared XML configuration: the sink keeps real
@@ -63,11 +68,11 @@ fn parse_with_config(
     input: &str,
     content_type: &'static str,
     ready_state: crate::ReadyState,
+    xml_document: bool,
     config: blitz_dom::DocumentConfig,
 ) -> Parsed {
     // The sink keeps real doctype, processing-instruction, CDATA, and xmlns
     // nodes, with internal entities expanded up front.
-    let font_ctx = config.font_ctx.clone().unwrap_or_default();
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
     let mut document = crate::documents::BlitzDocument::from_base(base);
     // Parsed processing instructions arrive with data but no attribute map;
@@ -75,14 +80,20 @@ fn parse_with_config(
     document.init_parsed_pi_attributes();
     let errors = document.base.take_parse_errors();
     if !errors.is_empty() {
-        return parser_error_document(content_type, ready_state, font_ctx, &errors);
+        return parser_error_document(
+            document,
+            content_type,
+            ready_state,
+            xml_document,
+            &errors,
+        );
     }
     Parsed {
         id: 0,
         document,
         quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
         content_type,
-        xml_document: true,
+        xml_document,
         ready_state,
         url: None,
         // `&str` input is already decoded: DOMParser keeps UTF-8 (correct).
@@ -93,36 +104,47 @@ fn parse_with_config(
     }
 }
 
-/// Builds the `parsererror` document for a non-well-formed XML input: an
-/// XML document of the same content type whose document element is a single
-/// `parsererror` element in the Mozilla parsererror namespace describing
-/// the failure
+/// Rebuilds the parsed document as a `parsererror` document for a
+/// non-well-formed XML input: the same content type, base URL, and providers,
+/// whose document element is a single `parsererror` element in
+/// [`PARSERERROR_NS`] describing the failure
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+///
+/// Reuses the parsed document instead of building a fresh one: a fresh build
+/// would lose the base URL and providers the caller configured, so a failed
+/// navigated response would resolve URLs differently than the same response
+/// parsed cleanly.
 fn parser_error_document(
+    mut document: crate::documents::BlitzDocument,
     content_type: &'static str,
     ready_state: crate::ReadyState,
-    font_ctx: parley::FontContext,
+    xml_document: bool,
     errors: &[String],
 ) -> Parsed {
-    let mut parsed = crate::Parsed::script(content_type, font_ctx);
-    parsed.xml_document = true;
-    parsed.ready_state = ready_state;
+    let root = document.base.root_node().id;
+    document.base.mutate().remove_and_drop_all_children(root);
     let name = markup5ever::QualName::new(
         None,
-        markup5ever::Namespace::from(
-            "http://www.mozilla.org/newlayout/xml/parsererror.xml",
-        ),
+        markup5ever::Namespace::from(PARSERERROR_NS),
         markup5ever::LocalName::from("parsererror"),
     );
-    let root = parsed.document.base.root_node().id;
-    let element = parsed.document.base.mutate().create_element(name, Vec::new());
-    parsed.document.base.mutate().append_children(root, &[element]);
+    let element = document.base.mutate().create_element(name, Vec::new());
+    document.base.mutate().append_children(root, &[element]);
     let message = errors.join("\n");
     if !message.is_empty() {
-        let text = parsed.document.base.mutate().create_text_node(&message);
-        parsed.document.base.mutate().append_children(element, &[text]);
+        let text = document.base.mutate().create_text_node(&message);
+        document.base.mutate().append_children(element, &[text]);
     }
-    parsed
+    Parsed {
+        id: 0,
+        document,
+        quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
+        content_type,
+        xml_document,
+        ready_state,
+        url: None,
+        character_set: "UTF-8",
+    }
 }
 
 /// The document content type when `header` is an XML MIME type, otherwise
@@ -187,11 +209,9 @@ fn intern_mime_essence(essence: String) -> &'static str {
     // Past the cap, unknown essences report as the generic binary type;
     // every essence the specs name is a fixed static above and unaffected.
     const MAX_INTERNED_ESSENCES: usize = 1024;
-    let mut guard = MIME_ESSENCES.lock().unwrap_or_else(|poisoned| {
-        // A panicking parser thread must not leave attacker-influenced state
-        // behind silently: recover the guard and keep serving from it.
-        poisoned.into_inner()
-    });
+    let mut guard = MIME_ESSENCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let interned = guard.get_or_insert_with(HashSet::new);
     if let Some(existing) = interned.get(essence.as_str()) {
         return existing;
@@ -215,13 +235,15 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
     }
 }
 
-/// https://www.w3.org/TR/xml/#NT-NameStartChar
+/// Whether `character` may start an XML `Name`
+/// (<https://www.w3.org/TR/xml/#NT-NameStartChar>).
 pub(crate) fn is_name_start(character: char) -> bool {
     matches!(character, ':' | 'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}')
         || ('\u{10000}'..='\u{EFFFF}').contains(&character)
 }
 
-/// https://www.w3.org/TR/xml/#NT-NameChar
+/// Whether `character` may continue an XML `Name`
+/// (<https://www.w3.org/TR/xml/#NT-NameChar>).
 pub(crate) fn is_name_char(character: char) -> bool {
     is_name_start(character)
         || matches!(character, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')

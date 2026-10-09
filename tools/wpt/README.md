@@ -4,8 +4,8 @@
 binary through cargo on every run (cargo's fingerprint no-ops when fresh),
 and installs the wptrunner product into WPT's venv only when the venv is
 missing or its stamp changed: the stamp covers the requirements files,
-`tools/wpt/*.py`, and the worktree root (one shared venv serves every
-worktree). The manifest walk is skipped with `--no-manifest-update` when the
+`tools/wpt/pyproject.toml`, the python version, and the worktree root (one shared venv serves every
+worktree; the adapter install is editable, so adapter edits need no reinstall). The manifest walk is skipped with `--no-manifest-update` when the
 checkout state and manifest bytes match the last walked run. It defaults
 `--processes` to the CPU count capped at 8 (unless `--processes`,
 `--fully-parallel`, or `-f` is set), `--test-types testharness crashtest`,

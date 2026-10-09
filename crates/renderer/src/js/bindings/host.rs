@@ -454,13 +454,6 @@ fn node_interface_matches(
             matches!(data, Some(NodeData::Fragment { .. }))
                 || (matches!(data, Some(NodeData::Element(_))) && is_fragment)
         }
-        _ if is_fragment => {
-            // A fragment is only `Node`, `EventTarget`, `DocumentFragment`,
-            // and `ParentNode`: every Element-family and ChildNode check below
-            // is false for backings and real fragments alike. `ParentNode` is
-            // matched below.
-            matches!(interface, "ParentNode")
-        }
         "ShadowRoot" => false,
         // `DocumentFragment` implements neither `Element` nor `ChildNode`:
         // fragment backings are plain elements under the hood, so every

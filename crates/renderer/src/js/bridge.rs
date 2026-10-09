@@ -42,6 +42,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     bridge.set("apply", reflect.get::<_, Function>("apply")?)?;
     let json: Object = ctx.globals().get("JSON")?;
     bridge.set("stringify", json.get::<_, Function>("stringify")?)?;
+    // Pristine `Function` constructor for event-handler compilation: pages
+    // may replace the global afterwards, and handlers compile on demand.
+    let function: Object = ctx.globals().get("Function")?;
+    bridge.set("__tb_function", function)?;
     let table = Object::new(ctx.clone())?;
     table.set_prototype(None)?;
     bridge.set("__tb_handles", table)?;

@@ -157,9 +157,10 @@ impl BlitzDocument {
         id: blitz_traits::node_id::NodeId,
         attributes: Vec<(String, String)>,
     ) {
-        if let Some(stored) = self.pi_attributes.get_mut(&id) {
-            *stored = attributes;
-        }
+        // Plain insert: both callers hold a PI (creation and the guarded
+        // reparse path), and silently dropping a write desyncs the map from
+        // the serialized data it produces.
+        self.pi_attributes.insert(id, attributes);
     }
 
     /// Creates a CDATA section whose data is `data`
@@ -178,21 +179,26 @@ impl BlitzDocument {
         from: blitz_traits::node_id::NodeId,
         to: blitz_traits::node_id::NodeId,
     ) {
-        if let Some(attributes) = self.pi_attributes.get(&from).cloned() {
-            self.pi_attributes.insert(to, attributes);
+        // Pure tax when the document never saw a PI: skip the walk entirely.
+        if self.pi_attributes.is_empty() {
+            return;
         }
-        let from_children = self
-            .base
-            .get_node(from)
-            .map(|node| node.children.clone())
-            .unwrap_or_default();
-        let to_children = self
-            .base
-            .get_node(to)
-            .map(|node| node.children.clone())
-            .unwrap_or_default();
-        for (from_child, to_child) in from_children.into_iter().zip(to_children) {
-            self.copy_pi_subtree(from_child, to_child);
+        let mut stack = vec![(from, to)];
+        while let Some((from, to)) = stack.pop() {
+            if let Some(attributes) = self.pi_attributes.get(&from).cloned() {
+                self.pi_attributes.insert(to, attributes);
+            }
+            let from_children = self
+                .base
+                .get_node(from)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            let to_children = self
+                .base
+                .get_node(to)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            stack.extend(from_children.into_iter().zip(to_children));
         }
     }
 

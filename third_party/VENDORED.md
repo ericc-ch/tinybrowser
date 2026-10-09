@@ -25,7 +25,9 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: `[patch.crates-io]` path entries for `blitz-dom`,
   `blitz-html`, `blitz-paint`, and `blitz-traits`; its own workspace excluded
   from the tinybrowser workspace.
-- **Pinned revision**: `third_party/blitz` at `41074d7` (`master`; check `git submodule status`).
+- **Pinned revision**: `third_party/blitz` at `41074d7` (branch `master`, recorded
+  in `.gitmodules`; the fork's default branch is `main`, which tracks upstream
+  and is unrelated to this pin — check `git submodule status`).
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here. Push before pinning.

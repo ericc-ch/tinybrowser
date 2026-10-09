@@ -431,6 +431,16 @@ pub(crate) fn is_template_tag(name: &markup5ever::QualName) -> bool {
     name.ns == html_namespace() && name.local.as_ref() == "template"
 }
 
+/// The template contents fragment of `id`, when it is a `template` element.
+pub(crate) fn template_contents(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+) -> Option<BlitzNodeId> {
+    base.get_node(id)?.data.downcast_element().filter(|element| {
+        is_template_tag(&element.name)
+    }).and_then(|element| element.template_contents)
+}
+
 /// Whether `node` is an HTML element named `local`.
 pub(crate) fn is_html_element(
     base: &blitz_dom::BaseDocument,
@@ -1193,34 +1203,38 @@ impl World {
         true
     }
 
-    /// The frame that sorts immediately after `container`'s frame among its
-    /// parent's children: the first following sibling container that already
-    /// has a frame, if any. Both insertion and `moveBefore` sort through
-    /// this, so `window[i]` follows container tree order
+    /// The frame that sorts immediately after `container`'s frame in document
+    /// tree order: the first following container in a pre-order walk that
+    /// already has a frame, if any. Sibling order is not enough: after
+    /// `a.appendChild(iframe)`, the moved frame belongs before `b`'s frame
+    /// in tree order but has no following sibling. Both insertion and
+    /// `moveBefore` sort through this, so `window[i]` follows container
+    /// tree order
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
     pub(crate) fn frame_sort_before(&self, container: NodeId) -> Option<FrameId> {
-        let (document, parent) = self.with_document(container, |parsed| {
-            parsed
-                .document
-                .base
-                .get_node(container.node)
-                .and_then(|node| node.parent)
-                .map(|parent| (parsed.id, parent))
-        })??;
-        let children = self.with_document(container, |parsed| {
-            child_ids(&parsed.document.base, document, parent)
-        })?;
-        let mut seen = false;
-        for child in children {
-            if child.node == container.node {
-                seen = true;
-                continue;
+        self.with_document(container, |parsed| {
+            let base = &parsed.document.base;
+            let mut stack = vec![base.root_node().id];
+            let mut seen = false;
+            while let Some(id) = stack.pop() {
+                if id == container.node {
+                    seen = true;
+                } else if seen
+                    && is_iframe_element(base, id)
+                    && is_connected(base, id)
+                    && let Some(frame) = self.frame_for_container(NodeId {
+                        document: container.document,
+                        node: id,
+                    })
+                {
+                    return Some(frame);
+                }
+                if let Some(node) = base.get_node(id) {
+                    stack.extend(node.children.iter().rev().copied());
+                }
             }
-            if seen && let Some(frame) = self.frame_for_container(child) {
-                return Some(frame);
-            }
-        }
-        None
+            None
+        })?
     }
 
     /// Creates the documents and realms for every registered frame.

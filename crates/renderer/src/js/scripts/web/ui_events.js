@@ -199,8 +199,9 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
 // not call the constructor, which requires a type. Getters below therefore
 // initialize uninitialized events with their spec defaults on first read
 // (real events constructed with `new` already carry entries). Non-events
-// still throw: only actual `Event` instances, checked against the pristine
-// constructor, are initialized.
+// still throw: the brand check is the native `Class<JsEvent>` conversion
+// (`host.__tbIsEvent`), not a prototype walk, so
+// `Object.create(MouseEvent.prototype)` throws instead of allocating state.
 const __tbEventEntry = (event, data, fresh) => {
   // Defined here but consumed lazily by `messaging.js` (evaluated earlier
   // per `order.txt`): every call site runs post-init, so no TDZ. A future
@@ -208,7 +209,7 @@ const __tbEventEntry = (event, data, fresh) => {
   // invisible cross-file dependency.
   const entry = data.get(event);
   if (entry !== undefined) return entry;
-  if (!(event instanceof __tbEventConstructor)) throw new TypeError('Illegal invocation');
+  if (!host.__tbIsEvent(event)) throw new TypeError('Illegal invocation');
   const initialized = fresh();
   data.set(event, initialized);
   return initialized;

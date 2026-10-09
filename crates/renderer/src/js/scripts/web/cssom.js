@@ -66,11 +66,16 @@
     __tbCssomBrand(element);
     let sheet = __tbApply(__tbWeakMapGet, __tbSheets, [element]);
     if (sheet !== undefined) return sheet;
-    // Honest stub: the engine exposes no parsed rule list yet, so `cssRules`
-    // is empty rather than a brace-count guess (nested at-rules, strings,
-    // comments, URLs, and `@import` all miscount). Fails honestly per the
-    // no-workaround policy until real rules are wired.
-    const cssRules = { length: 0 };
+    // Honest stub: the engine exposes no parsed rule list yet, so reading
+    // `length` (or anything else) throws instead of reporting a plausible
+    // wrong number. Fails loudly per the no-workaround policy until real
+    // rules are wired; `sheet` identity itself still works.
+    const cssRules = {};
+    __tbDefineProperty(cssRules, 'length', {
+      get() { throw new Error('CSSRuleList not implemented'); },
+      enumerable: true,
+      configurable: true,
+    });
     sheet = new CSSStyleSheet();
     sheet.cssRules = cssRules;
     __tbApply(__tbWeakMapSet, __tbSheets, [element, sheet]);
