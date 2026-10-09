@@ -860,11 +860,12 @@
   // byte, so file bytes survive unchanged while text is UTF-8 encoded first.
   const encoder = new TextEncoder();
   const toLatin1 = bytes => {
-    let text = '';
-    for (let index = 0; index < bytes.length; index++) {
-      text += String.fromCharCode(bytes[index]);
+    // Chunked: per-byte `+=` is quadratic on large multipart bodies.
+    const parts = __tbPrivateArray();
+    for (let start = 0; start < bytes.length; start += 4096) {
+      __tbArray.push(parts, __tbApply(String.fromCharCode, null, bytes.slice(start, start + 4096)));
     }
-    return text;
+    return __tbArray.join(parts, '');
   };
   const concatBytes = chunks => {
     let total = 0;

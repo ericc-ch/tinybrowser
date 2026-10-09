@@ -6,9 +6,14 @@ const __tbProgressData = host.slots('tinybrowser.progress.data');
 const __tbDecoderData = host.slots('tinybrowser.textdecoder.data');
 const __tbStreamData = host.slots('tinybrowser.readablestream.data');
 const __tbToLatin1 = bytes => {
-  let text = '';
-  for (let index = 0; index < bytes.length; index++) text += String.fromCharCode(bytes[index]);
-  return text;
+  // Chunked: per-byte `+=` is quadratic on large inputs (TextDecoder
+  // pending, response bodies). 4096-arg applies stay inside the engine
+  // call stack (<https://tc39.es/ecma262/#sec-apply>).
+  const parts = __tbPrivateArray();
+  for (let start = 0; start < bytes.length; start += 4096) {
+    __tbArray.push(parts, __tbApply(String.fromCharCode, null, bytes.slice(start, start + 4096)));
+  }
+  return __tbArray.join(parts, '');
 };
 const __tbFromLatin1 = text => {
   const bytes = host.slots.bytes(text.length);

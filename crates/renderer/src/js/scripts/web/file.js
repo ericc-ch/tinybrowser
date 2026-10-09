@@ -331,10 +331,12 @@ const __tbFileReaderRead = (reader, blob, kind, argument) => {
           } else if (kind === 'arraybuffer') {
             result = __tbBytesCopy(source.bytes).buffer;
           } else {
-            result = '';
-            for (let index = 0; index < source.bytes.length; index++) {
-              result += String.fromCharCode(source.bytes[index]);
+            // Chunked: per-byte `+=` is quadratic on large blobs.
+            const parts = __tbPrivateArray();
+            for (let start = 0; start < source.bytes.length; start += 4096) {
+              __tbArray.push(parts, __tbApply(String.fromCharCode, null, source.bytes.slice(start, start + 4096)));
             }
+            result = __tbArray.join(parts, '');
           }
         } catch (exception) {
           error = exception;
