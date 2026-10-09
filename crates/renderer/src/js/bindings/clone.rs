@@ -193,6 +193,9 @@ pub(crate) fn clone_within_document(
     }
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
+        // Blitz copies node data only; the PI attribute map lives beside
+        // the tree and follows in lockstep.
+        doc.copy_pi_subtree(id.node, cloned);
         return Ok(NodeId {
             document: doc_id,
             node: cloned,
@@ -272,6 +275,16 @@ pub(crate) enum ImportSnapshot {
     },
     Text(crate::dom_string::DomString),
     Comment(crate::dom_string::DomString),
+    DocumentType {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
+    ProcessingInstruction {
+        target: String,
+        data: crate::dom_string::DomString,
+    },
+    CData(crate::dom_string::DomString),
     Fragment(Vec<ImportSnapshot>),
 }
 
@@ -341,6 +354,22 @@ pub(crate) fn import_snapshot(
         }
         NodeData::Text(_) => Some(ImportSnapshot::Text(doc.character_data(id.node))),
         NodeData::Comment { .. } => Some(ImportSnapshot::Comment(doc.character_data(id.node))),
+        NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => Some(ImportSnapshot::DocumentType {
+            name: name.clone(),
+            public_id: public_id.clone(),
+            system_id: system_id.clone(),
+        }),
+        NodeData::ProcessingInstruction { target, .. } => {
+            Some(ImportSnapshot::ProcessingInstruction {
+                target: target.clone(),
+                data: doc.character_data(id.node),
+            })
+        }
+        NodeData::CDataSection { .. } => Some(ImportSnapshot::CData(doc.character_data(id.node))),
         NodeData::AnonymousBlock(_) => {
             let children = if deep {
                 snapshot_children(doc, id.document, node.children.iter().copied())
@@ -417,6 +446,24 @@ fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
         }
         Some(NodeData::Comment { .. }) => {
             LiveKind::Ready(ImportSnapshot::Comment(doc.character_data(id.node)))
+        }
+        Some(NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        }) => LiveKind::Ready(ImportSnapshot::DocumentType {
+            name: name.clone(),
+            public_id: public_id.clone(),
+            system_id: system_id.clone(),
+        }),
+        Some(NodeData::ProcessingInstruction { target, .. }) => {
+            LiveKind::Ready(ImportSnapshot::ProcessingInstruction {
+                target: target.clone(),
+                data: doc.character_data(id.node),
+            })
+        }
+        Some(NodeData::CDataSection { .. }) => {
+            LiveKind::Ready(ImportSnapshot::CData(doc.character_data(id.node)))
         }
         Some(NodeData::AnonymousBlock(_)) => LiveKind::Fragment(live_child_ids(doc, id)),
         Some(NodeData::Document(_)) | None => LiveKind::None,
@@ -498,6 +545,33 @@ pub(crate) fn materialize_import(
         }
         ImportSnapshot::Comment(data) => {
             let blitz_id = doc.create_comment(data);
+            Ok(NodeId {
+                document,
+                node: blitz_id,
+            })
+        }
+        ImportSnapshot::DocumentType {
+            name,
+            public_id,
+            system_id,
+        } => {
+            let blitz_id = doc.create_doctype(name.clone(), public_id.clone(), system_id.clone());
+            Ok(NodeId {
+                document,
+                node: blitz_id,
+            })
+        }
+        ImportSnapshot::ProcessingInstruction { target, data } => {
+            let text = data.to_string_lossy().into_owned();
+            let blitz_id = doc.create_processing_instruction(target.clone(), &text);
+            Ok(NodeId {
+                document,
+                node: blitz_id,
+            })
+        }
+        ImportSnapshot::CData(data) => {
+            let text = data.to_string_lossy().into_owned();
+            let blitz_id = doc.create_cdata_section(&text);
             Ok(NodeId {
                 document,
                 node: blitz_id,

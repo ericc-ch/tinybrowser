@@ -1,10 +1,12 @@
 //! XML parsing for `DOMParser`'s XML MIME types.
 //!
-//! Delegates to `blitz-html`'s XML path. Upstream records parse errors
-//! internally and exposes neither them nor a `parsererror` document, so
-//! malformed input yields whatever partial tree the sink built: detecting a
-//! failed XML parse is an upstream gap, noted in `docs/progress.md`, not
-//! something this module synthesizes.
+//! Delegates to `blitz-html`'s XML path, which now keeps real doctype and
+//! processing-instruction nodes. Still missing upstream: parse-error
+//! exposure (so no `parsererror` document yet), `xmlns` attributes
+//! (stripped by xml5ever's namespace processing before the sink sees them),
+//! internal-entity expansion (xml5ever has none), and CDATA section nodes on
+//! parse (CDATA content arrives as text). Each is noted in
+//! `docs/progress.md`.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -45,21 +47,25 @@ pub(crate) fn parse_navigated(
     parse_with_config(input, content_type, crate::ReadyState::Loading, config)
 }
 
-/// Parses `input` with the shared XML configuration: entity definitions,
-/// doctype, processing instructions, and xmlns attributes arrive as the
-/// sink leaves them (see `docs/progress.md`), and the document records the
-/// given content type and readiness.
+/// Parses `input` with the shared XML configuration: the sink keeps real
+/// doctype and processing-instruction nodes, while xmlns attributes,
+/// entity definitions, and parse errors stay upstream gaps
+/// (see `docs/progress.md`). The document records the given content type
+/// and readiness.
 fn parse_with_config(
     input: &str,
     content_type: &'static str,
     ready_state: crate::ReadyState,
     config: blitz_dom::DocumentConfig,
 ) -> Parsed {
-    // What the XML sink drops stays dropped: the doctype token, processing
-    // instruction data, xmlns attributes, and entity definitions are upstream
-    // gaps (see `docs/progress.md`), not things this module reconstructs.
+    // The sink keeps real doctype and processing-instruction nodes. What it
+    // cannot see (xmlns attributes, stripped by xml5ever before the sink)
+    // stays missing; see `docs/progress.md`.
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
-    let document = crate::documents::BlitzDocument::from_base(base);
+    let mut document = crate::documents::BlitzDocument::from_base(base);
+    // Parsed processing instructions arrive with data but no attribute map;
+    // the bindings read the map, so initialize it from the data here.
+    document.init_parsed_pi_attributes();
     Parsed {
         id: 0,
         document,

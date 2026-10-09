@@ -1272,6 +1272,11 @@ fn element_text(base: &blitz_dom::BaseDocument, id: crate::js::world::BlitzId) -
         if let Some(blitz_dom::NodeData::Text(data)) = base.get_node(child).map(|node| &node.data) {
             text.push_str(&data.content);
         }
+        if let Some(blitz_dom::NodeData::CDataSection { contents }) =
+            base.get_node(child).map(|node| &node.data)
+        {
+            text.push_str(contents);
+        }
     }
     text
 }

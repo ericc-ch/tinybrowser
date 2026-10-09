@@ -23,6 +23,7 @@ mod js;
 mod messaging;
 pub(crate) mod names;
 mod protocol;
+mod pseudo_attributes;
 mod remote;
 mod render;
 mod storage;
@@ -118,8 +119,8 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
     let quirks_mode = sniff_quirks_mode(input);
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_html(input, config).into();
     let document = BlitzDocument::from_base(base);
-    // The dropped doctype token stays dropped: restoring it is an upstream
-    // gap (see `docs/progress.md`), not something this call reconstructs.
+    // The sink appends the doctype as a real document child now; the PI
+    // attribute maps initialize lazily through the bindings.
     Parsed {
         id: 0,
         document,

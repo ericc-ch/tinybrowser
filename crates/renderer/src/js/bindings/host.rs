@@ -426,17 +426,21 @@ pub(crate) trait SharedClass {
 
 /// Whether `data` implements the named node interface, or `None` when the
 /// name is not one the shared payload can represent.
-///
-/// Doctype, processing-instruction, and CDATA nodes cannot exist (see
-/// `docs/progress.md`), so those interfaces never match.
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
     xml_document: bool,
     interface: &str,
 ) -> Option<bool> {
     use blitz_dom::NodeData;
-    let is_character_data =
-        matches!(data, Some(NodeData::Text(_) | NodeData::Comment { .. }));
+    let is_character_data = matches!(
+        data,
+        Some(
+            NodeData::Text(_)
+                | NodeData::Comment { .. }
+                | NodeData::ProcessingInstruction { .. }
+                | NodeData::CDataSection { .. }
+        )
+    );
     Some(match interface {
         // Every node is also an `EventTarget`
         // (<https://dom.spec.whatwg.org/#interface-eventtarget>).
@@ -458,9 +462,16 @@ fn node_interface_matches(
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::mathml_namespace())
         }
         "CharacterData" => is_character_data,
-        "Text" => matches!(data, Some(NodeData::Text(_))),
-        "CDATASection" | "DocumentType" | "ProcessingInstruction" => false,
+        // A CDATA section implements `Text`
+        // (<https://dom.spec.whatwg.org/#interface-cdatasection>).
+        "Text" => matches!(
+            data,
+            Some(NodeData::Text(_) | NodeData::CDataSection { .. })
+        ),
+        "CDATASection" => matches!(data, Some(NodeData::CDataSection { .. })),
         "Comment" => matches!(data, Some(NodeData::Comment { .. })),
+        "DocumentType" => matches!(data, Some(NodeData::Doctype { .. })),
+        "ProcessingInstruction" => matches!(data, Some(NodeData::ProcessingInstruction { .. })),
         // Spec mixins: their members are installed on every including
         // interface, so the receiver check accepts the union of those kinds.
         // `ElementCSSInlineStyle` is included by the HTML, SVG, and MathML
@@ -474,22 +485,19 @@ fn node_interface_matches(
         ),
         "ParentNode" => matches!(data, Some(NodeData::Document(_) | NodeData::Element(_))),
         // `ChildNode` includes `DocumentType`, `Element`, and `CharacterData`
-        // (<https://dom.spec.whatwg.org/#interface-childnode>). No doctype
-        // nodes exist, so this is elements and character data.
+        // (<https://dom.spec.whatwg.org/#interface-childnode>).
         "ChildNode" => {
-            matches!(
-                data,
-                Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
-            )
+            is_character_data
+                || matches!(
+                    data,
+                    Some(NodeData::Element(_) | NodeData::Doctype { .. })
+                )
         }
         // `NonDocumentTypeChildNode` includes `Element` and `CharacterData`,
         // not a doctype
         // (<https://dom.spec.whatwg.org/#interface-nondocumenttypechildnode>).
         "NonDocumentTypeChildNode" => {
-            matches!(
-                data,
-                Some(NodeData::Element(_) | NodeData::Text(_) | NodeData::Comment { .. })
-            )
+            is_character_data || matches!(data, Some(NodeData::Element(_)))
         }
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
@@ -691,10 +699,21 @@ pub(crate) fn document_type_argument<'js>(
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
-    // No doctype nodes exist (see `docs/progress.md`): any non-null value
-    // fails conversion.
-    let _ = super::required_node(ctx, value)?;
-    Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
+    let id = super::required_node(ctx, value)?;
+    let is_doctype = super::world_for_node(ctx, id).is_ok_and(|owner| {
+        owner.borrow().document(id).is_some_and(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(id.node)
+                .is_some_and(|node| matches!(node.data, blitz_dom::NodeData::Doctype { .. }))
+        })
+    });
+    if is_doctype {
+        Ok(Some(NodeReference::Tree(id)))
+    } else {
+        Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
+    }
 }
 
 pub(crate) fn nullable_string_argument<'js>(

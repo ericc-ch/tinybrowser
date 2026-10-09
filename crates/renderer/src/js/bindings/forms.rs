@@ -467,6 +467,7 @@ fn option_text(base: &BaseDocument, option: BlitzId) -> String {
         };
         match &node.data {
             NodeData::Text(data) => text.push_str(&data.content),
+            NodeData::CDataSection { contents } => text.push_str(contents),
             NodeData::Element(element) => {
                 let is_script = element.name.local.as_ref().eq_ignore_ascii_case("script")
                     && (element.name.ns == html_namespace()

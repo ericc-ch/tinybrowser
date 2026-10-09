@@ -840,7 +840,10 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
         Some(NodeData::Element(_)) if is_fragment => Some("DocumentFragment"),
         Some(NodeData::Element(element)) => Some(element_interface(&element.name)),
         Some(NodeData::Text(_)) => Some("Text"),
+        Some(NodeData::CDataSection { .. }) => Some("CDATASection"),
         Some(NodeData::Comment { .. }) => Some("Comment"),
+        Some(NodeData::ProcessingInstruction { .. }) => Some("ProcessingInstruction"),
+        Some(NodeData::Doctype { .. }) => Some("DocumentType"),
         _ => None,
     })?;
     let Some(brand) = brand else {
@@ -1175,6 +1178,30 @@ pub(super) fn set_character_data(
     id: NodeId,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
+    // Replacing data on a processing instruction reparses its attribute map
+    // unless the caller already updated the map
+    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
+    set_character_data_inner(ctx, id, data, true)
+}
+
+/// Replaces character data without reparsing a processing instruction's
+/// attribute map. `update data from attributes` passes true for
+/// `piAttributesAlreadyUpdated`
+/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
+pub(super) fn set_pi_data(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    data: &crate::dom_string::DomString,
+) -> Result<()> {
+    set_character_data_inner(ctx, id, data, false)
+}
+
+fn set_character_data_inner(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    data: &crate::dom_string::DomString,
+    reparse_pi: bool,
+) -> Result<()> {
     let utf8 = data.to_string_lossy().into_owned();
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
@@ -1184,7 +1211,13 @@ pub(super) fn set_character_data(
     let old_value = {
         let is_character_data =
             parsed.document.base.get_node(id.node).is_some_and(|node| {
-                matches!(node.data, NodeData::Text(_) | NodeData::Comment { .. })
+                matches!(
+                    node.data,
+                    NodeData::Text(_)
+                        | NodeData::Comment { .. }
+                        | NodeData::ProcessingInstruction { .. }
+                        | NodeData::CDataSection { .. }
+                )
             });
         if !is_character_data {
             return Ok(());
@@ -1209,6 +1242,24 @@ pub(super) fn set_character_data(
                     contents.push_str(&utf8);
                 }
             }
+            NodeData::ProcessingInstruction { .. } => {
+                base.snapshot_node(id.node);
+                if let Some(NodeData::ProcessingInstruction { contents, .. }) =
+                    base.get_node_mut(id.node).map(|node| &mut node.data)
+                {
+                    contents.clear();
+                    contents.push_str(&utf8);
+                }
+            }
+            NodeData::CDataSection { .. } => {
+                base.snapshot_node(id.node);
+                if let Some(NodeData::CDataSection { contents }) =
+                    base.get_node_mut(id.node).map(|node| &mut node.data)
+                {
+                    contents.clear();
+                    contents.push_str(&utf8);
+                }
+            }
             _ => return Ok(()),
         }
     }
@@ -1218,6 +1269,26 @@ pub(super) fn set_character_data(
             target: id,
             old_value,
         });
+    if reparse_pi
+        && parsed
+            .document
+            .base
+            .get_node(id.node)
+            .is_some_and(|node| matches!(node.data, NodeData::ProcessingInstruction { .. }))
+    {
+        let contents = parsed
+            .document
+            .base
+            .get_node(id.node)
+            .and_then(|node| match &node.data {
+                NodeData::ProcessingInstruction { contents, .. } => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let attributes =
+            crate::pseudo_attributes::parse_pseudo_attributes(&contents).unwrap_or_default();
+        parsed.document.set_pi_attributes(id.node, attributes);
+    }
     drop(parsed);
     drop(owner);
     schedule_mutation_delivery(ctx)
@@ -1380,6 +1451,10 @@ pub(super) fn descendant_text(
         };
         match &node.data {
             NodeData::Text(data) => text.push_str(&data.content),
+            // CDATA sections contribute their data to ancestor text content
+            // exactly like text
+            // (<https://dom.spec.whatwg.org/#concept-descendant-text-content>).
+            NodeData::CDataSection { contents } => text.push_str(contents),
             NodeData::Element(_) => {
                 stack.extend(node.children.iter().rev().copied());
             }
