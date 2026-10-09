@@ -48,10 +48,11 @@ pub(crate) fn parse_navigated(
 }
 
 /// Parses `input` with the shared XML configuration: the sink keeps real
-/// doctype and processing-instruction nodes, while xmlns attributes,
-/// entity definitions, and parse errors stay upstream gaps
-/// (see `docs/progress.md`). The document records the given content type
-/// and readiness.
+/// doctype and processing-instruction nodes, while xmlns attributes and
+/// entity definitions stay upstream gaps (see `docs/progress.md`). A
+/// non-well-formed input yields a `parsererror` document instead of the
+/// partial tree
+/// (<https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-documents>).
 fn parse_with_config(
     input: &str,
     content_type: &'static str,
@@ -61,11 +62,16 @@ fn parse_with_config(
     // The sink keeps real doctype and processing-instruction nodes. What it
     // cannot see (xmlns attributes, stripped by xml5ever before the sink)
     // stays missing; see `docs/progress.md`.
+    let font_ctx = config.font_ctx.clone().unwrap_or_default();
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
     let mut document = crate::documents::BlitzDocument::from_base(base);
     // Parsed processing instructions arrive with data but no attribute map;
     // the bindings read the map, so initialize it from the data here.
     document.init_parsed_pi_attributes();
+    let errors = document.base.take_parse_errors();
+    if !errors.is_empty() {
+        return parser_error_document(content_type, ready_state, font_ctx, &errors);
+    }
     Parsed {
         id: 0,
         document,
@@ -76,6 +82,30 @@ fn parse_with_config(
         url: None,
         character_set: "UTF-8",
     }
+}
+
+/// Builds the `parsererror` document for a non-well-formed XML input: an
+/// XML document of the same content type whose document element is a single
+/// `parsererror` element describing the failure.
+fn parser_error_document(
+    content_type: &'static str,
+    ready_state: crate::ReadyState,
+    font_ctx: parley::FontContext,
+    errors: &[String],
+) -> Parsed {
+    let mut parsed = crate::Parsed::script(content_type, font_ctx);
+    parsed.xml_document = true;
+    parsed.ready_state = ready_state;
+    let name = markup5ever::QualName::new(None, markup5ever::ns!(), markup5ever::LocalName::from("parsererror"));
+    let root = parsed.document.base.root_node().id;
+    let element = parsed.document.base.mutate().create_element(name, Vec::new());
+    parsed.document.base.mutate().append_children(root, &[element]);
+    let message = errors.join("\n");
+    if !message.is_empty() {
+        let text = parsed.document.base.mutate().create_text_node(&message);
+        parsed.document.base.mutate().append_children(element, &[text]);
+    }
+    parsed
 }
 
 /// The document content type when `header` is an XML MIME type, otherwise

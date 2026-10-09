@@ -272,7 +272,11 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
         source: rquickjs::String<'js>,
         type_: dom_parser_generated::DOMParserSupportedType,
     ) -> Result<Value<'js>> {
-        let source = source.to_string()?;
+        // A lone surrogate in the source is replaced with U+FFFD rather than
+        // failing conversion: XML parsing observes the replacement, so the
+        // document reports it in text
+        // (<https://crbug.com/40814739>).
+        let source = String::from_utf16_lossy(&source.to_utf16()?);
         let content_type = type_.as_str();
         // `DOMParser` parses with scripting disabled
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).

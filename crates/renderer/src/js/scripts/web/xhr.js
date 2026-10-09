@@ -130,9 +130,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     } catch (_) {
       parsed = null;
     }
-    // An empty body parses to no document element; anything else the parser
-    // accepts is the document. (Malformed-XML detection needs sink errors
-    // blitz-html does not expose yet; see the parsererror note in xml.rs.)
+    // An empty body parses to no document element; a `parsererror`
+    // document element means the body was not well-formed, so there is no
+    // document either (<https://xhr.spec.whatwg.org/#document-response>).
+    // Anything else the parser accepts is the document.
+    if (parsed !== null && parsed.documentElement !== null
+      && parsed.documentElement.localName === 'parsererror') parsed = null;
     data.responseDocument = parsed !== null && parsed.documentElement !== null ? parsed : null;
     return data.responseDocument;
   }
