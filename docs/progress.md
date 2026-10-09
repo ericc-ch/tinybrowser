@@ -307,13 +307,19 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 ## Upstream Blitz bugs (known-fail, not worked around)
 
 Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail closed as known-fails.
+Fixed in our `ericc-ch/blitz` fork (`third_party/blitz`, `master` is the line)
+so far: `resolve_url` no longer panics (returns `None`, callers skip);
+real doctype / processing-instruction / CDATA section node kinds with
+constructors, sink preservation (except the XML declaration, which is
+prolog), serialization, text, and layout treatment; real template
+contents fragments with host links, parser/fragment routing, cloning,
+and cycle visibility.
 
-- `blitz-dom-0.3.0-beta.2/src/document.rs:1086` `resolve_url` panics on unresolvable relative refs (observed: `foo.jpg` against `data:text/css` base). Upstream `main` still panics the same way.
-- `blitz-dom` has no PI / CDATA / doctype node kinds; parsing drops the doctype. Our surface stays simple: `createProcessingInstruction` / `createCDATASection` / `createDocumentType` throw `NotSupportedError` (after spec argument validation), `document.doctype` reads null, doctype arguments are dropped, `template.content` is an empty fragment. These fail as known-fails.
-- `blitz-html`'s XML sink drops processing-instruction data (empty comments remain), drops `xmlns` attributes after binding them, and has no internal-entity support; sink parse errors stay internal, so no `parsererror` document exists and XHR `responseXML` cannot detect malformed XML. Not reconstructed; fails as known-fails.
 - `blitz-dom` stores text as UTF-8, so lone surrogates in `CharacterData`, attributes, and titles read back as U+FFFD. No side table preserves them; fails as known-fails.
 - `blitz-dom` has no shadow DOM: no shadow roots, `attachShadow` never hosts, `ShadowRoot` brand never instantiates, `getComposedRanges` / composed options are no-ops.
-- `blitz-dom` has no template contents: `<template>` children live as ordinary element children.
+- Template contents share their host document instead of a separate inert template-contents owner document, so `content.ownerDocument !== document` assertions fail. Needs per-document inert owner documents with cross-arena contents routing; deferred as its own feature.
+- xml5ever (Servo's parser, not our fork) strips `xmlns` attributes in `process_namespaces` before the sink sees them, has no internal-entity support, and delivers CDATA content as plain text, so `lookupPrefix` / namespace-aware tests, entity-heavy XML, and parsed-CDATA nodes fail. Fixing the parser means a second fork (`xml5ever`); deferred as an explicit decision.
+- `blitz-html` records XML parse errors internally with no accessor, so no `parsererror` document exists and XHR `responseXML` cannot detect malformed XML. Needs an error-out API plus document-level handling; next fork item after owner documents.
 - `blitz-dom` keeps no form-control state: no dirty value flag, checkedness, selectedness, or indeterminate slots; values read from content attributes and descendant text, `select` events have no producer, form-state cloning carries structure only.
 - `blitz-dom` exposes no image-request state: `image_cache` / `pending_images` are `pub(crate)`, so request tracking (selected `currentSrc`, loading/broken flags, `load` / `error` events) stays ours; the decoded result itself is public (`ElementData::image_data`), so `naturalWidth` / `naturalHeight` and the `load` / `error` decision read Blitz state with no second decode. SVG and GIF `<img>` now load like Chromium.
 - `blitz-dom` exposes no public visibility helper: one `style::` use remains for the `visibility` check.
@@ -322,5 +328,6 @@ Policy: upstream Blitz bugs stay upstream. Our code stays simple; these fail clo
 - `blitz-dom` exposes only the viewport scroll offset, no per-element scroll-container offset API.
 - `blitz-dom` owns document language internally with no metadata setter, so a response `Content-Language` is not applied.
 - `blitz-html` always parses scripting-disabled (`noscript` as markup); scripting-enabled `noscript`-as-text diverges.
-- `blitz-dom-0.3.0-beta.2/src/stylo.rs:433` `NonTSPseudoClass::PlaceholderShown` is hardcoded `false`, so `:placeholder-shown` never matches and placeholder text does not paint (observed: Wikipedia's "Search Wikipedia").
+- `blitz-dom` `NonTSPseudoClass::PlaceholderShown` is hardcoded `false`, so `:placeholder-shown` never matches and placeholder text does not paint (observed: Wikipedia's "Search Wikipedia").
+- Proposal tests fail everywhere by design: HTML `<?...?>` stays a bogus comment per the HTML Standard (the PI-attributes proposal expects PI nodes), and two PI value subtests (`axx>`, `some<>`) contradict the spec's own escaping algorithm.
 - Pre-existing `main` crashes, out of scope: `dom/nodes/Document-characterSet-normalization-1.html`, `Document-characterSet-normalization-2.html`, `Document-createElement-namespace.html`.
