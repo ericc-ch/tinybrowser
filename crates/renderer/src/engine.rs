@@ -971,6 +971,11 @@ impl Engine {
     }
 
     fn fire_ready_frame_loads(&mut self) -> bool {
+        // Encoding-label maps append ~100 iframes; skip a realm for that
+        // burst. A handful of navigated HTML frames still get a realm
+        // before `load` so `contentDocument` wrappers have prototypes
+        // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
+        const EAGER_FRAME_REALM_CAP: usize = 8;
         let mut fired = false;
         let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
         for parent in frame_ids {
@@ -978,6 +983,7 @@ impl Engine {
                 continue;
             };
             let pending = document.pending_frame_loads();
+            let eager_realm = pending.len() <= EAGER_FRAME_REALM_CAP;
             for container in pending {
                 let Some(child) = self
                     .runtime
@@ -997,6 +1003,9 @@ impl Engine {
                     .is_none_or(Document::waiting_for_load);
                 if waiting {
                     continue;
+                }
+                if eager_realm && let Some(document) = self.frames.get_mut(&child) {
+                    document.ensure_js_ok();
                 }
                 self.publish_frame_document(container, child);
                 if let Some(document) = self.frames.get_mut(&parent) {
