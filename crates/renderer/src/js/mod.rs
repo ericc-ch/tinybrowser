@@ -35,7 +35,11 @@ pub(crate) use world::World;
 
 use crate::document::Stop;
 
-const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
+/// Shared QuickJS heap cap. Forty live subframe realms need more than
+/// 32MB (measured: script execution wedges past ~24 XML realms at 32MB, an
+/// allocation failure surfacing as a generic exception). 256MB still bounds
+/// a malicious page while fitting MAX_FRAMES-scale bursts.
+const MAX_RUNTIME_MEMORY: usize = 256 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 
