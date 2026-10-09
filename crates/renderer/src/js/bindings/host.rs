@@ -429,6 +429,7 @@ pub(crate) trait SharedClass {
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
     xml_document: bool,
+    is_fragment: bool,
     interface: &str,
 ) -> Option<bool> {
     use blitz_dom::NodeData;
@@ -447,10 +448,13 @@ fn node_interface_matches(
         "Node" | "EventTarget" => data.is_some(),
         "Document" => matches!(data, Some(NodeData::Document(_))),
         "XMLDocument" => matches!(data, Some(NodeData::Document(_))) && xml_document,
-        // Blitz has no shadow roots; every fragment is a plain fragment.
-        "DocumentFragment" | "ShadowRoot" => {
-            matches!(data, Some(NodeData::Element(_)))
+        // Blitz has no shadow roots, so `ShadowRoot` never matches. Fragments
+        // are real `Fragment` nodes or flagged backing elements.
+        "DocumentFragment" => {
+            matches!(data, Some(NodeData::Fragment { .. }))
+                || (matches!(data, Some(NodeData::Element(_))) && is_fragment)
         }
+        "ShadowRoot" => false,
         "Element" => matches!(data, Some(NodeData::Element(_))),
         "HTMLElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
@@ -483,7 +487,10 @@ fn node_interface_matches(
                     || element.name.ns == crate::js::world::svg_namespace()
                     || element.name.ns == crate::js::world::mathml_namespace()
         ),
-        "ParentNode" => matches!(data, Some(NodeData::Document(_) | NodeData::Element(_))),
+        "ParentNode" => matches!(
+            data,
+            Some(NodeData::Document(_) | NodeData::Element(_) | NodeData::Fragment { .. })
+        ),
         // `ChildNode` includes `DocumentType`, `Element`, and `CharacterData`
         // (<https://dom.spec.whatwg.org/#interface-childnode>).
         "ChildNode" => {
@@ -551,7 +558,8 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    match node_interface_matches(data, document.xml_document, interface) {
+    let is_fragment = document.document.is_fragment(id.node);
+    match node_interface_matches(data, document.xml_document, is_fragment, interface) {
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
@@ -595,7 +603,8 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    node_interface_matches(data, document.xml_document, interface) == Some(true)
+    let is_fragment = document.document.is_fragment(id.node);
+    node_interface_matches(data, document.xml_document, is_fragment, interface) == Some(true)
 }
 
 /// The receiver JS object for hand methods that keep it (observer identity

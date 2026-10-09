@@ -194,11 +194,15 @@ fn insertion_excluding_children(
             .document(parent)
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
         let base = &parsed.document.base;
-        // Only documents and elements can be parents. Fragment backings are
-        // plain elements, so fragments are covered by the element case.
+        // Only documents, elements, and fragments can be parents. Fragment
+        // backings are plain elements, so fragments are covered by the
+        // element case.
         // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
         let parent_is_document = base.root_node().id == parent.node;
-        if !parent_is_document && !is_element(base, parent.node) {
+        let parent_is_fragment = base.get_node(parent.node).is_some_and(|node| {
+            matches!(node.data, NodeData::Fragment { .. })
+        });
+        if !parent_is_document && !is_element(base, parent.node) && !parent_is_fragment {
             return Err(throw_dom(
                 ctx,
                 "HierarchyRequestError",
@@ -301,7 +305,14 @@ enum InsertedNode {
 /// else cannot be inserted
 /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
 fn classify_inserted(doc: &crate::documents::BlitzDocument, id: BlitzId) -> InsertedNode {
-    if doc.is_fragment(id) {
+    // Fragment backings (flagged elements) and real `Fragment` nodes both
+    // splice their children on insertion.
+    let is_fragment = doc.is_fragment(id)
+        || doc
+            .base
+            .get_node(id)
+            .is_some_and(|node| matches!(node.data, NodeData::Fragment { .. }));
+    if is_fragment {
         let children: Vec<BlitzId> = doc
             .base
             .get_node(id)
@@ -368,6 +379,11 @@ fn ensure_no_cycle(
     parent: BlitzId,
     node: BlitzId,
 ) -> Result<()> {
+    // Host-including inclusive ancestry: a template contents fragment counts
+    // as a child of its host, so appending an ancestor of the host into the
+    // fragment is a cycle
+    // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
+    // No shadow hosts exist, so the host link is the only non-parent step.
     let mut cursor = Some(parent);
     while let Some(current) = cursor {
         if current == node {
@@ -377,9 +393,12 @@ fn ensure_no_cycle(
                 "node cannot contain itself",
             ));
         }
-        cursor = base
-            .get_node(current)
-            .and_then(|candidate| candidate.parent);
+        cursor = base.get_node(current).and_then(|candidate| {
+            candidate.parent.or_else(|| match &candidate.data {
+                NodeData::Fragment { host } => *host,
+                _ => None,
+            })
+        });
     }
     Ok(())
 }
@@ -1083,10 +1102,28 @@ fn parse_html_fragment_snapshots(
         context_id
     };
     let scratch = crate::documents::BlitzDocument::from_base(base);
+    // Fragment parsing into a template context fills the context's
+    // template contents, not its children: snapshot from the contents.
     let children: Vec<BlitzId> = scratch
         .base
         .get_node(context_id)
-        .map(|node| node.children.iter().copied().collect())
+        .map(|node| match &node.data {
+            blitz_dom::NodeData::Element(element)
+                if element.name.ns == crate::js::world::html_namespace()
+                    && element.name.local.as_ref() == "template" =>
+            {
+                element
+                    .template_contents
+                    .and_then(|fragment| {
+                        scratch
+                            .base
+                            .get_node(fragment)
+                            .map(|backing| backing.children.iter().copied().collect())
+                    })
+                    .unwrap_or_default()
+            }
+            _ => node.children.iter().copied().collect(),
+        })
         .unwrap_or_default();
     children
         .into_iter()
@@ -1465,8 +1502,9 @@ fn ensure_can_move(ctx: &Ctx<'_>, parent: NodeId, node: NodeId, target: &MoveTar
             "move crosses shadow-including roots",
         ));
     }
-    // No shadow hosts, so a host-including inclusive ancestor is an inclusive
-    // ancestor (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
+    // Host-including ancestry (template contents via their host) is checked
+    // inside `ensure_no_cycle`; there are no shadow hosts
+    // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
     ensure_no_cycle(ctx, base, parent.node, node.node)?;
     let _reference = match target {
         MoveTarget::Before(child) => {
@@ -2769,6 +2807,7 @@ fn equal_view(doc: &crate::documents::BlitzDocument, id: BlitzId) -> Option<Equa
         } else {
             match &node.data {
                 NodeData::Document(_) => EqualKind::Document,
+                NodeData::Fragment { .. } => EqualKind::Fragment,
                 NodeData::Element(element) => EqualKind::Element {
                     name: element.name.clone(),
                     attributes: element
@@ -3059,10 +3098,28 @@ fn serialize_html_element(
     if serializes_as_void(name) {
         return;
     }
-    if let Some(node) = base.get_node(id) {
-        for child in &node.children.clone() {
-            serialize_html_node(doc, *child, Some(name), output);
-        }
+    // A template element serializes its template contents, not its (empty)
+    // children
+    // (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
+    let children: Vec<BlitzId> = base
+        .get_node(id)
+        .map(|node| {
+            if is_html_template_name(name) {
+                node.data
+                    .downcast_element()
+                    .and_then(|element| element.template_contents)
+                    .and_then(|fragment| {
+                        base.get_node(fragment)
+                            .map(|backing| backing.children.iter().copied().collect())
+                    })
+                    .unwrap_or_default()
+            } else {
+                node.children.iter().copied().collect()
+            }
+        })
+        .unwrap_or_default();
+    for child in &children {
+        serialize_html_node(doc, *child, Some(name), output);
     }
     output.push_str("</");
     push_html_element_name(output, name);
@@ -3154,6 +3211,12 @@ fn serialize_html_node(
             }
             output.push_str("?>");
         }
+        // A fragment serializes as its children.
+        NodeData::Fragment { .. } => {
+            for child in node.children.clone() {
+                serialize_html_node(doc, child, parent, output);
+            }
+        }
         NodeData::Document(_) => {}
     }
 }
@@ -3214,6 +3277,12 @@ fn push_escaped_xml_attribute(output: &mut HtmlOutput, value: &str) {
 /// children. Known gap: namespace prefix synthesis is skipped; the stored
 /// qualified name is used as-is
 /// (<https://w3c.github.io/DOM-Parsing/#xml-serialization>).
+/// Whether `name` is an HTML `template` element, whose serializable
+/// children live in its template contents fragment.
+fn is_html_template_name(name: &QualName) -> bool {
+    name.ns == crate::js::world::html_namespace() && name.local.as_ref() == "template"
+}
+
 fn serialize_xml_element(
     doc: &crate::documents::BlitzDocument,
     id: BlitzId,
@@ -3233,7 +3302,20 @@ fn serialize_xml_element(
     }
     let children: Vec<BlitzId> = base
         .get_node(id)
-        .map(|node| node.children.iter().copied().collect())
+        .map(|node| {
+            if is_html_template_name(name) {
+                node.data
+                    .downcast_element()
+                    .and_then(|element| element.template_contents)
+                    .and_then(|fragment| {
+                        base.get_node(fragment)
+                            .map(|backing| backing.children.iter().copied().collect())
+                    })
+                    .unwrap_or_default()
+            } else {
+                node.children.iter().copied().collect()
+            }
+        })
         .unwrap_or_default();
     if children.is_empty() {
         output.push_str("/>");
@@ -3313,6 +3395,11 @@ pub(crate) fn serialize_xml_node(
             output.push_str("<![CDATA[");
             output.push_str(contents);
             output.push_str("]]>");
+        }
+        NodeData::Fragment { .. } => {
+            for child in node.children.clone() {
+                serialize_xml_node(doc, child, output);
+            }
         }
     }
 }
@@ -3410,6 +3497,7 @@ impl JsNode {
             Some(NodeData::Document(_)) => Ok(9),
             Some(NodeData::Doctype { .. }) => Ok(10),
             Some(NodeData::CDataSection { .. }) => Ok(4),
+            Some(NodeData::Fragment { .. }) => Ok(11),
             Some(NodeData::AnonymousBlock(_)) | None => {
                 Err(Exception::throw_type(ctx, "stale node"))
             }
@@ -3439,6 +3527,7 @@ impl JsNode {
             Some(NodeData::ProcessingInstruction { target, .. }) => Ok(target.clone()),
             Some(NodeData::Comment { .. }) => Ok("#comment".into()),
             Some(NodeData::Doctype { name, .. }) => Ok(name.clone()),
+            Some(NodeData::Fragment { .. }) => Ok("#document-fragment".into()),
             Some(NodeData::Document(_)) => Ok("#document".into()),
             Some(NodeData::AnonymousBlock(_)) | None => {
                 Err(Exception::throw_type(ctx, "stale node"))
@@ -5201,6 +5290,22 @@ impl JsNode {
         if !parsed.document.is_fragment(container.node) && node.data.downcast_element().is_none() {
             return Err(Exception::throw_type(ctx, "innerHTML requires an element"));
         }
+        // innerHTML on a template reads its template contents, not its
+        // (empty) children
+        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
+        let container = node
+            .data
+            .downcast_element()
+            .filter(|element| {
+                element.name.ns == crate::js::world::html_namespace()
+                    && element.name.local.as_ref() == "template"
+            })
+            .and_then(|element| element.template_contents)
+            .map(|fragment| NodeId {
+                document: container.document,
+                node: fragment,
+            })
+            .unwrap_or(container);
         let html = world(ctx)?
             .borrow()
             .document(self.handle.0)
@@ -5268,6 +5373,29 @@ impl JsNode {
         };
 
         let container = element;
+        // innerHTML on a template replaces its template contents, not its
+        // (empty) children
+        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
+        let container = world_for_node(ctx, container)?
+            .borrow()
+            .document(container)
+            .and_then(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(container.node)
+                    .and_then(|node| node.data.downcast_element())
+                    .filter(|element| {
+                        element.name.ns == crate::js::world::html_namespace()
+                            && element.name.local.as_ref() == "template"
+                    })
+                    .and_then(|element| element.template_contents)
+            })
+            .map(|fragment| NodeId {
+                document: container.document,
+                node: fragment,
+            })
+            .unwrap_or(container);
         let owner = world_for_node(ctx, container)?;
         let world = owner.borrow();
         let Some(mut parsed) = world.document_mut(container) else {
@@ -5631,7 +5759,7 @@ impl JsNode {
             .base
             .get_node(self.handle.0.node)
             .map(|node| match &node.data {
-                NodeData::Element(_) => 0u8,
+                NodeData::Element(_) | NodeData::Fragment { .. } => 0u8,
                 NodeData::Text(_)
                 | NodeData::Comment { .. }
                 | NodeData::ProcessingInstruction { .. }
@@ -9082,10 +9210,6 @@ impl html_slot_element_generated::HTMLSlotElement<'_> for JsNode {}
 
 impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-template-contents
-    //
-    // No template-contents association exists (see `docs/progress.md`), so
-    // this is always an empty fragment: template children live as ordinary
-    // element children.
     fn get_content(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let owner = world_for_node(ctx, self.handle.0)?;
         let fragment = {
@@ -9093,9 +9217,20 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
             let Some(mut parsed) = owner.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
-            parsed.document.create_fragment()
+            parsed.document.base.mutate().ensure_template_contents(self.handle.0.node)
         };
-        wrap_node(ctx, NodeId { document: self.handle.0.document, node: fragment })
+        // The contents may have been adopted into another document since:
+        // follow the live id so a previously fetched `content` wrapper and
+        // this getter agree on the adopted fragment.
+        let fragment = NodeId {
+            document: self.handle.0.document,
+            node: fragment,
+        };
+        let fragment = owner.borrow().registry().borrow_mut().live_node_id(fragment);
+        wrap_node(
+            ctx,
+            fragment,
+        )
     }
 }
 

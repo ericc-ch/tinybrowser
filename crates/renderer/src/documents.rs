@@ -82,9 +82,14 @@ impl BlitzDocument {
         self.recording = recording;
     }
 
-    /// Whether `id` backs a `DocumentFragment`.
+    /// Whether `id` backs a `DocumentFragment`: a flagged backing element
+    /// or a real `Fragment` node (such as template contents).
     pub(crate) fn is_fragment(&self, id: blitz_traits::node_id::NodeId) -> bool {
         self.fragments.contains(&id)
+            || self
+                .base
+                .get_node(id)
+                .is_some_and(|node| matches!(node.data, NodeData::Fragment { .. }))
     }
 
     /// Creates a detached backing element for a new `DocumentFragment`.

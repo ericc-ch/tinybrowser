@@ -838,6 +838,7 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
             "Document"
         }),
         Some(NodeData::Element(_)) if is_fragment => Some("DocumentFragment"),
+        Some(NodeData::Fragment { .. }) => Some("DocumentFragment"),
         Some(NodeData::Element(element)) => Some(element_interface(&element.name)),
         Some(NodeData::Text(_)) => Some("Text"),
         Some(NodeData::CDataSection { .. }) => Some("CDATASection"),

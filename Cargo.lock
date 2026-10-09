@@ -178,6 +178,7 @@ dependencies = [
  "blitz-dom",
  "blitz-traits",
  "html5ever",
+ "markup5ever",
  "xml5ever",
 ]
 
