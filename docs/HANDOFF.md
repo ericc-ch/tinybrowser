@@ -1,66 +1,51 @@
-# Handoff (2026-10-05)
+# Handoff (2026-10-09)
 
-Goal: Finish the Blitz 0.3.0-beta.2 cutover on `blitz-adopt`: Blitz owns parse/style/layout/paint; tinybrowser keeps only the JS bindings, observer journal, resource dials, and CDP surface, with pre-cutover leftovers deleted and rendering fidelity checked against Chromium.
+Goal: Land PR 45 (`cursor/wpt-fast-loop-6d59`) and drive `dom/nodes` from 287/354 into Chrome/Firefox range (both effectively 100%). PR work is done with this note; what remains is the measured fail-list below.
 
-Plan: Land forward commits on `blitz-adopt` (no history rewrite), verify each batch with `tools/check` and `cargo test --workspace`, record size and upstream Blitz limitations in `docs/progress.md`, and compare real pages against Chromium to find gaps.
+Plan: Fix remaining `dom/nodes` failures in fork-domain order (parser/tree fixes in `ericc-ch/blitz` and `ericc-ch/html5ever` `master`, never tinybrowser workarounds), re-running only failures with `tools/wpt/retest`. Shadow DOM is its own multi-day project; template owner documents a medium feature.
 
-State: clean tree, branch `blitz-adopt` ahead of the PR #41 merge `6ab35db` (single-decode, tiny-skia backend, + this handoff), not pushed. PR #41 (plain non-blocking logger) is merged as `6ab35db`. Gates on HEAD: `tools/check` green, `cargo test --workspace` green, full Playwright gate 39/43 (same four pre-existing form gaps), `chromium-diff.spec.ts` green. WPT `dom/nodes` retest and push are outstanding.
+State: Branch `cursor/wpt-fast-loop-6d59` pushed to origin. `cargo test -p renderer --lib` 17/17 green. `cargo clippy -p renderer` clean except pre-existing `webidl-bindgen too_many_lines`. `dom/nodes` scored 2026-10-09: 272/354 clean-run, 287/354 stable after `retest` (15 `moveBefore` timing flakes resolve; 59 unexpected + 8 error remain). Reports are ephemeral (`/tmp/opencode/domnodelatest.json`, retest report under `/tmp/nix-shell.*/`); the committed evidence is the `dom/nodes` slice line in `docs/progress.md`.
 
-Done (this round):
+Done:
 
-- tiny-skia backend: new `anyrender_tiny_skia` workspace crate implements anyrender's `PaintScene`/`ImageRenderer` over tiny-skia (no fork; upstream explicitly welcomes tiny-skia backends). Fill/stroke with solid+gradient brushes, clip/blend layers, image patterns with premultiply handling, glyph runs through skrifa outlines, box shadows and single-node blur filters through the `image` crate's `fast_blur`. Screenshots paint through it; `anyrender_vello_cpu`/`vello_cpu` are deleted. Release binary 12,030,744 → 10,717,288 bytes (−1,313,456, ~11%).
-- Chromium pixel parity: `tools/playwright/chromium-diff.spec.ts` renders seven fixture pages in both browsers at 800x600 and asserts over-tolerance shares (solid pages 0.00%, text 2.13% hinting-level, shadow 1.34% blur-kernel shape; every max-delta pixel sits on a glyph edge or soft blur). Skips where system Chrome is absent.
-- Single image decode: our `<img>` dial and `render/decode.rs` (zune-jpeg, image-webp, 32 MiB pixel budget) are deleted. Blitz's fetch is the only fetch; `<img>` requests are waiters settled from Blitz's public `ElementData::image_data` on each delivery (`load` with natural dims, `error` otherwise). SVG natural size is declared absolute width/height else the 300x150 default object size (Chromium answers 300x150 even for viewBox-only SVG, probed 2026-10-06); SVG and GIF `<img>` now load instead of erroring.
-- `6ab35db` — merged PR #41: the logging crate is a plain non-blocking logger (`logging::install(level, file)`; `Config`/`Logger`/`ParseLevelError` deleted). Call sites keep using the macros; `src/main.rs` and `tests/renderer_process.rs` were updated by the PR. Rebased the review commits on top.
-
-- Init scripts are tab state: `Tab.init_scripts` with caller-assigned ids, `Mount`/`ResponseStart` replay the list on every renderer acquisition, every frame's world shares it (parsed and script-created child frames run it), `runImmediately` evaluates in existing frames, `remove` stops future documents. `worldName` is accepted but runs in the main world (no isolated worlds; Playwright's utility registration uses an empty source).
-- Viewport: `mount_virtual` replays the tab's viewport and scripts; child frames inherit the tab size; `Emulation.setDeviceMetricsOverride` requires integer sides, `0` clears, `>4096` errors, `mobile`/`deviceScaleFactor != 1` are refused; one `renderer::DEFAULT_VIEWPORT`. The world stores the persistent size so `window` metrics survive renderer swaps.
-- Capture: the renderer applies `ScreenshotRequest` dimensions for the capture only and restores the emulated viewport; raw CDP clips beyond the viewport work; `Page.getLayoutMetrics` reports real scrollable `contentSize` (2051px on the tall fixture); CSSOM View `client`/`scroll`/`offset` boxes are implemented through the generated `Element`/`HTMLElement` contracts and flush layout on read, so Playwright `fullPage` sizes correctly.
-- Input selection applicability matches the text-like states: `<input type=email>` answers `null` for `selectionStart/End` and rejects `setSelectionRange`, matching Chromium; this fixed the Playwright `fill` retry loop on email fields.
-- CDP lifecycle: the tab's current `loaderId` is kept for lifecycle events, `Page.setLifecycleEventsEnabled` gates `Page.lifecycleEvent` (instead of no-op), `init` is emitted on commit, and the `about:blank` path fires `DOMContentLoaded` before `load`.
-- Canvas `width`/`height` follow the HTML parsing rules (ASCII whitespace, digit prefix, u32 wrap; Chromium's overflow-to-default divergence noted in code); `getContext` answers spec-`null` with the deviation spelled out.
-- Bindgen: optional `any` with `= null` supplies `null`, not `undefined`; the dead `any`-attribute getter arm is removed.
-- Renderer: `load` waits for Blitz critical resources (stylesheets) and rechecks on each delivery; failed and cached subresource deliveries settle layout; a realm born while a response streams defers init scripts and rebinds `document` after install.
-- Tests: `tools/playwright/{init-scripts,viewport}.spec.ts`, clip/fullPage and stylesheet-load cases, raw-CDP helper (`tools/playwright/cdp.ts`), wire round-trips for the new commands, and CDP helper unit tests.
+- `0b85f28` — build: fork blitz like rquickjs, wire via `[patch.crates-io]`. Verified: `cargo build` from `third_party/blitz`.
+- `27425a4` — renderer: real doctype/PI/CDATA nodes over the fork. Verified: `Document-doctype`, `createProcessingInstruction`, `createCDATASection`, `cloneNode`, `adoptNode`, `replaceChildren` fully green (singles, `-- --exclude=worker`).
+- `253c6f9` — renderer: real template contents through fork fragments. Verified: template content/querySelector/outerHTML/innerHTML/clone probes hold; `Document-adoptNode-DocumentFragment-with-host` green except shadow case.
+- `95aab87` — renderer: `parsererror` documents from drained sink errors + XHR null mapping. Verified: `DOMParser-parseFromString-xml-parsererror` fully green.
+- `f77a3ba` — build,renderer: fork xml5ever (`third_party/html5ever` at `b71b746`, pushed to `origin/master` before recording), parsererror Mozilla namespace, DOMParser as plain `Document`. Verified: `Attr-prefix-xhtml`, `firstElementChild-xhtml`, `parseFromString-xml`, `-xml-doctype`, `-internal-subset` fully green.
+- `0137d1d` — build: bump html5ever fork for prolog-only tolerance. Verified: `processing-instruction-attributes` back to floor (only proposal/spec-disputed subtests fail).
+- `5317b7e` — renderer: shared QuickJS heap 32MB to 256MB. Verified: `Document-createElement-namespace` (40 parallel iframes) green; root-caused via manual WebDriver driving + `--verbose` logger, not guessing.
+- `18d95db` — renderer: `Node::is_visible` fork helper, drop direct `style::` use. Verified: `cargo test -p renderer --lib` 17/17; `elementFromPoint` failures unchanged (pre-existing hit-testing precision).
+- Fork `third_party/blitz` at `89550853` (`dom: expose Node::is_visible`, pushed). Fork `third_party/html5ever` at `39ba978` (`prolog-only documents are not errors`, pushed). Push-before-pin confirmed via `git ls-remote origin master` both.
+- Ledger: `docs/progress.md` upstream list updated (fork-fixed items moved up, stale `style::` visibility bullet removed, `dom/nodes` slice at 287/354).
 
 Unfinished:
 
-- Playwright gate is 39/43. The four failures predate this round (their code paths were untouched by it):
-  - `<select>` gets a 0x0 box from Blitz, so Playwright's visible check fails (`forms.spec.ts:8`, `forms.spec.ts:52`, `interaction.spec.ts:45`). Upstream Blitz layout gap.
-  - `keyboard.type` into `<textarea>` is lost (`interaction.spec.ts:28`): `__tbSetNativeValue` writes the `value` attribute, while textarea `.value` reads its child text. Needs a real API-value store in the bindings.
-- `Target.attachToTarget` is not implemented, so Playwright `context.newCDPSession` fails; the new specs use the raw `/json/list` WebSocket helper instead. Real gap for CDP clients.
-- Isolated worlds are not implemented; `worldName` scripts execute in the main world.
-- GitHub hero WebGL glow/mascots: page requests `getContext('webgl')`, we answer `null` (spec), so `.lp-IntroVisuals-canvas` never paints. Real support needs a WebGL stack; known-fail.
-- `document.styleSheets` / `document.fonts` are still undefined (real `StyleSheetList`/`FontFaceSet` over Blitz needed); `document.images`/`document.scripts` absent (cheap `HTMLCollection`s).
-- GitHub heading wraps greedily where Chromium balances two lines (`text-wrap: balance` unsupported).
-- WPT `dom/nodes` regressions unverified since the cleanup commits (11 OK-to-ERROR/TIMEOUT/CRASH files listed in the previous handoff). Needs approval: retest just those files with `tools/wpt`.
-- Release size re-measured after the vello removal: `10,717,288 bytes (2026-10-06)`, recorded in `docs/progress.md` with the realized saving in `docs/size.md`. Push still outstanding.
-- `subresource_bytes` on `Document` has no cap or eviction; cleared only on navigation.
+- `dom/nodes/Element-firstElementChild-entity-xhtml.xhtml` whole-file QuickJS ERROR (stable across retest). Suspect: navigated XHTML with internal entity expanding to markup. Counter-evidence: equivalent DOMParser probe expands fine (`root=html`, `fec=true`). Resume: replicate as `scratch-*.xhtml` (delete after use), capture the JS exception message — the runner only surfaces "Exception generated by QuickJS". No renderer crash in logs.
+- `dom/nodes/insertion-removing-steps/insertion-removing-steps-script.window.html` ERROR: `script0 can observe itself and no other scripts expected 4 but got 6`. Suspect our CDATA-as-script-text change widened script collection. Resume: single-file run, bisect script counting.
+- 6× `dom/nodes/NodeList-static-length-getter-tampered-*.html` ERROR `interrupted` (stable across retest). Suspect session death under getter-tamper loops, not assertions. Resume: run one singly with `--verbose` logging.
+- 59 unexpected subtests, biggest buckets: `CharacterData-surrogates` (UTF-8 storage, needs WTF-8/UTF-16 fork design), shadow files (`isConnected-shadow-dom`, `attach-shadow-realm`, declarative-shadow clone, `getRootNode composed`), `Element-matches` (`:empty`, `:lang`, `:target`), `MutationObserver` Range set, `Element-closest` (`:has(> :scope)`, `:invalid`), `Node-contains-xml` fragment case, `Text/Comment-constructor` cross-global ownerDocument.
+- Template-contents owner documents (`docs/progress.md:327`): `content.ownerDocument !== document` assertions fail (e.g. `template-content-hierarcy` subtest 2). Needs per-document inert owner documents with cross-arena routing.
+- Shadow DOM (`docs/progress.md:326`): no roots/slots/composed traversal/event retargeting. Design sketch needed before code.
 
 Next:
 
-1. Fix the textarea API-value store and check whether a UA/Blitz-side change can give `<select>` a box (or record it as an upstream known-fail).
-2. With explicit approval, retest the 11 WPT files listed in the previous handoff and refresh the branch-vs-main comparison.
-3. Re-measure the release binary; update `docs/progress.md` size lines.
-4. Decide `subresource_bytes` cap/eviction; push `blitz-adopt`.
-5. Optional: implement `Target.attachToTarget` so `context.newCDPSession` works.
+1. Triage the entity-xhtml ERROR (one-file fork-domain suspect, blocks a clean error bucket).
+2. Triage insertion-removing-steps-script 4-vs-6 and NodeList `interrupted` errors.
+3. Work the 59 unexpected by bucket: surrogates storage design, `:lang`/`:empty`/`:target` matching, MutationObserver Range, closest/matches selectors.
+4. Template owner documents, then shadow DOM design.
 
 Decisions made:
 
-- Upstream Blitz bugs are not worked around; known-fails live in `docs/progress.md` (resolve_url panic, no PI/CDATA/doctype kinds, no shadow DOM, no template contents, no form-control state, no image-element state, no visibility helper, hardcoded NoQuirks, AnonymousBlock in tree, no per-element scroll API, always scripting-disabled parse).
-- Deletions land as forward commits; bindings follow the pinned IDL, never the reverse.
-- Emulation is tab state; screenshots apply a capture-scoped size and restore the emulated viewport.
-- Init scripts are tab state and replay through mounts; `worldName` is accepted because rejecting it would break Playwright's empty-source utility registration, and isolated worlds do not exist.
-- CSSOM View box reads flush layout (`base.resolve`) like the existing rect paths.
-- No Blitz fork: every GitHub divergence traced back to our CDP/bindings layers.
+- Forks follow the rquickjs pattern: `master` is the line, push before pinning (`git ls-remote origin <sha>` inside the submodule first), `[patch.crates-io]` path entries, workspace-excluded. xml5ever builds against registry markup5ever so atom/tendril/TreeSink types stay unified.
+- Upstream deficiencies are never worked around in tinybrowser (`AGENTS.md`): side-channel reconstructions were deleted; fixes land in the forks.
+- PI-escaping follows the spec's update-data-from-attributes algorithm verbatim; the two contradicting proposal subtests fail everywhere by design. HTML `<?...?>` stays a bogus comment per the HTML Standard.
+- `moveBefore` animation/transition TIMEOUTs are load flakes (all 15 pass on retest), not engine failures; the stable score is 287/354.
 
 Gotchas:
 
-- Run Cargo and all runners via `nix develop --command`; the host shell lacks `pkg-config`/OpenSSL.
-- The machine-wide `~/.cargo/config.toml` points every project at `/mnt/ssd/rust-targets/shared`, which this session found cross-contaminated between worktrees. Use an isolated dir for reliable builds, e.g. `CARGO_TARGET_DIR=/mnt/ssd/rust-targets/blitz-adopt`.
-- `/mnt/ssd` fills up; a link failure with "No space left" is disk, not code.
-- WPT/Playwright/CDP suite runs need explicit approval and must stay surgical. The full Playwright gate takes under a minute once `node_modules` exists.
-- Scratch probes that open a raw CDP WebSocket can hang on exit; prefer `tools/playwright/cdp.ts` inside the committed specs.
-- Live Chromium comparisons use the `playwriter` CLI (session 1, extension-connected), e.g. `playwriter -s 1 -f /tmp/opencode/eval-email2.js`. The ms-playwright cached chrome cannot run here (missing `libglib-2.0.so.0`). Headless shots:
-  `/etc/profiles/per-user/erickc/bin/google-chrome-dev --headless=new --no-sandbox --disable-gpu --hide-scrollbars --force-device-scale-factor=1 --user-data-dir=/tmp/opencode/chrome-anon --window-size=1280,800 --virtual-time-budget=15000 --screenshot=<abs.png> <url>`
-- This worktree: `/home/erickc/.local/share/opencode/worktree/174cc2/swift-sailor`; main worktree is `~/projects/tinybrowser` (`main` at `b85926b`).
+- Run Cargo and all runners through `nix develop --command`; host shell lacks `pkg-config`/OpenSSL.
+- No suite/slice runs without being asked; `retest` (failures only) is the fast loop; full `dom/nodes` takes ~204s wall.
+- Scratch probes go under `third_party/wpt/` and must be deleted after use; `git status` then shows only `? third_party/wpt` (untracked scratch residue) — verify removal.
+- The runner surfaces JS failures only as "Exception generated by QuickJS"; use manual WebDriver driving with `--verbose` and the `logging` crate to see more.
+- `docs/progress.md`: replace binary size, total, and scored groups/slices only; upstream-bug list edits stay minimal.

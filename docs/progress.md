@@ -21,7 +21,7 @@ WPT has many test groups (html, css, dom, and more). Each percentage is the pass
 
 The **total** row is pass / (tests − skip) across every directory that produced a report in this overnight dump — not a claim that every WPT file on earth was run. Worker excludes and known-skips stay out of the fail pile.
 
-Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (278/354 on 2026-10-08), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
+Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (287/354 on 2026-10-09: 272 clean-run, 15 `moveBefore` timing flakes pass on retest; 59 unexpected + 8 error remain), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
 nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
@@ -315,7 +315,7 @@ prolog), serialization, text, and layout treatment; real template
 contents fragments with host links, parser/fragment routing, cloning,
 and cycle visibility; sink parse errors carried on the document for
 draining; internal general entities expanded up front with
-billion-laughs bounds.
+billion-laughs bounds; `Node::is_visible` for computed visibility.
 Fixed in our `ericc-ch/html5ever` fork (`third_party/html5ever`,
 `master` is the line, from the byte-identical 0.39.0 base) so far:
 namespace declarations kept on elements; CDATA sections tokenized and
@@ -328,7 +328,6 @@ reported; internal DTD subsets skipped instead of going bogus.
 - XML namespace prefix synthesis on serialization is skipped (stored qualified names used as-is); entity expansion covers internal general entities only.
 - `blitz-dom` keeps no form-control state: no dirty value flag, checkedness, selectedness, or indeterminate slots; values read from content attributes and descendant text, `select` events have no producer, form-state cloning carries structure only.
 - `blitz-dom` exposes no image-request state: `image_cache` / `pending_images` are `pub(crate)`, so request tracking (selected `currentSrc`, loading/broken flags, `load` / `error` events) stays ours; the decoded result itself is public (`ElementData::image_data`), so `naturalWidth` / `naturalHeight` and the `load` / `error` decision read Blitz state with no second decode. SVG and GIF `<img>` now load like Chromium.
-- `blitz-dom` exposes no public visibility helper: one `style::` use remains for the `visibility` check.
 - `blitz-dom` styles with hardcoded `NoQuirks` internally, so `document.compatMode` (sniffed from the doctype) can disagree with the rendering mode.
 - `blitz-dom` puts `AnonymousBlock` layout boxes in the same tree; we treat them as transparent (snapshot/serialize children only, never brand as elements).
 - `blitz-dom` exposes only the viewport scroll offset, no per-element scroll-container offset API.
