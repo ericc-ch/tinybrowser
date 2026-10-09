@@ -513,6 +513,14 @@ pub(crate) struct World {
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
     input_files: HashMap<NodeId, Vec<Persistent<Value<'static>>>>,
+    /// Streaming `TextDecoder` sessions, keyed by platform id. The decoder
+    /// object buffers partial sequences internally across `decode()` calls,
+    /// exactly as the Encoding Standard's streaming decoder does; the entry
+    /// dies with the realm, and `FinalizationRegistry` frees it earlier when
+    /// the engine runs the callback
+    /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
+    pub(crate) decoders: HashMap<u64, DecoderSession>,
+    pub(crate) next_decoder: u64,
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
@@ -586,6 +594,30 @@ pub(crate) struct World {
     pub(crate) image_broken: HashSet<NodeId>,
 }
 
+/// One streaming `TextDecoder` session: the decoder plus what recreates it.
+/// A `last=true` call ends the decoder (`encoding_rs` panics on reuse), so
+/// every non-streaming `decode()` replaces it with a fresh one.
+pub(crate) struct DecoderSession {
+    pub(crate) decoder: encoding_rs::Decoder,
+    pub(crate) encoding: &'static encoding_rs::Encoding,
+    pub(crate) ignore_bom: bool,
+}
+
+impl DecoderSession {
+    pub(crate) fn fresh(encoding: &'static encoding_rs::Encoding, ignore_bom: bool) -> Self {
+        let decoder = if ignore_bom {
+            encoding.new_decoder_without_bom_handling()
+        } else {
+            encoding.new_decoder_with_bom_removal()
+        };
+        Self {
+            decoder,
+            encoding,
+            ignore_bom,
+        }
+    }
+}
+
 impl Drop for World {
     fn drop(&mut self) {
         let object_bytes = self
@@ -633,6 +665,8 @@ impl World {
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
             input_files: HashMap::new(),
+            decoders: HashMap::new(),
+            next_decoder: 0,
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),

@@ -19,6 +19,9 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     host.set("__tbUtf8Encode", Func::from(utf8_encode))?;
     host.set("__tbEncodeInto", Func::from(encode_into))?;
     host.set("__tbDecode", Func::from(decode))?;
+    host.set("__tbDecoderInit", Func::from(decoder_init))?;
+    host.set("__tbDecoderDecode", Func::from(decoder_decode))?;
+    host.set("__tbDecoderFree", Func::from(decoder_free))?;
     host.set("__tbAtob", Func::from(atob))?;
     host.set("__tbBtoa", Func::from(btoa))?;
     host.set("__tbBase64Encode", Func::from(base64_encode))?;
@@ -64,9 +67,9 @@ fn encode_into<'js>(ctx: Ctx<'js>, source: Value<'js>, max: usize) -> Result<Obj
     Ok(result)
 }
 
-/// Decodes isomorphic-latin1 `source` with Encoding Standard label `label`.
-/// The result object has `text` and `remainder`; `stream` leaves a trailing
-/// incomplete sequence in `remainder`
+/// Decodes a complete buffer with Encoding Standard label `label`.
+/// Single-shot only: every caller passes a whole buffer, so the input is
+/// always final and nothing carries forward
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
 #[allow(
     clippy::needless_pass_by_value,
@@ -78,22 +81,93 @@ fn decode<'js>(
     label: String,
     fatal: bool,
     ignore_bom: bool,
-    stream: bool,
-) -> Result<Object<'js>> {
+) -> Result<String> {
     let bytes = bytes_from_latin1(&source)
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
-    let Some(encoding) = Encoding::for_label(label.trim().as_bytes()) else {
-        return Err(Exception::throw_range(
-            &ctx,
-            "The encoding label is not supported",
-        ));
+    let encoding = resolve_label(&ctx, &label)?;
+    let mut decoder = if ignore_bom {
+        encoding.new_decoder_without_bom_handling()
+    } else {
+        encoding.new_decoder_with_bom_removal()
     };
-    let (text, remainder) = decode_bytes(&bytes, encoding, fatal, ignore_bom, stream)
-        .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
-    let result = Object::new(ctx.clone())?;
-    result.set("text", text)?;
-    result.set("remainder", latin1_from_bytes(&remainder))?;
-    Ok(result)
+    decode_loop(&mut decoder, &bytes, fatal, true)
+        .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
+}
+
+/// Opens a streaming decoder session for `label`, returning its platform id.
+/// The session owns one `encoding_rs` decoder across `decode()` calls, which
+/// is what buffers a trailing partial sequence; a fresh decoder per call
+/// would silently drop it
+/// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn decoder_init<'js>(ctx: Ctx<'js>, label: String, ignore_bom: bool) -> Result<u64> {
+    let encoding = resolve_label(&ctx, &label)?;
+    let world = super::bindings::world(&ctx)?;
+    let mut world = world.borrow_mut();
+    let id = world.next_decoder;
+    world.next_decoder = world.next_decoder.wrapping_add(1);
+    world
+        .decoders
+        .insert(id, super::world::DecoderSession::fresh(encoding, ignore_bom));
+    Ok(id)
+}
+
+/// Decodes `source` through session `id`, keeping the decoder's buffered
+/// tail for the next call when `stream` is true. A fatal error throws but
+/// leaves the consumed position where it is, so later calls continue after
+/// the error (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn decoder_decode<'js>(
+    ctx: Ctx<'js>,
+    id: u64,
+    source: String,
+    fatal: bool,
+    stream: bool,
+) -> Result<String> {
+    let bytes = bytes_from_latin1(&source)
+        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+    let world = super::bindings::world(&ctx)?;
+    let mut world = world.borrow_mut();
+    let Some(session) = world.decoders.get_mut(&id) else {
+        return Err(Exception::throw_internal(&ctx, "The decoder is closed."));
+    };
+    let result = decode_loop(&mut session.decoder, &bytes, fatal, !stream);
+    if !stream {
+        // `last=true` ends the decoder, which must never run again; the next
+        // call starts a fresh session with the same encoding and BOM mode.
+        let fresh =
+            super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
+        session.decoder = fresh.decoder;
+    }
+    result.map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
+}
+
+/// Drops session `id`. Best-effort: after realm teardown there is no world
+/// left, and the realm drop itself reclaims every session.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn decoder_free<'js>(ctx: Ctx<'js>, id: u64) -> Result<()> {
+    if let Ok(world) = super::bindings::world(&ctx) {
+        world.borrow_mut().decoders.remove(&id);
+    }
+    Ok(())
+}
+
+/// Resolves `label` to an encoding, rejecting unknown labels and the
+/// `replacement` encoding, which getting an encoding never returns
+/// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
+fn resolve_label<'js>(ctx: &Ctx<'js>, label: &str) -> Result<&'static Encoding> {
+    Encoding::for_label(label.trim().as_bytes())
+        .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
+        .ok_or_else(|| Exception::throw_range(ctx, "The encoding label is not supported"))
 }
 
 /// Forgiving-base64 decode of an isomorphic string
@@ -131,26 +205,16 @@ fn base64_encode(source: String) -> Option<String> {
 
 struct DecodeFailure;
 
-fn decode_bytes(
-    bytes: &[u8],
-    encoding: &'static Encoding,
+/// Runs `decoder` over `input`, growing the output until the input is
+/// consumed. The caller owns how the decoder persists: one-shot callers pass
+/// a fresh decoder with `last` true, streaming sessions pass their stored
+/// decoder with `last` set from the `stream` option.
+fn decode_loop(
+    decoder: &mut encoding_rs::Decoder,
+    input: &[u8],
     fatal: bool,
-    ignore_bom: bool,
-    stream: bool,
-) -> core::result::Result<(String, Vec<u8>), DecodeFailure> {
-    let mut offset = 0;
-    if !ignore_bom {
-        if let Some((bom_encoding, bom_len)) = Encoding::for_bom(bytes) {
-            if bom_encoding == encoding {
-                offset = bom_len;
-            }
-        } else if stream && !bytes.is_empty() && is_bom_prefix_for(encoding, bytes) {
-            return Ok((String::new(), bytes.to_vec()));
-        }
-    }
-    let input = &bytes[offset..];
-    let mut decoder = encoding.new_decoder_without_bom_handling();
-    let last = !stream;
+    last: bool,
+) -> core::result::Result<String, DecodeFailure> {
     let mut output = String::with_capacity(
         decoder
             .max_utf8_buffer_length(input.len())
@@ -167,7 +231,7 @@ fn decode_bytes(
                 DecoderResult::InputEmpty => break,
                 DecoderResult::Malformed(_, _) => return Err(DecodeFailure),
                 DecoderResult::OutputFull => {
-                    reserve_decode(&mut decoder, &mut output, input.len().saturating_sub(read));
+                    reserve_output(decoder, &mut output, input.len().saturating_sub(read));
                 }
             }
         } else {
@@ -176,34 +240,21 @@ fn decode_bytes(
             match result {
                 CoderResult::InputEmpty => break,
                 CoderResult::OutputFull => {
-                    reserve_decode(&mut decoder, &mut output, input.len().saturating_sub(read));
+                    reserve_output(decoder, &mut output, input.len().saturating_sub(read));
                 }
             }
         }
     }
-    Ok((output, input[read..].to_vec()))
+    Ok(output)
 }
 
-fn reserve_decode(decoder: &mut encoding_rs::Decoder, output: &mut String, remaining: usize) {
+fn reserve_output(decoder: &mut encoding_rs::Decoder, output: &mut String, remaining: usize) {
     output.reserve(
         decoder
             .max_utf8_buffer_length(remaining)
             .unwrap_or(remaining.saturating_mul(3))
             .max(4),
     );
-}
-
-fn is_bom_prefix_for(encoding: &'static Encoding, bytes: &[u8]) -> bool {
-    let bom: &[u8] = if encoding == encoding_rs::UTF_8 {
-        &[0xEF, 0xBB, 0xBF]
-    } else if encoding == encoding_rs::UTF_16LE {
-        &[0xFF, 0xFE]
-    } else if encoding == encoding_rs::UTF_16BE {
-        &[0xFE, 0xFF]
-    } else {
-        return false;
-    };
-    bytes.len() < bom.len() && bom.starts_with(bytes)
 }
 
 /// Isomorphic decode: each code point below 256 becomes that byte

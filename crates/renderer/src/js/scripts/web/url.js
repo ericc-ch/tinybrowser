@@ -88,7 +88,7 @@ globalThis.URL = class URL {
 };
 globalThis.URL.createObjectURL = function(blob) {
   const data = __tbBrand(blob, __tbBlobData, 'value is not a Blob');
-  const text = __tbUtf8Decode(data.bytes, false, true).text;
+  const text = __tbUtf8Decode(data.bytes, false, true);
   const url = host.__tbCreateObjectURL(text, data.type);
   if (url == null) throw new RangeError('object URL budget exceeded');
   return url;

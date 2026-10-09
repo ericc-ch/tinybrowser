@@ -15,22 +15,14 @@ const __tbToLatin1 = bytes => {
   }
   return __tbArray.join(parts, '');
 };
-const __tbFromLatin1 = text => {
-  const bytes = host.slots.bytes(text.length);
-  for (let index = 0; index < text.length; index++) bytes[index] = text.charCodeAt(index);
-  return bytes;
-};
 const __tbUtf8Encode = value => host.__tbUtf8Encode(value);
-const __tbUtf8Decode = (bytes, fatal, ignoreBOM) => {
-  const decoded = host.__tbDecode(__tbToLatin1(bytes), 'utf-8', fatal, ignoreBOM, true);
-  return { text: decoded.text, remainder: __tbFromLatin1(decoded.remainder) };
-};
+const __tbUtf8Decode = bytes => host.__tbDecode(__tbToLatin1(bytes), 'utf-8', false, true);
 const __tbEncoding = label => {
   const name = host.__tbEncodingName(String(label));
   return name === null || name === undefined ? null : String(name).toLowerCase();
 };
 const __tbDecodeBytes = (bytes, encoding, fatal, ignoreBOM) =>
-  host.__tbDecode(__tbToLatin1(bytes), encoding, fatal, ignoreBOM, false).text;
+  host.__tbDecode(__tbToLatin1(bytes), encoding, fatal, ignoreBOM);
 // https://w3c.github.io/FileAPI/#convert-line-endings-to-native: LF is the
 // native line ending on this platform, so CR and CRLF collapse to LF.
 const __tbNativeEndings = value => String(value).replace(/\r\n?|\n/g, '\n');
@@ -63,39 +55,49 @@ globalThis.TextEncoder = __tbInstallInterface(class TextEncoder {
     return { read, written };
   }
 });
+// Best-effort session cleanup: entries die with the realm regardless, this
+// only reclaims earlier when the engine runs finalizer callbacks.
+const __tbDecoderFinalizer = (() => {
+  try {
+    if (typeof FinalizationRegistry === 'function') {
+      return new FinalizationRegistry(id => {
+        try { host.__tbDecoderFree(id); } catch (_) {}
+      });
+    }
+  } catch (_) {}
+  return null;
+})();
 globalThis.TextDecoder = class TextDecoder {
   constructor(label, options) {
     const optionsObject = options === undefined ? {} : Object(options);
     const encoding = label === undefined ? 'utf-8' : __tbEncoding(String(label));
     if (encoding === null) throw new RangeError('The encoding label is not supported');
-    __tbDecoderData.set(this, {
-        encoding,
-        fatal: optionsObject.fatal !== undefined && Boolean(optionsObject.fatal),
-        ignoreBOM: optionsObject.ignoreBOM !== undefined && Boolean(optionsObject.ignoreBOM),
-        pending: host.slots.bytes(0),
-    });
+    const fatal = optionsObject.fatal !== undefined && Boolean(optionsObject.fatal);
+    const ignoreBOM = optionsObject.ignoreBOM !== undefined && Boolean(optionsObject.ignoreBOM);
+    // The session owns the decoder across decode() calls, which is what
+    // buffers a trailing partial sequence
+    // (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
+    const decoder = host.__tbDecoderInit(encoding, ignoreBOM);
+    __tbDecoderData.set(this, { decoder, encoding, fatal, ignoreBOM });
+    if (__tbDecoderFinalizer !== null) {
+      try { __tbDecoderFinalizer.register(this, decoder); } catch (_) {}
+    }
   }
   get encoding() { return __tbBrand(this, __tbDecoderData).encoding; }
   get fatal() { return __tbBrand(this, __tbDecoderData).fatal; }
   get ignoreBOM() { return __tbBrand(this, __tbDecoderData).ignoreBOM; }
   decode(input, options) {
     const data = __tbBrand(this, __tbDecoderData);
+    let latin1 = '';
     if (input !== undefined && input !== null) {
       let bytes;
       if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
       else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
       else throw new TypeError('The input argument must be an ArrayBuffer or ArrayBufferView');
-      if (bytes.length > 0) {
-        const combined = host.slots.bytes(data.pending.length + bytes.length);
-        for (let index = 0; index < data.pending.length; index++) combined[index] = data.pending[index];
-        for (let index = 0; index < bytes.length; index++) combined[data.pending.length + index] = bytes[index];
-        data.pending = combined;
-      }
+      latin1 = __tbToLatin1(bytes);
     }
     const stream = options !== undefined && options.stream === true;
-    const decoded = host.__tbDecode(__tbToLatin1(data.pending), data.encoding, data.fatal, data.ignoreBOM, stream);
-    data.pending = stream ? __tbFromLatin1(decoded.remainder) : host.slots.bytes(0);
-    return decoded.text;
+    return host.__tbDecoderDecode(data.decoder, latin1, data.fatal, stream);
   }
 };
 Object.defineProperty(globalThis.TextDecoder.prototype, Symbol.toStringTag, { value: 'TextDecoder', writable: false, enumerable: false, configurable: true });

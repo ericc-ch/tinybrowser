@@ -56,12 +56,16 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
 
 /// Resolves an encoding label to its canonical name, or `null`
 /// (<https://encoding.spec.whatwg.org/#names-and-labels>).
+///
+/// The `replacement` encoding is never returned: getting an encoding
+/// rejects it (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 pub(super) fn encoding_name(label: String) -> Option<String> {
     encoding_rs::Encoding::for_label(label.trim().as_bytes())
+        .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .map(|encoding| encoding.name().to_owned())
 }
 
