@@ -313,13 +313,19 @@ real doctype / processing-instruction / CDATA section node kinds with
 constructors, sink preservation (except the XML declaration, which is
 prolog), serialization, text, and layout treatment; real template
 contents fragments with host links, parser/fragment routing, cloning,
-and cycle visibility.
+and cycle visibility; sink parse errors carried on the document for
+draining; internal general entities expanded up front with
+billion-laughs bounds.
+Fixed in our `ericc-ch/html5ever` fork (`third_party/html5ever`,
+`master` is the line, from the byte-identical 0.39.0 base) so far:
+namespace declarations kept on elements; CDATA sections tokenized and
+built as real nodes; EOF-with-open-elements and PUBLIC-without-SYSTEM
+reported; internal DTD subsets skipped instead of going bogus.
 
 - `blitz-dom` stores text as UTF-8, so lone surrogates in `CharacterData`, attributes, and titles read back as U+FFFD. No side table preserves them; fails as known-fails.
 - `blitz-dom` has no shadow DOM: no shadow roots, `attachShadow` never hosts, `ShadowRoot` brand never instantiates, `getComposedRanges` / composed options are no-ops.
 - Template contents share their host document instead of a separate inert template-contents owner document, so `content.ownerDocument !== document` assertions fail. Needs per-document inert owner documents with cross-arena contents routing; deferred as its own feature.
-- xml5ever (Servo's parser, not our fork) strips `xmlns` attributes in `process_namespaces` before the sink sees them, has no internal-entity support, and delivers CDATA content as plain text, so `lookupPrefix` / namespace-aware tests, entity-heavy XML, and parsed-CDATA nodes fail. Fixing the parser means a second fork (`xml5ever`); deferred as an explicit decision.
-- `blitz-html` records XML parse errors internally with no accessor, so no `parsererror` document exists and XHR `responseXML` cannot detect malformed XML. Needs an error-out API plus document-level handling; next fork item after owner documents.
+- XML namespace prefix synthesis on serialization is skipped (stored qualified names used as-is); entity expansion covers internal general entities only.
 - `blitz-dom` keeps no form-control state: no dirty value flag, checkedness, selectedness, or indeterminate slots; values read from content attributes and descendant text, `select` events have no producer, form-state cloning carries structure only.
 - `blitz-dom` exposes no image-request state: `image_cache` / `pending_images` are `pub(crate)`, so request tracking (selected `currentSrc`, loading/broken flags, `load` / `error` events) stays ours; the decoded result itself is public (`ElementData::image_data`), so `naturalWidth` / `naturalHeight` and the `load` / `error` decision read Blitz state with no second decode. SVG and GIF `<img>` now load like Chromium.
 - `blitz-dom` exposes no public visibility helper: one `style::` use remains for the `visibility` check.
