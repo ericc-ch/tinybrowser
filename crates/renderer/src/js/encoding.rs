@@ -165,21 +165,27 @@ fn decoder_free<'js>(ctx: Ctx<'js>, id: u64) -> Result<()> {
 /// `replacement` encoding, which getting an encoding never returns
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
 fn resolve_label<'js>(ctx: &Ctx<'js>, label: &str) -> Result<&'static Encoding> {
-    Encoding::for_label(label.trim().as_bytes())
+    Encoding::for_label(super::bindings::forms::trim_label(label).as_bytes())
         .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .ok_or_else(|| Exception::throw_range(ctx, "The encoding label is not supported"))
 }
 
 /// Forgiving-base64 decode of an isomorphic string
 /// (<https://infra.spec.whatwg.org/#forgiving-base64-decode>).
+///
+/// Takes the value, not a string: a lone surrogate has no UTF-8 form for a
+/// Rust `String` to cross in, so the Latin1 check runs on UTF-16 units and
+/// reports `None` for the caller's `InvalidCharacterError`.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn atob(input: String) -> Option<String> {
-    let bytes = bytes_from_latin1(&input)?;
-    let decoded = data_url::forgiving_base64::decode_to_vec(&bytes).ok()?;
-    Some(latin1_from_bytes(&decoded))
+fn atob<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
+    let Some(bytes) = latin1_bytes(&ctx, input)? else {
+        return Ok(None);
+    };
+    let decoded = data_url::forgiving_base64::decode_to_vec(&bytes).ok();
+    Ok(decoded.map(|bytes| latin1_from_bytes(&bytes)))
 }
 
 /// Latin-1-only `btoa`
@@ -188,9 +194,11 @@ fn atob(input: String) -> Option<String> {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn btoa(input: String) -> Option<String> {
-    let bytes = bytes_from_latin1(&input)?;
-    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+fn btoa<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
+    let Some(bytes) = latin1_bytes(&ctx, input)? else {
+        return Ok(None);
+    };
+    Ok(Some(base64::engine::general_purpose::STANDARD.encode(bytes)))
 }
 
 /// Standard base64 of isomorphic-latin1 bytes, for `FileReader` data URLs.
@@ -198,9 +206,24 @@ fn btoa(input: String) -> Option<String> {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn base64_encode(source: String) -> Option<String> {
-    let bytes = bytes_from_latin1(&source)?;
-    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+fn base64_encode<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Option<String>> {
+    let Some(bytes) = latin1_bytes(&ctx, source)? else {
+        return Ok(None);
+    };
+    Ok(Some(base64::engine::general_purpose::STANDARD.encode(bytes)))
+}
+
+/// UTF-16 units as Latin1 bytes, or `None` when a unit exceeds `0xFF`.
+fn latin1_bytes<'js>(ctx: &Ctx<'js>, input: Value<'js>) -> Result<Option<Vec<u8>>> {
+    let units = super::bindings::webidl_to_units(ctx, input)?;
+    let mut bytes = Vec::with_capacity(units.len());
+    for unit in units {
+        let Ok(byte) = u8::try_from(unit) else {
+            return Ok(None);
+        };
+        bytes.push(byte);
+    }
+    Ok(Some(bytes))
 }
 
 struct DecodeFailure;

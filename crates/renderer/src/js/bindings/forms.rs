@@ -54,6 +54,13 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Strips ASCII whitespace, the only whitespace the Encoding Standard's
+/// label matching removes
+/// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
+pub(crate) fn trim_label(label: &str) -> &str {
+    label.trim_matches(['\t', '\n', '\x0C', '\r', ' '])
+}
+
 /// Resolves an encoding label to its canonical name, or `null`
 /// (<https://encoding.spec.whatwg.org/#names-and-labels>).
 ///
@@ -64,7 +71,7 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 pub(super) fn encoding_name(label: String) -> Option<String> {
-    encoding_rs::Encoding::for_label(label.trim().as_bytes())
+    encoding_rs::Encoding::for_label(trim_label(&label).as_bytes())
         .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .map(|encoding| encoding.name().to_owned())
 }
