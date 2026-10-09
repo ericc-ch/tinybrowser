@@ -88,7 +88,7 @@ globalThis.URL = class URL {
 };
 globalThis.URL.createObjectURL = function(blob) {
   const data = __tbBrand(blob, __tbBlobData, 'value is not a Blob');
-  const text = __tbUtf8Decode(data.bytes, false, true);
+  const text = __tbUtf8Decode(data.bytes);
   const url = host.__tbCreateObjectURL(text, data.type);
   if (url == null) throw new RangeError('object URL budget exceeded');
   return url;
@@ -127,19 +127,19 @@ globalThis.URLSearchParams = class URLSearchParams {
     if (init !== null && typeof init === 'object') {
       if (typeof init[Symbol.iterator] === 'function') {
         for (const pair of init) {
-          const values = Array.from(pair);
+          const values = __tbArrayFrom(pair);
           if (values.length !== 2) throw new TypeError('parameter pair must contain two values');
           __tbArray.push(__tbParamsState(this).pairs, [host.__tbUSVString(values[0]), host.__tbUSVString(values[1])]);
         }
       } else {
-        for (const name of Object.keys(init)) {
+        for (const name of __tbObjectKeys(init)) {
           __tbArray.push(__tbParamsState(this).pairs, [host.__tbUSVString(name), host.__tbUSVString(init[name])]);
         }
       }
       return;
     }
     var input = host.__tbUSVString(init === undefined ? '' : init);
-    if (input.charAt(0) === '?') input = input.slice(1);
+    if (input[0] === '?') input = __tbApply(__tbStringSlice, input, [1]);
     if (!input) return;
     // The `application/x-www-form-urlencoded` parser drops empty items
     // (<https://url.spec.whatwg.org/#urlencoded-parsing>).

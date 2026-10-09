@@ -849,7 +849,7 @@
     // Chunked: per-byte `+=` is quadratic on large multipart bodies.
     const parts = __tbPrivateArray();
     for (let start = 0; start < bytes.length; start += 4096) {
-      __tbArray.push(parts, __tbApply(String.fromCharCode, null, bytes.slice(start, start + 4096)));
+      __tbArray.push(parts, __tbApply(__tbIDLFromCharCode, null, __tbBytesCopy(bytes, start, start + 4096)));
     }
     return __tbArray.join(parts, '');
   };

@@ -312,7 +312,7 @@ const __tbFileReaderRead = (reader, blob, kind, argument) => {
             // UTF-8; a BOM overrides (<https://w3c.github.io/FileAPI/#readAsDataText>).
             let encoding;
             if (argument !== undefined) {
-              const label = __tbEncoding(String(argument));
+              const label = __tbEncoding(__tbIDLString(argument));
               if (label !== null) encoding = label;
             }
             if (encoding === undefined) {
@@ -331,12 +331,7 @@ const __tbFileReaderRead = (reader, blob, kind, argument) => {
           } else if (kind === 'arraybuffer') {
             result = __tbBytesCopy(source.bytes).buffer;
           } else {
-            // Chunked: per-byte `+=` is quadratic on large blobs.
-            const parts = __tbPrivateArray();
-            for (let start = 0; start < source.bytes.length; start += 4096) {
-              __tbArray.push(parts, __tbApply(String.fromCharCode, null, source.bytes.slice(start, start + 4096)));
-            }
-            result = __tbArray.join(parts, '');
+            result = __tbToLatin1(source.bytes);
           }
         } catch (exception) {
           error = exception;

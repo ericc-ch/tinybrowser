@@ -11,15 +11,17 @@ const __tbToLatin1 = bytes => {
   // call stack (<https://tc39.es/ecma262/#sec-apply>).
   const parts = __tbPrivateArray();
   for (let start = 0; start < bytes.length; start += 4096) {
-    __tbArray.push(parts, __tbApply(String.fromCharCode, null, bytes.slice(start, start + 4096)));
+    __tbArray.push(parts, __tbApply(__tbIDLFromCharCode, null, __tbBytesCopy(bytes, start, start + 4096)));
   }
   return __tbArray.join(parts, '');
 };
-const __tbUtf8Encode = value => host.__tbUtf8Encode(value);
+const __tbUtf8Encode = value => host.__tbUtf8Encode(__tbIDLString(value));
 const __tbUtf8Decode = bytes => host.__tbDecode(__tbToLatin1(bytes), 'utf-8', false, true);
 const __tbEncoding = label => {
   const name = host.__tbEncodingName(String(label));
-  return name === null || name === undefined ? null : String(name).toLowerCase();
+  return name === null || name === undefined
+    ? null
+    : String(__tbApply(__tbStringToLowerCase, name, []));
 };
 const __tbDecodeBytes = (bytes, encoding, fatal, ignoreBOM) =>
   host.__tbDecode(__tbToLatin1(bytes), encoding, fatal, ignoreBOM);
@@ -47,7 +49,7 @@ globalThis.TextEncoder = __tbInstallInterface(class TextEncoder {
   }
   encodeInto(source, destination) {
     const length = __tbApply(__tbIDLTypedArrayLength, destination, []);
-    const packed = host.__tbEncodeInto(source, length);
+    const packed = host.__tbEncodeInto(__tbIDLString(source), length);
     const read = packed.read;
     const written = packed.written;
     const bytes = packed.bytes;
@@ -70,7 +72,7 @@ const __tbDecoderFinalizer = (() => {
 globalThis.TextDecoder = class TextDecoder {
   constructor(label, options) {
     const optionsObject = options === undefined ? {} : Object(options);
-    const encoding = label === undefined ? 'utf-8' : __tbEncoding(String(label));
+    const encoding = label === undefined ? 'utf-8' : __tbEncoding(__tbIDLString(label));
     if (encoding === null) throw new RangeError('The encoding label is not supported');
     const fatal = optionsObject.fatal !== undefined && Boolean(optionsObject.fatal);
     const ignoreBOM = optionsObject.ignoreBOM !== undefined && Boolean(optionsObject.ignoreBOM);
@@ -91,12 +93,20 @@ globalThis.TextDecoder = class TextDecoder {
     let latin1 = '';
     if (input !== undefined && input !== null) {
       let bytes;
-      if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-      else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+      if (__tbIsArrayBufferView(input)) {
+        // Snapshot once: a resizable buffer observed through unpinned
+        // getters could change between reads.
+        const buffer = input.buffer;
+        const offset = input.byteOffset;
+        const length = input.byteLength;
+        bytes = new __tbUint8Array(buffer, offset, length);
+      } else if (input instanceof ArrayBuffer) bytes = new __tbUint8Array(input);
       else throw new TypeError('The input argument must be an ArrayBuffer or ArrayBufferView');
       latin1 = __tbToLatin1(bytes);
     }
-    const stream = options !== undefined && options.stream === true;
+    // WebIDL dictionary: missing and null options both mean non-streaming,
+    // any other value converts with ToBoolean.
+    const stream = options !== undefined && options !== null && Boolean(options.stream);
     return host.__tbDecoderDecode(data.decoder, latin1, data.fatal, stream);
   }
 };
@@ -104,14 +114,14 @@ Object.defineProperty(globalThis.TextDecoder.prototype, Symbol.toStringTag, { va
 // https://html.spec.whatwg.org/multipage/webappapis.html#atob
 const __tbBase64Encode = bytes => host.__tbBase64Encode(__tbToLatin1(bytes));
 globalThis.btoa = function(input) {
-  const encoded = host.__tbBtoa(String(input));
+  const encoded = host.__tbBtoa(__tbIDLString(input));
   if (encoded === null || encoded === undefined) {
     throw new DOMException('The string to be encoded contains characters outside of the Latin1 range.', 'InvalidCharacterError');
   }
   return encoded;
 };
 globalThis.atob = function(input) {
-  const decoded = host.__tbAtob(String(input));
+  const decoded = host.__tbAtob(__tbIDLString(input));
   if (decoded === null || decoded === undefined) {
     throw new DOMException('The string to be decoded is not correctly encoded.', 'InvalidCharacterError');
   }
