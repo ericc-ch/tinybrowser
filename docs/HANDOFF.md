@@ -1,51 +1,51 @@
-# Handoff (2026-10-09)
+# Handoff (2026-10-10)
 
-Goal: Land PR 45 (`cursor/wpt-fast-loop-6d59`) and drive `dom/nodes` from 287/354 into Chrome/Firefox range (both effectively 100%). PR work is done with this note; what remains is the measured fail-list below.
+Goal: Land the PR 45 follow-ups on `main` and keep `dom/nodes` moving toward Chrome/Firefox range. `main` is at `0308a0a` (pushed, `ls-remote` verified). Everything below is on `main`; the `cursor/wpt-fast-loop-6d59` branch is superseded.
 
-Plan: Fix remaining `dom/nodes` failures in fork-domain order (parser/tree fixes in `ericc-ch/blitz` and `ericc-ch/html5ever` `master`, never tinybrowser workarounds), re-running only failures with `tools/wpt/retest`. Shadow DOM is its own multi-day project; template owner documents a medium feature.
+Plan: Work the remaining `dom/nodes` fail-list (see `docs/progress.md` slice line, 287/354 stable) in fork-domain order, then take the three deferred items in Next order. No suite/slice runs without approval per `AGENTS.md`; `tools/wpt/retest` is the fast loop.
 
-State: Branch `cursor/wpt-fast-loop-6d59` pushed to origin. `cargo test -p renderer --lib` 17/17 green. `cargo clippy -p renderer` clean except pre-existing `webidl-bindgen too_many_lines`. `dom/nodes` scored 2026-10-09: 272/354 clean-run, 287/354 stable after `retest` (15 `moveBefore` timing flakes resolve; 59 unexpected + 8 error remain). Reports are ephemeral (`/tmp/opencode/domnodelatest.json`, retest report under `/tmp/nix-shell.*/`); the committed evidence is the `dom/nodes` slice line in `docs/progress.md`.
+State: `cargo test -p renderer --lib` 17/17 green, `cargo test -p browser --lib` 35/35 green, `cargo check -p renderer` clean. Clippy fails only on pre-existing `webidl-bindgen too_many_lines` (`contracts.rs:541`, untouched by this work). Forks pinned and pushed before pinning: blitz `41074d7` (`branch = master` in `.gitmodules`), html5ever `02ecdaa`. `VENDORED.md` pins exact SHAs.
+
+## What a manifest is (asked 2026-10-10)
+
+`third_party/wpt/MANIFEST.json` (~40MB) is WPT's inventory of every test: file path → content hash + metadata (test type, timeout, variants). The runner reads it instead of scanning 100k+ files per run. Verified in-tree:
+
+- The file exists and has that shape (`items.<type>.<path>...: [sha, meta]`).
+- wptrunner rewalks (rebuilds it) on **every** run by default: `tools/wptrunner/wptrunner/wptcommandline.py:594-595` sets `manifest_update = True` when unset. Our `tools/wpt/run` passes `--no-manifest-update` only when its stamp says the tree is unchanged.
+- Our stamp (`manifest_token` in `tools/wpt/run`): git HEAD + `git status` + content hashes of tracked-modified and untracked files + manifest bytes, stored under `~/.cache/tinybrowser/`. Current = skip the walk.
+- The 2026-10-10 slow path additionally gates stamping on mtime change + no-signal + parses-OK (`tools/wpt/run:601,633-635`).
+- Correction to earlier discussion: there is **no** `./wpt manifest` subcommand at our pin (`third_party/wpt/tools/wpt/*.py` has no `manifest.py`). The deferred explicit-step follow-up must drive `load_and_update` in `third_party/wpt/tools/manifest/manifest.py:365` directly (small driver under `tools/wpt/`, run with the venv python).
 
 Done:
 
-- `0b85f28` — build: fork blitz like rquickjs, wire via `[patch.crates-io]`. Verified: `cargo build` from `third_party/blitz`.
-- `27425a4` — renderer: real doctype/PI/CDATA nodes over the fork. Verified: `Document-doctype`, `createProcessingInstruction`, `createCDATASection`, `cloneNode`, `adoptNode`, `replaceChildren` fully green (singles, `-- --exclude=worker`).
-- `253c6f9` — renderer: real template contents through fork fragments. Verified: template content/querySelector/outerHTML/innerHTML/clone probes hold; `Document-adoptNode-DocumentFragment-with-host` green except shadow case.
-- `95aab87` — renderer: `parsererror` documents from drained sink errors + XHR null mapping. Verified: `DOMParser-parseFromString-xml-parsererror` fully green.
-- `f77a3ba` — build,renderer: fork xml5ever (`third_party/html5ever` at `b71b746`, pushed to `origin/master` before recording), parsererror Mozilla namespace, DOMParser as plain `Document`. Verified: `Attr-prefix-xhtml`, `firstElementChild-xhtml`, `parseFromString-xml`, `-xml-doctype`, `-internal-subset` fully green.
-- `0137d1d` — build: bump html5ever fork for prolog-only tolerance. Verified: `processing-instruction-attributes` back to floor (only proposal/spec-disputed subtests fail).
-- `5317b7e` — renderer: shared QuickJS heap 32MB to 256MB. Verified: `Document-createElement-namespace` (40 parallel iframes) green; root-caused via manual WebDriver driving + `--verbose` logger, not guessing.
-- `18d95db` — renderer: `Node::is_visible` fork helper, drop direct `style::` use. Verified: `cargo test -p renderer --lib` 17/17; `elementFromPoint` failures unchanged (pre-existing hit-testing precision).
-- Fork `third_party/blitz` at `89550853` (`dom: expose Node::is_visible`, pushed). Fork `third_party/html5ever` at `39ba978` (`prolog-only documents are not errors`, pushed). Push-before-pin confirmed via `git ls-remote origin master` both.
-- Ledger: `docs/progress.md` upstream list updated (fork-fixed items moved up, stale `style::` visibility bullet removed, `dom/nodes` slice at 287/354).
+- `8190ed7` — code-review fixes across forks/renderer/scripts/runner (forks pushed, `ls-remote` verified; `VENDORED.md` exact pins). Verified: `cargo test -p renderer --lib` 17/17, `cargo check --workspace` clean.
+- `0308a0a` — PR 45 hostile-review (nitboo) follow-ups, coderabbit ignored. Verified: renderer lib 17/17, browser lib 35/35, `bash -n tools/wpt/run` OK, reorder-guard stub harness (typo → exit 1, swallowed path → exit 1, legit `--metadata a/b` → exit 0). SHAs and per-item reasoning are in that commit message.
+- Fork branch record: `.gitmodules` pins `branch = master`; fork default `main` confirmed diverged via `ls-remote` (74fe1ab vs 41074d7) — documented in `VENDORED.md`.
 
 Unfinished:
 
-- `dom/nodes/Element-firstElementChild-entity-xhtml.xhtml` whole-file QuickJS ERROR (stable across retest). Suspect: navigated XHTML with internal entity expanding to markup. Counter-evidence: equivalent DOMParser probe expands fine (`root=html`, `fec=true`). Resume: replicate as `scratch-*.xhtml` (delete after use), capture the JS exception message — the runner only surfaces "Exception generated by QuickJS". No renderer crash in logs.
-- `dom/nodes/insertion-removing-steps/insertion-removing-steps-script.window.html` ERROR: `script0 can observe itself and no other scripts expected 4 but got 6`. Suspect our CDATA-as-script-text change widened script collection. Resume: single-file run, bisect script counting.
-- 6× `dom/nodes/NodeList-static-length-getter-tampered-*.html` ERROR `interrupted` (stable across retest). Suspect session death under getter-tamper loops, not assertions. Resume: run one singly with `--verbose` logging.
-- 59 unexpected subtests, biggest buckets: `CharacterData-surrogates` (UTF-8 storage, needs WTF-8/UTF-16 fork design), shadow files (`isConnected-shadow-dom`, `attach-shadow-realm`, declarative-shadow clone, `getRootNode composed`), `Element-matches` (`:empty`, `:lang`, `:target`), `MutationObserver` Range set, `Element-closest` (`:has(> :scope)`, `:invalid`), `Node-contains-xml` fragment case, `Text/Comment-constructor` cross-global ownerDocument.
-- Template-contents owner documents (`docs/progress.md:327`): `content.ownerDocument !== document` assertions fail (e.g. `template-content-hierarcy` subtest 2). Needs per-document inert owner documents with cross-arena routing.
-- Shadow DOM (`docs/progress.md:326`): no roots/slots/composed traversal/event retargeting. Design sketch needed before code.
+- **Explicit manifest step** (deferred, low risk). Resume: write a `tools/wpt/manifest.py` driver calling `load_and_update(tests_root, manifest_path, url_base, ...)` with the venv python under the manifest lock, snapshot `manifest_token` before, stamp only on exit 0, then run tests with `--no-manifest-update`. Current mtime gate covers argparse-death/SIGTERM/torn-manifest; only mid-run tree edits can over-stamp (self-heals on next tree edit; stamp deletable in `~/.cache`).
+- **`createEvent` init-path proof** (deferred, needs approved WPT run). Resume: read `initEvent`/`initUIEvent` writes in `crates/renderer/src/js/events.rs` against the `__tbEventEntry` lazy slots, then run `dom/events` createEvent cases via `tools/wpt/run` (needs approval). Mechanism (lazy `fresh()` defaults + forge-proof `host.__tbIsEvent`) already in place; only proof missing. Legacy paths only; `new UIEvent()` unaffected.
+- **Per-move suppression** (deferred, needs approved WPT run). Resume: `noteConnectedMove`/`collectRecords` in `crates/renderer/src/js/scripts/web/custom_elements.js:88-106,378-390`. Two synchronous `moveBefore()`s on one node before observer delivery cause spurious disconnect+connect. Fix must tag suppression per move generation without breaking `schedule_mutation_delivery`, the `connected` set, or the shadow-including walk. Gate on the `moveBefore` WPT slice (incl. iframe-crash test; note the 15 known timing flakes).
+- **`dom/nodes` fail-list**: 59 unexpected + 8 error at 287/354 stable (entity-xhtml ERROR, script-count 4-vs-6, NodeList `interrupted`, surrogates/shadow/owner-docs buckets). Previous handoff detail was in the superseded branch note; re-derive from a fresh `retest` before working.
 
 Next:
 
-1. Triage the entity-xhtml ERROR (one-file fork-domain suspect, blocks a clean error bucket).
-2. Triage insertion-removing-steps-script 4-vs-6 and NodeList `interrupted` errors.
-3. Work the 59 unexpected by bucket: surrogates storage design, `:lang`/`:empty`/`:target` matching, MutationObserver Range, closest/matches selectors.
-4. Template owner documents, then shadow DOM design.
+1. Manifest explicit step (self-contained, no approval needed; verify with forced stale/fresh runs).
+2. `createEvent` init-path read + approved `dom/events` slice run.
+3. Per-move suppression + approved `moveBefore` slice run.
+4. `dom/nodes` buckets in score order.
 
 Decisions made:
 
-- Forks follow the rquickjs pattern: `master` is the line, push before pinning (`git ls-remote origin <sha>` inside the submodule first), `[patch.crates-io]` path entries, workspace-excluded. xml5ever builds against registry markup5ever so atom/tendril/TreeSink types stay unified.
-- Upstream deficiencies are never worked around in tinybrowser (`AGENTS.md`): side-channel reconstructions were deleted; fixes land in the forks.
-- PI-escaping follows the spec's update-data-from-attributes algorithm verbatim; the two contradicting proposal subtests fail everywhere by design. HTML `<?...?>` stays a bogus comment per the HTML Standard.
-- `moveBefore` animation/transition TIMEOUTs are load flakes (all 15 pass on retest), not engine failures; the stable score is 287/354.
+- Coderabbit comments ignored wholesale (noise); every nitboo comment verified against the tree, fixed only what held up. Rejected-with-evidence: `brands.js` fail-fast (broke 4 realm tests; silent skip is correct for script-implemented members), `decode_xml_response` String→bytes (Latin-1 projection round-trips losslessly; documented), drift-check import path (cwd is `$WPT`, correct as-is).
+- `cssRules.length` throws `not implemented` instead of reporting 0 — fails loudly per the no-workaround policy; tests expecting counts fail honestly until real rules land.
+- Network `Referer` check mirrors policy (downgrade-only reject) instead of overriding it; renderer stays the policy decider.
+- `parsererror` reuses the parsed document (keeps base URL/providers); `xml_document` passed in; shared `PARSERERROR_NS`; XHR checks namespace, not just local name.
 
 Gotchas:
 
-- Run Cargo and all runners through `nix develop --command`; host shell lacks `pkg-config`/OpenSSL.
-- No suite/slice runs without being asked; `retest` (failures only) is the fast loop; full `dom/nodes` takes ~204s wall.
-- Scratch probes go under `third_party/wpt/` and must be deleted after use; `git status` then shows only `? third_party/wpt` (untracked scratch residue) — verify removal.
-- The runner surfaces JS failures only as "Exception generated by QuickJS"; use manual WebDriver driving with `--verbose` and the `logging` crate to see more.
-- `docs/progress.md`: replace binary size, total, and scored groups/slices only; upstream-bug list edits stay minimal.
+- No host `python3` — everything Python must run via `nix develop --command` (also required for cargo: host lacks `pkg-config`/OpenSSL).
+- `tools/wpt/run` slow-path signal semantics are now load-bearing (INT-as-INT, re-wait loop, fds closed for children); test runner edits with the stub harness pattern from `0308a0a`, not live runs.
+- `docs/progress.md`: replace binary size, total, and scored groups/slices only.
+- Scratch probes go under `third_party/wpt/` and must be deleted after use.
