@@ -18,6 +18,7 @@ import tempfile
 
 from wptrunner.browsers.base import WebDriverBrowser, get_timeout_multiplier, require_arg
 from wptrunner.executors import executor_kwargs as base_executor_kwargs
+from wptrunner.executors.base import PytestExecutor  # noqa: F401
 from wptrunner.executors.executorwebdriver import (
     WebDriverCrashtestExecutor,
     WebDriverProtocol,
@@ -38,6 +39,12 @@ __wptrunner__ = {
         # report through testharness.js; Test262Test subclasses TestharnessTest
         # (wptrunner/wpttest.py), so the testharness executor drives them too.
         "test262": "TinyBrowserTestharnessExecutor",
+        # Red foundations: registered so the tests run and fail honestly
+        # instead of reporting an unsupported test type and running nothing.
+        # wdspec needs pytest plus element/frame/actions surface; aamtest
+        # needs platform accessibility hooks. BiDi work is deferred.
+        "wdspec": "PytestExecutor",
+        "aamtest": "PytestExecutor",
     },
     "browser_kwargs": "browser_kwargs",
     "executor_kwargs": "executor_kwargs",
