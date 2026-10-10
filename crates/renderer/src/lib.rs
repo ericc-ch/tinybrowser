@@ -136,32 +136,169 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
     }
 }
 
-/// Compatibility mode from the doctype: missing means quirks, an
-/// exact `html` doctype means standards, anything else means limited quirks.
+/// Compatibility mode from the doctype
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>,
+/// quirks-mode table): a missing doctype or a non-`html` name means quirks;
+/// matching public/system identifiers select limited quirks; otherwise
+/// (including the XHTML transitional/frameset identifiers *with* a system
+/// identifier) means no quirks.
 fn sniff_quirks_mode(input: &str) -> QuirksMode {
-    let rest = input.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\x0c', '\r']);
-    let Some(prefix) = rest.get(..9) else {
+    let Some((name, public, system)) = parse_doctype_ids(input) else {
         return QuirksMode::Quirks;
     };
-    if !prefix.eq_ignore_ascii_case("<!doctype") {
+    if !name.eq_ignore_ascii_case("html") {
         return QuirksMode::Quirks;
     }
-    let end = rest.find('>').map_or(rest.len(), |index| index + 1);
-    let normalized = rest[..end]
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized == "<!doctype html>" {
-        QuirksMode::NoQuirks
-    } else {
-        QuirksMode::LimitedQuirks
+    // Public identifiers selecting quirks mode regardless of the system
+    // identifier.
+    const QUIRKS_PUBLIC: &[&str] = &[
+        "-//w3o//dtd w3 html strict 3.0-//en",
+        "-/w3c/dtd html 4.0 transitional/en",
+        "html",
+    ];
+    // Public identifiers selecting limited quirks when the system
+    // identifier is missing.
+    const LIMITED_PUBLIC: &[&str] = &[
+        "-//w3c//dtd html 4.01 frameset//",
+        "-//w3c//dtd html 4.01 transitional//",
+        "-//w3c//dtd xhtml 1.0 frameset//",
+        "-//w3c//dtd xhtml 1.0 transitional//",
+    ];
+    let public = public.to_ascii_lowercase();
+    if QUIRKS_PUBLIC
+        .iter()
+        .any(|prefix| public.starts_with(prefix))
+    {
+        return QuirksMode::Quirks;
     }
+    if system.is_none()
+        && LIMITED_PUBLIC
+            .iter()
+            .any(|prefix| public.starts_with(prefix))
+    {
+        return QuirksMode::LimitedQuirks;
+    }
+    if system.as_deref() == Some("http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd") {
+        return QuirksMode::Quirks;
+    }
+    QuirksMode::NoQuirks
+}
+
+/// The doctype name and public/system identifiers from leading markup, if a
+/// complete `<!DOCTYPE ...>` token is present. Quoted identifiers keep
+/// their quotes stripped; anything malformed bails to `None` (quirks).
+fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
+    let rest = input.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\x0c', '\r']);
+    if rest.len() < 9 || !rest.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype")) {
+        return None;
+    }
+    let mut chars = rest[9..].chars().peekable();
+    while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+        chars.next();
+    }
+    let mut name = String::new();
+    while let Some(&char) = chars.peek() {
+        if char.is_ascii_whitespace() || char == '>' {
+            break;
+        }
+        name.push(char);
+        chars.next();
+    }
+    if name.is_empty() {
+        return None;
+    }
+    while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+        chars.next();
+    }
+    let mut word = String::new();
+    while let Some(&char) = chars.peek() {
+        if char.is_ascii_whitespace() || char == '>' || char == '"' || char == '\'' {
+            break;
+        }
+        word.push(char);
+        chars.next();
+    }
+    let (mut public, mut system) = (String::new(), None);
+    if word.eq_ignore_ascii_case("public") {
+        public = quoted_string(&mut chars)?;
+        system = quoted_string(&mut chars);
+    } else if word.eq_ignore_ascii_case("system") {
+        system = quoted_string(&mut chars);
+    } else if !word.is_empty() {
+        return None;
+    }
+    Some((name, public, system))
+}
+
+/// One single- or double-quoted string after optional whitespace, or `None`
+/// when the next token is not quoted.
+fn quoted_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+        chars.next();
+    }
+    let quote = *chars.peek()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    chars.next();
+    let mut value = String::new();
+    for char in chars.by_ref() {
+        if char == quote {
+            return Some(value);
+        }
+        if char == '>' {
+            return None;
+        }
+        value.push(char);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::{QuirksMode, sniff_quirks_mode};
+
+    // The quirks table: quirks and limited-quirks public identifiers with
+    // and without system identifiers
+    // (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>).
+    #[test]
+    fn quirks_sniff_follows_the_spec_table() {
+        let cases = [
+            ("<!DOCTYPE html>", QuirksMode::NoQuirks),
+            ("<!doctype html>", QuirksMode::NoQuirks),
+            // XHTML transitional *with* a system identifier is standards.
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">",
+                QuirksMode::NoQuirks,
+            ),
+            // ...without one it is limited quirks.
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">",
+                QuirksMode::LimitedQuirks,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">",
+                QuirksMode::LimitedQuirks,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">",
+                QuirksMode::NoQuirks,
+            ),
+            ("<!DOCTYPE html PUBLIC \"HTML\">", QuirksMode::Quirks),
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3O//DTD W3 HTML Strict 3.0-//EN\">",
+                QuirksMode::Quirks,
+            ),
+            (
+                "<!DOCTYPE html SYSTEM \"http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd\">",
+                QuirksMode::Quirks,
+            ),
+            ("<!DOCTYPE svg>", QuirksMode::Quirks),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(sniff_quirks_mode(input), expected, "{input}");
+        }
+    }
 
     // The quirks sniff slices near attacker-controlled bytes; none of these
     // inputs may panic, whatever mode they return.
