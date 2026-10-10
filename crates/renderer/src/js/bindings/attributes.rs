@@ -1776,6 +1776,13 @@ pub(crate) fn remove_attribute_sync(
     if let Some((name, value)) = removed {
         let namespace = name.ns.as_ref().to_owned();
         let local = name.local.as_ref().to_owned();
+        // The nonce attribute change steps reset the cryptographic nonce
+        // slot on removal (value `null`); only the null-namespace attribute
+        // participates
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+        if local == "nonce" && namespace.is_empty() {
+            world_rc.borrow_mut().nonce_slots.remove(&element);
+        }
         let registry = world_rc.borrow().registry();
         registry
             .borrow_mut()

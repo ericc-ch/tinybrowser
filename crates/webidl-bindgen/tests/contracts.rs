@@ -544,6 +544,145 @@ fn reflect_numeric_falls_through_to_hand_implementation() {
         !source.contains("reflect_set_ulong"),
         "numeric reflect must not use the generated setter"
     );
+    // The trait carries both methods with the path-specific numeric types:
+    // plain-method `unsigned long` getters answer `usize`.
+    let trait_source = bindings[0].rust.clone();
+    assert!(
+        trait_source.contains("fn get_size(&self, ctx: &Ctx<'js>) -> Result<usize>;"),
+        "missing exact getter signature"
+    );
+}
+
+#[test]
+fn reflect_legacy_null_rejects_non_strings() {
+    // `[LegacyNullToEmptyString]` requires `DOMString`: booleans, numerics,
+    // and `USVString` fail the build instead of silently dropping the flag.
+    for text in [
+        "[Exposed=Window] interface Group { [Reflect] attribute [LegacyNullToEmptyString] boolean flag; };",
+        "[Exposed=Window] interface Group { [Reflect] attribute [LegacyNullToEmptyString] USVString ping; };",
+        "[Exposed=Window] interface Group { [Reflect, LegacyNullToEmptyString] attribute unsigned long size; };",
+        "[Exposed=Window] interface Group { [ReflectSetter, LegacyNullToEmptyString] attribute long index; };",
+    ] {
+        let idl = [Source {
+            name: "html.idl",
+            text,
+        }];
+        let rust = [Source {
+            name: "group.rs",
+            text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_flag(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } fn get_ping(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> { Ok(\"\".into()) } fn get_size(&self, ctx: &Ctx<'js>) -> Result<usize> { Ok(0) } fn set_size(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> { Ok(()) } fn get_index(&self, ctx: &Ctx<'js>) -> Result<i32> { Ok(0) } }",
+        }];
+        assert!(
+            compile_contracts(&idl, &rust).is_err(),
+            "legacy null on a non-DOMString must fail: {text}"
+        );
+    }
+}
+
+#[test]
+fn reflect_url_special_shapes_stay_absent() {
+    // `[ReflectURL]` with `SameObject` and an implementation fails: the
+    // member stays absent (a plain method would lose the `SameObject`
+    // semantics), and the orphaned implementation trips the build's
+    // method-contract check instead of installing silently.
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [SameObject, ReflectURL] attribute USVString base; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_base(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> { Ok(\"\".into()) } }",
+    }];
+    assert!(compile_contracts(&idl, &rust).is_err());
+}
+
+#[test]
+fn reflect_url_dom_string_falls_through_to_hand_implementation() {
+    // Non-`USVString` `[ReflectURL]` (like `object.codeBase`) lowers as an
+    // ordinary hand-written method pair.
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [CEReactions, ReflectURL] attribute DOMString base; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_base(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> { rquickjs::String::from_str(ctx.clone(), \"\") } fn set_base(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> { Ok(()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("ReflectURL DOMString hand impl");
+    assert!(
+        bindings[0].rust.contains("fn get_base"),
+        "missing hand-written ReflectURL getter"
+    );
+}
+
+#[test]
+fn reflect_setter_rejects_member_attributes() {
+    // Unknown member attributes on the `[ReflectSetter]` path fail instead
+    // of being silently ignored.
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [ReflectSetter, SecureContext] attribute long index; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_index(&self, ctx: &Ctx<'js>) -> Result<i32> { Ok(0) } }",
+    }];
+    assert!(compile_contracts(&idl, &rust).is_err());
+}
+
+#[test]
+fn reflect_parameter_values_are_validated() {
+    // `ReflectDefault=foo` and any malformed `ReflectRange` fail the build.
+    for text in [
+        "[Exposed=Window] interface Group { [Reflect, ReflectDefault=foo] attribute unsigned long size; };",
+        "[Exposed=Window] interface Group { [Reflect, ReflectRange=(1, 2, 3)] attribute unsigned long size; };",
+        "[Exposed=Window] interface Group { [Reflect, ReflectRange=(one, two)] attribute unsigned long size; };",
+    ] {
+        let idl = [Source {
+            name: "html.idl",
+            text,
+        }];
+        let rust = [Source {
+            name: "group.rs",
+            text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_size(&self, ctx: &Ctx<'js>) -> Result<usize> { Ok(0) } fn set_size(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> { Ok(()) } }",
+        }];
+        assert!(
+            compile_contracts(&idl, &rust).is_err(),
+            "invalid reflection parameter must fail: {text}"
+        );
+    }
+}
+
+#[test]
+fn mixin_without_implemented_includers_fails() {
+    // A mixin included only by unimplemented interfaces has no install
+    // target: fail loudly instead of emitting an empty installer.
+    let idl = [Source {
+        name: "dom.idl",
+        text: "[Exposed=Window] interface Ghost {}; interface mixin Nodes { undefined append((Node or DOMString)... nodes); }; Ghost includes Nodes;",
+    }];
+    let rust = [Source {
+        name: "nodes.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> nodes_generated::Nodes<'js> for Payload { fn append(&self, ctx: Ctx<'js>, nodes: Vec<nodes_generated::DOMStringOrNode>) -> Result<()> { Ok(()) } }",
+    }];
+    assert!(compile_contracts(&idl, &rust).is_err());
+}
+
+#[test]
+fn usv_string_operation_argument_generates() {
+    // `USVString` operation arguments lower with the USV conversion.
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { undefined send(USVString data); };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn send(&self, ctx: Ctx<'js>, data: rquickjs::String<'js>) -> Result<()> { Ok(()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("USVString operation argument");
+    assert!(
+        bindings[0].rust.replace(' ', "").contains("usv_string_argument"),
+        "missing USVString argument conversion"
+    );
 }
 
 #[test]

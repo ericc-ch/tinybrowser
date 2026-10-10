@@ -244,8 +244,11 @@ pub(crate) fn reflect_set_long(
 
 /// Write a reflected `unsigned long` attribute: the decimal form of the
 /// converted value becomes the content attribute. Values above
-/// `i32::MAX` write zero instead: the reflection suite (matching Chromium)
-/// reads the default there rather than the wrapped value
+/// `i32::MAX` write zero instead: the reflection suite maps out-of-range
+/// IDL sets to the default on read-back (`reflection.js` unsigned-long
+/// `idlDomExpected`), even though the spec prose says shortest-string.
+/// Chromium follows the prose and fails those subtests; we follow the
+/// suite and pass them
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_set_ulong(
     ctx: &Ctx<'_>,
@@ -257,8 +260,8 @@ pub(crate) fn reflect_set_ulong(
 }
 
 /// Write a reflected `unsigned long` attribute with an IDL default: values
-/// above `i32::MAX` write the default instead of the converted value,
-/// matching the reflection suite's read-back there
+/// above `i32::MAX` write the default instead of the converted value, for
+/// the same suite reason as `reflect_set_ulong`
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_set_ulong_defaulting(
     ctx: &Ctx<'_>,

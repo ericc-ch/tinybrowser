@@ -138,10 +138,15 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
 
 /// Compatibility mode from the doctype
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>,
-/// quirks-mode table): a missing doctype or a non-`html` name means quirks;
-/// matching public/system identifiers select limited quirks; otherwise
-/// (including the XHTML transitional/frameset identifiers *with* a system
-/// identifier) means no quirks.
+/// quirks-mode table, mirrored from html5ever's `doctype_error_and_quirks`
+/// in `third_party/html5ever`): a missing doctype, a non-`html` name, or a
+/// force-quirks token means quirks. Otherwise the public identifier selects
+/// quirks by prefix or exact match, the IBM system identifier selects
+/// quirks, the XHTML frameset/transitional prefixes select limited quirks
+/// regardless of the system identifier, and the HTML 4.01 frameset/
+/// transitional prefixes select quirks without one and limited quirks with
+/// one (an explicitly empty system identifier counts as present).
+/// Everything else means no quirks.
 fn sniff_quirks_mode(input: &str) -> QuirksMode {
     let Some((name, public, system)) = parse_doctype_ids(input) else {
         return QuirksMode::Quirks;
@@ -149,45 +154,119 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
     if !name.eq_ignore_ascii_case("html") {
         return QuirksMode::Quirks;
     }
-    // Public identifiers selecting quirks mode regardless of the system
-    // identifier.
-    const QUIRKS_PUBLIC: &[&str] = &[
-        "-//w3o//dtd w3 html strict 3.0-//en",
+    // Quirks-mode public-identifier prefixes, ASCII case-insensitive
+    // (lowercase here; the public identifier is lowercased below).
+    const QUIRKS_PREFIXES: &[&str] = &[
+        "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
+        "-//as//dtd html 3.0 aswedit + extensions//",
+        "-//ietf//dtd html 2.0 level 1//",
+        "-//ietf//dtd html 2.0 level 2//",
+        "-//ietf//dtd html 2.0 strict level 1//",
+        "-//ietf//dtd html 2.0 strict level 2//",
+        "-//ietf//dtd html 2.0 strict//",
+        "-//ietf//dtd html 2.0//",
+        "-//ietf//dtd html 2.1e//",
+        "-//ietf//dtd html 3.0//",
+        "-//ietf//dtd html 3.2 final//",
+        "-//ietf//dtd html 3.2//",
+        "-//ietf//dtd html 3//",
+        "-//ietf//dtd html level 0//",
+        "-//ietf//dtd html level 1//",
+        "-//ietf//dtd html level 2//",
+        "-//ietf//dtd html level 3//",
+        "-//ietf//dtd html strict level 0//",
+        "-//ietf//dtd html strict level 1//",
+        "-//ietf//dtd html strict level 2//",
+        "-//ietf//dtd html strict level 3//",
+        "-//ietf//dtd html strict//",
+        "-//ietf//dtd html//",
+        "-//metrius//dtd metrius presentational//",
+        "-//microsoft//dtd internet explorer 2.0 html strict//",
+        "-//microsoft//dtd internet explorer 2.0 html//",
+        "-//microsoft//dtd internet explorer 2.0 tables//",
+        "-//microsoft//dtd internet explorer 3.0 html strict//",
+        "-//microsoft//dtd internet explorer 3.0 html//",
+        "-//microsoft//dtd internet explorer 3.0 tables//",
+        "-//netscape comm. corp.//dtd html//",
+        "-//netscape comm. corp.//dtd strict html//",
+        "-//o'reilly and associates//dtd html 2.0//",
+        "-//o'reilly and associates//dtd html extended 1.0//",
+        "-//o'reilly and associates//dtd html extended relaxed 1.0//",
+        "-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//",
+        "-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//",
+        "-//spyglass//dtd html 2.0 extended//",
+        "-//sq//dtd html 2.0 hotmetal + extensions//",
+        "-//sun microsystems corp.//dtd hotjava html//",
+        "-//sun microsystems corp.//dtd hotjava strict html//",
+        "-//w3c//dtd html 3 1995-03-24//",
+        "-//w3c//dtd html 3.2 draft//",
+        "-//w3c//dtd html 3.2 final//",
+        "-//w3c//dtd html 3.2//",
+        "-//w3c//dtd html 3.2s draft//",
+        "-//w3c//dtd html 4.0 frameset//",
+        "-//w3c//dtd html 4.0 transitional//",
+        "-//w3c//dtd html experimental 19960712//",
+        "-//w3c//dtd html experimental 970421//",
+        "-//w3c//dtd w3 html//",
+        "-//w3o//dtd w3 html 3.0//",
+        "-//webtechs//dtd mozilla html 2.0//",
+        "-//webtechs//dtd mozilla html//",
+    ];
+    // Quirks-mode public identifiers matched exactly (ASCII
+    // case-insensitive), not by prefix: `PUBLIC "HTML5"` is standards.
+    const QUIRKS_EXACT: &[&str] = &[
+        "-//w3o//dtd w3 html strict 3.0//en//",
         "-/w3c/dtd html 4.0 transitional/en",
         "html",
     ];
-    // Public identifiers selecting limited quirks when the system
-    // identifier is missing.
-    const LIMITED_PUBLIC: &[&str] = &[
-        "-//w3c//dtd html 4.01 frameset//",
-        "-//w3c//dtd html 4.01 transitional//",
+    // Limited-quirks prefixes regardless of the system identifier.
+    const LIMITED_PREFIXES: &[&str] = &[
         "-//w3c//dtd xhtml 1.0 frameset//",
         "-//w3c//dtd xhtml 1.0 transitional//",
     ];
+    // HTML 4.01 frameset/transitional: quirks without a system identifier,
+    // limited quirks with one.
+    const HTML4_PREFIXES: &[&str] = &[
+        "-//w3c//dtd html 4.01 frameset//",
+        "-//w3c//dtd html 4.01 transitional//",
+    ];
     let public = public.to_ascii_lowercase();
-    if QUIRKS_PUBLIC
+    if QUIRKS_PREFIXES
+        .iter()
+        .any(|prefix| public.starts_with(prefix))
+        || QUIRKS_EXACT.contains(&public.as_str())
+    {
+        return QuirksMode::Quirks;
+    }
+    if system.as_deref().is_some_and(|system| {
+        system.eq_ignore_ascii_case("http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd")
+    }) {
+        return QuirksMode::Quirks;
+    }
+    if LIMITED_PREFIXES
         .iter()
         .any(|prefix| public.starts_with(prefix))
     {
-        return QuirksMode::Quirks;
-    }
-    if system.is_none()
-        && LIMITED_PUBLIC
-            .iter()
-            .any(|prefix| public.starts_with(prefix))
-    {
         return QuirksMode::LimitedQuirks;
     }
-    if system.as_deref() == Some("http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd") {
-        return QuirksMode::Quirks;
+    if HTML4_PREFIXES
+        .iter()
+        .any(|prefix| public.starts_with(prefix))
+    {
+        if system.is_none() {
+            return QuirksMode::Quirks;
+        }
+        return QuirksMode::LimitedQuirks;
     }
     QuirksMode::NoQuirks
 }
 
 /// The doctype name and public/system identifiers from leading markup, if a
-/// complete `<!DOCTYPE ...>` token is present. Whitespace and comments may
-/// precede it; quoted identifiers keep their quotes stripped (`>` is legal
-/// inside them); anything malformed bails to `None` (quirks).
+/// complete `<!DOCTYPE ...>` token is present. Whitespace and closed
+/// comments may precede it; quoted identifiers keep their quotes stripped.
+/// Anything malformed bails to `None` (quirks): a `>` inside a quoted
+/// identifier (abrupt-doctype-identifier), a quoted identifier with no
+/// `PUBLIC`/`SYSTEM` keyword (bogus doctype), or a truncated token.
 fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
     let rest = skip_ignored_prefix(input);
     if rest.len() < 9 || !rest.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype")) {
@@ -227,6 +306,10 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
         system = quoted_string(&mut chars);
     } else if !word.is_empty() {
         return None;
+    } else if matches!(chars.peek(), Some('"') | Some('\'')) {
+        // A quoted identifier with no keyword is a bogus doctype, not an
+        // empty public identifier.
+        return None;
     }
     // The token must terminate: truncated markup is not a doctype.
     if !chars.any(|char| char == '>') {
@@ -235,19 +318,30 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
     Some((name, public, system))
 }
 
-/// Leading whitespace, BOM, and comments, which may precede the doctype
-/// without forcing quirks. An unterminated comment stops the scan so the
-/// doctype check fails.
+/// Leading whitespace, BOM, and closed comments, which may precede the
+/// doctype without forcing quirks. Abruptly-closed comments (`<!-->`,
+/// `<!--->`) and `--!>`-closed comments are closed comments too, so
+/// scanning continues past them; an unterminated comment stops the scan so
+/// the doctype check fails.
 fn skip_ignored_prefix(mut input: &str) -> &str {
     loop {
         let trimmed = input.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\x0c', '\r']);
         let Some(comment) = trimmed.strip_prefix("<!--") else {
             return trimmed;
         };
-        let Some(end) = comment.find("-->") else {
+        if let Some(end) = comment.find("-->") {
+            input = &comment[end + 3..];
+        } else if let Some(end) = comment.find("--!>") {
+            input = &comment[end + 4..];
+        } else if comment.starts_with('>') {
+            // Abruptly-closed empty comment: closed, scanning continues.
+            input = &comment[1..];
+        } else if comment.starts_with("->") {
+            // `<!--->`: the third dash is consumed, `>` abruptly closes.
+            input = &comment[2..];
+        } else {
             return trimmed;
-        };
-        input = &comment[end + 3..];
+        }
     }
 }
 
@@ -267,6 +361,11 @@ fn quoted_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option
         if char == quote {
             return Some(value);
         }
+        // A `>` inside the identifier is an abrupt-doctype-identifier parse
+        // error, which sets force-quirks.
+        if char == '>' {
+            return None;
+        }
         value.push(char);
     }
     None
@@ -284,34 +383,84 @@ mod tests {
         let cases = [
             ("<!DOCTYPE html>", QuirksMode::NoQuirks),
             ("<!doctype html>", QuirksMode::NoQuirks),
-            // XHTML transitional *with* a system identifier is standards.
+            // XHTML transitional/frameset: limited quirks with or without a
+            // system identifier.
             (
                 "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">",
-                QuirksMode::NoQuirks,
+                QuirksMode::LimitedQuirks,
             ),
-            // ...without one it is limited quirks.
             (
                 "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">",
                 QuirksMode::LimitedQuirks,
             ),
             (
-                "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">",
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Frameset//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd\">",
                 QuirksMode::LimitedQuirks,
+            ),
+            // HTML 4.01 transitional/frameset: quirks without a system
+            // identifier, limited quirks with one (even an empty one, which
+            // counts as present).
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">",
+                QuirksMode::Quirks,
             ),
             (
                 "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">",
-                QuirksMode::NoQuirks,
+                QuirksMode::LimitedQuirks,
             ),
-            ("<!DOCTYPE html PUBLIC \"HTML\">", QuirksMode::Quirks),
             (
-                "<!DOCTYPE html PUBLIC \"-//W3O//DTD W3 HTML Strict 3.0-//EN\">",
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Frameset//EN\" \"\">",
+                QuirksMode::LimitedQuirks,
+            ),
+            // Exact-match quirks identifiers: no prefix matching, so `HTML5`
+            // stays standards.
+            ("<!DOCTYPE html PUBLIC \"HTML\">", QuirksMode::Quirks),
+            ("<!DOCTYPE html PUBLIC \"HTML5\">", QuirksMode::NoQuirks),
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3O//DTD W3 HTML Strict 3.0//EN//\">",
                 QuirksMode::Quirks,
             ),
+            // Prefix quirks identifiers, ASCII case-insensitive.
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\">",
+                QuirksMode::Quirks,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \"-//w3c//dtd html 4.0 transitional//en\">",
+                QuirksMode::Quirks,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \"-//IETF//DTD HTML 2.0//EN\" \"anything\">",
+                QuirksMode::Quirks,
+            ),
+            // The IBM system identifier, ASCII case-insensitive.
             (
                 "<!DOCTYPE html SYSTEM \"http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd\">",
                 QuirksMode::Quirks,
             ),
+            (
+                "<!DOCTYPE html SYSTEM \"HTTP://WWW.IBM.COM/DATA/DTD/V11/IBMXHTML1-TRANSITIONAL.DTD\">",
+                QuirksMode::Quirks,
+            ),
             ("<!DOCTYPE svg>", QuirksMode::Quirks),
+            // Tokenizer-level force-quirks: `>` inside a quoted identifier,
+            // a quoted identifier with no keyword, comments before the
+            // doctype (including abruptly-closed ones).
+            (
+                "<!DOCTYPE html PUBLIC \"foo>bar\">",
+                QuirksMode::Quirks,
+            ),
+            ("<!DOCTYPE html \"foo\">", QuirksMode::Quirks),
+            (
+                "<!-- comment --><!DOCTYPE html>",
+                QuirksMode::NoQuirks,
+            ),
+            ("<!--><!DOCTYPE html>", QuirksMode::NoQuirks),
+            ("<!---><!DOCTYPE html>", QuirksMode::NoQuirks),
+            (
+                "<!-- x --!><!DOCTYPE html>",
+                QuirksMode::NoQuirks,
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(sniff_quirks_mode(input), expected, "{input}");

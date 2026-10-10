@@ -415,7 +415,11 @@ fn lower(
     implemented: &BTreeSet<String>,
 ) -> Result<model::Interface, Error> {
     // Mixins have no interface object; their members install on every
-    // including interface's prototype, derived from the IDL includes.
+    // *implemented* including interface's prototype, derived from the IDL
+    // includes. Included interfaces without an implementation have no
+    // global to install onto, so they are excluded (a JS-only includer
+    // added later needs an implementation to become an install target —
+    // it is silently skipped until then, by design).
     if let Ok(mixin) = database.mixin(&implementation.interface) {
         return lower_mixin(database, implementation, kind, &mixin, implemented);
     }
@@ -1316,7 +1320,11 @@ fn lower_argument(
     match (&type_, argument.optional.is_some(), &argument.default) {
         (_, false, None)
         | (
-            ReturnType::String | ReturnType::Boolean | ReturnType::Union(_, _) | ReturnType::Any,
+            ReturnType::String
+            | ReturnType::UsvString
+            | ReturnType::Boolean
+            | ReturnType::Union(_, _)
+            | ReturnType::Any,
             true,
             None,
         ) => {}
@@ -1412,8 +1420,12 @@ fn argument_parameter(
         ReturnType::NullableNode | ReturnType::NullableDocumentType => {
             quote! { Option<host::NodeReference> }
         }
-        ReturnType::String if optional => quote! { Option<rquickjs::String<'js>> },
-        ReturnType::String => quote! { rquickjs::String<'js> },
+        // `USVString` arrives as a converted string; only the argument
+        // conversion differs.
+        ReturnType::String | ReturnType::UsvString if optional => {
+            quote! { Option<rquickjs::String<'js>> }
+        }
+        ReturnType::String | ReturnType::UsvString => quote! { rquickjs::String<'js> },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Callback => quote! { rquickjs::Function<'js> },
         // A platform object or `any` argument arrives as the original value;
@@ -1555,6 +1567,45 @@ fn union_result(
     Ok((kind, result))
 }
 
+/// Whether a reflected member has a shape that must stay absent rather than
+/// fall through to method installation: `SameObject`/`PutForwards` members
+/// and non-stringifier special attributes lose their semantics as plain
+/// methods.
+fn is_special_reflect_shape(member: &weedle::interface::AttributeInterfaceMember<'_>) -> bool {
+    has_attribute(member.attributes.as_ref(), "SameObject")
+        || has_attribute(member.attributes.as_ref(), "PutForwards")
+        || member.modifier.as_ref().is_some_and(|modifier| {
+            !matches!(
+                modifier,
+                weedle::interface::StringifierOrInheritOrStatic::Stringifier(_)
+            )
+        })
+}
+
+/// Rejects `[LegacyNullToEmptyString]` on a reflected member whose type is
+/// not plain `DOMString`: anything else reaching the method path is invalid
+/// IDL (like operation arguments). Auto-generated string reflection handled
+/// its own flag before this runs.
+fn reject_legacy_non_string_reflect(
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+) -> Result<(), Error> {
+    let legacy = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
+    if legacy
+        && reflect_content(member.attributes.as_ref(), member.identifier.0).is_some()
+        && !matches!(
+            &member.type_.type_,
+            Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none()
+        )
+    {
+        return Err(Error(format!(
+            "{}: LegacyNullToEmptyString requires DOMString",
+            member.identifier.0
+        )));
+    }
+    Ok(())
+}
+
 fn lower_attribute(
     database: &Database<'_>,
     member: &weedle::interface::AttributeInterfaceMember<'_>,
@@ -1562,8 +1613,8 @@ fn lower_attribute(
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
     // Reflected attributes install without implementation methods, so
     // resolve them before the implemented-member checks below. Only shapes
-    // the generator auto-generates (plain string/boolean) take this path;
-    // anything else falls through to the normal method path when
+    // the generator auto-generates (plain string/boolean/`USVString`) take
+    // this path; anything else falls through to the normal method path when
     // implemented, so hand-written getters encode the spec algorithm. Other
     // members keep skip-if-unimplemented semantics.
     if let Some(content) = reflect_content(member.attributes.as_ref(), member.identifier.0)
@@ -1573,18 +1624,14 @@ fn lower_attribute(
     }
     // Special shapes stay absent rather than falling through: a plain
     // method installation would lose `SameObject`/`PutForwards` semantics.
-    if reflect_content(member.attributes.as_ref(), member.identifier.0).is_some()
-        && (has_attribute(member.attributes.as_ref(), "SameObject")
-            || has_attribute(member.attributes.as_ref(), "PutForwards")
-            || member.modifier.as_ref().is_some_and(|modifier| {
-                !matches!(
-                    modifier,
-                    weedle::interface::StringifierOrInheritOrStatic::Stringifier(_)
-                )
-            }))
+    // This covers both `[Reflect]` and `[ReflectURL]` shapes.
+    if is_special_reflect_shape(member)
+        && (reflect_content(member.attributes.as_ref(), member.identifier.0).is_some()
+            || reflect_url_content(member.attributes.as_ref(), member.identifier.0).is_some())
     {
         return Ok(None);
     }
+    reject_legacy_non_string_reflect(member)?;
     // `ReflectSetter` reflects on set while the getter stays custom: the
     // implementation provides the getter, the generator owns the setter.
     if let Some(content) = reflect_setter_content(member.attributes.as_ref(), member.identifier.0) {
@@ -1684,6 +1731,10 @@ fn attribute_result(type_: &ReturnType) -> Result<TokenStream, Error> {
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedShort => quote! { u16 },
+        // Plain-method `unsigned long` getters answer `usize` (they convert
+        // fallibly from the parsed `u32`, saturating past the address space),
+        // while `[ReflectSetter]` getters answer the converted `u32`
+        // directly; the setter conversion is identical in both paths.
         ReturnType::UnsignedLong => quote! { usize },
         ReturnType::Long => quote! { i32 },
         ReturnType::NullableUnsignedLong => quote! { Option<u32> },
@@ -1755,8 +1806,10 @@ fn put_forwards_target<'a>(attributes: Option<&ExtendedAttributeList<'a>>) -> Op
         })
 }
 
-/// The content attribute a `[ReflectURL]` member mirrors: the lowercase
-/// IDL name. Parameterized forms stay unsupported.
+/// The content attribute a `[ReflectURL]` member mirrors: the `ReflectURL`
+/// value or the lowercase IDL name. Only `USVString` is auto-generated;
+/// other shapes (like `object.codeBase`, a `DOMString`) fall through to
+/// hand implementation in `lower_attribute`.
 fn reflect_url_content(
     attributes: Option<&ExtendedAttributeList<'_>>,
     idl_name: &str,
@@ -1775,8 +1828,8 @@ fn reflect_url_content(
 
 /// The content attribute a `[Reflect]` member mirrors: the `Reflect` value
 /// or the lowercase IDL name, following Chromium's key derivation.
-/// `ReflectURL`, `ReflectOnly`, and the other parameterized forms need their
-/// own conversion support first.
+/// Numeric shapes are not auto-generated (they fall through to hand-written
+/// methods); `ReflectURL` has its own lowering below.
 fn reflect_content(
     attributes: Option<&ExtendedAttributeList<'_>>,
     idl_name: &str,
@@ -1852,6 +1905,7 @@ fn lower_reflect_setter_attribute(
         return Err(Error("reflect setters require a writable attribute".into()));
     }
     validate_argument_attributes(member.type_.attributes.as_ref())?;
+    validate_attribute_attributes(member.attributes.as_ref())?;
     if has_attribute(member.attributes.as_ref(), "SameObject")
         || has_attribute(member.attributes.as_ref(), "PutForwards")
     {
@@ -1886,7 +1940,18 @@ fn lower_reflect_setter_attribute(
         )));
     }
     let getter = format_ident!("{getter_name}");
-    let signature = reflect_setter_signature(&getter, &type_)?;
+    let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
+    // Like operation arguments, `[LegacyNullToEmptyString]` requires
+    // `DOMString`: on numerics it would otherwise be silently dropped by
+    // the generated setter.
+    if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
+        return Err(Error(format!(
+            "{}: LegacyNullToEmptyString requires DOMString",
+            member.identifier.0
+        )));
+    }
+    let signature = reflect_setter_signature(member.identifier.0, &getter, &type_)?;
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
         rust: getter,
@@ -1895,8 +1960,7 @@ fn lower_reflect_setter_attribute(
         setter: Some(model::Setter::Reflect {
             content: content.into(),
         }),
-        legacy_null_to_empty: has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-            || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString"),
+        legacy_null_to_empty,
         reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
     };
     Ok(Some((attribute, signature)))
@@ -1923,6 +1987,7 @@ fn check_method_signature(
 /// hand-written while the setter is generated, so each supported type
 /// names its own return.
 fn reflect_setter_signature(
+    attribute: &str,
     getter: &proc_macro2::Ident,
     type_: &ReturnType,
 ) -> Result<proc_macro2::TokenStream, Error> {
@@ -1933,9 +1998,9 @@ fn reflect_setter_signature(
         ReturnType::UnsignedLong => quote! { u32 },
         ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
         _ => {
-            return Err(Error(
-                "validated reflect setter mapping has no signature".into(),
-            ));
+            return Err(Error(format!(
+                "{attribute}: reflect setter type has no getter signature"
+            )));
         }
     };
     Ok(quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#returns>; })
@@ -2000,11 +2065,14 @@ fn lower_reflect_attribute(
     // to the empty string. On booleans it is invalid IDL.
     let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
         || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
-    // Only plain string and boolean reflection so far, plus `USVString`
-    // under a plain `[Reflect]` (which reads the raw content attribute
-    // exactly like `DOMString`: `a.ping`, `img.srcset`, while the setter
-    // argument still converts as USV); the type needs no database lookup,
-    // keeping reflected members independent of typedefs.
+    // Only plain string, boolean, and `USVString` reflection so far.
+    // `USVString` under a plain `[Reflect]` reads the raw content attribute
+    // exactly like `DOMString` (`a.ping`, `img.srcset`): stored content is
+    // a Rust `String`, which cannot hold lone surrogates, so no scalar
+    // replacement can be hiding in it; only the setter argument still
+    // converts as USV (<https://webidl.spec.whatwg.org/#es-USVString>).
+    // The type needs no database lookup, keeping reflected members
+    // independent of typedefs.
     let type_ = match &member.type_.type_ {
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
             ReturnType::String
@@ -2023,7 +2091,7 @@ fn lower_reflect_attribute(
         Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
             if legacy_null_to_empty {
                 return Err(Error(format!(
-                    "{}: LegacyNullToEmptyString on a boolean is invalid",
+                    "{}: LegacyNullToEmptyString requires DOMString",
                     member.identifier.0
                 )));
             }
@@ -2066,7 +2134,8 @@ fn lower_reflect_url_attribute(
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
     // URL reflection resolves a string against the document base; only
-    // `USVString` carries it in-tree. Anything else falls through.
+    // `USVString` is auto-generated. Anything else falls through to hand
+    // implementation (like `object.codeBase`, a `DOMString`).
     let auto = matches!(
         &member.type_.type_,
         Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none()
@@ -2078,7 +2147,7 @@ fn lower_reflect_url_attribute(
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
     if implemented.contains_key(&getter_name) || implemented.contains_key(&setter_name) {
         return Err(Error(format!(
-            "{}: reflected attributes are generated, not implemented",
+            "{}: URL-reflected attributes are generated, not implemented",
             member.identifier.0
         )));
     }
@@ -2126,7 +2195,9 @@ fn lower_reflect_url_attribute(
 /// `emit`'s setter conversions.
 fn setter_parameter(type_: &ReturnType) -> Result<TokenStream, Error> {
     Ok(match type_ {
-        ReturnType::String => quote! { rquickjs::String<'js> },
+        // `USVString` arrives as a converted string; only the argument
+        // conversion differs (see `setter_value_conversion`).
+        ReturnType::String | ReturnType::UsvString => quote! { rquickjs::String<'js> },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedLong => quote! { u32 },
@@ -2696,8 +2767,14 @@ fn validate_attribute_attributes(
                 }
                 // Numeric reflection parameters: hand-written getters encode
                 // the spec algorithm, so the normal method path documents
-                // them as consumed here. Only the standardized names are
-                // accepted, so a typo still fails the build.
+                // them as consumed here. Only the standardized names and
+                // shapes are accepted, so a typo still fails the build.
+                // Note a weedle4 quirk: `Identifier` accepts leading digits
+                // (`third_party/weedle4/src/common.rs`), so integer defaults
+                // like `ReflectDefault=20` parse as `Ident` with rhs `"20"`,
+                // while `ReflectDefault=1.0` parses as `Decimal`. The value
+                // checks below depend on this split: do not "simplify" the
+                // `Ident` arm without moving integer-default validation.
                 // `[PutForwards]` lowers to a generated forwarding setter.
                 // `[LegacyUnforgeable]` shapes the instance property in the
                 // interface's own shim, as the legacy path also accepts it;
@@ -2707,20 +2784,37 @@ fn validate_attribute_attributes(
                         item.0.0,
                         "ReflectNonNegative" | "ReflectPositive" | "ReflectPositiveWithFallback"
                     ) => {}
-                ExtendedAttribute::Ident(item)
-                    if item.lhs_identifier.0 == "PutForwards"
-                        || matches!(
-                            item.lhs_identifier.0,
-                            "ReflectDefault"
-                                | "ReflectNonNegative"
-                                | "ReflectPositive"
-                                | "ReflectPositiveWithFallback"
-                        ) => {}
+                // `[PutForwards]` takes an identifier naming the target.
+                ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "PutForwards" => {}
+                // An integer reflection default, e.g. `ReflectDefault=20`.
+                ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "ReflectDefault" => {
+                    if item.rhs.0.parse::<i64>().is_err() {
+                        return Err(Error(format!(
+                            "ReflectDefault needs an integer default, got `{}`",
+                            item.rhs.0
+                        )));
+                    }
+                }
                 ExtendedAttribute::Decimal(item)
                     if matches!(item.lhs_identifier.0, "ReflectDefault") => {}
-                ExtendedAttribute::ArgList(item) if item.identifier.0 == "ReflectRange" => {}
-                ExtendedAttribute::IdentList(item)
-                    if matches!(item.identifier.0, "ReflectRange") => {}
+                ExtendedAttribute::ArgList(item) if item.identifier.0 == "ReflectRange" => {
+                    if item.args.body.list.len() != 2 {
+                        return Err(Error(format!(
+                            "ReflectRange needs exactly two bounds, got {}",
+                            item.args.body.list.len()
+                        )));
+                    }
+                }
+                ExtendedAttribute::IdentList(item) if item.identifier.0 == "ReflectRange" => {
+                    let bounds: Vec<&str> =
+                        item.list.body.list.iter().map(|bound| bound.0).collect();
+                    if bounds.len() != 2 || bounds.iter().any(|bound| bound.parse::<i64>().is_err())
+                    {
+                        return Err(Error(format!(
+                            "ReflectRange needs two integer bounds, got `{item:?}`"
+                        )));
+                    }
+                }
                 ExtendedAttribute::String(item) if item.lhs_identifier.0 == "Reflect" => {}
                 _ => {
                     return Err(Error(format!(

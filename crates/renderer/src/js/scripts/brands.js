@@ -308,6 +308,15 @@
   // <https://html.spec.whatwg.org/multipage/input.html#dom-input-type>,
   // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-button-type>).
   const asciiLower = value => String(value).replace(/[A-Z]/g, c => c.toLowerCase());
+  // Web IDL `DOMString` conversion: `ToString`, which throws on Symbols
+  // (plain `String()` would stringify them instead)
+  // (<https://webidl.spec.whatwg.org/#es-DOMString>).
+  const toDOMString = value => {
+    if (typeof value === 'symbol') {
+      throw new TypeError('Cannot convert a Symbol value to a string');
+    }
+    return String(value);
+  };
   function reflectType(keywords, fallback) {
     return {
       get: function() {
@@ -316,7 +325,8 @@
         const lowered = asciiLower(value);
         return keywords.has(lowered) ? lowered : fallback;
       },
-      set: function(value) { this.setAttribute('type', String(value)); },
+      // The setter reflects verbatim: no lowercasing, only conversion.
+      set: function(value) { this.setAttribute('type', toDOMString(value)); },
       enumerable: true,
       configurable: true,
     };
@@ -337,7 +347,7 @@
       // The `type` attribute change runs the input type-change steps in the
       // DOM, whatever the mutation path
       // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
-      this.setAttribute('type', String(value));
+      this.setAttribute('type', toDOMString(value));
     },
     enumerable: true,
     configurable: true,
@@ -397,7 +407,7 @@
       let converted;
       if (value === null || value === undefined) converted = null;
       else if (typeof value === 'boolean' || typeof value === 'number') converted = value;
-      else converted = String(value);
+      else converted = toDOMString(value);
       if (typeof converted === 'string' && asciiLower(converted) === 'until-found') {
         this.setAttribute('hidden', 'until-found');
       } else if (

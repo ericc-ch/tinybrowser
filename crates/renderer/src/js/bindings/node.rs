@@ -6,7 +6,7 @@ use super::{
     WebIdlUnsignedLong, adopt_across_documents, adopt_into_document, ancestor_chain,
     attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
     blur_node, character_data, character_data_offset, child_value, clone_document,
-    clone_within_document, collection_ids, convert_union_nodes_into_node, deref_weak,
+    clone_within_document, copy_nonce_subtree, collection_ids, convert_union_nodes_into_node, deref_weak,
     descendant_text, document_base_url_string, document_is_html, document_is_html_content,
     document_url_string, dom_string, drain_mutation_journal, element_at_point, element_box,
     element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
@@ -3548,8 +3548,10 @@ fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
 /// Splits a rendered-text setter value into text and `br` nodes: `\r\n`
 /// and lone `\r` become `\n`, then every newline becomes a `br` with no
 /// empty text around it. When `pad_empty` and the value is all-empty, yields
-/// one empty text node (outerText must create a node even for `""`;
-/// innerText asserts no empty children instead).
+/// one empty text node: `outerText = ""` removes the element but the
+/// sibling-merge step expects a node to merge (proven by
+/// `outertext-setter.html`, fully passing); `innerText = ""` replaces with
+/// nothing.
 fn rendered_text_fragment(
     parsed: &mut crate::Parsed,
     value: &str,
@@ -3591,7 +3593,8 @@ fn rendered_text_fragment(
 
 /// Current viewport offset for `id`'s document.
 /// <https://drafts.csswg.org/cssom-view/#scrolling-viewport>
-fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {    let world = world_for_node(ctx, id)?;
+fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {
+    let world = world_for_node(ctx, id)?;
     let world = world.borrow();
     let Some(parsed) = world.document(id) else {
         return Ok((0.0, 0.0));
@@ -4792,18 +4795,15 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     #[qjs(skip)]
     fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
-        if !has_content_attr(&ctx, self.handle.0, "formmethod") {
-            // Absent reads empty; only a present-but-unknown value falls back
-            // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-            return Ok(String::new());
-        }
-        let raw = attribute_value(&ctx, self.handle.0, "formmethod")?;
-        Ok(match raw.trim().to_ascii_lowercase().as_str() {
-            "post" => "post",
-            "dialog" => "dialog",
-            _ => "get",
-        }
-        .to_owned())
+        // Enumerated without whitespace stripping: only an exact ASCII
+        // case-insensitive keyword matches
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
+        Ok(reflect_enum(
+            content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
+            &["post", "dialog"],
+            "",
+            "get",
+        ))
     }
 
     #[qjs(skip)]
@@ -4814,12 +4814,14 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     #[qjs(skip)]
     fn form_enctype(&self, ctx: Ctx<'_>) -> Result<String> {
-        if !has_content_attr(&ctx, self.handle.0, "formenctype") {
-            // Absent reads empty, like `formMethod`
-            // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-            return Ok(String::new());
-        }
-        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "formenctype")?).to_owned())
+        // Absent reads empty, like `formMethod`; no whitespace stripping
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
+        Ok(reflect_enum(
+            content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
+            &["multipart/form-data", "text/plain"],
+            "",
+            "application/x-www-form-urlencoded",
+        ))
     }
 
     #[qjs(skip)]
@@ -5640,8 +5642,8 @@ impl JsNode {
                 }
             });
             if let Some(previous) = previous
-                && is_text_node(&parsed.document.base, previous.node)
-                && is_text_node(&parsed.document.base, first.node)
+                && is_mergeable_text_node(&parsed.document.base, previous.node)
+                && is_mergeable_text_node(&parsed.document.base, first.node)
             {
                 let mut data =
                     String::from(parsed.document.character_data(previous.node));
@@ -5661,8 +5663,8 @@ impl JsNode {
                 node,
             });
             if let Some(next) = next
-                && is_text_node(&parsed.document.base, next.node)
-                && is_text_node(&parsed.document.base, last.node)
+                && is_mergeable_text_node(&parsed.document.base, next.node)
+                && is_mergeable_text_node(&parsed.document.base, last.node)
             {
                 let mut data = String::from(parsed.document.character_data(last.node));
                 data.push_str(&String::from(parsed.document.character_data(next.node)));
@@ -5680,7 +5682,8 @@ impl JsNode {
     /// them (an all-empty value yields one empty text node)
     /// (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
     #[qjs(set, rename = "innerText")]
-    fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {        let html = world(&ctx)?
+    fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let html = world(&ctx)?
             .borrow()
             .document(self.handle.0)
             .is_some_and(|parsed| {
@@ -6986,6 +6989,9 @@ impl JsNode {
                 .map_err(|err| throw_dom_error(&ctx, err))?;
             drop(parsed);
             drop(world);
+            // Cloning copies the cryptographic nonce slots into the fresh
+            // subtree (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes> cloning steps).
+            copy_nonce_subtree(&owner, self.handle.0, clone);
             clone
         } else {
             let world = world_rc.borrow();
@@ -6993,8 +6999,14 @@ impl JsNode {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let store = parsed.id;
-            clone_within_document(&mut parsed.document, store, self.handle.0, deep)
-                .map_err(|err| throw_dom_error(&ctx, err))?
+            let clone = clone_within_document(&mut parsed.document, store, self.handle.0, deep)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+            drop(parsed);
+            drop(world);
+            // Cloning copies the cryptographic nonce slots into the fresh
+            // subtree (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes> cloning steps).
+            copy_nonce_subtree(&world_rc, self.handle.0, clone);
+            clone
         };
         wrap_node(&ctx, clone)
     }
@@ -7954,24 +7966,14 @@ impl<'js> document_generated::Document<'js> for JsNode {
     // `document.dir` reflects the `dir` attribute of the document element
     // (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir>).
     fn get_dir(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        // Shared borrows nest: `content_attr` borrows the same world.
         let owner = world_for_node(ctx, self.handle.0)?;
         let value = owner
             .borrow()
             .document(self.handle.0)
             .and_then(|parsed| document_first_child(&parsed, is_element_data))
-            .and_then(|element| {
-                content_attr(ctx, element, "dir").map(|value| match value
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "ltr" => "ltr",
-                    "rtl" => "rtl",
-                    "auto" => "auto",
-                    _ => "",
-                })
-            })
-            .unwrap_or("");
-        rquickjs::String::from_str(ctx.clone(), value)
+            .and_then(|element| content_attr(ctx, element, "dir"));
+        rquickjs::String::from_str(ctx.clone(), reflect_dir(value.as_deref()))
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir
@@ -8846,11 +8848,6 @@ fn content_attr(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Option<String> {
     })
 }
 
-/// Whether `id` carries the content attribute `name`.
-fn has_content_attr(ctx: &Ctx<'_>, id: NodeId, name: &str) -> bool {
-    content_attr(ctx, id, name).is_some()
-}
-
 /// Whether `data` is an element node, for [`document_first_child`] searches.
 fn is_element_data(data: &NodeData) -> bool {
     matches!(data, NodeData::Element(_))
@@ -8972,10 +8969,50 @@ fn reflect_limited_double(raw: Option<&str>, default: f64) -> f64 {
     }
 }
 
-/// The `tabindex` default for one element: 0 for the locals focusable
-/// without an attribute, -1 otherwise. Connection and disabled state do
-/// not move the IDL default (a detached `button` still reads 0)
-/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex>).
+/// Whether `node` is the first `summary` element child of a `details`
+/// parent: only that one is focusable
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
+fn is_first_summary_child(
+    base: &blitz_dom::BaseDocument,
+    parent: BlitzId,
+    node: BlitzId,
+) -> bool {
+    if !crate::js::world::is_html_tag(
+        base.get_node(parent).map(|tree| &tree.data),
+        "details",
+    ) {
+        return false;
+    }
+    base.get_node(parent).is_some_and(|parent| {
+        parent.children.iter().find_map(|child| {
+            base.get_node(*child).and_then(|tree| {
+                tree.data.downcast_element().and_then(|element| {
+                    (element.name.ns == html_namespace()
+                        && element.name.local.as_ref() == "summary")
+                        .then_some(*child)
+                })
+            })
+        }) == Some(node)
+    })
+}
+
+/// One `dir` content-attribute value mapped to its IDL reading: an exact
+/// ASCII case-insensitive keyword match, else the empty string
+/// (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
+fn reflect_dir(raw: Option<&str>) -> &'static str {
+    match raw.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("ltr") => "ltr",
+        Some("rtl") => "rtl",
+        Some("auto") => "auto",
+        _ => "",
+    }
+}
+/// controls, links, media with controls, editing hosts, and the first
+/// `summary` of a `details`), -1 otherwise. Connection and disabled state
+/// do not move the IDL default (a detached `button` still reads 0; verified
+/// live against the WebDriver build, which has no layout)
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex>,
+/// <https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
 fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
     let Some(tree) = base.get_node(node) else {
         return -1;
@@ -8985,6 +9022,24 @@ fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
     };
     if element.name.ns != html_namespace() {
         return -1;
+    }
+    // Editing hosts are focusable: `contenteditable` in the True or
+    // Plaintext-Only state (empty, `true`, or `plaintext-only`, ASCII
+    // case-insensitive).
+    if crate::js::world::attr(base, node, "contenteditable").is_some_and(|state| {
+        matches!(
+            state.to_ascii_lowercase().as_str(),
+            "" | "true" | "plaintext-only"
+        )
+    }) {
+        return 0;
+    }
+    // The first `summary` child of a `details` is focusable.
+    if element.name.local.as_ref() == "summary"
+        && let Some(parent) = tree.parent
+        && is_first_summary_child(base, parent, node)
+    {
+        return 0;
     }
     match element.name.local.as_ref() {
         "input" => {
@@ -9037,22 +9092,8 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
     // as the empty string
     // (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
     fn get_dir(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let owner = world_for_node(ctx, self.handle.0)?;
-        let direction = owner
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| {
-                crate::js::world::attr(&parsed.document.base, self.handle.0.node, "dir")
-                    .map(str::to_owned)
-            })
-            .map(|value| match value.to_ascii_lowercase().as_str() {
-                "ltr" => "ltr",
-                "rtl" => "rtl",
-                "auto" => "auto",
-                _ => "",
-            })
-            .unwrap_or("");
-        rquickjs::String::from_str(ctx.clone(), direction)
+        let raw = content_attr(ctx, self.handle.0, "dir");
+        rquickjs::String::from_str(ctx.clone(), reflect_dir(raw.as_deref()))
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute
@@ -9970,6 +10011,7 @@ fn set_referrer_policy(
     id: NodeId,
     value: rquickjs::String<'_>,
 ) -> Result<()> {
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     set_attribute_sync(ctx, id, "referrerpolicy", &value.to_string()?)
 }
 
@@ -10005,6 +10047,7 @@ fn set_cross_origin(
     id: NodeId,
     value: Option<rquickjs::String<'_>>,
 ) -> Result<()> {
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-crossorigin
     match value {
         Some(value) => set_attribute_sync(ctx, id, "crossorigin", &value.to_string()?),
         None => remove_attribute_sync(ctx, id, "", "crossorigin", false),
@@ -10771,13 +10814,13 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
     fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let raw = attribute_value(ctx, self.handle.0, "method")?;
-        let method = match raw.trim().to_ascii_lowercase().as_str() {
-            "post" => "post",
-            "dialog" => "dialog",
-            _ => "get",
-        };
-        rquickjs::String::from_str(ctx.clone(), method)
+        let method = reflect_enum(
+            content_attr(ctx, self.handle.0, "method").as_deref(),
+            &["post", "dialog"],
+            "get",
+            "get",
+        );
+        rquickjs::String::from_str(ctx.clone(), &method)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
@@ -10791,8 +10834,13 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
     fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let raw = attribute_value(ctx, self.handle.0, "enctype")?;
-        rquickjs::String::from_str(ctx.clone(), encoding_keyword(&raw))
+        let enctype = reflect_enum(
+            content_attr(ctx, self.handle.0, "enctype").as_deref(),
+            &["multipart/form-data", "text/plain"],
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded",
+        );
+        rquickjs::String::from_str(ctx.clone(), &enctype)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
@@ -11204,7 +11252,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
 
     fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
         // Out-of-range values write the default rather than the raw value
-        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
         let value = if value > 2147483647 { 300 } else { value };
         set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
     }
@@ -11219,7 +11267,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
 
     fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
         // Out-of-range values write the default rather than the raw value
-        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height>).
         let value = if value > 2147483647 { 150 } else { value };
         set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())
     }
@@ -11445,9 +11493,11 @@ impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
     // `codeBase` resolves against the document base URL
     // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-codebase>).
     fn get_code_base(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        // `DOMString` preserves code units exactly: convert through UTF-16
+        // rather than lossy UTF-8.
         let resolved: crate::dom_string::DomString =
             host::reflect_url_string(ctx, self.handle.0, "codebase")?;
-        rquickjs::String::from_str(ctx.clone(), &resolved.to_string_lossy())
+        rquickjs::String::from_utf16(ctx.clone(), &resolved.units())
     }
 
     // https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-codebase
@@ -11976,6 +12026,16 @@ fn whole_text(ctx: &Ctx<'_>, id: NodeId) -> Result<DomString> {
         .unwrap_or_default())
 }
 
+/// Whether `id` is a `Text` node strictly (not CDATA): the outerText merge
+/// steps only merge `Text`
+/// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
+fn is_mergeable_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
+    matches!(
+        base.get_node(id).map(|node| &node.data),
+        Some(NodeData::Text(_))
+    )
+}
+
 /// Whether `id` is a text node for `wholeText`: `Text` or `CDATASection`,
 /// both in the contiguous run
 /// (<https://dom.spec.whatwg.org/#contiguous-text-nodes>).
@@ -12014,17 +12074,5 @@ fn direction_code(direction: &str) -> u8 {
         "forward" => 1,
         "backward" => 2,
         _ => 0,
-    }
-}
-
-/// The form `enctype` keyword for a raw attribute value: the three known
-/// keywords, case-insensitively, with the urlencoded default for a missing or
-/// invalid value
-/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
-fn encoding_keyword(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "multipart/form-data" => "multipart/form-data",
-        "text/plain" => "text/plain",
-        _ => "application/x-www-form-urlencoded",
     }
 }
