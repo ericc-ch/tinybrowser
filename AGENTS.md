@@ -8,7 +8,7 @@ In `docs/progress.md`, replace the latest binary size, the latest total, and sco
 ## Testing and conformance
 
 - Cargo tests cover tinybrowser-specific behavior only (`cargo test --workspace`).
-- Web-platform conformance is WPT (`tools/wpt/run`, `tools/wpt/run --score`, `rerun`).
+- Web-platform conformance is WPT (`tools/wpt/run`, `tools/wpt/run --score`, `tools/wpt/rerun`).
 - Extra runners: Blink CDP (`tools/cdp-tests/run`), Playwright (`tools/playwright/run`), test262 (`tools/intl/test262`).
 - Keep the WPT feedback loop fast: run the smallest slice that answers the question (single files or dirs, never suites); rerun only failures with `rerun`.
 - No suite or slice runs without being asked. Anything longer than minutes needs explicit approval.

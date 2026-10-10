@@ -41,8 +41,10 @@ __wptrunner__ = {
         "test262": "TinyBrowserTestharnessExecutor",
         # Red foundations: registered so the tests run and fail honestly
         # instead of reporting an unsupported test type and running nothing.
-        # wdspec needs pytest plus element/frame/actions surface; aamtest
+        # wdspec needs pytest (not yet vendored into the venv, so results are
+        # currently infra ERROR) plus element/frame/actions surface; aamtest
         # needs platform accessibility hooks. BiDi work is deferred.
+        # End-to-end probe pending an approved run.
         "wdspec": "PytestExecutor",
         "aamtest": "PytestExecutor",
     },

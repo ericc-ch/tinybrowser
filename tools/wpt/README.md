@@ -74,7 +74,7 @@ In `docs/progress.md`, replace the latest total and scored groups only.
 | crashtest | Page must load and settle without killing the renderer. |
 | reftest | Screenshot comparison through the WebDriver screenshot route; the engine has no chrome, so the outer window equals the inner 800x600 viewport. |
 | test262 | Served as generated `.test262.html` wrappers through the testharness executor. |
-| wdspec, aamtest | Registered as red foundations (pytest executors); they fail honestly until the engine grows the needed surface. |
+| wdspec, aamtest | Registered as red foundations (pytest executors). pytest is not vendored into the venv yet, so results are infra ERROR until then and until the engine grows the needed surface; end-to-end probe pending an approved run. |
 | HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. Actions/bless/permissions are engine-red foundations; BiDi later. |
 | Parallel processes | CPU count unless the command sets `--processes`, `--fully-parallel`, or `-f`. Each process gets its own browser and ports. `--fully-parallel`/`-f` is separate: every test is its own group, so the browser restarts per test. The count actually used is echoed as `wpt: processes N`. |

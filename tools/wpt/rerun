@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Re-run only the attention set from a previous wptreport.
-# The work lives in cli.py; see `tools/wpt/rerun`.
+# The work lives in cli.py (`rerun` subcommand).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 

@@ -3,7 +3,6 @@
 
 Upstream WPT (`third_party/wpt`, pristine submodule) owns serving,
 scheduling, driving, and reporting. This file owns three phases around it:
-
 * `run`    — build the binary, ready the shared venv + manifest, exec wpt.
 * `score`  — run a set, then print one row per directory + attention list.
 * `rerun`  — re-run only the attention set from a saved wptreport.
@@ -11,8 +10,9 @@ scheduling, driving, and reporting. This file owns three phases around it:
 
 `tinybrowser_wpt.py` stays separate: upstream imports it as the
 `wptrunner.products` entry-point, so it must remain a tiny importable module.
-Everything else that was `run` (bash), `launch.py`, `score.py`, `retest.py`
-lives here, sharing one argument grammar and one stamp/lock helper set.
+The run orchestration, in-venv patching, scoring, and rerun selection that
+used to be split across shell and Python files live here, sharing one
+argument grammar and one stamp/lock helper set.
 
 Grammar (all subcommands): test paths and our flags come first; a literal
 `--` starts verbatim upstream flags. For convenience an upstream flag before
@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -65,7 +66,7 @@ def eprint(*parts: object) -> None:
     print(*parts, file=sys.stderr)
 
 
-def die(prefix: str, message: str, code: int = 1) -> "int":
+def die(prefix: str, message: str, code: int = 1) -> int:
     eprint(f"{prefix}: {message}")
     return code
 
@@ -134,13 +135,13 @@ def opt_value(args: list[str], option: str) -> str | None:
 
 # --- WPT checkout ---
 
-def resolve_wpt_root() -> tuple[Path | None, str | None]:
+def resolve_wpt_root() -> Path:
     override = os.environ.get("TINYBROWSER_WPT_ROOT")
     if override:
-        return Path(override), None
+        return Path(override)
     status = git(["submodule", "status", "--", "third_party/wpt"])
     if status is not None and status != "" and not status.startswith("-"):
-        return ROOT / "third_party" / "wpt", None
+        return ROOT / "third_party" / "wpt"
     worktrees = git(["worktree", "list", "--porcelain"]) or ""
     primary = None
     for line in worktrees.splitlines():
@@ -148,7 +149,7 @@ def resolve_wpt_root() -> tuple[Path | None, str | None]:
             primary = line.split(" ", 1)[1]
             break
     base = Path(primary) if primary else ROOT
-    return base / "third_party" / "wpt", None
+    return base / "third_party" / "wpt"
 
 
 def check_pin(wpt: Path) -> int:
@@ -171,7 +172,7 @@ def check_pin(wpt: Path) -> int:
 
 # --- locks (shared venv + shared manifest) ---
 
-def acquire_lock(name: str, timeout_s: int = 1800):
+def acquire_lock(name: str, what: str | None = None, timeout_s: int = 1800):
     if os.environ.get("TINYBROWSER_WPT_NO_LOCK", "0") == "1":
         return None
     path = cache_dir() / name
@@ -186,7 +187,9 @@ def acquire_lock(name: str, timeout_s: int = 1800):
         timeout_s = int(raw) if raw else timeout_s
     except ValueError:
         timeout_s = 1800
-    eprint(f"another WPT install holds {path}; waiting")
+    if timeout_s < 0:
+        timeout_s = 1800
+    eprint(f"another WPT run holds {path}; waiting")
     deadline = time.monotonic() + timeout_s
     while True:
         try:
@@ -194,7 +197,7 @@ def acquire_lock(name: str, timeout_s: int = 1800):
             return handle
         except BlockingIOError:
             if time.monotonic() >= deadline:
-                eprint("timed out waiting for the WPT venv lock")
+                eprint(f"timed out waiting for {what or path}")
                 handle.close()
                 raise SystemExit(1)
             time.sleep(0.2)
@@ -415,11 +418,49 @@ def split_run_argv(argv: list[str]) -> tuple[list[str], bool, bool, list[str], s
     return paths, score, dry_run, extras, None
 
 
-def split_score_argv(argv: list[str]) -> tuple[Path | None, Path | None, list[str], list[str], str | None]:
+def hoist_paths_after_test_types(
+    paths: list[str], extras: list[str]
+) -> tuple[list[str], list[str], str | None]:
+    """Rescue positionals `--test-types` (nargs='*') would swallow.
+
+    Upstream argparse greedily consumes every positional following
+    `--test-types` as another type, so `run --processes 4 --test-types
+    reftest dom/nodes/` would silently cover nothing. Anything bare that
+    directly trails the type values and looks like a path (or `-`) moves
+    back to paths; a typeless bare word is a typo and fails loudly.
+    Option values elsewhere are untouched: only the tail of
+    `--test-types` is hazardous, since argparse assigns free positionals
+    correctly everywhere else.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(extras):
+        arg = extras[i]
+        out.append(arg)
+        i += 1
+        if arg != "--test-types" and not arg.startswith("--test-types="):
+            continue
+        while i < len(extras) and extras[i] in KNOWN_TEST_TYPE_SET:
+            out.append(extras[i])
+            i += 1
+        while i < len(extras) and not extras[i].startswith("-"):
+            token = extras[i]
+            i += 1
+            if token == "-" or "/" in token or "." in token:
+                paths.append(token)
+            else:
+                return paths, [], (
+                    f"unknown --test-types value '{token}'; expected one of: {KNOWN_TEST_TYPES}"
+                )
+    return paths, out, None
+
+
+def split_score_argv(argv: list[str]) -> tuple[Path | None, Path | None, list[str], list[str], bool, str | None]:
     report: Path | None = None
     save_report: Path | None = None
     paths: list[str] = []
     extra: list[str] = []
+    dry_run = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -440,14 +481,16 @@ def split_score_argv(argv: list[str]) -> tuple[Path | None, Path | None, list[st
             else:
                 save_report = Path(value)
         elif arg == "--dry-run":
-            extra.append(arg)
+            # Honored only here, before `--`: past the separator it is a
+            # verbatim upstream flag like any other.
+            dry_run = True
         elif arg.startswith("-"):
             extra.extend(argv[i:])
             break
         else:
             paths.append(arg)
         i += 1
-    return report, save_report, paths, extra, None
+    return report, save_report, paths, extra, dry_run, None
 
 
 def parse_rerun_argv(argv: list[str]) -> tuple[Path | None, bool, bool, Path | None, list[str], str | None]:
@@ -617,7 +660,7 @@ def rerun_status(remaining: int, runner_exit: int) -> tuple[int, bool]:
     return 0, False
 
 
-# --- in-venv runner (was launch.py) ---
+# --- in-venv runner ---
 
 def patch_wpt(wpt_root: Path) -> None:
     sys.path.insert(0, str(wpt_root))
@@ -707,10 +750,15 @@ def build_binary() -> Path:
     return binary
 
 
-def finalize_run_args(extras: list[str]) -> list[str]:
+def finalize_run_args(wpt: Path, extras: list[str]) -> list[str]:
     args = list(extras)
     if not has_option("--metadata", args):
         args = ["--metadata", str(ROOT / "tools" / "wpt" / "metadata"), *args]
+    if not has_option("--manifest", args):
+        # Upstream defaults the manifest into ${metadata_root}, which would
+        # land the 40MB walk output in our baselines dir; pin it at the WPT
+        # checkout so the stamp, lock, and mtime gate track the file wpt uses.
+        args = ["--manifest", str(wpt / "MANIFEST.json"), *args]
     if not has_option("--pause-after-test", args) and not has_option("--no-pause-after-test", args):
         args = ["--no-pause-after-test", *args]
     if not has_option("--no-restart-on-unexpected", args) and not has_option("--restart-on-unexpected", args):
@@ -743,12 +791,12 @@ def check_type_drift(exe: Path) -> None:
         eprint(f"wpt: KNOWN_TEST_TYPES drifts from wpttest.enabled_tests ({actual}); update tools/wpt/cli.py")
 
 
-def run_wpt(wpt: Path, exe: Path, binary: Path, final_args: list[str], manifest: Path, record: int) -> int:
+def run_wpt(wpt: Path, venv: Path, exe: Path, binary: Path, final_args: list[str], manifest: Path, record: int) -> int:
     inner_argv = ["--binary", str(binary), "tinybrowser", *final_args]
     manifest_lock = None
     if not has_option_exact("--no-manifest-update", final_args):
         lock_name = f"wpt-manifest-{sha16(str(manifest.resolve()))}.lock"
-        manifest_lock = acquire_lock(lock_name)
+        manifest_lock = acquire_lock(lock_name, what=f"manifest {manifest}")
     manifest_locked = manifest_lock is not None
     venv_lock = None
     if (
@@ -757,7 +805,7 @@ def run_wpt(wpt: Path, exe: Path, binary: Path, final_args: list[str], manifest:
         or has_option_exact("--manifest-download", final_args)
         or has_option("--install-fonts", final_args)
     ):
-        venv_lock = acquire_lock(f"wpt-{sha16(str((wpt / '_venv3').resolve()))}.lock")
+        venv_lock = acquire_lock(f"wpt-{sha16(str(venv.resolve()))}.lock", what=f"venv {venv}")
 
     for i, arg in enumerate(final_args):
         if arg == "--processes" and i + 1 < len(final_args):
@@ -767,11 +815,14 @@ def run_wpt(wpt: Path, exe: Path, binary: Path, final_args: list[str], manifest:
             eprint(f"wpt: processes {arg.split('=', 1)[1]}")
             break
 
-    if record == 0 and manifest_locked is False and venv_lock is None:
+    if record == 0 and not manifest_locked and venv_lock is None:
         # Fast path: nothing to record or serialize. exec restores direct
         # signal delivery to the runner instead of stranding browsers behind us.
         release_lock(manifest_lock)
-        os.execv(str(exe), [str(exe), str(CLI), "_inner", *inner_argv])
+        try:
+            os.execv(str(exe), [str(exe), str(CLI), "_inner", *inner_argv])
+        except OSError as error:
+            return die("run", f"cannot exec {exe}: {error}")
         raise AssertionError("unreachable")
 
     # Slow path: a manifest walk and/or venv writes happen under us, so stay
@@ -782,9 +833,14 @@ def run_wpt(wpt: Path, exe: Path, binary: Path, final_args: list[str], manifest:
         manifest_mtime_before = manifest.stat().st_mtime_ns
     except OSError:
         manifest_mtime_before = 0
-    child = subprocess.Popen(
-        [str(exe), str(CLI), "_inner", *inner_argv], cwd=str(wpt), close_fds=True,
-    )
+    try:
+        child = subprocess.Popen(
+            [str(exe), str(CLI), "_inner", *inner_argv], cwd=str(wpt), close_fds=True,
+        )
+    except OSError as error:
+        release_lock(venv_lock)
+        release_lock(manifest_lock)
+        return die("run", f"could not start the runner: {error}")
     interrupted = False
 
     def forward(signum, _frame):
@@ -798,9 +854,9 @@ def run_wpt(wpt: Path, exe: Path, binary: Path, final_args: list[str], manifest:
     old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGHUP)}
     old_int = signal.signal(signal.SIGINT, forward)
     try:
+        # wait() retries through trapped signals internally (unlike bash
+        # wait, it does not return early), so a single call suffices.
         status = child.wait()
-        while child.poll() is None:
-            status = child.wait()
     finally:
         for s, handler in old.items():
             signal.signal(s, handler)
@@ -810,15 +866,14 @@ def run_wpt(wpt: Path, exe: Path, binary: Path, final_args: list[str], manifest:
     except OSError:
         manifest_mtime_after = 0
     if (
-        interrupted is False
+        not interrupted
         and record == 1
         and manifest_mtime_after != manifest_mtime_before
         and manifest_locked
         and manifest_parses(exe, manifest)
     ):
         write_manifest_stamp(wpt, manifest)
-    if venv_lock is not None:
-        release_lock(venv_lock)
+    release_lock(venv_lock)
     release_lock(manifest_lock)
     return status
 
@@ -828,17 +883,20 @@ def run_main(argv: list[str]) -> int:
     if error:
         return die("run", error, 2)
     if score:
+        if dry_run:
+            extras = ["--dry-run", *extras]
         return score_main([*paths, *extras])
     if dry_run:
-        wpt, _err = resolve_wpt_root()
-        if wpt is None:
-            return die("run", "no WPT checkout", 2)
-        final = finalize_run_args(extras)
-        print(f"$ {wpt}/wpt run --binary <tinybrowser> tinybrowser {' '.join([*paths, *final])}")
+        wpt = resolve_wpt_root()
+        final = finalize_run_args(wpt, extras)
+        paths, final, error = hoist_paths_after_test_types(paths, final)
+        if error:
+            return die("run", error, 2)
+        print(f"$ {wpt}/wpt run --binary <tinybrowser> tinybrowser {shlex.join([*paths, *final])}")
         return 0
 
-    wpt, _err = resolve_wpt_root()
-    if wpt is None or not (wpt / "wpt").is_file():
+    wpt = resolve_wpt_root()
+    if not (wpt / "wpt").is_file():
         eprint(f"WPT checkout not found at {wpt}")
         eprint(f"Initialize it with: git submodule update --init third_party/wpt")
         eprint("or point TINYBROWSER_WPT_ROOT at an initialized checkout.")
@@ -862,7 +920,7 @@ def run_main(argv: list[str]) -> int:
     ensure_venv(wpt, venv)
     exe = venv_python(venv)
 
-    final = finalize_run_args(extras)
+    final = finalize_run_args(wpt, extras)
     check_type_drift(exe)
 
     manifest = Path(opt_value(final, "--manifest") or wpt / "MANIFEST.json")
@@ -876,7 +934,10 @@ def run_main(argv: list[str]) -> int:
         record = 1
     else:
         record = 1
-    return run_wpt(wpt, exe, binary, [*paths, *final], manifest, record)
+    paths, final, error = hoist_paths_after_test_types(paths, final)
+    if error:
+        return die("run", error, 2)
+    return run_wpt(wpt, venv, exe, binary, [*paths, *final], manifest, record)
 
 
 # --- `score` ---
@@ -890,34 +951,15 @@ def score_run(paths: list[str], extra: list[str], save_report: Path | None) -> t
         os.close(handle)
         report = Path(name)
     command = [sys.executable, str(CLI), "run", *paths, "--log-wptreport", str(report), "--no-fail-on-unexpected", *extra]
-    eprint(f"$ {' '.join(command)}")
+    eprint(f"$ {shlex.join(command)}")
     exit_code = subprocess.run(command, cwd=str(ROOT), stdout=sys.stderr).returncode
     if exit_code != 0:
         eprint(f"runner exited {exit_code}")
     return report, exit_code
 
 
-def score_main(argv: list[str]) -> int:
-    report, save_report, paths, extra, error = split_score_argv(argv)
-    if error:
-        return die("run --score", error, 2)
-    if report is not None and save_report is not None:
-        return die("run --score", "--report summarizes an existing report; do not combine it with --save-report", 2)
-    if report is not None:
-        if paths or extra:
-            return die("run --score", "--report summarizes an existing report; give no test paths", 2)
-        return summarize(report)
-    if "--dry-run" in extra:
-        extra = [a for a in extra if a != "--dry-run"]
-        eprint(f"$ {CLI} run {' '.join([*paths, '--log-wptreport', '<tmp>', '--no-fail-on-unexpected', *extra])}")
-        return 0
-    if not paths:
-        return die("run --score", "give test paths or --report FILE", 2)
-    started = time.monotonic()
-    try:
-        report_path, runner_exit = score_run(paths, extra, save_report)
-    except OSError as error:
-        return die("run --score", f"could not start the runner: {error}")
+def finish_scored_run(report_path: Path, runner_exit: int, save_report: Path | None, started: float) -> int:
+    """Shared score/overnight tail: keep-or-delete, summarize, wall time."""
     keep_report = runner_exit != 0 or save_report is not None
     try:
         if runner_exit != 0:
@@ -936,7 +978,30 @@ def score_main(argv: list[str]) -> int:
         eprint(f"wall time: {time.monotonic() - started:.1f}s")
 
 
-# --- `rerun` (was retest) ---
+def score_main(argv: list[str]) -> int:
+    report, save_report, paths, extra, dry_run, error = split_score_argv(argv)
+    if error:
+        return die("run --score", error, 2)
+    if report is not None and save_report is not None:
+        return die("run --score", "--report summarizes an existing report; do not combine it with --save-report", 2)
+    if report is not None:
+        if paths or extra or dry_run:
+            return die("run --score", "--report summarizes an existing report; give no test paths", 2)
+        return summarize(report)
+    if dry_run:
+        eprint(f"$ {CLI} run {shlex.join([*paths, '--log-wptreport', '<tmp>', '--no-fail-on-unexpected', *extra])}")
+        return 0
+    if not paths:
+        return die("run --score", "give test paths or --report FILE", 2)
+    started = time.monotonic()
+    try:
+        report_path, runner_exit = score_run(paths, extra, save_report)
+    except OSError as error:
+        return die("run --score", f"could not start the runner: {error}")
+    return finish_scored_run(report_path, runner_exit, save_report, started)
+
+
+# --- `rerun` ---
 
 def rerun_spawn(tests: list[str], extra: list[str], save_report: Path | None) -> tuple[Path, int]:
     handle, name = tempfile.mkstemp(prefix="wpt-rerun-", suffix=".txt")
@@ -956,7 +1021,7 @@ def rerun_spawn(tests: list[str], extra: list[str], save_report: Path | None) ->
         "--log-wptreport", str(report),
         "--no-fail-on-unexpected", *extra,
     ]
-    eprint(f"$ {' '.join(command)}")
+    eprint(f"$ {shlex.join(command)}")
     try:
         exit_code = subprocess.run(command, cwd=str(ROOT), stdout=sys.stderr).returncode
     finally:
@@ -1052,29 +1117,14 @@ def overnight_main(argv: list[str]) -> int:
             return die("overnight", f"unexpected argument {arg}", 2)
         i += 1
     if dry_run:
-        eprint(f"$ {CLI} run --log-wptreport <report> --no-fail-on-unexpected {' '.join(extra)}")
+        eprint(f"$ {CLI} run --log-wptreport <report> --no-fail-on-unexpected {shlex.join(extra)}")
         return 0
     started = time.monotonic()
     try:
         report_path, runner_exit = score_run([], extra, save_report)
     except OSError as error:
         return die("overnight", f"could not start the runner: {error}")
-    keep_report = runner_exit != 0 or save_report is not None
-    try:
-        if runner_exit != 0:
-            eprint(f"runner failed with exit {runner_exit}; report kept at {report_path}")
-            summarize(report_path)
-            return runner_exit
-        if keep_report:
-            eprint(f"report kept at {report_path}")
-        return summarize(report_path)
-    finally:
-        if not keep_report:
-            try:
-                os.unlink(report_path)
-            except OSError:
-                pass
-        eprint(f"wall time: {time.monotonic() - started:.1f}s")
+    return finish_scored_run(report_path, runner_exit, save_report, started)
 
 
 # --- selftest ---
@@ -1112,33 +1162,71 @@ def _selftest() -> None:
     _, _, _, _, err = split_run_argv(["--test-types", "testharnes", "dom/"])
     assert err is not None
 
+    # A positional trailing --test-types values in the verbatim region is
+    # rescued, not swallowed (nargs='*'); a typeless word fails loudly.
+    paths, extras, err = hoist_paths_after_test_types(
+        [], ["--processes", "4", "--test-types", "reftest", "dom/nodes/"]
+    )
+    assert err is None and paths == ["dom/nodes/"] and extras == ["--processes", "4", "--test-types", "reftest"]
+    _, _, err = hoist_paths_after_test_types([], ["--test-types", "testharnes", "dom/"])
+    assert err is not None  # typo fails loudly instead of running the wrong set
+    _, _, err = hoist_paths_after_test_types([], ["--test-types", "testharnes"])
+    assert err is not None
+
     rows, attention = classify_results(
         [{"test": "/html/foo.html", "status": "PASS", "expected": "FAIL", "subtests": [], "duration": 0}]
     )
     assert rows["html/foo.html"]["unexpected"] == 1 and attention == [("/html/foo.html", "", "PASS")]
     rows, attention = classify_results(
+        [{"test": "/dom/bar.html", "status": "OK",
+          "subtests": [{"name": "a", "status": "FAIL"},
+                       {"name": "b", "status": "PASS", "expected": "FAIL"}],
+          "duration": 0}]
+    )
+    assert rows["dom/bar.html"]["unexpected"] == 1 and attention == [("/dom/bar.html", "b", "PASS")]
+    rows, attention = classify_results(
         [{"test": "/dom/ok.html", "status": "OK",
           "subtests": [{"name": "a", "status": "PASS"}], "duration": 0}]
     )
     assert rows["dom/ok.html"]["pass"] == 1 and attention == []
+    rows, attention = classify_results(
+        [{"test": "/dom/fail.html", "status": "FAIL",
+          "subtests": [{"name": "a", "status": "FAIL"}], "duration": 0}]
+    )
+    assert rows["dom/fail.html"]["expected_fail"] == 1 and attention == []
 
     ok = {"test": "/dom/ok.html", "status": "PASS"}
-    skip = {"test": "/wasm/x.any.js", "status": "SKIP"}
+    skip = {"test": "/wasm/x.any.js", "status": "SKIP", "message": "does not support jsshell"}
     timeout = {"test": "/WebCryptoAPI/x.html", "status": "TIMEOUT"}
     error = {"test": "/html/y.html", "status": "ERROR", "expected": "OK"}
+    failed = {"test": "/FileAPI/z.html", "status": "FAIL", "expected": "PASS"}
     baselined = {"test": "/dom/baselined.html", "status": "FAIL"}
+    unpinned = {"test": "/dom/fixed.html", "status": "PASS", "expected": "FAIL"}
+    sub = {"test": "/dom/s.html", "status": "OK",
+           "subtests": [{"name": "a", "status": "FAIL", "expected": "PASS"}]}
+    sub_baselined = {"test": "/dom/sb.html", "status": "OK",
+                     "subtests": [{"name": "a", "status": "FAIL"}]}
+    expected = {"test": "/dom/e.html", "status": "OK",
+                "subtests": [{"name": "a", "status": "PASS", "expected": "FAIL"}]}
     assert not needs_retest(ok, include_timeout=False)
     assert not needs_retest(skip, include_timeout=False)
     assert not needs_retest(timeout, include_timeout=False)
     assert needs_retest(timeout, include_timeout=True)
     assert needs_retest(error, include_timeout=False)
+    assert needs_retest(failed, include_timeout=False)
     assert not needs_retest(baselined, include_timeout=False)
+    assert needs_retest(unpinned, include_timeout=False)
+    assert needs_retest(sub, include_timeout=False)
+    assert not needs_retest(sub_baselined, include_timeout=False)
+    assert needs_retest(expected, include_timeout=False)
     assert rerun_status(0, 0) == (0, False)
     assert rerun_status(0, 64) == (64, True)
     assert rerun_status(2, 0) == (1, True)
 
-    report, save, paths, extra, err = split_score_argv(["FileAPI/", "--save-report", "/tmp/x.json", "--", "--exclude=worker"])
-    assert report is None and save == Path("/tmp/x.json") and paths == ["FileAPI/"] and extra == ["--exclude=worker"] and err is None
+    report, save, paths, extra, dry, err = split_score_argv(["FileAPI/", "--save-report", "/tmp/x.json", "--", "--exclude=worker"])
+    assert report is None and save == Path("/tmp/x.json") and paths == ["FileAPI/"] and extra == ["--exclude=worker"] and not dry and err is None
+    report, save, paths, extra, dry, err = split_score_argv(["--dry-run", "dom/"])
+    assert dry and paths == ["dom/"] and err is None
     r, _, _, _, _, err = parse_rerun_argv(["r.json", "--include-timeout", "--", "--processes", "8"])
     assert r == Path("r.json") and err is None
     assert parse_rerun_argv([])[5] is not None
