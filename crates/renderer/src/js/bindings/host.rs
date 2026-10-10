@@ -231,7 +231,8 @@ pub(crate) fn reflect_set_bool(
 }
 
 /// Write a reflected `long` attribute: the decimal form of the converted
-/// value becomes the content attribute.
+/// value becomes the content attribute
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_set_long(
     ctx: &Ctx<'_>,
     element: NodeId,
@@ -244,7 +245,8 @@ pub(crate) fn reflect_set_long(
 /// Write a reflected `unsigned long` attribute: the decimal form of the
 /// converted value becomes the content attribute. Values above
 /// `i32::MAX` write zero instead: the reflection suite (matching Chromium)
-/// reads the default there rather than the wrapped value.
+/// reads the default there rather than the wrapped value
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_set_ulong(
     ctx: &Ctx<'_>,
     element: NodeId,
@@ -256,7 +258,8 @@ pub(crate) fn reflect_set_ulong(
 
 /// Write a reflected `unsigned long` attribute with an IDL default: values
 /// above `i32::MAX` write the default instead of the converted value,
-/// matching the reflection suite's read-back there.
+/// matching the reflection suite's read-back there
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_set_ulong_defaulting(
     ctx: &Ctx<'_>,
     element: NodeId,
@@ -274,7 +277,8 @@ pub(crate) fn reflect_set_ulong_defaulting(
 
 /// Write a reflected `double` attribute: the number stringified with JS
 /// semantics, so `1e25` writes `1e+25` like `String(1e25)` rather than
-/// Rust's full digits.
+/// Rust's full digits
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_set_double(
     ctx: &Ctx<'_>,
     element: NodeId,
@@ -655,7 +659,11 @@ fn node_interface_matches(
         "HTMLOListElement" => crate::js::world::is_html_tag(data, "ol"),
         "HTMLParagraphElement" => crate::js::world::is_html_tag(data, "p"),
         "HTMLPictureElement" => crate::js::world::is_html_tag(data, "picture"),
-        "HTMLPreElement" => crate::js::world::is_html_tag(data, "pre"),
+        "HTMLPreElement" => {
+            crate::js::world::is_html_tag(data, "pre")
+                || crate::js::world::is_html_tag(data, "listing")
+                || crate::js::world::is_html_tag(data, "xmp")
+        }
         "HTMLProgressElement" => crate::js::world::is_html_tag(data, "progress"),
         "HTMLQuoteElement" => {
             crate::js::world::is_html_tag(data, "blockquote")
@@ -775,6 +783,23 @@ pub(crate) fn put_forwards<'js>(
     Ok(Value::new_undefined(ctx.clone()))
 }
 
+/// A `USVString` argument: `ToString`, then lone surrogates become U+FFFD
+/// (unlike `DOMString`, this conversion never throws for them)
+/// (<https://webidl.spec.whatwg.org/#es-USVString>).
+pub(crate) fn usv_string_argument<'js>(
+    params: &Params<'_, 'js>,
+    index: usize,
+) -> Result<rquickjs::String<'js>> {
+    // https://webidl.spec.whatwg.org/#dfn-overload-resolution-algorithm
+    let value = params
+        .arg(index)
+        .unwrap_or_else(|| Value::new_undefined(params.ctx().clone()));
+    let coerced: Coerced<rquickjs::String> = FromJs::from_js(params.ctx(), value)?;
+    let units = coerced.0.to_utf16()?;
+    let lossy = String::from_utf16_lossy(&units);
+    rquickjs::String::from_str(params.ctx().clone(), &lossy)
+}
+
 pub(crate) fn string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
@@ -813,11 +838,12 @@ pub(crate) fn callback_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Resu
         .ok_or_else(|| Exception::throw_type(ctx, "argument is not a function"))
 }
 
+/// A `[LegacyNullToEmptyString]` `DOMString` argument: null becomes empty.
+/// (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
 pub(crate) fn legacy_null_string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
 ) -> Result<rquickjs::String<'js>> {
-    // https://webidl.spec.whatwg.org/#LegacyNullToEmptyString
     if params.arg(index).is_some_and(|value| value.is_null()) {
         rquickjs::String::from_str(params.ctx().clone(), "")
     } else {

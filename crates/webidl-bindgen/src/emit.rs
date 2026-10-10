@@ -713,7 +713,10 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
         // method. The receiver check already ran, so `node_id` targets the
         // branded element.
         GetterMapping::Reflect { content } => match getter.return_type {
-            ReturnType::String => quote! {
+            // `USVString` under a plain `[Reflect]` reads the raw content
+            // attribute exactly like `DOMString` (stored content is
+            // already scalar values); only the setter argument converts.
+            ReturnType::String | ReturnType::UsvString => quote! {
                 host::reflect_string(&ctx, receiver.node_id(), #content)?.into_js(&ctx)
             },
             ReturnType::Boolean => quote! {
@@ -806,6 +809,8 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
             host::legacy_null_string_argument(params, 0)?
         },
         ReturnType::String => quote! { host::string_argument(params, 0, None)? },
+        // https://webidl.spec.whatwg.org/#es-USVString
+        ReturnType::UsvString => quote! { host::usv_string_argument(params, 0)? },
         ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
         ReturnType::NullableUnsignedLong => quote! {
             {
@@ -926,11 +931,15 @@ fn setter_dispatch(
 fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenStream {
     let id = index * 2 + 2;
     let convert = match attribute.return_type {
-        ReturnType::String | ReturnType::UsvString if attribute.legacy_null_to_empty => {
+        ReturnType::String if attribute.legacy_null_to_empty => {
             quote! { host::legacy_null_string_argument(params, 0)? }
         }
-        ReturnType::String | ReturnType::UsvString => {
+        ReturnType::String => {
             quote! { host::string_argument(params, 0, None)? }
+        }
+        // https://webidl.spec.whatwg.org/#es-USVString
+        ReturnType::UsvString => {
+            quote! { host::usv_string_argument(params, 0)? }
         }
         // https://webidl.spec.whatwg.org/#es-boolean
         ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
@@ -1235,18 +1244,13 @@ fn operation_argument_at(
             } else {
                 quote! { host::string_argument(params, #index, None)? }
             };
-            if argument.arity == ArgumentArity::Optional {
-                quote! {
-                    #fetch
-                    let #variable = if value.is_undefined() {
-                        None
-                    } else {
-                        Some(#conversion)
-                    };
-                }
-            } else {
-                quote! { let #variable = #conversion; }
-            }
+            optional_argument(&fetch, variable, &conversion, argument.arity)
+        }
+        ReturnType::UsvString => {
+            // Handled like `DOMString` except for lone surrogates; legacy
+            // null is rejected at contract time.
+            let conversion = quote! { host::usv_string_argument(params, #index)? };
+            optional_argument(&fetch, variable, &conversion, argument.arity)
         }
         ReturnType::NullableString => quote! {
             let #variable = host::nullable_string_argument(params, #index)?;
@@ -1299,8 +1303,29 @@ fn operation_argument_at(
     }
 }
 
-fn unsigned_long_argument(variable: &proc_macro2::Ident, fetch: &TokenStream) -> TokenStream {
-    quote! {
+/// Wraps a value conversion for an optional operation argument: `undefined`
+/// stays `None`, otherwise the conversion runs for `Some`.
+fn optional_argument(
+    fetch: &TokenStream,
+    variable: &proc_macro2::Ident,
+    conversion: &TokenStream,
+    arity: ArgumentArity,
+) -> TokenStream {
+    if arity == ArgumentArity::Optional {
+        quote! {
+            #fetch
+            let #variable = if value.is_undefined() {
+                None
+            } else {
+                Some(#conversion)
+            };
+        }
+    } else {
+        quote! { let #variable = #conversion; }
+    }
+}
+
+fn unsigned_long_argument(variable: &proc_macro2::Ident, fetch: &TokenStream) -> TokenStream {    quote! {
         #fetch
         // https://webidl.spec.whatwg.org/#es-unsigned-long
         let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;

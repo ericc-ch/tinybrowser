@@ -969,6 +969,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("legend", "HTMLLegendElement"),
     ("li", "HTMLLIElement"),
     ("link", "HTMLLinkElement"),
+    ("listing", "HTMLPreElement"),
     ("main", "HTMLElement"),
     ("map", "HTMLMapElement"),
     ("mark", "HTMLElement"),
@@ -1028,6 +1029,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("var", "HTMLElement"),
     ("video", "HTMLVideoElement"),
     ("wbr", "HTMLElement"),
+    ("xmp", "HTMLPreElement"),
 ];
 
 fn html_element_interface(local: &str) -> &'static str {
@@ -1490,6 +1492,8 @@ pub(crate) fn parse_double(value: &str) -> Option<f64> {
         return None;
     }
     let mut result = sign * (integer + fraction);
+    // The value set excludes `-0`: adding `+0` normalizes it.
+    result += 0.0;
     if chars.peek().is_some_and(|c| *c == 'e' || *c == 'E') {
         let mut probe = chars.clone();
         probe.next();

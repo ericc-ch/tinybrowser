@@ -185,10 +185,11 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
 }
 
 /// The doctype name and public/system identifiers from leading markup, if a
-/// complete `<!DOCTYPE ...>` token is present. Quoted identifiers keep
-/// their quotes stripped; anything malformed bails to `None` (quirks).
+/// complete `<!DOCTYPE ...>` token is present. Whitespace and comments may
+/// precede it; quoted identifiers keep their quotes stripped (`>` is legal
+/// inside them); anything malformed bails to `None` (quirks).
 fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
-    let rest = input.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\x0c', '\r']);
+    let rest = skip_ignored_prefix(input);
     if rest.len() < 9 || !rest.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype")) {
         return None;
     }
@@ -227,7 +228,27 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
     } else if !word.is_empty() {
         return None;
     }
+    // The token must terminate: truncated markup is not a doctype.
+    if !chars.any(|char| char == '>') {
+        return None;
+    }
     Some((name, public, system))
+}
+
+/// Leading whitespace, BOM, and comments, which may precede the doctype
+/// without forcing quirks. An unterminated comment stops the scan so the
+/// doctype check fails.
+fn skip_ignored_prefix(mut input: &str) -> &str {
+    loop {
+        let trimmed = input.trim_start_matches(['\u{feff}', ' ', '\t', '\n', '\x0c', '\r']);
+        let Some(comment) = trimmed.strip_prefix("<!--") else {
+            return trimmed;
+        };
+        let Some(end) = comment.find("-->") else {
+            return trimmed;
+        };
+        input = &comment[end + 3..];
+    }
 }
 
 /// One single- or double-quoted string after optional whitespace, or `None`
@@ -245,9 +266,6 @@ fn quoted_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option
     for char in chars.by_ref() {
         if char == quote {
             return Some(value);
-        }
-        if char == '>' {
-            return None;
         }
         value.push(char);
     }

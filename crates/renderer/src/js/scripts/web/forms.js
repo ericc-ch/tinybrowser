@@ -22,6 +22,7 @@
     if (i === start) return null;
     result *= sign;
     if (result < -2147483648 || result > 2147483647) return null;
+    // Normalize `-0` to `+0`: SameValue distinguishes them.
     return result === 0 ? 0 : result;
   };
 

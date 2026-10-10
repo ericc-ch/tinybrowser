@@ -5602,6 +5602,25 @@ impl JsNode {
                 "outerText needs a parent",
             ));
         };
+        // Replacing the document element would put text under `Document`.
+        let is_document_parent = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            world.document(self.handle.0).is_some_and(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(parent.node)
+                    .is_some_and(|node| matches!(node.data, NodeData::Document(_)))
+            })
+        };
+        if is_document_parent {
+            return Err(throw_dom(
+                &ctx,
+                "HierarchyRequestError",
+                "outerText cannot replace the document element",
+            ));
+        }
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -8888,7 +8907,8 @@ fn reflect_enum(raw: Option<&str>, keywords: &[&str], missing: &str, invalid: &s
 }
 
 /// `unsigned long` reflection: a non-negative integer within `long` range,
-/// otherwise the default.
+/// otherwise the default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_ulong(raw: Option<&str>, default: u32) -> u32 {
     raw.and_then(|value| super::parse_integer(value))
         .and_then(|value| u32::try_from(value).ok())
@@ -8899,7 +8919,8 @@ fn reflect_ulong(raw: Option<&str>, default: u32) -> u32 {
 /// full-range non-negative parsing, then clamping; parse failure reads the
 /// default. Unlike plain reflection the range is not capped at 2^31 - 1
 /// before clamping, so `4294967296` clamps to the edge rather than the
-/// default.
+/// default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_clamped_ulong(raw: Option<&str>, default: u32, min: u32, max: u32) -> u32 {
     let Some(text) = raw else {
         return default;
@@ -8934,14 +8955,16 @@ fn reflect_clamped_ulong(raw: Option<&str>, default: u32, min: u32, max: u32) ->
     u32::try_from(result).map_or(max, |value| value.clamp(min, max))
 }
 
-/// `double` reflection: a floating-point value or the default.
+/// `double` reflection: a floating-point value or the default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_double(raw: Option<&str>, default: f64) -> f64 {
     raw.and_then(|value| super::parse_double(value))
         .unwrap_or(default)
 }
 
 /// Limited `double` reflection (used by `progress.max`): a positive
-/// floating-point value or the default.
+/// floating-point value or the default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_limited_double(raw: Option<&str>, default: f64) -> f64 {
     match raw.and_then(|value| super::parse_double(value)) {
         Some(value) if value > 0.0 => value,
@@ -9917,6 +9940,15 @@ const CROSS_ORIGIN_KEYWORDS: &[&str] = &["anonymous", "use-credentials"];
 const PRELOAD_KEYWORDS: &[&str] = &["none", "metadata", "auto"];
 const LAZY_EAGER_KEYWORDS: &[&str] = &["lazy", "eager"];
 
+/// Whether the input is in the image button state (`type=image`, ASCII
+/// case-insensitive)
+/// (<https://html.spec.whatwg.org/multipage/input.html#image-button-state>).
+fn is_image_input(ctx: &Ctx<'_>, id: NodeId) -> bool {
+    content_attr(ctx, id, "type")
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("image"))
+}
+
 /// `referrerpolicy` reflection, shared by every element that declares it:
 /// an enumerated attribute defaulting to the empty string
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy>).
@@ -10125,8 +10157,8 @@ impl<'js> html_marquee_element_generated::HTMLMarqueeElement<'js> for JsNode {
     }
 }
 impl<'js> html_meter_element_generated::HTMLMeterElement<'js> for JsNode {
-    // Meter gauges parse as doubles; the WPT reflection suite exercises the
-    // setters, so each getter answers the parsed value with the spec default
+    // Meter gauges parse as doubles. `low` defaults to the minimum, `high`
+    // to the maximum, and `optimum` to their midpoint
     // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-meter-element>).
     fn get_value(&self, ctx: &Ctx<'js>) -> Result<f64> {
         Ok(reflect_double(content_attr(ctx, self.handle.0, "value").as_deref(), 0.0))
@@ -10144,19 +10176,23 @@ impl<'js> html_meter_element_generated::HTMLMeterElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-max
     fn get_low(&self, ctx: &Ctx<'js>) -> Result<f64> {
-        Ok(reflect_double(content_attr(ctx, self.handle.0, "low").as_deref(), 0.0))
+        let min = reflect_double(content_attr(ctx, self.handle.0, "min").as_deref(), 0.0);
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "low").as_deref(), min))
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-low
     fn get_high(&self, ctx: &Ctx<'js>) -> Result<f64> {
-        Ok(reflect_double(content_attr(ctx, self.handle.0, "high").as_deref(), 1.0))
+        let max = reflect_double(content_attr(ctx, self.handle.0, "max").as_deref(), 1.0);
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "high").as_deref(), max))
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-high
     fn get_optimum(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        let min = reflect_double(content_attr(ctx, self.handle.0, "min").as_deref(), 0.0);
+        let max = reflect_double(content_attr(ctx, self.handle.0, "max").as_deref(), 1.0);
         Ok(reflect_double(
             content_attr(ctx, self.handle.0, "optimum").as_deref(),
-            0.5,
+            (min + max) / 2.0,
         ))
     }
 }
@@ -10626,15 +10662,21 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
         host::reflect_set_ulong_defaulting(ctx, self.handle.0, "size", value, 20)
     }
 
-    // Image-button dimensions default to zero; the setters are generated
-    // from `[ReflectSetter]`
+    // Image-button dimensions default to zero, and read zero outside the
+    // image state; the setters are generated from `[ReflectSetter]`
     // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-width>).
     fn get_width(&self, ctx: &Ctx<'js>) -> Result<u32> {
+        if !is_image_input(ctx, self.handle.0) {
+            return Ok(0);
+        }
         Ok(reflect_ulong(content_attr(ctx, self.handle.0, "width").as_deref(), 0))
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-height
     fn get_height(&self, ctx: &Ctx<'js>) -> Result<u32> {
+        if !is_image_input(ctx, self.handle.0) {
+            return Ok(0);
+        }
         Ok(reflect_ulong(content_attr(ctx, self.handle.0, "height").as_deref(), 0))
     }
 
@@ -11098,12 +11140,14 @@ impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
 }
 
 impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
-    // `as` is an enumeration defaulting to the empty string
+    // `as` is an enumeration over the preload and module preload
+    // destinations, defaulting to the empty string
     // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as>).
     fn get_as(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         const KEYWORDS: &[&str] = &[
-            "fetch", "audio", "document", "embed", "font", "image", "manifest", "object",
-            "report", "script", "sharedworker", "style", "track", "video", "worker", "xslt",
+            "fetch", "audio", "audioworklet", "document", "embed", "font", "frame", "iframe",
+            "image", "json", "manifest", "object", "paintworklet", "report", "script",
+            "serviceworker", "sharedworker", "style", "track", "video", "worker", "xslt",
         ];
         let value = reflect_enum(
             content_attr(ctx, self.handle.0, "as").as_deref(),
@@ -11159,7 +11203,8 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     }
 
     fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
-        // Out-of-range values write the default rather than the raw value.
+        // Out-of-range values write the default rather than the raw value
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
         let value = if value > 2147483647 { 300 } else { value };
         set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
     }
@@ -11173,7 +11218,8 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     }
 
     fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
-        // Out-of-range values write the default rather than the raw value.
+        // Out-of-range values write the default rather than the raw value
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
         let value = if value > 2147483647 { 150 } else { value };
         set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())
     }

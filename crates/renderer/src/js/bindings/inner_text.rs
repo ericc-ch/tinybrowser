@@ -97,9 +97,8 @@ fn white_space_of(base: &BaseDocument, node: BlitzId, inherited: WhiteSpace) -> 
     if let Some(style) = crate::js::world::attr(base, node, "style")
         && let Some(value) = style_property(style, "white-space")
     {
-        eprintln!("DBG ws_of style={style:?} value={value:?}");
         return match value.to_ascii_lowercase().as_str() {
-            "pre" | "pre-wrap" => WhiteSpace::Pre,
+            "pre" | "pre-wrap" | "break-spaces" => WhiteSpace::Pre,
             "pre-line" => WhiteSpace::PreLine,
             _ => WhiteSpace::Normal,
         };
@@ -186,10 +185,11 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
     }
     if !html {
         // Foreign content without styling: known never-rendered SVG
-        // containers are skipped, everything else is inline.
+        // containers are skipped, everything else is inline. SVG local
+        // names are case-sensitive (`clipPath`, not `clippath`).
         return if matches!(
             local,
-            "defs" | "desc" | "metadata" | "stop" | "title" | "mask" | "clippath" | "pattern"
+            "defs" | "desc" | "metadata" | "stop" | "title" | "mask" | "clipPath" | "pattern"
             | "symbol" | "use" | "script" | "style"
         ) {
             Level::Hidden
@@ -246,17 +246,18 @@ fn subtree_skipped(base: &BaseDocument, node: BlitzId) -> bool {
     )
 }
 
-/// The effective `visibility` of an element: explicit style wins, else
-/// inherited.
+/// The effective `visibility` of an element: an explicit `visible` or
+/// hiding value wins, anything else (including invalid values) inherits.
 fn visibility_of(base: &BaseDocument, node: BlitzId, inherited: Visibility) -> Visibility {
     if let Some(style) = crate::js::world::attr(base, node, "style")
         && let Some(value) = style_property(style, "visibility")
     {
-        return if value.eq_ignore_ascii_case("visible") {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
+        if value.eq_ignore_ascii_case("visible") {
+            return Visibility::Visible;
+        }
+        if value.eq_ignore_ascii_case("hidden") || value.eq_ignore_ascii_case("collapse") {
+            return Visibility::Hidden;
+        }
     }
     inherited
 }
@@ -548,7 +549,10 @@ impl<'a> Collector<'a> {
 fn is_flex(base: &BaseDocument, node: BlitzId) -> bool {
     crate::js::world::attr(base, node, "style").is_some_and(|style| {
         style_property(style, "display").is_some_and(|value| {
-            value.eq_ignore_ascii_case("flex") || value.eq_ignore_ascii_case("grid")
+            value.eq_ignore_ascii_case("flex")
+                || value.eq_ignore_ascii_case("grid")
+                || value.eq_ignore_ascii_case("inline-flex")
+                || value.eq_ignore_ascii_case("inline-grid")
         })
     })
 }
@@ -754,6 +758,14 @@ fn is_optgroup_ancestor(base: &BaseDocument, node: BlitzId) -> bool {
     false
 }
 
+/// Whether the element itself opts out of rendering with `display:none`.
+/// Unlike `visibility`, descendants cannot re-show through this.
+fn display_none(base: &BaseDocument, node: BlitzId) -> bool {
+    crate::js::world::attr(base, node, "style").is_some_and(|style| {
+        style_property(style, "display").is_some_and(|value| value.eq_ignore_ascii_case("none"))
+    })
+}
+
 /// Collects a `table` subtree: rows newline-separated, cells tab-separated
 /// (including trailing empty cells), captions broken. Whitespace directly
 /// under table structure is ignored.
@@ -782,6 +794,10 @@ fn collect_table(
         .map(|child| (child, visibility))
         .collect();
     while let Some((current, inherited)) = stack.pop() {
+        // `display:none` subtrees never render, so they contribute no rows.
+        if display_none(collector.base, current) {
+            continue;
+        }
         let Some(tree) = collector.base.get_node(current) else {
             continue;
         };
@@ -922,6 +938,10 @@ fn collect_select(
         return;
     };
     for child in tree.children.to_vec() {
+        // `display:none` options never render.
+        if display_none(collector.base, child) {
+            continue;
+        }
         let kind = collector.base.get_node(child).and_then(|tree| {
             tree.data.downcast_element().and_then(|element| {
                 (element.name.ns == crate::js::world::html_namespace())
@@ -1131,8 +1151,9 @@ fn initial_styles(base: &BaseDocument, node: BlitzId) -> (WhiteSpace, Visibility
     )
 }
 
-/// Whether the node is being rendered: no `display:none`, `hidden`, or
-/// never-rendered tag on the path to the root.
+/// Whether the node is being rendered: no `display:none`, no `hidden`
+/// (except `hidden=until-found`, which renders), and no never-rendered tag
+/// on the path to the root.
 fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
     let mut cursor = Some(node);
     while let Some(current) = cursor {
@@ -1142,7 +1163,11 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
         if let Some(element) = tree.data.downcast_element() {
             let html = element.name.ns == crate::js::world::html_namespace();
             let local = element.name.local.as_ref();
-            if html && crate::js::world::attr(base, current, "hidden").is_some() {
+            if html
+                && crate::js::world::attr(base, current, "hidden").is_some_and(|value| {
+                    !value.eq_ignore_ascii_case("until-found")
+                })
+            {
                 return false;
             }
             if let Some(style) = crate::js::world::attr(base, current, "style")

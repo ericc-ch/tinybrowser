@@ -429,7 +429,7 @@ fn unscopable_operations_list_in_unscopables() {
 fn mixin_implementations_install_on_includers() {
     let idl = [Source {
         name: "dom.idl",
-        text: "[Exposed=Window] interface Node {}; [Exposed=Window] interface Element {}; [Exposed=Window] interface Document {}; interface mixin Nodes { undefined append((Node or DOMString)... nodes); }; Element includes Nodes; Document includes Nodes;",
+        text: "[Exposed=Window] interface Node {}; [Exposed=Window] interface Element {}; [Exposed=Window] interface Document {}; [Exposed=Window] interface Ghost {}; interface mixin Nodes { undefined append((Node or DOMString)... nodes); }; Element includes Nodes; Document includes Nodes; Ghost includes Nodes;",
     }];
     // Install targets are the implemented includers: an included interface
     // without an implementation has no global to install onto.
@@ -452,6 +452,10 @@ fn mixin_implementations_install_on_includers() {
     assert!(
         !source.contains("ctx.globals().get(\"Nodes\")"),
         "mixin must not install on itself"
+    );
+    assert!(
+        !source.contains("ctx.globals().get(\"Ghost\")"),
+        "mixin must not install on unimplemented includers"
     );
 }
 
@@ -512,6 +516,86 @@ fn reflect_conflicts_and_unsupported_shapes() {
         assert!(
             !bindings[0].rust.contains("reflect_"),
             "unexpected reflection for {text}"
+        );
+    }
+}
+
+#[test]
+fn reflect_numeric_falls_through_to_hand_implementation() {
+    // Numeric `[Reflect]` is not auto-generated: a hand-written getter and
+    // setter pair lowers as ordinary methods.
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [CEReactions, Reflect] attribute unsigned long size; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_size(&self, ctx: &Ctx<'js>) -> Result<usize> { Ok(0) } fn set_size(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> { Ok(()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("numeric reflect hand impl");
+    let source = bindings[0].rust.replace(' ', "");
+    for fragment in ["fnget_size", "fnset_size", "usize", "u32"] {
+        assert!(
+            source.contains(&fragment.replace(' ', "")),
+            "missing {fragment}"
+        );
+    }
+    assert!(
+        !source.contains("reflect_set_ulong"),
+        "numeric reflect must not use the generated setter"
+    );
+}
+
+#[test]
+fn reflect_legacy_null_generates() {
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [CEReactions, Reflect] attribute [LegacyNullToEmptyString] DOMString border; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload {}",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("legacy reflect");
+    assert!(
+        bindings[0].rust.replace(' ', "").contains("legacy_null_string_argument"),
+        "missing legacy-null setter conversion"
+    );
+}
+
+#[test]
+fn reflect_usv_string_generates() {
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [CEReactions, Reflect] attribute USVString ping; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload {}",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("usv reflect");
+    assert!(
+        bindings[0].rust.replace(' ', "").contains("usv_string_argument"),
+        "missing USVString setter conversion"
+    );
+}
+
+#[test]
+fn reflect_setter_numeric_types() {
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [CEReactions, ReflectSetter] attribute long index; [CEReactions, ReflectSetter] attribute double score; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_index(&self, ctx: &Ctx<'js>) -> Result<i32> { Ok(0) } fn get_score(&self, ctx: &Ctx<'js>) -> Result<f64> { Ok(0.0) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("numeric reflect setter");
+    let source = bindings[0].rust.replace(' ', "");
+    for fragment in ["i32", "f64", "reflect_set_long", "reflect_set_double"] {
+        assert!(
+            source.contains(&fragment.replace(' ', "")),
+            "missing {fragment}"
         );
     }
 }

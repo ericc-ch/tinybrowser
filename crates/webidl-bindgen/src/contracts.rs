@@ -1561,13 +1561,29 @@ fn lower_attribute(
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
     // Reflected attributes install without implementation methods, so
-    // resolve them before the implemented-member checks below. Shapes the
-    // generator does not auto-generate fall through to the normal method
-    // path when implemented, so hand-written getters encode the spec
-    // algorithm. Other members keep skip-if-unimplemented semantics.
+    // resolve them before the implemented-member checks below. Only shapes
+    // the generator auto-generates (plain string/boolean) take this path;
+    // anything else falls through to the normal method path when
+    // implemented, so hand-written getters encode the spec algorithm. Other
+    // members keep skip-if-unimplemented semantics.
     if let Some(content) = reflect_content(member.attributes.as_ref(), member.identifier.0)
-        && let Some(lowered) = lower_reflect_attribute(member, &content, implemented)? {
+        && let Some(lowered) = lower_reflect_attribute(member, &content, implemented)?
+    {
         return Ok(Some(lowered));
+    }
+    // Special shapes stay absent rather than falling through: a plain
+    // method installation would lose `SameObject`/`PutForwards` semantics.
+    if reflect_content(member.attributes.as_ref(), member.identifier.0).is_some()
+        && (has_attribute(member.attributes.as_ref(), "SameObject")
+            || has_attribute(member.attributes.as_ref(), "PutForwards")
+            || member.modifier.as_ref().is_some_and(|modifier| {
+                !matches!(
+                    modifier,
+                    weedle::interface::StringifierOrInheritOrStatic::Stringifier(_)
+                )
+            }))
+    {
+        return Ok(None);
     }
     // `ReflectSetter` reflects on set while the getter stays custom: the
     // implementation provides the getter, the generator owns the setter.
@@ -1870,7 +1886,7 @@ fn lower_reflect_setter_attribute(
         )));
     }
     let getter = format_ident!("{getter_name}");
-    let signature = reflect_setter_signature(&getter, &type_);
+    let signature = reflect_setter_signature(&getter, &type_)?;
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
         rust: getter,
@@ -1879,7 +1895,8 @@ fn lower_reflect_setter_attribute(
         setter: Some(model::Setter::Reflect {
             content: content.into(),
         }),
-        legacy_null_to_empty: false,
+        legacy_null_to_empty: has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
+            || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString"),
         reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
     };
     Ok(Some((attribute, signature)))
@@ -1908,16 +1925,20 @@ fn check_method_signature(
 fn reflect_setter_signature(
     getter: &proc_macro2::Ident,
     type_: &ReturnType,
-) -> proc_macro2::TokenStream {
+) -> Result<proc_macro2::TokenStream, Error> {
     let returns = match type_ {
         ReturnType::UsvString => quote! { crate::dom_string::DomString },
         ReturnType::String => quote! { rquickjs::String<'js> },
         ReturnType::Long => quote! { i32 },
         ReturnType::UnsignedLong => quote! { u32 },
         ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
-        _ => unreachable!("validated reflect setter mapping"),
+        _ => {
+            return Err(Error(
+                "validated reflect setter mapping has no signature".into(),
+            ));
+        }
     };
-    quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#returns>; }
+    Ok(quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#returns>; })
 }
 
 /// Lower a `[Reflect]` attribute to generated content-attribute access.
@@ -1974,22 +1995,38 @@ fn lower_reflect_attribute(
     {
         return Ok(None);
     }
-    // `[LegacyNullToEmptyString]` reflection is auto-generatable: the getter
-    // is plain reflection and the setter converts null to the empty string.
+    // `[LegacyNullToEmptyString]` reflection is auto-generatable for
+    // strings: the getter is plain reflection and the setter converts null
+    // to the empty string. On booleans it is invalid IDL.
     let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
         || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
     // Only plain string and boolean reflection so far, plus `USVString`
-    // under a plain `[Reflect]` (which reflects the raw value exactly like
-    // `DOMString`: `a.ping`, `img.srcset`); the type needs no database
-    // lookup, keeping reflected members independent of typedefs.
+    // under a plain `[Reflect]` (which reads the raw content attribute
+    // exactly like `DOMString`: `a.ping`, `img.srcset`, while the setter
+    // argument still converts as USV); the type needs no database lookup,
+    // keeping reflected members independent of typedefs.
     let type_ = match &member.type_.type_ {
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
             ReturnType::String
         }
         Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none() => {
-            ReturnType::String
+            // Like operation arguments, `[LegacyNullToEmptyString]` requires
+            // `DOMString`.
+            if legacy_null_to_empty {
+                return Err(Error(format!(
+                    "{}: LegacyNullToEmptyString requires DOMString",
+                    member.identifier.0
+                )));
+            }
+            ReturnType::UsvString
         }
         Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
+            if legacy_null_to_empty {
+                return Err(Error(format!(
+                    "{}: LegacyNullToEmptyString on a boolean is invalid",
+                    member.identifier.0
+                )));
+            }
             ReturnType::Boolean
         }
         _ => return Ok(None),
@@ -2657,23 +2694,33 @@ fn validate_attribute_attributes(
                     ) =>
                 {
                 }
-                // Numeric reflection parameters (`ReflectDefault`, `ReflectRange`,
-                // `ReflectNonNegative`, `ReflectPositive`, `ReflectPositiveWithFallback`):
-                // hand-written getters encode the spec algorithm, so the normal
-                // method path documents them as consumed here.
+                // Numeric reflection parameters: hand-written getters encode
+                // the spec algorithm, so the normal method path documents
+                // them as consumed here. Only the standardized names are
+                // accepted, so a typo still fails the build.
                 // `[PutForwards]` lowers to a generated forwarding setter.
                 // `[LegacyUnforgeable]` shapes the instance property in the
                 // interface's own shim, as the legacy path also accepts it;
                 // the generator installs the prototype accessor.
-                ExtendedAttribute::NoArgs(item) if item.0.0.starts_with("Reflect") => {}
+                ExtendedAttribute::NoArgs(item)
+                    if matches!(
+                        item.0.0,
+                        "ReflectNonNegative" | "ReflectPositive" | "ReflectPositiveWithFallback"
+                    ) => {}
                 ExtendedAttribute::Ident(item)
                     if item.lhs_identifier.0 == "PutForwards"
-                        || item.lhs_identifier.0.starts_with("Reflect") => {}
-                ExtendedAttribute::Decimal(item) if item.lhs_identifier.0.starts_with("Reflect") => {}
-                ExtendedAttribute::ArgList(item) if item.identifier.0.starts_with("Reflect") => {}
-                ExtendedAttribute::IdentList(item) if item.identifier.0.starts_with("Reflect") => {}
-                ExtendedAttribute::NamedArgList(item)
-                    if item.lhs_identifier.0.starts_with("Reflect") => {}
+                        || matches!(
+                            item.lhs_identifier.0,
+                            "ReflectDefault"
+                                | "ReflectNonNegative"
+                                | "ReflectPositive"
+                                | "ReflectPositiveWithFallback"
+                        ) => {}
+                ExtendedAttribute::Decimal(item)
+                    if matches!(item.lhs_identifier.0, "ReflectDefault") => {}
+                ExtendedAttribute::ArgList(item) if item.identifier.0 == "ReflectRange" => {}
+                ExtendedAttribute::IdentList(item)
+                    if matches!(item.identifier.0, "ReflectRange") => {}
                 ExtendedAttribute::String(item) if item.lhs_identifier.0 == "Reflect" => {}
                 _ => {
                     return Err(Error(format!(
