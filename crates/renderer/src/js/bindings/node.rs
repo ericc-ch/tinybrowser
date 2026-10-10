@@ -6,7 +6,7 @@ use super::{
     WebIdlUnsignedLong, adopt_across_documents, adopt_into_document, ancestor_chain,
     attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
     blur_node, character_data, character_data_offset, child_value, clone_document,
-    clone_within_document, collection_ids, convert_union_nodes_into_node, deref_weak,
+    clone_within_document, copy_nonce_subtree, collection_ids, convert_union_nodes_into_node, deref_weak,
     descendant_text, document_base_url_string, document_is_html, document_is_html_content,
     document_url_string, dom_string, drain_mutation_journal, element_at_point, element_box,
     element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
@@ -61,6 +61,8 @@ include!(concat!(env!("OUT_DIR"), "/ParentNode.rs"));
 include!(concat!(env!("OUT_DIR"), "/ChildNode.rs"));
 include!(concat!(env!("OUT_DIR"), "/NonDocumentTypeChildNode.rs"));
 include!(concat!(env!("OUT_DIR"), "/ElementCSSInlineStyle.rs"));
+include!(concat!(env!("OUT_DIR"), "/ElementContentEditable.rs"));
+include!(concat!(env!("OUT_DIR"), "/ARIAMixin.rs"));
 include!(concat!(env!("OUT_DIR"), "/ShadowRoot.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLFormElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLInputElement.rs"));
@@ -92,6 +94,46 @@ include!(concat!(env!("OUT_DIR"), "/HTMLTemplateElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLTableElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLTableSectionElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLTableRowElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLAnchorElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLAreaElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLAudioElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLBodyElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLBRElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTableCaptionElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLDataElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLDataListElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLDetailsElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLDialogElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLDirectoryElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLDivElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLDListElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLFontElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLFrameSetElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLHeadElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLHeadingElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLHRElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLHtmlElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLLabelElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLLegendElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLLIElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMenuElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMarqueeElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMeterElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLModElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLOListElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLParagraphElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLPictureElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLPreElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLProgressElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLQuoteElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLSpanElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLStyleElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTableCellElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTableColElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTimeElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTitleElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLUListElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLVideoElement.rs"));
 
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     node_generated::install(ctx)?;
@@ -109,6 +151,8 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     child_node_generated::install(ctx)?;
     non_document_type_child_node_generated::install(ctx)?;
     element_css_inline_style_generated::install(ctx)?;
+    element_content_editable_generated::install(ctx)?;
+    aria_mixin_generated::install(ctx)?;
     shadow_root_generated::install(ctx)?;
     html_form_element_generated::install(ctx)?;
     html_input_element_generated::install(ctx)?;
@@ -139,6 +183,46 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_template_element_generated::install(ctx)?;
     html_table_element_generated::install(ctx)?;
     html_table_section_element_generated::install(ctx)?;
+    html_anchor_element_generated::install(ctx)?;
+    html_area_element_generated::install(ctx)?;
+    html_audio_element_generated::install(ctx)?;
+    html_body_element_generated::install(ctx)?;
+    htmlbr_element_generated::install(ctx)?;
+    html_table_caption_element_generated::install(ctx)?;
+    html_data_element_generated::install(ctx)?;
+    html_data_list_element_generated::install(ctx)?;
+    html_details_element_generated::install(ctx)?;
+    html_dialog_element_generated::install(ctx)?;
+    html_directory_element_generated::install(ctx)?;
+    html_div_element_generated::install(ctx)?;
+    htmld_list_element_generated::install(ctx)?;
+    html_font_element_generated::install(ctx)?;
+    html_frame_set_element_generated::install(ctx)?;
+    html_head_element_generated::install(ctx)?;
+    html_heading_element_generated::install(ctx)?;
+    htmlhr_element_generated::install(ctx)?;
+    html_html_element_generated::install(ctx)?;
+    html_label_element_generated::install(ctx)?;
+    html_legend_element_generated::install(ctx)?;
+    htmlli_element_generated::install(ctx)?;
+    html_menu_element_generated::install(ctx)?;
+    html_marquee_element_generated::install(ctx)?;
+    html_meter_element_generated::install(ctx)?;
+    html_mod_element_generated::install(ctx)?;
+    htmlo_list_element_generated::install(ctx)?;
+    html_paragraph_element_generated::install(ctx)?;
+    html_picture_element_generated::install(ctx)?;
+    html_pre_element_generated::install(ctx)?;
+    html_progress_element_generated::install(ctx)?;
+    html_quote_element_generated::install(ctx)?;
+    html_span_element_generated::install(ctx)?;
+    html_style_element_generated::install(ctx)?;
+    html_table_cell_element_generated::install(ctx)?;
+    html_table_col_element_generated::install(ctx)?;
+    html_time_element_generated::install(ctx)?;
+    html_title_element_generated::install(ctx)?;
+    htmlu_list_element_generated::install(ctx)?;
+    html_video_element_generated::install(ctx)?;
     html_table_row_element_generated::install(ctx)
 }
 
@@ -3461,6 +3545,52 @@ fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
     Ok(world.borrow().images.get(&id).copied())
 }
 
+/// Splits a rendered-text setter value into text and `br` nodes: `\r\n`
+/// and lone `\r` become `\n`, then every newline becomes a `br` with no
+/// empty text around it. When `pad_empty` and the value is all-empty, yields
+/// one empty text node: `outerText = ""` removes the element but the
+/// sibling-merge step expects a node to merge (proven by
+/// `outertext-setter.html`, fully passing); `innerText = ""` replaces with
+/// nothing.
+fn rendered_text_fragment(
+    parsed: &mut crate::Parsed,
+    value: &str,
+    pad_empty: bool,
+) -> Vec<NodeId> {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.is_empty() {
+        if !pad_empty {
+            return Vec::new();
+        }
+        let node = parsed.document.create_text(&DomString::default());
+        return vec![NodeId {
+            document: parsed.id,
+            node,
+        }];
+    }
+    let mut added = Vec::new();
+    for (index, part) in normalized.split('\n').enumerate() {
+        if index > 0 {
+            let br = parsed.document.base.mutate().create_element(
+                QualName::new(None, html_namespace(), LocalName::from("br")),
+                Vec::new(),
+            );
+            added.push(NodeId {
+                document: parsed.id,
+                node: br,
+            });
+        }
+        if !part.is_empty() {
+            let node = parsed.document.create_text(&DomString::from(part));
+            added.push(NodeId {
+                document: parsed.id,
+                node,
+            });
+        }
+    }
+    added
+}
+
 /// Current viewport offset for `id`'s document.
 /// <https://drafts.csswg.org/cssom-view/#scrolling-viewport>
 fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {
@@ -4665,13 +4795,15 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     #[qjs(skip)]
     fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
-        let raw = attribute_value(&ctx, self.handle.0, "formmethod")?;
-        Ok(match raw.trim().to_ascii_lowercase().as_str() {
-            "post" => "post",
-            "dialog" => "dialog",
-            _ => "get",
-        }
-        .to_owned())
+        // Enumerated without whitespace stripping: only an exact ASCII
+        // case-insensitive keyword matches
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
+        Ok(reflect_enum(
+            content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
+            &["post", "dialog"],
+            "",
+            "get",
+        ))
     }
 
     #[qjs(skip)]
@@ -4682,7 +4814,14 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     #[qjs(skip)]
     fn form_enctype(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "formenctype")?).to_owned())
+        // Absent reads empty, like `formMethod`; no whitespace stripping
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
+        Ok(reflect_enum(
+            content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
+            &["multipart/form-data", "text/plain"],
+            "",
+            "application/x-www-form-urlencoded",
+        ))
     }
 
     #[qjs(skip)]
@@ -5425,14 +5564,122 @@ impl JsNode {
     /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
     #[qjs(get, rename = "innerText")]
     fn inner_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        match self.text_content(&ctx)? {
-            Some(value) => Ok(value),
-            None => rquickjs::String::from_str(ctx, ""),
-        }
+        let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx, &text)
     }
 
-    /// Not-being-rendered innerText replace-all with one text node. Converting
-    /// newlines to `br` is the rendered-text-fragment path and a known gap
+    /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    #[qjs(get, rename = "outerText")]
+    fn outer_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx, &text)
+    }
+
+    /// Setting `outerText` replaces the element with the rendered text
+    /// fragment, then merges with adjacent text siblings (but does not
+    /// fully normalize). Without a parent it throws; the setter is a no-op
+    /// on non-HTML elements, which never install it.
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
+    #[qjs(set, rename = "outerText")]
+    fn set_outer_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let parent = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            world.document(self.handle.0).and_then(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(self.handle.0.node)
+                    .and_then(|node| node.parent)
+                    .map(|parent| NodeId {
+                        document: self.handle.0.document,
+                        node: parent,
+                    })
+            })
+        };
+        let Some(parent) = parent else {
+            return Err(throw_dom(
+                &ctx,
+                "NoModificationAllowedError",
+                "outerText needs a parent",
+            ));
+        };
+        // Replacing the document element would put text under `Document`.
+        let is_document_parent = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            world.document(self.handle.0).is_some_and(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(parent.node)
+                    .is_some_and(|node| matches!(node.data, NodeData::Document(_)))
+            })
+        };
+        if is_document_parent {
+            return Err(throw_dom(
+                &ctx,
+                "HierarchyRequestError",
+                "outerText cannot replace the document element",
+            ));
+        }
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let mut added = rendered_text_fragment(&mut parsed, &value.0, true);
+        for child in &added {
+            place_journaled(&mut parsed, parent, *child, Some(self.handle.0));
+        }
+        unlink_journaled(&mut parsed, self.handle.0);
+        // Merge with the previous text sibling, then the following one.
+        if let Some(first) = added.first().copied() {
+            let previous = sibling(&parsed.document.base, first.node, false).map(|node| {
+                NodeId {
+                    document: first.document,
+                    node,
+                }
+            });
+            if let Some(previous) = previous
+                && is_mergeable_text_node(&parsed.document.base, previous.node)
+                && is_mergeable_text_node(&parsed.document.base, first.node)
+            {
+                let mut data =
+                    String::from(parsed.document.character_data(previous.node));
+                data.push_str(&String::from(parsed.document.character_data(first.node)));
+                parsed.document.base.mutate().set_node_text(previous.node, &data);
+                unlink_journaled(&mut parsed, first);
+                if added.last() == Some(&first) {
+                    added[0] = previous;
+                } else {
+                    added.remove(0);
+                }
+            }
+        }
+        if let Some(last) = added.last().copied() {
+            let next = sibling(&parsed.document.base, last.node, true).map(|node| NodeId {
+                document: last.document,
+                node,
+            });
+            if let Some(next) = next
+                && is_mergeable_text_node(&parsed.document.base, next.node)
+                && is_mergeable_text_node(&parsed.document.base, last.node)
+            {
+                let mut data = String::from(parsed.document.character_data(last.node));
+                data.push_str(&String::from(parsed.document.character_data(next.node)));
+                parsed.document.base.mutate().set_node_text(last.node, &data);
+                unlink_journaled(&mut parsed, next);
+            }
+        }
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    /// Setting `innerText` replaces all children with the rendered text
+    /// fragment: newlines become `br` elements with no empty text around
+    /// them (an all-empty value yields one empty text node)
     /// (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
     #[qjs(set, rename = "innerText")]
     fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
@@ -5453,8 +5700,16 @@ impl JsNode {
         if !html {
             return Ok(());
         }
-        let string = rquickjs::String::from_str(ctx.clone(), &value.0)?;
-        self.set_text_content(&ctx, Some(string))
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let added = rendered_text_fragment(&mut parsed, &value.0, false);
+        replace_all_journaled(&world, &mut parsed, self.handle.0, added);
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-insertadjacenthtml
@@ -6734,6 +6989,9 @@ impl JsNode {
                 .map_err(|err| throw_dom_error(&ctx, err))?;
             drop(parsed);
             drop(world);
+            // Cloning copies the cryptographic nonce slots into the fresh
+            // subtree (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes> cloning steps).
+            copy_nonce_subtree(&owner, self.handle.0, clone);
             clone
         } else {
             let world = world_rc.borrow();
@@ -6741,8 +6999,14 @@ impl JsNode {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let store = parsed.id;
-            clone_within_document(&mut parsed.document, store, self.handle.0, deep)
-                .map_err(|err| throw_dom_error(&ctx, err))?
+            let clone = clone_within_document(&mut parsed.document, store, self.handle.0, deep)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+            drop(parsed);
+            drop(world);
+            // Cloning copies the cryptographic nonce slots into the fresh
+            // subtree (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes> cloning steps).
+            copy_nonce_subtree(&world_rc, self.handle.0, clone);
+            clone
         };
         wrap_node(&ctx, clone)
     }
@@ -7699,6 +7963,84 @@ impl<'js> document_generated::Document<'js> for JsNode {
         )
     }
 
+    // `document.dir` reflects the `dir` attribute of the document element
+    // (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir>).
+    fn get_dir(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        // Shared borrows nest: `content_attr` borrows the same world.
+        let owner = world_for_node(ctx, self.handle.0)?;
+        let value = owner
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| document_first_child(&parsed, is_element_data))
+            .and_then(|element| content_attr(ctx, element, "dir"));
+        rquickjs::String::from_str(ctx.clone(), reflect_dir(value.as_deref()))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir
+    fn set_dir(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        let owner = world_for_node(ctx, self.handle.0)?;
+        let element = owner
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| document_first_child(&parsed, is_element_data));
+        if let Some(element) = element {
+            set_attribute_sync(ctx, element, "dir", &value.to_string()?)?;
+        }
+        Ok(())
+    }
+
+    // Obsolete document color attributes reflect the matching `body`
+    // content attributes
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor>).
+    fn get_fg_color(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        document_body_attr(ctx, self.handle.0, "text")
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn set_fg_color(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_document_body_attr(ctx, self.handle.0, "text", &value.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn get_link_color(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        document_body_attr(ctx, self.handle.0, "link")
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn set_link_color(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_document_body_attr(ctx, self.handle.0, "link", &value.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn get_vlink_color(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        document_body_attr(ctx, self.handle.0, "vlink")
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn set_vlink_color(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_document_body_attr(ctx, self.handle.0, "vlink", &value.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn get_alink_color(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        document_body_attr(ctx, self.handle.0, "alink")
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn set_alink_color(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_document_body_attr(ctx, self.handle.0, "alink", &value.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn get_bg_color(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        document_body_attr(ctx, self.handle.0, "bgcolor")
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-bgcolor
+    fn set_bg_color(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_document_body_attr(ctx, self.handle.0, "bgcolor", &value.to_string()?)
+    }
+
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
     fn write(&self, ctx: Ctx<'js>, arg_0: Vec<rquickjs::String<'js>>) -> Result<()> {
         let mut text = Vec::with_capacity(arg_0.len());
@@ -8497,10 +8839,310 @@ fn focus_element(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     Ok(())
 }
 
+/// One content attribute's raw value, when the attribute is present.
+fn content_attr(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Option<String> {
+    let owner = world_for_node(ctx, id).ok()?;
+    let borrowed = owner.borrow();
+    borrowed.document(id).and_then(|parsed| {
+        crate::js::world::attr(&parsed.document.base, id.node, name).map(str::to_owned)
+    })
+}
+
+/// Whether `data` is an element node, for [`document_first_child`] searches.
+fn is_element_data(data: &NodeData) -> bool {
+    matches!(data, NodeData::Element(_))
+}
+
+/// One `body` content attribute of `document`, or the empty string when the
+/// body or attribute is missing.
+fn document_body_attr<'js>(
+    ctx: &Ctx<'js>,
+    document: NodeId,
+    name: &str,
+) -> Result<rquickjs::String<'js>> {
+    let owner = world_for_node(ctx, document)?;
+    let value = owner
+        .borrow()
+        .document(document)
+        .and_then(|parsed| document_first(&parsed, "body"))
+        .and_then(|body| content_attr(ctx, body, name))
+        .unwrap_or_default();
+    rquickjs::String::from_str(ctx.clone(), &value)
+}
+
+/// Writes one `body` content attribute of `document`, ignoring a missing body.
+fn set_document_body_attr(
+    ctx: &Ctx<'_>,
+    document: NodeId,
+    name: &str,
+    value: &str,
+) -> Result<()> {
+    let owner = world_for_node(ctx, document)?;
+    let body = owner
+        .borrow()
+        .document(document)
+        .and_then(|parsed| document_first(&parsed, "body"));
+    if let Some(body) = body {
+        set_attribute_sync(ctx, body, name, value)?;
+    }
+    Ok(())
+}
+
+/// Enumerated reflection: an ASCII case-insensitive keyword match yields
+/// the canonical keyword, absence yields the missing default, and anything
+/// else yields the invalid default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
+fn reflect_enum(raw: Option<&str>, keywords: &[&str], missing: &str, invalid: &str) -> String {
+    let Some(value) = raw else {
+        return missing.into();
+    };
+    let lowered = value.to_ascii_lowercase();
+    keywords
+        .iter()
+        .find(|keyword| **keyword == lowered)
+        .map_or(invalid.into(), |keyword| (*keyword).to_owned())
+}
+
+/// `unsigned long` reflection: a non-negative integer within `long` range,
+/// otherwise the default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+fn reflect_ulong(raw: Option<&str>, default: u32) -> u32 {
+    raw.and_then(|value| super::parse_integer(value))
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(default)
+}
+
+/// Clamped `unsigned long` reflection (used by `colSpan`, `rowSpan`, `span`):
+/// full-range non-negative parsing, then clamping; parse failure reads the
+/// default. Unlike plain reflection the range is not capped at 2^31 - 1
+/// before clamping, so `4294967296` clamps to the edge rather than the
+/// default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+fn reflect_clamped_ulong(raw: Option<&str>, default: u32, min: u32, max: u32) -> u32 {
+    let Some(text) = raw else {
+        return default;
+    };
+    let mut chars = text.chars().peekable();
+    while super::is_html_whitespace(chars.peek()) {
+        chars.next();
+    }
+    let mut negative = false;
+    if chars.peek() == Some(&'+') {
+        chars.next();
+    } else if chars.peek() == Some(&'-') {
+        negative = true;
+        chars.next();
+    }
+    let mut digits = 0_u32;
+    let mut result: u64 = 0;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        result = result.saturating_mul(10).saturating_add(u64::from(digit));
+        digits += 1;
+        chars.next();
+    }
+    if digits == 0 {
+        return default;
+    }
+    if result == 0 {
+        return 0_u32.clamp(min, max);
+    }
+    if negative {
+        return default;
+    }
+    u32::try_from(result).map_or(max, |value| value.clamp(min, max))
+}
+
+/// `double` reflection: a floating-point value or the default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+fn reflect_double(raw: Option<&str>, default: f64) -> f64 {
+    raw.and_then(|value| super::parse_double(value))
+        .unwrap_or(default)
+}
+
+/// Limited `double` reflection (used by `progress.max`): a positive
+/// floating-point value or the default
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+fn reflect_limited_double(raw: Option<&str>, default: f64) -> f64 {
+    match raw.and_then(|value| super::parse_double(value)) {
+        Some(value) if value > 0.0 => value,
+        _ => default,
+    }
+}
+
+/// Whether `node` is the first `summary` element child of a `details`
+/// parent: only that one is focusable
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
+fn is_first_summary_child(
+    base: &blitz_dom::BaseDocument,
+    parent: BlitzId,
+    node: BlitzId,
+) -> bool {
+    if !crate::js::world::is_html_tag(
+        base.get_node(parent).map(|tree| &tree.data),
+        "details",
+    ) {
+        return false;
+    }
+    base.get_node(parent).is_some_and(|parent| {
+        parent.children.iter().find_map(|child| {
+            base.get_node(*child).and_then(|tree| {
+                tree.data.downcast_element().and_then(|element| {
+                    (element.name.ns == html_namespace()
+                        && element.name.local.as_ref() == "summary")
+                        .then_some(*child)
+                })
+            })
+        }) == Some(node)
+    })
+}
+
+/// One `dir` content-attribute value mapped to its IDL reading: an exact
+/// ASCII case-insensitive keyword match, else the empty string
+/// (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
+fn reflect_dir(raw: Option<&str>) -> &'static str {
+    match raw.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("ltr") => "ltr",
+        Some("rtl") => "rtl",
+        Some("auto") => "auto",
+        _ => "",
+    }
+}
+/// controls, links, media with controls, editing hosts, and the first
+/// `summary` of a `details`), -1 otherwise. Connection and disabled state
+/// do not move the IDL default (a detached `button` still reads 0; verified
+/// live against the WebDriver build, which has no layout)
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex>,
+/// <https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
+fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
+    let Some(tree) = base.get_node(node) else {
+        return -1;
+    };
+    let Some(element) = tree.data.downcast_element() else {
+        return -1;
+    };
+    if element.name.ns != html_namespace() {
+        return -1;
+    }
+    // Editing hosts are focusable: `contenteditable` in the True or
+    // Plaintext-Only state (empty, `true`, or `plaintext-only`, ASCII
+    // case-insensitive).
+    if crate::js::world::attr(base, node, "contenteditable").is_some_and(|state| {
+        matches!(
+            state.to_ascii_lowercase().as_str(),
+            "" | "true" | "plaintext-only"
+        )
+    }) {
+        return 0;
+    }
+    // The first `summary` child of a `details` is focusable.
+    if element.name.local.as_ref() == "summary"
+        && let Some(parent) = tree.parent
+        && is_first_summary_child(base, parent, node)
+    {
+        return 0;
+    }
+    match element.name.local.as_ref() {
+        "input" => {
+            if crate::js::world::attr(base, node, "type").is_some_and(|kind| {
+                kind.eq_ignore_ascii_case("hidden")
+            }) {
+                -1
+            } else {
+                0
+            }
+        }
+        "a" => {
+            if crate::js::world::attr(base, node, "href").is_some() {
+                0
+            } else {
+                -1
+            }
+        }
+        "button" | "select" | "textarea" | "iframe" => 0,
+        "audio" | "video" => {
+            if crate::js::world::attr(base, node, "controls").is_some() {
+                0
+            } else {
+                -1
+            }
+        }
+        _ => -1,
+    }
+}
+
+/// The cryptographic nonce of `id`: the IDL-set slot when present, else
+/// the content attribute, else empty
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+fn nonce_of(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
+    let owner = world_for_node(ctx, id)?;
+    if let Some(slot) = owner.borrow().nonce_slots.get(&id) {
+        return Ok(slot.clone());
+    }
+    Ok(content_attr(ctx, id, "nonce").unwrap_or_default())
+}
+
 impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
     fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.dataset(ctx)
+    }
+
+    // The `dir` content attribute is enumerated (`ltr`, `rtl`, `auto`,
+    // ASCII case-insensitive); anything else, including absence, reads
+    // as the empty string
+    // (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
+    fn get_dir(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let raw = content_attr(ctx, self.handle.0, "dir");
+        rquickjs::String::from_str(ctx.clone(), reflect_dir(raw.as_deref()))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute
+    fn set_dir(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "dir", &value.to_string()?)
+    }
+
+    // The cryptographic nonce: reading answers the slot, writing sets it
+    // without touching the content attribute
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-nonce>).
+    fn get_nonce(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = nonce_of(ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-nonce
+    fn set_nonce(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        let owner = world_for_node(ctx, self.handle.0)?;
+        owner
+            .borrow_mut()
+            .nonce_slots
+            .insert(self.handle.0, value.to_string()?);
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/editing.html#dom-writingsuggestions
+    fn get_writing_suggestions(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        host::reflect_string(ctx, self.handle.0, "writingsuggestions")
+    }
+
+    // https://html.spec.whatwg.org/multipage/editing.html#dom-autocapitalize
+    fn get_autocapitalize(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        host::reflect_string(ctx, self.handle.0, "autocapitalize")
+    }
+
+    // The `tabindex` content attribute parses as an integer; absence,
+    // parse failure, or overflow reads as the element default (0 for the
+    // focusable locals, -1 otherwise)
+    // (<https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex>).
+    fn get_tab_index(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        let owner = world_for_node(ctx, self.handle.0)?;
+        let borrowed = owner.borrow();
+        let Some(parsed) = borrowed.document(self.handle.0) else {
+            return Ok(-1);
+        };
+        let base = &parsed.document.base;
+        Ok(crate::js::world::attr(base, self.handle.0.node, "tabindex")
+            .and_then(|raw| super::parse_integer(raw))
+            .unwrap_or_else(|| tab_index_default(base, self.handle.0.node)))
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-click
@@ -8535,6 +9177,22 @@ impl<'js> svg_element_generated::SVGElement<'js> for JsNode {
         self.dataset(ctx)
     }
 
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-nonce
+    fn get_nonce(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = nonce_of(ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-nonce
+    fn set_nonce(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        let owner = world_for_node(ctx, self.handle.0)?;
+        owner
+            .borrow_mut()
+            .nonce_slots
+            .insert(self.handle.0, value.to_string()?);
+        Ok(())
+    }
+
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
     fn focus(&self, ctx: Ctx<'js>, _options: svg_element_generated::FocusOptions) -> Result<()> {
         focus_element(&ctx, self.handle.0)
@@ -8550,6 +9208,22 @@ impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
     fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.dataset(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-nonce
+    fn get_nonce(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = nonce_of(ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-nonce
+    fn set_nonce(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        let owner = world_for_node(ctx, self.handle.0)?;
+        owner
+            .borrow_mut()
+            .nonce_slots
+            .insert(self.handle.0, value.to_string()?);
+        Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
@@ -8568,6 +9242,1222 @@ impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
 }
 
 impl html_opt_group_element_generated::HTMLOptGroupElement<'_> for JsNode {}
+
+/// One nullable `aria-*` (or `role`) reflection read: the content attribute
+/// value, or null when absent.
+fn aria_get<'js>(
+    ctx: &Ctx<'js>,
+    id: NodeId,
+    name: &str,
+) -> Result<Option<rquickjs::String<'js>>> {
+    match content_attr(ctx, id, name) {
+        Some(value) => Ok(Some(rquickjs::String::from_str(ctx.clone(), &value)?)),
+        None => Ok(None),
+    }
+}
+
+/// One nullable `aria-*` (or `role`) reflection write: null removes the
+/// content attribute.
+fn aria_set(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    name: &str,
+    value: Option<rquickjs::String<'_>>,
+) -> Result<()> {
+    match value {
+        Some(value) => set_attribute_sync(ctx, id, name, &value.to_string()?),
+        None => remove_attribute_sync(ctx, id, "", name, false),
+    }
+}
+
+/// `ARIAMixin` is a spec mixin included by `Element`: nullable string
+/// reflection over `role` and the `aria-*` content attributes
+/// (<https://w3c.github.io/aria/#introstates>).
+impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
+    // https://w3c.github.io/aria/#role
+    fn get_role(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "role")
+    }
+
+    // https://w3c.github.io/aria/#role
+    fn set_role(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
+        aria_set(ctx, self.handle.0, "role", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-atomic
+    fn get_aria_atomic(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-atomic")
+    }
+
+    // https://w3c.github.io/aria/#aria-atomic
+    fn set_aria_atomic(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-atomic", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-autocomplete
+    fn get_aria_auto_complete(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-autocomplete")
+    }
+
+    // https://w3c.github.io/aria/#aria-autocomplete
+    fn set_aria_auto_complete(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-autocomplete", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-braillelabel
+    fn get_aria_braille_label(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-braillelabel")
+    }
+
+    // https://w3c.github.io/aria/#aria-braillelabel
+    fn set_aria_braille_label(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-braillelabel", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-brailleroledescription
+    fn get_aria_braille_role_description(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-brailleroledescription")
+    }
+
+    // https://w3c.github.io/aria/#aria-brailleroledescription
+    fn set_aria_braille_role_description(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-brailleroledescription", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-busy
+    fn get_aria_busy(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-busy")
+    }
+
+    // https://w3c.github.io/aria/#aria-busy
+    fn set_aria_busy(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-busy", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-checked
+    fn get_aria_checked(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-checked")
+    }
+
+    // https://w3c.github.io/aria/#aria-checked
+    fn set_aria_checked(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-checked", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-colcount
+    fn get_aria_col_count(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-colcount")
+    }
+
+    // https://w3c.github.io/aria/#aria-colcount
+    fn set_aria_col_count(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-colcount", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-colindex
+    fn get_aria_col_index(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-colindex")
+    }
+
+    // https://w3c.github.io/aria/#aria-colindex
+    fn set_aria_col_index(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-colindex", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-colindextext
+    fn get_aria_col_index_text(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-colindextext")
+    }
+
+    // https://w3c.github.io/aria/#aria-colindextext
+    fn set_aria_col_index_text(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-colindextext", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-colspan
+    fn get_aria_col_span(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-colspan")
+    }
+
+    // https://w3c.github.io/aria/#aria-colspan
+    fn set_aria_col_span(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-colspan", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-current
+    fn get_aria_current(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-current")
+    }
+
+    // https://w3c.github.io/aria/#aria-current
+    fn set_aria_current(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-current", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-description
+    fn get_aria_description(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-description")
+    }
+
+    // https://w3c.github.io/aria/#aria-description
+    fn set_aria_description(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-description", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-disabled
+    fn get_aria_disabled(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-disabled")
+    }
+
+    // https://w3c.github.io/aria/#aria-disabled
+    fn set_aria_disabled(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-disabled", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-expanded
+    fn get_aria_expanded(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-expanded")
+    }
+
+    // https://w3c.github.io/aria/#aria-expanded
+    fn set_aria_expanded(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-expanded", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-haspopup
+    fn get_aria_has_popup(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-haspopup")
+    }
+
+    // https://w3c.github.io/aria/#aria-haspopup
+    fn set_aria_has_popup(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-haspopup", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-hidden
+    fn get_aria_hidden(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-hidden")
+    }
+
+    // https://w3c.github.io/aria/#aria-hidden
+    fn set_aria_hidden(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-hidden", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-invalid
+    fn get_aria_invalid(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-invalid")
+    }
+
+    // https://w3c.github.io/aria/#aria-invalid
+    fn set_aria_invalid(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-invalid", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-keyshortcuts
+    fn get_aria_key_shortcuts(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-keyshortcuts")
+    }
+
+    // https://w3c.github.io/aria/#aria-keyshortcuts
+    fn set_aria_key_shortcuts(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-keyshortcuts", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-label
+    fn get_aria_label(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-label")
+    }
+
+    // https://w3c.github.io/aria/#aria-label
+    fn set_aria_label(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-label", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-level
+    fn get_aria_level(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-level")
+    }
+
+    // https://w3c.github.io/aria/#aria-level
+    fn set_aria_level(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-level", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-live
+    fn get_aria_live(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-live")
+    }
+
+    // https://w3c.github.io/aria/#aria-live
+    fn set_aria_live(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-live", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-modal
+    fn get_aria_modal(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-modal")
+    }
+
+    // https://w3c.github.io/aria/#aria-modal
+    fn set_aria_modal(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-modal", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-multiline
+    fn get_aria_multi_line(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-multiline")
+    }
+
+    // https://w3c.github.io/aria/#aria-multiline
+    fn set_aria_multi_line(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-multiline", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-multiselectable
+    fn get_aria_multi_selectable(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-multiselectable")
+    }
+
+    // https://w3c.github.io/aria/#aria-multiselectable
+    fn set_aria_multi_selectable(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-multiselectable", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-orientation
+    fn get_aria_orientation(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-orientation")
+    }
+
+    // https://w3c.github.io/aria/#aria-orientation
+    fn set_aria_orientation(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-orientation", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-placeholder
+    fn get_aria_placeholder(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-placeholder")
+    }
+
+    // https://w3c.github.io/aria/#aria-placeholder
+    fn set_aria_placeholder(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-placeholder", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-posinset
+    fn get_aria_pos_in_set(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-posinset")
+    }
+
+    // https://w3c.github.io/aria/#aria-posinset
+    fn set_aria_pos_in_set(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-posinset", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-pressed
+    fn get_aria_pressed(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-pressed")
+    }
+
+    // https://w3c.github.io/aria/#aria-pressed
+    fn set_aria_pressed(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-pressed", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-readonly
+    fn get_aria_read_only(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-readonly")
+    }
+
+    // https://w3c.github.io/aria/#aria-readonly
+    fn set_aria_read_only(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-readonly", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-relevant
+    fn get_aria_relevant(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-relevant")
+    }
+
+    // https://w3c.github.io/aria/#aria-relevant
+    fn set_aria_relevant(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-relevant", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-required
+    fn get_aria_required(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-required")
+    }
+
+    // https://w3c.github.io/aria/#aria-required
+    fn set_aria_required(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-required", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-roledescription
+    fn get_aria_role_description(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-roledescription")
+    }
+
+    // https://w3c.github.io/aria/#aria-roledescription
+    fn set_aria_role_description(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-roledescription", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-rowcount
+    fn get_aria_row_count(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-rowcount")
+    }
+
+    // https://w3c.github.io/aria/#aria-rowcount
+    fn set_aria_row_count(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-rowcount", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-rowindex
+    fn get_aria_row_index(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-rowindex")
+    }
+
+    // https://w3c.github.io/aria/#aria-rowindex
+    fn set_aria_row_index(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-rowindex", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-rowindextext
+    fn get_aria_row_index_text(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-rowindextext")
+    }
+
+    // https://w3c.github.io/aria/#aria-rowindextext
+    fn set_aria_row_index_text(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-rowindextext", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-rowspan
+    fn get_aria_row_span(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-rowspan")
+    }
+
+    // https://w3c.github.io/aria/#aria-rowspan
+    fn set_aria_row_span(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-rowspan", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-selected
+    fn get_aria_selected(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-selected")
+    }
+
+    // https://w3c.github.io/aria/#aria-selected
+    fn set_aria_selected(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-selected", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-setsize
+    fn get_aria_set_size(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-setsize")
+    }
+
+    // https://w3c.github.io/aria/#aria-setsize
+    fn set_aria_set_size(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-setsize", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-sort
+    fn get_aria_sort(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-sort")
+    }
+
+    // https://w3c.github.io/aria/#aria-sort
+    fn set_aria_sort(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-sort", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-valuemax
+    fn get_aria_value_max(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-valuemax")
+    }
+
+    // https://w3c.github.io/aria/#aria-valuemax
+    fn set_aria_value_max(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-valuemax", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-valuemin
+    fn get_aria_value_min(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-valuemin")
+    }
+
+    // https://w3c.github.io/aria/#aria-valuemin
+    fn set_aria_value_min(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-valuemin", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-valuenow
+    fn get_aria_value_now(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-valuenow")
+    }
+
+    // https://w3c.github.io/aria/#aria-valuenow
+    fn set_aria_value_now(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-valuenow", value)
+    }
+
+    // https://w3c.github.io/aria/#aria-valuetext
+    fn get_aria_value_text(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        aria_get(ctx, self.handle.0, "aria-valuetext")
+    }
+
+    // https://w3c.github.io/aria/#aria-valuetext
+    fn set_aria_value_text(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        aria_set(ctx, self.handle.0, "aria-valuetext", value)
+    }
+}
+
+// Shared enumerated keyword tables for content-attribute reflection.
+const REFERRER_POLICY_KEYWORDS: &[&str] = &[
+    "",
+    "no-referrer",
+    "no-referrer-when-downgrade",
+    "same-origin",
+    "origin",
+    "strict-origin",
+    "origin-when-cross-origin",
+    "strict-origin-when-cross-origin",
+    "unsafe-url",
+];
+const CROSS_ORIGIN_KEYWORDS: &[&str] = &["anonymous", "use-credentials"];
+const PRELOAD_KEYWORDS: &[&str] = &["none", "metadata", "auto"];
+const LAZY_EAGER_KEYWORDS: &[&str] = &["lazy", "eager"];
+
+/// Whether the input is in the image button state (`type=image`, ASCII
+/// case-insensitive)
+/// (<https://html.spec.whatwg.org/multipage/input.html#image-button-state>).
+fn is_image_input(ctx: &Ctx<'_>, id: NodeId) -> bool {
+    content_attr(ctx, id, "type")
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("image"))
+}
+
+/// `referrerpolicy` reflection, shared by every element that declares it:
+/// an enumerated attribute defaulting to the empty string
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy>).
+fn reflect_referrer_policy<'js>(
+    ctx: &Ctx<'js>,
+    id: NodeId,
+) -> Result<rquickjs::String<'js>> {
+    let value = reflect_enum(
+        content_attr(ctx, id, "referrerpolicy").as_deref(),
+        REFERRER_POLICY_KEYWORDS,
+        "",
+        "",
+    );
+    rquickjs::String::from_str(ctx.clone(), &value)
+}
+
+fn set_referrer_policy(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    value: rquickjs::String<'_>,
+) -> Result<()> {
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    set_attribute_sync(ctx, id, "referrerpolicy", &value.to_string()?)
+}
+
+/// `crossorigin` reflection: absent reads null, the empty string reads
+/// `anonymous`, anything else matches ASCII case-insensitively with an
+/// `anonymous` invalid default; setting null removes the attribute
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-crossorigin>).
+fn reflect_cross_origin<'js>(
+    ctx: &Ctx<'js>,
+    id: NodeId,
+) -> Result<Option<rquickjs::String<'js>>> {
+    let raw = content_attr(ctx, id, "crossorigin");
+    let Some(value) = raw.as_deref() else {
+        return Ok(None);
+    };
+    let lowered = value.to_ascii_lowercase();
+    let canonical = if lowered.is_empty() || lowered == "anonymous" {
+        "anonymous"
+    } else {
+        CROSS_ORIGIN_KEYWORDS
+            .iter()
+            .find(|keyword| **keyword == lowered)
+            .map_or("anonymous", |keyword| *keyword)
+    };
+    Ok(Some(rquickjs::String::from_str(
+        ctx.clone(),
+        canonical,
+    )?))
+}
+
+fn set_cross_origin(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    value: Option<rquickjs::String<'_>>,
+) -> Result<()> {
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-crossorigin
+    match value {
+        Some(value) => set_attribute_sync(ctx, id, "crossorigin", &value.to_string()?),
+        None => remove_attribute_sync(ctx, id, "", "crossorigin", false),
+    }
+}
+
+// Empty element contracts: every member the generator lowers from these
+// interfaces is fully generated (`[Reflect]` string/boolean/URL and
+// `[ReflectSetter]` with an implemented getter), so the trait carries no
+// methods yet. Adding the contract installs that generated surface;
+// members needing hand-written algorithms stay absent until implemented.
+impl<'js> html_anchor_element_generated::HTMLAnchorElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        reflect_referrer_policy(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_referrer_policy(ctx, self.handle.0, value)
+    }
+}
+
+impl<'js> html_area_element_generated::HTMLAreaElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        reflect_referrer_policy(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_referrer_policy(ctx, self.handle.0, value)
+    }
+}
+impl html_audio_element_generated::HTMLAudioElement<'_> for JsNode {}
+impl html_body_element_generated::HTMLBodyElement<'_> for JsNode {}
+impl htmlbr_element_generated::HTMLBRElement<'_> for JsNode {}
+impl html_table_caption_element_generated::HTMLTableCaptionElement<'_> for JsNode {}
+impl html_data_element_generated::HTMLDataElement<'_> for JsNode {}
+impl html_data_list_element_generated::HTMLDataListElement<'_> for JsNode {}
+impl html_details_element_generated::HTMLDetailsElement<'_> for JsNode {}
+impl html_dialog_element_generated::HTMLDialogElement<'_> for JsNode {}
+impl html_directory_element_generated::HTMLDirectoryElement<'_> for JsNode {}
+impl html_div_element_generated::HTMLDivElement<'_> for JsNode {}
+impl htmld_list_element_generated::HTMLDListElement<'_> for JsNode {}
+impl html_font_element_generated::HTMLFontElement<'_> for JsNode {}
+impl html_frame_set_element_generated::HTMLFrameSetElement<'_> for JsNode {}
+impl html_head_element_generated::HTMLHeadElement<'_> for JsNode {}
+impl html_heading_element_generated::HTMLHeadingElement<'_> for JsNode {}
+impl htmlhr_element_generated::HTMLHRElement<'_> for JsNode {}
+impl html_html_element_generated::HTMLHtmlElement<'_> for JsNode {}
+impl html_label_element_generated::HTMLLabelElement<'_> for JsNode {}
+impl html_legend_element_generated::HTMLLegendElement<'_> for JsNode {}
+impl<'js> htmlli_element_generated::HTMLLIElement<'js> for JsNode {
+    // `value` is a plain long defaulting to zero
+    // (<https://html.spec.whatwg.org/multipage/grouping-content.html#dom-li-value>).
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        Ok(content_attr(ctx, self.handle.0, "value")
+            .as_deref()
+            .and_then(super::parse_integer)
+            .unwrap_or(0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/grouping-content.html#dom-li-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: i32) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "value", &value.to_string())
+    }
+}
+impl html_menu_element_generated::HTMLMenuElement<'_> for JsNode {}
+impl<'js> html_marquee_element_generated::HTMLMarqueeElement<'js> for JsNode {
+    // `scrollAmount` defaults to 6, `scrollDelay` to 85; both are plain
+    // unsigned-long reflection
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-scrollamount>).
+    fn get_scroll_amount(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "scrollamount").as_deref(),
+                6,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-scrollamount
+    fn set_scroll_amount(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "scrollamount", value, 6)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-scrolldelay
+    fn get_scroll_delay(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "scrolldelay").as_deref(),
+                85,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-scrolldelay
+    fn set_scroll_delay(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "scrolldelay", value, 85)
+    }
+
+    // `loop` is a plain long defaulting to -1
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-loop>).
+    fn get_loop(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        Ok(content_attr(ctx, self.handle.0, "loop")
+            .as_deref()
+            .and_then(super::parse_integer)
+            .unwrap_or(-1))
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-loop
+    fn set_loop(&self, ctx: &Ctx<'js>, value: i32) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "loop", &value.to_string())
+    }
+
+    // Obsolete `hspace`/`vspace` default to zero
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-hspace>).
+    fn get_hspace(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "hspace").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-hspace
+    fn set_hspace(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "hspace", value, 0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-vspace
+    fn get_vspace(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "vspace").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-marquee-vspace
+    fn set_vspace(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "vspace", value, 0)
+    }
+}
+impl<'js> html_meter_element_generated::HTMLMeterElement<'js> for JsNode {
+    // Meter gauges parse as doubles. `low` defaults to the minimum, `high`
+    // to the maximum, and `optimum` to their midpoint
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-meter-element>).
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "value").as_deref(), 0.0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-value
+    fn get_min(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "min").as_deref(), 0.0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-min
+    fn get_max(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "max").as_deref(), 1.0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-max
+    fn get_low(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        let min = reflect_double(content_attr(ctx, self.handle.0, "min").as_deref(), 0.0);
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "low").as_deref(), min))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-low
+    fn get_high(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        let max = reflect_double(content_attr(ctx, self.handle.0, "max").as_deref(), 1.0);
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "high").as_deref(), max))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-meter-high
+    fn get_optimum(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        let min = reflect_double(content_attr(ctx, self.handle.0, "min").as_deref(), 0.0);
+        let max = reflect_double(content_attr(ctx, self.handle.0, "max").as_deref(), 1.0);
+        Ok(reflect_double(
+            content_attr(ctx, self.handle.0, "optimum").as_deref(),
+            (min + max) / 2.0,
+        ))
+    }
+}
+
+impl<'js> html_progress_element_generated::HTMLProgressElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        Ok(reflect_double(content_attr(ctx, self.handle.0, "value").as_deref(), 0.0))
+    }
+
+    // `max` must parse positive, defaulting to 1.0
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-max>).
+    fn get_max(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        Ok(reflect_limited_double(
+            content_attr(ctx, self.handle.0, "max").as_deref(),
+            1.0,
+        ))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-max
+    fn set_max(&self, ctx: &Ctx<'js>, value: f64) -> Result<()> {
+        // Non-positive values leave the attribute untouched
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-max>).
+        if !(value > 0.0) {
+            return Ok(());
+        }
+        host::reflect_set_double(ctx, self.handle.0, "max", value)
+    }
+}
+
+impl html_mod_element_generated::HTMLModElement<'_> for JsNode {}
+impl<'js> htmlo_list_element_generated::HTMLOListElement<'js> for JsNode {
+    // `start` defaults to 1
+    // (<https://html.spec.whatwg.org/multipage/grouping-content.html#dom-ol-start>).
+    fn get_start(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        Ok(content_attr(ctx, self.handle.0, "start")
+            .as_deref()
+            .and_then(super::parse_integer)
+            .unwrap_or(1))
+    }
+
+    // https://html.spec.whatwg.org/multipage/grouping-content.html#dom-ol-start
+    fn set_start(&self, ctx: &Ctx<'js>, value: i32) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "start", &value.to_string())
+    }
+}
+impl html_paragraph_element_generated::HTMLParagraphElement<'_> for JsNode {}
+impl html_picture_element_generated::HTMLPictureElement<'_> for JsNode {}
+impl<'js> html_pre_element_generated::HTMLPreElement<'js> for JsNode {
+    // `width` is a plain long defaulting to zero
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-pre-width>).
+    fn get_width(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        Ok(content_attr(ctx, self.handle.0, "width")
+            .as_deref()
+            .and_then(super::parse_integer)
+            .unwrap_or(0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-pre-width
+    fn set_width(&self, ctx: &Ctx<'js>, value: i32) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
+    }
+}
+impl html_quote_element_generated::HTMLQuoteElement<'_> for JsNode {}
+impl html_span_element_generated::HTMLSpanElement<'_> for JsNode {}
+impl html_style_element_generated::HTMLStyleElement<'_> for JsNode {}
+impl<'js> html_table_cell_element_generated::HTMLTableCellElement<'js> for JsNode {
+    // `colSpan` parses 1..1000, defaulting to 1
+    // (<https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-colspan>).
+    fn get_col_span(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_clamped_ulong(
+                content_attr(ctx, self.handle.0, "colspan").as_deref(),
+                1,
+                1,
+                1000,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-colspan
+    fn set_col_span(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "colspan", value, 1)
+    }
+
+    // `rowSpan` parses 0..65534, defaulting to 1
+    // (<https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-rowspan>).
+    fn get_row_span(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_clamped_ulong(
+                content_attr(ctx, self.handle.0, "rowspan").as_deref(),
+                1,
+                0,
+                65534,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-rowspan
+    fn set_row_span(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "rowspan", value, 1)
+    }
+
+    // `scope` is an enumeration with an empty-string default
+    // (<https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-scope>).
+    fn get_scope(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        const KEYWORDS: &[&str] = &["row", "col", "rowgroup", "colgroup"];
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "scope").as_deref(),
+            KEYWORDS,
+            "",
+            "",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-scope
+    fn set_scope(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "scope", &value.to_string()?)
+    }
+}
+
+impl<'js> html_table_col_element_generated::HTMLTableColElement<'js> for JsNode {
+    // `span` parses 1..1000, defaulting to 1
+    // (<https://html.spec.whatwg.org/multipage/tables.html#dom-col-span>).
+    fn get_span(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_clamped_ulong(
+                content_attr(ctx, self.handle.0, "span").as_deref(),
+                1,
+                1,
+                1000,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/tables.html#dom-col-span
+    fn set_span(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "span", value, 1)
+    }
+}
+impl html_time_element_generated::HTMLTimeElement<'_> for JsNode {}
+impl html_title_element_generated::HTMLTitleElement<'_> for JsNode {}
+impl htmlu_list_element_generated::HTMLUListElement<'_> for JsNode {}
+impl<'js> html_video_element_generated::HTMLVideoElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-video-width
+    fn get_width(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "width").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-video-width
+    fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "width", value, 0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-video-height
+    fn get_height(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "height").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-video-height
+    fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "height", value, 0)
+    }
+}
+
+/// `ElementContentEditable` is a spec mixin included by `HTMLElement`: the
+/// enumerated `enterkeyhint`/`inputmode` live here rather than on the
+/// element contract
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint>).
+impl<'js> element_content_editable_generated::ElementContentEditable<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-enterkeyhint
+    fn get_enter_key_hint(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        const KEYWORDS: &[&str] =
+            &["enter", "done", "go", "next", "previous", "search", "send"];
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "enterkeyhint").as_deref(),
+            KEYWORDS,
+            "",
+            "",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-enterkeyhint
+    fn set_enter_key_hint(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "enterkeyhint", &value.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-inputmode
+    fn get_input_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        const KEYWORDS: &[&str] =
+            &["none", "text", "tel", "url", "email", "numeric", "decimal", "search"];
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "inputmode").as_deref(),
+            KEYWORDS,
+            "",
+            "",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-inputmode
+    fn set_input_mode(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "inputmode", &value.to_string()?)
+    }
+}
 
 impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
     /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
@@ -8646,6 +10536,13 @@ impl<'js> html_select_element_generated::HTMLSelectElement<'js> for JsNode {
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
+
+    // `autocomplete` reflects with a generated setter; the getter answers
+    // the content attribute
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-autocomplete>).
+    fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        host::reflect_string(ctx, self.handle.0, "autocomplete")
+    }
 }
 
 impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode {
@@ -8715,6 +10612,13 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
+
+    // `autocomplete` reflects with a generated setter; the getter answers
+    // the content attribute
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-autocomplete>).
+    fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        host::reflect_string(ctx, self.handle.0, "autocomplete")
+    }
 }
 
 impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
@@ -8782,6 +10686,48 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
     fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
         self.set_value(ctx.clone(), LegacyNullString(value.to_string()?))
+    }
+
+    // `size` defaults to 20; zero or unparseable reads 20, setting zero
+    // throws
+    // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-size>).
+    fn get_size(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        let value = reflect_ulong(content_attr(ctx, self.handle.0, "size").as_deref(), 20);
+        Ok(usize::try_from(if value == 0 { 20 } else { value }).unwrap_or(usize::MAX))
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-size
+    fn set_size(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        if value == 0 {
+            return Err(throw_dom(ctx, "IndexSizeError", "input size is zero"));
+        }
+        // Out-of-range values write the default rather than the raw value.
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "size", value, 20)
+    }
+
+    // Image-button dimensions default to zero, and read zero outside the
+    // image state; the setters are generated from `[ReflectSetter]`
+    // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-width>).
+    fn get_width(&self, ctx: &Ctx<'js>) -> Result<u32> {
+        if !is_image_input(ctx, self.handle.0) {
+            return Ok(0);
+        }
+        Ok(reflect_ulong(content_attr(ctx, self.handle.0, "width").as_deref(), 0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-height
+    fn get_height(&self, ctx: &Ctx<'js>) -> Result<u32> {
+        if !is_image_input(ctx, self.handle.0) {
+            return Ok(0);
+        }
+        Ok(reflect_ulong(content_attr(ctx, self.handle.0, "height").as_deref(), 0))
+    }
+
+    // `autocomplete` reflects with a generated setter; the getter answers
+    // the content attribute
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-autocomplete>).
+    fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        host::reflect_string(ctx, self.handle.0, "autocomplete")
     }
 
     // Upstream selection accessors are nullable, keeping the spec-prose
@@ -8868,13 +10814,13 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
     fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let raw = attribute_value(ctx, self.handle.0, "method")?;
-        let method = match raw.trim().to_ascii_lowercase().as_str() {
-            "post" => "post",
-            "dialog" => "dialog",
-            _ => "get",
-        };
-        rquickjs::String::from_str(ctx.clone(), method)
+        let method = reflect_enum(
+            content_attr(ctx, self.handle.0, "method").as_deref(),
+            &["post", "dialog"],
+            "get",
+            "get",
+        );
+        rquickjs::String::from_str(ctx.clone(), &method)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
@@ -8888,8 +10834,13 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
     fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let raw = attribute_value(ctx, self.handle.0, "enctype")?;
-        rquickjs::String::from_str(ctx.clone(), encoding_keyword(&raw))
+        let enctype = reflect_enum(
+            content_attr(ctx, self.handle.0, "enctype").as_deref(),
+            &["multipart/form-data", "text/plain"],
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded",
+        );
+        rquickjs::String::from_str(ctx.clone(), &enctype)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
@@ -8914,6 +10865,24 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
     fn reset(&self, ctx: Ctx<'js>) -> Result<()> {
         self.reset_form(ctx)
+    }
+
+    // `autocomplete` is an on/off enumeration defaulting to on
+    // (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-autocomplete>).
+    fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        const KEYWORDS: &[&str] = &["on", "off"];
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "autocomplete").as_deref(),
+            KEYWORDS,
+            "on",
+            "on",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-autocomplete
+    fn set_autocomplete(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "autocomplete", &value.to_string()?)
     }
 }
 
@@ -9006,6 +10975,44 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
     fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.content_window(ctx.clone())
     }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        reflect_referrer_policy(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_referrer_policy(ctx, self.handle.0, value)
+    }
+
+    // `loading` defaults to `eager`
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading>).
+    fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "loading").as_deref(),
+            LAZY_EAGER_KEYWORDS,
+            "eager",
+            "eager",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
+    fn set_loading(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "loading", &value.to_string()?)
+    }
+
+    // `srcdoc` answers the content attribute
+    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-srcdoc>).
+    fn get_srcdoc(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        host::reflect_string(ctx, self.handle.0, "srcdoc")
+    }
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-srcdoc
+    fn set_srcdoc(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "srcdoc", &value.to_string()?)
+    }
 }
 
 impl<'js> html_frame_element_generated::HTMLFrameElement<'js> for JsNode {
@@ -9039,6 +11046,110 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
     fn get_current_src(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
         Ok(self.current_src(ctx.clone())?.into())
+    }
+
+    // `width`/`height` reflect with generated setters; the getters answer
+    // the parsed value
+    // (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-width>).
+    fn get_width(&self, ctx: &Ctx<'js>) -> Result<u32> {
+        Ok(reflect_ulong(content_attr(ctx, self.handle.0, "width").as_deref(), 0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-height
+    fn get_height(&self, ctx: &Ctx<'js>) -> Result<u32> {
+        Ok(reflect_ulong(content_attr(ctx, self.handle.0, "height").as_deref(), 0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-crossorigin
+    fn get_cross_origin(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        reflect_cross_origin(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-crossorigin
+    fn set_cross_origin(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        set_cross_origin(ctx, self.handle.0, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        reflect_referrer_policy(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_referrer_policy(ctx, self.handle.0, value)
+    }
+
+    // `decoding` defaults to `auto`
+    // (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decoding>).
+    fn get_decoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        const KEYWORDS: &[&str] = &["async", "sync", "auto"];
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "decoding").as_deref(),
+            KEYWORDS,
+            "auto",
+            "auto",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decoding
+    fn set_decoding(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "decoding", &value.to_string()?)
+    }
+
+    // `loading` defaults to `eager`
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading>).
+    fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "loading").as_deref(),
+            LAZY_EAGER_KEYWORDS,
+            "eager",
+            "eager",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
+    fn set_loading(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "loading", &value.to_string()?)
+    }
+
+    // Obsolete `hspace`/`vspace` default to zero
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-img-hspace>).
+    fn get_hspace(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "hspace").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-img-hspace
+    fn set_hspace(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "hspace", value, 0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-img-vspace
+    fn get_vspace(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "vspace").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-img-vspace
+    fn set_vspace(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "vspace", value, 0)
     }
 }
 
@@ -9076,7 +11187,54 @@ impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
     }
 }
 
-impl html_link_element_generated::HTMLLinkElement<'_> for JsNode {}
+impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
+    // `as` is an enumeration over the preload and module preload
+    // destinations, defaulting to the empty string
+    // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as>).
+    fn get_as(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        const KEYWORDS: &[&str] = &[
+            "fetch", "audio", "audioworklet", "document", "embed", "font", "frame", "iframe",
+            "image", "json", "manifest", "object", "paintworklet", "report", "script",
+            "serviceworker", "sharedworker", "style", "track", "video", "worker", "xslt",
+        ];
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "as").as_deref(),
+            KEYWORDS,
+            "",
+            "",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as
+    fn set_as(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "as", &value.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        reflect_referrer_policy(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_referrer_policy(ctx, self.handle.0, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-crossorigin
+    fn get_cross_origin(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        reflect_cross_origin(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-crossorigin
+    fn set_cross_origin(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        set_cross_origin(ctx, self.handle.0, value)
+    }
+}
 
 /// The generated union of rendering contexts. No variant is ever produced
 /// until a canvas backend exists.
@@ -9093,6 +11251,9 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     }
 
     fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        // Out-of-range values write the default rather than the raw value
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
+        let value = if value > 2147483647 { 300 } else { value };
         set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
     }
 
@@ -9105,6 +11266,9 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     }
 
     fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        // Out-of-range values write the default rather than the raw value
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height>).
+        let value = if value > 2147483647 { 150 } else { value };
         set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())
     }
 
@@ -9184,15 +11348,104 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
     fn get_ready_state(&self, _ctx: &Ctx<'js>) -> Result<u16> {
         Ok(0)
     }
+
+    // https://html.spec.whatwg.org/multipage/media.html#dom-media-crossorigin
+    fn get_cross_origin(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        reflect_cross_origin(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/media.html#dom-media-crossorigin
+    fn set_cross_origin(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        set_cross_origin(ctx, self.handle.0, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/media.html#dom-media-preload
+    fn get_preload(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "preload").as_deref(),
+            PRELOAD_KEYWORDS,
+            "auto",
+            "auto",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/media.html#dom-media-preload
+    fn set_preload(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "preload", &value.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
+    fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "loading").as_deref(),
+            LAZY_EAGER_KEYWORDS,
+            "eager",
+            "eager",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
+    fn set_loading(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "loading", &value.to_string()?)
+    }
 }
 
 impl html_embed_element_generated::HTMLEmbedElement<'_> for JsNode {}
 
-impl html_script_element_generated::HTMLScriptElement<'_> for JsNode {}
+impl<'js> html_script_element_generated::HTMLScriptElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn get_referrer_policy(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        reflect_referrer_policy(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
+    fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_referrer_policy(ctx, self.handle.0, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-crossorigin
+    fn get_cross_origin(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        reflect_cross_origin(ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-crossorigin
+    fn set_cross_origin(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        set_cross_origin(ctx, self.handle.0, value)
+    }
+}
 
 impl html_source_element_generated::HTMLSourceElement<'_> for JsNode {}
 
-impl html_track_element_generated::HTMLTrackElement<'_> for JsNode {}
+impl<'js> html_track_element_generated::HTMLTrackElement<'js> for JsNode {
+    // `kind` defaults to `subtitles`; unknown values read `metadata`
+    // (<https://html.spec.whatwg.org/multipage/media.html#dom-track-kind>).
+    fn get_kind(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        const KEYWORDS: &[&str] =
+            &["subtitles", "captions", "descriptions", "chapters", "metadata"];
+        let value = reflect_enum(
+            content_attr(ctx, self.handle.0, "kind").as_deref(),
+            KEYWORDS,
+            "subtitles",
+            "metadata",
+        );
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/media.html#dom-track-kind
+    fn set_kind(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "kind", &value.to_string()?)
+    }
+}
 
 impl html_meta_element_generated::HTMLMetaElement<'_> for JsNode {}
 
@@ -9202,6 +11455,54 @@ impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
     /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
+    }
+
+    // Obsolete `hspace`/`vspace` default to zero
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-hspace>).
+    fn get_hspace(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "hspace").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-hspace
+    fn set_hspace(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "hspace", value, 0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-vspace
+    fn get_vspace(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(
+            usize::try_from(reflect_ulong(
+                content_attr(ctx, self.handle.0, "vspace").as_deref(),
+                0,
+            ))
+            .unwrap_or(usize::MAX),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-vspace
+    fn set_vspace(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        host::reflect_set_ulong_defaulting(ctx, self.handle.0, "vspace", value, 0)
+    }
+
+    // `codeBase` resolves against the document base URL
+    // (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-codebase>).
+    fn get_code_base(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        // `DOMString` preserves code units exactly: convert through UTF-16
+        // rather than lossy UTF-8.
+        let resolved: crate::dom_string::DomString =
+            host::reflect_url_string(ctx, self.handle.0, "codebase")?;
+        rquickjs::String::from_utf16(ctx.clone(), &resolved.units())
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-object-codebase
+    fn set_code_base(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attribute_sync(ctx, self.handle.0, "codebase", &value.to_string()?)
     }
 }
 
@@ -9725,6 +12026,16 @@ fn whole_text(ctx: &Ctx<'_>, id: NodeId) -> Result<DomString> {
         .unwrap_or_default())
 }
 
+/// Whether `id` is a `Text` node strictly (not CDATA): the outerText merge
+/// steps only merge `Text`
+/// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
+fn is_mergeable_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
+    matches!(
+        base.get_node(id).map(|node| &node.data),
+        Some(NodeData::Text(_))
+    )
+}
+
 /// Whether `id` is a text node for `wholeText`: `Text` or `CDATASection`,
 /// both in the contiguous run
 /// (<https://dom.spec.whatwg.org/#contiguous-text-nodes>).
@@ -9763,17 +12074,5 @@ fn direction_code(direction: &str) -> u8 {
         "forward" => 1,
         "backward" => 2,
         _ => 0,
-    }
-}
-
-/// The form `enctype` keyword for a raw attribute value: the three known
-/// keywords, case-insensitively, with the urlencoded default for a missing or
-/// invalid value
-/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
-fn encoding_keyword(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "multipart/form-data" => "multipart/form-data",
-        "text/plain" => "text/plain",
-        _ => "application/x-www-form-urlencoded",
     }
 }

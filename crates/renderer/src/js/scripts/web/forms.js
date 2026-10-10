@@ -3,18 +3,62 @@
 // Rust binding (docs/engines.md), so this file only reads
 // attributes and the `value` IDL attribute.
 (function() {
-  const ASCII_WHITESPACE = /^[\t\n\f\r ]+|[\t\n\f\r ]+$/g;
+  // Rules for parsing integers, capped at the 32-bit range
+  // (<https://infra.spec.whatwg.org/#rules-for-parsing-integers>).
+  const parseInteger = value => {
+    const text = String(value);
+    let i = 0;
+    while (i < text.length && ' \t\n\f\r'.includes(text[i])) i++;
+    let sign = 1;
+    if (text[i] === '-') { sign = -1; i++; }
+    else if (text[i] === '+') { i++; }
+    const start = i;
+    let result = 0;
+    while (i < text.length && text[i] >= '0' && text[i] <= '9') {
+      result = result * 10 + (text.charCodeAt(i) - 48);
+      if (result > 2147483648) return null;
+      i++;
+    }
+    if (i === start) return null;
+    result *= sign;
+    if (result < -2147483648 || result > 2147483647) return null;
+    // Normalize `-0` to `+0`: SameValue distinguishes them.
+    return result === 0 ? 0 : result;
+  };
 
-  // Rules for parsing non-negative integers
-  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-non-negative-integers>).
+  // Rules for parsing non-negative integers: signed parsing with negatives
+  // rejected, so `-0` still yields `0`
+  // (<https://infra.spec.whatwg.org/#rules-for-parsing-non-negative-integers>).
   const parseNonNegative = value => {
-    const text = String(value).replace(ASCII_WHITESPACE, '');
-    if (text === '' || !/^[0-9]+$/.test(text)) return null;
-    return Number(text);
+    const parsed = parseInteger(value);
+    if (parsed === null || parsed < 0) return null;
+    return parsed;
+  };
+
+  // ASCII case-insensitive lowercase: only A-Z fold. Unicode folding would
+  // wrongly match Kelvin K to `k` or Turkish İ to `i` in enumerated
+  // keywords (<https://infra.spec.whatwg.org/#ascii-case-insensitive>).
+  const asciiLower = value => String(value).replace(/[A-Z]/g, c => c.toLowerCase());
+  // ASCII whitespace stripping only: Unicode `trim()` would strip NBSP and
+  // friends that the infra grammars must reject
+  // (<https://infra.spec.whatwg.org/#ascii-whitespace>).
+  const asciiTrim = value => String(value).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  // Web IDL `DOMString` conversion: `ToString`, which throws on Symbols
+  // (plain `String()` would stringify them instead)
+  // (<https://webidl.spec.whatwg.org/#es-DOMString>).
+  const toDOMString = value => {
+    if (typeof value === 'symbol') {
+      throw new TypeError('Cannot convert a Symbol value to a string');
+    }
+    return String(value);
   };
 
   // Web IDL `long` conversion (<https://webidl.spec.whatwg.org/#es-long>).
   const toLong = value => {
+    // Explicit `Number()` converts BigInts; WebIDL's `ToNumber` throws.
+    if (typeof value === 'bigint') {
+      throw new TypeError('Cannot convert a BigInt value to a number');
+    }
     let number = Number(value);
     if (!Number.isFinite(number)) number = 0;
     return Math.trunc(number) | 0;
@@ -211,7 +255,7 @@
       // A comma separates addresses only with the `multiple` attribute
       // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-multiple>).
       if (element.hasAttribute('multiple')) {
-        return value.split(',').some(part => !address.test(part.trim()));
+        return value.split(',').some(part => !address.test(asciiTrim(part)));
       }
       return !address.test(value);
     }
@@ -266,7 +310,7 @@
     // For a multiple email control the pattern applies to each address
     // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-multiple>).
     if (inputType(element) === 'email' && element.hasAttribute('multiple')) {
-      return element.value.split(',').some(part => !expression.test(part.trim()));
+      return element.value.split(',').some(part => !expression.test(asciiTrim(part)));
     }
     return !expression.test(element.value);
   };
@@ -383,22 +427,22 @@
     const fallback = STEP_DEFAULT[type];
     if (fallback === undefined) return false;
     const rawStep = element.getAttribute('step');
-    if (rawStep !== null && rawStep.trim().toLowerCase() === 'any') return false;
+    if (rawStep !== null && asciiLower(asciiTrim(rawStep)) === 'any') return false;
     if (type === 'number' || type === 'range') {
       // Exact decimal arithmetic: a very small step with a large value loses
       // the fraction in f64
       // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
       const value = parseDecimal(element.value);
       if (value === null) return false;
-      let step = rawStep === null ? null : parseDecimal(rawStep.trim());
+      let step = rawStep === null ? null : parseDecimal(asciiTrim(rawStep));
       if (step === null || step.value <= 0n) step = { value: 1n, scale: 0 };
       // The step base is the min attribute, else the value attribute, else 0.
       let base = null;
       const minText = element.getAttribute('min');
-      if (minText !== null) base = parseDecimal(minText.trim());
+      if (minText !== null) base = parseDecimal(asciiTrim(minText));
       if (base === null) {
         const valueText = element.getAttribute('value');
-        if (valueText !== null) base = parseDecimal(valueText.trim());
+        if (valueText !== null) base = parseDecimal(asciiTrim(valueText));
       }
       if (base === null) base = { value: 0n, scale: 0 };
       const scale = Math.max(value.scale, base.scale, step.scale);
@@ -551,6 +595,11 @@
 
   // Web IDL `unsigned long` conversion.
   const toUnsignedLong = value => {
+    // Explicit `Number()` converts BigInts; WebIDL's `ToNumber` throws
+    // (and `Number(Symbol)` throws already).
+    if (typeof value === 'bigint') {
+      throw new TypeError('Cannot convert a BigInt value to a number');
+    }
     let number = Number(value);
     if (!Number.isFinite(number)) number = 0;
     number = Math.trunc(number);
@@ -673,29 +722,20 @@
       return parsed === null || parsed === 0 ? fallback : parsed;
     },
     set: function(value) {
-      this.setAttribute(name, String(toUnsignedLong(value)));
+      const unsigned = toUnsignedLong(value);
+      this.setAttribute(name, String(unsigned === 0 || unsigned > 2147483647 ? fallback : unsigned));
     },
     enumerable: true,
     configurable: true,
   });
 
   if (globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype) {
+    // `rows`/`cols` are numeric `[Reflect]` the generator does not
+    // auto-generate, so this shim owns them until it does. (`wrap` is plain
+    // string `[Reflect]` and stays generated in Rust: no shim here.)
     Object.defineProperties(globalThis.HTMLTextAreaElement.prototype, {
       rows: positiveFallback('rows', 2),
       cols: positiveFallback('cols', 20),
-      // `[Reflect]`; the enumerated missing value default is Soft
-      // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-wrap>).
-      wrap: {
-        get: function() {
-          const raw = this.getAttribute('wrap');
-          return raw === null ? 'soft' : raw;
-        },
-        set: function(value) {
-          this.setAttribute('wrap', String(value));
-        },
-        enumerable: true,
-        configurable: true,
-      },
     });
   }
 
@@ -911,11 +951,11 @@
   };
 
   const methodKeyword = raw => {
-    const value = String(raw).trim().toLowerCase();
+    const value = asciiLower(asciiTrim(raw));
     return (value === 'post' || value === 'dialog') ? value : 'get';
   };
   const enctypeKeyword = raw => {
-    const value = String(raw).trim().toLowerCase();
+    const value = asciiLower(asciiTrim(raw));
     if (value === 'multipart/form-data' || value === 'text/plain') return value;
     return 'application/x-www-form-urlencoded';
   };
@@ -1073,19 +1113,21 @@
   });
 
   Object.defineProperties(globalThis.HTMLSelectElement.prototype, {
-    // `[Reflect, ReflectDefault=0] attribute unsigned long size` with the
-    // rules for parsing non-negative integers
+    // `[Reflect, ReflectDefault=0] attribute unsigned long size`: numeric
+    // `[Reflect]` is not auto-generated, so this shim owns the property
+    // until the generator lowers it (like `rows`/`cols` below). The getter
+    // parses non-negative integers, defaulting to 0
     // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-size>).
     size: {
       get: function() {
         const raw = this.getAttribute('size');
-        const match = raw === null ? null : /^[\t\n\f\r ]*\+?([0-9]+)/.exec(raw);
-        const parsed = match === null ? null : Number(match[1]);
-        return parsed !== null && parsed <= 2147483647 ? parsed : 0;
+        if (raw === null) return 0;
+        const parsed = parseNonNegative(raw);
+        return parsed === null ? 0 : parsed;
       },
       set: function(value) {
-        const unsigned = (+value) >>> 0;
-        this.setAttribute('size', String(unsigned <= 2147483647 ? unsigned : 0));
+        const unsigned = toUnsignedLong(value);
+        this.setAttribute('size', String(unsigned > 2147483647 ? 0 : unsigned));
       },
       enumerable: true, configurable: true,
     },
@@ -1336,10 +1378,10 @@
       throw new DOMException('stepUp is not applicable', 'InvalidStateError');
     }
     const raw = element.getAttribute('step');
-    if (raw !== null && raw.trim().toLowerCase() === 'any') {
+    if (raw !== null && asciiLower(asciiTrim(raw)) === 'any') {
       throw new DOMException('step is any', 'InvalidStateError');
     }
-    let step = raw === null ? fallback : Number(raw);
+    let step = raw === null ? fallback : Number(asciiTrim(raw));
     if (Number.isNaN(step) || step <= 0) step = fallback;
     const min = parseValue(type, element.getAttribute('min'));
     const max = parseValue(type, element.getAttribute('max'));
@@ -1384,11 +1426,11 @@
       configurable: true,
     },
     stepUp: {
-      value: function(count) { stepBy(this, count === undefined ? 1 : Math.trunc(Number(count)), 1); },
+      value: function(count) { stepBy(this, count === undefined ? 1 : toLong(count), 1); },
       writable: true, enumerable: true, configurable: true,
     },
     stepDown: {
-      value: function(count) { stepBy(this, count === undefined ? 1 : Math.trunc(Number(count)), -1); },
+      value: function(count) { stepBy(this, count === undefined ? 1 : toLong(count), -1); },
       writable: true, enumerable: true, configurable: true,
     },
   });

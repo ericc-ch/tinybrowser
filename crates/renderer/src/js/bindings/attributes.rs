@@ -1776,6 +1776,13 @@ pub(crate) fn remove_attribute_sync(
     if let Some((name, value)) = removed {
         let namespace = name.ns.as_ref().to_owned();
         let local = name.local.as_ref().to_owned();
+        // The nonce attribute change steps reset the cryptographic nonce
+        // slot on removal (value `null`); only the null-namespace attribute
+        // participates
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+        if local == "nonce" && namespace.is_empty() {
+            world_rc.borrow_mut().nonce_slots.remove(&element);
+        }
         let registry = world_rc.borrow().registry();
         registry
             .borrow_mut()
@@ -1897,6 +1904,16 @@ pub(crate) fn set_attribute_sync(
     });
     drop(parsed);
     drop(world);
+    if local == "nonce" {
+        // The content attribute feeds the cryptographic nonce slot, so a
+        // later IDL read answers the attribute value until the IDL setter
+        // overrides it
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+        world_rc
+            .borrow_mut()
+            .nonce_slots
+            .insert(element, value.to_owned());
+    }
     touch_attr(ctx, element, &namespace, local, value)?;
     after_attribute_change(ctx, element, local)?;
     schedule_mutation_delivery(ctx)

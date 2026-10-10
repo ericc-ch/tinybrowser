@@ -819,6 +819,19 @@ pub(crate) struct World {
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
     pub(crate) image_broken: HashSet<NodeId>,
+    /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
+    /// without touching the content attribute
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+    /// Invariant: the slot mirrors the spec's [[CryptographicNonce]].
+    /// Content-attribute writes feed it through `set_attribute_sync`, and
+    /// removals clear it through `remove_attribute_sync` (the attribute
+    /// change steps, where `null` resets the slot). Parser-created `nonce`
+    /// attributes bypass both hooks, so a missing entry falls back to the
+    /// content attribute in `nonce_of` — which matches the spec state for
+    /// every transition except a remove-after-parse with no intervening
+    /// write, closed by clearing on removal. Clones copy the slot, adopts
+    /// retarget it, and `forget_document` drops a dead document's entries.
+    pub(crate) nonce_slots: HashMap<NodeId, String>,
 }
 
 /// One streaming `TextDecoder` session: the decoder plus what recreates it.
@@ -932,6 +945,7 @@ impl World {
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
             image_broken: HashSet::new(),
+            nonce_slots: HashMap::new(),
         }
     }
 
@@ -996,6 +1010,7 @@ impl World {
     fn drop_active_document(&mut self) {
         if let Some(old) = self.document.take() {
             self.owned.remove(&old);
+            self.nonce_slots.retain(|node, _| node.document != old);
             self.runtime.documents.borrow_mut().remove(old);
             self.runtime.registry.borrow_mut().forget_document(old);
         }
@@ -1007,6 +1022,7 @@ impl World {
         for id in self.owned.drain() {
             self.runtime.documents.borrow_mut().remove(id);
             self.runtime.registry.borrow_mut().forget_document(id);
+            self.nonce_slots.retain(|node, _| node.document != id);
             self.handler_attributes
                 .retain(|(node, _), _| node.is_some_and(|node| node.document_id() != id));
             self.cleared_handlers
