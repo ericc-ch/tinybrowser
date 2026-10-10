@@ -1897,6 +1897,16 @@ pub(crate) fn set_attribute_sync(
     });
     drop(parsed);
     drop(world);
+    if local == "nonce" {
+        // The content attribute feeds the cryptographic nonce slot, so a
+        // later IDL read answers the attribute value until the IDL setter
+        // overrides it
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+        world_rc
+            .borrow_mut()
+            .nonce_slots
+            .insert(element, value.to_owned());
+    }
     touch_attr(ctx, element, &namespace, local, value)?;
     after_attribute_change(ctx, element, local)?;
     schedule_mutation_delivery(ctx)

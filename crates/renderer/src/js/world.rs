@@ -819,6 +819,10 @@ pub(crate) struct World {
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
     pub(crate) image_broken: HashSet<NodeId>,
+    /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
+    /// without touching the content attribute
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+    pub(crate) nonce_slots: HashMap<NodeId, String>,
 }
 
 /// One streaming `TextDecoder` session: the decoder plus what recreates it.
@@ -932,6 +936,7 @@ impl World {
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
             image_broken: HashSet::new(),
+            nonce_slots: HashMap::new(),
         }
     }
 

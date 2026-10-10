@@ -431,13 +431,18 @@ fn mixin_implementations_install_on_includers() {
         name: "dom.idl",
         text: "[Exposed=Window] interface Node {}; [Exposed=Window] interface Element {}; [Exposed=Window] interface Document {}; interface mixin Nodes { undefined append((Node or DOMString)... nodes); }; Element includes Nodes; Document includes Nodes;",
     }];
+    // Install targets are the implemented includers: an included interface
+    // without an implementation has no global to install onto.
     let rust = [Source {
         name: "nodes.rs",
-        text: "#[rquickjs::class] struct Payload; impl<'js> nodes_generated::Nodes<'js> for Payload { fn append(&self, ctx: Ctx<'js>, nodes: Vec<nodes_generated::DOMStringOrNode>) -> Result<()> { Ok(()) } }",
+        text: "#[rquickjs::class] struct Payload; impl<'js> nodes_generated::Nodes<'js> for Payload { fn append(&self, ctx: Ctx<'js>, nodes: Vec<nodes_generated::DOMStringOrNode>) -> Result<()> { Ok(()) } } impl<'js> element_generated::Element<'js> for Payload {} impl<'js> document_generated::Document<'js> for Payload {}",
     }];
     let bindings = compile_contracts(&idl, &rust).expect("compile mixin");
-    assert_eq!(bindings[0].interface, "Nodes");
-    let source = bindings[0].rust.replace(' ', "");
+    let binding = bindings
+        .iter()
+        .find(|binding| binding.interface == "Nodes")
+        .expect("mixin binding");
+    let source = binding.rust.replace(' ', "");
     for target in ["Element", "Document"] {
         assert!(
             source.contains(&format!("ctx.globals().get(\"{target}\")")),

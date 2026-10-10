@@ -3,14 +3,35 @@
 // Rust binding (docs/engines.md), so this file only reads
 // attributes and the `value` IDL attribute.
 (function() {
-  const ASCII_WHITESPACE = /^[\t\n\f\r ]+|[\t\n\f\r ]+$/g;
+  // Rules for parsing integers, capped at the 32-bit range
+  // (<https://infra.spec.whatwg.org/#rules-for-parsing-integers>).
+  const parseInteger = value => {
+    const text = String(value);
+    let i = 0;
+    while (i < text.length && ' \t\n\f\r'.includes(text[i])) i++;
+    let sign = 1;
+    if (text[i] === '-') { sign = -1; i++; }
+    else if (text[i] === '+') { i++; }
+    const start = i;
+    let result = 0;
+    while (i < text.length && text[i] >= '0' && text[i] <= '9') {
+      result = result * 10 + (text.charCodeAt(i) - 48);
+      if (result > 2147483648) return null;
+      i++;
+    }
+    if (i === start) return null;
+    result *= sign;
+    if (result < -2147483648 || result > 2147483647) return null;
+    return result === 0 ? 0 : result;
+  };
 
-  // Rules for parsing non-negative integers
-  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-non-negative-integers>).
+  // Rules for parsing non-negative integers: signed parsing with negatives
+  // rejected, so `-0` still yields `0`
+  // (<https://infra.spec.whatwg.org/#rules-for-parsing-non-negative-integers>).
   const parseNonNegative = value => {
-    const text = String(value).replace(ASCII_WHITESPACE, '');
-    if (text === '' || !/^[0-9]+$/.test(text)) return null;
-    return Number(text);
+    const parsed = parseInteger(value);
+    if (parsed === null || parsed < 0) return null;
+    return parsed;
   };
 
   // Web IDL `long` conversion (<https://webidl.spec.whatwg.org/#es-long>).
@@ -673,7 +694,8 @@
       return parsed === null || parsed === 0 ? fallback : parsed;
     },
     set: function(value) {
-      this.setAttribute(name, String(toUnsignedLong(value)));
+      const unsigned = toUnsignedLong(value);
+      this.setAttribute(name, String(unsigned === 0 || unsigned > 2147483647 ? fallback : unsigned));
     },
     enumerable: true,
     configurable: true,
@@ -683,12 +705,12 @@
     Object.defineProperties(globalThis.HTMLTextAreaElement.prototype, {
       rows: positiveFallback('rows', 2),
       cols: positiveFallback('cols', 20),
-      // `[Reflect]`; the enumerated missing value default is Soft
+      // `wrap` is plain string reflection
       // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-wrap>).
       wrap: {
         get: function() {
           const raw = this.getAttribute('wrap');
-          return raw === null ? 'soft' : raw;
+          return raw === null ? '' : raw;
         },
         set: function(value) {
           this.setAttribute('wrap', String(value));

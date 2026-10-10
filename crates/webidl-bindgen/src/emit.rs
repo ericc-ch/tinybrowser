@@ -926,11 +926,52 @@ fn setter_dispatch(
 fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenStream {
     let id = index * 2 + 2;
     let convert = match attribute.return_type {
+        ReturnType::String | ReturnType::UsvString if attribute.legacy_null_to_empty => {
+            quote! { host::legacy_null_string_argument(params, 0)? }
+        }
         ReturnType::String | ReturnType::UsvString => {
             quote! { host::string_argument(params, 0, None)? }
         }
         // https://webidl.spec.whatwg.org/#es-boolean
         ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
+        // https://webidl.spec.whatwg.org/#es-long
+        ReturnType::Long => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                converted.0
+            }
+        },
+        // https://webidl.spec.whatwg.org/#es-unsigned-long
+        ReturnType::UnsignedLong => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                converted.0.cast_unsigned()
+            }
+        },
+        // https://webidl.spec.whatwg.org/#es-double
+        ReturnType::Double => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+                converted.0
+            }
+        },
+        // Restricted `double` rejects NaN and infinities.
+        ReturnType::RestrictedDouble => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+                if !converted.0.is_finite() {
+                    return Err(rquickjs::Exception::throw_type(
+                        &ctx,
+                        "finite double required",
+                    ));
+                }
+                converted.0
+            }
+        },
         _ => unreachable!("validated reflect mapping"),
     };
     let write = match attribute.return_type {
@@ -939,6 +980,15 @@ fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenSt
         },
         ReturnType::Boolean => quote! {
             host::reflect_set_bool(&ctx, receiver.node_id(), #content, value)?;
+        },
+        ReturnType::Long => quote! {
+            host::reflect_set_long(&ctx, receiver.node_id(), #content, value)?;
+        },
+        ReturnType::UnsignedLong => quote! {
+            host::reflect_set_ulong(&ctx, receiver.node_id(), #content, value)?;
+        },
+        ReturnType::Double | ReturnType::RestrictedDouble => quote! {
+            host::reflect_set_double(&ctx, receiver.node_id(), #content, value)?;
         },
         _ => unreachable!("validated reflect mapping"),
     };

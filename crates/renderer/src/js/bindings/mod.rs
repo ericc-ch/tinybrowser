@@ -915,7 +915,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("bdo", "HTMLElement"),
     ("bgsound", "HTMLElement"),
     ("big", "HTMLElement"),
-    ("blockquote", "HTMLElement"),
+    ("blockquote", "HTMLQuoteElement"),
     ("body", "HTMLBodyElement"),
     ("br", "HTMLBRElement"),
     ("button", "HTMLButtonElement"),
@@ -930,7 +930,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("datalist", "HTMLDataListElement"),
     ("dd", "HTMLElement"),
     ("del", "HTMLModElement"),
-    ("details", "HTMLElement"),
+    ("details", "HTMLDetailsElement"),
     ("dfn", "HTMLElement"),
     ("dialog", "HTMLDialogElement"),
     ("dir", "HTMLDirectoryElement"),
@@ -971,7 +971,8 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("main", "HTMLElement"),
     ("map", "HTMLMapElement"),
     ("mark", "HTMLElement"),
-    ("marquee", "HTMLElement"),
+    ("marquee", "HTMLMarqueeElement"),
+    ("menu", "HTMLMenuElement"),
     ("meta", "HTMLMetaElement"),
     ("meter", "HTMLMeterElement"),
     ("nav", "HTMLElement"),
@@ -985,6 +986,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("output", "HTMLOutputElement"),
     ("p", "HTMLParagraphElement"),
     ("param", "HTMLParamElement"),
+    ("picture", "HTMLPictureElement"),
     ("pre", "HTMLPreElement"),
     ("progress", "HTMLProgressElement"),
     ("q", "HTMLQuoteElement"),
@@ -1011,7 +1013,9 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("td", "HTMLTableCellElement"),
     ("template", "HTMLTemplateElement"),
     ("textarea", "HTMLTextAreaElement"),
+    ("tfoot", "HTMLTableSectionElement"),
     ("th", "HTMLTableCellElement"),
+    ("thead", "HTMLTableSectionElement"),
     ("time", "HTMLTimeElement"),
     ("title", "HTMLTitleElement"),
     ("tr", "HTMLTableRowElement"),
@@ -1381,28 +1385,136 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
     Ok(rquickjs::String::from_str(ctx.clone(), text)?.into_value())
 }
 
-/// The HTML rules for parsing non-negative integers: skip ASCII whitespace,
-/// require an ASCII digit, then consume digits (modulo 2^32) and ignore
-/// whatever follows them
+/// The HTML rules for parsing non-negative integers (ASCII whitespace,
+/// an optional `+`, ASCII digits with trailing garbage ignored), capped at
+/// 2^31 - 1 like unsigned-long reflection: larger values fail, `-0` still
+/// yields `0`
 /// (<https://infra.spec.whatwg.org/#rules-for-parsing-non-negative-integers>).
-///
-/// Divergence: Chromium returns the reflection default for values that
-/// overflow `unsigned long` (a canvas `width="4294967296"` reads 300 there)
-/// where the IDL conversion wraps to 0.
 pub(crate) fn parse_non_negative_integer(value: &str) -> Option<u32> {
+    match parse_integer(value)? {
+        0 => Some(0),
+        parsed @ 1..=2147483647 => u32::try_from(parsed).ok(),
+        _ => None,
+    }
+}
+
+/// ASCII whitespace for the HTML parsing rules: space, tab, LF, FF, CR.
+/// Notably not vertical tab or other Unicode spaces, which stop parsing
+/// instead of being skipped
+/// (<https://infra.spec.whatwg.org/#ascii-whitespace>).
+fn is_html_whitespace(char: Option<&char>) -> bool {
+    matches!(char, Some(' ' | '\t' | '\n' | '\u{c}' | '\r'))
+}
+
+/// The HTML rules for parsing integers: skip ASCII whitespace, take an
+/// optional sign, require an ASCII digit, then consume digits and ignore
+/// whatever follows them
+/// (<https://infra.spec.whatwg.org/#rules-for-parsing-integers>).
+///
+/// Overflow bails to `None` like a parse failure: reflection sites map both
+/// to the IDL default, so the distinction is unobservable there.
+pub(crate) fn parse_integer(value: &str) -> Option<i32> {
     let mut chars = value.chars().peekable();
-    while chars.peek().is_some_and(char::is_ascii_whitespace) {
+    while is_html_whitespace(chars.peek()) {
         chars.next();
+    }
+    let mut sign: i64 = 1;
+    match chars.peek() {
+        Some('-') => {
+            sign = -1;
+            chars.next();
+        }
+        Some('+') => {
+            chars.next();
+        }
+        _ => {}
     }
     if !chars.peek().is_some_and(char::is_ascii_digit) {
         return None;
     }
-    let mut result = 0_u32;
+    let mut result: i64 = 0;
     while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
-        result = result.wrapping_mul(10).wrapping_add(digit);
+        result = result
+            .checked_mul(10)?
+            .checked_add(i64::from(digit))?;
         chars.next();
     }
-    Some(result)
+    let result = result.checked_mul(sign)?;
+    i32::try_from(result).ok()
+}
+
+/// The HTML rules for parsing floating-point number values: skip ASCII
+/// whitespace, take an optional sign, read an integer and fraction part,
+/// then an optional exponent; trailing garbage is ignored
+/// (<https://infra.spec.whatwg.org/#rules-for-parsing-floating-point-number-values>).
+///
+/// Failure and non-finite results both bail to `None`: reflection sites map
+/// either to the IDL default.
+pub(crate) fn parse_double(value: &str) -> Option<f64> {
+    let mut chars = value.chars().peekable();
+    while is_html_whitespace(chars.peek()) {
+        chars.next();
+    }
+    let mut sign = 1.0;
+    match chars.peek() {
+        Some('-') => {
+            sign = -1.0;
+            chars.next();
+        }
+        Some('+') => {
+            chars.next();
+        }
+        _ => {}
+    }
+    let mut integer = 0.0;
+    let mut integer_digits = 0_u32;
+    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+        integer = integer * 10.0 + f64::from(digit);
+        integer_digits += 1;
+        chars.next();
+    }
+    let mut fraction = 0.0;
+    let mut fraction_digits = 0_u32;
+    if chars.peek() == Some(&'.') {
+        chars.next();
+        let mut divisor = 10.0;
+        while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+            fraction += f64::from(digit) / divisor;
+            divisor *= 10.0;
+            fraction_digits += 1;
+            chars.next();
+        }
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return None;
+    }
+    let mut result = sign * (integer + fraction);
+    if chars.peek().is_some_and(|c| *c == 'e' || *c == 'E') {
+        let mut probe = chars.clone();
+        probe.next();
+        let mut exponent_sign = 1.0;
+        match probe.peek() {
+            Some('-') => {
+                exponent_sign = -1.0;
+                probe.next();
+            }
+            Some('+') => {
+                probe.next();
+            }
+            _ => {}
+        }
+        let mut exponent = 0_i32;
+        let mut exponent_digits = 0_u32;
+        while let Some(digit) = probe.peek().and_then(|c| c.to_digit(10)) {
+            exponent = exponent.saturating_mul(10).saturating_add(digit as i32);
+            exponent_digits += 1;
+            probe.next();
+        }
+        if exponent_digits > 0 {
+            result *= 10_f64.powf(exponent_sign * f64::from(exponent));
+        }
+    }
+    if result.is_finite() { Some(result) } else { None }
 }
 
 /// Rebinds the `document` global to the realm world's active document. A realm

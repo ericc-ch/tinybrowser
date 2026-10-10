@@ -209,6 +209,7 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             *usage.entry(payload.to_string()).or_default() += 1;
         }
     }
+    let implemented: BTreeSet<String> = implementations.keys().cloned().collect();
     implementations
         .into_values()
         .map(|mut implementation| {
@@ -218,7 +219,7 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             } else {
                 InterfaceKind::Complete
             };
-            let interface = lower(&database, &implementation, kind)
+            let interface = lower(&database, &implementation, kind, &implemented)
                 .map_err(|error| Error(format!("{}: {error}", implementation.interface)))?;
             let syntax = syn::parse2(crate::emit::interface(&interface))
                 .map_err(|error| Error(format!("invalid generated contract: {error}")))?;
@@ -411,11 +412,12 @@ fn lower(
     database: &Database<'_>,
     implementation: &Implementation,
     kind: InterfaceKind,
+    implemented: &BTreeSet<String>,
 ) -> Result<model::Interface, Error> {
     // Mixins have no interface object; their members install on every
     // including interface's prototype, derived from the IDL includes.
     if let Ok(mixin) = database.mixin(&implementation.interface) {
-        return lower_mixin(database, implementation, kind, &mixin);
+        return lower_mixin(database, implementation, kind, &mixin, implemented);
     }
     let declaration = database.interface(&implementation.interface)?;
     validate_interface_attributes(declaration.attributes.as_ref())?;
@@ -464,13 +466,17 @@ fn lower(
 }
 
 /// Lower a mixin implementation. The mixin itself has no prototype; the
-/// generated installer targets every interface that includes it, resolved
-/// from the imported includes statements rather than a handwritten list.
+/// generated installer targets every implemented interface that includes
+/// it, resolved from the imported includes statements rather than a
+/// handwritten list. Included interfaces without an implementation have no
+/// global to install onto, so they are excluded rather than failing the
+/// install at runtime.
 fn lower_mixin(
     database: &Database<'_>,
     implementation: &Implementation,
     kind: InterfaceKind,
     mixin: &crate::database::Mixin<'_>,
+    implemented: &BTreeSet<String>,
 ) -> Result<model::Interface, Error> {
     if !matches!(kind, InterfaceKind::Partial) {
         return Err(Error(format!(
@@ -495,12 +501,16 @@ fn lower_mixin(
         properties: PropertyHooks::None,
         stringifier: None,
         indexed_setter: None,
-        install_targets: database.includers(&implementation.interface),
+        install_targets: database
+            .includers(&implementation.interface)
+            .into_iter()
+            .filter(|includer| implemented.contains(includer))
+            .collect(),
         contract: None,
     };
     if interface.install_targets.is_empty() {
         return Err(Error(format!(
-            "{}: mixin is included by no interface",
+            "{}: mixin is included by no implemented interface",
             implementation.interface
         )));
     }
@@ -1551,10 +1561,13 @@ fn lower_attribute(
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
     // Reflected attributes install without implementation methods, so
-    // resolve them before the implemented-member checks below. Other
-    // members keep skip-if-unimplemented semantics.
-    if let Some(content) = reflect_content(member.attributes.as_ref(), member.identifier.0) {
-        return lower_reflect_attribute(member, &content, implemented);
+    // resolve them before the implemented-member checks below. Shapes the
+    // generator does not auto-generate fall through to the normal method
+    // path when implemented, so hand-written getters encode the spec
+    // algorithm. Other members keep skip-if-unimplemented semantics.
+    if let Some(content) = reflect_content(member.attributes.as_ref(), member.identifier.0)
+        && let Some(lowered) = lower_reflect_attribute(member, &content, implemented)? {
+        return Ok(Some(lowered));
     }
     // `ReflectSetter` reflects on set while the getter stays custom: the
     // implementation provides the getter, the generator owns the setter.
@@ -1562,9 +1575,11 @@ fn lower_attribute(
         return lower_reflect_setter_attribute(database, member, &content, implemented);
     }
     // `ReflectURL` resolves the content attribute against the document base
-    // on get and reflects plainly on set, fully generated.
-    if let Some(content) = reflect_url_content(member.attributes.as_ref(), member.identifier.0) {
-        return lower_reflect_url_attribute(member, &content, implemented);
+    // on get and reflects plainly on set, fully generated. Non-`USVString`
+    // shapes (like `object.codeBase`) fall through for hand implementation.
+    if let Some(content) = reflect_url_content(member.attributes.as_ref(), member.identifier.0)
+        && let Some(lowered) = lower_reflect_url_attribute(member, &content, implemented)? {
+        return Ok(Some(lowered));
     }
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
@@ -1830,9 +1845,19 @@ fn lower_reflect_setter_attribute(
         )));
     }
     // The setter writes a string, so only string-family getters pair with
-    // it.
+    // it. `long`, `unsigned long`, and `double` pair too: the setter
+    // converts the number and writes its decimal form (used by `tabindex`,
+    // dimension attributes, and meter/progress values).
     let type_ = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
-    if !matches!(type_, ReturnType::String | ReturnType::UsvString) {
+    if !matches!(
+        type_,
+        ReturnType::String
+            | ReturnType::UsvString
+            | ReturnType::Long
+            | ReturnType::UnsignedLong
+            | ReturnType::Double
+            | ReturnType::RestrictedDouble
+    ) {
         return Err(Error(format!(
             "{}: reflect setter type is not supported yet",
             member.identifier.0
@@ -1845,12 +1870,7 @@ fn lower_reflect_setter_attribute(
         )));
     }
     let getter = format_ident!("{getter_name}");
-    let returns = if matches!(type_, ReturnType::UsvString) {
-        quote! { crate::dom_string::DomString }
-    } else {
-        quote! { rquickjs::String<'js> }
-    };
-    let signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#returns>; };
+    let signature = reflect_setter_signature(&getter, &type_);
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
         rust: getter,
@@ -1882,18 +1902,55 @@ fn check_method_signature(
     Ok(())
 }
 
+/// The trait signature for a `[ReflectSetter]` getter: the getter stays
+/// hand-written while the setter is generated, so each supported type
+/// names its own return.
+fn reflect_setter_signature(
+    getter: &proc_macro2::Ident,
+    type_: &ReturnType,
+) -> proc_macro2::TokenStream {
+    let returns = match type_ {
+        ReturnType::UsvString => quote! { crate::dom_string::DomString },
+        ReturnType::String => quote! { rquickjs::String<'js> },
+        ReturnType::Long => quote! { i32 },
+        ReturnType::UnsignedLong => quote! { u32 },
+        ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
+        _ => unreachable!("validated reflect setter mapping"),
+    };
+    quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#returns>; }
+}
+
 /// Lower a `[Reflect]` attribute to generated content-attribute access.
 /// The trait carries no method and the implementation provides none: like
 /// Chromium's generated reflectors, the binding is complete by itself.
-/// Claiming a reflected name with implementation methods fails the build,
-/// so a custom algorithm cannot silently replace the reflection.
-/// Unsupported reflect shapes without implementation methods are absent
-/// until the generator grows them, like any unimplemented member.
+/// Claiming an auto-generatable reflected name with implementation methods
+/// fails the build, so a custom algorithm cannot silently replace the
+/// reflection. Shapes the generator does not auto-generate (numeric
+/// reflection with spec-prose defaults, `LegacyNullToEmptyString` pairs
+/// handled below) fall through to the normal method path when implemented,
+/// so hand-written getters encode the spec algorithm.
 fn lower_reflect_attribute(
     member: &weedle::interface::AttributeInterfaceMember<'_>,
     content: &str,
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    // Auto-generatable shapes first: plain string/boolean, plus `USVString`
+    // under a plain `[Reflect]` (which reflects the raw value exactly like
+    // `DOMString`: `a.ping`, `img.srcset`). Anything else falls through
+    // for hand implementation instead of erroring here.
+    let auto = matches!(
+        &member.type_.type_,
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none()
+    ) || matches!(
+        &member.type_.type_,
+        Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none()
+    ) || matches!(
+        &member.type_.type_,
+        Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none()
+    );
+    if !auto {
+        return Ok(None);
+    }
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
     if implemented.contains_key(&getter_name) || implemented.contains_key(&setter_name) {
@@ -1914,15 +1971,22 @@ fn lower_reflect_attribute(
     validate_argument_attributes(member.type_.attributes.as_ref())?;
     if has_attribute(member.attributes.as_ref(), "SameObject")
         || has_attribute(member.attributes.as_ref(), "PutForwards")
-        || has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
     {
         return Ok(None);
     }
-    // Only plain string and boolean reflection so far; the type needs no
-    // database lookup, keeping reflected members independent of typedefs.
+    // `[LegacyNullToEmptyString]` reflection is auto-generatable: the getter
+    // is plain reflection and the setter converts null to the empty string.
+    let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
+    // Only plain string and boolean reflection so far, plus `USVString`
+    // under a plain `[Reflect]` (which reflects the raw value exactly like
+    // `DOMString`: `a.ping`, `img.srcset`); the type needs no database
+    // lookup, keeping reflected members independent of typedefs.
     let type_ = match &member.type_.type_ {
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
+            ReturnType::String
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none() => {
             ReturnType::String
         }
         Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
@@ -1949,7 +2013,7 @@ fn lower_reflect_attribute(
             content: content.into(),
         },
         setter,
-        legacy_null_to_empty: false,
+        legacy_null_to_empty,
         reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
     };
     Ok(Some((attribute, quote! {})))
@@ -1957,12 +2021,22 @@ fn lower_reflect_attribute(
 
 /// Lower a `[ReflectURL]` attribute to generated content-attribute access
 /// with URL resolution. Like `[Reflect]`, the trait carries no method and
-/// the implementation provides none; claiming the name fails the build.
+/// the implementation provides none for auto-generatable shapes; other
+/// shapes fall through for hand implementation.
 fn lower_reflect_url_attribute(
     member: &weedle::interface::AttributeInterfaceMember<'_>,
     content: &str,
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    // URL reflection resolves a string against the document base; only
+    // `USVString` carries it in-tree. Anything else falls through.
+    let auto = matches!(
+        &member.type_.type_,
+        Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none()
+    );
+    if !auto {
+        return Ok(None);
+    }
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
     if implemented.contains_key(&getter_name) || implemented.contains_key(&setter_name) {
@@ -1988,14 +2062,6 @@ fn lower_reflect_url_attribute(
     {
         return Ok(None);
     }
-    // URL reflection resolves a string against the document base; only
-    // `USVString` carries it in-tree.
-    let type_ = match &member.type_.type_ {
-        Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none() => {
-            ReturnType::UsvString
-        }
-        _ => return Ok(None),
-    };
     validate_attribute_attributes(member.attributes.as_ref())?;
     let getter = format_ident!("{getter_name}");
     let setter = if writable {
@@ -2008,7 +2074,7 @@ fn lower_reflect_url_attribute(
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
         rust: getter,
-        return_type: type_,
+        return_type: ReturnType::UsvString,
         mapping: GetterMapping::ReflectUrl {
             content: content.into(),
         },
@@ -2588,12 +2654,26 @@ fn validate_attribute_attributes(
                             | "Reflect"
                             | "ReflectSetter"
                             | "ReflectURL"
-                    ) => {}
+                    ) =>
+                {
+                }
+                // Numeric reflection parameters (`ReflectDefault`, `ReflectRange`,
+                // `ReflectNonNegative`, `ReflectPositive`, `ReflectPositiveWithFallback`):
+                // hand-written getters encode the spec algorithm, so the normal
+                // method path documents them as consumed here.
                 // `[PutForwards]` lowers to a generated forwarding setter.
                 // `[LegacyUnforgeable]` shapes the instance property in the
                 // interface's own shim, as the legacy path also accepts it;
                 // the generator installs the prototype accessor.
-                ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "PutForwards" => {}
+                ExtendedAttribute::NoArgs(item) if item.0.0.starts_with("Reflect") => {}
+                ExtendedAttribute::Ident(item)
+                    if item.lhs_identifier.0 == "PutForwards"
+                        || item.lhs_identifier.0.starts_with("Reflect") => {}
+                ExtendedAttribute::Decimal(item) if item.lhs_identifier.0.starts_with("Reflect") => {}
+                ExtendedAttribute::ArgList(item) if item.identifier.0.starts_with("Reflect") => {}
+                ExtendedAttribute::IdentList(item) if item.identifier.0.starts_with("Reflect") => {}
+                ExtendedAttribute::NamedArgList(item)
+                    if item.lhs_identifier.0.starts_with("Reflect") => {}
                 ExtendedAttribute::String(item) if item.lhs_identifier.0 == "Reflect" => {}
                 _ => {
                     return Err(Error(format!(
