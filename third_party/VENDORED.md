@@ -85,7 +85,7 @@ exception is the JS engine forks below, which do ship.
   `html/syntax/parsing/`.
 - **Upstream**: <https://github.com/web-platform-tests/wpt>, git submodule
   (`third_party/wpt`), full file tree at the pin below.
-- **Pinned revision**: `92054a74d0c6a1ed2e9024d71ebf2880f2af02e2`
+- **Pinned revision**: `9f868fd730423a984c45f32e6d524db9da9e21a5`
 - **License**: each test's own license; see WPT `LICENSE.md`.
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Driver**: classic WebDriver on `tinybrowser webdriver --port=PORT` over
