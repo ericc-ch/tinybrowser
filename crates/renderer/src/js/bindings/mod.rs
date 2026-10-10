@@ -14,6 +14,7 @@ mod exceptions;
 mod focus;
 pub(crate) mod forms;
 pub(crate) mod host;
+mod inner_text;
 mod messaging;
 mod mutation;
 mod node;

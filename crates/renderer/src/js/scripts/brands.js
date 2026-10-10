@@ -126,7 +126,7 @@
   const ShadowRootInterface = define('ShadowRoot', DocumentFragmentInterface, [
     'host', 'mode', 'innerHTML', 'activeElement'
   ]);
-  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur', 'innerText'], true);
+  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur', 'innerText', 'outerText'], true);
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
   const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);

@@ -3545,10 +3545,53 @@ fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
     Ok(world.borrow().images.get(&id).copied())
 }
 
+/// Splits a rendered-text setter value into text and `br` nodes: `\r\n`
+/// and lone `\r` become `\n`, then every newline becomes a `br` with no
+/// empty text around it. When `pad_empty` and the value is all-empty, yields
+/// one empty text node (outerText must create a node even for `""`;
+/// innerText asserts no empty children instead).
+fn rendered_text_fragment(
+    parsed: &mut crate::Parsed,
+    value: &str,
+    pad_empty: bool,
+) -> Vec<NodeId> {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.is_empty() {
+        if !pad_empty {
+            return Vec::new();
+        }
+        let node = parsed.document.create_text(&DomString::default());
+        return vec![NodeId {
+            document: parsed.id,
+            node,
+        }];
+    }
+    let mut added = Vec::new();
+    for (index, part) in normalized.split('\n').enumerate() {
+        if index > 0 {
+            let br = parsed.document.base.mutate().create_element(
+                QualName::new(None, html_namespace(), LocalName::from("br")),
+                Vec::new(),
+            );
+            added.push(NodeId {
+                document: parsed.id,
+                node: br,
+            });
+        }
+        if !part.is_empty() {
+            let node = parsed.document.create_text(&DomString::from(part));
+            added.push(NodeId {
+                document: parsed.id,
+                node,
+            });
+        }
+    }
+    added
+}
+
 /// Current viewport offset for `id`'s document.
 /// <https://drafts.csswg.org/cssom-view/#scrolling-viewport>
-fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {
-    let world = world_for_node(ctx, id)?;
+fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {    let world = world_for_node(ctx, id)?;
     let world = world.borrow();
     let Some(parsed) = world.document(id) else {
         return Ok((0.0, 0.0));
@@ -5519,18 +5562,106 @@ impl JsNode {
     /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
     #[qjs(get, rename = "innerText")]
     fn inner_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        match self.text_content(&ctx)? {
-            Some(value) => Ok(value),
-            None => rquickjs::String::from_str(ctx, ""),
-        }
+        let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx, &text)
     }
 
-    /// Not-being-rendered innerText replace-all with one text node. Converting
-    /// newlines to `br` is the rendered-text-fragment path and a known gap
+    /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    #[qjs(get, rename = "outerText")]
+    fn outer_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx, &text)
+    }
+
+    /// Setting `outerText` replaces the element with the rendered text
+    /// fragment, then merges with adjacent text siblings (but does not
+    /// fully normalize). Without a parent it throws; the setter is a no-op
+    /// on non-HTML elements, which never install it.
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
+    #[qjs(set, rename = "outerText")]
+    fn set_outer_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let parent = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            world.document(self.handle.0).and_then(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(self.handle.0.node)
+                    .and_then(|node| node.parent)
+                    .map(|parent| NodeId {
+                        document: self.handle.0.document,
+                        node: parent,
+                    })
+            })
+        };
+        let Some(parent) = parent else {
+            return Err(throw_dom(
+                &ctx,
+                "NoModificationAllowedError",
+                "outerText needs a parent",
+            ));
+        };
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let mut added = rendered_text_fragment(&mut parsed, &value.0, true);
+        for child in &added {
+            place_journaled(&mut parsed, parent, *child, Some(self.handle.0));
+        }
+        unlink_journaled(&mut parsed, self.handle.0);
+        // Merge with the previous text sibling, then the following one.
+        if let Some(first) = added.first().copied() {
+            let previous = sibling(&parsed.document.base, first.node, false).map(|node| {
+                NodeId {
+                    document: first.document,
+                    node,
+                }
+            });
+            if let Some(previous) = previous
+                && is_text_node(&parsed.document.base, previous.node)
+                && is_text_node(&parsed.document.base, first.node)
+            {
+                let mut data =
+                    String::from(parsed.document.character_data(previous.node));
+                data.push_str(&String::from(parsed.document.character_data(first.node)));
+                parsed.document.base.mutate().set_node_text(previous.node, &data);
+                unlink_journaled(&mut parsed, first);
+                if added.last() == Some(&first) {
+                    added[0] = previous;
+                } else {
+                    added.remove(0);
+                }
+            }
+        }
+        if let Some(last) = added.last().copied() {
+            let next = sibling(&parsed.document.base, last.node, true).map(|node| NodeId {
+                document: last.document,
+                node,
+            });
+            if let Some(next) = next
+                && is_text_node(&parsed.document.base, next.node)
+                && is_text_node(&parsed.document.base, last.node)
+            {
+                let mut data = String::from(parsed.document.character_data(last.node));
+                data.push_str(&String::from(parsed.document.character_data(next.node)));
+                parsed.document.base.mutate().set_node_text(last.node, &data);
+                unlink_journaled(&mut parsed, next);
+            }
+        }
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    /// Setting `innerText` replaces all children with the rendered text
+    /// fragment: newlines become `br` elements with no empty text around
+    /// them (an all-empty value yields one empty text node)
     /// (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
     #[qjs(set, rename = "innerText")]
-    fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        let html = world(&ctx)?
+    fn set_inner_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {        let html = world(&ctx)?
             .borrow()
             .document(self.handle.0)
             .is_some_and(|parsed| {
@@ -5547,8 +5678,16 @@ impl JsNode {
         if !html {
             return Ok(());
         }
-        let string = rquickjs::String::from_str(ctx.clone(), &value.0)?;
-        self.set_text_content(&ctx, Some(string))
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let added = rendered_text_fragment(&mut parsed, &value.0, false);
+        replace_all_journaled(&world, &mut parsed, self.handle.0, added);
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-insertadjacenthtml
