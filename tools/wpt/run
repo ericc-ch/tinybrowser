@@ -263,6 +263,18 @@ has_option() {
   done
   return 1
 }
+has_option_exact() {
+  # Exact and `opt=value` forms only. See `has_option` for why the
+  # manifest family must not use abbreviation matching.
+  local option="$1" arg
+  shift
+  for arg in "$@"; do
+    if [[ "$arg" == "$option" || "$arg" == "$option="* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 # The test types wpt knows, in one place, in `wpttest.enabled_tests` sort
 # order so the drift check below compares equal strings. Verified against
 # wptrunner/wpttest.py `enabled_tests` at runtime (below) when --test-types
@@ -390,9 +402,9 @@ manifest_path_from_args() {
 }
 MANIFEST_PATH="$(manifest_path_from_args)"
 record_manifest_stamp=0
-if has_option --no-manifest-update "${args[@]}"; then
+if has_option_exact --no-manifest-update "${args[@]}"; then
   :
-elif has_option --manifest-update "${args[@]}"; then
+elif has_option_exact --manifest-update "${args[@]}"; then
   record_manifest_stamp=1
 elif manifest_is_current "$MANIFEST_PATH"; then
   echo "wpt: manifest is current, skipping update" >&2
@@ -571,7 +583,7 @@ fi
 # writes interleave with another run's `uv pip install`.
 venv_held_for_run=0
 if has_option --install-browser "${args[@]}" || has_option --install-webdriver "${args[@]}" \
-  || has_option --manifest-download "${args[@]}" || has_option --install-fonts "${args[@]}"; then
+  || has_option_exact --manifest-download "${args[@]}" || has_option --install-fonts "${args[@]}"; then
   acquire_venv_lock
   venv_held_for_run=1
 fi
