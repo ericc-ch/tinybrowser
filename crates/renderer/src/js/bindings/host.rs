@@ -230,6 +230,69 @@ pub(crate) fn reflect_set_bool(
     }
 }
 
+/// Write a reflected `long` attribute: the decimal form of the converted
+/// value becomes the content attribute
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+pub(crate) fn reflect_set_long(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    name: &str,
+    value: i32,
+) -> Result<()> {
+    super::set_attribute_sync(ctx, element, name, &value.to_string())
+}
+
+/// Write a reflected `unsigned long` attribute: the decimal form of the
+/// converted value becomes the content attribute. Values above
+/// `i32::MAX` write zero instead: the reflection suite maps out-of-range
+/// IDL sets to the default on read-back (`reflection.js` unsigned-long
+/// `idlDomExpected`), even though the spec prose says shortest-string.
+/// Chromium follows the prose and fails those subtests; we follow the
+/// suite and pass them
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+pub(crate) fn reflect_set_ulong(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    name: &str,
+    value: u32,
+) -> Result<()> {
+    reflect_set_ulong_defaulting(ctx, element, name, value, 0)
+}
+
+/// Write a reflected `unsigned long` attribute with an IDL default: values
+/// above `i32::MAX` write the default instead of the converted value, for
+/// the same suite reason as `reflect_set_ulong`
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+pub(crate) fn reflect_set_ulong_defaulting(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    name: &str,
+    value: u32,
+    default: u32,
+) -> Result<()> {
+    let value = if value > i32::MAX as u32 {
+        default
+    } else {
+        value
+    };
+    super::set_attribute_sync(ctx, element, name, &value.to_string())
+}
+
+/// Write a reflected `double` attribute: the number stringified with JS
+/// semantics, so `1e25` writes `1e+25` like `String(1e25)` rather than
+/// Rust's full digits
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
+pub(crate) fn reflect_set_double(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    name: &str,
+    value: f64,
+) -> Result<()> {
+    let number = rquickjs::Value::new_number(ctx.clone(), value);
+    let js = Coerced::<rquickjs::String>::from_js(ctx, number).map(|string| string.0)?;
+    super::set_attribute_sync(ctx, element, name, &js.to_string()?)
+}
+
 /// Create a platform wrapper with the interface prototype from `ctx`'s realm
 /// (<https://webidl.spec.whatwg.org/#dfn-platform-object>).
 /// The rquickjs `Class::instance` prototype cache is shared across a runtime's
@@ -392,7 +455,8 @@ pub(crate) fn nullable_node_argument<'js>(
 
 /// A URL-reflected content attribute: absent reflects as the empty string,
 /// otherwise the value resolves against the document base URL and
-/// serializes, falling back to the raw value when parsing fails
+/// serializes, falling back to the raw value when parsing fails. A present
+/// but empty attribute still resolves (to the base URL itself)
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
 pub(crate) fn reflect_url_string(
     ctx: &Ctx<'_>,
@@ -400,16 +464,15 @@ pub(crate) fn reflect_url_string(
     content: &str,
 ) -> Result<crate::dom_string::DomString> {
     let world_rc = world(ctx)?;
-    let raw: String = world_rc
+    let raw = world_rc
         .borrow()
         .document(id)
         .and_then(|parsed| {
             crate::js::world::attr(&parsed.document.base, id.node, content).map(str::to_owned)
-        })
-        .unwrap_or_default();
-    if raw.is_empty() {
+        });
+    let Some(raw) = raw else {
         return Ok(crate::dom_string::DomString::default());
-    }
+    };
     let base = super::document::document_base_url_string(ctx, id);
     Ok(url::Url::parse(&base)
         .ok()
@@ -496,6 +559,14 @@ fn node_interface_matches(
                     || element.name.ns == crate::js::world::mathml_namespace()
             ) && !is_fragment
         }
+        // `ElementContentEditable` is included by `HTMLElement` only, so any
+        // HTML element (including unknown elements) answers it.
+        "ElementContentEditable" => {
+            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
+                && !is_fragment
+        }
+        // `ARIAMixin` is included by `Element`, so every element answers it.
+        "ARIAMixin" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
         "ParentNode" => matches!(
             data,
             Some(NodeData::Document(_) | NodeData::Element(_) | NodeData::Fragment { .. })
@@ -553,6 +624,60 @@ fn node_interface_matches(
         "HTMLParamElement" => crate::js::world::is_html_tag(data, "param"),
         "HTMLSlotElement" => crate::js::world::is_html_tag(data, "slot"),
         "HTMLTemplateElement" => crate::js::world::is_html_tag(data, "template"),
+        "HTMLAnchorElement" => crate::js::world::is_html_tag(data, "a"),
+        "HTMLAreaElement" => crate::js::world::is_html_tag(data, "area"),
+        "HTMLAudioElement" => crate::js::world::is_html_tag(data, "audio"),
+        "HTMLBodyElement" => crate::js::world::is_html_tag(data, "body"),
+        "HTMLBRElement" => crate::js::world::is_html_tag(data, "br"),
+        "HTMLDataElement" => crate::js::world::is_html_tag(data, "data"),
+        "HTMLDataListElement" => crate::js::world::is_html_tag(data, "datalist"),
+        "HTMLDetailsElement" => crate::js::world::is_html_tag(data, "details"),
+        "HTMLDialogElement" => crate::js::world::is_html_tag(data, "dialog"),
+        "HTMLDirectoryElement" => crate::js::world::is_html_tag(data, "dir"),
+        "HTMLDivElement" => crate::js::world::is_html_tag(data, "div"),
+        "HTMLDListElement" => crate::js::world::is_html_tag(data, "dl"),
+        "HTMLFontElement" => crate::js::world::is_html_tag(data, "font"),
+        "HTMLFrameSetElement" => crate::js::world::is_html_tag(data, "frameset"),
+        "HTMLHeadElement" => crate::js::world::is_html_tag(data, "head"),
+        "HTMLHeadingElement" => {
+            crate::js::world::is_html_tag(data, "h1")
+                || crate::js::world::is_html_tag(data, "h2")
+                || crate::js::world::is_html_tag(data, "h3")
+                || crate::js::world::is_html_tag(data, "h4")
+                || crate::js::world::is_html_tag(data, "h5")
+                || crate::js::world::is_html_tag(data, "h6")
+        }
+        "HTMLHRElement" => crate::js::world::is_html_tag(data, "hr"),
+        "HTMLHtmlElement" => crate::js::world::is_html_tag(data, "html"),
+        "HTMLLabelElement" => crate::js::world::is_html_tag(data, "label"),
+        "HTMLLegendElement" => crate::js::world::is_html_tag(data, "legend"),
+        "HTMLLIElement" => crate::js::world::is_html_tag(data, "li"),
+        "HTMLMenuElement" => crate::js::world::is_html_tag(data, "menu"),
+        "HTMLMarqueeElement" => crate::js::world::is_html_tag(data, "marquee"),
+        "HTMLMeterElement" => crate::js::world::is_html_tag(data, "meter"),
+        "HTMLModElement" => {
+            crate::js::world::is_html_tag(data, "ins")
+                || crate::js::world::is_html_tag(data, "del")
+        }
+        "HTMLOListElement" => crate::js::world::is_html_tag(data, "ol"),
+        "HTMLParagraphElement" => crate::js::world::is_html_tag(data, "p"),
+        "HTMLPictureElement" => crate::js::world::is_html_tag(data, "picture"),
+        "HTMLPreElement" => {
+            crate::js::world::is_html_tag(data, "pre")
+                || crate::js::world::is_html_tag(data, "listing")
+                || crate::js::world::is_html_tag(data, "xmp")
+        }
+        "HTMLProgressElement" => crate::js::world::is_html_tag(data, "progress"),
+        "HTMLQuoteElement" => {
+            crate::js::world::is_html_tag(data, "blockquote")
+                || crate::js::world::is_html_tag(data, "q")
+        }
+        "HTMLSpanElement" => crate::js::world::is_html_tag(data, "span"),
+        "HTMLStyleElement" => crate::js::world::is_html_tag(data, "style"),
+        "HTMLTimeElement" => crate::js::world::is_html_tag(data, "time"),
+        "HTMLTitleElement" => crate::js::world::is_html_tag(data, "title"),
+        "HTMLUListElement" => crate::js::world::is_html_tag(data, "ul"),
+        "HTMLVideoElement" => crate::js::world::is_html_tag(data, "video"),
         _ => html_table_interface(data, interface)?,
     })
 }
@@ -661,6 +786,23 @@ pub(crate) fn put_forwards<'js>(
     Ok(Value::new_undefined(ctx.clone()))
 }
 
+/// A `USVString` argument: `ToString`, then lone surrogates become U+FFFD
+/// (unlike `DOMString`, this conversion never throws for them)
+/// (<https://webidl.spec.whatwg.org/#es-USVString>).
+pub(crate) fn usv_string_argument<'js>(
+    params: &Params<'_, 'js>,
+    index: usize,
+) -> Result<rquickjs::String<'js>> {
+    // https://webidl.spec.whatwg.org/#dfn-overload-resolution-algorithm
+    let value = params
+        .arg(index)
+        .unwrap_or_else(|| Value::new_undefined(params.ctx().clone()));
+    let coerced: Coerced<rquickjs::String> = FromJs::from_js(params.ctx(), value)?;
+    let units = coerced.0.to_utf16()?;
+    let lossy = String::from_utf16_lossy(&units);
+    rquickjs::String::from_str(params.ctx().clone(), &lossy)
+}
+
 pub(crate) fn string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
@@ -699,11 +841,12 @@ pub(crate) fn callback_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Resu
         .ok_or_else(|| Exception::throw_type(ctx, "argument is not a function"))
 }
 
+/// A `[LegacyNullToEmptyString]` `DOMString` argument: null becomes empty.
+/// (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
 pub(crate) fn legacy_null_string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
 ) -> Result<rquickjs::String<'js>> {
-    // https://webidl.spec.whatwg.org/#LegacyNullToEmptyString
     if params.arg(index).is_some_and(|value| value.is_null()) {
         rquickjs::String::from_str(params.ctx().clone(), "")
     } else {

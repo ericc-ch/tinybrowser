@@ -14,6 +14,7 @@ mod exceptions;
 mod focus;
 pub(crate) mod forms;
 pub(crate) mod host;
+mod inner_text;
 mod messaging;
 mod mutation;
 mod node;
@@ -915,7 +916,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("bdo", "HTMLElement"),
     ("bgsound", "HTMLElement"),
     ("big", "HTMLElement"),
-    ("blockquote", "HTMLElement"),
+    ("blockquote", "HTMLQuoteElement"),
     ("body", "HTMLBodyElement"),
     ("br", "HTMLBRElement"),
     ("button", "HTMLButtonElement"),
@@ -930,7 +931,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("datalist", "HTMLDataListElement"),
     ("dd", "HTMLElement"),
     ("del", "HTMLModElement"),
-    ("details", "HTMLElement"),
+    ("details", "HTMLDetailsElement"),
     ("dfn", "HTMLElement"),
     ("dialog", "HTMLDialogElement"),
     ("dir", "HTMLDirectoryElement"),
@@ -968,10 +969,12 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("legend", "HTMLLegendElement"),
     ("li", "HTMLLIElement"),
     ("link", "HTMLLinkElement"),
+    ("listing", "HTMLPreElement"),
     ("main", "HTMLElement"),
     ("map", "HTMLMapElement"),
     ("mark", "HTMLElement"),
-    ("marquee", "HTMLElement"),
+    ("marquee", "HTMLMarqueeElement"),
+    ("menu", "HTMLMenuElement"),
     ("meta", "HTMLMetaElement"),
     ("meter", "HTMLMeterElement"),
     ("nav", "HTMLElement"),
@@ -985,6 +988,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("output", "HTMLOutputElement"),
     ("p", "HTMLParagraphElement"),
     ("param", "HTMLParamElement"),
+    ("picture", "HTMLPictureElement"),
     ("pre", "HTMLPreElement"),
     ("progress", "HTMLProgressElement"),
     ("q", "HTMLQuoteElement"),
@@ -1011,7 +1015,9 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("td", "HTMLTableCellElement"),
     ("template", "HTMLTemplateElement"),
     ("textarea", "HTMLTextAreaElement"),
+    ("tfoot", "HTMLTableSectionElement"),
     ("th", "HTMLTableCellElement"),
+    ("thead", "HTMLTableSectionElement"),
     ("time", "HTMLTimeElement"),
     ("title", "HTMLTitleElement"),
     ("tr", "HTMLTableRowElement"),
@@ -1023,6 +1029,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("var", "HTMLElement"),
     ("video", "HTMLVideoElement"),
     ("wbr", "HTMLElement"),
+    ("xmp", "HTMLPreElement"),
 ];
 
 fn html_element_interface(local: &str) -> &'static str {
@@ -1207,16 +1214,15 @@ fn set_character_data_inner(
         return Ok(());
     };
     let old_value = {
-        let is_character_data =
-            parsed.document.base.get_node(id.node).is_some_and(|node| {
-                matches!(
-                    node.data,
-                    NodeData::Text(_)
-                        | NodeData::Comment { .. }
-                        | NodeData::ProcessingInstruction { .. }
-                        | NodeData::CDataSection { .. }
-                )
-            });
+        let is_character_data = parsed.document.base.get_node(id.node).is_some_and(|node| {
+            matches!(
+                node.data,
+                NodeData::Text(_)
+                    | NodeData::Comment { .. }
+                    | NodeData::ProcessingInstruction { .. }
+                    | NodeData::CDataSection { .. }
+            )
+        });
         if !is_character_data {
             return Ok(());
         }
@@ -1381,28 +1387,118 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
     Ok(rquickjs::String::from_str(ctx.clone(), text)?.into_value())
 }
 
-/// The HTML rules for parsing non-negative integers: skip ASCII whitespace,
-/// require an ASCII digit, then consume digits (modulo 2^32) and ignore
-/// whatever follows them
+/// The HTML rules for parsing non-negative integers (ASCII whitespace,
+/// an optional `+`, ASCII digits with trailing garbage ignored), capped at
+/// 2^31 - 1 like unsigned-long reflection: larger values fail, `-0` still
+/// yields `0`
 /// (<https://infra.spec.whatwg.org/#rules-for-parsing-non-negative-integers>).
-///
-/// Divergence: Chromium returns the reflection default for values that
-/// overflow `unsigned long` (a canvas `width="4294967296"` reads 300 there)
-/// where the IDL conversion wraps to 0.
 pub(crate) fn parse_non_negative_integer(value: &str) -> Option<u32> {
+    match parse_integer(value)? {
+        0 => Some(0),
+        parsed @ 1..=2147483647 => u32::try_from(parsed).ok(),
+        _ => None,
+    }
+}
+
+/// ASCII whitespace for the HTML parsing rules: space, tab, LF, FF, CR.
+/// Notably not vertical tab or other Unicode spaces, which stop parsing
+/// instead of being skipped
+/// (<https://infra.spec.whatwg.org/#ascii-whitespace>).
+fn is_html_whitespace(char: Option<&char>) -> bool {
+    matches!(char, Some(' ' | '\t' | '\n' | '\u{c}' | '\r'))
+}
+
+/// The HTML rules for parsing integers: skip ASCII whitespace, take an
+/// optional sign, require an ASCII digit, then consume digits and ignore
+/// whatever follows them
+/// (<https://infra.spec.whatwg.org/#rules-for-parsing-integers>).
+///
+/// Overflow bails to `None` like a parse failure: reflection sites map both
+/// to the IDL default, so the distinction is unobservable there.
+pub(crate) fn parse_integer(value: &str) -> Option<i32> {
     let mut chars = value.chars().peekable();
-    while chars.peek().is_some_and(char::is_ascii_whitespace) {
+    while is_html_whitespace(chars.peek()) {
         chars.next();
+    }
+    let mut sign: i64 = 1;
+    match chars.peek() {
+        Some('-') => {
+            sign = -1;
+            chars.next();
+        }
+        Some('+') => {
+            chars.next();
+        }
+        _ => {}
     }
     if !chars.peek().is_some_and(char::is_ascii_digit) {
         return None;
     }
-    let mut result = 0_u32;
+    let mut result: i64 = 0;
     while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
-        result = result.wrapping_mul(10).wrapping_add(digit);
+        result = result.checked_mul(10)?.checked_add(i64::from(digit))?;
         chars.next();
     }
-    Some(result)
+    let result = result.checked_mul(sign)?;
+    i32::try_from(result).ok()
+}
+
+/// The HTML rules for parsing floating-point number values: skip ASCII
+/// whitespace, take an optional sign, read an integer and fraction part,
+/// then an optional exponent; trailing garbage is ignored
+/// (<https://infra.spec.whatwg.org/#rules-for-parsing-floating-point-number-values>).
+///
+/// Failure and non-finite results both bail to `None`: reflection sites map
+/// either to the IDL default.
+pub(crate) fn parse_double(value: &str) -> Option<f64> {
+    let bytes = value.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\x0c' | b'\r') {
+        pos += 1;
+    }
+    let start = pos;
+    if pos < bytes.len() && (bytes[pos] == b'-' || bytes[pos] == b'+') {
+        pos += 1;
+    }
+    let mut integer_digits = 0_u32;
+    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+        integer_digits += 1;
+        pos += 1;
+    }
+    let mut fraction_digits = 0_u32;
+    if pos < bytes.len() && bytes[pos] == b'.' {
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            fraction_digits += 1;
+            pos += 1;
+        }
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return None;
+    }
+    if pos < bytes.len() && (bytes[pos] == b'e' || bytes[pos] == b'E') {
+        let mut probe = pos + 1;
+        if probe < bytes.len() && (bytes[probe] == b'-' || bytes[probe] == b'+') {
+            probe += 1;
+        }
+        let exponent_start = probe;
+        while probe < bytes.len() && bytes[probe].is_ascii_digit() {
+            probe += 1;
+        }
+        if probe > exponent_start {
+            pos = probe;
+        }
+    }
+    // The scanner above accepts exactly the spec's grammar, so the standard
+    // parser (correctly rounded, with proper overflow handling) converts it:
+    // `0e999999` is 0, `1e999` overflows to infinity (failure here).
+    let parsed: f64 = value[start..pos].parse().ok()?;
+    if parsed.is_finite() {
+        // The value set excludes `-0`: adding `+0` normalizes it.
+        Some(parsed + 0.0)
+    } else {
+        None
+    }
 }
 
 /// Rebinds the `document` global to the realm world's active document. A realm
