@@ -733,7 +733,7 @@ class DurationRecorder:
 
 # --- in-venv runner ---
 
-def patch_wpt(wpt_root: Path, durations: dict[str, float]) -> None:
+def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRecorder) -> None:
     sys.path.insert(0, str(wpt_root))
     from tools import localpaths  # noqa: F401
     from tools.wpt import run as wpt_run
@@ -786,6 +786,18 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float]) -> None:
 
     testloader.TestFilter = TinybrowserTestFilter
 
+    from wptrunner import wptlogging
+
+    enter_logger = wptlogging.LoggerManager.__enter__
+
+    def enter_recording_logger(self):
+        logger = enter_logger(self)
+        if recorder not in logger.handlers:
+            logger.add_handler(recorder)
+        return logger
+
+    wptlogging.LoggerManager.__enter__ = enter_recording_logger
+
     if not durations:
         return
 
@@ -825,15 +837,15 @@ def inner_main(argv: list[str]) -> int:
     """Runs under the venv python: patch upstream, then `wpt run`."""
     wpt_root = Path(os.environ.get("TINYBROWSER_WPT_ROOT") or ROOT / "third_party" / "wpt")
     source = durations_source()
-    patch_wpt(wpt_root, read_durations(source) if source else {})
-    from mozlog.structuredlog import StructuredLogger
+    recorder = DurationRecorder()
+    patch_wpt(wpt_root, read_durations(source) if source else {}, recorder)
     from tools.wpt import wpt
 
-    recorder = DurationRecorder()
-    StructuredLogger("web-platform-tests").add_handler(recorder)
-    code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
-    if recorder.durations:
-        write_durations(cache_dir() / "wpt-durations.json", recorder.durations)
+    try:
+        code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
+    finally:
+        if recorder.durations:
+            write_durations(cache_dir() / "wpt-durations.json", recorder.durations)
     return code if isinstance(code, int) else 0
 
 
