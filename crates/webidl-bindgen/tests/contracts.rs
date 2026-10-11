@@ -653,6 +653,22 @@ fn reflect_parameter_values_are_validated() {
 }
 
 #[test]
+fn reflect_setter_unsigned_long_with_default_fails() {
+    // A non-zero `ReflectDefault` on a generated `unsigned long` setter
+    // would be silently ignored (the writer falls back to 0), so it fails
+    // the build instead of emitting the wrong fallback.
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [ReflectSetter, ReflectDefault=1] attribute unsigned long span; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_span(&self, ctx: &Ctx<'js>) -> Result<u32> { Ok(0) } }",
+    }];
+    assert!(compile_contracts(&idl, &rust).is_err());
+}
+
+#[test]
 fn mixin_without_implemented_includers_fails() {
     // A mixin included only by unimplemented interfaces has no install
     // target: fail loudly instead of emitting an empty installer.
@@ -680,7 +696,10 @@ fn usv_string_operation_argument_generates() {
     }];
     let bindings = compile_contracts(&idl, &rust).expect("USVString operation argument");
     assert!(
-        bindings[0].rust.replace(' ', "").contains("usv_string_argument"),
+        bindings[0]
+            .rust
+            .replace(' ', "")
+            .contains("usv_string_argument"),
         "missing USVString argument conversion"
     );
 }
@@ -697,7 +716,10 @@ fn reflect_legacy_null_generates() {
     }];
     let bindings = compile_contracts(&idl, &rust).expect("legacy reflect");
     assert!(
-        bindings[0].rust.replace(' ', "").contains("legacy_null_string_argument"),
+        bindings[0]
+            .rust
+            .replace(' ', "")
+            .contains("legacy_null_string_argument"),
         "missing legacy-null setter conversion"
     );
 }
@@ -714,7 +736,10 @@ fn reflect_usv_string_generates() {
     }];
     let bindings = compile_contracts(&idl, &rust).expect("usv reflect");
     assert!(
-        bindings[0].rust.replace(' ', "").contains("usv_string_argument"),
+        bindings[0]
+            .rust
+            .replace(' ', "")
+            .contains("usv_string_argument"),
         "missing USVString setter conversion"
     );
 }

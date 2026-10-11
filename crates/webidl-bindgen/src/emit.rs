@@ -861,7 +861,8 @@ fn restricted_double_from_value() -> TokenStream {
 }
 
 /// One attribute setter's value conversion from the first argument.
-fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool) -> TokenStream {    match return_type {
+fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool) -> TokenStream {
+    match return_type {
         ReturnType::String if legacy_null_to_empty => quote! {
             host::legacy_null_string_argument(params, 0)?
         },
@@ -882,7 +883,7 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
                     }
                 }
             }
-        },
+        }
         // https://webidl.spec.whatwg.org/#es-boolean
         ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
         // https://webidl.spec.whatwg.org/#es-unsigned-long
@@ -890,25 +891,25 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
             let fetch = fetch_first_argument();
             let convert = ulong_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         // https://webidl.spec.whatwg.org/#es-long
         ReturnType::Long => {
             let fetch = fetch_first_argument();
             let convert = long_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         // https://webidl.spec.whatwg.org/#es-double
         ReturnType::Double => {
             let fetch = fetch_first_argument();
             let convert = double_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         // Restricted `double` rejects NaN and infinities.
         ReturnType::RestrictedDouble => {
             let fetch = fetch_first_argument();
             let convert = restricted_double_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         // A platform-object setter takes the value as-is.
         ReturnType::PlatformObject => quote! {
             params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()))
@@ -922,7 +923,9 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
                 }
             }
         }
-        _ => unreachable!("validated attribute setter: string, USVString, boolean, integer, double, enumeration, or platform object"),
+        _ => unreachable!(
+            "validated attribute setter: string, USVString, boolean, integer, double, enumeration, or platform object"
+        ),
     }
 }
 
@@ -993,25 +996,25 @@ fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenSt
             let fetch = fetch_first_argument();
             let convert = long_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         // https://webidl.spec.whatwg.org/#es-unsigned-long
         ReturnType::UnsignedLong => {
             let fetch = fetch_first_argument();
             let convert = ulong_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         // https://webidl.spec.whatwg.org/#es-double
         ReturnType::Double => {
             let fetch = fetch_first_argument();
             let convert = double_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         // Restricted `double` rejects NaN and infinities.
         ReturnType::RestrictedDouble => {
             let fetch = fetch_first_argument();
             let convert = restricted_double_from_value();
             quote! { { #fetch #convert } }
-        },
+        }
         _ => unreachable!("validated reflect mapping"),
     };
     let write = match attribute.return_type {

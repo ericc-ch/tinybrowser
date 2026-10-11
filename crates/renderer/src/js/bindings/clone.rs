@@ -103,8 +103,7 @@ fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<(
         // The cryptographic nonce slot follows the adopted node into its
         // new identity; content attributes travel with the materialized
         // copy already.
-        if let (Ok(from_owner), Ok(to_owner)) =
-            (world_for_node(ctx, from), world_for_node(ctx, to))
+        if let (Ok(from_owner), Ok(to_owner)) = (world_for_node(ctx, from), world_for_node(ctx, to))
         {
             if std::rc::Rc::ptr_eq(&from_owner, &to_owner) {
                 let mut world = from_owner.borrow_mut();
@@ -243,9 +242,6 @@ pub(crate) fn detach_for_adopt(
     Ok(())
 }
 
-/// Same-document clone via Blitz.
-/// Blitz ids are per-tree, so this must never run across documents;
-/// cross-document clones go through `import_snapshot`/`materialize_import`.
 /// Copies cryptographic nonce slots from a cloned subtree to its clone,
 /// walking both trees in lockstep: cloning preserves child order, so pairs
 /// align; a length mismatch skips that subtree rather than misaligning
@@ -260,8 +256,7 @@ pub(crate) fn copy_nonce_subtree(
 ) {
     let pairs: Vec<(NodeId, NodeId)> = {
         let world = owner.borrow();
-        let (Some(from_parsed), Some(to_parsed)) =
-            (world.document(from), world.document(to))
+        let (Some(from_parsed), Some(to_parsed)) = (world.document(from), world.document(to))
         else {
             return;
         };
@@ -304,6 +299,9 @@ pub(crate) fn copy_nonce_subtree(
     }
 }
 
+/// Same-document clone via Blitz.
+/// Blitz ids are per-tree, so this must never run across documents;
+/// cross-document clones go through `import_snapshot`/`materialize_import`.
 pub(crate) fn clone_within_document(
     doc: &mut BlitzDocument,
     doc_id: u32,
@@ -415,7 +413,6 @@ pub(crate) enum ImportSnapshot {
     CData(crate::dom_string::DomString),
     Fragment(Vec<ImportSnapshot>),
 }
-
 
 /// Deep-snapshots `children` for cross-document cloning.
 fn snapshot_children(
@@ -699,9 +696,7 @@ pub(crate) fn materialize_import(
             // Template children materialize into the fresh element's
             // contents fragment, which creation already established.
             let parent = if crate::js::world::is_template_tag(name) {
-                doc.base
-                    .mutate()
-                    .ensure_template_contents(blitz_id)
+                doc.base.mutate().ensure_template_contents(blitz_id)
             } else {
                 blitz_id
             };

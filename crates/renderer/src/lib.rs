@@ -269,7 +269,11 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
 /// `PUBLIC`/`SYSTEM` keyword (bogus doctype), or a truncated token.
 fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
     let rest = skip_ignored_prefix(input);
-    if rest.len() < 9 || !rest.get(..9).is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype")) {
+    if rest.len() < 9
+        || !rest
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype"))
+    {
         return None;
     }
     let mut chars = rest[9..].chars().peekable();
@@ -301,9 +305,20 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
     let (mut public, mut system) = (String::new(), None);
     if word.eq_ignore_ascii_case("public") {
         public = quoted_string(&mut chars)?;
-        system = quoted_string(&mut chars);
+        // After `PUBLIC "..."`, only whitespace and `>` may follow without
+        // a system identifier; anything else must be a quoted identifier
+        // (a missing quote is a missing-quote parse error, which sets
+        // force-quirks).
+        while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+            chars.next();
+        }
+        if chars.peek() != Some(&'>') {
+            system = Some(quoted_string(&mut chars)?);
+        }
     } else if word.eq_ignore_ascii_case("system") {
-        system = quoted_string(&mut chars);
+        // A `SYSTEM` keyword requires a quoted identifier; its absence is a
+        // missing-doctype-system-identifier parse error (force-quirks).
+        system = Some(quoted_string(&mut chars)?);
     } else if !word.is_empty() {
         return None;
     } else if matches!(chars.peek(), Some('"') | Some('\'')) {
@@ -329,16 +344,21 @@ fn skip_ignored_prefix(mut input: &str) -> &str {
         let Some(comment) = trimmed.strip_prefix("<!--") else {
             return trimmed;
         };
-        if let Some(end) = comment.find("-->") {
-            input = &comment[end + 3..];
-        } else if let Some(end) = comment.find("--!>") {
-            input = &comment[end + 4..];
-        } else if comment.starts_with('>') {
-            // Abruptly-closed empty comment: closed, scanning continues.
-            input = &comment[1..];
-        } else if comment.starts_with("->") {
-            // `<!--->`: the third dash is consumed, `>` abruptly closes.
-            input = &comment[2..];
+        // Abruptly-closed comments (`<!-->`, `<!--->`) close at the first
+        // `>`: check them before the longer terminators, then take the
+        // earliest `-->`/`--!>` close. A later terminator never wins over
+        // character data produced by an earlier close.
+        if let Some(rest) = comment
+            .strip_prefix('>')
+            .or_else(|| comment.strip_prefix("->"))
+        {
+            input = rest;
+        } else if let Some(end) = [("-->", 3), ("--!>", 4)]
+            .iter()
+            .filter_map(|(marker, len)| comment.find(marker).map(|index| index + len))
+            .min()
+        {
+            input = &comment[end..];
         } else {
             return trimmed;
         }
@@ -446,21 +466,22 @@ mod tests {
             // Tokenizer-level force-quirks: `>` inside a quoted identifier,
             // a quoted identifier with no keyword, comments before the
             // doctype (including abruptly-closed ones).
-            (
-                "<!DOCTYPE html PUBLIC \"foo>bar\">",
-                QuirksMode::Quirks,
-            ),
+            ("<!DOCTYPE html PUBLIC \"foo>bar\">", QuirksMode::Quirks),
             ("<!DOCTYPE html \"foo\">", QuirksMode::Quirks),
-            (
-                "<!-- comment --><!DOCTYPE html>",
-                QuirksMode::NoQuirks,
-            ),
+            ("<!-- comment --><!DOCTYPE html>", QuirksMode::NoQuirks),
             ("<!--><!DOCTYPE html>", QuirksMode::NoQuirks),
             ("<!---><!DOCTYPE html>", QuirksMode::NoQuirks),
-            (
-                "<!-- x --!><!DOCTYPE html>",
-                QuirksMode::NoQuirks,
-            ),
+            ("<!-- x --!><!DOCTYPE html>", QuirksMode::NoQuirks),
+            // An abrupt close wins over a later `-->`/`--!>`: `<!-->`
+            // closes at the first `>`, leaving character data before the
+            // doctype (quirks).
+            ("<!--> x --><!DOCTYPE html>", QuirksMode::Quirks),
+            ("<!-- a --!> b --><!DOCTYPE html>", QuirksMode::Quirks),
+            // A `SYSTEM` keyword without a quoted identifier, and trailing
+            // garbage where the system identifier belongs, are tokenizer
+            // force-quirks inputs.
+            ("<!DOCTYPE html SYSTEM>", QuirksMode::Quirks),
+            ("<!DOCTYPE html PUBLIC \"x\" foo>", QuirksMode::Quirks),
         ];
         for (input, expected) in cases {
             assert_eq!(sniff_quirks_mode(input), expected, "{input}");

@@ -1904,7 +1904,11 @@ pub(crate) fn set_attribute_sync(
     });
     drop(parsed);
     drop(world);
-    if local == "nonce" {
+    // The nonce content attribute lives in the null namespace: a namespaced
+    // attribute that merely shares the local name must not feed the
+    // cryptographic nonce slot
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+    if local == "nonce" && namespace.is_empty() {
         // The content attribute feeds the cryptographic nonce slot, so a
         // later IDL read answers the attribute value until the IDL setter
         // overrides it

@@ -1214,16 +1214,15 @@ fn set_character_data_inner(
         return Ok(());
     };
     let old_value = {
-        let is_character_data =
-            parsed.document.base.get_node(id.node).is_some_and(|node| {
-                matches!(
-                    node.data,
-                    NodeData::Text(_)
-                        | NodeData::Comment { .. }
-                        | NodeData::ProcessingInstruction { .. }
-                        | NodeData::CDataSection { .. }
-                )
-            });
+        let is_character_data = parsed.document.base.get_node(id.node).is_some_and(|node| {
+            matches!(
+                node.data,
+                NodeData::Text(_)
+                    | NodeData::Comment { .. }
+                    | NodeData::ProcessingInstruction { .. }
+                    | NodeData::CDataSection { .. }
+            )
+        });
         if !is_character_data {
             return Ok(());
         }
@@ -1437,9 +1436,7 @@ pub(crate) fn parse_integer(value: &str) -> Option<i32> {
     }
     let mut result: i64 = 0;
     while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
-        result = result
-            .checked_mul(10)?
-            .checked_add(i64::from(digit))?;
+        result = result.checked_mul(10)?.checked_add(i64::from(digit))?;
         chars.next();
     }
     let result = result.checked_mul(sign)?;
@@ -1454,72 +1451,54 @@ pub(crate) fn parse_integer(value: &str) -> Option<i32> {
 /// Failure and non-finite results both bail to `None`: reflection sites map
 /// either to the IDL default.
 pub(crate) fn parse_double(value: &str) -> Option<f64> {
-    let mut chars = value.chars().peekable();
-    while is_html_whitespace(chars.peek()) {
-        chars.next();
+    let bytes = value.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\x0c' | b'\r') {
+        pos += 1;
     }
-    let mut sign = 1.0;
-    match chars.peek() {
-        Some('-') => {
-            sign = -1.0;
-            chars.next();
-        }
-        Some('+') => {
-            chars.next();
-        }
-        _ => {}
+    let start = pos;
+    if pos < bytes.len() && (bytes[pos] == b'-' || bytes[pos] == b'+') {
+        pos += 1;
     }
-    let mut integer = 0.0;
     let mut integer_digits = 0_u32;
-    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
-        integer = integer * 10.0 + f64::from(digit);
+    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
         integer_digits += 1;
-        chars.next();
+        pos += 1;
     }
-    let mut fraction = 0.0;
     let mut fraction_digits = 0_u32;
-    if chars.peek() == Some(&'.') {
-        chars.next();
-        let mut divisor = 10.0;
-        while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
-            fraction += f64::from(digit) / divisor;
-            divisor *= 10.0;
+    if pos < bytes.len() && bytes[pos] == b'.' {
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
             fraction_digits += 1;
-            chars.next();
+            pos += 1;
         }
     }
     if integer_digits == 0 && fraction_digits == 0 {
         return None;
     }
-    let mut result = sign * (integer + fraction);
-    // The value set excludes `-0`: adding `+0` normalizes it.
-    result += 0.0;
-    if chars.peek().is_some_and(|c| *c == 'e' || *c == 'E') {
-        let mut probe = chars.clone();
-        probe.next();
-        let mut exponent_sign = 1.0;
-        match probe.peek() {
-            Some('-') => {
-                exponent_sign = -1.0;
-                probe.next();
-            }
-            Some('+') => {
-                probe.next();
-            }
-            _ => {}
+    if pos < bytes.len() && (bytes[pos] == b'e' || bytes[pos] == b'E') {
+        let mut probe = pos + 1;
+        if probe < bytes.len() && (bytes[probe] == b'-' || bytes[probe] == b'+') {
+            probe += 1;
         }
-        let mut exponent = 0_i32;
-        let mut exponent_digits = 0_u32;
-        while let Some(digit) = probe.peek().and_then(|c| c.to_digit(10)) {
-            exponent = exponent.saturating_mul(10).saturating_add(digit as i32);
-            exponent_digits += 1;
-            probe.next();
+        let exponent_start = probe;
+        while probe < bytes.len() && bytes[probe].is_ascii_digit() {
+            probe += 1;
         }
-        if exponent_digits > 0 {
-            result *= 10_f64.powf(exponent_sign * f64::from(exponent));
+        if probe > exponent_start {
+            pos = probe;
         }
     }
-    if result.is_finite() { Some(result) } else { None }
+    // The scanner above accepts exactly the spec's grammar, so the standard
+    // parser (correctly rounded, with proper overflow handling) converts it:
+    // `0e999999` is 0, `1e999` overflows to infinity (failure here).
+    let parsed: f64 = value[start..pos].parse().ok()?;
+    if parsed.is_finite() {
+        // The value set excludes `-0`: adding `+0` normalizes it.
+        Some(parsed + 0.0)
+    } else {
+        None
+    }
 }
 
 /// Rebinds the `document` global to the realm world's active document. A realm

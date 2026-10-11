@@ -11,8 +11,8 @@
 
 use blitz_dom::{BaseDocument, NodeData};
 
-use crate::js::world::{BlitzId, NodeId};
 use super::world_for_node;
+use crate::js::world::{BlitzId, NodeId};
 use rquickjs::{Ctx, Result};
 
 /// The `white-space` modes that change collection.
@@ -80,16 +80,22 @@ fn style_property<'a>(style: &'a str, property: &str) -> Option<&'a str> {
 }
 
 /// Splits a `style` attribute into declarations on `;` outside single and
-/// double quotes and parentheses.
+/// double quotes and parentheses. A backslash inside quotes escapes the
+/// next character, so `content: "a\";b"` keeps its `;`.
 fn split_declarations(style: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0_u32;
     let mut quote = None;
+    let mut escaped = false;
     let mut start = 0;
     for (index, char) in style.char_indices() {
         match quote {
             Some(q) => {
-                if char == q {
+                if escaped {
+                    escaped = false;
+                } else if char == '\\' {
+                    escaped = true;
+                } else if char == q {
                     quote = None;
                 }
             }
@@ -114,8 +120,10 @@ fn split_declarations(style: &str) -> Vec<&str> {
 fn strip_important(value: &str) -> &str {
     let trimmed = value.trim_end();
     if let Some(bang) = trimmed.rfind('!') {
-        let marker: String =
-            trimmed[bang + 1..].chars().filter(|char| !char.is_whitespace()).collect();
+        let marker: String = trimmed[bang + 1..]
+            .chars()
+            .filter(|char| !char.is_whitespace())
+            .collect();
         if marker.eq_ignore_ascii_case("important") {
             return trimmed[..bang].trim_end();
         }
@@ -234,8 +242,18 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
         // names are case-sensitive (`clipPath`, not `clippath`).
         return if matches!(
             local,
-            "defs" | "desc" | "metadata" | "stop" | "title" | "mask" | "clipPath" | "pattern"
-            | "symbol" | "use" | "script" | "style"
+            "defs"
+                | "desc"
+                | "metadata"
+                | "stop"
+                | "title"
+                | "mask"
+                | "clipPath"
+                | "pattern"
+                | "symbol"
+                | "use"
+                | "script"
+                | "style"
         ) {
             Level::Hidden
         } else {
@@ -246,32 +264,29 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
         // Never rendered (without an overriding `style` attribute, which
         // returned above for rendering displays; `source`/`track` join
         // `script`/`style` here; `template`/`noscript` returned earlier).
-        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source"
-        | "track" | "frame" | "frameset" | "noframes" | "noembed" | "datalist" => {
-            Level::Hidden
-        }
+        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source" | "track"
+        | "frame" | "frameset" | "noframes" | "noembed" | "datalist" => Level::Hidden,
         // `rp` never renders (its parens are dropped); an explicit rendering
         // display above still wins.
         "rp" => Level::Hidden,
         // Transparent containers.
         "span" | "a" | "b" | "i" | "em" | "strong" | "code" | "tt" | "u" | "s" | "small"
         | "big" | "cite" | "q" | "dfn" | "abbr" | "kbd" | "samp" | "var" | "sub" | "sup"
-        | "mark" | "ruby" | "rt" | "bdi" | "bdo" | "font" | "label" | "output" | "nobr"
-        | "wbr" | "slot" | "picture" | "colgroup" | "col" | "thead"
-        | "tbody" | "tfoot" | "tr" | "td" | "th" | "caption" | "marquee"
-        | "isindex" => Level::Inline,
+        | "mark" | "ruby" | "rt" | "bdi" | "bdo" | "font" | "label" | "output" | "nobr" | "wbr"
+        | "slot" | "picture" | "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr" | "td"
+        | "th" | "caption" | "marquee" | "isindex" => Level::Inline,
         // Block containers (`li` is `list-item`, block-level; `fieldset`,
         // `legend`, `center`, `search`, `dt`/`dd` are `block`).
-        "address" | "article" | "aside" | "blockquote" | "details" | "dialog" | "div"
-        | "dl" | "dt" | "dd" | "fieldset" | "legend" | "figcaption" | "figure" | "footer"
-        | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup" | "main"
-        | "nav" | "ol" | "ul" | "li" | "dir" | "menu" | "section" | "summary" | "center"
-        | "search" | "pre" | "listing" | "xmp" | "plaintext" | "table" => Level::Block,
+        "address" | "article" | "aside" | "blockquote" | "details" | "dialog" | "div" | "dl"
+        | "dt" | "dd" | "fieldset" | "legend" | "figcaption" | "figure" | "footer" | "form"
+        | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup" | "main" | "nav" | "ol"
+        | "ul" | "li" | "dir" | "menu" | "section" | "summary" | "center" | "search" | "pre"
+        | "listing" | "xmp" | "plaintext" | "table" => Level::Block,
         // Atomic inline: replaced elements and controls with ignored content
         // (`button` is `inline-block`).
         "img" | "input" | "textarea" | "iframe" | "audio" | "video" | "canvas" | "object"
         | "embed" | "param" | "map" | "area" | "applet" | "button" => Level::Atomic,
-        "select" | "option" | "optgroup" | "p" => Level::Paragraph,
+        "select" | "option" | "optgroup" => Level::Paragraph,
         // Unknown and custom elements are inline by default.
         _ => Level::Inline,
     }
@@ -286,8 +301,8 @@ fn subtree_skipped(base: &BaseDocument, node: BlitzId) -> bool {
         base,
         node,
         &[
-            "input", "textarea", "iframe", "audio", "video", "canvas", "object", "embed",
-            "img", "param", "map", "area",
+            "input", "textarea", "iframe", "audio", "video", "canvas", "object", "embed", "img",
+            "param", "map", "area",
         ],
     )
 }
@@ -335,7 +350,10 @@ fn transform_of(base: &BaseDocument, node: BlitzId, inherited: Transform) -> Tra
 }
 
 /// Applies an effective transform to already-whitespace-processed text.
-fn apply_transform(text: &str, transform: Transform) -> String {
+/// `word_open` threads across text nodes: a word does not end at an inline
+/// element boundary, so `<span style="text-transform:capitalize">f<b>oo</b></span>`
+/// is `"Foo"`, not `"FOo"`.
+fn apply_transform(text: &str, transform: Transform, word_open: &mut bool) -> String {
     match transform {
         Transform::None => text.to_owned(),
         Transform::Upper(turkish) => {
@@ -368,19 +386,18 @@ fn apply_transform(text: &str, transform: Transform) -> String {
         }
         Transform::Capitalize => {
             let mut out = String::with_capacity(text.len());
-            let mut word_start = true;
             for char in text.chars() {
                 if char.is_alphabetic() {
-                    if word_start {
-                        out.extend(char.to_uppercase());
-                    } else {
+                    if *word_open {
                         out.push(char);
+                    } else {
+                        out.extend(char.to_uppercase());
                     }
-                    word_start = false;
+                    *word_open = true;
                 } else {
                     out.push(char);
                     if matches!(char, ' ' | '\t' | '\n' | '\u{c}' | '\r' | '\u{a0}') {
-                        word_start = true;
+                        *word_open = false;
                     }
                 }
             }
@@ -419,9 +436,7 @@ fn process_text(text: &str, mode: WhiteSpace) -> String {
             pending_space = false;
             after_newline = true;
             out.push('\n');
-        } else if matches!(char, ' ' | '\t' | '\u{c}')
-            || (collapse_newlines && char == '\n')
-        {
+        } else if matches!(char, ' ' | '\t' | '\u{c}') || (collapse_newlines && char == '\n') {
             if after_newline {
                 continue;
             }
@@ -453,6 +468,9 @@ struct Collector<'a> {
     /// The last item collected was atomic content with nothing after it
     /// yet: a trailing space materializes at the very end.
     trailing_atomic: bool,
+    /// Whether the last emitted character continues a word (for
+    /// `text-transform: capitalize` across text-node boundaries).
+    word_open: bool,
     /// Whether the last pushed text preserved spaces (`pre`).
     last_preserve: bool,
     /// Trailing boundary breaks issued since the last content: content
@@ -497,8 +515,7 @@ impl<'a> Collector<'a> {
                 // Atomic boundaries keep their space; an owed space
                 // materializes once against the run.
                 self.out.push(' ');
-            } else if !(self.out.is_empty() || self.out.ends_with([' ', '\n', '\t']))
-            {
+            } else if !(self.out.is_empty() || self.out.ends_with([' ', '\n', '\t'])) {
                 self.out.push(' ');
             }
             self.pending_space = false;
@@ -608,7 +625,6 @@ fn is_flex(base: &BaseDocument, node: BlitzId) -> bool {
 }
 
 /// Collects rendered text for `node`'s children.
-#[allow(clippy::too_many_arguments)]
 fn collect_children(
     collector: &mut Collector<'_>,
     node: BlitzId,
@@ -627,7 +643,6 @@ fn collect_children(
 }
 
 /// Collects one node.
-#[allow(clippy::too_many_arguments)]
 fn collect_node(
     collector: &mut Collector<'_>,
     node: BlitzId,
@@ -646,19 +661,21 @@ fn collect_node(
                 return;
             }
             let processed = process_text(&text.content, inherited_mode);
-            let transformed = apply_transform(&processed, inherited_transform);
+            let transformed =
+                apply_transform(&processed, inherited_transform, &mut collector.word_open);
             collector.push_text(&transformed, inherited_mode == WhiteSpace::Pre);
         }
         NodeData::Element(element) => {
-            let local = element.name.local.as_ref().to_owned();
+            let local: &str = element.name.local.as_ref();
             let html = element.name.ns == crate::js::world::html_namespace();
             let visibility = visibility_of(base, node, inherited_visibility);
             // `visibility:hidden` still lays out: recurse so explicitly
             // visible descendants show, but hide this level's own text.
             // (The text arm skips hidden text; breaks still apply.)
-            if html && crate::js::world::attr(base, node, "hidden").is_some_and(|value| {
-                !value.eq_ignore_ascii_case("until-found")
-            }) {
+            if html
+                && crate::js::world::attr(base, node, "hidden")
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))
+            {
                 return;
             }
             if html && local == "br" {
@@ -674,19 +691,10 @@ fn collect_node(
             }
             if html && local == "hr" {
                 collector.ensure_breaks(1);
-                collect_children(
-                    collector,
-                    node,
-                    mode,
-                    visibility,
-                    transform,
-                    false,
-                );
+                collect_children(collector, node, mode, visibility, transform, false);
                 collector.ensure_breaks(1);
                 return;
             }
-            let mode = white_space_of(base, node, inherited_mode);
-            let transform = transform_of(base, node, inherited_transform);
             let mut level = level_of(base, node);
             if flex_parent && level == Level::Inline {
                 level = Level::Block;
@@ -694,14 +702,7 @@ fn collect_node(
             match level {
                 Level::Hidden => {}
                 Level::Contents => {
-                    collect_children(
-                        collector,
-                        node,
-                        mode,
-                        visibility,
-                        transform,
-                        flex_parent,
-                    );
+                    collect_children(collector, node, mode, visibility, transform, flex_parent);
                 }
                 Level::Atomic => {
                     if subtree_skipped(base, node) {
@@ -713,6 +714,7 @@ fn collect_node(
                         out: String::new(),
                         pending_space: false,
                         force_space: false,
+                        word_open: false,
                         last_preserve: false,
                         trailing_breaks: 0,
                         trailing_forced: false,
@@ -828,7 +830,6 @@ fn display_none(base: &BaseDocument, node: BlitzId) -> bool {
 /// Collects a `table` subtree: rows newline-separated, cells tab-separated
 /// (including trailing empty cells), captions broken. Whitespace directly
 /// under table structure is ignored.
-#[allow(clippy::too_many_arguments)]
 fn collect_table(
     collector: &mut Collector<'_>,
     node: BlitzId,
@@ -897,25 +898,9 @@ fn collect_table(
             captions.push(child);
         }
     }
-    let mut first = true;
-    for (row, row_inherited, row_mode_inherited, row_transform_inherited) in rows {
-        if !first {
-            collector.ensure_breaks(1);
-        }
-        first = false;
-        // Rows resolve their own box properties so `tbody`/`tr` styles
-        // (e.g. `visibility:collapse`) apply to their cells.
-        let row_visibility = visibility_of(collector.base, row, row_inherited);
-        let row_mode = white_space_of(collector.base, row, row_mode_inherited);
-        let row_transform = transform_of(collector.base, row, row_transform_inherited);
-        collect_row(
-            collector,
-            row,
-            row_mode,
-            row_visibility,
-            row_transform,
-        );
-    }
+    let mut first = captions.is_empty();
+    // Captions come before the rows: the default `caption-side` is top,
+    // so the caption box precedes the table grid box.
     for caption in captions {
         collector.ensure_breaks(1);
         let caption_visibility = visibility_of(collector.base, caption, visibility);
@@ -930,13 +915,24 @@ fn collect_table(
             false,
         );
     }
+    for (row, row_inherited, row_mode_inherited, row_transform_inherited) in rows {
+        if !first {
+            collector.ensure_breaks(1);
+        }
+        first = false;
+        // Rows resolve their own box properties so `tbody`/`tr` styles
+        // (e.g. `visibility:collapse`) apply to their cells.
+        let row_visibility = visibility_of(collector.base, row, row_inherited);
+        let row_mode = white_space_of(collector.base, row, row_mode_inherited);
+        let row_transform = transform_of(collector.base, row, row_transform_inherited);
+        collect_row(collector, row, row_mode, row_visibility, row_transform);
+    }
     collector.ensure_breaks(1);
 }
 
 /// Collects one table row: cells tab-separated (including trailing empty
 /// cells). An empty row still breaks: its own line survives the shared
 /// separator.
-#[allow(clippy::too_many_arguments)]
 fn collect_row(
     collector: &mut Collector<'_>,
     row: BlitzId,
@@ -995,7 +991,6 @@ fn collect_row(
 /// direct text ignored. Other elements are transparent: their `option`
 /// descendants still collect (getter-tests `select>div>optgroup` expects
 /// `"one\ntwo"`).
-#[allow(clippy::too_many_arguments)]
 fn collect_select(
     collector: &mut Collector<'_>,
     node: BlitzId,
@@ -1051,7 +1046,6 @@ fn collect_select(
 
 /// Collects a `details` subtree: without `open`, only the first `summary`
 /// shows.
-#[allow(clippy::too_many_arguments)]
 fn collect_details(
     collector: &mut Collector<'_>,
     node: BlitzId,
@@ -1064,9 +1058,12 @@ fn collect_details(
         let Some(tree) = collector.base.get_node(node) else {
             return;
         };
-        if let Some(summary) = tree.children.to_vec().into_iter().find(|child| {
-            is_html_tag(collector.base, *child, &["summary"])
-        }) {
+        if let Some(summary) = tree
+            .children
+            .to_vec()
+            .into_iter()
+            .find(|child| is_html_tag(collector.base, *child, &["summary"]))
+        {
             collect_node(collector, summary, mode, visibility, transform, false);
         }
         collector.ensure_breaks(1);
@@ -1096,9 +1093,10 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
     let Some(tree) = base.get_node(id.node) else {
         return Ok(String::new());
     };
-    let is_html_element = tree.data.downcast_element().is_some_and(|element| {
-        element.name.ns == crate::js::world::html_namespace()
-    });
+    let is_html_element = tree
+        .data
+        .downcast_element()
+        .is_some_and(|element| element.name.ns == crate::js::world::html_namespace());
     if !is_html_element {
         return Ok(String::new());
     }
@@ -1120,6 +1118,7 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
         out: String::new(),
         pending_space: false,
         force_space: false,
+        word_open: false,
         last_preserve: false,
         trailing_breaks: 0,
         trailing_forced: false,
@@ -1129,6 +1128,12 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
     // dispatch applies (tables, selects, and details collect structurally
     // even at the top level): collect the target itself rather than only
     // its children. Leading breaks never arise; trailing ones trim below.
+    // The target's own `flex` value does not make it a flex child: the
+    // flag means "my parent is a flex container", so resolve the parent.
+    let parent_flex = base
+        .get_node(id.node)
+        .and_then(|tree| tree.parent)
+        .is_some_and(|parent| is_flex(base, parent));
     let (top_mode, top_visibility, top_transform) = initial_styles(base, id.node);
     collect_node(
         &mut collector,
@@ -1136,7 +1141,7 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
         top_mode,
         top_visibility,
         top_transform,
-        is_flex(base, id.node),
+        parent_flex,
     );
     let mut out = collector.out;
     // Leading block breaks never arise (ensures skip empty buffers), but a
@@ -1157,9 +1162,7 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
     }
     // A trailing collapsible space vanishes at the end, as does a stale
     // atomic force (a flushed pending space, if any, already stands in the
-    // buffer; no new space materializes here).
-    collector.pending_space = false;
-    collector.force_space = false;
+    // buffer).
     Ok(out)
 }
 
@@ -1194,17 +1197,18 @@ fn initial_styles(base: &BaseDocument, node: BlitzId) -> (WhiteSpace, Visibility
 /// rendering takes the `textContent` path instead of collecting nothing.
 fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
     let mut cursor = Some(node);
+    let mut root = node;
     while let Some(current) = cursor {
         let Some(tree) = base.get_node(current) else {
             return false;
         };
+        root = current;
         if let Some(element) = tree.data.downcast_element() {
             let html = element.name.ns == crate::js::world::html_namespace();
             let local = element.name.local.as_ref();
             if html
-                && crate::js::world::attr(base, current, "hidden").is_some_and(|value| {
-                    !value.eq_ignore_ascii_case("until-found")
-                })
+                && crate::js::world::attr(base, current, "hidden")
+                    .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))
             {
                 return false;
             }
@@ -1217,9 +1221,23 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
             if html
                 && matches!(
                     local,
-                    "template" | "noscript" | "head" | "meta" | "link" | "base" | "title"
-                    | "script" | "style" | "source" | "track" | "frame" | "frameset"
-                    | "noframes" | "noembed" | "datalist" | "rp"
+                    "template"
+                        | "noscript"
+                        | "head"
+                        | "meta"
+                        | "link"
+                        | "base"
+                        | "title"
+                        | "script"
+                        | "style"
+                        | "source"
+                        | "track"
+                        | "frame"
+                        | "frameset"
+                        | "noframes"
+                        | "noembed"
+                        | "datalist"
+                        | "rp"
                 )
             {
                 return false;
@@ -1227,8 +1245,18 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
             if !html
                 && matches!(
                     local,
-                    "defs" | "desc" | "metadata" | "stop" | "title" | "mask" | "clipPath"
-                    | "pattern" | "symbol" | "use" | "script" | "style"
+                    "defs"
+                        | "desc"
+                        | "metadata"
+                        | "stop"
+                        | "title"
+                        | "mask"
+                        | "clipPath"
+                        | "pattern"
+                        | "symbol"
+                        | "use"
+                        | "script"
+                        | "style"
                 )
             {
                 return false;
@@ -1236,11 +1264,15 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
         }
         cursor = tree.parent;
     }
-    true
+    // Only a connected tree (rooted at the document) renders: a detached
+    // element has no box, so it takes the `textContent` path.
+    base.get_node(root)
+        .is_some_and(|tree| matches!(tree.data, NodeData::Document(_)))
 }
 
 /// Descendant text without any processing (the not-rendered path).
-fn text_content(base: &BaseDocument, id: BlitzId) -> String {    let mut text = String::new();
+fn text_content(base: &BaseDocument, id: BlitzId) -> String {
+    let mut text = String::new();
     let mut stack = base
         .get_node(id)
         .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())

@@ -421,6 +421,17 @@
     return { value, scale };
   };
   const atScale = (decimal, scale) => decimal.value * 10n ** BigInt(scale - decimal.scale);
+  // A `step` attribute parsed strictly: only the floating-point grammar
+  // counts. `Number()` would also accept "0x10", "Infinity", and "1e999"
+  // (infinite), none of which are valid step values; anything unparseable
+  // or non-positive falls back to the default step.
+  const parseStep = (raw, fallback) => {
+    if (raw === null) return fallback;
+    const parsed = parseDecimal(asciiTrim(raw));
+    if (parsed === null) return fallback;
+    const step = Number(parsed.value) / 10 ** parsed.scale;
+    return Number.isFinite(step) && step > 0 ? step : fallback;
+  };
 
   const stepMismatch = element => {
     const type = inputType(element);
@@ -452,8 +463,7 @@
     // weeks, or seconds), which is the step scale factor's unit.
     const value = parseValue(type, element.value);
     if (value === null) return false;
-    let step = rawStep === null ? fallback : Number(rawStep);
-    if (Number.isNaN(step) || step <= 0) step = fallback;
+    const step = parseStep(rawStep, fallback);
     // The step base is the min attribute, else the value attribute, else 0.
     let base = parseValue(type, element.getAttribute('min'));
     if (base === null) base = parseValue(type, element.getAttribute('value'));
@@ -1381,8 +1391,7 @@
     if (raw !== null && asciiLower(asciiTrim(raw)) === 'any') {
       throw new DOMException('step is any', 'InvalidStateError');
     }
-    let step = raw === null ? fallback : Number(asciiTrim(raw));
-    if (Number.isNaN(step) || step <= 0) step = fallback;
+    let step = parseStep(raw, fallback);
     const min = parseValue(type, element.getAttribute('min'));
     const max = parseValue(type, element.getAttribute('max'));
     if (min !== null && max !== null && min > max) return;
@@ -1460,7 +1469,7 @@
   // (<https://html.spec.whatwg.org/multipage/forms.html#dom-label-htmlfor>).
   Object.defineProperty(globalThis.HTMLLabelElement.prototype, 'htmlFor', {
     get() { return this.getAttribute('for') ?? ''; },
-    set(value) { this.setAttribute('for', String(value)); },
+    set(value) { this.setAttribute('for', toDOMString(value)); },
     enumerable: true, configurable: true,
   });
 

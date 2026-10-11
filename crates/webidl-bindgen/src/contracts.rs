@@ -1641,7 +1641,8 @@ fn lower_attribute(
     // on get and reflects plainly on set, fully generated. Non-`USVString`
     // shapes (like `object.codeBase`) fall through for hand implementation.
     if let Some(content) = reflect_url_content(member.attributes.as_ref(), member.identifier.0)
-        && let Some(lowered) = lower_reflect_url_attribute(member, &content, implemented)? {
+        && let Some(lowered) = lower_reflect_url_attribute(member, &content, implemented)?
+    {
         return Ok(Some(lowered));
     }
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
@@ -1951,6 +1952,18 @@ fn lower_reflect_setter_attribute(
             member.identifier.0
         )));
     }
+    // The generated `unsigned long` setter writes 0 for out-of-range
+    // values, which is only correct for a zero default: a non-zero
+    // `ReflectDefault` would be silently ignored, so fail the build
+    // instead of emitting the wrong fallback.
+    if matches!(type_, ReturnType::UnsignedLong)
+        && reflect_default(member.attributes.as_ref())?.is_some_and(|default| default != 0.0)
+    {
+        return Err(Error(format!(
+            "{}: ReflectSetter on unsigned long needs its ReflectDefault plumbed",
+            member.identifier.0
+        )));
+    }
     let signature = reflect_setter_signature(member.identifier.0, &getter, &type_)?;
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
@@ -1964,6 +1977,38 @@ fn lower_reflect_setter_attribute(
         reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
     };
     Ok(Some((attribute, signature)))
+}
+
+/// The numeric `ReflectDefault` on a member's extended attributes, if
+/// present. Integer defaults (`ReflectDefault=20`) parse as `Ident`,
+/// floating ones (`ReflectDefault=1.0`) as `Decimal` (see the weedle4 note
+/// in [`validate_attribute_attributes`]).
+fn reflect_default(attributes: Option<&ExtendedAttributeList<'_>>) -> Result<Option<f64>, Error> {
+    let Some(attributes) = attributes else {
+        return Ok(None);
+    };
+    for attribute in &attributes.body.list {
+        match attribute {
+            ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "ReflectDefault" => {
+                return item.rhs.0.parse().map(Some).map_err(|_| {
+                    Error(format!(
+                        "ReflectDefault needs a numeric default, got `{}`",
+                        item.rhs.0
+                    ))
+                });
+            }
+            ExtendedAttribute::Decimal(item) if item.lhs_identifier.0 == "ReflectDefault" => {
+                return item.rhs.0.parse().map(Some).map_err(|_| {
+                    Error(format!(
+                        "ReflectDefault needs a numeric default, got `{}`",
+                        item.rhs.0
+                    ))
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// Reject an implementation method whose receiver or parameter count does
@@ -2762,9 +2807,7 @@ fn validate_attribute_attributes(
                             | "Reflect"
                             | "ReflectSetter"
                             | "ReflectURL"
-                    ) =>
-                {
-                }
+                    ) => {}
                 // Numeric reflection parameters: hand-written getters encode
                 // the spec algorithm, so the normal method path documents
                 // them as consumed here. Only the standardized names and
@@ -2775,15 +2818,15 @@ fn validate_attribute_attributes(
                 // while `ReflectDefault=1.0` parses as `Decimal`. The value
                 // checks below depend on this split: do not "simplify" the
                 // `Ident` arm without moving integer-default validation.
-                // `[PutForwards]` lowers to a generated forwarding setter.
-                // `[LegacyUnforgeable]` shapes the instance property in the
-                // interface's own shim, as the legacy path also accepts it;
-                // the generator installs the prototype accessor.
                 ExtendedAttribute::NoArgs(item)
                     if matches!(
                         item.0.0,
                         "ReflectNonNegative" | "ReflectPositive" | "ReflectPositiveWithFallback"
                     ) => {}
+                // `[PutForwards]` lowers to a generated forwarding setter.
+                // `[LegacyUnforgeable]` shapes the instance property in the
+                // interface's own shim, as the legacy path also accepts it;
+                // the generator installs the prototype accessor.
                 // `[PutForwards]` takes an identifier naming the target.
                 ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "PutForwards" => {}
                 // An integer reflection default, e.g. `ReflectDefault=20`.
