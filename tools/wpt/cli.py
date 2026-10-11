@@ -798,9 +798,6 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
 
     wptlogging.LoggerManager.__enter__ = enter_recording_logger
 
-    if not durations:
-        return
-
     class LongestFirstSource(testloader.SingleTestSource):
         """Default (no `--run-by-dir`/`-f`) split, balanced by past durations.
 
