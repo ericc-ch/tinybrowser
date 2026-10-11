@@ -63,13 +63,16 @@ TIMEOUT_STATUSES = ("TIMEOUT", "EXTERNAL-TIMEOUT")
 MAX_LISTED = 40
 
 # `wpt run`'s requirements (tools/wpt/commands.json), which WPT re-checks on
-# every run, and the setuptools that still ships pkg_resources for that check.
+# every run, and a setuptools whose pkg_resources works for that check: WPT's
+# tools/localpaths puts its vendored packaging 21 (needs pyparsing) ahead of
+# site-packages, and setuptools >= 71 imports top-level packaging, so only
+# releases that load their own vendored copy import cleanly there.
 WPT_RUN_REQUIREMENTS = (
     "tools/manifest/requirements.txt",
     "tools/wptrunner/requirements.txt",
     "tools/serve/requirements.txt",
 )
-SETUPTOOLS = "setuptools<81"
+SETUPTOOLS = "setuptools<71"
 
 
 def eprint(*parts: object) -> None:

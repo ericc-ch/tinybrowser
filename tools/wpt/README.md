@@ -11,9 +11,11 @@ changed: the stamp covers the `wpt run` requirements files (manifest,
 wptrunner, serve), `tools/wpt/pyproject.toml`, the python version, and the
 worktree root (one shared venv serves every worktree; the adapter install is
 editable, so adapter edits need no reinstall). The install adds
-`setuptools<81` because uv seeds only pip on Python 3.12 and WPT's own
-per-run requirements check needs `pkg_resources`; without it WPT shells out
-to `pip install` three times every run. The manifest walk is skipped with
+`setuptools<71` because uv seeds only pip on Python 3.12 and WPT's own
+per-run requirements check needs `pkg_resources`; newer setuptools imports the
+top-level `packaging`, which WPT's sys.path resolves to its vendored copy, and
+fails there. Without a working `pkg_resources` WPT shells out to
+`pip install` three times every run. The manifest walk is skipped with
 `--no-manifest-update` when the checkout state and manifest bytes match the
 last walked run. It defaults `--processes` to the CPU count (unless
 `--processes`, `--fully-parallel`, or `-f` is set), `--test-types
