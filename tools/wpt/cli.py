@@ -984,6 +984,8 @@ def score_main(argv: list[str]) -> int:
         return die("run --score", error, 2)
     if report is not None and save_report is not None:
         return die("run --score", "--report summarizes an existing report; do not combine it with --save-report", 2)
+    if has_option("--skip-timeout", extra):
+        return die("run --score", "--skip-timeout is a dev-loop flag for `run`; a score must run expected TIMEOUTs", 2)
     if report is not None:
         if paths or extra or dry_run:
             return die("run --score", "--report summarizes an existing report; give no test paths", 2)
@@ -1116,6 +1118,8 @@ def overnight_main(argv: list[str]) -> int:
         else:
             return die("overnight", f"unexpected argument {arg}", 2)
         i += 1
+    if has_option("--skip-timeout", extra):
+        return die("overnight", "--skip-timeout is a dev-loop flag for `run`; a score must run expected TIMEOUTs", 2)
     if dry_run:
         eprint(f"$ {CLI} run --log-wptreport <report> --no-fail-on-unexpected {shlex.join(extra)}")
         return 0
