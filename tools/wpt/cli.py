@@ -804,31 +804,40 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
     class LongestFirstSource(testloader.SingleTestSource):
         """Default (no `--run-by-dir`/`-f`) split, balanced by past durations.
 
-        Upstream hashes test ids into one fixed queue per process with no
-        work stealing, so one unlucky process gets the 60 s tests. Tests
-        never timed before cost the median known duration.
+        Upstream hashes test ids into one fixed group per process and test
+        type, so one unlucky process gets the 60 s tests. Here every test,
+        whatever its type, goes longest first to the least-loaded process;
+        each process's tests become one group per type, and the queue hands
+        out the costliest groups first so the short tail groups land on
+        whichever process frees up. Tests never timed cost the median.
         """
 
-        def make_groups(self, tests_by_type):
-            known = [durations[t.id] for tests in tests_by_type.values() for t in tests if t.id in durations]
+        def make_queue(self, tests_by_type):
+            tests = {(key, t.id): t for key, group in tests_by_type.items() for t in group}
+            known = [durations[test_id] for _, test_id in tests if test_id in durations]
             if not known:
-                return super().make_groups(tests_by_type)
-            unknown_ms = statistics.median(known)
+                return super().make_queue(tests_by_type)
             eprint(f"wpt: longest-first split, {len(known)} tests with known durations")
+            unknown_ms = statistics.median(known)
+            costs = {item: durations.get(item[1], unknown_ms) for item in tests}
             groups = []
-            for (subsuite, test_type), tests in tests_by_type.items():
-                by_id = {t.id: t for t in tests}
-                costs = {t.id: durations.get(t.id, unknown_ms) for t in tests}
-                for ids in longest_first(costs, self.kwargs["processes"]):
-                    if not ids:
-                        continue
+            for bucket in longest_first(costs, self.kwargs["processes"]):
+                by_type = defaultdict(list)
+                for key, test_id in bucket:
+                    by_type[key].append((key, test_id))
+                for (subsuite, test_type), items in by_type.items():
                     metadata = self.group_metadata({})
                     queue = deque()
-                    for test_id in ids:
-                        by_id[test_id].update_metadata(metadata.extra)
-                        queue.append(by_id[test_id])
-                    groups.append(testloader.TestGroup(queue, subsuite, test_type, metadata))
-            return groups
+                    for item in items:
+                        tests[item].update_metadata(metadata.extra)
+                        queue.append(tests[item])
+                    cost = sum(costs[item] for item in items)
+                    groups.append((cost, testloader.TestGroup(queue, subsuite, test_type, metadata)))
+            groups.sort(key=lambda entry: entry[0], reverse=True)
+            test_queue = testloader.WriteQueue()
+            for _, group in groups:
+                test_queue.put(group)
+            return test_queue.to_read(), self.process_count(self.kwargs["processes"], len(groups))
 
     testloader.SingleTestSource = LongestFirstSource
 
