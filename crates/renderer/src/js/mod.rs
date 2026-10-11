@@ -44,7 +44,13 @@ use crate::document::Stop;
 /// QuickJS shape (see `SharedRuntime`).
 const MAX_RUNTIME_MEMORY: usize = 256 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
-const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
+/// Wall-clock limit for one top-level entry into JS (a script, a timer or
+/// event callback, a browser evaluation without its own timeout) and its
+/// microtask checkpoint. Past it the interrupt handler aborts the task with
+/// [`JsError::Interrupted`]. It stays well below the browser's 60 s renderer
+/// request timeout, so a runaway task is cut here before the browser gives
+/// up on the renderer.
+const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy)]
 enum MicrotaskCheckpoint {
