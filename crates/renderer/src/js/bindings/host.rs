@@ -486,6 +486,10 @@ pub(crate) trait SharedClass {
 
 /// Whether `data` implements the named node interface, or `None` when the
 /// name is not one the shared payload can represent.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per node interface name; splitting the table is a refactor, not a lint fix"
+)]
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
     xml_document: bool,

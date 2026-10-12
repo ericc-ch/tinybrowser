@@ -447,6 +447,10 @@ fn process_text(text: &str, mode: WhiteSpace) -> String {
 }
 
 /// Collector state for one rendered-text run.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent whitespace and break flags of the rendered-text walk; folding them into a state machine is a refactor"
+)]
 struct Collector<'a> {
     base: &'a BaseDocument,
     out: String,
@@ -633,6 +637,10 @@ fn collect_children(
 }
 
 /// Collects one node.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-node rendered-text steps kept in one place; splitting them is a refactor, not a lint fix"
+)]
 fn collect_node(
     collector: &mut Collector<'_>,
     node: BlitzId,

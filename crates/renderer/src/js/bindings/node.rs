@@ -5588,6 +5588,10 @@ impl JsNode {
     /// fully normalize). Without a parent it throws; the setter is a no-op
     /// on non-HTML elements, which never install it.
     /// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "outerText setter steps in spec order; splitting them is a refactor, not a lint fix"
+    )]
     #[qjs(set, rename = "outerText")]
     fn set_outer_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
         let parent = {
@@ -6768,6 +6772,10 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-normalize
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Node.normalize steps in spec order; splitting them is a refactor, not a lint fix"
+    )]
     #[qjs(skip)]
     fn normalize(&self, ctx: Ctx<'_>) -> Result<()> {
         let world = world(&ctx)?;
