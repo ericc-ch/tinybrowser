@@ -119,6 +119,7 @@ impl CookieJar {
     /// a `SameSite` cookie set from a cross-site context all mean "keep the
     /// existing state".
     pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) -> bool {
+        self.evict_expired(op.now);
         let Some(parsed) = parse_set_cookie(set_cookie) else {
             return false;
         };
@@ -127,9 +128,10 @@ impl CookieJar {
         };
         self.cookies
             .retain(|old| !same_cookie_identity(old, &stored));
-        self.cookies.push(stored);
-        self.evict_expired(op.now);
-        self.evict_excess();
+        if stored.expiry.is_none_or(|exp| exp > op.now) {
+            self.cookies.push(stored);
+            self.evict_excess();
+        }
         true
     }
 
@@ -467,9 +469,12 @@ fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
                 parsed.expires = Some(t);
             }
         } else if aname.eq_ignore_ascii_case("Domain") {
+            // An empty value is the last Domain attribute too, and it leaves
+            // the cookie host-only:
+            // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
             let d = avalue.strip_prefix('.').unwrap_or(avalue);
             if d.len() <= 1024 {
-                parsed.domain = Some(d.to_ascii_lowercase());
+                parsed.domain = (!d.is_empty()).then(|| d.to_ascii_lowercase());
             }
         } else if aname.eq_ignore_ascii_case("Path") {
             if avalue.len() <= 1024 && avalue.starts_with('/') {
@@ -499,7 +504,11 @@ fn parse_max_age(value: &str) -> Option<i64> {
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    value.parse().ok()
+    Some(value.parse().unwrap_or(if value.starts_with('-') {
+        i64::MIN
+    } else {
+        i64::MAX
+    }))
 }
 
 fn receive_cookie(
@@ -830,12 +839,15 @@ fn suffix_list() -> &'static SuffixList {
             if line.is_empty() || line.starts_with("//") {
                 continue;
             }
-            if let Some(rest) = line.strip_prefix('!') {
-                exceptions.insert(Box::from(rest.to_ascii_lowercase()));
+            let (set, body) = if let Some(rest) = line.strip_prefix('!') {
+                (&mut exceptions, rest)
             } else if let Some(rest) = line.strip_prefix("*.") {
-                wildcards.insert(Box::from(rest.to_ascii_lowercase()));
+                (&mut wildcards, rest)
             } else {
-                rules.insert(Box::from(line.to_ascii_lowercase()));
+                (&mut rules, line)
+            };
+            if let Ok(Host::Domain(ascii)) = Host::parse(body) {
+                set.insert(Box::from(ascii));
             }
         }
         SuffixList {
@@ -1147,5 +1159,232 @@ fn civil_to_system(
         Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
     } else {
         UNIX_EPOCH.checked_sub(Duration::from_secs(u64::try_from(-secs).ok()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use url::Url;
+
+    use super::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, site};
+
+    /// 2026-10-12T00:00:00Z.
+    const NOW: u64 = 1_791_763_200;
+    const DAY: Duration = Duration::from_hours(24);
+
+    fn url(raw: &str) -> Url {
+        Url::parse(raw).expect("test URL parses")
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn op(url: &Url, now: SystemTime, kind: RetrievalKind) -> CookieOp<'_> {
+        CookieOp {
+            url,
+            now,
+            kind,
+            initiator_kind: InitiatorKind::Navigation,
+            method_is_safe: true,
+            initiator: None,
+            cross_site_redirect: false,
+        }
+    }
+
+    fn http(url: &Url, now: SystemTime) -> CookieOp<'_> {
+        op(url, now, RetrievalKind::Http)
+    }
+
+    #[test]
+    fn expired_secure_cookie_does_not_block_a_plain_one() {
+        let secure = url("https://example.com/");
+        let plain = url("http://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1; Secure; Max-Age=1", http(&secure, at(NOW))));
+        assert!(jar.store("a=2", http(&plain, at(NOW + 2))));
+        assert_eq!(jar.cookie_string(http(&plain, at(NOW + 2))), "a=2");
+    }
+
+    #[test]
+    fn expired_http_only_cookie_does_not_block_script() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("h=1; HttpOnly; Max-Age=1", http(&page, at(NOW))));
+        let script = op(&page, at(NOW + 2), RetrievalKind::NonHttp);
+        assert!(jar.store("h=2", script));
+        assert_eq!(jar.cookie_string(script), "h=2");
+    }
+
+    #[test]
+    fn replacing_an_expired_cookie_gets_a_fresh_creation_time() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("x=1; Max-Age=2", http(&page, at(NOW))));
+        assert!(jar.store("y=1", http(&page, at(NOW + 1))));
+        assert!(jar.store("x=2", http(&page, at(NOW + 3))));
+        assert_eq!(jar.cookie_string(http(&page, at(NOW + 3))), "y=1; x=2");
+    }
+
+    #[test]
+    fn unicode_public_suffix_rules_match_punycode_hosts() {
+        let a = url("https://a.公司.cn/");
+        let b = url("https://b.公司.cn/");
+        assert_eq!(site(&a).as_deref(), Some("https://a.xn--55qx5d.cn"));
+        assert_eq!(site(&b).as_deref(), Some("https://b.xn--55qx5d.cn"));
+        let mut jar = CookieJar::default();
+        assert!(!jar.store("a=1; Domain=公司.cn", http(&a, at(NOW))));
+        assert!(!jar.store("a=1; Domain=xn--55qx5d.cn", http(&a, at(NOW))));
+    }
+
+    #[test]
+    fn wildcard_public_suffix_rule_makes_every_child_a_suffix() {
+        assert_eq!(
+            site(&url("https://a.b.ck/")).as_deref(),
+            Some("https://a.b.ck")
+        );
+        let mut jar = CookieJar::default();
+        let page = url("https://a.b.ck/");
+        assert!(!jar.store("a=1; Domain=b.ck", http(&page, at(NOW))));
+    }
+
+    #[test]
+    fn exception_public_suffix_rule_overrides_the_wildcard() {
+        assert_eq!(
+            site(&url("https://www.ck/")).as_deref(),
+            Some("https://www.ck")
+        );
+        assert_eq!(
+            site(&url("https://a.www.ck/")).as_deref(),
+            Some("https://www.ck")
+        );
+        let mut jar = CookieJar::default();
+        let page = url("https://a.www.ck/");
+        assert!(jar.store("a=1; Domain=www.ck", http(&page, at(NOW))));
+        assert_eq!(
+            jar.cookie_string(http(&url("https://b.www.ck/"), at(NOW))),
+            "a=1"
+        );
+    }
+
+    #[test]
+    fn negative_max_age_overflow_deletes_the_cookie() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1", http(&page, at(NOW))));
+        assert!(jar.store("a=1; Max-Age=-99999999999999999999", http(&page, at(NOW))));
+        assert_eq!(jar.cookie_string(http(&page, at(NOW))), "");
+    }
+
+    #[test]
+    fn positive_max_age_overflow_takes_the_capped_lifetime() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store(
+            "a=1; Max-Age=99999999999999999999; Expires=Tue, 13 Oct 2026 00:00:00 GMT",
+            http(&page, at(NOW))
+        ));
+        let expiry = jar.snapshot()[0].expiry;
+        assert_eq!(expiry, Some(at(NOW) + DAY * 400));
+    }
+
+    #[test]
+    fn empty_domain_attribute_stores_a_host_only_cookie() {
+        let page = url("https://sub.example.com/");
+        let child = url("https://x.sub.example.com/");
+        for line in [
+            "a=1; Domain=",
+            "a=1; Domain=.",
+            "a=1; Domain=example.com; Domain=",
+        ] {
+            let mut jar = CookieJar::default();
+            assert!(jar.store(line, http(&page, at(NOW))), "{line}");
+            let records = jar.records_for(http(&page, at(NOW)));
+            assert_eq!(records.len(), 1, "{line}");
+            assert!(records[0].host_only, "{line}");
+            assert_eq!(records[0].domain, "sub.example.com", "{line}");
+            assert_eq!(jar.cookie_string(http(&child, at(NOW))), "", "{line}");
+        }
+    }
+
+    fn persistent_expiry(line: &str, now: SystemTime) -> Option<SystemTime> {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store(line, http(&page, now)), "{line}");
+        jar.snapshot().first().and_then(|record| record.expiry)
+    }
+
+    #[test]
+    fn two_digit_year_69_is_2069() {
+        let now = at(3_124_137_600);
+        assert_eq!(
+            persistent_expiry("a=1; Expires=Tue, 01 Jan 69 00:00:00 GMT", now),
+            Some(at(3_124_224_000))
+        );
+    }
+
+    #[test]
+    fn two_digit_year_70_is_1970() {
+        let now = UNIX_EPOCH - DAY;
+        assert_eq!(
+            persistent_expiry("a=1; Expires=Thu, 01 Jan 70 00:00:01 GMT", now),
+            Some(at(1))
+        );
+    }
+
+    #[test]
+    fn leap_day_exists_in_2000() {
+        let now = at(946_598_400);
+        assert_eq!(
+            persistent_expiry("a=1; Expires=Tue, 29 Feb 2000 00:00:00 GMT", now),
+            Some(at(951_782_400))
+        );
+    }
+
+    #[test]
+    fn leap_day_in_1900_is_not_a_date() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store(
+            "a=1; Expires=Thu, 29 Feb 1900 00:00:00 GMT",
+            http(&page, at(NOW))
+        ));
+        assert!(jar.snapshot().is_empty());
+        assert_eq!(jar.cookie_string(http(&page, at(NOW))), "a=1");
+    }
+
+    #[test]
+    fn year_1601_is_a_date_and_deletes_the_cookie() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1", http(&page, at(NOW))));
+        assert!(jar.store(
+            "a=1; Expires=Mon, 01 Jan 1601 00:00:00 GMT",
+            http(&page, at(NOW))
+        ));
+        assert_eq!(jar.cookie_string(http(&page, at(NOW))), "");
+    }
+
+    #[test]
+    fn year_1600_is_not_a_date() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store(
+            "a=1; Expires=Fri, 31 Dec 1600 23:59:59 GMT",
+            http(&page, at(NOW))
+        ));
+        assert!(jar.snapshot().is_empty());
+        assert_eq!(jar.cookie_string(http(&page, at(NOW))), "a=1");
+    }
+
+    #[test]
+    fn dates_before_1970_convert_exactly() {
+        let now = UNIX_EPOCH - DAY;
+        assert_eq!(
+            persistent_expiry("a=1; Expires=Wed, 31 Dec 1969 23:59:59 GMT", now),
+            Some(UNIX_EPOCH - Duration::from_secs(1))
+        );
     }
 }
