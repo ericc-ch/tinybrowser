@@ -3477,25 +3477,25 @@ pub(crate) fn serialize_xml_node(
             public_id,
             system_id,
         } => {
-            // The serialization of an ID quotes with `'` when the ID
-            // contains `"`, else with `"`.
-            let push_id = |output: &mut HtmlOutput, id: &str| {
-                let quote = if id.contains('"') { "'" } else { "\"" };
-                output.push_str(" ");
-                output.push_str(quote);
-                output.push_str(id);
-                output.push_str(quote);
-            };
+            // DOM Parsing's "serialization of the ID" quotes with `'` when the
+            // ID contains `"`, but WPT `domparsing/xml-serialization.xhtml`
+            // ("DocumentType: 'QUOTATION MARK' (U+0022)") expects `"`
+            // unconditionally, so the ids keep `"`.
             output.push_str("<!DOCTYPE ");
             output.push_str(name);
             if !public_id.is_empty() {
-                output.push_str(" PUBLIC");
-                push_id(output, public_id);
+                output.push_str(" PUBLIC \"");
+                output.push_str(public_id);
+                output.push_str("\"");
+                if !system_id.is_empty() {
+                    output.push_str(" \"");
+                    output.push_str(system_id);
+                    output.push_str("\"");
+                }
             } else if !system_id.is_empty() {
-                output.push_str(" SYSTEM");
-            }
-            if !system_id.is_empty() {
-                push_id(output, system_id);
+                output.push_str(" SYSTEM \"");
+                output.push_str(system_id);
+                output.push_str("\"");
             }
             output.push_str(">");
         }
