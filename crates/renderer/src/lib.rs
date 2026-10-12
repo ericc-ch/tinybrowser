@@ -138,15 +138,19 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
 
 /// Compatibility mode from the doctype
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>,
-/// quirks-mode table, mirrored from html5ever's `doctype_error_and_quirks`
-/// in `third_party/html5ever`): a missing doctype, a non-`html` name, or a
+/// quirks-mode table): a missing doctype, a non-`html` name, or a
 /// force-quirks token means quirks. Otherwise the public identifier selects
 /// quirks by prefix or exact match, the IBM system identifier selects
 /// quirks, the XHTML frameset/transitional prefixes select limited quirks
 /// regardless of the system identifier, and the HTML 4.01 frameset/
-/// transitional prefixes select quirks without one and limited quirks with
-/// one (an explicitly empty system identifier counts as present).
+/// transitional prefixes select quirks when the system identifier is missing
+/// or empty and limited quirks otherwise.
 /// Everything else means no quirks.
+///
+/// html5ever's `doctype_error_and_quirks` still treats an empty system
+/// identifier as present (limited quirks for HTML 4.01); Chromium's
+/// `HTMLConstructionSite::SetCompatibilityModeFromDoctype` tests
+/// `system_id.empty()` and matches the spec, so this follows the spec.
 fn sniff_quirks_mode(input: &str) -> QuirksMode {
     let Some((name, public, system)) = parse_doctype_ids(input) else {
         return QuirksMode::Quirks;
@@ -157,6 +161,7 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
     // Quirks-mode public-identifier prefixes, ASCII case-insensitive
     // (lowercase here; the public identifier is lowercased below).
     const QUIRKS_PREFIXES: &[&str] = &[
+        "+//silmaril//dtd html pro v0r11 19970101//",
         "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
         "-//as//dtd html 3.0 aswedit + extensions//",
         "-//ietf//dtd html 2.0 level 1//",
@@ -224,8 +229,8 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
         "-//w3c//dtd xhtml 1.0 frameset//",
         "-//w3c//dtd xhtml 1.0 transitional//",
     ];
-    // HTML 4.01 frameset/transitional: quirks without a system identifier,
-    // limited quirks with one.
+    // HTML 4.01 frameset/transitional: quirks when the system identifier is
+    // missing or empty, limited quirks otherwise.
     const HTML4_PREFIXES: &[&str] = &[
         "-//w3c//dtd html 4.01 frameset//",
         "-//w3c//dtd html 4.01 transitional//",
@@ -253,7 +258,7 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
         .iter()
         .any(|prefix| public.starts_with(prefix))
     {
-        if system.is_none() {
+        if system.as_deref().is_none_or(str::is_empty) {
             return QuirksMode::Quirks;
         }
         return QuirksMode::LimitedQuirks;
@@ -417,9 +422,8 @@ mod tests {
                 "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Frameset//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-frameset.dtd\">",
                 QuirksMode::LimitedQuirks,
             ),
-            // HTML 4.01 transitional/frameset: quirks without a system
-            // identifier, limited quirks with one (even an empty one, which
-            // counts as present).
+            // HTML 4.01 transitional/frameset: quirks when the system
+            // identifier is missing or empty, limited quirks otherwise.
             (
                 "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">",
                 QuirksMode::Quirks,
@@ -430,6 +434,15 @@ mod tests {
             ),
             (
                 "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Frameset//EN\" \"\">",
+                QuirksMode::Quirks,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" ''>",
+                QuirksMode::Quirks,
+            ),
+            // An empty system identifier keeps XHTML 1.0 at limited quirks.
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"\">",
                 QuirksMode::LimitedQuirks,
             ),
             // Exact-match quirks identifiers: no prefix matching, so `HTML5`
@@ -451,6 +464,10 @@ mod tests {
             ),
             (
                 "<!DOCTYPE html PUBLIC \"-//IETF//DTD HTML 2.0//EN\" \"anything\">",
+                QuirksMode::Quirks,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \"+//Silmaril//dtd html Pro v0r11 19970101//EN\">",
                 QuirksMode::Quirks,
             ),
             // The IBM system identifier, ASCII case-insensitive.
