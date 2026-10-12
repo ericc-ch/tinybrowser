@@ -2351,11 +2351,16 @@ fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
 }
 
 /// A referrer-policy `content` value normalized to its canonical token,
-/// or `None` when the value names no policy.
+/// or `None` when the value names no policy. The legacy meta values map to
+/// their modern tokens
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
 fn parse_referrer_policy(content: &str) -> Option<String> {
     let token = content.trim().to_ascii_lowercase();
     match token.as_str() {
         "never" | "no-referrer" => Some("no-referrer".to_owned()),
+        "default" => Some("strict-origin-when-cross-origin".to_owned()),
+        "always" => Some("unsafe-url".to_owned()),
+        "origin-when-crossorigin" => Some("origin-when-cross-origin".to_owned()),
         "no-referrer-when-downgrade"
         | "origin"
         | "origin-when-cross-origin"
