@@ -2254,7 +2254,9 @@ fn document_character_set(ctx: &Ctx<'_>, id: NodeId) -> &'static str {
 
 /// Registers browsing contexts for iframes inserted by markup setters.
 /// Those paths skip script insertion steps (innerHTML must not run scripts)
-/// but still create iframe browsing contexts
+/// but still create iframe browsing contexts. The iframe insertion steps
+/// only run for an iframe that became connected, so roots outside a
+/// document (template contents, detached subtrees) are skipped
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
 fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
     let mut steps = Vec::new();
@@ -2265,6 +2267,9 @@ fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
             let Some(parsed) = world.document(*root) else {
                 continue;
             };
+            if !is_connected(&parsed.document.base, root.node) {
+                continue;
+            }
             collect_html_insertion_steps(&parsed.document.base, *root, &mut steps);
         }
     }
