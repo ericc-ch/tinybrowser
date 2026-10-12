@@ -353,8 +353,12 @@ impl<'js> xml_serializer_generated::XMLSerializer<'js> for JsXmlSerializer {
         let text = owner.borrow().document(id).map_or_else(
             crate::dom_string::DomString::default,
             |parsed| {
-                let mut output = super::node::HtmlOutput::default();
-                super::node::serialize_xml_node(&parsed.document, id.node, &mut output);
+                let mut output = crate::dom::serialization::HtmlOutput::default();
+                crate::dom::serialization::serialize_xml_node(
+                    &parsed.document,
+                    id.node,
+                    &mut output,
+                );
                 output.finish()
             },
         );

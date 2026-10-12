@@ -11,4 +11,6 @@
 //! not belong to a realm, and only the JS wrappers do
 //! (<https://dom.spec.whatwg.org/#concept-node-adopt>).
 
+pub(crate) mod equality;
+pub(crate) mod serialization;
 pub(crate) mod tree;

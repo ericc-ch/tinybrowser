@@ -265,3 +265,25 @@ pub(crate) fn form_owner_of(
     }
     None
 }
+
+/// The DOM qualified name of `name`: `prefix:local` when a prefix exists, the
+/// local name otherwise
+/// (<https://dom.spec.whatwg.org/#concept-element-qualified-name>).
+pub(crate) fn qualified_name(name: &markup5ever::QualName) -> String {
+    match &name.prefix {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
+        _ => name.local.to_string(),
+    }
+}
+
+/// `Node.nodeName` for an element: the HTML-uppercased qualified name in HTML
+/// documents, the qualified name otherwise
+/// (<https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name>).
+pub(crate) fn element_node_name(name: &markup5ever::QualName, uppercase: bool) -> String {
+    let qualified = qualified_name(name);
+    if uppercase && name.ns == html_namespace() {
+        qualified.to_ascii_uppercase()
+    } else {
+        qualified
+    }
+}

@@ -8,6 +8,7 @@ use blitz_traits::node_id::NodeId as BlitzNodeId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
+use crate::documents::DocumentStore;
 use crate::dom::tree::{NodeId, attr, is_connected, is_iframe_element};
 use crate::dom_string::DomString;
 
@@ -824,6 +825,11 @@ impl World {
             store.get(id.document_id())
         })
         .ok()
+    }
+
+    /// The tree store, for realm-free algorithms that take `&DocumentStore`.
+    pub(crate) fn store(&self) -> Ref<'_, DocumentStore> {
+        self.runtime.documents.borrow()
     }
 
     /// Runs `reader` against the tree owning `id`.

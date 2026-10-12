@@ -1671,22 +1671,6 @@ fn is_infra_whitespace(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ')
 }
 
-pub(super) fn element_node_name(name: &QualName, uppercase: bool) -> String {
-    let qualified = qualified_name(name);
-    if uppercase && name.ns == crate::dom::tree::html_namespace() {
-        qualified.to_ascii_uppercase()
-    } else {
-        qualified
-    }
-}
-
-pub(super) fn qualified_name(name: &QualName) -> String {
-    match &name.prefix {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
-        _ => name.local.to_string(),
-    }
-}
-
 pub(super) fn elements_by_tag<'js>(
     ctx: &Ctx<'js>,
     scope: NodeId,

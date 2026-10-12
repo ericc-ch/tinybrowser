@@ -1,9 +1,9 @@
 //! Attribute, class, and handler-attribute objects and plumbing.
 
 use super::{
-    FromJs, OptString, WebIdlString, child_value, deref_weak, make_weak, qualified_name,
-    realm_registry, schedule_mutation_delivery, string_value, throw_dom, with_node_data, world,
-    world_for_node, wrap_node,
+    FromJs, OptString, WebIdlString, child_value, deref_weak, make_weak, realm_registry,
+    schedule_mutation_delivery, string_value, throw_dom, with_node_data, world, world_for_node,
+    wrap_node,
 };
 
 use std::cell::RefCell;
@@ -14,6 +14,7 @@ use std::rc::Rc;
 use markup5ever::{LocalName, QualName};
 
 use crate::dom::tree::NodeId;
+use crate::dom::tree::qualified_name;
 use crate::js::world::{
     AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, JournalEntry,
     NavigationTarget, World,
