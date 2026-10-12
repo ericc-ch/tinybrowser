@@ -945,7 +945,7 @@ fn collect_row(
         return;
     };
     let mut cell_first = true;
-    for cell in tree.children.to_vec() {
+    for cell in tree.children.iter().copied() {
         let is_cell = collector.base.get_node(cell).is_some_and(|tree| {
             tree.data.downcast_element().is_some_and(|element| {
                 element.name.ns == crate::js::world::html_namespace()
@@ -1001,7 +1001,7 @@ fn collect_select(
     let Some(tree) = collector.base.get_node(node) else {
         return;
     };
-    for child in tree.children.to_vec() {
+    for child in tree.children.iter().copied() {
         // `display:none` options never render.
         if display_none(collector.base, child) {
             continue;
@@ -1060,8 +1060,8 @@ fn collect_details(
         };
         if let Some(summary) = tree
             .children
-            .to_vec()
-            .into_iter()
+            .iter()
+            .copied()
             .find(|child| is_html_tag(collector.base, *child, &["summary"]))
         {
             collect_node(collector, summary, mode, visibility, transform, false);

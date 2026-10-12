@@ -1360,7 +1360,7 @@ pub(crate) fn referrer_for_policy(
             origin
         })
     } else if policy.eq_ignore_ascii_case("strict-origin") {
-        (!downgrade).then(|| origin)
+        (!downgrade).then_some(origin)
     } else if policy.eq_ignore_ascii_case("no-referrer-when-downgrade") {
         (!downgrade).then(|| stripped.to_string())
     } else {

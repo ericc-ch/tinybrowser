@@ -277,7 +277,7 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
         return None;
     }
     let mut chars = rest[9..].chars().peekable();
-    while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+    while chars.peek().is_some_and(char::is_ascii_whitespace) {
         chars.next();
     }
     let mut name = String::new();
@@ -291,7 +291,7 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
     if name.is_empty() {
         return None;
     }
-    while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+    while chars.peek().is_some_and(char::is_ascii_whitespace) {
         chars.next();
     }
     let mut word = String::new();
@@ -309,7 +309,7 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
         // a system identifier; anything else must be a quoted identifier
         // (a missing quote is a missing-quote parse error, which sets
         // force-quirks).
-        while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+        while chars.peek().is_some_and(char::is_ascii_whitespace) {
             chars.next();
         }
         if chars.peek() != Some(&'>') {
@@ -368,7 +368,7 @@ fn skip_ignored_prefix(mut input: &str) -> &str {
 /// One single- or double-quoted string after optional whitespace, or `None`
 /// when the next token is not quoted.
 fn quoted_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
-    while chars.peek().is_some_and(|char| char.is_ascii_whitespace()) {
+    while chars.peek().is_some_and(char::is_ascii_whitespace) {
         chars.next();
     }
     let quote = *chars.peek()?;

@@ -485,7 +485,7 @@ fn ensure_no_cycle(
             ));
         }
         cursor = base.get_node(current).and_then(|candidate| {
-            candidate.parent.or_else(|| match &candidate.data {
+            candidate.parent.or(match &candidate.data {
                 NodeData::Fragment { host } => *host,
                 _ => None,
             })
@@ -5457,11 +5457,10 @@ impl JsNode {
         // (empty) children
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
         let container = crate::js::world::template_contents(&parsed.document.base, container.node)
-            .map(|fragment| NodeId {
+            .map_or(container, |fragment| NodeId {
                 document: container.document,
                 node: fragment,
-            })
-            .unwrap_or(container);
+            });
         let html = world(ctx)?
             .borrow()
             .document(self.handle.0)
@@ -5538,11 +5537,10 @@ impl JsNode {
             .and_then(|parsed| {
                 crate::js::world::template_contents(&parsed.document.base, container.node)
             })
-            .map(|fragment| NodeId {
+            .map_or(container, |fragment| NodeId {
                 document: container.document,
                 node: fragment,
-            })
-            .unwrap_or(container);
+            });
         let owner = world_for_node(ctx, container)?;
         let world = owner.borrow();
         let Some(mut parsed) = world.document_mut(container) else {
@@ -8941,7 +8939,7 @@ fn reflect_enum(raw: Option<&str>, keywords: &[&str], missing: &str, invalid: &s
 /// otherwise the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_ulong(raw: Option<&str>, default: u32) -> u32 {
-    raw.and_then(|value| super::parse_integer(value))
+    raw.and_then(super::parse_integer)
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(default)
 }
@@ -8989,15 +8987,14 @@ fn reflect_clamped_ulong(raw: Option<&str>, default: u32, min: u32, max: u32) ->
 /// `double` reflection: a floating-point value or the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_double(raw: Option<&str>, default: f64) -> f64 {
-    raw.and_then(|value| super::parse_double(value))
-        .unwrap_or(default)
+    raw.and_then(super::parse_double).unwrap_or(default)
 }
 
 /// Limited `double` reflection (used by `progress.max`): a positive
 /// floating-point value or the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_limited_double(raw: Option<&str>, default: f64) -> f64 {
-    match raw.and_then(|value| super::parse_double(value)) {
+    match raw.and_then(super::parse_double) {
         Some(value) if value > 0.0 => value,
         _ => default,
     }
@@ -9027,7 +9024,7 @@ fn is_first_summary_child(base: &blitz_dom::BaseDocument, parent: BlitzId, node:
 /// ASCII case-insensitive keyword match, else the empty string
 /// (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
 fn reflect_dir(raw: Option<&str>) -> &'static str {
-    match raw.map(|value| value.to_ascii_lowercase()).as_deref() {
+    match raw.map(str::to_ascii_lowercase).as_deref() {
         Some("ltr") => "ltr",
         Some("rtl") => "rtl",
         Some("auto") => "auto",
@@ -9224,7 +9221,7 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
         };
         let base = &parsed.document.base;
         Ok(crate::js::world::attr(base, self.handle.0.node, "tabindex")
-            .and_then(|raw| super::parse_integer(raw))
+            .and_then(super::parse_integer)
             .unwrap_or_else(|| tab_index_default(base, self.handle.0.node)))
     }
 
