@@ -2193,7 +2193,7 @@ fn clear_nonce_on_connect(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
     Ok(())
 }
 
-/// The HTML, SVG, and MathML elements under `id` whose `nonce` content
+/// The HTML, SVG, and `MathML` elements under `id` whose `nonce` content
 /// attribute clears on browsing-context connection.
 fn collect_nonce_elements(base: &blitz_dom::BaseDocument, id: NodeId, out: &mut Vec<NodeId>) {
     if let Some(element) = base
@@ -3399,7 +3399,6 @@ fn push_escaped_xml_attribute(output: &mut HtmlOutput, value: &str) {
 /// children. Known gap: namespace prefix synthesis is skipped; the stored
 /// qualified name is used as-is
 /// (<https://w3c.github.io/DOM-Parsing/#xml-serialization>).
-
 fn serialize_xml_element(
     doc: &crate::documents::BlitzDocument,
     id: BlitzId,
@@ -4080,7 +4079,7 @@ impl JsNode {
         attr_wrapper(&ctx, id)
     }
 
-    /// https://dom.spec.whatwg.org/#dom-document-adoptnode
+    /// <https://dom.spec.whatwg.org/#dom-document-adoptnode>
     #[qjs(rename = "adoptNode")]
     fn document_adopt_node<'js>(&self, ctx: Ctx<'js>, node: Value<'js>) -> Result<Value<'js>> {
         match host::node_argument(&ctx, &node)? {
@@ -4415,7 +4414,7 @@ impl JsNode {
         Ok(Value::new_null(ctx.clone()))
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-characterset
+    /// <https://encoding.spec.whatwg.org/#dom-document-characterset>
     #[qjs(skip)]
     #[allow(
         clippy::unnecessary_wraps,
@@ -5021,7 +5020,7 @@ impl JsNode {
         })?))
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     #[qjs(skip)]
     fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let form = {
@@ -5575,14 +5574,14 @@ impl JsNode {
         schedule_mutation_delivery(ctx)
     }
 
-    /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    /// <https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>
     #[qjs(get, rename = "innerText")]
     fn inner_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
         rquickjs::String::from_str(ctx, &text)
     }
 
-    /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    /// <https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>
     #[qjs(get, rename = "outerText")]
     fn outer_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
@@ -7485,7 +7484,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         self.matches(ctx, WebIdlString(arg_0.to_string()?))
     }
 
-    /// https://dom.spec.whatwg.org/#dom-element-webkitmatchesselector
+    /// <https://dom.spec.whatwg.org/#dom-element-webkitmatchesselector>
     fn webkit_matches_selector(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
         // Legacy alias of `matches(selectors)`.
         self.matches(ctx, WebIdlString(arg_0.to_string()?))
@@ -7530,7 +7529,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         )
     }
 
-    /// https://dom.spec.whatwg.org/#dom-element-insertadjacentelement
+    /// <https://dom.spec.whatwg.org/#dom-element-insertadjacentelement>
     fn insert_adjacent_element(
         &self,
         ctx: Ctx<'js>,
@@ -7545,7 +7544,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         }
     }
 
-    /// https://dom.spec.whatwg.org/#dom-element-insertadjacenttext
+    /// <https://dom.spec.whatwg.org/#dom-element-insertadjacenttext>
     fn insert_adjacent_text(
         &self,
         ctx: Ctx<'js>,
@@ -7936,19 +7935,19 @@ impl<'js> document_generated::Document<'js> for JsNode {
         rquickjs::String::from_str(ctx.clone(), &mode)
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-characterset
+    /// <https://encoding.spec.whatwg.org/#dom-document-characterset>
     fn get_character_set(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let set = self.character_set(ctx)?;
         rquickjs::String::from_str(ctx.clone(), set)
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-charset
+    /// <https://encoding.spec.whatwg.org/#dom-document-charset>
     fn get_charset(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let set = self.charset(ctx)?;
         rquickjs::String::from_str(ctx.clone(), set)
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-inputencoding
+    /// <https://encoding.spec.whatwg.org/#dom-document-inputencoding>
     fn get_input_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let encoding = self.input_encoding(ctx)?;
         rquickjs::String::from_str(ctx.clone(), encoding)
@@ -8446,7 +8445,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         schedule_mutation_delivery(&ctx)
     }
 
-    /// https://dom.spec.whatwg.org/#dom-parentnode-movebefore
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-movebefore>
     fn move_before(
         &self,
         ctx: Ctx<'js>,
@@ -10428,7 +10427,7 @@ impl<'js> element_content_editable_generated::ElementContentEditable<'js> for Js
 }
 
 impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10462,7 +10461,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
 }
 
 impl<'js> html_field_set_element_generated::HTMLFieldSetElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10500,7 +10499,7 @@ impl<'js> html_select_element_generated::HTMLSelectElement<'js> for JsNode {
         self.selected_options(ctx.clone())
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10576,7 +10575,7 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
         self.set_selection_direction(ctx.clone(), WebIdlString(value.to_string()?))
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10600,7 +10599,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
         self.set_checked(ctx.clone(), value)
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10861,7 +10860,7 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 }
 
 impl<'js> html_option_element_generated::HTMLOptionElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -11436,7 +11435,7 @@ impl html_meta_element_generated::HTMLMetaElement<'_> for JsNode {}
 impl html_map_element_generated::HTMLMapElement<'_> for JsNode {}
 
 impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -11487,7 +11486,7 @@ impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
 }
 
 impl<'js> html_output_element_generated::HTMLOutputElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -11529,7 +11528,7 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
 }
 
 impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies>
     fn get_t_bodies(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -11539,7 +11538,7 @@ impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
         )
     }
 
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows>
     fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -11556,7 +11555,7 @@ impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
 }
 
 impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells>
     fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -11568,7 +11567,7 @@ impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for
 }
 
 impl<'js> html_table_row_element_generated::HTMLTableRowElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells>
     fn get_cells(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -11910,12 +11909,12 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
 }
 
 impl<'js> text_generated::Text<'js> for JsNode {
-    /// https://dom.spec.whatwg.org/#dom-text-splittext
+    /// <https://dom.spec.whatwg.org/#dom-text-splittext>
     fn split_text(&self, ctx: Ctx<'js>, offset: u32) -> Result<Value<'js>> {
         split_text_node(&ctx, self.handle.0, offset)
     }
 
-    /// https://dom.spec.whatwg.org/#dom-text-wholetext
+    /// <https://dom.spec.whatwg.org/#dom-text-wholetext>
     fn get_whole_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         dom_string(ctx, &whole_text(ctx, self.handle.0)?)
     }

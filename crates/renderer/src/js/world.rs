@@ -824,7 +824,7 @@ pub(crate) struct World {
     /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
     /// without touching the content attribute
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
-    /// Invariant: the slot mirrors the spec's [[CryptographicNonce]].
+    /// Invariant: the slot mirrors the spec's `[[CryptographicNonce]]`.
     /// Content-attribute writes feed it through `set_attribute_sync`, and
     /// removals clear it through `remove_attribute_sync` (the attribute
     /// change steps, where `null` resets the slot). Parser-created `nonce`
