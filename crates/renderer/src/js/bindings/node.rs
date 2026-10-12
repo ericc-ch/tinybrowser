@@ -8013,7 +8013,10 @@ impl<'js> document_generated::Document<'js> for JsNode {
             .document(self.handle.0)
             .and_then(|parsed| document_first_child(&parsed, is_element_data))
             .and_then(|element| content_attr(ctx, element, "dir"));
-        rquickjs::String::from_str(ctx.clone(), reflect_dir(value.as_deref()))
+        rquickjs::String::from_str(
+            ctx.clone(),
+            &reflect_enum(value.as_deref(), DIR_KEYWORDS, "", ""),
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-dir
@@ -9024,17 +9027,9 @@ fn is_first_summary_child(base: &blitz_dom::BaseDocument, parent: BlitzId, node:
     })
 }
 
-/// One `dir` content-attribute value mapped to its IDL reading: an exact
-/// ASCII case-insensitive keyword match, else the empty string
-/// (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
-fn reflect_dir(raw: Option<&str>) -> &'static str {
-    match raw.map(|value| value.to_ascii_lowercase()).as_deref() {
-        Some("ltr") => "ltr",
-        Some("rtl") => "rtl",
-        Some("auto") => "auto",
-        _ => "",
-    }
-}
+/// The `dir` attribute keywords; `dir` reflects with no missing or invalid
+/// default (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
+const DIR_KEYWORDS: &[&str] = &["ltr", "rtl", "auto"];
 
 /// The computed `writingSuggestions` value for `node`: the nearest
 /// ancestor-or-self carrying the attribute decides, ASCII
@@ -9073,6 +9068,7 @@ fn autocapitalize_keyword(raw: Option<&str>) -> &'static str {
         _ => "sentences",
     }
 }
+
 /// The `tabindex` default for one element: 0 for the focusable locals
 /// (buttons, `select`/`textarea`/`iframe`, editing hosts, and the first
 /// `summary` of a `details`), -1 otherwise. Connection and disabled state
@@ -9165,7 +9161,10 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
     // (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
     fn get_dir(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let raw = content_attr(ctx, self.handle.0, "dir");
-        rquickjs::String::from_str(ctx.clone(), reflect_dir(raw.as_deref()))
+        rquickjs::String::from_str(
+            ctx.clone(),
+            &reflect_enum(raw.as_deref(), DIR_KEYWORDS, "", ""),
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute

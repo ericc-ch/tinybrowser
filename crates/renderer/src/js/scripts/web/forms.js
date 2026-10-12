@@ -35,23 +35,10 @@
     return parsed;
   };
 
-  // ASCII case-insensitive lowercase: only A-Z fold. Unicode folding would
-  // wrongly match Kelvin K to `k` or Turkish İ to `i` in enumerated
-  // keywords (<https://infra.spec.whatwg.org/#ascii-case-insensitive>).
-  const asciiLower = value => String(value).replace(/[A-Z]/g, c => c.toLowerCase());
   // ASCII whitespace stripping only: Unicode `trim()` would strip NBSP and
   // friends that the infra grammars must reject
   // (<https://infra.spec.whatwg.org/#ascii-whitespace>).
   const asciiTrim = value => String(value).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
-  // Web IDL `DOMString` conversion: `ToString`, which throws on Symbols
-  // (plain `String()` would stringify them instead)
-  // (<https://webidl.spec.whatwg.org/#es-DOMString>).
-  const toDOMString = value => {
-    if (typeof value === 'symbol') {
-      throw new TypeError('Cannot convert a Symbol value to a string');
-    }
-    return String(value);
-  };
 
   // Web IDL `long` conversion (<https://webidl.spec.whatwg.org/#es-long>).
   const toLong = value => {
@@ -403,34 +390,41 @@
     if (min !== null && min > max) return value > max && value < min;
     return value > max;
   };
-  // Parses a decimal string into an exact `BigInt` scaled by a power of ten
-  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-floating-point-number-values>).
+  // Parses a decimal string into an exact `BigInt` scaled by a power of ten,
+  // plus its rounded `number`
+  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-floating-point-number-values>):
+  // trailing garbage is ignored and a `.` may be followed directly by the
+  // exponent (`1.e2` is 100). A value that rounds to infinity is an error; one that
+  // rounds to zero is zero, which also keeps the `BigInt` power bounded by
+  // the input length.
   const parseDecimal = text => {
-    const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text);
-    if (match === null) return null;
-    const integer = match[2] || '';
+    const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?/.exec(text);
+    const integer = match[2];
     const fraction = match[3] || '';
     if (integer === '' && fraction === '') return null;
+    const exponent = match[4] || '0';
+    const number = Number(`${match[1]}${integer || '0'}.${fraction || '0'}e${exponent}`) + 0;
+    if (!Number.isFinite(number)) return null;
+    if (number === 0) return { value: 0n, scale: 0, number };
     const sign = match[1] === '-' ? -1n : 1n;
     let value = BigInt(integer + fraction) * sign;
-    let scale = fraction.length - (match[4] ? Number(match[4]) : 0);
+    let scale = fraction.length - Number(exponent);
     if (scale < 0) {
       value *= 10n ** BigInt(-scale);
       scale = 0;
     }
-    return { value, scale };
+    return { value, scale, number };
   };
   const atScale = (decimal, scale) => decimal.value * 10n ** BigInt(scale - decimal.scale);
-  // A `step` attribute parsed strictly: only the floating-point grammar
-  // counts. `Number()` would also accept "0x10", "Infinity", and "1e999"
+  // A `step` attribute parsed by the floating-point rules alone:
+  // `Number()` would also accept "0x10", "Infinity", and "1e999"
   // (infinite), none of which are valid step values; anything unparseable
   // or non-positive falls back to the default step.
   const parseStep = (raw, fallback) => {
     if (raw === null) return fallback;
     const parsed = parseDecimal(asciiTrim(raw));
     if (parsed === null) return fallback;
-    const step = Number(parsed.value) / 10 ** parsed.scale;
-    return Number.isFinite(step) && step > 0 ? step : fallback;
+    return parsed.number > 0 ? parsed.number : fallback;
   };
 
   const stepMismatch = element => {
@@ -438,7 +432,7 @@
     const fallback = STEP_DEFAULT[type];
     if (fallback === undefined) return false;
     const rawStep = element.getAttribute('step');
-    if (rawStep !== null && asciiLower(asciiTrim(rawStep)) === 'any') return false;
+    if (rawStep !== null && __tbAsciiLower(asciiTrim(rawStep)) === 'any') return false;
     if (type === 'number' || type === 'range') {
       // Exact decimal arithmetic: a very small step with a large value loses
       // the fraction in f64
@@ -961,11 +955,11 @@
   };
 
   const methodKeyword = raw => {
-    const value = asciiLower(asciiTrim(raw));
+    const value = __tbAsciiLower(asciiTrim(raw));
     return (value === 'post' || value === 'dialog') ? value : 'get';
   };
   const enctypeKeyword = raw => {
-    const value = asciiLower(asciiTrim(raw));
+    const value = __tbAsciiLower(asciiTrim(raw));
     if (value === 'multipart/form-data' || value === 'text/plain') return value;
     return 'application/x-www-form-urlencoded';
   };
@@ -1388,10 +1382,10 @@
       throw new DOMException('stepUp is not applicable', 'InvalidStateError');
     }
     const raw = element.getAttribute('step');
-    if (raw !== null && asciiLower(asciiTrim(raw)) === 'any') {
+    if (raw !== null && __tbAsciiLower(asciiTrim(raw)) === 'any') {
       throw new DOMException('step is any', 'InvalidStateError');
     }
-    let step = parseStep(raw, fallback);
+    const step = parseStep(raw, fallback);
     const min = parseValue(type, element.getAttribute('min'));
     const max = parseValue(type, element.getAttribute('max'));
     if (min !== null && max !== null && min > max) return;
@@ -1469,7 +1463,7 @@
   // (<https://html.spec.whatwg.org/multipage/forms.html#dom-label-htmlfor>).
   Object.defineProperty(globalThis.HTMLLabelElement.prototype, 'htmlFor', {
     get() { return this.getAttribute('for') ?? ''; },
-    set(value) { this.setAttribute('for', toDOMString(value)); },
+    set(value) { this.setAttribute('for', __tbToDOMString(value)); },
     enumerable: true, configurable: true,
   });
 
