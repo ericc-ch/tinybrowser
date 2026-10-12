@@ -1,9 +1,11 @@
 # Vendored third-party code and data
 
 Most of `third_party/` is test input that never ships in the binary. The
-exception is the JS engine forks below, which do ship.
+exceptions are the engine forks and vendored crates below, which do ship.
 
 ## Engine forks (ship in the binary)
+
+### rquickjs and QuickJS-NG
 
 - **What**: the maintained rquickjs and QuickJS-NG forks tinybrowser builds
   against.
@@ -13,11 +15,13 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: `[patch.crates-io]` path entries in the workspace root
   `Cargo.toml`; the rquickjs tree is its own workspace excluded from the
   tinybrowser workspace.
-- **Pinned revisions**: `third_party/rquickjs` at `50b403e`, nested
-  `sys/quickjs` at `8feb526` (check `git submodule status`).
+- **Pinned revisions**: `third_party/rquickjs` at `cb54a23`, nested
+  `sys/quickjs` at `ac85002` (check `git submodule status --recursive`).
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here.
+
+### Blitz
 
 - **What**: the maintained Blitz fork tinybrowser builds against.
 - **Upstream**: <https://github.com/ericc-ch/blitz> at `third_party/blitz`
@@ -25,12 +29,15 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: `[patch.crates-io]` path entries for `blitz-dom`,
   `blitz-html`, `blitz-paint`, and `blitz-traits`; its own workspace excluded
   from the tinybrowser workspace.
-- **Pinned revision**: `third_party/blitz` at `41074d7` (branch `master`, recorded
-  in `.gitmodules`; the fork's default branch is `main`, which tracks upstream
-  and is unrelated to this pin — check `git submodule status`).
+- **Pinned revision**: `third_party/blitz` at `2a0b0ac` (`master`, which
+  merges ericc-ch/blitz#1, the entity fail-closed fix; the fork's default
+  branch is `main`, which tracks upstream and is unrelated to this pin —
+  check `git submodule status`).
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here. Push before pinning.
+
+### xml5ever
 
 - **What**: the maintained xml5ever fork tinybrowser parses XML with.
 - **Upstream**: <https://github.com/ericc-ch/html5ever> at
@@ -38,8 +45,9 @@ exception is the JS engine forks below, which do ship.
 - **Wiring**: a `[patch.crates-io]` path entry for `xml5ever` only. It builds
   against registry markup5ever so the atom/tendril/TreeSink type family stays
   unified; the workspace's own markup5ever/tendril/web_atoms copies are unused.
-- **Pinned revision**: `third_party/html5ever` at `02ecdaa` (`master`, from the
-  `0.39.0` base; check `git submodule status`).
+- **Pinned revision**: `third_party/html5ever` at `dbccaac` (`master`, from
+  the `0.39.0` base, which merges ericc-ch/html5ever#1, the rootless-XML
+  parse error; check `git submodule status`).
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Update**: pull upstream inside the submodule, push the fork branch there,
   then bump the submodule pointer here. Push before pinning.
