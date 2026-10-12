@@ -26,17 +26,19 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import heapq
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -668,9 +670,78 @@ def rerun_status(remaining: int, runner_exit: int) -> tuple[int, bool]:
     return 0, False
 
 
+# --- longest-first split (durations from earlier runs) ---
+
+def durations_source() -> Path | None:
+    """The wptreport-shaped file whose per-test durations drive the split.
+
+    `TINYBROWSER_WPT_DURATIONS` names one (any `--log-wptreport` output);
+    set to empty it disables the split. Unset, it is the cache every run
+    refreshes, so the second run of a slice is already balanced.
+    """
+    override = os.environ.get("TINYBROWSER_WPT_DURATIONS")
+    if override is not None:
+        return Path(override) if override else None
+    return cache_dir() / "wpt-durations.json"
+
+
+def read_durations(report: Path) -> dict[str, float]:
+    try:
+        data = json.loads(report.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        r["test"]: float(r["duration"])
+        for r in data.get("results", [])
+        if r.get("test") and isinstance(r.get("duration"), (int, float)) and r["duration"] > 0
+    }
+
+
+def write_durations(cache: Path, durations: dict[str, float]) -> None:
+    merged = read_durations(cache)
+    merged.update(durations)
+    results = [{"test": test, "duration": round(ms)} for test, ms in sorted(merged.items())]
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=cache.parent, prefix=cache.name, delete=False) as out:
+            json.dump({"results": results}, out)
+        os.replace(out.name, cache)
+    except OSError as error:
+        eprint(f"wpt: cannot record test durations in {cache}: {error}")
+
+
+def longest_first(costs: dict[str, float], buckets: int) -> list[list[str]]:
+    """LPT: hand each test, longest first, to the least-loaded bucket.
+
+    Bucket order is longest first too, so stragglers start early. Ties
+    break on the test id, so the split is deterministic for a given input.
+    """
+    loads = [(0.0, i) for i in range(buckets)]
+    out: list[list[str]] = [[] for _ in range(buckets)]
+    for test in sorted(costs, key=lambda t: (-costs[t], t)):
+        load, i = heapq.heappop(loads)
+        out[i].append(test)
+        heapq.heappush(loads, (load + costs[test], i))
+    return out
+
+
+class DurationRecorder:
+    """mozlog handler: wall time from `test_start` to `test_end`, in ms."""
+
+    def __init__(self) -> None:
+        self.started: dict[str, int] = {}
+        self.durations: dict[str, float] = {}
+
+    def __call__(self, data: dict) -> None:
+        action = data.get("action")
+        if action == "test_start":
+            self.started[data["test"]] = data["time"]
+        elif action == "test_end" and data["test"] in self.started:
+            self.durations[data["test"]] = data["time"] - self.started.pop(data["test"])
+
+
 # --- in-venv runner ---
 
-def patch_wpt(wpt_root: Path) -> None:
+def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRecorder) -> None:
     sys.path.insert(0, str(wpt_root))
     from tools import localpaths  # noqa: F401
     from tools.wpt import run as wpt_run
@@ -723,14 +794,72 @@ def patch_wpt(wpt_root: Path) -> None:
 
     testloader.TestFilter = TinybrowserTestFilter
 
+    from wptrunner import wptlogging
+
+    enter_logger = wptlogging.LoggerManager.__enter__
+
+    def enter_recording_logger(self):
+        logger = enter_logger(self)
+        if recorder not in logger.handlers:
+            logger.add_handler(recorder)
+        return logger
+
+    wptlogging.LoggerManager.__enter__ = enter_recording_logger
+
+    class LongestFirstSource(testloader.SingleTestSource):
+        """Default (no `--run-by-dir`/`-f`) split, balanced by past durations.
+
+        Upstream hashes test ids into one fixed group per process and test
+        type, so one unlucky process gets the 60 s tests. Here every test,
+        whatever its type, goes longest first to the least-loaded process;
+        each process's tests become one group per type, and the queue hands
+        out the costliest groups first so the short tail groups land on
+        whichever process frees up. Tests never timed cost the median.
+        """
+
+        def make_queue(self, tests_by_type):
+            tests = {(key, t.id): t for key, group in tests_by_type.items() for t in group}
+            known = [durations[test_id] for _, test_id in tests if test_id in durations]
+            if not known:
+                return super().make_queue(tests_by_type)
+            eprint(f"wpt: longest-first split, {len(known)} tests with known durations")
+            unknown_ms = statistics.median(known)
+            costs = {item: durations.get(item[1], unknown_ms) for item in tests}
+            groups = []
+            for bucket in longest_first(costs, self.kwargs["processes"]):
+                by_type = defaultdict(list)
+                for key, test_id in bucket:
+                    by_type[key].append((key, test_id))
+                for (subsuite, test_type), items in by_type.items():
+                    metadata = self.group_metadata({})
+                    queue = deque()
+                    for item in items:
+                        tests[item].update_metadata(metadata.extra)
+                        queue.append(tests[item])
+                    cost = sum(costs[item] for item in items)
+                    groups.append((cost, testloader.TestGroup(queue, subsuite, test_type, metadata)))
+            groups.sort(key=lambda entry: entry[0], reverse=True)
+            test_queue = testloader.WriteQueue()
+            for _, group in groups:
+                test_queue.put(group)
+            return test_queue.to_read(), self.process_count(self.kwargs["processes"], len(groups))
+
+    testloader.SingleTestSource = LongestFirstSource
+
 
 def inner_main(argv: list[str]) -> int:
     """Runs under the venv python: patch upstream, then `wpt run`."""
     wpt_root = Path(os.environ.get("TINYBROWSER_WPT_ROOT") or ROOT / "third_party" / "wpt")
-    patch_wpt(wpt_root)
+    source = durations_source()
+    recorder = DurationRecorder()
+    patch_wpt(wpt_root, read_durations(source) if source else {}, recorder)
     from tools.wpt import wpt
 
-    code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
+    try:
+        code = wpt.main(prog=str(wpt_root / "wpt"), argv=["run", *argv])
+    finally:
+        if recorder.durations:
+            write_durations(cache_dir() / "wpt-durations.json", recorder.durations)
     return code if isinstance(code, int) else 0
 
 
@@ -1232,6 +1361,16 @@ def _selftest() -> None:
     assert rerun_status(0, 0) == (0, False)
     assert rerun_status(0, 64) == (64, True)
     assert rerun_status(2, 0) == (1, True)
+
+    assert longest_first({"a": 60, "b": 10, "c": 10, "d": 10, "e": 30, "f": 30}, 2) == [
+        ["a", "b", "d"], ["e", "f", "c"]
+    ]
+    assert longest_first({"a": 1}, 3) == [["a"], [], []]
+    recorder = DurationRecorder()
+    recorder({"action": "test_start", "test": "/a.html", "time": 1000})
+    recorder({"action": "test_end", "test": "/a.html", "time": 1250})
+    recorder({"action": "test_end", "test": "/b.html", "time": 1300})
+    assert recorder.durations == {"/a.html": 250}
 
     report, save, paths, extra, dry, err = split_score_argv(["FileAPI/", "--save-report", "/tmp/x.json", "--", "--exclude=worker"])
     assert report is None and save == Path("/tmp/x.json") and paths == ["FileAPI/"] and extra == ["--exclude=worker"] and not dry and err is None
