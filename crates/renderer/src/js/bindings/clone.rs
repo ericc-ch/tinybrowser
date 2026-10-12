@@ -510,15 +510,7 @@ pub(crate) fn import_snapshot(
             })
         }
         NodeData::CDataSection { .. } => Some(ImportSnapshot::CData(doc.character_data(id.node))),
-        NodeData::AnonymousBlock(_) => {
-            let children = if deep {
-                snapshot_children(doc, id.document, node.children.iter().copied())
-            } else {
-                Vec::new()
-            };
-            Some(ImportSnapshot::Fragment(children))
-        }
-        NodeData::Fragment { .. } => {
+        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
             let children = if deep {
                 snapshot_children(doc, id.document, node.children.iter().copied())
             } else {
@@ -630,8 +622,9 @@ fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
         Some(NodeData::CDataSection { .. }) => {
             LiveKind::Ready(ImportSnapshot::CData(doc.character_data(id.node)))
         }
-        Some(NodeData::AnonymousBlock(_)) => LiveKind::Fragment(live_child_ids(doc, id)),
-        Some(NodeData::Fragment { .. }) => LiveKind::Fragment(live_child_ids(doc, id)),
+        Some(NodeData::AnonymousBlock(_) | NodeData::Fragment { .. }) => {
+            LiveKind::Fragment(live_child_ids(doc, id))
+        }
         Some(NodeData::Document(_)) | None => LiveKind::None,
     })
 }
@@ -728,7 +721,7 @@ pub(crate) fn materialize_import(
             public_id,
             system_id,
         } => {
-            let blitz_id = doc.create_doctype(name.clone(), public_id.clone(), system_id.clone());
+            let blitz_id = doc.create_doctype(name, public_id, system_id);
             Ok(NodeId {
                 document,
                 node: blitz_id,
@@ -736,7 +729,7 @@ pub(crate) fn materialize_import(
         }
         ImportSnapshot::ProcessingInstruction { target, data } => {
             let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.create_processing_instruction(target.clone(), &text);
+            let blitz_id = doc.create_processing_instruction(target, &text);
             Ok(NodeId {
                 document,
                 node: blitz_id,

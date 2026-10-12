@@ -86,7 +86,7 @@ impl FrameTree {
     /// no-op or an end push, never a loss.
     pub(crate) fn reposition(&mut self, child: FrameId, before: Option<FrameId>) {
         let mut parent = None;
-        for (candidate, siblings) in self.children.iter_mut() {
+        for (candidate, siblings) in &mut self.children {
             if let Some(position) = siblings.iter().position(|frame| *frame == child) {
                 siblings.remove(position);
                 parent = Some(*candidate);

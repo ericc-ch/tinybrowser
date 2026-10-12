@@ -48,7 +48,9 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         }
         // https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype
         create_node(&ctx, self.document.0, |parsed| {
-            parsed.document.create_doctype(name, public_id, system_id)
+            parsed
+                .document
+                .create_doctype(&name, &public_id, &system_id)
         })
     }
 
@@ -125,10 +127,7 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         let mut parsed = crate::Parsed::script("text/html", font_ctx);
         // https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument
         let document_root = parsed.document.base.root_node().id;
-        let doctype =
-            parsed
-                .document
-                .create_doctype("html".to_owned(), String::new(), String::new());
+        let doctype = parsed.document.create_doctype("html", "", "");
         parsed
             .document
             .base
@@ -180,7 +179,6 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
         wrap_new_document_in_world(&ctx, parsed, &world_for_node(&ctx, self.document.0)?)
     }
 }
-
 
 /// Adopts `doctype` into `document` and appends it, retargeting the wrapper
 /// so the caller's object and `document.doctype` are the same node

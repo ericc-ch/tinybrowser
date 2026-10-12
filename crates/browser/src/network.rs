@@ -482,13 +482,22 @@ mod tests {
     fn unsafe_referrer_survives_plain_http_cross_origin() {
         // WPT servers are plain http: an http referrer to another http
         // origin must keep its header; only a true downgrade is dropped.
-        assert!(is_safe_referrer("http://a.test/page", "http://b.test/other"));
+        assert!(is_safe_referrer(
+            "http://a.test/page",
+            "http://b.test/other"
+        ));
         assert!(is_safe_referrer(
             "https://a.test/page",
             "https://b.test/other"
         ));
-        assert!(!is_safe_referrer("https://a.test/page", "http://b.test/other"));
-        assert!(!is_safe_referrer("data:text/plain,x", "http://b.test/other"));
+        assert!(!is_safe_referrer(
+            "https://a.test/page",
+            "http://b.test/other"
+        ));
+        assert!(!is_safe_referrer(
+            "data:text/plain,x",
+            "http://b.test/other"
+        ));
         assert!(!is_safe_referrer("not a url", "http://b.test/other"));
     }
 

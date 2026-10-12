@@ -548,6 +548,10 @@ fn route_event(
 
 /// Routes one browser service call from a renderer. This is a dispatch table:
 /// each arm validates and forwards one call shape.
+#[expect(
+    clippy::too_many_lines,
+    reason = "dispatch table with one arm per service call; splitting it is a refactor, not a lint fix"
+)]
 async fn route_service_call(
     context: &ServiceContext,
     id: RequestId,

@@ -61,6 +61,24 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
         InterfaceKind::Partial => quote! {},
     };
     let receiver_check = receiver_check(interface, &interface.rust);
+    let unknown_operation =
+        quote! { Err(rquickjs::Exception::throw_internal(&ctx, "unknown native operation")) };
+    let operation_routes = if routes.is_empty() {
+        unknown_operation
+    } else {
+        quote! {
+            match operation.index() {
+                #(#routes,)*
+                _ => #unknown_operation,
+            }
+        }
+    };
+    let operation =
+        if routes.is_empty() && constructor_dispatch.is_empty() && alternate_dispatch.is_empty() {
+            format_ident!("_operation")
+        } else {
+            format_ident!("operation")
+        };
     quote! {
         pub(crate) mod #module {
             use super::#rust;
@@ -78,7 +96,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
             #unscopables
 
             // https://webidl.spec.whatwg.org/#es-interface-call
-            fn dispatch<'js>(operation: host::Operation, params: &Params<'_, 'js>) -> Result<Value<'js>> {
+            fn dispatch<'js>(#operation: host::Operation, params: &Params<'_, 'js>) -> Result<Value<'js>> {
                 let ctx = params.ctx().clone();
                 #constructor_dispatch
                 #alternate_dispatch
@@ -87,10 +105,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
                 let receiver = host::receiver::<#payload>(params)?;
                 let receiver = receiver.borrow();
                 #receiver_check
-                match operation.index() {
-                    #(#routes,)*
-                    _ => Err(rquickjs::Exception::throw_internal(&ctx, "unknown native operation")),
-                }
+                #operation_routes
             }
 
             #(#groups)*

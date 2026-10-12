@@ -2040,14 +2040,14 @@ fn html_needs_realm(parsed: &crate::Parsed) -> bool {
         if crate::js::world::is_html_element(base, id, "script") {
             return true;
         }
-        if let Some(element) = node.data.downcast_element() {
-            if element.attrs.iter().any(|attribute| {
+        if let Some(element) = node.data.downcast_element()
+            && element.attrs.iter().any(|attribute| {
                 attribute.name.prefix.as_ref().is_none()
                     && attribute.name.ns.as_ref().is_empty()
                     && crate::js::world::is_handler_attribute_name(attribute.name.local.as_ref())
-            }) {
-                return true;
-            }
+            })
+        {
+            return true;
         }
         stack.extend(node.children.iter().rev().copied());
     }

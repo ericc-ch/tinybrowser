@@ -67,6 +67,20 @@ selects testharness and crashtest only:
 nix develop --command ./tools/wpt/rerun /tmp/test262.json -- --test-types test262
 ```
 
+Tests baselined `expected: TIMEOUT` in `tools/wpt/metadata` wait on a
+capability the engine does not have (for example `transitionstart` or
+`animationstart` with no CSS transitions or animations, or Perform
+Actions), so each one costs its full timeout every run. In a dev loop,
+skip them with upstream's `--skip-timeout`; they are reported as SKIP:
+
+```sh
+nix develop --command ./tools/wpt/run dom/nodes/ -- --skip-timeout
+```
+
+`score` and `overnight` refuse `--skip-timeout`, so scored runs always pay
+for and report every expected TIMEOUT. Baseline a TIMEOUT only when the
+missing capability is understood, like any other expectation.
+
 `tools/wpt/cli.py overnight` runs the full suite (no path filter) and scores
 it. It takes minutes to hours; it needs explicit approval per `AGENTS.md`
 like any suite run.
@@ -85,6 +99,7 @@ In `docs/progress.md`, replace the latest total and scored groups only.
 | HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. Actions/bless/permissions are engine-red foundations; BiDi later. |
 | Parallel processes | CPU count unless the command sets `--processes`, `--fully-parallel`, or `-f`. Each process gets its own browser and ports. `--fully-parallel`/`-f` is separate: every test is its own group, so the browser restarts per test. The count actually used is echoed as `wpt: processes N`. |
+| Longest-first split | The default split gives each process one fixed queue with no work stealing; upstream fills it by test-id hash, so one process can draw several 60 s tests. With known durations the harness assigns tests longest-first to the least-loaded process instead (`wpt: longest-first split, N tests with known durations`); tests never timed cost the median. Every run records its per-test durations in `~/.cache/tinybrowser/wpt-durations.json`, so the second run of a slice is balanced. `TINYBROWSER_WPT_DURATIONS=REPORT.json` reads durations from any `--log-wptreport` output instead; `TINYBROWSER_WPT_DURATIONS=` (empty) keeps the hash split. `--run-by-dir`, `--test-groups`, and `-f` keep their upstream grouping. |
 | Skips and locks | The venv install holds the shared-venv lock only around an install that is still needed, then releases it before tests; a run that skips the install takes no lock. A run that lets wpt rewrite the shared manifest holds a manifest lock for the whole invocation; `--no-manifest-update` runs stay parallel. Runs passing `--install-browser`, `--install-webdriver`, `--manifest-download`, or `--install-fonts` hold the venv lock throughout, since wpt itself then writes into the venv. |
 
 ## Blocked on engine capabilities
