@@ -290,7 +290,10 @@ def ensure_venv(wpt: Path, venv: Path) -> None:
 
 # --- manifest (whole-tree inventory; skip the walk when unchanged) ---
 
-def manifest_token(wpt: Path, manifest: Path) -> str:
+def tree_state(wpt: Path) -> list[str]:
+    """The checkout's content: HEAD plus hashes of every changed or
+    untracked file. Taken before a run so an edit made while tests run is
+    not stamped as walked."""
     parts: list[str] = []
     rev = git(["rev-parse", "HEAD"], cwd=wpt) or "no-git"
     parts.append(f"rev {rev}")
@@ -324,6 +327,11 @@ def manifest_token(wpt: Path, manifest: Path) -> str:
         parts.extend(hashed(names))
     except OSError:
         pass
+    return parts
+
+
+def manifest_token(tree: list[str], manifest: Path) -> str:
+    parts = list(tree)
     try:
         parts.append(f"{sha_file(manifest)}  {manifest}")
     except OSError:
@@ -346,17 +354,17 @@ def manifest_is_current(wpt: Path, manifest: Path) -> bool:
     if not stamp.is_file():
         return False
     try:
-        return manifest_token(wpt, manifest) == stamp.read_text().strip()
+        return manifest_token(tree_state(wpt), manifest) == stamp.read_text().strip()
     except OSError:
         return False
 
 
-def write_manifest_stamp(wpt: Path, manifest: Path) -> None:
+def write_manifest_stamp(wpt: Path, manifest: Path, tree: list[str]) -> None:
     if git(["rev-parse", "HEAD"], cwd=wpt) is None:
         return
     stamp = manifest_stamp_file(manifest)
     try:
-        stamp.write_text(manifest_token(wpt, manifest) + "\n")
+        stamp.write_text(manifest_token(tree, manifest) + "\n")
     except OSError:
         pass
 
@@ -833,6 +841,8 @@ def run_wpt(wpt: Path, venv: Path, exe: Path, binary: Path, final_args: list[str
         manifest_mtime_before = manifest.stat().st_mtime_ns
     except OSError:
         manifest_mtime_before = 0
+    # The walk sees the tree as it is when the runner starts; snapshot it now.
+    tree_before = tree_state(wpt) if record == 1 and manifest_locked else []
     try:
         child = subprocess.Popen(
             [str(exe), str(CLI), "_inner", *inner_argv], cwd=str(wpt), close_fds=True,
@@ -872,7 +882,7 @@ def run_wpt(wpt: Path, venv: Path, exe: Path, binary: Path, final_args: list[str
         and manifest_locked
         and manifest_parses(exe, manifest)
     ):
-        write_manifest_stamp(wpt, manifest)
+        write_manifest_stamp(wpt, manifest, tree_before)
     release_lock(venv_lock)
     release_lock(manifest_lock)
     return status
