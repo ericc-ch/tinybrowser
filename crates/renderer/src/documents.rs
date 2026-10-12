@@ -108,13 +108,13 @@ impl BlitzDocument {
     /// (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype>).
     pub(crate) fn create_doctype(
         &mut self,
-        name: String,
-        public_id: String,
-        system_id: String,
+        name: &str,
+        public_id: &str,
+        system_id: &str,
     ) -> blitz_traits::node_id::NodeId {
         self.base
             .mutate()
-            .create_doctype_node(&name, &public_id, &system_id)
+            .create_doctype_node(name, public_id, system_id)
     }
 
     /// Creates a processing instruction
@@ -125,13 +125,13 @@ impl BlitzDocument {
     /// (<https://dom.spec.whatwg.org/#processinginstruction-initialize>).
     pub(crate) fn create_processing_instruction(
         &mut self,
-        target: String,
+        target: &str,
         data: &str,
     ) -> blitz_traits::node_id::NodeId {
         let id = self
             .base
             .mutate()
-            .create_processing_instruction_node(&target, data);
+            .create_processing_instruction_node(target, data);
         let attributes =
             crate::pseudo_attributes::parse_pseudo_attributes(data).unwrap_or_default();
         self.pi_attributes.insert(id, attributes);
@@ -165,10 +165,7 @@ impl BlitzDocument {
 
     /// Creates a CDATA section whose data is `data`
     /// (<https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
-    pub(crate) fn create_cdata_section(
-        &mut self,
-        data: &str,
-    ) -> blitz_traits::node_id::NodeId {
+    pub(crate) fn create_cdata_section(&mut self, data: &str) -> blitz_traits::node_id::NodeId {
         self.base.mutate().create_cdata_section_node(data)
     }
 
@@ -260,11 +257,11 @@ impl BlitzDocument {
     pub(crate) fn character_data(&self, id: blitz_traits::node_id::NodeId) -> DomString {
         match self.base.get_node(id).map(|node| &node.data) {
             Some(NodeData::Text(text)) => DomString::from(text.content.clone()),
-            Some(NodeData::Comment { contents }) => DomString::from(contents.clone()),
-            Some(NodeData::ProcessingInstruction { contents, .. }) => {
-                DomString::from(contents.clone())
-            }
-            Some(NodeData::CDataSection { contents }) => DomString::from(contents.clone()),
+            Some(
+                NodeData::Comment { contents }
+                | NodeData::ProcessingInstruction { contents, .. }
+                | NodeData::CDataSection { contents },
+            ) => DomString::from(contents.clone()),
             _ => DomString::default(),
         }
     }

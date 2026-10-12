@@ -13,30 +13,37 @@
     const lengthDesc = Object.getOwnPropertyDescriptor(native, 'length');
     const nativeLength = lengthDesc.get;
     const nativeItem = native.item;
-    const staticLengths = host.slots();
-    Object.defineProperty(native, 'length', {
-      get: function() {
-        const length = staticLengths.get(this);
-        if (length !== undefined) return length;
-        return __tbApply(nativeLength, this, []);
-      },
-      enumerable: lengthDesc.enumerable,
-      configurable: lengthDesc.configurable,
-    });
-    Object.defineProperty(native, 'item', {
-      value: function item(index) {
-        if (staticLengths.get(this) !== undefined) {
-          const value = this[index >>> 0];
-          return value === undefined ? null : value;
-        }
-        return __tbApply(nativeItem, this, arguments);
-      },
-      writable: true,
-      enumerable: true,
-      configurable: true,
-    });
+    class StaticNodeList extends function(list) { return list; } {
+      #length;
+      constructor(list, length) {
+        super(list);
+        this.#length = length;
+      }
+      static {
+        Object.defineProperty(native, 'length', {
+          get: function() {
+            if (#length in this) return this.#length;
+            return __tbApply(nativeLength, this, []);
+          },
+          enumerable: lengthDesc.enumerable,
+          configurable: lengthDesc.configurable,
+        });
+        Object.defineProperty(native, 'item', {
+          value: function item(index) {
+            if (#length in this) {
+              const value = this[index >>> 0];
+              return value === undefined ? null : value;
+            }
+            return __tbApply(nativeItem, this, arguments);
+          },
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+    }
     host.__tbFinishStaticNodeList = function(list, length) {
-      staticLengths.set(list, length);
+      new StaticNodeList(list, length);
     };
   }
   // Value iterators for `iterable<T>` on `DOMTokenList`

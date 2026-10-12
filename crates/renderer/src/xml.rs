@@ -56,7 +56,13 @@ pub(crate) fn parse_navigated(
     content_type: &'static str,
     config: blitz_dom::DocumentConfig,
 ) -> Parsed {
-    parse_with_config(input, content_type, crate::ReadyState::Loading, true, config)
+    parse_with_config(
+        input,
+        content_type,
+        crate::ReadyState::Loading,
+        true,
+        config,
+    )
 }
 
 /// Parses `input` with the shared XML configuration: the sink keeps real
@@ -80,13 +86,7 @@ fn parse_with_config(
     document.init_parsed_pi_attributes();
     let errors = document.base.take_parse_errors();
     if !errors.is_empty() {
-        return parser_error_document(
-            document,
-            content_type,
-            ready_state,
-            xml_document,
-            &errors,
-        );
+        return parser_error_document(document, content_type, ready_state, xml_document, &errors);
     }
     Parsed {
         id: 0,
@@ -248,4 +248,3 @@ pub(crate) fn is_name_char(character: char) -> bool {
     is_name_start(character)
         || matches!(character, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
 }
-
