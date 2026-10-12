@@ -321,7 +321,7 @@ fn parse_doctype_ids(input: &str) -> Option<(String, String, Option<String>)> {
         system = Some(quoted_string(&mut chars)?);
     } else if !word.is_empty() {
         return None;
-    } else if matches!(chars.peek(), Some('"') | Some('\'')) {
+    } else if matches!(chars.peek(), Some('"' | '\'')) {
         // A quoted identifier with no keyword is a bogus doctype, not an
         // empty public identifier.
         return None;

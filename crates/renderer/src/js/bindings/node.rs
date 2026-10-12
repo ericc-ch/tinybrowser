@@ -3265,7 +3265,8 @@ fn serialize_html_node(
             let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
             serialize_html_element(doc, id, &name, &attributes, output);
         }
-        NodeData::AnonymousBlock(_) => {
+        // A fragment serializes as its children.
+        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
             for child in node.children.clone() {
                 serialize_html_node(doc, child, parent, output);
             }
@@ -3332,12 +3333,6 @@ fn serialize_html_node(
                 output.push_str(contents);
             }
             output.push_str("?>");
-        }
-        // A fragment serializes as its children.
-        NodeData::Fragment { .. } => {
-            for child in node.children.clone() {
-                serialize_html_node(doc, child, parent, output);
-            }
         }
         NodeData::Document(_) => {}
     }
@@ -9127,13 +9122,7 @@ fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
             }
         }
         "button" | "select" | "textarea" | "iframe" => 0,
-        "audio" | "video" => {
-            if crate::js::world::attr(base, node, "controls").is_some() {
-                0
-            } else {
-                -1
-            }
-        }
+        "audio" | "video" if crate::js::world::attr(base, node, "controls").is_some() => 0,
         _ => -1,
     }
 }

@@ -519,8 +519,11 @@ fn node_interface_matches(
         // fragment backings are plain elements under the hood, so every
         // Element-family check below excludes them
         // (<https://dom.spec.whatwg.org/#interface-documentfragment>).
-        "Element" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
-        "HTMLElement" => {
+        // `ARIAMixin` is included by `Element`, so every element answers it.
+        "Element" | "ARIAMixin" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
+        // `ElementContentEditable` is included by `HTMLElement` only, so any
+        // HTML element (including unknown elements) answers it.
+        "HTMLElement" | "ElementContentEditable" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
                 && !is_fragment
         }
@@ -556,14 +559,6 @@ fn node_interface_matches(
                     || element.name.ns == crate::js::world::mathml_namespace()
             ) && !is_fragment
         }
-        // `ElementContentEditable` is included by `HTMLElement` only, so any
-        // HTML element (including unknown elements) answers it.
-        "ElementContentEditable" => {
-            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
-                && !is_fragment
-        }
-        // `ARIAMixin` is included by `Element`, so every element answers it.
-        "ARIAMixin" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
         "ParentNode" => matches!(
             data,
             Some(NodeData::Document(_) | NodeData::Element(_) | NodeData::Fragment { .. })

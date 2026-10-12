@@ -257,11 +257,11 @@ impl BlitzDocument {
     pub(crate) fn character_data(&self, id: blitz_traits::node_id::NodeId) -> DomString {
         match self.base.get_node(id).map(|node| &node.data) {
             Some(NodeData::Text(text)) => DomString::from(text.content.clone()),
-            Some(NodeData::Comment { contents }) => DomString::from(contents.clone()),
-            Some(NodeData::ProcessingInstruction { contents, .. }) => {
-                DomString::from(contents.clone())
-            }
-            Some(NodeData::CDataSection { contents }) => DomString::from(contents.clone()),
+            Some(
+                NodeData::Comment { contents }
+                | NodeData::ProcessingInstruction { contents, .. }
+                | NodeData::CDataSection { contents },
+            ) => DomString::from(contents.clone()),
             _ => DomString::default(),
         }
     }

@@ -68,9 +68,8 @@ enum Transform {
 fn style_property<'a>(style: &'a str, property: &str) -> Option<&'a str> {
     let mut found = None;
     for declaration in split_declarations(style) {
-        let (name, value) = match declaration.split_once(':') {
-            Some(pair) => pair,
-            None => continue,
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
         };
         if name.trim().eq_ignore_ascii_case(property) {
             found = Some(strip_important(value.trim()));
@@ -223,9 +222,6 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
             // Table-internal displays outside a table walk have no
             // anonymous-table repair, so their content collects inline
             // rather than vanishing.
-            "table-row" | "table-cell" | "table-caption" | "table-column"
-            | "table-column-group" | "table-row-group" | "table-header-group"
-            | "table-footer-group" => Level::Inline,
             _ => Level::Inline,
         };
     }
@@ -264,17 +260,10 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
         // Never rendered (without an overriding `style` attribute, which
         // returned above for rendering displays; `source`/`track` join
         // `script`/`style` here; `template`/`noscript` returned earlier).
-        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source" | "track"
-        | "frame" | "frameset" | "noframes" | "noembed" | "datalist" => Level::Hidden,
         // `rp` never renders (its parens are dropped); an explicit rendering
         // display above still wins.
-        "rp" => Level::Hidden,
-        // Transparent containers.
-        "span" | "a" | "b" | "i" | "em" | "strong" | "code" | "tt" | "u" | "s" | "small"
-        | "big" | "cite" | "q" | "dfn" | "abbr" | "kbd" | "samp" | "var" | "sub" | "sup"
-        | "mark" | "ruby" | "rt" | "bdi" | "bdo" | "font" | "label" | "output" | "nobr" | "wbr"
-        | "slot" | "picture" | "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr" | "td"
-        | "th" | "caption" | "marquee" | "isindex" => Level::Inline,
+        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source" | "track"
+        | "frame" | "frameset" | "noframes" | "noembed" | "datalist" | "rp" => Level::Hidden,
         // Block containers (`li` is `list-item`, block-level; `fieldset`,
         // `legend`, `center`, `search`, `dt`/`dd` are `block`).
         "address" | "article" | "aside" | "blockquote" | "details" | "dialog" | "div" | "dl"
@@ -287,7 +276,8 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
         "img" | "input" | "textarea" | "iframe" | "audio" | "video" | "canvas" | "object"
         | "embed" | "param" | "map" | "area" | "applet" | "button" => Level::Atomic,
         "select" | "option" | "optgroup" => Level::Paragraph,
-        // Unknown and custom elements are inline by default.
+        // Transparent containers (`span`, `a`, `b`, table parts, ...) and
+        // unknown and custom elements are inline by default.
         _ => Level::Inline,
     }
 }
@@ -869,8 +859,7 @@ fn collect_table(
             Some("tr") => {
                 rows.push((current, inherited, inherited_mode, inherited_transform));
             }
-            Some("td") | Some("th") => {}
-            Some("table") => {}
+            Some("td" | "th" | "table") => {}
             _ => {
                 let item_visibility = visibility_of(collector.base, current, inherited);
                 let item_mode = white_space_of(collector.base, current, inherited_mode);
@@ -1015,7 +1004,7 @@ fn collect_select(
         match kind.as_deref() {
             // Text directly under `select` is ignored.
             None => {}
-            Some("option") | Some("optgroup") => {
+            Some("option" | "optgroup") => {
                 if kind.as_deref() == Some("optgroup")
                     && is_optgroup_ancestor(collector.base, child)
                 {

@@ -510,15 +510,7 @@ pub(crate) fn import_snapshot(
             })
         }
         NodeData::CDataSection { .. } => Some(ImportSnapshot::CData(doc.character_data(id.node))),
-        NodeData::AnonymousBlock(_) => {
-            let children = if deep {
-                snapshot_children(doc, id.document, node.children.iter().copied())
-            } else {
-                Vec::new()
-            };
-            Some(ImportSnapshot::Fragment(children))
-        }
-        NodeData::Fragment { .. } => {
+        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
             let children = if deep {
                 snapshot_children(doc, id.document, node.children.iter().copied())
             } else {
@@ -630,8 +622,9 @@ fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
         Some(NodeData::CDataSection { .. }) => {
             LiveKind::Ready(ImportSnapshot::CData(doc.character_data(id.node)))
         }
-        Some(NodeData::AnonymousBlock(_)) => LiveKind::Fragment(live_child_ids(doc, id)),
-        Some(NodeData::Fragment { .. }) => LiveKind::Fragment(live_child_ids(doc, id)),
+        Some(NodeData::AnonymousBlock(_) | NodeData::Fragment { .. }) => {
+            LiveKind::Fragment(live_child_ids(doc, id))
+        }
         Some(NodeData::Document(_)) | None => LiveKind::None,
     })
 }
