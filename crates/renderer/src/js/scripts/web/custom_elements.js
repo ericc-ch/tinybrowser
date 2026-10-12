@@ -300,11 +300,15 @@
       get: innerHTML.get,
       set: function(value) {
         nativeApply(innerHTML.set, this, [value]);
-        upgradeFromNodeDocument(this);
+        if (isConnected(this)) upgradeFromNodeDocument(this);
       },
     });
   }
+  // Insertion only upgrades elements that became connected; template
+  // contents and detached subtrees stay un-upgraded until they connect
+  // (<https://dom.spec.whatwg.org/#concept-node-insert>).
   host.__tbUpgradeParsedTree = function(root) {
+    if (!isConnected(root)) return;
     upgradeFromNodeDocument(root);
     pushReactions();
     try { upgradeTree(root); } finally { popReactions(); }
@@ -330,7 +334,11 @@
       const inserted = insertedNodes(arguments[0]);
       const result = nativeApply(native, this, arguments);
       pushReactions();
-      try { for (const node of inserted) upgradeTree(node); } finally { popReactions(); }
+      try {
+        for (const node of inserted) {
+          if (isConnected(node)) upgradeTree(node);
+        }
+      } finally { popReactions(); }
       return result;
     };
     __tbDefineProperty(insertion, 'length', { value: native.length });
@@ -385,7 +393,7 @@
             atomicMoves.delete(node);
             continue;
           }
-          upgradeTree(node);
+          if (isConnected(node)) upgradeTree(node);
           notifyConnected(node);
         }
       } else if (record.type === 'attributes' && upgraded.has(record.target)) {
