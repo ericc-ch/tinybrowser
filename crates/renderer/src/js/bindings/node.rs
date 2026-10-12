@@ -3988,7 +3988,9 @@ impl JsNode {
         let text = data.0.to_string_lossy().into_owned();
         let target = target.0;
         create_node(&ctx, self.handle.0, |parsed| {
-            parsed.document.create_processing_instruction(target, &text)
+            parsed
+                .document
+                .create_processing_instruction(&target, &text)
         })
     }
 
@@ -4802,16 +4804,16 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     #[qjs(skip)]
-    fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn form_method(&self, ctx: Ctx<'_>) -> String {
         // Enumerated without whitespace stripping: only an exact ASCII
         // case-insensitive keyword matches
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        Ok(reflect_enum(
+        reflect_enum(
             content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
             &["post", "dialog"],
             "",
             "get",
-        ))
+        )
     }
 
     #[qjs(skip)]
@@ -4821,15 +4823,15 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     #[qjs(skip)]
-    fn form_enctype(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn form_enctype(&self, ctx: Ctx<'_>) -> String {
         // Absent reads empty, like `formMethod`; no whitespace stripping
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        Ok(reflect_enum(
+        reflect_enum(
             content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
             &["multipart/form-data", "text/plain"],
             "",
             "application/x-www-form-urlencoded",
-        ))
+        )
     }
 
     #[qjs(skip)]
@@ -9944,7 +9946,7 @@ fn reflect_referrer_policy<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<rquickjs::
     rquickjs::String::from_str(ctx.clone(), &value)
 }
 
-fn set_referrer_policy(ctx: &Ctx<'_>, id: NodeId, value: rquickjs::String<'_>) -> Result<()> {
+fn set_referrer_policy(ctx: &Ctx<'_>, id: NodeId, value: &rquickjs::String<'_>) -> Result<()> {
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     set_attribute_sync(ctx, id, "referrerpolicy", &value.to_string()?)
 }
@@ -9991,7 +9993,7 @@ impl<'js> html_anchor_element_generated::HTMLAnchorElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 }
 
@@ -10003,7 +10005,7 @@ impl<'js> html_area_element_generated::HTMLAreaElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 }
 impl html_audio_element_generated::HTMLAudioElement<'_> for JsNode {}
@@ -10425,7 +10427,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let method = self.form_method(ctx.clone())?;
+        let method = self.form_method(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &method)
     }
 
@@ -10436,7 +10438,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let enctype = self.form_enctype(ctx.clone())?;
+        let enctype = self.form_enctype(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &enctype)
     }
 
@@ -10597,7 +10599,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let method = self.form_method(ctx.clone())?;
+        let method = self.form_method(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &method)
     }
 
@@ -10608,7 +10610,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let enctype = self.form_enctype(ctx.clone())?;
+        let enctype = self.form_enctype(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &enctype)
     }
 
@@ -10942,7 +10944,7 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // `loading` defaults to `eager`
@@ -11042,7 +11044,7 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // `decoding` defaults to `auto`
@@ -11194,7 +11196,7 @@ impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-crossorigin
@@ -11374,7 +11376,7 @@ impl<'js> html_script_element_generated::HTMLScriptElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-crossorigin

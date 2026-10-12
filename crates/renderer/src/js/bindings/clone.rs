@@ -721,7 +721,7 @@ pub(crate) fn materialize_import(
             public_id,
             system_id,
         } => {
-            let blitz_id = doc.create_doctype(name.clone(), public_id.clone(), system_id.clone());
+            let blitz_id = doc.create_doctype(name, public_id, system_id);
             Ok(NodeId {
                 document,
                 node: blitz_id,
@@ -729,7 +729,7 @@ pub(crate) fn materialize_import(
         }
         ImportSnapshot::ProcessingInstruction { target, data } => {
             let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.create_processing_instruction(target.clone(), &text);
+            let blitz_id = doc.create_processing_instruction(target, &text);
             Ok(NodeId {
                 document,
                 node: blitz_id,

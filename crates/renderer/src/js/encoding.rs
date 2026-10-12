@@ -211,11 +211,10 @@ fn decoder_decode(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decoder_free(ctx: Ctx<'_>, id: u64) -> Result<()> {
+fn decoder_free(ctx: Ctx<'_>, id: u64) {
     if let Ok(world) = super::bindings::world(&ctx) {
         world.borrow_mut().decoders.remove(&id);
     }
-    Ok(())
 }
 
 /// Resolves `label` to an encoding, rejecting unknown labels and the
