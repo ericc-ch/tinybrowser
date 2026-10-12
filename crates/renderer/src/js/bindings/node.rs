@@ -3327,7 +3327,7 @@ fn serialize_html_node(
         NodeData::ProcessingInstruction { target, contents } => {
             output.push_str("<?");
             output.push_str(target);
-            output.push(' ');
+            output.push_str(" ");
             output.push_str(contents);
             output.push_str("?>");
         }
@@ -3479,12 +3479,12 @@ pub(crate) fn serialize_xml_node(
         } => {
             // The serialization of an ID quotes with `'` when the ID
             // contains `"`, else with `"`.
-            let push_id = |output: &mut String, id: &str| {
-                let quote = if id.contains('"') { '\'' } else { '"' };
-                output.push(' ');
-                output.push(quote);
+            let push_id = |output: &mut HtmlOutput, id: &str| {
+                let quote = if id.contains('"') { "'" } else { "\"" };
+                output.push_str(" ");
+                output.push_str(quote);
                 output.push_str(id);
-                output.push(quote);
+                output.push_str(quote);
             };
             output.push_str("<!DOCTYPE ");
             output.push_str(name);
@@ -3502,7 +3502,7 @@ pub(crate) fn serialize_xml_node(
         NodeData::ProcessingInstruction { target, contents } => {
             output.push_str("<?");
             output.push_str(target);
-            output.push(' ');
+            output.push_str(" ");
             output.push_str(contents);
             output.push_str("?>");
         }
