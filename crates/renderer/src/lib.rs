@@ -136,6 +136,83 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
     }
 }
 
+// Quirks-mode public-identifier prefixes, ASCII case-insensitive
+// (lowercase here; `sniff_quirks_mode` lowercases the public identifier).
+const QUIRKS_PREFIXES: &[&str] = &[
+    "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
+    "-//as//dtd html 3.0 aswedit + extensions//",
+    "-//ietf//dtd html 2.0 level 1//",
+    "-//ietf//dtd html 2.0 level 2//",
+    "-//ietf//dtd html 2.0 strict level 1//",
+    "-//ietf//dtd html 2.0 strict level 2//",
+    "-//ietf//dtd html 2.0 strict//",
+    "-//ietf//dtd html 2.0//",
+    "-//ietf//dtd html 2.1e//",
+    "-//ietf//dtd html 3.0//",
+    "-//ietf//dtd html 3.2 final//",
+    "-//ietf//dtd html 3.2//",
+    "-//ietf//dtd html 3//",
+    "-//ietf//dtd html level 0//",
+    "-//ietf//dtd html level 1//",
+    "-//ietf//dtd html level 2//",
+    "-//ietf//dtd html level 3//",
+    "-//ietf//dtd html strict level 0//",
+    "-//ietf//dtd html strict level 1//",
+    "-//ietf//dtd html strict level 2//",
+    "-//ietf//dtd html strict level 3//",
+    "-//ietf//dtd html strict//",
+    "-//ietf//dtd html//",
+    "-//metrius//dtd metrius presentational//",
+    "-//microsoft//dtd internet explorer 2.0 html strict//",
+    "-//microsoft//dtd internet explorer 2.0 html//",
+    "-//microsoft//dtd internet explorer 2.0 tables//",
+    "-//microsoft//dtd internet explorer 3.0 html strict//",
+    "-//microsoft//dtd internet explorer 3.0 html//",
+    "-//microsoft//dtd internet explorer 3.0 tables//",
+    "-//netscape comm. corp.//dtd html//",
+    "-//netscape comm. corp.//dtd strict html//",
+    "-//o'reilly and associates//dtd html 2.0//",
+    "-//o'reilly and associates//dtd html extended 1.0//",
+    "-//o'reilly and associates//dtd html extended relaxed 1.0//",
+    "-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//",
+    "-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//",
+    "-//spyglass//dtd html 2.0 extended//",
+    "-//sq//dtd html 2.0 hotmetal + extensions//",
+    "-//sun microsystems corp.//dtd hotjava html//",
+    "-//sun microsystems corp.//dtd hotjava strict html//",
+    "-//w3c//dtd html 3 1995-03-24//",
+    "-//w3c//dtd html 3.2 draft//",
+    "-//w3c//dtd html 3.2 final//",
+    "-//w3c//dtd html 3.2//",
+    "-//w3c//dtd html 3.2s draft//",
+    "-//w3c//dtd html 4.0 frameset//",
+    "-//w3c//dtd html 4.0 transitional//",
+    "-//w3c//dtd html experimental 19960712//",
+    "-//w3c//dtd html experimental 970421//",
+    "-//w3c//dtd w3 html//",
+    "-//w3o//dtd w3 html 3.0//",
+    "-//webtechs//dtd mozilla html 2.0//",
+    "-//webtechs//dtd mozilla html//",
+];
+// Quirks-mode public identifiers matched exactly (ASCII
+// case-insensitive), not by prefix: `PUBLIC "HTML5"` is standards.
+const QUIRKS_EXACT: &[&str] = &[
+    "-//w3o//dtd w3 html strict 3.0//en//",
+    "-/w3c/dtd html 4.0 transitional/en",
+    "html",
+];
+// Limited-quirks prefixes regardless of the system identifier.
+const LIMITED_PREFIXES: &[&str] = &[
+    "-//w3c//dtd xhtml 1.0 frameset//",
+    "-//w3c//dtd xhtml 1.0 transitional//",
+];
+// HTML 4.01 frameset/transitional: quirks without a system identifier,
+// limited quirks with one.
+const HTML4_PREFIXES: &[&str] = &[
+    "-//w3c//dtd html 4.01 frameset//",
+    "-//w3c//dtd html 4.01 transitional//",
+];
+
 /// Compatibility mode from the doctype
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>,
 /// quirks-mode table, mirrored from html5ever's `doctype_error_and_quirks`
@@ -154,82 +231,6 @@ fn sniff_quirks_mode(input: &str) -> QuirksMode {
     if !name.eq_ignore_ascii_case("html") {
         return QuirksMode::Quirks;
     }
-    // Quirks-mode public-identifier prefixes, ASCII case-insensitive
-    // (lowercase here; the public identifier is lowercased below).
-    const QUIRKS_PREFIXES: &[&str] = &[
-        "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
-        "-//as//dtd html 3.0 aswedit + extensions//",
-        "-//ietf//dtd html 2.0 level 1//",
-        "-//ietf//dtd html 2.0 level 2//",
-        "-//ietf//dtd html 2.0 strict level 1//",
-        "-//ietf//dtd html 2.0 strict level 2//",
-        "-//ietf//dtd html 2.0 strict//",
-        "-//ietf//dtd html 2.0//",
-        "-//ietf//dtd html 2.1e//",
-        "-//ietf//dtd html 3.0//",
-        "-//ietf//dtd html 3.2 final//",
-        "-//ietf//dtd html 3.2//",
-        "-//ietf//dtd html 3//",
-        "-//ietf//dtd html level 0//",
-        "-//ietf//dtd html level 1//",
-        "-//ietf//dtd html level 2//",
-        "-//ietf//dtd html level 3//",
-        "-//ietf//dtd html strict level 0//",
-        "-//ietf//dtd html strict level 1//",
-        "-//ietf//dtd html strict level 2//",
-        "-//ietf//dtd html strict level 3//",
-        "-//ietf//dtd html strict//",
-        "-//ietf//dtd html//",
-        "-//metrius//dtd metrius presentational//",
-        "-//microsoft//dtd internet explorer 2.0 html strict//",
-        "-//microsoft//dtd internet explorer 2.0 html//",
-        "-//microsoft//dtd internet explorer 2.0 tables//",
-        "-//microsoft//dtd internet explorer 3.0 html strict//",
-        "-//microsoft//dtd internet explorer 3.0 html//",
-        "-//microsoft//dtd internet explorer 3.0 tables//",
-        "-//netscape comm. corp.//dtd html//",
-        "-//netscape comm. corp.//dtd strict html//",
-        "-//o'reilly and associates//dtd html 2.0//",
-        "-//o'reilly and associates//dtd html extended 1.0//",
-        "-//o'reilly and associates//dtd html extended relaxed 1.0//",
-        "-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//",
-        "-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//",
-        "-//spyglass//dtd html 2.0 extended//",
-        "-//sq//dtd html 2.0 hotmetal + extensions//",
-        "-//sun microsystems corp.//dtd hotjava html//",
-        "-//sun microsystems corp.//dtd hotjava strict html//",
-        "-//w3c//dtd html 3 1995-03-24//",
-        "-//w3c//dtd html 3.2 draft//",
-        "-//w3c//dtd html 3.2 final//",
-        "-//w3c//dtd html 3.2//",
-        "-//w3c//dtd html 3.2s draft//",
-        "-//w3c//dtd html 4.0 frameset//",
-        "-//w3c//dtd html 4.0 transitional//",
-        "-//w3c//dtd html experimental 19960712//",
-        "-//w3c//dtd html experimental 970421//",
-        "-//w3c//dtd w3 html//",
-        "-//w3o//dtd w3 html 3.0//",
-        "-//webtechs//dtd mozilla html 2.0//",
-        "-//webtechs//dtd mozilla html//",
-    ];
-    // Quirks-mode public identifiers matched exactly (ASCII
-    // case-insensitive), not by prefix: `PUBLIC "HTML5"` is standards.
-    const QUIRKS_EXACT: &[&str] = &[
-        "-//w3o//dtd w3 html strict 3.0//en//",
-        "-/w3c/dtd html 4.0 transitional/en",
-        "html",
-    ];
-    // Limited-quirks prefixes regardless of the system identifier.
-    const LIMITED_PREFIXES: &[&str] = &[
-        "-//w3c//dtd xhtml 1.0 frameset//",
-        "-//w3c//dtd xhtml 1.0 transitional//",
-    ];
-    // HTML 4.01 frameset/transitional: quirks without a system identifier,
-    // limited quirks with one.
-    const HTML4_PREFIXES: &[&str] = &[
-        "-//w3c//dtd html 4.01 frameset//",
-        "-//w3c//dtd html 4.01 transitional//",
-    ];
     let public = public.to_ascii_lowercase();
     if QUIRKS_PREFIXES
         .iter()

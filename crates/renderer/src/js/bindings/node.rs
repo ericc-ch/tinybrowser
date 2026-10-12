@@ -10179,6 +10179,10 @@ fn meter_gauge(ctx: &Ctx<'_>, id: NodeId) -> MeterGauge {
     if high < low {
         high = low;
     }
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "f64::midpoint differs only when min + max overflows; a lint cleanup keeps the existing result"
+    )]
     let raw_optimum = reflect_double(
         content_attr(ctx, id, "optimum").as_deref(),
         (min + max) / 2.0,
@@ -10224,7 +10228,7 @@ impl<'js> html_progress_element_generated::HTMLProgressElement<'js> for JsNode {
     fn set_max(&self, ctx: &Ctx<'js>, value: f64) -> Result<()> {
         // Non-positive values leave the attribute untouched
         // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-max>).
-        if !(value > 0.0) {
+        if value.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return Ok(());
         }
         host::reflect_set_double(ctx, self.handle.0, "max", value)
