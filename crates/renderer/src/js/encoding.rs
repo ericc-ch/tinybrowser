@@ -76,8 +76,8 @@ fn encode_into<'js>(ctx: Ctx<'js>, source: Value<'js>, max: usize) -> Result<Obj
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decode<'js>(
-    ctx: Ctx<'js>,
+fn decode(
+    ctx: Ctx<'_>,
     source: String,
     label: String,
     fatal: bool,
@@ -110,15 +110,20 @@ fn decode<'js>(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decode_xml_response<'js>(ctx: Ctx<'js>, source: String, content_type: String) -> Result<String> {
+fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Result<String> {
     let bytes = bytes_from_latin1(&source)
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
     let header = (!content_type.trim().is_empty()).then_some(content_type.as_str());
     let (encoding, bom_len) = crate::document::dial::sniff_encoding(&bytes, header, true)
         .unwrap_or((encoding_rs::UTF_8, 0));
     let mut decoder = encoding.new_decoder_without_bom_handling();
-    decode_loop(&mut decoder, bytes.get(bom_len..).unwrap_or(&[]), true, true)
-        .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
+    decode_loop(
+        &mut decoder,
+        bytes.get(bom_len..).unwrap_or(&[]),
+        true,
+        true,
+    )
+    .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
 }
 
 /// Opens a streaming decoder session for `label`, returning its platform id.
@@ -130,7 +135,7 @@ fn decode_xml_response<'js>(ctx: Ctx<'js>, source: String, content_type: String)
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decoder_init<'js>(ctx: Ctx<'js>, label: String, ignore_bom: bool) -> Result<u64> {
+fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
     let encoding = resolve_label(&ctx, &label)?;
     let world_rc = super::bindings::world(&ctx)?;
     let id = world_rc
@@ -155,8 +160,8 @@ fn decoder_init<'js>(ctx: Ctx<'js>, label: String, ignore_bom: bool) -> Result<u
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decoder_decode<'js>(
-    ctx: Ctx<'js>,
+fn decoder_decode(
+    ctx: Ctx<'_>,
     id: u64,
     source: String,
     fatal: bool,
@@ -178,7 +183,8 @@ fn decoder_decode<'js>(
                 // `last=true` ends the decoder, which must never run again;
                 // the next call starts a fresh session with the same encoding
                 // and BOM mode.
-                *session = super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
+                *session =
+                    super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
             }
             Ok(text)
         }
@@ -188,9 +194,13 @@ fn decoder_decode<'js>(
                 // it carries forward.
                 session.carry = input[failure.consumed..].to_vec();
             } else {
-                *session = super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
+                *session =
+                    super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
             }
-            Err(Exception::throw_type(&ctx, "The encoded data was not valid."))
+            Err(Exception::throw_type(
+                &ctx,
+                "The encoded data was not valid.",
+            ))
         }
     }
 }
@@ -201,17 +211,16 @@ fn decoder_decode<'js>(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decoder_free<'js>(ctx: Ctx<'js>, id: u64) -> Result<()> {
+fn decoder_free(ctx: Ctx<'_>, id: u64) {
     if let Ok(world) = super::bindings::world(&ctx) {
         world.borrow_mut().decoders.remove(&id);
     }
-    Ok(())
 }
 
 /// Resolves `label` to an encoding, rejecting unknown labels and the
 /// `replacement` encoding, which getting an encoding never returns
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
-fn resolve_label<'js>(ctx: &Ctx<'js>, label: &str) -> Result<&'static Encoding> {
+fn resolve_label(ctx: &Ctx<'_>, label: &str) -> Result<&'static Encoding> {
     Encoding::for_label(super::bindings::forms::trim_label(label).as_bytes())
         .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .ok_or_else(|| Exception::throw_range(ctx, "The encoding label is not supported"))
@@ -245,7 +254,9 @@ fn btoa<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, input)? else {
         return Ok(None);
     };
-    Ok(Some(base64::engine::general_purpose::STANDARD.encode(bytes)))
+    Ok(Some(
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
 }
 
 /// Standard base64 of isomorphic-latin1 bytes, for `FileReader` data URLs.
@@ -257,7 +268,9 @@ fn base64_encode<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Option<String
     let Some(bytes) = latin1_bytes(&ctx, source)? else {
         return Ok(None);
     };
-    Ok(Some(base64::engine::general_purpose::STANDARD.encode(bytes)))
+    Ok(Some(
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
 }
 
 /// UTF-16 units as Latin1 bytes, or `None` when a unit exceeds `0xFF`.
