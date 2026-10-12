@@ -307,26 +307,16 @@
   // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>,
   // <https://html.spec.whatwg.org/multipage/input.html#dom-input-type>,
   // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-button-type>).
-  const asciiLower = value => String(value).replace(/[A-Z]/g, c => c.toLowerCase());
-  // Web IDL `DOMString` conversion: `ToString`, which throws on Symbols
-  // (plain `String()` would stringify them instead)
-  // (<https://webidl.spec.whatwg.org/#es-DOMString>).
-  const toDOMString = value => {
-    if (typeof value === 'symbol') {
-      throw new TypeError('Cannot convert a Symbol value to a string');
-    }
-    return String(value);
-  };
   function reflectType(keywords, fallback) {
     return {
       get: function() {
         const value = this.getAttribute('type');
         if (value === null) return fallback;
-        const lowered = asciiLower(value);
+        const lowered = __tbAsciiLower(value);
         return keywords.has(lowered) ? lowered : fallback;
       },
       // The setter reflects verbatim: no lowercasing, only conversion.
-      set: function(value) { this.setAttribute('type', toDOMString(value)); },
+      set: function(value) { this.setAttribute('type', __tbToDOMString(value)); },
       enumerable: true,
       configurable: true,
     };
@@ -340,14 +330,14 @@
     get: function() {
       const value = this.getAttribute('type');
       if (value === null) return 'text';
-      const lowered = asciiLower(value);
+      const lowered = __tbAsciiLower(value);
       return INPUT_TYPE_KEYWORDS.has(lowered) ? lowered : 'text';
     },
     set: function(value) {
       // The `type` attribute change runs the input type-change steps in the
       // DOM, whatever the mutation path
       // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
-      this.setAttribute('type', toDOMString(value));
+      this.setAttribute('type', __tbToDOMString(value));
     },
     enumerable: true,
     configurable: true,
@@ -398,7 +388,7 @@
     get: function() {
       const value = this.getAttribute('hidden');
       if (value === null) return false;
-      if (asciiLower(value) === 'until-found') return 'until-found';
+      if (__tbAsciiLower(value) === 'until-found') return 'until-found';
       return true;
     },
     set: function(value) {
@@ -407,8 +397,8 @@
       let converted;
       if (value === null || value === undefined) converted = null;
       else if (typeof value === 'boolean' || typeof value === 'number') converted = value;
-      else converted = toDOMString(value);
-      if (typeof converted === 'string' && asciiLower(converted) === 'until-found') {
+      else converted = __tbToDOMString(value);
+      if (typeof converted === 'string' && __tbAsciiLower(converted) === 'until-found') {
         this.setAttribute('hidden', 'until-found');
       } else if (
         converted === false || converted === '' || converted === null ||

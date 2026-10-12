@@ -74,6 +74,19 @@ const __tbStringTrim = String.prototype.trim;
 const __tbStringIncludes = String.prototype.includes;
 const __tbStringEndsWith = String.prototype.endsWith;
 const __tbStringToLowerCase = String.prototype.toLowerCase;
+// ASCII lowercase: only A-Z fold. Unicode folding would wrongly match
+// Kelvin K to `k` or Turkish İ to `i` in enumerated keywords
+// (<https://infra.spec.whatwg.org/#ascii-lowercase>).
+const __tbAsciiLower = value => __tbStringCtor(value).replace(/[A-Z]/g, c => c.toLowerCase());
+// Web IDL `DOMString` conversion: `ToString`, which throws on Symbols
+// (plain `String()` would stringify them instead)
+// (<https://webidl.spec.whatwg.org/#es-DOMString>).
+const __tbToDOMString = value => {
+  if (typeof value === 'symbol') {
+    throw new TypeError('Cannot convert a Symbol value to a string');
+  }
+  return __tbStringCtor(value);
+};
 const __tbWeakMapGet = WeakMap.prototype.get;
 const __tbWeakMapSet = WeakMap.prototype.set;
 const __tbMapConstructor = Map;
