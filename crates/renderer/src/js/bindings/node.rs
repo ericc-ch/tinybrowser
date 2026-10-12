@@ -485,7 +485,7 @@ fn ensure_no_cycle(
             ));
         }
         cursor = base.get_node(current).and_then(|candidate| {
-            candidate.parent.or_else(|| match &candidate.data {
+            candidate.parent.or(match &candidate.data {
                 NodeData::Fragment { host } => *host,
                 _ => None,
             })
@@ -2193,7 +2193,7 @@ fn clear_nonce_on_connect(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
     Ok(())
 }
 
-/// The HTML, SVG, and MathML elements under `id` whose `nonce` content
+/// The HTML, SVG, and `MathML` elements under `id` whose `nonce` content
 /// attribute clears on browsing-context connection.
 fn collect_nonce_elements(base: &blitz_dom::BaseDocument, id: NodeId, out: &mut Vec<NodeId>) {
     if let Some(element) = base
@@ -3265,7 +3265,8 @@ fn serialize_html_node(
             let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
             serialize_html_element(doc, id, &name, &attributes, output);
         }
-        NodeData::AnonymousBlock(_) => {
+        // A fragment serializes as its children.
+        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
             for child in node.children.clone() {
                 serialize_html_node(doc, child, parent, output);
             }
@@ -3333,12 +3334,6 @@ fn serialize_html_node(
             }
             output.push_str("?>");
         }
-        // A fragment serializes as its children.
-        NodeData::Fragment { .. } => {
-            for child in node.children.clone() {
-                serialize_html_node(doc, child, parent, output);
-            }
-        }
         NodeData::Document(_) => {}
     }
 }
@@ -3399,7 +3394,6 @@ fn push_escaped_xml_attribute(output: &mut HtmlOutput, value: &str) {
 /// children. Known gap: namespace prefix synthesis is skipped; the stored
 /// qualified name is used as-is
 /// (<https://w3c.github.io/DOM-Parsing/#xml-serialization>).
-
 fn serialize_xml_element(
     doc: &crate::documents::BlitzDocument,
     id: BlitzId,
@@ -3994,7 +3988,9 @@ impl JsNode {
         let text = data.0.to_string_lossy().into_owned();
         let target = target.0;
         create_node(&ctx, self.handle.0, |parsed| {
-            parsed.document.create_processing_instruction(target, &text)
+            parsed
+                .document
+                .create_processing_instruction(&target, &text)
         })
     }
 
@@ -4080,7 +4076,7 @@ impl JsNode {
         attr_wrapper(&ctx, id)
     }
 
-    /// https://dom.spec.whatwg.org/#dom-document-adoptnode
+    /// <https://dom.spec.whatwg.org/#dom-document-adoptnode>
     #[qjs(rename = "adoptNode")]
     fn document_adopt_node<'js>(&self, ctx: Ctx<'js>, node: Value<'js>) -> Result<Value<'js>> {
         match host::node_argument(&ctx, &node)? {
@@ -4415,7 +4411,7 @@ impl JsNode {
         Ok(Value::new_null(ctx.clone()))
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-characterset
+    /// <https://encoding.spec.whatwg.org/#dom-document-characterset>
     #[qjs(skip)]
     #[allow(
         clippy::unnecessary_wraps,
@@ -4808,16 +4804,16 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     #[qjs(skip)]
-    fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn form_method(&self, ctx: Ctx<'_>) -> String {
         // Enumerated without whitespace stripping: only an exact ASCII
         // case-insensitive keyword matches
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        Ok(reflect_enum(
+        reflect_enum(
             content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
             &["post", "dialog"],
             "",
             "get",
-        ))
+        )
     }
 
     #[qjs(skip)]
@@ -4827,15 +4823,15 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     #[qjs(skip)]
-    fn form_enctype(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn form_enctype(&self, ctx: Ctx<'_>) -> String {
         // Absent reads empty, like `formMethod`; no whitespace stripping
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        Ok(reflect_enum(
+        reflect_enum(
             content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
             &["multipart/form-data", "text/plain"],
             "",
             "application/x-www-form-urlencoded",
-        ))
+        )
     }
 
     #[qjs(skip)]
@@ -5021,7 +5017,7 @@ impl JsNode {
         })?))
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     #[qjs(skip)]
     fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let form = {
@@ -5458,11 +5454,10 @@ impl JsNode {
         // (empty) children
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
         let container = crate::js::world::template_contents(&parsed.document.base, container.node)
-            .map(|fragment| NodeId {
+            .map_or(container, |fragment| NodeId {
                 document: container.document,
                 node: fragment,
-            })
-            .unwrap_or(container);
+            });
         let html = world(ctx)?
             .borrow()
             .document(self.handle.0)
@@ -5539,11 +5534,10 @@ impl JsNode {
             .and_then(|parsed| {
                 crate::js::world::template_contents(&parsed.document.base, container.node)
             })
-            .map(|fragment| NodeId {
+            .map_or(container, |fragment| NodeId {
                 document: container.document,
                 node: fragment,
-            })
-            .unwrap_or(container);
+            });
         let owner = world_for_node(ctx, container)?;
         let world = owner.borrow();
         let Some(mut parsed) = world.document_mut(container) else {
@@ -5575,14 +5569,14 @@ impl JsNode {
         schedule_mutation_delivery(ctx)
     }
 
-    /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    /// <https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>
     #[qjs(get, rename = "innerText")]
     fn inner_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
         rquickjs::String::from_str(ctx, &text)
     }
 
-    /// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    /// <https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>
     #[qjs(get, rename = "outerText")]
     fn outer_text<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let text = super::inner_text::rendered_text(&ctx, self.handle.0)?;
@@ -5594,6 +5588,10 @@ impl JsNode {
     /// fully normalize). Without a parent it throws; the setter is a no-op
     /// on non-HTML elements, which never install it.
     /// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "outerText setter steps in spec order; splitting them is a refactor, not a lint fix"
+    )]
     #[qjs(set, rename = "outerText")]
     fn set_outer_text(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
         let parent = {
@@ -6774,6 +6772,10 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-normalize
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Node.normalize steps in spec order; splitting them is a refactor, not a lint fix"
+    )]
     #[qjs(skip)]
     fn normalize(&self, ctx: Ctx<'_>) -> Result<()> {
         let world = world(&ctx)?;
@@ -7485,7 +7487,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         self.matches(ctx, WebIdlString(arg_0.to_string()?))
     }
 
-    /// https://dom.spec.whatwg.org/#dom-element-webkitmatchesselector
+    /// <https://dom.spec.whatwg.org/#dom-element-webkitmatchesselector>
     fn webkit_matches_selector(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
         // Legacy alias of `matches(selectors)`.
         self.matches(ctx, WebIdlString(arg_0.to_string()?))
@@ -7530,7 +7532,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         )
     }
 
-    /// https://dom.spec.whatwg.org/#dom-element-insertadjacentelement
+    /// <https://dom.spec.whatwg.org/#dom-element-insertadjacentelement>
     fn insert_adjacent_element(
         &self,
         ctx: Ctx<'js>,
@@ -7545,7 +7547,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
         }
     }
 
-    /// https://dom.spec.whatwg.org/#dom-element-insertadjacenttext
+    /// <https://dom.spec.whatwg.org/#dom-element-insertadjacenttext>
     fn insert_adjacent_text(
         &self,
         ctx: Ctx<'js>,
@@ -7936,19 +7938,19 @@ impl<'js> document_generated::Document<'js> for JsNode {
         rquickjs::String::from_str(ctx.clone(), &mode)
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-characterset
+    /// <https://encoding.spec.whatwg.org/#dom-document-characterset>
     fn get_character_set(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let set = self.character_set(ctx)?;
         rquickjs::String::from_str(ctx.clone(), set)
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-charset
+    /// <https://encoding.spec.whatwg.org/#dom-document-charset>
     fn get_charset(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let set = self.charset(ctx)?;
         rquickjs::String::from_str(ctx.clone(), set)
     }
 
-    /// https://encoding.spec.whatwg.org/#dom-document-inputencoding
+    /// <https://encoding.spec.whatwg.org/#dom-document-inputencoding>
     fn get_input_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let encoding = self.input_encoding(ctx)?;
         rquickjs::String::from_str(ctx.clone(), encoding)
@@ -8449,7 +8451,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         schedule_mutation_delivery(&ctx)
     }
 
-    /// https://dom.spec.whatwg.org/#dom-parentnode-movebefore
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-movebefore>
     fn move_before(
         &self,
         ctx: Ctx<'js>,
@@ -8945,7 +8947,7 @@ fn reflect_enum(raw: Option<&str>, keywords: &[&str], missing: &str, invalid: &s
 /// otherwise the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_ulong(raw: Option<&str>, default: u32) -> u32 {
-    raw.and_then(|value| super::parse_integer(value))
+    raw.and_then(super::parse_integer)
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(default)
 }
@@ -8993,15 +8995,14 @@ fn reflect_clamped_ulong(raw: Option<&str>, default: u32, min: u32, max: u32) ->
 /// `double` reflection: a floating-point value or the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_double(raw: Option<&str>, default: f64) -> f64 {
-    raw.and_then(|value| super::parse_double(value))
-        .unwrap_or(default)
+    raw.and_then(super::parse_double).unwrap_or(default)
 }
 
 /// Limited `double` reflection (used by `progress.max`): a positive
 /// floating-point value or the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_limited_double(raw: Option<&str>, default: f64) -> f64 {
-    match raw.and_then(|value| super::parse_double(value)) {
+    match raw.and_then(super::parse_double) {
         Some(value) if value > 0.0 => value,
         _ => default,
     }
@@ -9127,13 +9128,7 @@ fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
             }
         }
         "button" | "select" | "textarea" | "iframe" => 0,
-        "audio" | "video" => {
-            if crate::js::world::attr(base, node, "controls").is_some() {
-                0
-            } else {
-                -1
-            }
-        }
+        "audio" | "video" if crate::js::world::attr(base, node, "controls").is_some() => 0,
         _ => -1,
     }
 }
@@ -9224,7 +9219,7 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
         };
         let base = &parsed.document.base;
         Ok(crate::js::world::attr(base, self.handle.0.node, "tabindex")
-            .and_then(|raw| super::parse_integer(raw))
+            .and_then(super::parse_integer)
             .unwrap_or_else(|| tab_index_default(base, self.handle.0.node)))
     }
 
@@ -9368,19 +9363,12 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-atomic
-    fn set_aria_atomic(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_atomic(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-atomic", value)
     }
 
     // https://w3c.github.io/aria/#aria-autocomplete
-    fn get_aria_auto_complete(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_auto_complete(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-autocomplete")
     }
 
@@ -9394,10 +9382,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-braillelabel
-    fn get_aria_braille_label(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_braille_label(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-braillelabel")
     }
 
@@ -9433,11 +9418,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-busy
-    fn set_aria_busy(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_busy(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-busy", value)
     }
 
@@ -9447,19 +9428,12 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-checked
-    fn set_aria_checked(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_checked(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-checked", value)
     }
 
     // https://w3c.github.io/aria/#aria-colcount
-    fn get_aria_col_count(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_col_count(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-colcount")
     }
 
@@ -9473,10 +9447,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-colindex
-    fn get_aria_col_index(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_col_index(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-colindex")
     }
 
@@ -9490,10 +9461,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-colindextext
-    fn get_aria_col_index_text(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_col_index_text(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-colindextext")
     }
 
@@ -9507,10 +9475,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-colspan
-    fn get_aria_col_span(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_col_span(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-colspan")
     }
 
@@ -9529,19 +9494,12 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-current
-    fn set_aria_current(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_current(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-current", value)
     }
 
     // https://w3c.github.io/aria/#aria-description
-    fn get_aria_description(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_description(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-description")
     }
 
@@ -9583,10 +9541,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-haspopup
-    fn get_aria_has_popup(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_has_popup(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-haspopup")
     }
 
@@ -9605,11 +9560,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-hidden
-    fn set_aria_hidden(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_hidden(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-hidden", value)
     }
 
@@ -9619,19 +9570,12 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-invalid
-    fn set_aria_invalid(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_invalid(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-invalid", value)
     }
 
     // https://w3c.github.io/aria/#aria-keyshortcuts
-    fn get_aria_key_shortcuts(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_key_shortcuts(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-keyshortcuts")
     }
 
@@ -9650,11 +9594,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-label
-    fn set_aria_label(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_label(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-label", value)
     }
 
@@ -9664,11 +9604,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-level
-    fn set_aria_level(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_level(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-level", value)
     }
 
@@ -9678,11 +9614,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-live
-    fn set_aria_live(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_live(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-live", value)
     }
 
@@ -9692,19 +9624,12 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-modal
-    fn set_aria_modal(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_modal(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-modal", value)
     }
 
     // https://w3c.github.io/aria/#aria-multiline
-    fn get_aria_multi_line(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_multi_line(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-multiline")
     }
 
@@ -9718,10 +9643,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-multiselectable
-    fn get_aria_multi_selectable(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_multi_selectable(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-multiselectable")
     }
 
@@ -9735,10 +9657,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-orientation
-    fn get_aria_orientation(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_orientation(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-orientation")
     }
 
@@ -9752,10 +9671,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-placeholder
-    fn get_aria_placeholder(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_placeholder(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-placeholder")
     }
 
@@ -9769,10 +9685,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-posinset
-    fn get_aria_pos_in_set(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_pos_in_set(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-posinset")
     }
 
@@ -9791,19 +9704,12 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-pressed
-    fn set_aria_pressed(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_pressed(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-pressed", value)
     }
 
     // https://w3c.github.io/aria/#aria-readonly
-    fn get_aria_read_only(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_read_only(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-readonly")
     }
 
@@ -9845,10 +9751,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-roledescription
-    fn get_aria_role_description(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_role_description(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-roledescription")
     }
 
@@ -9862,10 +9765,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-rowcount
-    fn get_aria_row_count(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_row_count(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-rowcount")
     }
 
@@ -9879,10 +9779,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-rowindex
-    fn get_aria_row_index(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_row_index(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-rowindex")
     }
 
@@ -9896,10 +9793,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-rowindextext
-    fn get_aria_row_index_text(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_row_index_text(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-rowindextext")
     }
 
@@ -9913,10 +9807,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-rowspan
-    fn get_aria_row_span(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_row_span(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-rowspan")
     }
 
@@ -9944,10 +9835,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-setsize
-    fn get_aria_set_size(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_set_size(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-setsize")
     }
 
@@ -9966,19 +9854,12 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-sort
-    fn set_aria_sort(
-        &self,
-        ctx: &Ctx<'js>,
-        value: Option<rquickjs::String<'js>>,
-    ) -> Result<()> {
+    fn set_aria_sort(&self, ctx: &Ctx<'js>, value: Option<rquickjs::String<'js>>) -> Result<()> {
         aria_set(ctx, self.handle.0, "aria-sort", value)
     }
 
     // https://w3c.github.io/aria/#aria-valuemax
-    fn get_aria_value_max(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_value_max(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-valuemax")
     }
 
@@ -9992,10 +9873,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-valuemin
-    fn get_aria_value_min(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_value_min(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-valuemin")
     }
 
@@ -10009,10 +9887,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-valuenow
-    fn get_aria_value_now(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_value_now(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-valuenow")
     }
 
@@ -10026,10 +9901,7 @@ impl<'js> aria_mixin_generated::ARIAMixin<'js> for JsNode {
     }
 
     // https://w3c.github.io/aria/#aria-valuetext
-    fn get_aria_value_text(
-        &self,
-        ctx: &Ctx<'js>,
-    ) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_aria_value_text(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         aria_get(ctx, self.handle.0, "aria-valuetext")
     }
 
@@ -10081,7 +9953,7 @@ fn reflect_referrer_policy<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<rquickjs::
     rquickjs::String::from_str(ctx.clone(), &value)
 }
 
-fn set_referrer_policy(ctx: &Ctx<'_>, id: NodeId, value: rquickjs::String<'_>) -> Result<()> {
+fn set_referrer_policy(ctx: &Ctx<'_>, id: NodeId, value: &rquickjs::String<'_>) -> Result<()> {
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     set_attribute_sync(ctx, id, "referrerpolicy", &value.to_string()?)
 }
@@ -10128,7 +10000,7 @@ impl<'js> html_anchor_element_generated::HTMLAnchorElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 }
 
@@ -10140,7 +10012,7 @@ impl<'js> html_area_element_generated::HTMLAreaElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 }
 impl html_audio_element_generated::HTMLAudioElement<'_> for JsNode {}
@@ -10314,6 +10186,10 @@ fn meter_gauge(ctx: &Ctx<'_>, id: NodeId) -> MeterGauge {
     if high < low {
         high = low;
     }
+    #[expect(
+        clippy::manual_midpoint,
+        reason = "f64::midpoint differs only when min + max overflows; a lint cleanup keeps the existing result"
+    )]
     let raw_optimum = reflect_double(
         content_attr(ctx, id, "optimum").as_deref(),
         (min + max) / 2.0,
@@ -10359,7 +10235,7 @@ impl<'js> html_progress_element_generated::HTMLProgressElement<'js> for JsNode {
     fn set_max(&self, ctx: &Ctx<'js>, value: f64) -> Result<()> {
         // Non-positive values leave the attribute untouched
         // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-max>).
-        if !(value > 0.0) {
+        if value.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return Ok(());
         }
         host::reflect_set_double(ctx, self.handle.0, "max", value)
@@ -10550,7 +10426,7 @@ impl<'js> element_content_editable_generated::ElementContentEditable<'js> for Js
 }
 
 impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10562,7 +10438,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let method = self.form_method(ctx.clone())?;
+        let method = self.form_method(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &method)
     }
 
@@ -10573,7 +10449,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let enctype = self.form_enctype(ctx.clone())?;
+        let enctype = self.form_enctype(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &enctype)
     }
 
@@ -10584,7 +10460,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
 }
 
 impl<'js> html_field_set_element_generated::HTMLFieldSetElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10622,7 +10498,7 @@ impl<'js> html_select_element_generated::HTMLSelectElement<'js> for JsNode {
         self.selected_options(ctx.clone())
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10698,7 +10574,7 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
         self.set_selection_direction(ctx.clone(), WebIdlString(value.to_string()?))
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10722,7 +10598,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
         self.set_checked(ctx.clone(), value)
     }
 
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -10734,7 +10610,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let method = self.form_method(ctx.clone())?;
+        let method = self.form_method(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &method)
     }
 
@@ -10745,7 +10621,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let enctype = self.form_enctype(ctx.clone())?;
+        let enctype = self.form_enctype(ctx.clone());
         rquickjs::String::from_str(ctx.clone(), &enctype)
     }
 
@@ -10983,7 +10859,7 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 }
 
 impl<'js> html_option_element_generated::HTMLOptionElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -11079,7 +10955,7 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // `loading` defaults to `eager`
@@ -11179,7 +11055,7 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // `decoding` defaults to `auto`
@@ -11331,7 +11207,7 @@ impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-crossorigin
@@ -11362,7 +11238,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
         // Out-of-range values write the default rather than the raw value
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
-        let value = if value > 2147483647 { 300 } else { value };
+        let value = if value > 2_147_483_647 { 300 } else { value };
         set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
     }
 
@@ -11377,7 +11253,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
         // Out-of-range values write the default rather than the raw value
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height>).
-        let value = if value > 2147483647 { 150 } else { value };
+        let value = if value > 2_147_483_647 { 150 } else { value };
         set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())
     }
 
@@ -11511,7 +11387,7 @@ impl<'js> html_script_element_generated::HTMLScriptElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy
     fn set_referrer_policy(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_referrer_policy(ctx, self.handle.0, value)
+        set_referrer_policy(ctx, self.handle.0, &value)
     }
 
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-script-crossorigin
@@ -11558,7 +11434,7 @@ impl html_meta_element_generated::HTMLMetaElement<'_> for JsNode {}
 impl html_map_element_generated::HTMLMapElement<'_> for JsNode {}
 
 impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -11609,7 +11485,7 @@ impl<'js> html_object_element_generated::HTMLObjectElement<'js> for JsNode {
 }
 
 impl<'js> html_output_element_generated::HTMLOutputElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    /// <https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form>
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
     }
@@ -11651,7 +11527,7 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
 }
 
 impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-table-tbodies>
     fn get_t_bodies(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -11661,7 +11537,7 @@ impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
         )
     }
 
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-table-rows>
     fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -11678,7 +11554,7 @@ impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
 }
 
 impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells>
     fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -11690,7 +11566,7 @@ impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for
 }
 
 impl<'js> html_table_row_element_generated::HTMLTableRowElement<'js> for JsNode {
-    /// https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells>
     fn get_cells(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
@@ -12032,12 +11908,12 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
 }
 
 impl<'js> text_generated::Text<'js> for JsNode {
-    /// https://dom.spec.whatwg.org/#dom-text-splittext
+    /// <https://dom.spec.whatwg.org/#dom-text-splittext>
     fn split_text(&self, ctx: Ctx<'js>, offset: u32) -> Result<Value<'js>> {
         split_text_node(&ctx, self.handle.0, offset)
     }
 
-    /// https://dom.spec.whatwg.org/#dom-text-wholetext
+    /// <https://dom.spec.whatwg.org/#dom-text-wholetext>
     fn get_whole_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         dom_string(ctx, &whole_text(ctx, self.handle.0)?)
     }

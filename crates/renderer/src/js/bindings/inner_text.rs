@@ -68,9 +68,8 @@ enum Transform {
 fn style_property<'a>(style: &'a str, property: &str) -> Option<&'a str> {
     let mut found = None;
     for declaration in split_declarations(style) {
-        let (name, value) = match declaration.split_once(':') {
-            Some(pair) => pair,
-            None => continue,
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
         };
         if name.trim().eq_ignore_ascii_case(property) {
             found = Some(strip_important(value.trim()));
@@ -223,9 +222,6 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
             // Table-internal displays outside a table walk have no
             // anonymous-table repair, so their content collects inline
             // rather than vanishing.
-            "table-row" | "table-cell" | "table-caption" | "table-column"
-            | "table-column-group" | "table-row-group" | "table-header-group"
-            | "table-footer-group" => Level::Inline,
             _ => Level::Inline,
         };
     }
@@ -264,17 +260,10 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
         // Never rendered (without an overriding `style` attribute, which
         // returned above for rendering displays; `source`/`track` join
         // `script`/`style` here; `template`/`noscript` returned earlier).
-        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source" | "track"
-        | "frame" | "frameset" | "noframes" | "noembed" | "datalist" => Level::Hidden,
         // `rp` never renders (its parens are dropped); an explicit rendering
         // display above still wins.
-        "rp" => Level::Hidden,
-        // Transparent containers.
-        "span" | "a" | "b" | "i" | "em" | "strong" | "code" | "tt" | "u" | "s" | "small"
-        | "big" | "cite" | "q" | "dfn" | "abbr" | "kbd" | "samp" | "var" | "sub" | "sup"
-        | "mark" | "ruby" | "rt" | "bdi" | "bdo" | "font" | "label" | "output" | "nobr" | "wbr"
-        | "slot" | "picture" | "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr" | "td"
-        | "th" | "caption" | "marquee" | "isindex" => Level::Inline,
+        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source" | "track"
+        | "frame" | "frameset" | "noframes" | "noembed" | "datalist" | "rp" => Level::Hidden,
         // Block containers (`li` is `list-item`, block-level; `fieldset`,
         // `legend`, `center`, `search`, `dt`/`dd` are `block`).
         "address" | "article" | "aside" | "blockquote" | "details" | "dialog" | "div" | "dl"
@@ -287,7 +276,8 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
         "img" | "input" | "textarea" | "iframe" | "audio" | "video" | "canvas" | "object"
         | "embed" | "param" | "map" | "area" | "applet" | "button" => Level::Atomic,
         "select" | "option" | "optgroup" => Level::Paragraph,
-        // Unknown and custom elements are inline by default.
+        // Transparent containers (`span`, `a`, `b`, table parts, ...) and
+        // unknown and custom elements are inline by default.
         _ => Level::Inline,
     }
 }
@@ -457,6 +447,10 @@ fn process_text(text: &str, mode: WhiteSpace) -> String {
 }
 
 /// Collector state for one rendered-text run.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent whitespace and break flags of the rendered-text walk; folding them into a state machine is a refactor"
+)]
 struct Collector<'a> {
     base: &'a BaseDocument,
     out: String,
@@ -481,7 +475,7 @@ struct Collector<'a> {
     trailing_forced: bool,
 }
 
-impl<'a> Collector<'a> {
+impl Collector<'_> {
     /// Pushes mode-processed text, merging boundary spaces unless preserved.
     fn push_text(&mut self, text: &str, preserve: bool) {
         if text.is_empty() {
@@ -643,6 +637,10 @@ fn collect_children(
 }
 
 /// Collects one node.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-node rendered-text steps kept in one place; splitting them is a refactor, not a lint fix"
+)]
 fn collect_node(
     collector: &mut Collector<'_>,
     node: BlitzId,
@@ -869,8 +867,7 @@ fn collect_table(
             Some("tr") => {
                 rows.push((current, inherited, inherited_mode, inherited_transform));
             }
-            Some("td") | Some("th") => {}
-            Some("table") => {}
+            Some("td" | "th" | "table") => {}
             _ => {
                 let item_visibility = visibility_of(collector.base, current, inherited);
                 let item_mode = white_space_of(collector.base, current, inherited_mode);
@@ -945,7 +942,7 @@ fn collect_row(
         return;
     };
     let mut cell_first = true;
-    for cell in tree.children.to_vec() {
+    for cell in tree.children.iter().copied() {
         let is_cell = collector.base.get_node(cell).is_some_and(|tree| {
             tree.data.downcast_element().is_some_and(|element| {
                 element.name.ns == crate::js::world::html_namespace()
@@ -1001,7 +998,7 @@ fn collect_select(
     let Some(tree) = collector.base.get_node(node) else {
         return;
     };
-    for child in tree.children.to_vec() {
+    for child in tree.children.iter().copied() {
         // `display:none` options never render.
         if display_none(collector.base, child) {
             continue;
@@ -1015,7 +1012,7 @@ fn collect_select(
         match kind.as_deref() {
             // Text directly under `select` is ignored.
             None => {}
-            Some("option") | Some("optgroup") => {
+            Some("option" | "optgroup") => {
                 if kind.as_deref() == Some("optgroup")
                     && is_optgroup_ancestor(collector.base, child)
                 {
@@ -1060,8 +1057,8 @@ fn collect_details(
         };
         if let Some(summary) = tree
             .children
-            .to_vec()
-            .into_iter()
+            .iter()
+            .copied()
             .find(|child| is_html_tag(collector.base, *child, &["summary"]))
         {
             collect_node(collector, summary, mode, visibility, transform, false);

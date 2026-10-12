@@ -248,7 +248,7 @@ impl Agent {
         method: &Method,
         initiator: Option<&Url>,
         cross_site_redirect: bool,
-    ) {
+    ) -> Result<(), NetError> {
         let cookie = self.jar().cookie_string(CookieOp {
             url,
             now: (self.now)(),
@@ -259,13 +259,14 @@ impl Agent {
             cross_site_redirect,
         });
         if !cookie.is_empty() {
-            if let Some(existing) = headers.get("cookie") {
-                let merged = format!("{}; {cookie}", String::from_utf8_lossy(existing));
-                headers.remove("cookie");
-                let _ = headers.insert("Cookie", merged.as_bytes());
-            } else {
-                let _ = headers.insert("Cookie", cookie.as_bytes());
-            }
+            let value = match headers.get("cookie") {
+                Some(existing) => format!("{}; {cookie}", String::from_utf8_lossy(existing)),
+                None => cookie,
+            };
+            headers.remove("cookie");
+            headers
+                .insert("Cookie", value)
+                .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
         }
         if headers.get("user-agent").is_none()
             && let Some(ua) = &self.ua
@@ -279,6 +280,7 @@ impl Agent {
             headers.remove("origin");
             let _ = headers.insert("Origin", origin.as_bytes());
         }
+        Ok(())
     }
 
     pub(crate) fn store_set_cookie_lines(
@@ -315,8 +317,9 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request, or an
-    /// unusable `Location`. [`NetError::Limit`] when the redirect cap is exceeded.
+    /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request
+    /// (including a merged `Cookie` header that is not a valid field value), or
+    /// an unusable `Location`. [`NetError::Limit`] when the redirect cap is exceeded.
     /// [`NetError::Transport`] when a hop fails.
     pub async fn send(&self, request: Request) -> Result<Response, NetError> {
         if !matches!(request.url.scheme(), "http" | "https") {
@@ -361,7 +364,7 @@ impl Agent {
                 &method,
                 initiator.as_ref(),
                 cross_site_redirect,
-            );
+            )?;
             apply_url_credentials(&mut hop_headers, &url);
             let (status, response_headers, reader) = self
                 .engine
@@ -412,7 +415,8 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`NetError::Protocol`] for a non-WebSocket URL or a failed handshake.
+    /// [`NetError::Protocol`] for a non-WebSocket URL, a merged `Cookie` header
+    /// that is not a valid field value, or a failed handshake.
     /// [`NetError::Transport`] when the dial or TLS handshake fails.
     pub async fn upgrade(&self, request: Request) -> Result<WebSocket, NetError> {
         if !matches!(request.url.scheme(), "ws" | "wss") {
@@ -428,7 +432,7 @@ impl Agent {
             &method,
             request.initiator.as_ref(),
             false,
-        );
+        )?;
         websocket::connect(
             self,
             &request.url,

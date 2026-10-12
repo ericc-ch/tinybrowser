@@ -349,11 +349,11 @@ pub(crate) fn child_ids(
 }
 
 /// The value of the first attribute of `id` matching `match_name`.
-fn attr_find<'a>(
-    base: &'a blitz_dom::BaseDocument,
+fn attr_find(
+    base: &blitz_dom::BaseDocument,
     id: BlitzNodeId,
     match_name: impl Fn(&markup5ever::QualName) -> bool,
-) -> Option<&'a str> {
+) -> Option<&str> {
     base.get_node(id)?
         .data
         .downcast_element()?
@@ -436,9 +436,11 @@ pub(crate) fn template_contents(
     base: &blitz_dom::BaseDocument,
     id: BlitzNodeId,
 ) -> Option<BlitzNodeId> {
-    base.get_node(id)?.data.downcast_element().filter(|element| {
-        is_template_tag(&element.name)
-    }).and_then(|element| element.template_contents)
+    base.get_node(id)?
+        .data
+        .downcast_element()
+        .filter(|element| is_template_tag(&element.name))
+        .and_then(|element| element.template_contents)
 }
 
 /// Whether `node` is an HTML element named `local`.
@@ -822,7 +824,7 @@ pub(crate) struct World {
     /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
     /// without touching the content attribute
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
-    /// Invariant: the slot mirrors the spec's [[CryptographicNonce]].
+    /// Invariant: the slot mirrors the spec's `[[CryptographicNonce]]`.
     /// Content-attribute writes feed it through `set_attribute_sync`, and
     /// removals clear it through `remove_attribute_sync` (the attribute
     /// change steps, where `null` resets the slot). Parser-created `nonce`

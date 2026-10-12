@@ -509,8 +509,8 @@ pub(crate) fn install_event_target_bridge(ctx: &Ctx<'_>) -> Result<()> {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn is_event_bridge<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<bool> {
-    Ok(Class::<JsEvent>::from_js(&ctx, value).is_ok())
+fn is_event_bridge<'js>(ctx: Ctx<'js>, value: Value<'js>) -> bool {
+    Class::<JsEvent>::from_js(&ctx, value).is_ok()
 }
 
 #[allow(

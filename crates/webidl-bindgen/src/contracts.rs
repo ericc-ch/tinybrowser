@@ -552,6 +552,10 @@ fn member_name<'a>(member: &InterfaceMember<'a>) -> &'a str {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per IDL interface member kind; splitting the arms would thread the shared accumulators through several helpers"
+)]
 fn lower_members(
     database: &Database<'_>,
     declaration: &crate::database::Interface<'_>,

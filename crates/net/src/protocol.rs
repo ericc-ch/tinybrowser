@@ -165,10 +165,20 @@ impl Method {
         Ok(Self(stored))
     }
 
-    /// Whether this is `GET`, `HEAD`, or `OPTIONS`.
+    /// Whether this method is safe per
+    /// [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.1):
+    /// `GET`, `HEAD`, `OPTIONS`, or `TRACE`, matched case-sensitively.
+    ///
+    /// ```
+    /// use net::Method;
+    ///
+    /// assert!(Method::GET.is_safe());
+    /// assert!(Method::parse("TRACE").unwrap().is_safe());
+    /// assert!(!Method::POST.is_safe());
+    /// ```
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        matches!(self.0.as_ref(), "GET" | "HEAD" | "OPTIONS")
+        matches!(self.0.as_ref(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
     }
 
     /// Wire spelling of this method.
