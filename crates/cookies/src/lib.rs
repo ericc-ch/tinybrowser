@@ -231,10 +231,16 @@ impl CookieJar {
     ///
     /// Records come from storage a caller controls, so each one is re-checked
     /// against the rules [`CookieJar::store`] applies to a parsed line: a
-    /// rooted path, a canonical registrable domain, the prefix requirements,
+    /// name and value the `Cookie` header can carry (not both empty, no
+    /// control characters other than TAB, no `;` in either, no `=` in the
+    /// name, at most 4096 bytes together), a rooted path of at most 1024
+    /// bytes, a canonical domain of at most 1024 bytes that is not a public
+    /// suffix or IP address unless host-only, the prefix requirements,
     /// `SameSite=None` needing `Secure`, and no weakening of a live cookie's
-    /// `Secure` flag. Expired records are dropped, expiry is capped, and the
-    /// storage-model caps apply.
+    /// `Secure` flag. Unlike [`CookieJar::store`], that last rule holds even
+    /// for a secure request: a record has no request URL to judge. Expired
+    /// records are dropped, expiry is capped, and the storage-model caps
+    /// apply. Rejected records are skipped without error.
     pub fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
         for record in records {
             let Some(stored) = self.sanitize(record, now) else {
@@ -253,7 +259,16 @@ impl CookieJar {
         if record.expiry.is_some_and(|expiry| expiry <= now) {
             return None;
         }
-        if !record.path.starts_with('/') {
+        if (record.name.is_empty() && record.value.is_empty())
+            || record.name.len() + record.value.len() > 4096
+            || has_ctl_excluding_htab(&record.name)
+            || has_ctl_excluding_htab(&record.value)
+            || record.name.contains([';', '='])
+            || record.value.contains(';')
+        {
+            return None;
+        }
+        if !record.path.starts_with('/') || record.path.len() > 1024 {
             return None;
         }
         // The record names its own domain, so require the canonical form the
@@ -530,7 +545,10 @@ fn receive_cookie(
     if http_only && matches!(kind, RetrievalKind::NonHttp) {
         return None;
     }
-    if overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure) {
+    // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
+    if !is_secure_url(request_url)
+        && overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure)
+    {
         return None;
     }
     let same_site = parsed.same_site.unwrap_or(SameSite::Default);
@@ -1168,7 +1186,9 @@ mod tests {
 
     use url::Url;
 
-    use super::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, site};
+    use super::{
+        CookieJar, CookieOp, CookieRecord, CookieSameSite, InitiatorKind, RetrievalKind, site,
+    };
 
     /// 2026-10-12T00:00:00Z.
     const NOW: u64 = 1_791_763_200;
@@ -1386,5 +1406,182 @@ mod tests {
             persistent_expiry("a=1; Expires=Wed, 31 Dec 1969 23:59:59 GMT", now),
             Some(UNIX_EPOCH - Duration::from_secs(1))
         );
+    }
+
+    #[test]
+    fn secure_request_can_replace_a_secure_cookie_with_a_plain_one() {
+        let secure = url("https://example.com/");
+        let plain = url("http://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1; Secure", http(&secure, at(NOW))));
+        assert!(!jar.store("a=2", http(&plain, at(NOW))));
+        assert!(jar.store("a=3", http(&secure, at(NOW))));
+        assert_eq!(jar.cookie_string(http(&plain, at(NOW))), "a=3");
+    }
+
+    fn record(name: &str, value: &str) -> CookieRecord {
+        CookieRecord {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            expiry: Some(at(NOW) + DAY),
+            domain: "example.com".to_owned(),
+            path: "/".to_owned(),
+            created: at(NOW),
+            last_access: at(NOW),
+            host_only: true,
+            secure: false,
+            http_only: false,
+            same_site: CookieSameSite::Default,
+        }
+    }
+
+    fn restored(records: Vec<CookieRecord>) -> String {
+        let mut jar = CookieJar::default();
+        jar.restore(records, at(NOW));
+        jar.cookie_string(http(&url("https://example.com/a/b"), at(NOW)))
+    }
+
+    #[test]
+    fn restore_loads_a_valid_record() {
+        assert_eq!(restored(vec![record("a", "1")]), "a=1");
+        assert_eq!(restored(vec![record("", "bare")]), "bare");
+        assert_eq!(restored(vec![record("a", "x\ty")]), "a=x\ty");
+    }
+
+    #[test]
+    fn restore_rejects_records_that_would_split_the_cookie_header() {
+        for (name, value) in [("a", "x; admin=1"), ("a;b", "1"), ("a=b", "1"), ("", "")] {
+            let records = vec![record(name, value), record("ok", "1")];
+            assert_eq!(restored(records), "ok=1", "{name:?}={value:?}");
+        }
+    }
+
+    #[test]
+    fn restore_rejects_control_characters() {
+        for (name, value) in [("a\n", "1"), ("a", "1\r"), ("a", "\u{7f}"), ("\0", "1")] {
+            let records = vec![record(name, value), record("ok", "1")];
+            assert_eq!(restored(records), "ok=1", "{name:?}={value:?}");
+        }
+    }
+
+    #[test]
+    fn restore_caps_name_and_value_at_4096_bytes() {
+        let at_cap = "v".repeat(4095);
+        assert_eq!(restored(vec![record("a", &at_cap)]), format!("a={at_cap}"));
+        assert_eq!(restored(vec![record("ab", &at_cap)]), "");
+    }
+
+    #[test]
+    fn restore_caps_path_and_domain_at_1024_bytes() {
+        let path = format!("/{}", "p".repeat(1023));
+        let mut jar = CookieJar::default();
+        jar.restore(
+            vec![CookieRecord {
+                path: path.clone(),
+                ..record("a", "1")
+            }],
+            at(NOW),
+        );
+        assert_eq!(jar.snapshot().len(), 1);
+        jar.restore(
+            vec![CookieRecord {
+                path: format!("{path}p"),
+                ..record("b", "1")
+            }],
+            at(NOW),
+        );
+        assert_eq!(jar.snapshot().len(), 1);
+
+        let label = "d".repeat(63);
+        let long = format!("{label}.{label}.{label}.{label}.").repeat(4) + "example.com";
+        assert!(long.len() > 1024);
+        let mut jar = CookieJar::default();
+        jar.restore(
+            vec![CookieRecord {
+                domain: long,
+                ..record("a", "1")
+            }],
+            at(NOW),
+        );
+        assert!(jar.snapshot().is_empty());
+    }
+
+    #[test]
+    fn restore_rejects_a_non_canonical_or_public_suffix_domain() {
+        for (domain, host_only) in [
+            ("Example.com", true),
+            (".example.com", false),
+            ("com", false),
+            ("127.0.0.1", false),
+        ] {
+            let mut jar = CookieJar::default();
+            jar.restore(
+                vec![CookieRecord {
+                    domain: domain.to_owned(),
+                    host_only,
+                    ..record("a", "1")
+                }],
+                at(NOW),
+            );
+            assert!(jar.snapshot().is_empty(), "{domain}");
+        }
+    }
+
+    #[test]
+    fn restore_applies_prefix_and_same_site_rules() {
+        let host_not_host_only = CookieRecord {
+            secure: true,
+            host_only: false,
+            ..record("__Host-a", "1")
+        };
+        let secure_prefix_plain = record("__Secure-a", "1");
+        let none_without_secure = CookieRecord {
+            same_site: CookieSameSite::None,
+            ..record("a", "1")
+        };
+        for bad in [host_not_host_only, secure_prefix_plain, none_without_secure] {
+            let mut jar = CookieJar::default();
+            jar.restore(vec![bad.clone()], at(NOW));
+            assert!(jar.snapshot().is_empty(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn restore_drops_expired_records_and_caps_expiry() {
+        let mut jar = CookieJar::default();
+        jar.restore(
+            vec![
+                CookieRecord {
+                    expiry: Some(at(NOW)),
+                    ..record("old", "1")
+                },
+                CookieRecord {
+                    expiry: Some(at(NOW) + DAY * 1000),
+                    ..record("far", "1")
+                },
+            ],
+            at(NOW),
+        );
+        let snapshot = jar.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].name, "far");
+        assert_eq!(snapshot[0].expiry, Some(at(NOW) + DAY * 400));
+    }
+
+    #[test]
+    fn restore_never_weakens_a_live_secure_cookie() {
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1; Secure; Max-Age=60", http(&page, at(NOW))));
+        jar.restore(vec![record("a", "2")], at(NOW));
+        assert_eq!(jar.cookie_string(http(&page, at(NOW))), "a=1");
+        jar.restore(
+            vec![CookieRecord {
+                secure: true,
+                ..record("a", "3")
+            }],
+            at(NOW),
+        );
+        assert_eq!(jar.cookie_string(http(&page, at(NOW))), "a=3");
     }
 }
