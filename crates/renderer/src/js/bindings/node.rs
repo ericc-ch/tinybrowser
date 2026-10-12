@@ -3327,10 +3327,8 @@ fn serialize_html_node(
         NodeData::ProcessingInstruction { target, contents } => {
             output.push_str("<?");
             output.push_str(target);
-            if !contents.is_empty() {
-                output.push_str(" ");
-                output.push_str(contents);
-            }
+            output.push(' ');
+            output.push_str(contents);
             output.push_str("?>");
         }
         // A fragment serializes as its children.
@@ -3479,31 +3477,33 @@ pub(crate) fn serialize_xml_node(
             public_id,
             system_id,
         } => {
+            // The serialization of an ID quotes with `'` when the ID
+            // contains `"`, else with `"`.
+            let push_id = |output: &mut String, id: &str| {
+                let quote = if id.contains('"') { '\'' } else { '"' };
+                output.push(' ');
+                output.push(quote);
+                output.push_str(id);
+                output.push(quote);
+            };
             output.push_str("<!DOCTYPE ");
             output.push_str(name);
             if !public_id.is_empty() {
-                output.push_str(" PUBLIC \"");
-                output.push_str(public_id);
-                output.push_str("\"");
-                if !system_id.is_empty() {
-                    output.push_str(" \"");
-                    output.push_str(system_id);
-                    output.push_str("\"");
-                }
+                output.push_str(" PUBLIC");
+                push_id(output, public_id);
             } else if !system_id.is_empty() {
-                output.push_str(" SYSTEM \"");
-                output.push_str(system_id);
-                output.push_str("\"");
+                output.push_str(" SYSTEM");
+            }
+            if !system_id.is_empty() {
+                push_id(output, system_id);
             }
             output.push_str(">");
         }
         NodeData::ProcessingInstruction { target, contents } => {
             output.push_str("<?");
             output.push_str(target);
-            if !contents.is_empty() {
-                output.push_str(" ");
-                output.push_str(contents);
-            }
+            output.push(' ');
+            output.push_str(contents);
             output.push_str("?>");
         }
         NodeData::CDataSection { contents } => {
