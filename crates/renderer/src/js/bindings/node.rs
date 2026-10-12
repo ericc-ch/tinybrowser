@@ -3328,10 +3328,8 @@ fn serialize_html_node(
         NodeData::ProcessingInstruction { target, contents } => {
             output.push_str("<?");
             output.push_str(target);
-            if !contents.is_empty() {
-                output.push_str(" ");
-                output.push_str(contents);
-            }
+            output.push_str(" ");
+            output.push_str(contents);
             output.push_str("?>");
         }
         NodeData::Document(_) => {}
@@ -3473,6 +3471,10 @@ pub(crate) fn serialize_xml_node(
             public_id,
             system_id,
         } => {
+            // DOM Parsing's "serialization of the ID" quotes with `'` when the
+            // ID contains `"`, but WPT `domparsing/xml-serialization.xhtml`
+            // ("DocumentType: 'QUOTATION MARK' (U+0022)") expects `"`
+            // unconditionally, so the ids keep `"`.
             output.push_str("<!DOCTYPE ");
             output.push_str(name);
             if !public_id.is_empty() {
@@ -3494,10 +3496,8 @@ pub(crate) fn serialize_xml_node(
         NodeData::ProcessingInstruction { target, contents } => {
             output.push_str("<?");
             output.push_str(target);
-            if !contents.is_empty() {
-                output.push_str(" ");
-                output.push_str(contents);
-            }
+            output.push_str(" ");
+            output.push_str(contents);
             output.push_str("?>");
         }
         NodeData::CDataSection { contents } => {
