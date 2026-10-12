@@ -60,6 +60,20 @@ selects testharness and crashtest only:
 nix develop --command ./tools/wpt/rerun /tmp/test262.json -- --test-types test262
 ```
 
+Tests baselined `expected: TIMEOUT` in `tools/wpt/metadata` wait on a
+capability the engine does not have (for example `transitionstart` or
+`animationstart` with no CSS transitions or animations, or Perform
+Actions), so each one costs its full timeout every run. In a dev loop,
+skip them with upstream's `--skip-timeout`; they are reported as SKIP:
+
+```sh
+nix develop --command ./tools/wpt/run dom/nodes/ -- --skip-timeout
+```
+
+`score` and `overnight` refuse `--skip-timeout`, so scored runs always pay
+for and report every expected TIMEOUT. Baseline a TIMEOUT only when the
+missing capability is understood, like any other expectation.
+
 `tools/wpt/cli.py overnight` runs the full suite (no path filter) and scores
 it. It takes minutes to hours; it needs explicit approval per `AGENTS.md`
 like any suite run.
