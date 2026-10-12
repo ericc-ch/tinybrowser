@@ -1,4 +1,4 @@
-use net::{Agent, AgentOptions};
+use net::{Agent, AgentOptions, Method};
 
 /// The global quota is our policy, not the spec's: eviction runs oldest
 /// first across all domains. Path scoping, `SameSite`, and security prefixes
@@ -58,4 +58,36 @@ fn public_suffix_domains_are_rejected() {
             .cookies_for(&url::Url::parse("https://foo.github.io/").expect("sub"))
             .is_empty()
     );
+}
+
+/// `Method::is_safe` decides whether `SameSite=Lax` cookies follow a
+/// cross-site top-level navigation. RFC 9110 section 9.2.1 names the safe set.
+#[test]
+fn get_is_safe() {
+    assert!(Method::GET.is_safe());
+}
+
+#[test]
+fn head_is_safe() {
+    assert!(Method::HEAD.is_safe());
+}
+
+#[test]
+fn options_is_safe() {
+    assert!(Method::OPTIONS.is_safe());
+}
+
+#[test]
+fn trace_is_safe() {
+    assert!(Method::parse("TRACE").expect("TRACE is a token").is_safe());
+}
+
+#[test]
+fn unsafe_methods_are_not_safe() {
+    for method in ["POST", "PUT", "DELETE", "PATCH", "CONNECT", "trace"] {
+        assert!(
+            !Method::parse(method).expect("method is a token").is_safe(),
+            "{method}"
+        );
+    }
 }

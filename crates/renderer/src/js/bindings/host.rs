@@ -464,12 +464,9 @@ pub(crate) fn reflect_url_string(
     content: &str,
 ) -> Result<crate::dom_string::DomString> {
     let world_rc = world(ctx)?;
-    let raw = world_rc
-        .borrow()
-        .document(id)
-        .and_then(|parsed| {
-            crate::js::world::attr(&parsed.document.base, id.node, content).map(str::to_owned)
-        });
+    let raw = world_rc.borrow().document(id).and_then(|parsed| {
+        crate::js::world::attr(&parsed.document.base, id.node, content).map(str::to_owned)
+    });
     let Some(raw) = raw else {
         return Ok(crate::dom_string::DomString::default());
     };
@@ -489,6 +486,10 @@ pub(crate) trait SharedClass {
 
 /// Whether `data` implements the named node interface, or `None` when the
 /// name is not one the shared payload can represent.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per node interface name; splitting the table is a refactor, not a lint fix"
+)]
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
     xml_document: bool,
@@ -522,8 +523,11 @@ fn node_interface_matches(
         // fragment backings are plain elements under the hood, so every
         // Element-family check below excludes them
         // (<https://dom.spec.whatwg.org/#interface-documentfragment>).
-        "Element" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
-        "HTMLElement" => {
+        // `ARIAMixin` is included by `Element`, so every element answers it.
+        "Element" | "ARIAMixin" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
+        // `ElementContentEditable` is included by `HTMLElement` only, so any
+        // HTML element (including unknown elements) answers it.
+        "HTMLElement" | "ElementContentEditable" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
                 && !is_fragment
         }
@@ -559,14 +563,6 @@ fn node_interface_matches(
                     || element.name.ns == crate::js::world::mathml_namespace()
             ) && !is_fragment
         }
-        // `ElementContentEditable` is included by `HTMLElement` only, so any
-        // HTML element (including unknown elements) answers it.
-        "ElementContentEditable" => {
-            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
-                && !is_fragment
-        }
-        // `ARIAMixin` is included by `Element`, so every element answers it.
-        "ARIAMixin" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
         "ParentNode" => matches!(
             data,
             Some(NodeData::Document(_) | NodeData::Element(_) | NodeData::Fragment { .. })
@@ -577,17 +573,13 @@ fn node_interface_matches(
         "ChildNode" => {
             !is_fragment
                 && (is_character_data
-                    || matches!(
-                        data,
-                        Some(NodeData::Element(_) | NodeData::Doctype { .. })
-                    ))
+                    || matches!(data, Some(NodeData::Element(_) | NodeData::Doctype { .. })))
         }
         // `NonDocumentTypeChildNode` includes `Element` and `CharacterData`,
         // not a doctype or a fragment
         // (<https://dom.spec.whatwg.org/#interface-nondocumenttypechildnode>).
         "NonDocumentTypeChildNode" => {
-            !is_fragment
-                && (is_character_data || matches!(data, Some(NodeData::Element(_))))
+            !is_fragment && (is_character_data || matches!(data, Some(NodeData::Element(_))))
         }
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
@@ -656,8 +648,7 @@ fn node_interface_matches(
         "HTMLMarqueeElement" => crate::js::world::is_html_tag(data, "marquee"),
         "HTMLMeterElement" => crate::js::world::is_html_tag(data, "meter"),
         "HTMLModElement" => {
-            crate::js::world::is_html_tag(data, "ins")
-                || crate::js::world::is_html_tag(data, "del")
+            crate::js::world::is_html_tag(data, "ins") || crate::js::world::is_html_tag(data, "del")
         }
         "HTMLOListElement" => crate::js::world::is_html_tag(data, "ol"),
         "HTMLParagraphElement" => crate::js::world::is_html_tag(data, "p"),

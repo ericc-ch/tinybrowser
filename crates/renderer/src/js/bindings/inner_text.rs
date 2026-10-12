@@ -272,9 +272,6 @@ fn level_of(base: &BaseDocument, node: BlitzId, style: &InlineStyle<'_>) -> Leve
             // Table-internal displays outside a table walk have no
             // anonymous-table repair, so their content collects inline
             // rather than vanishing.
-            "table-row" | "table-cell" | "table-caption" | "table-column"
-            | "table-column-group" | "table-row-group" | "table-header-group"
-            | "table-footer-group" => Level::Inline,
             _ => Level::Inline,
         };
     }
@@ -313,17 +310,10 @@ fn level_of(base: &BaseDocument, node: BlitzId, style: &InlineStyle<'_>) -> Leve
         // Never rendered (without an overriding `style` attribute, which
         // returned above for rendering displays; `source`/`track` join
         // `script`/`style` here; `template`/`noscript` returned earlier).
-        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source" | "track"
-        | "frame" | "frameset" | "noframes" | "noembed" | "datalist" => Level::Hidden,
         // `rp` never renders (its parens are dropped); an explicit rendering
         // display above still wins.
-        "rp" => Level::Hidden,
-        // Transparent containers.
-        "span" | "a" | "b" | "i" | "em" | "strong" | "code" | "tt" | "u" | "s" | "small"
-        | "big" | "cite" | "q" | "dfn" | "abbr" | "kbd" | "samp" | "var" | "sub" | "sup"
-        | "mark" | "ruby" | "rt" | "bdi" | "bdo" | "font" | "label" | "output" | "nobr" | "wbr"
-        | "slot" | "picture" | "colgroup" | "col" | "thead" | "tbody" | "tfoot" | "tr" | "td"
-        | "th" | "caption" | "marquee" | "isindex" => Level::Inline,
+        "head" | "meta" | "link" | "base" | "title" | "script" | "style" | "source" | "track"
+        | "frame" | "frameset" | "noframes" | "noembed" | "datalist" | "rp" => Level::Hidden,
         // Block containers (`li` is `list-item`, block-level; `fieldset`,
         // `legend`, `center`, `search`, `dt`/`dd` are `block`).
         "address" | "article" | "aside" | "blockquote" | "details" | "dialog" | "div" | "dl"
@@ -336,7 +326,8 @@ fn level_of(base: &BaseDocument, node: BlitzId, style: &InlineStyle<'_>) -> Leve
         "img" | "input" | "textarea" | "iframe" | "audio" | "video" | "canvas" | "object"
         | "embed" | "param" | "map" | "area" | "applet" | "button" => Level::Atomic,
         "select" | "option" | "optgroup" => Level::Paragraph,
-        // Unknown and custom elements are inline by default.
+        // Transparent containers (`span`, `a`, `b`, table parts, ...) and
+        // unknown and custom elements are inline by default.
         _ => Level::Inline,
     }
 }
@@ -507,6 +498,10 @@ fn process_text(text: &str, mode: WhiteSpace) -> String {
 }
 
 /// Collector state for one rendered-text run.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent whitespace and break flags of the rendered-text walk; folding them into a state machine is a refactor"
+)]
 struct Collector<'a> {
     base: &'a BaseDocument,
     out: String,
@@ -532,7 +527,7 @@ struct Collector<'a> {
     trailing_forced: bool,
 }
 
-impl<'a> Collector<'a> {
+impl Collector<'_> {
     /// Pushes mode-processed text, merging boundary spaces unless preserved.
     fn push_text(&mut self, text: &str, preserve: bool) {
         if text.is_empty() {
@@ -685,6 +680,10 @@ fn collect_children(
 }
 
 /// Collects one node.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-node rendered-text steps kept in one place; splitting them is a refactor, not a lint fix"
+)]
 fn collect_node(
     collector: &mut Collector<'_>,
     node: BlitzId,

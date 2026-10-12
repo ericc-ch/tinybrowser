@@ -5,18 +5,25 @@ single Python CLI `tools/wpt/cli.py` (`run` | `score` | `rerun` |
 `overnight` | `selftest`); `tools/wpt/run` and `tools/wpt/rerun` are thin
 shims that find a Python before the venv exists (`tools/wpt/retest` is a
 compat alias for `rerun`). The CLI builds the debug binary through cargo on
-every run (cargo's fingerprint no-ops when fresh), and installs the wptrunner
-product into WPT's venv only when the venv is missing or its stamp changed:
-the stamp covers the requirements files, `tools/wpt/pyproject.toml`, the
-python version, and the worktree root (one shared venv serves every
-worktree; the adapter install is editable, so adapter edits need no
-reinstall). The manifest walk is skipped with `--no-manifest-update` when the
-checkout state and manifest bytes match the last walked run. It defaults
-`--processes` to the CPU count (unless `--processes`, `--fully-parallel`, or
-`-f` is set), `--test-types testharness crashtest`, enables HTTPS with the
-wptserve CA, and passes `--resolve` maps instead of editing `/etc/hosts`.
-`TINYBROWSER_BINARY` uses a prebuilt binary as-is with no freshness check
-(it says so on stderr).
+every run (cargo's fingerprint no-ops when fresh), and installs the
+wptrunner product into WPT's venv only when the venv is missing or its stamp
+changed: the stamp covers the `wpt run` requirements files (manifest,
+wptrunner, serve), `tools/wpt/pyproject.toml`, the python version, and the
+worktree root (one shared venv serves every worktree; the adapter install is
+editable, so adapter edits need no reinstall). The install adds
+`setuptools<71` because uv seeds only pip on Python 3.12 and WPT's own
+per-run requirements check needs `pkg_resources`; newer setuptools imports the
+top-level `packaging`, which WPT's sys.path resolves to its vendored copy, and
+fails there. Without a working `pkg_resources` WPT shells out to
+`pip install` three times every run. The manifest walk is skipped with
+`--no-manifest-update` when the checkout state and manifest bytes match the
+last walked run. It defaults `--processes` to the CPU count (unless
+`--processes`, `--fully-parallel`, or `-f` is set), `--test-types
+testharness crashtest`, enables HTTPS with the wptserve CA, and passes
+`--resolve` maps instead of editing `/etc/hosts`. `TINYBROWSER_BINARY` uses
+a prebuilt binary as-is with no freshness check (it says so on stderr).
+Browser start-up polls the WebDriver port every 10 ms (upstream polls every
+500 ms; the binary listens in under 0.1 s).
 
 ```sh
 nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
@@ -60,6 +67,20 @@ selects testharness and crashtest only:
 nix develop --command ./tools/wpt/rerun /tmp/test262.json -- --test-types test262
 ```
 
+Tests baselined `expected: TIMEOUT` in `tools/wpt/metadata` wait on a
+capability the engine does not have (for example `transitionstart` or
+`animationstart` with no CSS transitions or animations, or Perform
+Actions), so each one costs its full timeout every run. In a dev loop,
+skip them with upstream's `--skip-timeout`; they are reported as SKIP:
+
+```sh
+nix develop --command ./tools/wpt/run dom/nodes/ -- --skip-timeout
+```
+
+`score` and `overnight` refuse `--skip-timeout`, so scored runs always pay
+for and report every expected TIMEOUT. Baseline a TIMEOUT only when the
+missing capability is understood, like any other expectation.
+
 `tools/wpt/cli.py overnight` runs the full suite (no path filter) and scores
 it. It takes minutes to hours; it needs explicit approval per `AGENTS.md`
 like any suite run.
@@ -78,6 +99,7 @@ In `docs/progress.md`, replace the latest total and scored groups only.
 | HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. Actions/bless/permissions are engine-red foundations; BiDi later. |
 | Parallel processes | CPU count unless the command sets `--processes`, `--fully-parallel`, or `-f`. Each process gets its own browser and ports. `--fully-parallel`/`-f` is separate: every test is its own group, so the browser restarts per test. The count actually used is echoed as `wpt: processes N`. |
+| Longest-first split | The default split gives each process one fixed queue with no work stealing; upstream fills it by test-id hash, so one process can draw several 60 s tests. With known durations the harness assigns tests longest-first to the least-loaded process instead (`wpt: longest-first split, N tests with known durations`); tests never timed cost the median. Every run records its per-test durations in `~/.cache/tinybrowser/wpt-durations.json`, so the second run of a slice is balanced. `TINYBROWSER_WPT_DURATIONS=REPORT.json` reads durations from any `--log-wptreport` output instead; `TINYBROWSER_WPT_DURATIONS=` (empty) keeps the hash split. `--run-by-dir`, `--test-groups`, and `-f` keep their upstream grouping. |
 | Skips and locks | The venv install holds the shared-venv lock only around an install that is still needed, then releases it before tests; a run that skips the install takes no lock. A run that lets wpt rewrite the shared manifest holds a manifest lock for the whole invocation; `--no-manifest-update` runs stay parallel. Runs passing `--install-browser`, `--install-webdriver`, `--manifest-download`, or `--install-fonts` hold the venv lock throughout, since wpt itself then writes into the venv. |
 
 ## Blocked on engine capabilities

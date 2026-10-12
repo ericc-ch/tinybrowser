@@ -597,6 +597,10 @@ pub(super) fn encode_form(text: String, label: String) -> String {
 /// Percent-encodes `text` for form submission: Encoding Standard `encode`
 /// in `label`, then the urlencoded byte serializer over those bytes
 /// (<https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer>).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
 pub(super) fn urlencode_form(text: String, label: String) -> String {
     let (bytes, _, _) = submission_encoding(&label).encode(&text);
     url::form_urlencoded::byte_serialize(bytes.as_ref()).collect()

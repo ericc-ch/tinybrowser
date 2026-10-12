@@ -1395,7 +1395,7 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 pub(crate) fn parse_non_negative_integer(value: &str) -> Option<u32> {
     match parse_integer(value)? {
         0 => Some(0),
-        parsed @ 1..=2147483647 => u32::try_from(parsed).ok(),
+        parsed @ 1..=2_147_483_647 => u32::try_from(parsed).ok(),
         _ => None,
     }
 }
