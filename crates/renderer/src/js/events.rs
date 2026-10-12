@@ -1434,7 +1434,7 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
                 .query_selector_in(base.root_node().id, "html")
                 .ok()
                 .flatten()
-                .map(|node| super::world::NodeId {
+                .map(|node| crate::dom::tree::NodeId {
                     document: id.document,
                     node,
                 });
@@ -1445,7 +1445,7 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
                 .query_selector_in(base.root_node().id, "body")
                 .ok()
                 .flatten()
-                .map(|node| super::world::NodeId {
+                .map(|node| crate::dom::tree::NodeId {
                     document: id.document,
                     node,
                 });
@@ -1661,7 +1661,7 @@ fn handler_attribute_source<'js>(
 }
 
 /// The body element of the current realm's active document, when it has one.
-fn active_body(ctx: &Ctx<'_>) -> Option<super::world::NodeId> {
+fn active_body(ctx: &Ctx<'_>) -> Option<crate::dom::tree::NodeId> {
     let world = bindings::world(ctx).ok()?;
     let world = world.borrow();
     let parsed = world.main_document()?;
@@ -1670,7 +1670,7 @@ fn active_body(ctx: &Ctx<'_>) -> Option<super::world::NodeId> {
     base.query_selector_in(base.root_node().id, "body")
         .ok()
         .flatten()
-        .map(|node| super::world::NodeId { document, node })
+        .map(|node| crate::dom::tree::NodeId { document, node })
 }
 
 /// `ToBoolean` for an optional argument; a missing or undefined argument is

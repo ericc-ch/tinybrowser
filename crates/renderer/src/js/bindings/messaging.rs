@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use std::rc::Rc;
 
-use crate::js::world::NodeId;
+use crate::dom::tree::NodeId;
 
 use rquickjs::{Ctx, Object, Persistent, Result, Value};
 

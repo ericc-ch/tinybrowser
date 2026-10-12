@@ -15,9 +15,8 @@
 //! into the tree.
 
 use super::{descendant_text, host_node_id, world, world_for_node};
-use crate::js::world::{
-    BlitzId, JournalEntry, NodeId, attr, form_owner_of, html_namespace, is_html_element,
-};
+use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_html_element};
+use crate::js::world::JournalEntry;
 use crate::js::{FrameNavigation, World};
 use blitz_dom::{BaseDocument, NodeData};
 use markup5ever::{LocalName, Namespace, QualName};

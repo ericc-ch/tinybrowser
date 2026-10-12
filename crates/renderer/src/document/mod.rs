@@ -78,7 +78,7 @@ pub(crate) enum DialContext {
         epoch: u64,
     },
     ClassicScript {
-        element: crate::js::world::NodeId,
+        element: crate::dom::tree::NodeId,
         epoch: u64,
     },
     /// A child frame's own navigation
@@ -149,15 +149,15 @@ enum ParserOwner {
 /// A connection transition for one `iframe` container in this document.
 pub(crate) enum IframeLifecycle {
     /// A container whose frame is gone or disconnected.
-    Removed(crate::js::world::NodeId),
+    Removed(crate::dom::tree::NodeId),
 }
 
 /// A connection transition for one `<img>` element in this document.
 pub(crate) enum ImageLifecycle {
     /// A newly connected image to start fetching.
-    Connected(crate::js::world::NodeId),
+    Connected(crate::dom::tree::NodeId),
     /// A disconnected image to stop fetching.
-    Disconnected(crate::js::world::NodeId),
+    Disconnected(crate::dom::tree::NodeId),
 }
 
 struct Timer {
@@ -235,13 +235,13 @@ pub(crate) struct Document {
     /// load event; Blitz fetches and decodes, we only watch.
     /// Selected source URL for the current request
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    image_selected_src: HashMap<crate::js::world::NodeId, String>,
+    image_selected_src: HashMap<crate::dom::tree::NodeId, String>,
     /// Elements with an unresolved image request for the current generation.
-    in_flight_images: HashSet<crate::js::world::NodeId>,
+    in_flight_images: HashSet<crate::dom::tree::NodeId>,
     /// Connected `<img>` elements the last lifecycle scan saw, so insertion
     /// starts a fetch and removal drops one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    connected_images: HashSet<crate::js::world::NodeId>,
+    connected_images: HashSet<crate::dom::tree::NodeId>,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -256,7 +256,7 @@ pub(crate) struct Document {
     /// The `iframe` containers awaiting their child's load event; this
     /// document's own `load` event is delayed until they all have
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-    pending_frame_loads: HashSet<crate::js::world::NodeId>,
+    pending_frame_loads: HashSet<crate::dom::tree::NodeId>,
     /// Whether this document's `load` event has fired.
     load_fired: bool,
     events: Vec<RendererEvent>,
@@ -274,7 +274,7 @@ pub(crate) struct Document {
     active_buffer: Option<String>,
     /// Scripts already executed for the current parse, so a walk resumed
     /// after a `src` fetch does not run them twice.
-    executed_scripts: HashSet<crate::js::world::NodeId>,
+    executed_scripts: HashSet<crate::dom::tree::NodeId>,
     parser_eof: bool,
     /// Who owns the active parser, which decides whether `document.close()` may
     /// end it.
@@ -290,7 +290,7 @@ pub(crate) struct Document {
     /// `document.open()`, stays HTML.
     response_content_type: Option<String>,
     classic_fetch_in_flight: bool,
-    deferred_modules: Vec<(crate::js::world::NodeId, crate::js::ScriptSource)>,
+    deferred_modules: Vec<(crate::dom::tree::NodeId, crate::js::ScriptSource)>,
     stop: Arc<Stop>,
 }
 
@@ -385,10 +385,10 @@ impl Document {
     }
 
     /// The root node of the frame's active document.
-    pub(crate) fn document_root(&self) -> Option<crate::js::world::NodeId> {
+    pub(crate) fn document_root(&self) -> Option<crate::dom::tree::NodeId> {
         self.world
             .borrow()
-            .with_main_document(|parsed| crate::js::world::NodeId {
+            .with_main_document(|parsed| crate::dom::tree::NodeId {
                 document: parsed.id,
                 node: parsed.document.base.root_node().id,
             })
@@ -398,10 +398,10 @@ impl Document {
     /// non-empty one
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-src>).
     #[must_use]
-    pub(crate) fn frame_src(&self, container: crate::js::world::NodeId) -> Option<String> {
+    pub(crate) fn frame_src(&self, container: crate::dom::tree::NodeId) -> Option<String> {
         let world = self.world.borrow();
         let value = world.document(container).and_then(|parsed| {
-            crate::js::world::attr(&parsed.document.base, container.node, "src").map(str::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, container.node, "src").map(str::to_owned)
         })?;
         (!value.is_empty()).then_some(value)
     }
@@ -444,7 +444,7 @@ impl Document {
     /// the current script; src loads that start earlier fire `load` before
     /// later classic scripts define their onload functions
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-    fn adopt_pending_frames_before_node(&mut self, before: Option<crate::js::world::NodeId>) {
+    fn adopt_pending_frames_before_node(&mut self, before: Option<crate::dom::tree::NodeId>) {
         let created = World::adopt_pending_frames(&self.world, before);
         for container in created {
             // The child is loading from this moment on, so this document's
@@ -463,7 +463,7 @@ impl Document {
 
     /// Takes the child frames this document's realm created for the engine to
     /// adopt.
-    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, crate::js::world::NodeId, Document)> {
+    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, crate::dom::tree::NodeId, Document)> {
         self.world.borrow_mut().take_new_frames()
     }
 
@@ -486,12 +486,12 @@ impl Document {
                 let mut images = Vec::new();
                 let mut stack = vec![base.root_node().id];
                 while let Some(id) = stack.pop() {
-                    if crate::js::world::is_connected(base, id) {
-                        if crate::js::world::is_iframe_element(base, id) {
-                            containers.push(crate::js::world::NodeId { document, node: id });
+                    if crate::dom::tree::is_connected(base, id) {
+                        if crate::dom::tree::is_iframe_element(base, id) {
+                            containers.push(crate::dom::tree::NodeId { document, node: id });
                         }
-                        if crate::js::world::is_html_element(base, id, "img") {
-                            images.push(crate::js::world::NodeId { document, node: id });
+                        if crate::dom::tree::is_html_element(base, id, "img") {
+                            images.push(crate::dom::tree::NodeId { document, node: id });
                         }
                     }
                     if let Some(node) = base.get_node(id) {
@@ -502,14 +502,14 @@ impl Document {
             })
             .unwrap_or_default();
         let shared = self.shared.borrow();
-        let known: std::collections::HashSet<crate::js::world::NodeId> = shared
+        let known: std::collections::HashSet<crate::dom::tree::NodeId> = shared
             .tree
             .children(self.frame)
             .iter()
             .filter_map(|child| shared.tree.container(*child))
             .collect();
         drop(shared);
-        let connected_set: std::collections::HashSet<crate::js::world::NodeId> =
+        let connected_set: std::collections::HashSet<crate::dom::tree::NodeId> =
             connected.iter().copied().collect();
         let mut iframe_events = Vec::new();
         // Insertion is World::adopt_pending_frames / materialize_iframe in
@@ -520,7 +520,7 @@ impl Document {
                 iframe_events.push(IframeLifecycle::Removed(*container));
             }
         }
-        let connected_image_set: std::collections::HashSet<crate::js::world::NodeId> =
+        let connected_image_set: std::collections::HashSet<crate::dom::tree::NodeId> =
             connected_images.iter().copied().collect();
         let mut image_events = Vec::new();
         for element in &connected_images {
@@ -555,19 +555,19 @@ impl Document {
         self.world.borrow_mut().take_document_stream()
     }
 
-    pub(crate) fn fire_node_load(&mut self, id: crate::js::world::NodeId) {
+    pub(crate) fn fire_node_load(&mut self, id: crate::dom::tree::NodeId) {
         self.fire_js(|js| js.fire_node_load(id));
         self.adopt_js_work();
     }
 
     /// Queues the image fetch for a newly connected `<img>`, if it still needs one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    pub(crate) fn queue_connected_image(&mut self, element: crate::js::world::NodeId) {
+    pub(crate) fn queue_connected_image(&mut self, element: crate::dom::tree::NodeId) {
         self.queue_image(element, false);
     }
 
     /// Drops a disconnected `<img>`'s decoded size and ignores its waiter.
-    pub(crate) fn disconnect_image(&mut self, element: crate::js::world::NodeId) {
+    pub(crate) fn disconnect_image(&mut self, element: crate::dom::tree::NodeId) {
         self.in_flight_images.remove(&element);
         self.image_selected_src.remove(&element);
         self.world.borrow_mut().forget_image(element);
@@ -1237,7 +1237,7 @@ impl Document {
     fn eval_classic(
         &mut self,
         source: &str,
-        element: Option<crate::js::world::NodeId>,
+        element: Option<crate::dom::tree::NodeId>,
         base_line: u32,
         filename: &str,
     ) {
@@ -1488,7 +1488,7 @@ impl Document {
     /// walk, so later scripts still run in order
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#pending-parsing-blocking-script>).
     fn run_scripts(&mut self) -> bool {
-        let scripts: Vec<crate::js::world::NodeId> = {
+        let scripts: Vec<crate::dom::tree::NodeId> = {
             let world = self.world.borrow();
             let Some(parsed) = world.main_document() else {
                 return false;
@@ -1501,8 +1501,8 @@ impl Document {
                 let Some(node) = base.get_node(id) else {
                     continue;
                 };
-                if crate::js::world::is_html_element(base, id, "script") {
-                    scripts.push(crate::js::world::NodeId { document, node: id });
+                if crate::dom::tree::is_html_element(base, id, "script") {
+                    scripts.push(crate::dom::tree::NodeId { document, node: id });
                 }
                 stack.extend(node.children.iter().rev().copied());
             }
@@ -1586,7 +1586,7 @@ impl Document {
                 let base = &parsed.document.base;
                 let root = base.root_node().id;
                 let base_el = base.query_selector_in(root, "base[href]").ok().flatten()?;
-                crate::js::world::attr(base, base_el, "href").map(str::to_owned)
+                crate::dom::tree::attr(base, base_el, "href").map(str::to_owned)
             })
             .flatten();
         let Some(href) = base_href else {
@@ -1799,7 +1799,7 @@ impl Document {
     /// waiters. Image requests delay the load event until they succeed or fail
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     fn load_images(&mut self) {
-        let images: Vec<crate::js::world::NodeId> = self
+        let images: Vec<crate::dom::tree::NodeId> = self
             .world
             .borrow()
             .with_main_document(|parsed| {
@@ -1808,10 +1808,10 @@ impl Document {
                 let mut images = Vec::new();
                 let mut stack = vec![base.root_node().id];
                 while let Some(id) = stack.pop() {
-                    if crate::js::world::is_html_element(base, id, "img")
-                        && crate::js::world::attr(base, id, "src").is_some()
+                    if crate::dom::tree::is_html_element(base, id, "img")
+                        && crate::dom::tree::attr(base, id, "src").is_some()
                     {
-                        images.push(crate::js::world::NodeId { document, node: id });
+                        images.push(crate::dom::tree::NodeId { document, node: id });
                     }
                     if let Some(node) = base.get_node(id) {
                         stack.extend(node.children.iter().rev().copied());
@@ -1862,7 +1862,7 @@ impl Document {
     /// request is already in flight or decoded.
     pub(in crate::document) fn queue_image(
         &mut self,
-        element: crate::js::world::NodeId,
+        element: crate::dom::tree::NodeId,
         force: bool,
     ) {
         if !force
@@ -1872,9 +1872,9 @@ impl Document {
             return;
         }
         let src = self.world.borrow().document(element).and_then(|parsed| {
-            crate::js::world::is_html_element(&parsed.document.base, element.node, "img")
+            crate::dom::tree::is_html_element(&parsed.document.base, element.node, "img")
                 .then(|| {
-                    crate::js::world::attr(&parsed.document.base, element.node, "src")
+                    crate::dom::tree::attr(&parsed.document.base, element.node, "src")
                         .map(str::to_owned)
                 })
                 .flatten()
@@ -1913,7 +1913,7 @@ impl Document {
     /// Decoded dimensions Blitz holds for `element`'s current request, if it
     /// decoded one. Blitz decodes synchronously on delivery, so after
     /// [`Self::settle_blitz_layout`] this is settled for every delivered URL.
-    fn blitz_image_dims(&self, element: crate::js::world::NodeId) -> Option<(u32, u32)> {
+    fn blitz_image_dims(&self, element: crate::dom::tree::NodeId) -> Option<(u32, u32)> {
         let world = self.world.borrow();
         let parsed = world.main_document()?;
         let node = parsed.document.base.get_node(element.node)?;
@@ -1927,7 +1927,7 @@ impl Document {
     /// Settles every waiter selected for `url` from Blitz's decoded state:
     /// decoded dimensions fire `load`, anything else fires `error`.
     fn settle_image_waiters(&mut self, url: &str) {
-        let waiting: Vec<crate::js::world::NodeId> = self
+        let waiting: Vec<crate::dom::tree::NodeId> = self
             .in_flight_images
             .iter()
             .filter(|element| {
@@ -1974,18 +1974,18 @@ impl Document {
 
     /// A child browsing context started loading; this document's `load` event
     /// waits for it, and the container is remembered until it finishes.
-    pub(crate) fn mark_frame_load_pending(&mut self, container: crate::js::world::NodeId) {
+    pub(crate) fn mark_frame_load_pending(&mut self, container: crate::dom::tree::NodeId) {
         self.pending_frame_loads.insert(container);
     }
 
     /// The containers whose child frames have not finished loading.
-    pub(crate) fn pending_frame_loads(&self) -> Vec<crate::js::world::NodeId> {
+    pub(crate) fn pending_frame_loads(&self) -> Vec<crate::dom::tree::NodeId> {
         self.pending_frame_loads.iter().copied().collect()
     }
 
     /// Fires one container's `load` event and lets this document's own `load`
     /// event proceed once no child is left loading.
-    pub(crate) fn finish_frame_load(&mut self, container: crate::js::world::NodeId) -> bool {
+    pub(crate) fn finish_frame_load(&mut self, container: crate::dom::tree::NodeId) -> bool {
         if !self.pending_frame_loads.remove(&container) {
             return false;
         }
@@ -2006,7 +2006,7 @@ impl Document {
     }
 
     /// Drops a container that went away before its child finished loading.
-    pub(crate) fn cancel_frame_load(&mut self, container: crate::js::world::NodeId) {
+    pub(crate) fn cancel_frame_load(&mut self, container: crate::dom::tree::NodeId) {
         let _ = self
             .world
             .borrow_mut()
@@ -2037,14 +2037,14 @@ fn html_needs_realm(parsed: &crate::Parsed) -> bool {
         let Some(node) = base.get_node(id) else {
             continue;
         };
-        if crate::js::world::is_html_element(base, id, "script") {
+        if crate::dom::tree::is_html_element(base, id, "script") {
             return true;
         }
         if let Some(element) = node.data.downcast_element()
             && element.attrs.iter().any(|attribute| {
                 attribute.name.prefix.as_ref().is_none()
                     && attribute.name.ns.as_ref().is_empty()
-                    && crate::js::world::is_handler_attribute_name(attribute.name.local.as_ref())
+                    && crate::dom::tree::is_handler_attribute_name(attribute.name.local.as_ref())
             })
         {
             return true;

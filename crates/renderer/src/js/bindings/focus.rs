@@ -5,10 +5,8 @@ use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for
 use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
-use crate::js::world::EventTargetKey;
-use crate::js::world::{
-    BlitzId, JournalEntry, NodeId, attr, form_owner_of, html_namespace, is_connected,
-};
+use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected};
+use crate::js::world::{EventTargetKey, JournalEntry};
 
 /// The node-removal focus fixup: when the document's focused area is inside
 /// a removed subtree, clear it without firing events

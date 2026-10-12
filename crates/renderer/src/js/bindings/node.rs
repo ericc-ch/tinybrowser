@@ -38,11 +38,12 @@ use rquickjs::{
 use crate::js::events;
 use crate::js::world::World;
 
-use crate::js::world::{
-    BlitzId, DocumentStreamCommand, Handle, JournalEntry, NodeId, NodeReference, Wrapper, attr,
-    child_ids, form_owner_of, html_namespace, is_connected, is_html_element, is_iframe_element,
-    mathml_namespace, svg_namespace,
+use crate::dom::tree::{
+    BlitzId, NodeId, attr, child_ids, form_owner_of, html_namespace, is_connected, is_html_element,
+    is_iframe_element, mathml_namespace, svg_namespace,
 };
+
+use crate::js::world::{DocumentStreamCommand, Handle, JournalEntry, NodeReference, Wrapper};
 
 use crate::ReadyState;
 
@@ -1224,7 +1225,7 @@ fn parse_html_fragment_snapshots(
         .get_node(context_id)
         .map(|node| match &node.data {
             blitz_dom::NodeData::Element(element)
-                if crate::js::world::is_template_tag(&element.name) =>
+                if crate::dom::tree::is_template_tag(&element.name) =>
             {
                 element
                     .template_contents
@@ -2182,7 +2183,7 @@ fn clear_nonce_on_connect(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Result<()> {
         let owner = world_for_node(ctx, id)?;
         let saved = owner.borrow().nonce_slots.get(&id).cloned().or_else(|| {
             owner.borrow().document(id).and_then(|parsed| {
-                crate::js::world::attr(&parsed.document.base, id.node, "nonce").map(str::to_owned)
+                crate::dom::tree::attr(&parsed.document.base, id.node, "nonce").map(str::to_owned)
             })
         });
         set_attribute_sync(ctx, id, "nonce", "")?;
@@ -2335,11 +2336,11 @@ fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
             return;
         };
         let base = &parsed.document.base;
-        let name = crate::js::world::attr(base, id.node, "name").unwrap_or_default();
+        let name = crate::dom::tree::attr(base, id.node, "name").unwrap_or_default();
         if !name.eq_ignore_ascii_case("referrer") {
             return;
         }
-        parse_referrer_policy(crate::js::world::attr(base, id.node, "content").unwrap_or_default())
+        parse_referrer_policy(crate::dom::tree::attr(base, id.node, "content").unwrap_or_default())
     };
     let Some(policy) = policy else {
         return;
@@ -2385,7 +2386,7 @@ fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
         if parsed.document.script_already_started(id.node) {
             return Ok(());
         }
-        if !crate::js::world::is_connected(&parsed.document.base, id.node) {
+        if !crate::dom::tree::is_connected(&parsed.document.base, id.node) {
             return Ok(());
         }
         match crate::js::script_at(&world, id) {
@@ -2562,7 +2563,7 @@ fn option_select_owner(
 ) -> Option<NodeId> {
     let mut cursor = base.get_node(option).and_then(|node| node.parent);
     while let Some(current) = cursor {
-        if crate::js::world::is_html_element(base, current, "select") {
+        if crate::dom::tree::is_html_element(base, current, "select") {
             return Some(NodeId {
                 document,
                 node: current,
@@ -3239,8 +3240,8 @@ fn serialize_html_element(
     let children: Vec<BlitzId> = base
         .get_node(id)
         .map(|node| {
-            if crate::js::world::is_template_tag(name) {
-                crate::js::world::template_contents(base, id)
+            if crate::dom::tree::is_template_tag(name) {
+                crate::dom::tree::template_contents(base, id)
                     .and_then(|fragment| {
                         base.get_node(fragment)
                             .map(|backing| backing.children.iter().copied().collect())
@@ -3422,8 +3423,8 @@ fn serialize_xml_element(
     let children: Vec<BlitzId> = base
         .get_node(id)
         .map(|node| {
-            if crate::js::world::is_template_tag(name) {
-                crate::js::world::template_contents(base, id)
+            if crate::dom::tree::is_template_tag(name) {
+                crate::dom::tree::template_contents(base, id)
                     .and_then(|fragment| {
                         base.get_node(fragment)
                             .map(|backing| backing.children.iter().copied().collect())
@@ -3560,7 +3561,7 @@ fn iframe_frame(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
 fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
     let owner = world_for_node(ctx, id)?;
     let is_img = owner.borrow().document(id).is_some_and(|parsed| {
-        crate::js::world::is_html_element(&parsed.document.base, id.node, "img")
+        crate::dom::tree::is_html_element(&parsed.document.base, id.node, "img")
     });
     if !is_img {
         return Ok(None);
@@ -4480,7 +4481,7 @@ impl JsNode {
         let local = attribute_local_name(&ctx, self.handle.0, &name.0);
         let world = world(&ctx)?;
         let found = world.borrow().document(self.handle.0).and_then(|parsed| {
-            crate::js::world::attr_by_qualified_name(
+            crate::dom::tree::attr_by_qualified_name(
                 &parsed.document.base,
                 self.handle.0.node,
                 &local,
@@ -4760,7 +4761,7 @@ impl JsNode {
             .borrow()
             .document(self.handle.0)
             .is_some_and(|parsed| {
-                crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "form")
+                crate::dom::tree::is_html_element(&parsed.document.base, self.handle.0.node, "form")
             });
         if !is_form {
             return Err(throw_dom(
@@ -5318,7 +5319,7 @@ impl JsNode {
             .borrow()
             .document(self.handle.0)
             .is_some_and(|parsed| {
-                crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "img")
+                crate::dom::tree::is_html_element(&parsed.document.base, self.handle.0.node, "img")
             });
         if !is_img {
             return Ok(false);
@@ -5351,7 +5352,7 @@ impl JsNode {
             .borrow()
             .document(self.handle.0)
             .is_some_and(|parsed| {
-                crate::js::world::is_html_element(&parsed.document.base, self.handle.0.node, "img")
+                crate::dom::tree::is_html_element(&parsed.document.base, self.handle.0.node, "img")
             });
         if !is_img {
             return Ok(String::new());
@@ -5463,7 +5464,7 @@ impl JsNode {
         // innerHTML on a template reads its template contents, not its
         // (empty) children
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
-        let container = crate::js::world::template_contents(&parsed.document.base, container.node)
+        let container = crate::dom::tree::template_contents(&parsed.document.base, container.node)
             .map_or(container, |fragment| NodeId {
                 document: container.document,
                 node: fragment,
@@ -5542,7 +5543,7 @@ impl JsNode {
             .borrow()
             .document(container)
             .and_then(|parsed| {
-                crate::js::world::template_contents(&parsed.document.base, container.node)
+                crate::dom::tree::template_contents(&parsed.document.base, container.node)
             })
             .map_or(container, |fragment| NodeId {
                 document: container.document,
@@ -6449,7 +6450,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(crate::js::world::attr_by_qualified_name(
+        Ok(crate::dom::tree::attr_by_qualified_name(
             &parsed.document.base,
             self.handle.0.node,
             &local,
@@ -6762,7 +6763,7 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            crate::js::world::attr_by_qualified_name(
+            crate::dom::tree::attr_by_qualified_name(
                 &parsed.document.base,
                 self.handle.0.node,
                 &local,
@@ -8899,7 +8900,7 @@ fn content_attr(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Option<String> {
     let owner = world_for_node(ctx, id).ok()?;
     let borrowed = owner.borrow();
     borrowed.document(id).and_then(|parsed| {
-        crate::js::world::attr(&parsed.document.base, id.node, name).map(str::to_owned)
+        crate::dom::tree::attr(&parsed.document.base, id.node, name).map(str::to_owned)
     })
 }
 
@@ -9022,7 +9023,7 @@ fn reflect_limited_double(raw: Option<&str>, default: f64) -> f64 {
 /// parent: only that one is focusable
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
 fn is_first_summary_child(base: &blitz_dom::BaseDocument, parent: BlitzId, node: BlitzId) -> bool {
-    if !crate::js::world::is_html_tag(base.get_node(parent).map(|tree| &tree.data), "details") {
+    if !crate::dom::tree::is_html_tag(base.get_node(parent).map(|tree| &tree.data), "details") {
         return false;
     }
     base.get_node(parent).is_some_and(|parent| {
@@ -9050,7 +9051,7 @@ const DIR_KEYWORDS: &[&str] = &["ltr", "rtl", "auto"];
 fn writing_suggestions_value(base: &blitz_dom::BaseDocument, node: BlitzId) -> &'static str {
     let mut cursor = Some(node);
     while let Some(current) = cursor {
-        if let Some(value) = crate::js::world::attr(base, current, "writingsuggestions") {
+        if let Some(value) = crate::dom::tree::attr(base, current, "writingsuggestions") {
             return if value.eq_ignore_ascii_case("false") {
                 "false"
             } else {
@@ -9105,7 +9106,7 @@ fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
     // Editing hosts are focusable: `contenteditable` in the True or
     // Plaintext-Only state (empty, `true`, or `plaintext-only`, ASCII
     // case-insensitive).
-    if crate::js::world::attr(base, node, "contenteditable").is_some_and(|state| {
+    if crate::dom::tree::attr(base, node, "contenteditable").is_some_and(|state| {
         matches!(
             state.to_ascii_lowercase().as_str(),
             "" | "true" | "plaintext-only"
@@ -9122,7 +9123,7 @@ fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
     }
     match element.name.local.as_ref() {
         "input" => {
-            if crate::js::world::attr(base, node, "type")
+            if crate::dom::tree::attr(base, node, "type")
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))
             {
                 -1
@@ -9131,14 +9132,14 @@ fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -> i32 {
             }
         }
         "a" => {
-            if crate::js::world::attr(base, node, "href").is_some() {
+            if crate::dom::tree::attr(base, node, "href").is_some() {
                 0
             } else {
                 -1
             }
         }
         "button" | "select" | "textarea" | "iframe" => 0,
-        "audio" | "video" if crate::js::world::attr(base, node, "controls").is_some() => 0,
+        "audio" | "video" if crate::dom::tree::attr(base, node, "controls").is_some() => 0,
         _ => -1,
     }
 }
@@ -9228,7 +9229,7 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
             return Ok(-1);
         };
         let base = &parsed.document.base;
-        Ok(crate::js::world::attr(base, self.handle.0.node, "tabindex")
+        Ok(crate::dom::tree::attr(base, self.handle.0.node, "tabindex")
             .and_then(super::parse_integer)
             .unwrap_or_else(|| tab_index_default(base, self.handle.0.node)))
     }

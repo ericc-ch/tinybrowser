@@ -3,7 +3,8 @@
 use super::{TreeError, throw_dom, throw_dom_error, world, world_for_node, wrap_new_document};
 
 use crate::documents::BlitzDocument;
-use crate::js::world::{JournalEntry, NodeId};
+use crate::dom::tree::NodeId;
+use crate::js::world::JournalEntry;
 
 use blitz_dom::NodeData;
 use markup5ever::QualName;
@@ -124,7 +125,7 @@ fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<(
             world_for_node(ctx, id).ok().and_then(|owner| {
                 let owner = owner.borrow();
                 owner.document(id).and_then(|parsed| {
-                    crate::js::world::template_contents(&parsed.document.base, id.node).map(
+                    crate::dom::tree::template_contents(&parsed.document.base, id.node).map(
                         |fragment| NodeId {
                             document: id.document,
                             node: fragment,
@@ -162,7 +163,7 @@ fn adopted_children(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<NodeId>> {
         .get_node(id.node)
         .map(|node| {
             if let Some(element) = node.data.downcast_element()
-                && crate::js::world::is_template_tag(&element.name)
+                && crate::dom::tree::is_template_tag(&element.name)
                 && let Some(fragment) = element.template_contents
             {
                 return parsed
@@ -467,7 +468,7 @@ pub(crate) fn import_snapshot(
             // as element children: snapshot from the contents
             // (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
             let children = if deep {
-                if crate::js::world::is_template_tag(&name) {
+                if crate::dom::tree::is_template_tag(&name) {
                     doc.base
                         .get_node(id.node)
                         .and_then(|node| node.data.downcast_element())
@@ -576,7 +577,7 @@ fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
     Ok(match doc.base.get_node(id.node).map(|node| &node.data) {
         Some(NodeData::Element(element)) => {
             // Template children live in the contents fragment.
-            let children = if crate::js::world::is_template_tag(&element.name) {
+            let children = if crate::dom::tree::is_template_tag(&element.name) {
                 element
                     .template_contents
                     .map(|fragment| {
@@ -688,7 +689,7 @@ pub(crate) fn materialize_import(
                 .create_element(name.clone(), attributes.clone());
             // Template children materialize into the fresh element's
             // contents fragment, which creation already established.
-            let parent = if crate::js::world::is_template_tag(name) {
+            let parent = if crate::dom::tree::is_template_tag(name) {
                 doc.base.mutate().ensure_template_contents(blitz_id)
             } else {
                 blitz_id

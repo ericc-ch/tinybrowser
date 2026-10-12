@@ -13,7 +13,7 @@ use rquickjs::{
 };
 
 use super::{world, world_for_node};
-use crate::js::world::NodeId;
+use crate::dom::tree::NodeId;
 pub(crate) use crate::js::world::NodeReference;
 
 pub(crate) type Dispatch = for<'a, 'js> fn(Operation, &Params<'a, 'js>) -> Result<Value<'js>>;
@@ -187,7 +187,7 @@ pub(crate) fn reflect_string<'js>(
         .borrow()
         .document(element)
         .and_then(|parsed| {
-            crate::js::world::attr(&parsed.document.base, element.node, name).map(str::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, element.node, name).map(str::to_owned)
         })
         .unwrap_or_default();
     rquickjs::String::from_str(ctx.clone(), &value)
@@ -198,7 +198,7 @@ pub(crate) fn reflect_string<'js>(
 pub(crate) fn reflect_bool(ctx: &Ctx<'_>, element: NodeId, name: &str) -> Result<bool> {
     let world = super::world(ctx)?;
     Ok(world.borrow().document(element).is_some_and(|parsed| {
-        crate::js::world::attr(&parsed.document.base, element.node, name).is_some()
+        crate::dom::tree::attr(&parsed.document.base, element.node, name).is_some()
     }))
 }
 
@@ -465,7 +465,7 @@ pub(crate) fn reflect_url_string(
 ) -> Result<crate::dom_string::DomString> {
     let world_rc = world(ctx)?;
     let raw = world_rc.borrow().document(id).and_then(|parsed| {
-        crate::js::world::attr(&parsed.document.base, id.node, content).map(str::to_owned)
+        crate::dom::tree::attr(&parsed.document.base, id.node, content).map(str::to_owned)
     });
     let Some(raw) = raw else {
         return Ok(crate::dom_string::DomString::default());
@@ -528,15 +528,15 @@ fn node_interface_matches(
         // `ElementContentEditable` is included by `HTMLElement` only, so any
         // HTML element (including unknown elements) answers it.
         "HTMLElement" | "ElementContentEditable" => {
-            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::html_namespace())
+            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::dom::tree::html_namespace())
                 && !is_fragment
         }
         "SVGElement" => {
-            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::svg_namespace())
+            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::dom::tree::svg_namespace())
                 && !is_fragment
         }
         "MathMLElement" => {
-            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::js::world::mathml_namespace())
+            matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::dom::tree::mathml_namespace())
                 && !is_fragment
         }
         "CharacterData" => is_character_data,
@@ -558,9 +558,9 @@ fn node_interface_matches(
             matches!(
                 data,
                 Some(NodeData::Element(element))
-                if element.name.ns == crate::js::world::html_namespace()
-                    || element.name.ns == crate::js::world::svg_namespace()
-                    || element.name.ns == crate::js::world::mathml_namespace()
+                if element.name.ns == crate::dom::tree::html_namespace()
+                    || element.name.ns == crate::dom::tree::svg_namespace()
+                    || element.name.ns == crate::dom::tree::mathml_namespace()
             ) && !is_fragment
         }
         "ParentNode" => matches!(
@@ -584,91 +584,91 @@ fn node_interface_matches(
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
         "HTMLHyperlinkElementUtils" => {
-            crate::js::world::is_html_tag(data, "a") || crate::js::world::is_html_tag(data, "area")
+            crate::dom::tree::is_html_tag(data, "a") || crate::dom::tree::is_html_tag(data, "area")
         }
         // HTML element interfaces check the element's local name.
-        "HTMLFormElement" => crate::js::world::is_html_tag(data, "form"),
-        "HTMLInputElement" => crate::js::world::is_html_tag(data, "input"),
-        "HTMLTextAreaElement" => crate::js::world::is_html_tag(data, "textarea"),
-        "HTMLSelectElement" => crate::js::world::is_html_tag(data, "select"),
-        "HTMLOptionElement" => crate::js::world::is_html_tag(data, "option"),
-        "HTMLButtonElement" => crate::js::world::is_html_tag(data, "button"),
-        "HTMLFieldSetElement" => crate::js::world::is_html_tag(data, "fieldset"),
-        "HTMLOptGroupElement" => crate::js::world::is_html_tag(data, "optgroup"),
-        "HTMLIFrameElement" => crate::js::world::is_html_tag(data, "iframe"),
-        "HTMLFrameElement" => crate::js::world::is_html_tag(data, "frame"),
-        "HTMLImageElement" => crate::js::world::is_html_tag(data, "img"),
-        "HTMLCanvasElement" => crate::js::world::is_html_tag(data, "canvas"),
-        "HTMLBaseElement" => crate::js::world::is_html_tag(data, "base"),
-        "HTMLLinkElement" => crate::js::world::is_html_tag(data, "link"),
+        "HTMLFormElement" => crate::dom::tree::is_html_tag(data, "form"),
+        "HTMLInputElement" => crate::dom::tree::is_html_tag(data, "input"),
+        "HTMLTextAreaElement" => crate::dom::tree::is_html_tag(data, "textarea"),
+        "HTMLSelectElement" => crate::dom::tree::is_html_tag(data, "select"),
+        "HTMLOptionElement" => crate::dom::tree::is_html_tag(data, "option"),
+        "HTMLButtonElement" => crate::dom::tree::is_html_tag(data, "button"),
+        "HTMLFieldSetElement" => crate::dom::tree::is_html_tag(data, "fieldset"),
+        "HTMLOptGroupElement" => crate::dom::tree::is_html_tag(data, "optgroup"),
+        "HTMLIFrameElement" => crate::dom::tree::is_html_tag(data, "iframe"),
+        "HTMLFrameElement" => crate::dom::tree::is_html_tag(data, "frame"),
+        "HTMLImageElement" => crate::dom::tree::is_html_tag(data, "img"),
+        "HTMLCanvasElement" => crate::dom::tree::is_html_tag(data, "canvas"),
+        "HTMLBaseElement" => crate::dom::tree::is_html_tag(data, "base"),
+        "HTMLLinkElement" => crate::dom::tree::is_html_tag(data, "link"),
         "HTMLMediaElement" => {
-            crate::js::world::is_html_tag(data, "audio")
-                || crate::js::world::is_html_tag(data, "video")
+            crate::dom::tree::is_html_tag(data, "audio")
+                || crate::dom::tree::is_html_tag(data, "video")
         }
-        "HTMLEmbedElement" => crate::js::world::is_html_tag(data, "embed"),
-        "HTMLScriptElement" => crate::js::world::is_html_tag(data, "script"),
-        "HTMLSourceElement" => crate::js::world::is_html_tag(data, "source"),
-        "HTMLTrackElement" => crate::js::world::is_html_tag(data, "track"),
-        "HTMLMetaElement" => crate::js::world::is_html_tag(data, "meta"),
-        "HTMLMapElement" => crate::js::world::is_html_tag(data, "map"),
-        "HTMLObjectElement" => crate::js::world::is_html_tag(data, "object"),
-        "HTMLOutputElement" => crate::js::world::is_html_tag(data, "output"),
-        "HTMLParamElement" => crate::js::world::is_html_tag(data, "param"),
-        "HTMLSlotElement" => crate::js::world::is_html_tag(data, "slot"),
-        "HTMLTemplateElement" => crate::js::world::is_html_tag(data, "template"),
-        "HTMLAnchorElement" => crate::js::world::is_html_tag(data, "a"),
-        "HTMLAreaElement" => crate::js::world::is_html_tag(data, "area"),
-        "HTMLAudioElement" => crate::js::world::is_html_tag(data, "audio"),
-        "HTMLBodyElement" => crate::js::world::is_html_tag(data, "body"),
-        "HTMLBRElement" => crate::js::world::is_html_tag(data, "br"),
-        "HTMLDataElement" => crate::js::world::is_html_tag(data, "data"),
-        "HTMLDataListElement" => crate::js::world::is_html_tag(data, "datalist"),
-        "HTMLDetailsElement" => crate::js::world::is_html_tag(data, "details"),
-        "HTMLDialogElement" => crate::js::world::is_html_tag(data, "dialog"),
-        "HTMLDirectoryElement" => crate::js::world::is_html_tag(data, "dir"),
-        "HTMLDivElement" => crate::js::world::is_html_tag(data, "div"),
-        "HTMLDListElement" => crate::js::world::is_html_tag(data, "dl"),
-        "HTMLFontElement" => crate::js::world::is_html_tag(data, "font"),
-        "HTMLFrameSetElement" => crate::js::world::is_html_tag(data, "frameset"),
-        "HTMLHeadElement" => crate::js::world::is_html_tag(data, "head"),
+        "HTMLEmbedElement" => crate::dom::tree::is_html_tag(data, "embed"),
+        "HTMLScriptElement" => crate::dom::tree::is_html_tag(data, "script"),
+        "HTMLSourceElement" => crate::dom::tree::is_html_tag(data, "source"),
+        "HTMLTrackElement" => crate::dom::tree::is_html_tag(data, "track"),
+        "HTMLMetaElement" => crate::dom::tree::is_html_tag(data, "meta"),
+        "HTMLMapElement" => crate::dom::tree::is_html_tag(data, "map"),
+        "HTMLObjectElement" => crate::dom::tree::is_html_tag(data, "object"),
+        "HTMLOutputElement" => crate::dom::tree::is_html_tag(data, "output"),
+        "HTMLParamElement" => crate::dom::tree::is_html_tag(data, "param"),
+        "HTMLSlotElement" => crate::dom::tree::is_html_tag(data, "slot"),
+        "HTMLTemplateElement" => crate::dom::tree::is_html_tag(data, "template"),
+        "HTMLAnchorElement" => crate::dom::tree::is_html_tag(data, "a"),
+        "HTMLAreaElement" => crate::dom::tree::is_html_tag(data, "area"),
+        "HTMLAudioElement" => crate::dom::tree::is_html_tag(data, "audio"),
+        "HTMLBodyElement" => crate::dom::tree::is_html_tag(data, "body"),
+        "HTMLBRElement" => crate::dom::tree::is_html_tag(data, "br"),
+        "HTMLDataElement" => crate::dom::tree::is_html_tag(data, "data"),
+        "HTMLDataListElement" => crate::dom::tree::is_html_tag(data, "datalist"),
+        "HTMLDetailsElement" => crate::dom::tree::is_html_tag(data, "details"),
+        "HTMLDialogElement" => crate::dom::tree::is_html_tag(data, "dialog"),
+        "HTMLDirectoryElement" => crate::dom::tree::is_html_tag(data, "dir"),
+        "HTMLDivElement" => crate::dom::tree::is_html_tag(data, "div"),
+        "HTMLDListElement" => crate::dom::tree::is_html_tag(data, "dl"),
+        "HTMLFontElement" => crate::dom::tree::is_html_tag(data, "font"),
+        "HTMLFrameSetElement" => crate::dom::tree::is_html_tag(data, "frameset"),
+        "HTMLHeadElement" => crate::dom::tree::is_html_tag(data, "head"),
         "HTMLHeadingElement" => {
-            crate::js::world::is_html_tag(data, "h1")
-                || crate::js::world::is_html_tag(data, "h2")
-                || crate::js::world::is_html_tag(data, "h3")
-                || crate::js::world::is_html_tag(data, "h4")
-                || crate::js::world::is_html_tag(data, "h5")
-                || crate::js::world::is_html_tag(data, "h6")
+            crate::dom::tree::is_html_tag(data, "h1")
+                || crate::dom::tree::is_html_tag(data, "h2")
+                || crate::dom::tree::is_html_tag(data, "h3")
+                || crate::dom::tree::is_html_tag(data, "h4")
+                || crate::dom::tree::is_html_tag(data, "h5")
+                || crate::dom::tree::is_html_tag(data, "h6")
         }
-        "HTMLHRElement" => crate::js::world::is_html_tag(data, "hr"),
-        "HTMLHtmlElement" => crate::js::world::is_html_tag(data, "html"),
-        "HTMLLabelElement" => crate::js::world::is_html_tag(data, "label"),
-        "HTMLLegendElement" => crate::js::world::is_html_tag(data, "legend"),
-        "HTMLLIElement" => crate::js::world::is_html_tag(data, "li"),
-        "HTMLMenuElement" => crate::js::world::is_html_tag(data, "menu"),
-        "HTMLMarqueeElement" => crate::js::world::is_html_tag(data, "marquee"),
-        "HTMLMeterElement" => crate::js::world::is_html_tag(data, "meter"),
+        "HTMLHRElement" => crate::dom::tree::is_html_tag(data, "hr"),
+        "HTMLHtmlElement" => crate::dom::tree::is_html_tag(data, "html"),
+        "HTMLLabelElement" => crate::dom::tree::is_html_tag(data, "label"),
+        "HTMLLegendElement" => crate::dom::tree::is_html_tag(data, "legend"),
+        "HTMLLIElement" => crate::dom::tree::is_html_tag(data, "li"),
+        "HTMLMenuElement" => crate::dom::tree::is_html_tag(data, "menu"),
+        "HTMLMarqueeElement" => crate::dom::tree::is_html_tag(data, "marquee"),
+        "HTMLMeterElement" => crate::dom::tree::is_html_tag(data, "meter"),
         "HTMLModElement" => {
-            crate::js::world::is_html_tag(data, "ins") || crate::js::world::is_html_tag(data, "del")
+            crate::dom::tree::is_html_tag(data, "ins") || crate::dom::tree::is_html_tag(data, "del")
         }
-        "HTMLOListElement" => crate::js::world::is_html_tag(data, "ol"),
-        "HTMLParagraphElement" => crate::js::world::is_html_tag(data, "p"),
-        "HTMLPictureElement" => crate::js::world::is_html_tag(data, "picture"),
+        "HTMLOListElement" => crate::dom::tree::is_html_tag(data, "ol"),
+        "HTMLParagraphElement" => crate::dom::tree::is_html_tag(data, "p"),
+        "HTMLPictureElement" => crate::dom::tree::is_html_tag(data, "picture"),
         "HTMLPreElement" => {
-            crate::js::world::is_html_tag(data, "pre")
-                || crate::js::world::is_html_tag(data, "listing")
-                || crate::js::world::is_html_tag(data, "xmp")
+            crate::dom::tree::is_html_tag(data, "pre")
+                || crate::dom::tree::is_html_tag(data, "listing")
+                || crate::dom::tree::is_html_tag(data, "xmp")
         }
-        "HTMLProgressElement" => crate::js::world::is_html_tag(data, "progress"),
+        "HTMLProgressElement" => crate::dom::tree::is_html_tag(data, "progress"),
         "HTMLQuoteElement" => {
-            crate::js::world::is_html_tag(data, "blockquote")
-                || crate::js::world::is_html_tag(data, "q")
+            crate::dom::tree::is_html_tag(data, "blockquote")
+                || crate::dom::tree::is_html_tag(data, "q")
         }
-        "HTMLSpanElement" => crate::js::world::is_html_tag(data, "span"),
-        "HTMLStyleElement" => crate::js::world::is_html_tag(data, "style"),
-        "HTMLTimeElement" => crate::js::world::is_html_tag(data, "time"),
-        "HTMLTitleElement" => crate::js::world::is_html_tag(data, "title"),
-        "HTMLUListElement" => crate::js::world::is_html_tag(data, "ul"),
-        "HTMLVideoElement" => crate::js::world::is_html_tag(data, "video"),
+        "HTMLSpanElement" => crate::dom::tree::is_html_tag(data, "span"),
+        "HTMLStyleElement" => crate::dom::tree::is_html_tag(data, "style"),
+        "HTMLTimeElement" => crate::dom::tree::is_html_tag(data, "time"),
+        "HTMLTitleElement" => crate::dom::tree::is_html_tag(data, "title"),
+        "HTMLUListElement" => crate::dom::tree::is_html_tag(data, "ul"),
+        "HTMLVideoElement" => crate::dom::tree::is_html_tag(data, "video"),
         _ => html_table_interface(data, interface)?,
     })
 }
@@ -708,7 +708,7 @@ fn html_table_interface(data: Option<&blitz_dom::NodeData>, interface: &str) -> 
     };
     Some(
         tags.iter()
-            .any(|tag| crate::js::world::is_html_tag(data, tag)),
+            .any(|tag| crate::dom::tree::is_html_tag(data, tag)),
     )
 }
 

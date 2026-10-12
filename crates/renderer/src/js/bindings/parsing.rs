@@ -6,8 +6,8 @@ use super::{
     wrap_new_document, wrap_new_document_in_world, wrap_node,
 };
 
+use crate::dom::tree::NodeId;
 use crate::js::world::Handle;
-use crate::js::world::NodeId;
 
 use markup5ever::{LocalName, QualName};
 
@@ -222,7 +222,7 @@ fn append_adopted_doctype(ctx: &Ctx<'_>, document: NodeId, doctype: NodeId) -> R
 fn html_element_name(local: &str) -> QualName {
     QualName::new(
         None,
-        crate::js::world::html_namespace(),
+        crate::dom::tree::html_namespace(),
         LocalName::from(local),
     )
 }

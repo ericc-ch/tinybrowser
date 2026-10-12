@@ -16,6 +16,7 @@ use crate::documents::BlitzDocument;
 
 mod document;
 mod documents;
+mod dom;
 pub mod dom_string;
 mod embedded;
 mod engine;

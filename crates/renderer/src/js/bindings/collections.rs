@@ -9,7 +9,8 @@ use rquickjs::{
     prelude::Func,
 };
 
-use crate::js::world::{BlitzId, Handle, JournalEntry, NodeId, attr, html_namespace};
+use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace};
+use crate::js::world::{Handle, JournalEntry};
 use crate::names::qualified_name_eq;
 use markup5ever::{LocalName, QualName};
 use std::collections::HashSet;
@@ -125,8 +126,8 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
     let base = &parsed.document.base;
     let document = scope.document;
     Ok(match kind {
-        CollectionKind::Children => crate::js::world::child_ids(base, document, scope.node),
-        CollectionKind::ElementChildren => crate::js::world::child_ids(base, document, scope.node)
+        CollectionKind::Children => crate::dom::tree::child_ids(base, document, scope.node),
+        CollectionKind::ElementChildren => crate::dom::tree::child_ids(base, document, scope.node)
             .into_iter()
             .filter(|kid| super::is_element(base, kid.node))
             .collect(),
@@ -183,7 +184,7 @@ fn collect_html_scripts(
         if doc.is_fragment(id) {
             continue;
         }
-        if crate::js::world::is_html_element(&doc.base, id, "script")
+        if crate::dom::tree::is_html_element(&doc.base, id, "script")
             && script_is_in_document(doc, id)
         {
             order.push(NodeId { document, node: id });
@@ -537,7 +538,7 @@ fn html_child_elements(
     parent: BlitzId,
     locals: &[&str],
 ) -> Vec<NodeId> {
-    crate::js::world::child_ids(base, document, parent)
+    crate::dom::tree::child_ids(base, document, parent)
         .into_iter()
         .filter(|kid| locals.iter().any(|local| html_named(base, kid.node, local)))
         .collect()
@@ -573,7 +574,7 @@ fn table_rows(base: &blitz_dom::BaseDocument, document: u32, table: BlitzId) -> 
     let mut head = Vec::new();
     let mut body = Vec::new();
     let mut foot = Vec::new();
-    for kid in crate::js::world::child_ids(base, document, table) {
+    for kid in crate::dom::tree::child_ids(base, document, table) {
         if html_named(base, kid.node, "thead") {
             head.extend(table_section_rows(base, document, kid.node));
         } else if html_named(base, kid.node, "tfoot") {

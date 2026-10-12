@@ -593,7 +593,7 @@ impl Engine {
     /// document is replaced or disconnected. Lifecycle events can arrive only
     /// for the direct iframe, so recurse through the frame tree explicitly to
     /// avoid stale realms and pending loads.
-    fn remove_subtree(&mut self, container: crate::js::world::NodeId) {
+    fn remove_subtree(&mut self, container: crate::dom::tree::NodeId) {
         let Some(child) = self
             .runtime
             .shared
@@ -603,7 +603,7 @@ impl Engine {
         else {
             return;
         };
-        let descendants: Vec<crate::js::world::NodeId> = self
+        let descendants: Vec<crate::dom::tree::NodeId> = self
             .runtime
             .shared
             .borrow()
@@ -628,7 +628,7 @@ impl Engine {
     }
 
     fn remove_descendants(&mut self, parent: FrameId) {
-        let containers: Vec<crate::js::world::NodeId> = self
+        let containers: Vec<crate::dom::tree::NodeId> = self
             .runtime
             .shared
             .borrow()
@@ -648,7 +648,7 @@ impl Engine {
     fn navigate_frame(
         &mut self,
         child: FrameId,
-        container: crate::js::world::NodeId,
+        container: crate::dom::tree::NodeId,
         spec: &str,
         method: &str,
         body: &[u8],
@@ -811,7 +811,7 @@ impl Engine {
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
     /// A later container navigation supersedes the insertion firing, so the
     /// recorded entry is cleared: the navigation's own `load` must fire.
-    fn mark_frame_load_pending(&mut self, container: crate::js::world::NodeId, parent: FrameId) {
+    fn mark_frame_load_pending(&mut self, container: crate::dom::tree::NodeId, parent: FrameId) {
         if let Some(document) = self.frames.get_mut(&parent) {
             document.mark_frame_load_pending(container);
             let _ = document
@@ -982,7 +982,7 @@ impl Engine {
     /// Publishes `frame`'s document root as the active document of
     /// `container`, which is what `contentDocument` resolves through
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).
-    fn publish_frame_document(&mut self, container: crate::js::world::NodeId, frame: FrameId) {
+    fn publish_frame_document(&mut self, container: crate::dom::tree::NodeId, frame: FrameId) {
         let document = self.frames.get(&frame).and_then(Document::document_root);
         if let Some(document) = document {
             self.runtime

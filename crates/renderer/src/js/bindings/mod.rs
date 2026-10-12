@@ -46,7 +46,7 @@ use std::fmt;
 use blitz_dom::NodeData;
 use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
-use crate::js::world::NodeId;
+use crate::dom::tree::NodeId;
 
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
@@ -623,7 +623,7 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
         let base = &parsed.document.base;
-        super::world::is_connected(base, node.node)
+        crate::dom::tree::is_connected(base, node.node)
             && base
                 .get_node(node.node)
                 .is_some_and(|node| node.data.downcast_element().is_some())
@@ -888,11 +888,11 @@ fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value
 /// and <https://w3c.github.io/mathml-core/#dom-mathmlelement>).
 /// Other namespaces use the base `Element` interface.
 fn element_interface(name: &QualName) -> &'static str {
-    if name.ns == super::world::html_namespace() {
+    if name.ns == crate::dom::tree::html_namespace() {
         html_element_interface(name.local.as_ref())
-    } else if name.ns == super::world::svg_namespace() {
+    } else if name.ns == crate::dom::tree::svg_namespace() {
         "SVGElement"
-    } else if name.ns == super::world::mathml_namespace() {
+    } else if name.ns == crate::dom::tree::mathml_namespace() {
         "MathMLElement"
     } else {
         "Element"
@@ -1167,7 +1167,7 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
         .borrow()
         .document(id)
         .and_then(|parsed| {
-            super::world::attr(&parsed.document.base, id.node, local).map(str::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, id.node, local).map(str::to_owned)
         })
         .unwrap_or_default())
 }
@@ -1338,9 +1338,9 @@ pub(super) fn sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> R
 /// The sibling of `id` in `forward` direction, or `None` at the edge.
 pub(super) fn sibling(
     base: &blitz_dom::BaseDocument,
-    id: super::world::BlitzId,
+    id: crate::dom::tree::BlitzId,
     forward: bool,
-) -> Option<super::world::BlitzId> {
+) -> Option<crate::dom::tree::BlitzId> {
     let node = base.get_node(id)?;
     let parent = node.parent?;
     let siblings = &base.get_node(parent)?.children;
@@ -1532,7 +1532,7 @@ pub(crate) fn dom_string<'js>(
 /// plain elements, so fragments are covered.
 pub(super) fn descendant_text(
     base: &blitz_dom::BaseDocument,
-    id: super::world::BlitzId,
+    id: crate::dom::tree::BlitzId,
 ) -> crate::dom_string::DomString {
     let mut text = crate::dom_string::DomString::default();
     let mut stack = base
@@ -1673,7 +1673,7 @@ fn is_infra_whitespace(c: char) -> bool {
 
 pub(super) fn element_node_name(name: &QualName, uppercase: bool) -> String {
     let qualified = qualified_name(name);
-    if uppercase && name.ns == super::world::html_namespace() {
+    if uppercase && name.ns == crate::dom::tree::html_namespace() {
         qualified.to_ascii_uppercase()
     } else {
         qualified
@@ -1742,14 +1742,14 @@ pub(super) fn live_collection<'js>(
     }
 }
 
-pub(super) fn is_element(base: &blitz_dom::BaseDocument, id: super::world::BlitzId) -> bool {
+pub(super) fn is_element(base: &blitz_dom::BaseDocument, id: crate::dom::tree::BlitzId) -> bool {
     base.get_node(id)
         .is_some_and(|node| matches!(node.data, NodeData::Element(_)))
 }
 
 pub(super) fn is_real_element(
     doc: &crate::documents::BlitzDocument,
-    id: super::world::BlitzId,
+    id: crate::dom::tree::BlitzId,
 ) -> bool {
     !doc.is_fragment(id) && is_element(&doc.base, id)
 }
@@ -1757,8 +1757,8 @@ pub(super) fn is_real_element(
 /// The root of the tree `id` participates in (itself when detached).
 pub(super) fn root_of(
     base: &blitz_dom::BaseDocument,
-    id: super::world::BlitzId,
-) -> super::world::BlitzId {
+    id: crate::dom::tree::BlitzId,
+) -> crate::dom::tree::BlitzId {
     let mut root = id;
     while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
         root = parent;
@@ -1770,7 +1770,7 @@ pub(super) fn root_of(
 pub(super) fn ancestor_chain(
     base: &blitz_dom::BaseDocument,
     document: u32,
-    id: super::world::BlitzId,
+    id: crate::dom::tree::BlitzId,
 ) -> Vec<NodeId> {
     let mut chain = vec![NodeId { document, node: id }];
     let mut cursor = id;
@@ -1789,8 +1789,8 @@ pub(super) fn ancestor_chain(
 pub(super) fn tree_order(
     base: &blitz_dom::BaseDocument,
     document: u32,
-    a: super::world::BlitzId,
-    b: super::world::BlitzId,
+    a: crate::dom::tree::BlitzId,
+    b: crate::dom::tree::BlitzId,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let chain_a = ancestor_chain(base, document, a);
@@ -1837,7 +1837,7 @@ pub(super) fn tree_order(
 pub(super) fn find_element_by_id(
     base: &blitz_dom::BaseDocument,
     document: u32,
-    scope: super::world::BlitzId,
+    scope: crate::dom::tree::BlitzId,
     id: &str,
 ) -> Option<NodeId> {
     // An element with an empty ID has no ID, so no element matches
@@ -1876,7 +1876,7 @@ mod realm_tests {
 
     use super::{world, wrap_node};
     use crate::document::Stop;
-    use crate::js::world::NodeId;
+    use crate::dom::tree::NodeId;
     use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::messaging::Shared;
     use crate::protocol::{

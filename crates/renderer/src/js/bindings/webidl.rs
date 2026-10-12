@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use super::node::insert_converted_node;
 use super::{adopt_across_documents, throw_dom, world};
 
-use crate::js::world::NodeId;
+use crate::dom::tree::NodeId;
 
 use rquickjs::{Ctx, Exception, Function, Object, Result, Value};
 

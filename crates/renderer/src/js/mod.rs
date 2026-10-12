@@ -91,7 +91,7 @@ pub enum ScriptValue {
     /// JS string.
     String(String),
     /// A DOM node handle for `WebDriver` element encoding.
-    Node(crate::js::world::NodeId),
+    Node(crate::dom::tree::NodeId),
     /// A JS array, for `WebDriver` JSON.
     List(Vec<ScriptValue>),
     /// A JS object, for `WebDriver` JSON.
@@ -498,7 +498,7 @@ impl JsRealm {
         })
     }
 
-    pub(crate) fn fire_node_load(&self, id: crate::js::world::NodeId) -> Result<(), JsError> {
+    pub(crate) fn fire_node_load(&self, id: crate::dom::tree::NodeId) -> Result<(), JsError> {
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_node_load(&ctx, id)?;
@@ -507,7 +507,7 @@ impl JsRealm {
         })
     }
 
-    pub(crate) fn fire_node_error(&self, id: crate::js::world::NodeId) -> Result<(), JsError> {
+    pub(crate) fn fire_node_error(&self, id: crate::dom::tree::NodeId) -> Result<(), JsError> {
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_node_error(&ctx, id)?;
@@ -1206,18 +1206,18 @@ impl Drop for JsRealm {
     }
 }
 
-pub(crate) fn script_at(world: &World, id: crate::js::world::NodeId) -> Option<Script> {
+pub(crate) fn script_at(world: &World, id: crate::dom::tree::NodeId) -> Option<Script> {
     let parsed = world.document(id)?;
     let base = &parsed.document.base;
     let node = base.get_node(id.node)?;
     let element = node.data.downcast_element()?;
     let name = &element.name;
-    if name.ns != crate::js::world::html_namespace()
+    if name.ns != crate::dom::tree::html_namespace()
         || !name.local.as_ref().eq_ignore_ascii_case("script")
     {
         return None;
     }
-    let source = match crate::js::world::attr(base, id.node, "src") {
+    let source = match crate::dom::tree::attr(base, id.node, "src") {
         Some(src) if !src.trim().is_empty() => ScriptSource::Src(src.to_owned()),
         _ => ScriptSource::Inline {
             source: element_text(base, id.node),
@@ -1225,7 +1225,7 @@ pub(crate) fn script_at(world: &World, id: crate::js::world::NodeId) -> Option<S
             line: 0,
         },
     };
-    let typ = crate::js::world::attr(base, id.node, "type");
+    let typ = crate::dom::tree::attr(base, id.node, "type");
     if typ.is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module")) {
         Some(Script::Module(source))
     } else {
@@ -1272,7 +1272,7 @@ fn javascript_mime(typ: Option<&str>) -> bool {
     )
 }
 
-fn element_text(base: &blitz_dom::BaseDocument, id: crate::js::world::BlitzId) -> String {
+fn element_text(base: &blitz_dom::BaseDocument, id: crate::dom::tree::BlitzId) -> String {
     // Script source is the node's [child text content], not descendant text
     // (<https://dom.spec.whatwg.org/#concept-child-text-content>,
     // <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).

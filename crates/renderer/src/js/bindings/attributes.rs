@@ -13,10 +13,10 @@ use std::rc::Rc;
 
 use markup5ever::{LocalName, QualName};
 
-use crate::js::world as js_world;
+use crate::dom::tree::NodeId;
 use crate::js::world::{
     AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, JournalEntry,
-    NavigationTarget, NodeId, World,
+    NavigationTarget, World,
 };
 use crate::names::qualified_name_eq;
 
@@ -50,7 +50,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
             .borrow()
             .document(self.element.0)
             .and_then(|parsed| {
-                js_world::attr(&parsed.document.base, self.element.0.node, "class")
+                crate::dom::tree::attr(&parsed.document.base, self.element.0.node, "class")
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_default();
@@ -190,7 +190,7 @@ fn class_tokens(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<String>> {
         .borrow()
         .document(id)
         .and_then(|parsed| {
-            js_world::attr(&parsed.document.base, id.node, "class").map(ToOwned::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, id.node, "class").map(ToOwned::to_owned)
         })
         .unwrap_or_default()
         .split_ascii_whitespace()
@@ -246,10 +246,9 @@ fn validate_token_pair(ctx: &Ctx<'_>, old: &str, new: &str) -> Result<()> {
 /// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
 fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()> {
     if tokens.is_empty()
-        && world(ctx)?
-            .borrow()
-            .document(id)
-            .is_none_or(|parsed| js_world::attr(&parsed.document.base, id.node, "class").is_none())
+        && world(ctx)?.borrow().document(id).is_none_or(|parsed| {
+            crate::dom::tree::attr(&parsed.document.base, id.node, "class").is_none()
+        })
     {
         return Ok(());
     }
@@ -1046,7 +1045,7 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
     fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
         let html = with_node_data(ctx, self.element.0, |data| {
             data.and_then(|data| data.downcast_element())
-                .is_some_and(|element| element.name.ns == js_world::html_namespace())
+                .is_some_and(|element| element.name.ns == crate::dom::tree::html_namespace())
         })
         .unwrap_or(false)
             && super::document::document_is_html_content(ctx, self.element.0);
@@ -1223,7 +1222,7 @@ pub(super) fn attribute_local_name(ctx: &Ctx<'_>, element: NodeId, name: &str) -
     // A missing document falls back to the non-HTML spelling instead of throwing.
     let html = with_node_data(ctx, element, |data| {
         data.and_then(|data| data.downcast_element())
-            .is_some_and(|element| element.name.ns == js_world::html_namespace())
+            .is_some_and(|element| element.name.ns == crate::dom::tree::html_namespace())
     })
     .unwrap_or(false)
         && super::document::document_is_html_content(ctx, element);
@@ -1579,7 +1578,7 @@ const WINDOW_HANDLER_ATTRIBUTES: &[&str] = &[
 fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Result<()> {
     let name = format!("on{typ}");
     let body = world(ctx)?.borrow().document(element).and_then(|parsed| {
-        js_world::attr(&parsed.document.base, element.node, &name).map(ToOwned::to_owned)
+        crate::dom::tree::attr(&parsed.document.base, element.node, &name).map(ToOwned::to_owned)
     });
     let Some(object) = wrap_node(ctx, element)?.as_object().cloned() else {
         return Ok(());
@@ -1589,7 +1588,7 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     // (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
     let is_body = world_for_node(ctx, element).is_ok_and(|owner| {
         owner.borrow().document(element).is_some_and(|parsed| {
-            js_world::is_html_element(&parsed.document.base, element.node, "body")
+            crate::dom::tree::is_html_element(&parsed.document.base, element.node, "body")
         })
     });
     let forwarded = WINDOW_HANDLER_ATTRIBUTES.contains(&name.as_str()) && is_body;
@@ -1659,8 +1658,8 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
             owner.borrow().document(element).map(|parsed| {
                 let base = &parsed.document.base;
                 (
-                    js_world::is_html_element(base, element.node, "iframe"),
-                    js_world::is_html_element(base, element.node, "img"),
+                    crate::dom::tree::is_html_element(base, element.node, "iframe"),
+                    crate::dom::tree::is_html_element(base, element.node, "img"),
                 )
             })
         })
@@ -1673,7 +1672,8 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         .borrow()
         .document(element)
         .and_then(|parsed| {
-            js_world::attr(&parsed.document.base, element.node, "src").map(ToOwned::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, element.node, "src")
+                .map(ToOwned::to_owned)
         })
         .unwrap_or_default();
     // A detached `iframe` has no browsing context yet; insertion reads the
@@ -1682,7 +1682,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     let connected = world
         .borrow()
         .document(element)
-        .is_some_and(|parsed| js_world::is_connected(&parsed.document.base, element.node));
+        .is_some_and(|parsed| crate::dom::tree::is_connected(&parsed.document.base, element.node));
     if !connected {
         return Ok(());
     }
@@ -1703,7 +1703,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
 pub(crate) fn handler_attribute(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<Option<String>> {
     let world = world(ctx)?;
     Ok(world.borrow().document(id).and_then(|parsed| {
-        js_world::attr(&parsed.document.base, id.node, name).map(ToOwned::to_owned)
+        crate::dom::tree::attr(&parsed.document.base, id.node, name).map(ToOwned::to_owned)
     }))
 }
 
@@ -1800,7 +1800,7 @@ pub(crate) fn remove_attribute_sync(
 /// One attribute on an element: its stored `(prefix, qualified name, value)`.
 fn element_attribute(
     base: &blitz_dom::BaseDocument,
-    id: js_world::BlitzId,
+    id: crate::dom::tree::BlitzId,
     namespace: &str,
     local: &str,
 ) -> Option<(Option<String>, String, String)> {
@@ -1829,7 +1829,7 @@ fn element_attribute(
 /// The value of the `(namespace, local)` attribute on `id`, if present.
 fn attribute_ns_value(
     base: &blitz_dom::BaseDocument,
-    id: js_world::BlitzId,
+    id: crate::dom::tree::BlitzId,
     namespace: &str,
     local: &str,
 ) -> Option<String> {
@@ -1884,8 +1884,8 @@ pub(crate) fn set_attribute_sync(
                 },
                 |attribute| attribute.name.clone(),
             );
-        let old_value =
-            js_world::attr_by_qualified_name(base, element.node, local).map(ToOwned::to_owned);
+        let old_value = crate::dom::tree::attr_by_qualified_name(base, element.node, local)
+            .map(ToOwned::to_owned);
         (name, old_value)
     };
     let namespace = name.ns.as_ref().to_owned();

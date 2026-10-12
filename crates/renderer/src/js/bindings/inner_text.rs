@@ -12,7 +12,7 @@
 use blitz_dom::{BaseDocument, NodeData};
 
 use super::world_for_node;
-use crate::js::world::{BlitzId, NodeId};
+use crate::dom::tree::{BlitzId, NodeId};
 use rquickjs::{Ctx, Result};
 
 /// The `white-space` modes that change collection.
@@ -80,7 +80,7 @@ impl<'a> InlineStyle<'a> {
     /// outside quotes and parentheses, so `url("a;b")` survives.
     fn of(base: &'a BaseDocument, node: BlitzId) -> Self {
         let mut style = Self::default();
-        let Some(attribute) = crate::js::world::attr(base, node, "style") else {
+        let Some(attribute) = crate::dom::tree::attr(base, node, "style") else {
             return style;
         };
         for declaration in split_declarations(attribute) {
@@ -184,7 +184,7 @@ fn strip_important(value: &str) -> &str {
 fn is_html_tag(base: &BaseDocument, node: BlitzId, tags: &[&str]) -> bool {
     base.get_node(node).is_some_and(|tree| {
         tree.data.downcast_element().is_some_and(|element| {
-            element.name.ns == crate::js::world::html_namespace()
+            element.name.ns == crate::dom::tree::html_namespace()
                 && tags.contains(&element.name.local.as_ref())
         })
     })
@@ -222,7 +222,7 @@ fn level_of(base: &BaseDocument, node: BlitzId, style: &InlineStyle<'_>) -> Leve
     let Some(element) = tree.data.downcast_element() else {
         return Level::Inline;
     };
-    let html = element.name.ns == crate::js::world::html_namespace();
+    let html = element.name.ns == crate::dom::tree::html_namespace();
     let local = element.name.local.as_ref();
     // `template` and `noscript` never render, regardless of styling: their
     // content is not elements (noscript) or lives in a separate fragment.
@@ -373,7 +373,7 @@ fn transform_of(
         let mut turkish = false;
         let mut cursor = Some(node);
         while let Some(current) = cursor {
-            if let Some(lang) = crate::js::world::attr(base, current, "lang") {
+            if let Some(lang) = crate::dom::tree::attr(base, current, "lang") {
                 let lang = lang.to_ascii_lowercase();
                 turkish = lang == "tr" || lang.starts_with("tr-");
                 break;
@@ -708,14 +708,14 @@ fn collect_node(
         }
         NodeData::Element(element) => {
             let local: &str = element.name.local.as_ref();
-            let html = element.name.ns == crate::js::world::html_namespace();
+            let html = element.name.ns == crate::dom::tree::html_namespace();
             let style = InlineStyle::of(base, node);
             let visibility = visibility_of(&style, inherited_visibility);
             // `visibility:hidden` still lays out: recurse so explicitly
             // visible descendants show, but hide this level's own text.
             // (The text arm skips hidden text; breaks still apply.)
             if html
-                && crate::js::world::attr(base, node, "hidden")
+                && crate::dom::tree::attr(base, node, "hidden")
                     .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))
             {
                 return;
@@ -903,7 +903,7 @@ fn collect_table(
             continue;
         };
         let kind = tree.data.downcast_element().and_then(|element| {
-            (element.name.ns == crate::js::world::html_namespace())
+            (element.name.ns == crate::dom::tree::html_namespace())
                 .then_some(element.name.local.as_ref())
         });
         // Rows and cells resolve their own box properties so `tbody`/`tr`
@@ -967,7 +967,7 @@ fn collect_row(
     for &cell in &tree.children {
         let is_cell = base.get_node(cell).is_some_and(|tree| {
             tree.data.downcast_element().is_some_and(|element| {
-                element.name.ns == crate::js::world::html_namespace()
+                element.name.ns == crate::dom::tree::html_namespace()
                     && matches!(element.name.local.as_ref(), "td" | "th")
             })
         });
@@ -1030,7 +1030,7 @@ fn collect_select(
         }
         let kind = base.get_node(child).and_then(|tree| {
             tree.data.downcast_element().and_then(|element| {
-                (element.name.ns == crate::js::world::html_namespace())
+                (element.name.ns == crate::dom::tree::html_namespace())
                     .then_some(element.name.local.as_ref())
             })
         });
@@ -1074,7 +1074,7 @@ fn collect_details(
     transform: Transform,
 ) {
     collector.ensure_breaks(1);
-    if crate::js::world::attr(collector.base, node, "open").is_none() {
+    if crate::dom::tree::attr(collector.base, node, "open").is_none() {
         let Some(tree) = collector.base.get_node(node) else {
             return;
         };
@@ -1115,7 +1115,7 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
     let is_html_element = tree
         .data
         .downcast_element()
-        .is_some_and(|element| element.name.ns == crate::js::world::html_namespace());
+        .is_some_and(|element| element.name.ns == crate::dom::tree::html_namespace());
     if !is_html_element {
         return Ok(String::new());
     }
@@ -1221,10 +1221,10 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
         };
         root = current;
         if let Some(element) = tree.data.downcast_element() {
-            let html = element.name.ns == crate::js::world::html_namespace();
+            let html = element.name.ns == crate::dom::tree::html_namespace();
             let local = element.name.local.as_ref();
             if html
-                && crate::js::world::attr(base, current, "hidden")
+                && crate::dom::tree::attr(base, current, "hidden")
                     .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))
             {
                 return false;
