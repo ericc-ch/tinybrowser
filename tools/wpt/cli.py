@@ -33,6 +33,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -62,6 +63,18 @@ WORKER_VARIANT = re.compile(r"\.(any\.)?(sharedworker|serviceworker|worker)(-mod
 HARD_STATUSES = ("TIMEOUT", "CRASH", "ERROR")
 TIMEOUT_STATUSES = ("TIMEOUT", "EXTERNAL-TIMEOUT")
 MAX_LISTED = 40
+
+# `wpt run`'s requirements (tools/wpt/commands.json), which WPT re-checks on
+# every run, and a setuptools whose pkg_resources works for that check: WPT's
+# tools/localpaths puts its vendored packaging 21 (needs pyparsing) ahead of
+# site-packages, and setuptools >= 71 imports top-level packaging, so only
+# releases that load their own vendored copy import cleanly there.
+WPT_RUN_REQUIREMENTS = (
+    "tools/manifest/requirements.txt",
+    "tools/wptrunner/requirements.txt",
+    "tools/serve/requirements.txt",
+)
+SETUPTOOLS = "setuptools<71"
 
 
 def eprint(*parts: object) -> None:
@@ -141,9 +154,9 @@ def resolve_wpt_root() -> Path:
     override = os.environ.get("TINYBROWSER_WPT_ROOT")
     if override:
         return Path(override)
-    status = git(["submodule", "status", "--", "third_party/wpt"])
-    if status is not None and status != "" and not status.startswith("-"):
-        return ROOT / "third_party" / "wpt"
+    local = ROOT / "third_party" / "wpt"
+    if (local / "wpt").is_file():
+        return local
     worktrees = git(["worktree", "list", "--porcelain"]) or ""
     primary = None
     for line in worktrees.splitlines():
@@ -233,8 +246,9 @@ def venv_stamp_payload(wpt: Path, venv: Path) -> str:
             lines.append("no-python")
     else:
         lines.append("no-python")
-    for rel in ("tools/manifest/requirements.txt", "tools/wptrunner/requirements.txt"):
+    for rel in WPT_RUN_REQUIREMENTS:
         lines.append(sha_file(wpt / rel))
+    lines.append(SETUPTOOLS)
     lines.append(sha_file(ROOT / "tools" / "wpt" / "pyproject.toml"))
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
@@ -260,12 +274,11 @@ def install_venv(wpt: Path, venv: Path) -> None:
             eprint(f"WPT virtualenv not found at {venv}; TINYBROWSER_WPT_VENV must name one")
             raise SystemExit(1)
         subprocess.run(["uv", "venv", "--seed", str(venv), "--python", "3.12"], check=True)
-    # uv owns the venv; --seed keeps pip/setuptools so WPT's working-set
-    # check finds everything satisfied and never falls back to its pip path.
+    # uv seeds only pip on Python 3.12; WPT's per-run requirements check
+    # needs pkg_resources, or it shells out to pip for every file.
+    requirements = [arg for rel in WPT_RUN_REQUIREMENTS for arg in ("-r", str(wpt / rel))]
     subprocess.run(
-        ["uv", "pip", "install", "--python", str(exe), "-q",
-         "-r", str(wpt / "tools/manifest/requirements.txt"),
-         "-r", str(wpt / "tools/wptrunner/requirements.txt")],
+        ["uv", "pip", "install", "--python", str(exe), "-q", SETUPTOOLS, *requirements],
         check=True,
     )
     subprocess.run(
@@ -793,6 +806,30 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
                 yield test_type, test_path, tests
 
     testloader.TestFilter = TinybrowserTestFilter
+
+    from wptrunner.browsers import base as browser_base
+
+    def wait_for_webdriver(logger, host, port, timeout=60, server_process=None):
+        """`wait_for_service`, polling every 10 ms instead of 500 ms.
+
+        The tinybrowser WebDriver listens ~75 ms after spawn, so upstream's
+        interval turned every browser start into a 0.5 s wait.
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            if server_process is not None and server_process.poll() is not None:
+                break
+            with socket.socket() as probe:
+                try:
+                    probe.connect((host, port))
+                except ConnectionRefusedError:
+                    time.sleep(0.01)
+                    continue
+            logger.debug(f"Connected to {host}:{port}")
+            return True
+        raise OSError(f"Service is unavailable: {host}:{port}")
+
+    browser_base.wait_for_service = wait_for_webdriver
 
     from wptrunner import wptlogging
 
