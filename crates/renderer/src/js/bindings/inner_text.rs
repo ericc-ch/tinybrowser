@@ -481,7 +481,7 @@ struct Collector<'a> {
     trailing_forced: bool,
 }
 
-impl<'a> Collector<'a> {
+impl Collector<'_> {
     /// Pushes mode-processed text, merging boundary spaces unless preserved.
     fn push_text(&mut self, text: &str, preserve: bool) {
         if text.is_empty() {

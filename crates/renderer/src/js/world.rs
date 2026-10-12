@@ -349,11 +349,11 @@ pub(crate) fn child_ids(
 }
 
 /// The value of the first attribute of `id` matching `match_name`.
-fn attr_find<'a>(
-    base: &'a blitz_dom::BaseDocument,
+fn attr_find(
+    base: &blitz_dom::BaseDocument,
     id: BlitzNodeId,
     match_name: impl Fn(&markup5ever::QualName) -> bool,
-) -> Option<&'a str> {
+) -> Option<&str> {
     base.get_node(id)?
         .data
         .downcast_element()?

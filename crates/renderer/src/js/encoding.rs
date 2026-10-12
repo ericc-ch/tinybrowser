@@ -76,8 +76,8 @@ fn encode_into<'js>(ctx: Ctx<'js>, source: Value<'js>, max: usize) -> Result<Obj
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decode<'js>(
-    ctx: Ctx<'js>,
+fn decode(
+    ctx: Ctx<'_>,
     source: String,
     label: String,
     fatal: bool,
@@ -110,7 +110,7 @@ fn decode<'js>(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decode_xml_response<'js>(ctx: Ctx<'js>, source: String, content_type: String) -> Result<String> {
+fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Result<String> {
     let bytes = bytes_from_latin1(&source)
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
     let header = (!content_type.trim().is_empty()).then_some(content_type.as_str());
@@ -135,7 +135,7 @@ fn decode_xml_response<'js>(ctx: Ctx<'js>, source: String, content_type: String)
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decoder_init<'js>(ctx: Ctx<'js>, label: String, ignore_bom: bool) -> Result<u64> {
+fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
     let encoding = resolve_label(&ctx, &label)?;
     let world_rc = super::bindings::world(&ctx)?;
     let id = world_rc
@@ -160,8 +160,8 @@ fn decoder_init<'js>(ctx: Ctx<'js>, label: String, ignore_bom: bool) -> Result<u
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decoder_decode<'js>(
-    ctx: Ctx<'js>,
+fn decoder_decode(
+    ctx: Ctx<'_>,
     id: u64,
     source: String,
     fatal: bool,
@@ -211,7 +211,7 @@ fn decoder_decode<'js>(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-fn decoder_free<'js>(ctx: Ctx<'js>, id: u64) -> Result<()> {
+fn decoder_free(ctx: Ctx<'_>, id: u64) -> Result<()> {
     if let Ok(world) = super::bindings::world(&ctx) {
         world.borrow_mut().decoders.remove(&id);
     }
@@ -221,7 +221,7 @@ fn decoder_free<'js>(ctx: Ctx<'js>, id: u64) -> Result<()> {
 /// Resolves `label` to an encoding, rejecting unknown labels and the
 /// `replacement` encoding, which getting an encoding never returns
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
-fn resolve_label<'js>(ctx: &Ctx<'js>, label: &str) -> Result<&'static Encoding> {
+fn resolve_label(ctx: &Ctx<'_>, label: &str) -> Result<&'static Encoding> {
     Encoding::for_label(super::bindings::forms::trim_label(label).as_bytes())
         .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .ok_or_else(|| Exception::throw_range(ctx, "The encoding label is not supported"))

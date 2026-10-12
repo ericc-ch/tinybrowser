@@ -11236,7 +11236,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     fn set_width(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
         // Out-of-range values write the default rather than the raw value
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
-        let value = if value > 2147483647 { 300 } else { value };
+        let value = if value > 2_147_483_647 { 300 } else { value };
         set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
     }
 
@@ -11251,7 +11251,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     fn set_height(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
         // Out-of-range values write the default rather than the raw value
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height>).
-        let value = if value > 2147483647 { 150 } else { value };
+        let value = if value > 2_147_483_647 { 150 } else { value };
         set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())
     }
 
