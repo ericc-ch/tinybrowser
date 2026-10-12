@@ -165,10 +165,7 @@ impl BlitzDocument {
 
     /// Creates a CDATA section whose data is `data`
     /// (<https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
-    pub(crate) fn create_cdata_section(
-        &mut self,
-        data: &str,
-    ) -> blitz_traits::node_id::NodeId {
+    pub(crate) fn create_cdata_section(&mut self, data: &str) -> blitz_traits::node_id::NodeId {
         self.base.mutate().create_cdata_section_node(data)
     }
 

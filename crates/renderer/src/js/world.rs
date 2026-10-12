@@ -436,9 +436,11 @@ pub(crate) fn template_contents(
     base: &blitz_dom::BaseDocument,
     id: BlitzNodeId,
 ) -> Option<BlitzNodeId> {
-    base.get_node(id)?.data.downcast_element().filter(|element| {
-        is_template_tag(&element.name)
-    }).and_then(|element| element.template_contents)
+    base.get_node(id)?
+        .data
+        .downcast_element()
+        .filter(|element| is_template_tag(&element.name))
+        .and_then(|element| element.template_contents)
 }
 
 /// Whether `node` is an HTML element named `local`.

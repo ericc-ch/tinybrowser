@@ -117,8 +117,13 @@ fn decode_xml_response<'js>(ctx: Ctx<'js>, source: String, content_type: String)
     let (encoding, bom_len) = crate::document::dial::sniff_encoding(&bytes, header, true)
         .unwrap_or((encoding_rs::UTF_8, 0));
     let mut decoder = encoding.new_decoder_without_bom_handling();
-    decode_loop(&mut decoder, bytes.get(bom_len..).unwrap_or(&[]), true, true)
-        .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
+    decode_loop(
+        &mut decoder,
+        bytes.get(bom_len..).unwrap_or(&[]),
+        true,
+        true,
+    )
+    .map_err(|_| Exception::throw_type(&ctx, "The encoded data was not valid."))
 }
 
 /// Opens a streaming decoder session for `label`, returning its platform id.
@@ -178,7 +183,8 @@ fn decoder_decode<'js>(
                 // `last=true` ends the decoder, which must never run again;
                 // the next call starts a fresh session with the same encoding
                 // and BOM mode.
-                *session = super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
+                *session =
+                    super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
             }
             Ok(text)
         }
@@ -188,9 +194,13 @@ fn decoder_decode<'js>(
                 // it carries forward.
                 session.carry = input[failure.consumed..].to_vec();
             } else {
-                *session = super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
+                *session =
+                    super::world::DecoderSession::fresh(session.encoding, session.ignore_bom);
             }
-            Err(Exception::throw_type(&ctx, "The encoded data was not valid."))
+            Err(Exception::throw_type(
+                &ctx,
+                "The encoded data was not valid.",
+            ))
         }
     }
 }
@@ -245,7 +255,9 @@ fn btoa<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, input)? else {
         return Ok(None);
     };
-    Ok(Some(base64::engine::general_purpose::STANDARD.encode(bytes)))
+    Ok(Some(
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
 }
 
 /// Standard base64 of isomorphic-latin1 bytes, for `FileReader` data URLs.
@@ -257,7 +269,9 @@ fn base64_encode<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Option<String
     let Some(bytes) = latin1_bytes(&ctx, source)? else {
         return Ok(None);
     };
-    Ok(Some(base64::engine::general_purpose::STANDARD.encode(bytes)))
+    Ok(Some(
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
 }
 
 /// UTF-16 units as Latin1 bytes, or `None` when a unit exceeds `0xFF`.

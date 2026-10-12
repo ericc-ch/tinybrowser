@@ -1307,11 +1307,7 @@ impl Drop for ClearInterrupt<'_> {
 /// `data:`) documents send nothing; an empty policy means
 /// `strict-origin-when-cross-origin`.
 fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
-    referrer_for_policy(
-        &world.referrer_policy,
-        &world.document_url,
-        request_url,
-    )
+    referrer_for_policy(&world.referrer_policy, &world.document_url, request_url)
 }
 
 /// The pure policy decision behind [`fetch_referrer`], split out so unit
@@ -1338,8 +1334,7 @@ pub(crate) fn referrer_for_policy(
     // document; parsing standalone would drop the `Referer` even under
     // `unsafe-url`.
     let request = document_url.join(request_url).ok()?;
-    let downgrade =
-        document_url.scheme() == "https" && matches!(request.scheme(), "http" | "ws");
+    let downgrade = document_url.scheme() == "https" && matches!(request.scheme(), "http" | "ws");
     let same_origin = document_url.scheme() == request.scheme()
         && document_url.host_str() == request.host_str()
         && document_url.port_or_known_default() == request.port_or_known_default();
@@ -1547,10 +1542,7 @@ mod tests {
             referrer("same-origin", doc, "https://example.com:8443/other"),
             Some("https://example.com:8443/path?q=1".to_owned())
         );
-        assert_eq!(
-            referrer("same-origin", doc, "https://other.test/x"),
-            None
-        );
+        assert_eq!(referrer("same-origin", doc, "https://other.test/x"), None);
         assert_eq!(
             referrer("origin-when-cross-origin", doc, "https://other.test/x"),
             Some("https://example.com:8443/".to_owned())

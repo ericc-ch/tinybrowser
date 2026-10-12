@@ -181,7 +181,6 @@ impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementat
     }
 }
 
-
 /// Adopts `doctype` into `document` and appends it, retargeting the wrapper
 /// so the caller's object and `document.doctype` are the same node
 /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).

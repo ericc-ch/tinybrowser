@@ -464,12 +464,9 @@ pub(crate) fn reflect_url_string(
     content: &str,
 ) -> Result<crate::dom_string::DomString> {
     let world_rc = world(ctx)?;
-    let raw = world_rc
-        .borrow()
-        .document(id)
-        .and_then(|parsed| {
-            crate::js::world::attr(&parsed.document.base, id.node, content).map(str::to_owned)
-        });
+    let raw = world_rc.borrow().document(id).and_then(|parsed| {
+        crate::js::world::attr(&parsed.document.base, id.node, content).map(str::to_owned)
+    });
     let Some(raw) = raw else {
         return Ok(crate::dom_string::DomString::default());
     };
@@ -577,17 +574,13 @@ fn node_interface_matches(
         "ChildNode" => {
             !is_fragment
                 && (is_character_data
-                    || matches!(
-                        data,
-                        Some(NodeData::Element(_) | NodeData::Doctype { .. })
-                    ))
+                    || matches!(data, Some(NodeData::Element(_) | NodeData::Doctype { .. })))
         }
         // `NonDocumentTypeChildNode` includes `Element` and `CharacterData`,
         // not a doctype or a fragment
         // (<https://dom.spec.whatwg.org/#interface-nondocumenttypechildnode>).
         "NonDocumentTypeChildNode" => {
-            !is_fragment
-                && (is_character_data || matches!(data, Some(NodeData::Element(_))))
+            !is_fragment && (is_character_data || matches!(data, Some(NodeData::Element(_))))
         }
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
@@ -656,8 +649,7 @@ fn node_interface_matches(
         "HTMLMarqueeElement" => crate::js::world::is_html_tag(data, "marquee"),
         "HTMLMeterElement" => crate::js::world::is_html_tag(data, "meter"),
         "HTMLModElement" => {
-            crate::js::world::is_html_tag(data, "ins")
-                || crate::js::world::is_html_tag(data, "del")
+            crate::js::world::is_html_tag(data, "ins") || crate::js::world::is_html_tag(data, "del")
         }
         "HTMLOListElement" => crate::js::world::is_html_tag(data, "ol"),
         "HTMLParagraphElement" => crate::js::world::is_html_tag(data, "p"),
