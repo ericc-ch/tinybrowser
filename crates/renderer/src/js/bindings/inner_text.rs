@@ -61,22 +61,71 @@ enum Transform {
     Capitalize,
 }
 
-/// Reads one CSS property from a `style` attribute value: the last
-/// declaration wins, `!important` (ASCII case-insensitive, optional
-/// whitespace) is stripped, names are case-insensitive. Declarations split
-/// on `;` outside quotes and parentheses, so `url("a;b")` survives.
-fn style_property<'a>(style: &'a str, property: &str) -> Option<&'a str> {
-    let mut found = None;
-    for declaration in split_declarations(style) {
-        let (name, value) = match declaration.split_once(':') {
-            Some(pair) => pair,
-            None => continue,
+/// The `style` attribute declarations collection reads, parsed once per
+/// element.
+#[derive(Clone, Copy, Default)]
+struct InlineStyle<'a> {
+    display: Option<&'a str>,
+    white_space: Option<&'a str>,
+    visibility: Option<&'a str>,
+    text_transform: Option<&'a str>,
+    float: Option<&'a str>,
+    position: Option<&'a str>,
+}
+
+impl<'a> InlineStyle<'a> {
+    /// Parses `node`'s `style` attribute: the last declaration of a property
+    /// wins, `!important` (ASCII case-insensitive, optional whitespace) is
+    /// stripped, names are case-insensitive. Declarations split on `;`
+    /// outside quotes and parentheses, so `url("a;b")` survives.
+    fn of(base: &'a BaseDocument, node: BlitzId) -> Self {
+        let mut style = Self::default();
+        let Some(attribute) = crate::js::world::attr(base, node, "style") else {
+            return style;
         };
-        if name.trim().eq_ignore_ascii_case(property) {
-            found = Some(strip_important(value.trim()));
+        for declaration in split_declarations(attribute) {
+            let Some((name, value)) = declaration.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            let slot = if name.eq_ignore_ascii_case("display") {
+                &mut style.display
+            } else if name.eq_ignore_ascii_case("white-space") {
+                &mut style.white_space
+            } else if name.eq_ignore_ascii_case("visibility") {
+                &mut style.visibility
+            } else if name.eq_ignore_ascii_case("text-transform") {
+                &mut style.text_transform
+            } else if name.eq_ignore_ascii_case("float") {
+                &mut style.float
+            } else if name.eq_ignore_ascii_case("position") {
+                &mut style.position
+            } else {
+                continue;
+            };
+            *slot = Some(strip_important(value.trim()));
         }
+        style
     }
-    found
+
+    /// Whether the element establishes a flex/grid container (children
+    /// blockify).
+    fn is_flex(&self) -> bool {
+        self.display.is_some_and(|value| {
+            value.eq_ignore_ascii_case("flex")
+                || value.eq_ignore_ascii_case("grid")
+                || value.eq_ignore_ascii_case("inline-flex")
+                || value.eq_ignore_ascii_case("inline-grid")
+        })
+    }
+
+    /// Whether the element itself opts out of rendering with
+    /// `display:none`. Unlike `visibility`, descendants cannot re-show
+    /// through this.
+    fn display_none(&self) -> bool {
+        self.display
+            .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+    }
 }
 
 /// Splits a `style` attribute into declarations on `;` outside single and
@@ -143,10 +192,13 @@ fn is_html_tag(base: &BaseDocument, node: BlitzId, tags: &[&str]) -> bool {
 
 /// The `white-space` mode of an element: the `style` attribute wins, then
 /// `pre`-family tags, then inheritance.
-fn white_space_of(base: &BaseDocument, node: BlitzId, inherited: WhiteSpace) -> WhiteSpace {
-    if let Some(style) = crate::js::world::attr(base, node, "style")
-        && let Some(value) = style_property(style, "white-space")
-    {
+fn white_space_of(
+    base: &BaseDocument,
+    node: BlitzId,
+    style: &InlineStyle<'_>,
+    inherited: WhiteSpace,
+) -> WhiteSpace {
+    if let Some(value) = style.white_space {
         return match value.to_ascii_lowercase().as_str() {
             "pre" | "pre-wrap" | "break-spaces" => WhiteSpace::Pre,
             "pre-line" => WhiteSpace::PreLine,
@@ -163,7 +215,7 @@ fn white_space_of(base: &BaseDocument, node: BlitzId, inherited: WhiteSpace) -> 
 /// `float` (non-`none`) and absolute positioning blockifying, then tag
 /// defaults. Stylesheet classes are invisible, so class-driven layouts
 /// keep their tag default and fail honestly.
-fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
+fn level_of(base: &BaseDocument, node: BlitzId, style: &InlineStyle<'_>) -> Level {
     let Some(tree) = base.get_node(node) else {
         return Level::Hidden;
     };
@@ -177,17 +229,14 @@ fn level_of(base: &BaseDocument, node: BlitzId) -> Level {
     if html && (local == "template" || local == "noscript") {
         return Level::Hidden;
     }
-    let style = crate::js::world::attr(base, node, "style");
-    let display = style.and_then(|style| style_property(style, "display"));
     // `float` and absolute positioning blockify.
-    let blockified = style.is_some_and(|style| {
-        style_property(style, "float")
-            .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
-            || style_property(style, "position").is_some_and(|value| {
-                value.eq_ignore_ascii_case("absolute") || value.eq_ignore_ascii_case("fixed")
-            })
-    });
-    if let Some(display) = display {
+    let blockified = style
+        .float
+        .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
+        || style.position.is_some_and(|value| {
+            value.eq_ignore_ascii_case("absolute") || value.eq_ignore_ascii_case("fixed")
+        });
+    if let Some(display) = style.display {
         let display = display.to_ascii_lowercase();
         let display = display.as_str();
         if display == "none" {
@@ -309,10 +358,8 @@ fn subtree_skipped(base: &BaseDocument, node: BlitzId) -> bool {
 
 /// The effective `visibility` of an element: an explicit `visible` or
 /// hiding value wins, anything else (including invalid values) inherits.
-fn visibility_of(base: &BaseDocument, node: BlitzId, inherited: Visibility) -> Visibility {
-    if let Some(style) = crate::js::world::attr(base, node, "style")
-        && let Some(value) = style_property(style, "visibility")
-    {
+fn visibility_of(style: &InlineStyle<'_>, inherited: Visibility) -> Visibility {
+    if let Some(value) = style.visibility {
         if value.eq_ignore_ascii_case("visible") {
             return Visibility::Visible;
         }
@@ -325,10 +372,13 @@ fn visibility_of(base: &BaseDocument, node: BlitzId, inherited: Visibility) -> V
 
 /// The effective `text-transform` of an element: explicit style wins, else
 /// inherited. Turkish casing resolves `lang` up the ancestor chain.
-fn transform_of(base: &BaseDocument, node: BlitzId, inherited: Transform) -> Transform {
-    if let Some(style) = crate::js::world::attr(base, node, "style")
-        && let Some(value) = style_property(style, "text-transform")
-    {
+fn transform_of(
+    base: &BaseDocument,
+    node: BlitzId,
+    style: &InlineStyle<'_>,
+    inherited: Transform,
+) -> Transform {
+    if let Some(value) = style.text_transform {
         let mut turkish = false;
         let mut cursor = Some(node);
         while let Some(current) = cursor {
@@ -396,7 +446,7 @@ fn apply_transform(text: &str, transform: Transform, word_open: &mut bool) -> St
                     *word_open = true;
                 } else {
                     out.push(char);
-                    if matches!(char, ' ' | '\t' | '\n' | '\u{c}' | '\r' | '\u{a0}') {
+                    if matches!(char, ' ' | '\t' | '\n' | '\u{c}' | '\u{a0}') {
                         *word_open = false;
                     }
                 }
@@ -469,7 +519,8 @@ struct Collector<'a> {
     /// yet: a trailing space materializes at the very end.
     trailing_atomic: bool,
     /// Whether the last emitted character continues a word (for
-    /// `text-transform: capitalize` across text-node boundaries).
+    /// `text-transform: capitalize` across text-node boundaries). Breaks
+    /// and atomic inlines end the word.
     word_open: bool,
     /// Whether the last pushed text preserved spaces (`pre`).
     last_preserve: bool,
@@ -558,6 +609,7 @@ impl<'a> Collector<'a> {
         }
         let trimmed = text.trim_matches([' ', '\n', '\t']);
         self.out.push_str(trimmed);
+        self.word_open = false;
         self.force_space = true;
         self.last_preserve = false;
         self.trailing_breaks = 0;
@@ -567,6 +619,7 @@ impl<'a> Collector<'a> {
 
     /// A forced break (`br`): always exactly one newline.
     fn push_forced_break(&mut self) {
+        self.word_open = false;
         self.pending_space = false;
         self.force_space = false;
         if !self.last_preserve {
@@ -588,6 +641,7 @@ impl<'a> Collector<'a> {
     /// survives (a following block still collapses against it via the
     /// count).
     fn ensure_breaks(&mut self, count: usize) {
+        self.word_open = false;
         if self.out.is_empty() {
             self.pending_space = false;
             self.force_space = false;
@@ -612,18 +666,6 @@ impl<'a> Collector<'a> {
     }
 }
 
-/// Whether the element establishes a flex/grid container (children blockify).
-fn is_flex(base: &BaseDocument, node: BlitzId) -> bool {
-    crate::js::world::attr(base, node, "style").is_some_and(|style| {
-        style_property(style, "display").is_some_and(|value| {
-            value.eq_ignore_ascii_case("flex")
-                || value.eq_ignore_ascii_case("grid")
-                || value.eq_ignore_ascii_case("inline-flex")
-                || value.eq_ignore_ascii_case("inline-grid")
-        })
-    })
-}
-
 /// Collects rendered text for `node`'s children.
 fn collect_children(
     collector: &mut Collector<'_>,
@@ -633,11 +675,11 @@ fn collect_children(
     transform: Transform,
     flex_parent: bool,
 ) {
-    let Some(tree) = collector.base.get_node(node) else {
+    let base = collector.base;
+    let Some(tree) = base.get_node(node) else {
         return;
     };
-    let children: Vec<BlitzId> = tree.children.to_vec();
-    for child in children {
+    for &child in &tree.children {
         collect_node(collector, child, mode, visibility, transform, flex_parent);
     }
 }
@@ -668,7 +710,8 @@ fn collect_node(
         NodeData::Element(element) => {
             let local: &str = element.name.local.as_ref();
             let html = element.name.ns == crate::js::world::html_namespace();
-            let visibility = visibility_of(base, node, inherited_visibility);
+            let style = InlineStyle::of(base, node);
+            let visibility = visibility_of(&style, inherited_visibility);
             // `visibility:hidden` still lays out: recurse so explicitly
             // visible descendants show, but hide this level's own text.
             // (The text arm skips hidden text; breaks still apply.)
@@ -682,8 +725,8 @@ fn collect_node(
                 collector.push_forced_break();
                 return;
             }
-            let mode = white_space_of(base, node, inherited_mode);
-            let transform = transform_of(base, node, inherited_transform);
+            let mode = white_space_of(base, node, &style, inherited_mode);
+            let transform = transform_of(base, node, &style, inherited_transform);
             // A `tr` target (or nested row) collects its cells directly.
             if html && local == "tr" {
                 collect_row(collector, node, mode, visibility, transform);
@@ -695,7 +738,7 @@ fn collect_node(
                 collector.ensure_breaks(1);
                 return;
             }
-            let mut level = level_of(base, node);
+            let mut level = level_of(base, node, &style);
             if flex_parent && level == Level::Inline {
                 level = Level::Block;
             }
@@ -746,7 +789,7 @@ fn collect_node(
                     // all: skip it without forcing breaks of its own (the
                     // surrounding items break already).
                     if html && (local == "option" || local == "optgroup") {
-                        if display_none(base, node) {
+                        if style.display_none() {
                             return;
                         }
                         if local == "optgroup" && is_optgroup_ancestor(base, node) {
@@ -761,7 +804,7 @@ fn collect_node(
                             mode,
                             visibility,
                             transform,
-                            is_flex(base, node),
+                            style.is_flex(),
                         );
                         if !transparent {
                             collector.ensure_breaks(1);
@@ -780,7 +823,7 @@ fn collect_node(
                             mode,
                             visibility,
                             transform,
-                            is_flex(base, node),
+                            style.is_flex(),
                         );
                     }
                     // A trailing atomic keeps its space instead of a break.
@@ -819,17 +862,16 @@ fn is_optgroup_ancestor(base: &BaseDocument, node: BlitzId) -> bool {
     false
 }
 
-/// Whether the element itself opts out of rendering with `display:none`.
-/// Unlike `visibility`, descendants cannot re-show through this.
-fn display_none(base: &BaseDocument, node: BlitzId) -> bool {
-    crate::js::world::attr(base, node, "style").is_some_and(|style| {
-        style_property(style, "display").is_some_and(|value| value.eq_ignore_ascii_case("none"))
-    })
-}
-
 /// Collects a `table` subtree: rows newline-separated, cells tab-separated
 /// (including trailing empty cells), captions broken. Whitespace directly
 /// under table structure is ignored.
+///
+/// Rows and captions collect in tree order (`tfoot` is not reordered, and a
+/// caption after the rows comes after them), as the rendered text
+/// collection steps walk child nodes in tree order. Browsers agree
+/// (WPT `getter-tests.js` "Newline between cells and caption" expects
+/// `abc\ndef` for a caption parsed after its row), even though the default
+/// `caption-side: top` draws the caption box first.
 fn collect_table(
     collector: &mut Collector<'_>,
     node: BlitzId,
@@ -838,94 +880,71 @@ fn collect_table(
     transform: Transform,
 ) {
     collector.ensure_breaks(1);
-    // Rows in tree order (`tfoot` is not reordered); captions are direct
-    // children only. Row groups pass their `visibility` down so collapsed
-    // sections hide their rows.
-    let top_children: Vec<BlitzId> = collector
-        .base
-        .get_node(node)
-        .map(|tree| tree.children.to_vec())
-        .unwrap_or_default();
-    let mut rows: Vec<(BlitzId, Visibility, WhiteSpace, Transform)> = Vec::new();
-    let mut captions: Vec<BlitzId> = Vec::new();
-    let mut stack: Vec<(BlitzId, Visibility, WhiteSpace, Transform)> = top_children
-        .into_iter()
+    let base = collector.base;
+    let Some(table) = base.get_node(node) else {
+        return;
+    };
+    // Captions count only as direct children; rows at any depth below
+    // non-table structure. Row groups pass their `visibility` down so
+    // collapsed sections hide their rows.
+    let mut stack: Vec<(BlitzId, bool, Visibility, WhiteSpace, Transform)> = table
+        .children
+        .iter()
         .rev()
-        .map(|child| (child, visibility, mode, transform))
+        .map(|&child| (child, true, visibility, mode, transform))
         .collect();
-    while let Some((current, inherited, inherited_mode, inherited_transform)) = stack.pop() {
+    let mut first = true;
+    while let Some((current, top, inherited, inherited_mode, inherited_transform)) = stack.pop() {
+        let style = InlineStyle::of(base, current);
         // `display:none` subtrees never render, so they contribute no rows.
-        if display_none(collector.base, current) {
+        if style.display_none() {
             continue;
         }
-        let Some(tree) = collector.base.get_node(current) else {
+        let Some(tree) = base.get_node(current) else {
             continue;
         };
         let kind = tree.data.downcast_element().and_then(|element| {
             (element.name.ns == crate::js::world::html_namespace())
-                .then(|| element.name.local.as_ref().to_owned())
+                .then_some(element.name.local.as_ref())
         });
-        match kind.as_deref() {
+        // Rows and cells resolve their own box properties so `tbody`/`tr`
+        // styles (e.g. `visibility:collapse`) apply to their cells.
+        let item_visibility = visibility_of(&style, inherited);
+        let item_mode = white_space_of(base, current, &style, inherited_mode);
+        let item_transform = transform_of(base, current, &style, inherited_transform);
+        match kind {
             Some("tr") => {
-                rows.push((current, inherited, inherited_mode, inherited_transform));
+                if !first {
+                    collector.ensure_breaks(1);
+                }
+                first = false;
+                collect_row(
+                    collector,
+                    current,
+                    item_mode,
+                    item_visibility,
+                    item_transform,
+                );
             }
-            Some("td") | Some("th") => {}
-            Some("table") => {}
+            Some("caption") if top => {
+                collector.ensure_breaks(1);
+                first = false;
+                collect_children(
+                    collector,
+                    current,
+                    item_mode,
+                    item_visibility,
+                    item_transform,
+                    false,
+                );
+            }
+            Some("td" | "th" | "table") => {}
             _ => {
-                let item_visibility = visibility_of(collector.base, current, inherited);
-                let item_mode = white_space_of(collector.base, current, inherited_mode);
-                let item_transform = transform_of(collector.base, current, inherited_transform);
-                let children = tree.children.to_vec();
-                for child in children.into_iter().rev() {
-                    stack.push((child, item_visibility, item_mode, item_transform));
+                for &child in tree.children.iter().rev() {
+                    stack.push((child, false, item_visibility, item_mode, item_transform));
                 }
             }
         }
-    }
-    for child in collector
-        .base
-        .get_node(node)
-        .map(|tree| tree.children.to_vec())
-        .unwrap_or_default()
-    {
-        let is_caption = collector.base.get_node(child).is_some_and(|tree| {
-            tree.data.downcast_element().is_some_and(|element| {
-                element.name.ns == crate::js::world::html_namespace()
-                    && element.name.local.as_ref() == "caption"
-            })
-        });
-        if is_caption {
-            captions.push(child);
-        }
-    }
-    let mut first = captions.is_empty();
-    // Captions come before the rows: the default `caption-side` is top,
-    // so the caption box precedes the table grid box.
-    for caption in captions {
-        collector.ensure_breaks(1);
-        let caption_visibility = visibility_of(collector.base, caption, visibility);
-        let caption_mode = white_space_of(collector.base, caption, mode);
-        let caption_transform = transform_of(collector.base, caption, transform);
-        collect_children(
-            collector,
-            caption,
-            caption_mode,
-            caption_visibility,
-            caption_transform,
-            false,
-        );
-    }
-    for (row, row_inherited, row_mode_inherited, row_transform_inherited) in rows {
-        if !first {
-            collector.ensure_breaks(1);
-        }
-        first = false;
-        // Rows resolve their own box properties so `tbody`/`tr` styles
-        // (e.g. `visibility:collapse`) apply to their cells.
-        let row_visibility = visibility_of(collector.base, row, row_inherited);
-        let row_mode = white_space_of(collector.base, row, row_mode_inherited);
-        let row_transform = transform_of(collector.base, row, row_transform_inherited);
-        collect_row(collector, row, row_mode, row_visibility, row_transform);
     }
     collector.ensure_breaks(1);
 }
@@ -941,12 +960,13 @@ fn collect_row(
     transform: Transform,
 ) {
     let before = collector.out.len();
-    let Some(tree) = collector.base.get_node(row) else {
+    let base = collector.base;
+    let Some(tree) = base.get_node(row) else {
         return;
     };
     let mut cell_first = true;
-    for cell in tree.children.to_vec() {
-        let is_cell = collector.base.get_node(cell).is_some_and(|tree| {
+    for &cell in &tree.children {
+        let is_cell = base.get_node(cell).is_some_and(|tree| {
             tree.data.downcast_element().is_some_and(|element| {
                 element.name.ns == crate::js::world::html_namespace()
                     && matches!(element.name.local.as_ref(), "td" | "th")
@@ -955,8 +975,9 @@ fn collect_row(
         if !is_cell {
             continue;
         }
+        let style = InlineStyle::of(base, cell);
         // `display:none` cells never render, not even their tab stop.
-        if display_none(collector.base, cell) {
+        if style.display_none() {
             continue;
         }
         if !cell_first {
@@ -969,9 +990,9 @@ fn collect_row(
             collector.trailing_forced = false;
         }
         cell_first = false;
-        let cell_visibility = visibility_of(collector.base, cell, visibility);
-        let cell_mode = white_space_of(collector.base, cell, mode);
-        let cell_transform = transform_of(collector.base, cell, transform);
+        let cell_visibility = visibility_of(&style, visibility);
+        let cell_mode = white_space_of(base, cell, &style, mode);
+        let cell_transform = transform_of(base, cell, &style, transform);
         collect_children(
             collector,
             cell,
@@ -998,33 +1019,33 @@ fn collect_select(
     visibility: Visibility,
     transform: Transform,
 ) {
-    let Some(tree) = collector.base.get_node(node) else {
+    let base = collector.base;
+    let Some(tree) = base.get_node(node) else {
         return;
     };
-    for child in tree.children.to_vec() {
+    for &child in &tree.children {
+        let style = InlineStyle::of(base, child);
         // `display:none` options never render.
-        if display_none(collector.base, child) {
+        if style.display_none() {
             continue;
         }
-        let kind = collector.base.get_node(child).and_then(|tree| {
+        let kind = base.get_node(child).and_then(|tree| {
             tree.data.downcast_element().and_then(|element| {
                 (element.name.ns == crate::js::world::html_namespace())
-                    .then(|| element.name.local.as_ref().to_owned())
+                    .then_some(element.name.local.as_ref())
             })
         });
-        match kind.as_deref() {
+        match kind {
             // Text directly under `select` is ignored.
             None => {}
-            Some("option") | Some("optgroup") => {
-                if kind.as_deref() == Some("optgroup")
-                    && is_optgroup_ancestor(collector.base, child)
-                {
+            Some("option" | "optgroup") => {
+                if kind == Some("optgroup") && is_optgroup_ancestor(base, child) {
                     continue;
                 }
                 collector.ensure_breaks(1);
-                let item_visibility = visibility_of(collector.base, child, visibility);
-                let item_mode = white_space_of(collector.base, child, mode);
-                let item_transform = transform_of(collector.base, child, transform);
+                let item_visibility = visibility_of(&style, visibility);
+                let item_mode = white_space_of(base, child, &style, mode);
+                let item_transform = transform_of(base, child, &style, transform);
                 collect_children(
                     collector,
                     child,
@@ -1058,11 +1079,10 @@ fn collect_details(
         let Some(tree) = collector.base.get_node(node) else {
             return;
         };
-        if let Some(summary) = tree
+        if let Some(&summary) = tree
             .children
-            .to_vec()
-            .into_iter()
-            .find(|child| is_html_tag(collector.base, *child, &["summary"]))
+            .iter()
+            .find(|&&child| is_html_tag(collector.base, child, &["summary"]))
         {
             collect_node(collector, summary, mode, visibility, transform, false);
         }
@@ -1075,7 +1095,7 @@ fn collect_details(
         mode,
         visibility,
         transform,
-        is_flex(collector.base, node),
+        InlineStyle::of(collector.base, node).is_flex(),
     );
     collector.ensure_breaks(1);
 }
@@ -1133,7 +1153,7 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
     let parent_flex = base
         .get_node(id.node)
         .and_then(|tree| tree.parent)
-        .is_some_and(|parent| is_flex(base, parent));
+        .is_some_and(|parent| InlineStyle::of(base, parent).is_flex());
     let (top_mode, top_visibility, top_transform) = initial_styles(base, id.node);
     collect_node(
         &mut collector,
@@ -1160,9 +1180,6 @@ pub(crate) fn rendered_text(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
             }
         }
     }
-    // A trailing collapsible space vanishes at the end, as does a stale
-    // atomic force (a flushed pending space, if any, already stands in the
-    // buffer).
     Ok(out)
 }
 
@@ -1183,9 +1200,10 @@ fn initial_styles(base: &BaseDocument, node: BlitzId) -> (WhiteSpace, Visibility
     let mut visibility = Visibility::Visible;
     let mut transform = Transform::None;
     for ancestor in chain.into_iter().rev() {
-        mode = white_space_of(base, ancestor, mode);
-        visibility = visibility_of(base, ancestor, visibility);
-        transform = transform_of(base, ancestor, transform);
+        let style = InlineStyle::of(base, ancestor);
+        mode = white_space_of(base, ancestor, &style, mode);
+        visibility = visibility_of(&style, visibility);
+        transform = transform_of(base, ancestor, &style, transform);
     }
     (mode, visibility, transform)
 }
@@ -1212,10 +1230,7 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
             {
                 return false;
             }
-            if let Some(style) = crate::js::world::attr(base, current, "style")
-                && let Some(display) = style_property(style, "display")
-                && display.eq_ignore_ascii_case("none")
-            {
+            if InlineStyle::of(base, current).display_none() {
                 return false;
             }
             if html
@@ -1284,9 +1299,7 @@ fn text_content(base: &BaseDocument, id: BlitzId) -> String {
         match &node.data {
             NodeData::Text(data) => text.push_str(&data.content),
             NodeData::Element(_) | NodeData::Fragment { .. } | NodeData::AnonymousBlock(_) => {
-                let mut children = node.children.to_vec();
-                children.reverse();
-                stack.extend(children);
+                stack.extend(node.children.iter().rev());
             }
             _ => {}
         }
