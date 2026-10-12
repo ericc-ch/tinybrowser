@@ -14,6 +14,7 @@
 //! Sizes and method: `docs/size.md`.
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("PROFILE").as_deref() != Ok("release") {
         return;
     }

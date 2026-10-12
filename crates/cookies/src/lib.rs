@@ -236,15 +236,19 @@ impl CookieJar {
     /// against the rules [`CookieJar::store`] applies to a parsed line: a
     /// name and value the `Cookie` header can carry (not both empty, no
     /// control characters other than TAB, no `;` in either, no `=` in the
-    /// name, at most 4096 bytes together), a rooted path of at most 1024
-    /// bytes, a canonical domain of at most 1024 bytes that is not a public
-    /// suffix or IP address unless host-only, the prefix requirements,
-    /// `SameSite=None` needing `Secure`, and no weakening of a live cookie's
-    /// `Secure` flag. Unlike [`CookieJar::store`], that last rule holds even
-    /// for a secure request: a record has no request URL to judge. Expired
-    /// records are dropped, expiry is capped, and the storage-model caps
-    /// apply. Rejected records are skipped without error.
+    /// name, at most 4096 bytes together), a rooted path, a canonical domain
+    /// of at most 1024 bytes that is not a public suffix or IP address unless
+    /// host-only, the prefix requirements, `SameSite=None` needing `Secure`,
+    /// and no weakening of a live cookie's `Secure` flag. Unlike
+    /// [`CookieJar::store`], that last rule holds even for a secure request: a
+    /// record has no request URL to judge. Expired records are dropped, expiry
+    /// is capped, and the storage-model caps apply. Rejected records are
+    /// skipped without error.
     pub fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
+        // Expired cookies are gone before anything looks at the live jar, so a
+        // dead cookie cannot block or weaken the records that follow. This is
+        // the same ordering [`CookieJar::store`] uses.
+        self.evict_expired(now);
         for record in records {
             let Some(stored) = self.sanitize(record, now) else {
                 continue;
@@ -253,7 +257,6 @@ impl CookieJar {
                 .retain(|old| !same_cookie_identity(old, &stored));
             self.cookies.push(stored);
         }
-        self.evict_expired(now);
         self.evict_excess();
     }
 
@@ -271,9 +274,13 @@ impl CookieJar {
         {
             return None;
         }
-        if !record.path.starts_with('/') || record.path.len() > 1024 {
+        if !record.path.starts_with('/') {
             return None;
         }
+        // No length cap on the path. The 1024-byte limit is a parse-time rule
+        // on the `Path` attribute; a cookie with no attribute stores the
+        // request URI's directory, which has no such cap:
+        // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
         // The record names its own domain, so require the canonical form the
         // jar writes rather than trusting a raw attribute.
         let domain = canonicalize_domain_attr(&record.domain)?;
@@ -1453,26 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_caps_path_and_domain_at_1024_bytes() {
-        let path = format!("/{}", "p".repeat(1023));
-        let mut jar = CookieJar::default();
-        jar.restore(
-            vec![CookieRecord {
-                path: path.clone(),
-                ..record("a", "1")
-            }],
-            at(NOW),
-        );
-        assert_eq!(jar.snapshot().len(), 1);
-        jar.restore(
-            vec![CookieRecord {
-                path: format!("{path}p"),
-                ..record("b", "1")
-            }],
-            at(NOW),
-        );
-        assert_eq!(jar.snapshot().len(), 1);
-
+    fn restore_caps_domain_at_1024_bytes() {
         let label = "d".repeat(63);
         let long = format!("{label}.{label}.{label}.{label}.").repeat(4) + "example.com";
         assert!(long.len() > 1024);
@@ -1485,6 +1473,35 @@ mod tests {
             at(NOW),
         );
         assert!(jar.snapshot().is_empty());
+    }
+
+    #[test]
+    fn restore_keeps_a_cookie_whose_effective_path_exceeds_1024_bytes() {
+        // The 1024-byte cap is a parse-time rule on the `Path` attribute. A
+        // cookie with no attribute stores the request URI's directory, which
+        // has no such cap, so the round trip must preserve it.
+        let page = url(&format!("https://example.com/{}/x", "p".repeat(1030)));
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1; Max-Age=3600", http(&page, at(NOW))));
+        let records = jar.snapshot();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].path.len() > 1024);
+
+        let mut restored = CookieJar::default();
+        restored.restore(records, at(NOW));
+        assert_eq!(restored.cookie_string(http(&page, at(NOW))), "a=1");
+    }
+
+    #[test]
+    fn restore_ignores_an_expired_live_cookie_when_replacing() {
+        // `restore` evicts expired cookies before `sanitize` consults the live
+        // jar for the secure overlay, so a dead Secure cookie cannot block the
+        // replacement a record brings.
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1; Secure; Max-Age=1", http(&page, at(NOW))));
+        jar.restore(vec![record("a", "2")], at(NOW + 2));
+        assert_eq!(jar.cookie_string(http(&page, at(NOW + 2))), "a=2");
     }
 
     #[test]
