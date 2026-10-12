@@ -12,7 +12,7 @@
 //! Behavior follows
 //! [draft-ietf-httpbis-rfc6265bis](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -92,10 +92,13 @@ pub struct CookieOp<'a> {
     /// What the request is for; `SameSite=Lax` treats a top-level navigation
     /// differently from a subresource request.
     pub initiator_kind: InitiatorKind,
-    /// Whether the request's method is safe (`GET`/`HEAD`).
+    /// Whether the request's method is safe per
+    /// [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.1):
+    /// `GET`, `HEAD`, `OPTIONS`, or `TRACE`.
     ///
-    /// Only consulted for a top-level navigation, where `SameSite=Lax` allows
-    /// a safe method; callers must pass the real method's safety.
+    /// Only consulted for a top-level navigation, where `SameSite=Lax`
+    /// cookies go with a cross-site request only when its method is safe;
+    /// callers must pass the real method's safety.
     pub method_is_safe: bool,
     /// Document URL the request started from, for the same-site check.
     pub initiator: Option<&'a Url>,
@@ -388,14 +391,18 @@ impl From<CookieSameSite> for SameSite {
 }
 
 fn over_quota_domain(cookies: &[StoredCookie]) -> Option<String> {
-    let mut domains = HashSet::new();
-    for cookie in cookies {
-        domains.insert(cookie.domain.as_str());
+    if cookies.len() <= MAX_COOKIES_PER_DOMAIN {
+        return None;
     }
-    domains.into_iter().find_map(|domain| {
-        let count = cookies.iter().filter(|c| c.domain == domain).count();
-        (count > MAX_COOKIES_PER_DOMAIN).then(|| domain.to_owned())
-    })
+    let mut counts = HashMap::new();
+    for cookie in cookies {
+        let count = counts.entry(cookie.domain.as_str()).or_insert(0_usize);
+        *count += 1;
+        if *count > MAX_COOKIES_PER_DOMAIN {
+            return Some(cookie.domain.clone());
+        }
+    }
+    None
 }
 
 fn evict_one(cookies: &mut Vec<StoredCookie>, domain: Option<&str>) -> bool {
@@ -440,7 +447,7 @@ struct ParsedSetCookie {
 
 fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
     // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-parsing
-    if input.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+    if has_ctl_excluding_htab(input) {
         return None;
     }
     let (pair, attrs) = match input.split_once(';') {
@@ -455,10 +462,7 @@ fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
     if name.is_empty() && value.is_empty() {
         return None;
     }
-    if name.len().saturating_add(value.len()) > 4096 {
-        return None;
-    }
-    if has_ctl_excluding_htab(&name) || has_ctl_excluding_htab(&value) {
+    if name.len() + value.len() > 4096 {
         return None;
     }
 
@@ -620,8 +624,7 @@ fn cookie_expiry(parsed: &ParsedSetCookie, now: SystemTime) -> Option<SystemTime
         if max_age <= 0 {
             Some(now)
         } else {
-            let secs = u64::try_from(max_age).unwrap_or(u64::MAX);
-            Some(now + Duration::from_secs(secs).min(MAX_LIFETIME))
+            Some(now + Duration::from_secs(max_age.unsigned_abs()).min(MAX_LIFETIME))
         }
     } else {
         parsed
@@ -728,9 +731,6 @@ impl StoredCookie {
         if !host_ok {
             return false;
         }
-        if !self.host_only && is_public_suffix(&self.domain) {
-            return false;
-        }
         if !path_match(request_path, &self.path) {
             return false;
         }
@@ -827,24 +827,18 @@ fn registrable_domain(host: &str) -> String {
     if is_ip(host) {
         return host.to_owned();
     }
-    let host = host.trim_matches('.').to_ascii_lowercase();
-    let suffix = public_suffix(&host);
-    if host == suffix {
-        return host;
-    }
-    let Some(prefix) = host.strip_suffix(&suffix).and_then(|p| p.strip_suffix('.')) else {
-        return host;
+    let host = host.trim_matches('.');
+    let suffix = public_suffix(host);
+    let Some(prefix) = host.strip_suffix(suffix).and_then(|p| p.strip_suffix('.')) else {
+        return host.to_owned();
     };
     let label = prefix.rsplit('.').next().unwrap_or(prefix);
     format!("{label}.{suffix}")
 }
 
 fn is_public_suffix(domain: &str) -> bool {
-    let d = domain.trim_matches('.').to_ascii_lowercase();
-    if d.is_empty() {
-        return false;
-    }
-    public_suffix(&d) == d
+    let d = domain.trim_matches('.');
+    !d.is_empty() && public_suffix(d) == d
 }
 
 struct SuffixList {
@@ -883,34 +877,27 @@ fn suffix_list() -> &'static SuffixList {
     })
 }
 
-fn public_suffix(host: &str) -> String {
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.is_empty() {
-        return String::new();
-    }
+// https://github.com/publicsuffix/list/wiki/Format#formal-algorithm
+fn public_suffix(host: &str) -> &str {
     let list = suffix_list();
-    let suffix_at = |i: usize| labels[i..].join(".");
     let mut matched_rule = None;
-    for i in 0..labels.len() {
-        let suffix = suffix_at(i);
-        if list.exceptions.contains(suffix.as_str()) {
-            return suffix_at(i + 1);
+    let mut candidate = host;
+    loop {
+        let parent = candidate.split_once('.').map(|(_, rest)| rest);
+        if list.exceptions.contains(candidate) {
+            return parent.unwrap_or("");
         }
-        let parent = if i + 1 < labels.len() {
-            suffix_at(i + 1)
-        } else {
-            String::new()
-        };
         if matched_rule.is_none()
-            && (list.rules.contains(suffix.as_str()) || list.wildcards.contains(parent.as_str()))
+            && (list.rules.contains(candidate)
+                || parent.is_some_and(|parent| list.wildcards.contains(parent)))
         {
-            matched_rule = Some(i);
+            matched_rule = Some(candidate);
+        }
+        match parent {
+            Some(parent) => candidate = parent,
+            None => return matched_rule.unwrap_or(candidate),
         }
     }
-    if let Some(i) = matched_rule {
-        return suffix_at(i);
-    }
-    labels[labels.len() - 1].to_owned()
 }
 
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.3
@@ -921,11 +908,10 @@ pub(crate) fn domain_match(host: &str, domain: &str) -> bool {
     if is_ip(host) {
         return false;
     }
-    let host = host.to_ascii_lowercase();
-    let domain = domain.to_ascii_lowercase();
-    host.ends_with(&domain)
-        && host.len() > domain.len()
-        && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+    let (host, domain) = (host.as_bytes(), domain.as_bytes());
+    host.len() > domain.len()
+        && host[host.len() - domain.len() - 1] == b'.'
+        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain)
 }
 
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.4
@@ -942,15 +928,12 @@ pub(crate) fn path_match(request_path: &str, cookie_path: &str) -> bool {
     false
 }
 
+// https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-paths-and-path-match
 fn default_path(uri_path: &str) -> String {
-    if uri_path.is_empty() || !uri_path.starts_with('/') {
-        return "/".to_owned();
+    match uri_path.rfind('/') {
+        Some(end) if end > 0 && uri_path.starts_with('/') => uri_path[..end].to_owned(),
+        _ => "/".to_owned(),
     }
-    if uri_path.bytes().filter(|b| *b == b'/').count() <= 1 {
-        return "/".to_owned();
-    }
-    let end = uri_path.rfind('/').unwrap_or(0);
-    uri_path[..end].to_owned()
 }
 
 fn canonicalize_host(url: &Url) -> Option<String> {
@@ -1057,10 +1040,8 @@ fn is_cookie_date_delimiter(b: u8) -> bool {
 }
 
 fn cookie_date_tokens(s: &str) -> impl Iterator<Item = &str> {
-    s.as_bytes()
-        .split(|b| is_cookie_date_delimiter(*b))
-        .filter(|chunk| !chunk.is_empty())
-        .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
+    s.split(|c| u8::try_from(c).is_ok_and(is_cookie_date_delimiter))
+        .filter(|token| !token.is_empty())
 }
 
 fn parse_day_token(token: &str) -> Option<u32> {
@@ -1600,5 +1581,126 @@ mod tests {
             at(NOW),
         );
         assert_eq!(jar.cookie_string(http(&page, at(NOW))), "a=3");
+    }
+
+    #[test]
+    fn lax_cookie_follows_a_cross_site_navigation_only_with_a_safe_method() {
+        let page = url("https://example.com/");
+        let other = url("https://other.test/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("lax=1; SameSite=Lax", http(&page, at(NOW))));
+        let cross_site = |method_is_safe| CookieOp {
+            initiator: Some(&other),
+            method_is_safe,
+            ..http(&page, at(NOW))
+        };
+        assert_eq!(jar.cookie_string(cross_site(true)), "lax=1");
+        assert_eq!(jar.cookie_string(cross_site(false)), "");
+    }
+
+    #[test]
+    fn domain_cookie_matches_subdomains_but_not_lookalikes() {
+        let page = url("https://www.example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1; Domain=EXAMPLE.com", http(&page, at(NOW))));
+        for (host, expected) in [
+            ("https://example.com/", "a=1"),
+            ("https://a.b.example.com/", "a=1"),
+            ("https://badexample.com/", ""),
+            ("https://example.com.evil.test/", ""),
+        ] {
+            assert_eq!(
+                jar.cookie_string(http(&url(host), at(NOW))),
+                expected,
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_path_is_the_request_directory() {
+        let mut jar = CookieJar::default();
+        for (request, path) in [
+            ("https://example.com/", "/"),
+            ("https://example.com/file", "/"),
+            ("https://example.com/dir/file", "/dir"),
+            ("https://example.com/a/b/", "/a/b"),
+        ] {
+            jar.clear();
+            assert!(jar.store("a=1", http(&url(request), at(NOW))), "{request}");
+            let records = jar.records_for(http(&url(request), at(NOW)));
+            assert_eq!(records[0].path, path, "{request}");
+        }
+    }
+
+    #[test]
+    fn cookie_date_tokens_split_on_ascii_delimiters_only() {
+        assert_eq!(
+            persistent_expiry("a=1; Expires=Tue,29-Feb-2000/00:00:00", at(946_598_400)),
+            Some(at(951_782_400))
+        );
+        assert_eq!(
+            persistent_expiry("a=1; Expires=Tue 29 Feb 2000 00:00:00 ü", at(946_598_400)),
+            Some(at(951_782_400))
+        );
+        let page = url("https://example.com/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store(
+            "a=1; Expires=Tue 29 üFeb 2000 00:00:00",
+            http(&page, at(946_598_400))
+        ));
+        assert!(jar.snapshot().is_empty());
+    }
+
+    fn fill(jar: &mut CookieJar, page: &Url, names: impl IntoIterator<Item = String>, from: u64) {
+        for (i, name) in (from..).zip(names) {
+            assert!(jar.store(&format!("{name}=1"), http(page, at(NOW + i))));
+        }
+    }
+
+    #[test]
+    fn per_domain_eviction_takes_non_secure_cookies_first() {
+        let page = url("https://quota.example/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("s=1; Secure", http(&page, at(NOW))));
+        fill(&mut jar, &page, (0..50).map(|i| format!("n{i}")), 1);
+        let header = jar.cookie_string(http(&page, at(NOW + 100)));
+        assert_eq!(header.split("; ").count(), 50);
+        assert!(header.starts_with("s=1; n1=1"), "{header}");
+    }
+
+    #[test]
+    fn eviction_breaks_a_last_access_tie_by_creation_time() {
+        let page = url("https://quota.example/");
+        let mut jar = CookieJar::default();
+        fill(&mut jar, &page, (0..50).map(|i| format!("c{i}")), 0);
+        assert!(jar.store("c0=2", http(&page, at(NOW + 50))));
+        jar.cookie_string(http(&page, at(NOW + 60)));
+        assert!(jar.store("c50=1", http(&page, at(NOW + 61))));
+        let header = jar.cookie_string(http(&page, at(NOW + 62)));
+        assert!(!header.contains("c0="), "{header}");
+        assert!(header.starts_with("c1=1; "), "{header}");
+    }
+
+    #[test]
+    fn per_domain_quota_only_trims_the_domain_over_it() {
+        let pages = [
+            url("https://a.example/"),
+            url("https://b.example/"),
+            url("https://c.example/"),
+        ];
+        let mut jar = CookieJar::default();
+        for page in &pages {
+            fill(&mut jar, page, (0..50).map(|i| format!("k{i}")), 0);
+        }
+        assert!(jar.store("extra=1", http(&pages[1], at(NOW + 100))));
+        let counts: Vec<usize> = pages
+            .iter()
+            .map(|page| jar.records_for(http(page, at(NOW + 100))).len())
+            .collect();
+        assert_eq!(counts, [50, 50, 50]);
+        let b = jar.cookie_string(http(&pages[1], at(NOW + 100)));
+        assert!(!b.contains("k0="), "{b}");
+        assert!(b.contains("extra=1"), "{b}");
     }
 }
