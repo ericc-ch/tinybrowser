@@ -22,7 +22,7 @@ use crate::names::qualified_name_eq;
 
 use rquickjs::{Class, Ctx, Exception, Object, Persistent, Result, Value, class::Trace};
 
-use super::node::node_generated;
+use super::node::core::node_generated;
 use crate::js::events::{
     JsEvent, add_listener_parsed, dispatch_event, event_target_generated, listener_callback,
     listener_options, remove_capture, remove_listener_parsed, report_exception,
@@ -507,7 +507,7 @@ impl<'object> JsAttr<'object> {
     pub(super) fn get_root_node<'js>(
         &self,
         ctx: Ctx<'js>,
-        _options: super::node::node_generated::GetRootNodeOptions,
+        _options: super::node::core::node_generated::GetRootNodeOptions,
     ) -> Result<Value<'js>> {
         attr_wrapper(&ctx, self.id)
     }
