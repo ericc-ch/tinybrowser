@@ -7,8 +7,8 @@
 //! Both ends of this conversation live in this crate — the host end in
 //! [`crate::link`], the child end in [`crate::child`] — so the message
 //! vocabulary and the framing sit next to both. Payloads that describe a page
-//! ([`FrameId`], [`Mount`], [`RendererEvent`], [`DialRequest`]) come from the
-//! engine crate and stay there; this module only carries them.
+//! ([`FrameId`], [`Mount`](renderer::Mount), [`RendererEvent`], [`DialRequest`])
+//! come from the engine crate and stay there; this module only carries them.
 
 pub mod channel;
 

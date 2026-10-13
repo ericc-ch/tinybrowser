@@ -4,9 +4,10 @@
 #   clippy    stable shell. Workspace lints, then `node --check` on JavaScript
 #            `include_str!`'d into the renderer, then the realm-free layer
 #            check (dom/ and documents.rs never name Ctx/Value/Persistent/
-#            JsNode), then `cargo doc --no-deps` (intra-doc link lints are
-#            denied workspace-wide, so a bare or stale path fails here instead
-#            of shipping). Always run this.
+#            JsNode), then `cargo doc --no-deps --document-private-items`
+#            (intra-doc link lints are denied workspace-wide, so a bare or
+#            stale path fails here instead of shipping, private items
+#            included). Always run this.
 #   miri     nightly shell. Miri over pure-Rust crates. It CANNOT execute
 #            FFI, so crates linking rquickjs or native-tls are excluded; put
 #            unsafe logic in a pure-Rust module with tests to get Miri
@@ -97,9 +98,10 @@ run_layers() {
 }
 
 run_docs() {
-  # Workspace `warnings` (deny) covers rustdoc's intra-doc link lints, so
-  # broken or stale doc paths fail the gate instead of shipping.
-  nix develop --command cargo doc --workspace --no-deps
+  # Workspace `warnings` (deny) covers rustdoc's intra-doc link lints, and
+  # `--document-private-items` documents private items too, so a broken or
+  # stale path fails the gate instead of shipping.
+  nix develop --command cargo doc --workspace --no-deps --document-private-items
 }
 
 valgrind_test() {

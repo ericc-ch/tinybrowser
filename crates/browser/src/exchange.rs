@@ -191,7 +191,7 @@ impl<T> Sender<T> {
         }
     }
 
-    /// Sends `value`, or drops it when the lane is full. Unlike [`try_send`],
+    /// Sends `value`, or drops it when the lane is full. Unlike `try_send`,
     /// a full lane does not disconnect the peer.
     pub(crate) fn try_send_lossy(&self, value: T) -> Result<(), Error>
     where

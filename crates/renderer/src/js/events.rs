@@ -744,11 +744,11 @@ pub(crate) fn install_custom_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     super::blob::decompress(ctx, INSTALL_CUSTOM_EVENT_DEFLATE, &CACHE)
 }
 
-/// Appends one listener to a target's list
-/// (<https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener>).
-/// [`add_listener`] on a chosen realm. `contentWindow.addEventListener` runs
-/// in the caller's realm and must still register on the frame's window
-/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+/// Appends one listener to a target's list in a chosen realm, so
+/// `contentWindow.addEventListener` runs in the caller's realm and still
+/// registers on the frame's window
+/// (<https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener>,
+/// <https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
 pub(crate) fn add_listener_in<'js>(
     ctx: &Ctx<'js>,
     world: &Rc<RefCell<World>>,
@@ -763,8 +763,8 @@ pub(crate) fn add_listener_in<'js>(
     add_listener_parsed_in(ctx, world, target, typ, callback, options)
 }
 
-/// [`add_listener`] from an already-converted `EventListener?` and options,
-/// used by the generated `EventTarget` contract.
+/// [`add_listener_in`] from an already-converted `EventListener?` and
+/// options, used by the generated `EventTarget` contract.
 pub(crate) fn add_listener_parsed(
     ctx: &Ctx<'_>,
     target: EventTargetKey,
@@ -856,8 +856,8 @@ pub(crate) fn remove_listener_in<'js>(
     remove_listener_parsed_in(ctx, world, target, &typ, callback.as_ref(), capture)
 }
 
-/// [`remove_listener`] from an already-converted `EventListener?` and capture,
-/// used by the generated `EventTarget` contract.
+/// [`remove_listener_in`] from an already-converted `EventListener?` and
+/// capture, used by the generated `EventTarget` contract.
 pub(crate) fn remove_listener_parsed(
     ctx: &Ctx<'_>,
     target: EventTargetKey,

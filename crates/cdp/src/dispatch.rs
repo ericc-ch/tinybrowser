@@ -859,7 +859,7 @@ pub(crate) async fn css_computed_style(
     dom_eval(tab, &script).await
 }
 
-/// One viewport rectangle for [`Page.getLayoutMetrics`].
+/// One viewport rectangle for `Page.getLayoutMetrics`.
 fn viewport_rect(width: f64, height: f64) -> Value {
     json!({"pageX": 0, "pageY": 0, "clientWidth": width, "clientHeight": height})
 }

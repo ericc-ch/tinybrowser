@@ -27,7 +27,7 @@ pub(crate) fn document_is_html_content(ctx: &Ctx<'_>, id: NodeId) -> bool {
 }
 
 /// Whether `id` is the realm's active document. See
-/// [`World::is_main_document`].
+/// [`World::is_main_document`](crate::js::world::World::is_main_document).
 pub(crate) fn is_main_document(ctx: &Ctx<'_>, id: NodeId) -> bool {
     world(ctx).is_ok_and(|world| world.borrow().is_main_document(id))
 }
