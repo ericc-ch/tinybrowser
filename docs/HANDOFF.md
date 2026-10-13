@@ -1,66 +1,125 @@
 # Handoff (2026-10-13)
 
-Goal: Extract the realm-free DOM layer out of the JS bindings. Move every DOM algorithm into `crates/renderer/src/dom/`, leave `crates/renderer/src/js/` with the WebIDL surface (the `JsNode` payload, generated contracts, prototypes, value conversion), and unify the platform-object lifecycle so new interfaces stop sprinkling code into five shared files. Candidate 2 (webidl-bindgen) stays a later pass; its findings are recorded below.
+Status: complete on branch `refactor/dom-layer`, 12 commits on `d78b30e`.
+Nothing pushed. The PR is the record; this note keeps the decisions, the
+evidence, and the follow-ups that did not fit a commit message.
 
-Plan: Layering `documents` + `dom` <- `js` <- `document` <- `engine`. The rule: below `js/` there is no `Ctx`, no `Value`, no `Persistent`, and no `JsNode`. `dom/` takes `&Parsed`/`&mut Parsed`, `DocumentStore`, `World` side data, and `NodeId`s. Tree algorithms return ordered effects (navigables to destroy, an `InsertionStep` list) that the binding layer applies in spec order. WPT slices for `dom/nodes` and the forms/member slices are approved (2026-10-13).
+Goal: extract the realm-free DOM layer out of the JS bindings, split the
+bindings by interface family, migrate the last natively installed members onto
+generated contracts, cut the `js`/`document` cycle, and unify the
+platform-object lifecycle.
 
-State: work is on branch `refactor/dom-layer`, eight commits on top of `d78b30e` (`main` is reset to `d78b30e`; nothing pushed). Commits `f70c0d4` through `13c470f` are green: `tools/check` exit 0, `cargo test --workspace` 34/34 binaries, and the `dom/nodes` slice matches the pre-refactor failure list exactly (422 tests, 317 pass, 84 unexpected, 15 timeout, 6 error).
+Layering: `documents` + `dom` <- `js` <- `document` <- `engine`. Below `js/`
+there is no `Ctx`, no `Value`, no `Persistent`, and no `JsNode`; `tools/check`
+enforces that for `dom/` and `documents.rs` (`run_layers`). Tree algorithms
+return ordered effects (navigables to destroy, an `InsertionStep` list), not
+callbacks.
 
-**Step 6 is mid-flight and does not compile (35 errors).** Uncommitted changes in `node/document.rs`, `node/element.rs`, `node/mod.rs`. Do not build or run WPT until the resume point below is done.
+What landed:
 
-Done:
+- `f70c0d4` node identity and tree walks -> `dom/tree.rs`.
+- `78b4e24` serialization and node equality -> `dom/serialization.rs`,
+  `dom/equality.rs`; `nodes_equal` takes `&DocumentStore`.
+- `4d1716a` insertion core -> `dom/insertion.rs`; `JournalEntry` ->
+  `documents.rs`; `replace_all_*` return navigables to destroy.
+- `50401a7` pre-insert validity -> `dom/insertion.rs` returning `TreeError`.
+- `9017fea` `MoveTarget`, `ensure_can_move`, `move_parsed`, `replace_parsed`;
+  one `apply_inserted` realm-side application point.
+- `8a1a84f` adoption snapshots and materialization -> `dom/adoption.rs`.
+- `133e122` form state (`dom/forms.rs`), rendered text (`dom/text.rs`), infra
+  parsers (`dom/parse.rs`), namespaces (`dom/namespaces.rs`); the three copies
+  of the option/select helpers become one.
+- `13c470f` `bindings/node.rs` (10,892 lines) splits into
+  `bindings/node/{mod,core,document,element,forms,media,html_elements}.rs`.
+- `b24a514` `Document.adoptNode`, `Document.scripts`,
+  `HTMLElement.innerText`/`outerText` move onto generated contracts; the
+  `#[rquickjs::methods]` block holds only the constructor; brands.js loses the
+  native member copy and the `interfaceMembers` table.
+- `f9e6598` `FrameRuntime` -> `js/runtime.rs`; frame creation inverted through
+  a frame-host hook so `js` never names `Document`; `Stop` -> `js/runtime.rs`;
+  encoding sniffing -> neutral `sniff.rs`; the layer gate lands in
+  `tools/check`.
+- `05241fb` `WrapperCache<K>` for the wrapper caches; the same-object cache is
+  keyed by IDL interface name instead of the `Wrapper` enum; one construction
+  point (`host::instance_proto`) with named prototype rules;
+  `docs/bindings.md` gains the Platform objects section.
 
-- `f70c0d4` — step 1: `NodeId`, `BlitzId`, and the tree walks (`is_connected`, `is_iframe_element`, `child_ids`, `attr`, `attr_by_qualified_name`, `is_handler_attribute_name`, namespaces, `is_html_tag`, `is_template_tag`, `template_contents`, `is_html_element`, `first_element_with_id`, `form_owner_of`) to `dom/tree.rs`. Verified: `tools/check` 0, workspace tests green.
-- `78b4e24` — step 2: serialization (`dom/serialization.rs`) and `isEqualNode` views (`dom/equality.rs`); `nodes_equal` takes `&DocumentStore`; `World::store()` added; `qualified_name`/`element_node_name` to `dom/tree.rs`. Verified: `tools/check` 0, workspace tests green.
-- `4d1716a` — step 3a: tree mutation core to `dom/insertion.rs`; `JournalEntry` to `documents.rs`; `replace_all_*` return the iframes to destroy; `is_element`/`is_real_element`/`root_of`/`ancestor_chain`/`tree_order`/`sibling` to `dom/tree.rs`; `tree_children` now calls `child_ids`. Verified: `tools/check` 0, workspace tests green, plus the first `dom/nodes` comparison against `d78b30e` (identical failures; delta was two NodeList flakes that pass alone on both revisions).
-- `50401a7` — step 3b: the four pre-insert validity algorithms to `dom/insertion.rs` returning `TreeError`; `TreeError` to `dom/mod.rs`; callers wrap with `throw_dom_error`. Verified: `tools/check` 0, workspace tests green.
-- `9017fea` — step 3c: `MoveTarget`, realm-free `ensure_can_move`, `move_parsed`, and `replace_parsed` (dropping its unused `Ctx`) to `dom/insertion.rs`; the two duplicated fixup-plus-steps tails of `insert_tree_node_inner` became one `apply_inserted`. Verified: `tools/check` 0, workspace tests green.
-- `8a1a84f` — step 3d: adoption snapshots (`ImportSnapshot`, `snapshot_children`, `import_snapshot`, `live_child_ids`, `materialize_import`, `materialize_children`, `detach_for_adopt`, `clone_within_document`) to `dom/adoption.rs`; new `adopt_across_store` runs snapshot/detach/materialize against `&mut DocumentStore`; bindings keep wrapper retargeting and nonce slots. Verified: `tools/check` 0, workspace tests green.
-- `133e122` — step 4: `dom/forms.rs` unifies three copies of the option/select helpers plus the entry-list machinery, string helpers, submission encoders, `radio_group_members`, `control_value_len`, `selection_applies`, and the insertion-fixup split (`options_to_deselect`/`radios_to_uncheck` in dom, `remove_attribute_sync` in bindings); `dom/text.rs` owns rendered-text collection (pure), `descendant_text`, `rendered_text_fragment`, `is_mergeable_text_node`; `dom/parse.rs` owns the infra integer/double parsers; `dom/namespaces.rs` keeps the spec-correct `locate_*` and the divergent copy is deleted. Verified: `tools/check` 0, workspace tests green; forms slices against `d78b30e` showed no new failures and one fix (`select-selectedOptions-nesting`).
-- `13c470f` — step 5: `bindings/node.rs` (10,892 lines) split into `bindings/node/{mod,core,document,element,forms,media,html_elements}.rs`. `mod.rs` keeps the payload, the single forced `#[rquickjs::methods]` block, `install` orchestration, and a 6-name facade (`compare_node_position`, `insert_converted_node`, `construct_node`, `construct_node_in_frame`, `create_node`, `install_custom_construction`). The 164 `#[qjs(skip)]` methods became `pub(super)` inherent methods per family (inherent methods shadow same-named generated trait methods and must stay visible). Verified: `tools/check` 0, workspace tests green, `dom/nodes` failure list identical to baseline.
+Verification (all against `d78b30e` as the pre-refactor baseline):
 
-Unfinished (step 6, resume here):
+- `tools/check` exit 0 (clippy, embedded JS, layer gate, rustdoc).
+- `cargo test --workspace` 34/34 test binaries.
+- WPT `dom/nodes`: identical failure list (422 tests, 317 pass, 84 unexpected,
+  15 timeout, 6 error).
+- WPT `html/dom/elements/the-innertext-and-outertext-properties` plus both
+  `Document-adoptNode` tests: identical failure lists.
+- WPT `document.scripts.html` 1/1; `dom/collections` + classList tests 13/13.
+- WPT iframe-element slice (nosrc, javascript-url initial insertion,
+  not-about-blank, append-to-child-document): identical failure list.
+- Playwright gate: 35 passed, the same 9 pre-existing screenshot/forms
+  failures as baseline.
+- Blink CDP default corpus passes.
+- Release binary 11,103,368 bytes vs 11,116,328 on `d78b30e` (12,960 bytes
+  smaller). `docs/progress.md` size snapshot updated.
 
-- **Files touched, uncommitted**: `crates/renderer/src/js/bindings/node/{mod,document,element}.rs`. The six native members are out of the macro block; the trait impls and inherent bodies are moved; the build is broken with 35 errors.
-- **What is done**: `mod.rs` macro block holds only `require_interface` + `ctor`. `document.rs` has `fn adopt_node(&self, ctx: Ctx<'js>, arg_0: host::NodeReference) -> Result<Value<'js>>` and `fn get_scripts(&self, ctx: &Ctx<'js>) -> Result<Value<'js>>` in the `Document` trait impl, plus an inherent block at the end. `element.rs` has `get_inner_text`/`set_inner_text`/`get_outer_text`/`set_outer_text` in the `HTMLElement` trait impl plus an inherent block at the end.
-- **Exact errors to fix** (`nix develop --command cargo check -p renderer --message-format short`):
-  1. `document.rs:38` — `use super::super::{adopt_into_document, import_attr};` duplicates names already imported; delete the line.
-  2. `element.rs` — the two setter bodies still take `ctx: Ctx` by value and use `world(&ctx)`, `world_for_node(&ctx, …)`, `throw_dom(&ctx, …)`, `fixup_focus_after_removal(&ctx, …)`, `schedule_mutation_delivery(&ctx)`, and `value.0` (the old `LegacyNullString` tuple). The trait now hands `rquickjs::String<'js>`, so: bind `let value = value.to_string()?;` first, and drop the `&` on every `ctx` receiver inside those bodies. 17 `mismatched types: expected &Ctx<'_>, found Ctx<'_>` are this.
-  3. `element.rs` — missing imports for the moved bodies: `iframe_containers_in_subtrees`, `place_journaled`, `unlink_journaled`, `replace_all_journaled` (from `crate::dom::insertion`), `JournalEntry` (from `crate::documents`), `DomString`, `fixup_focus_after_removal`.
-  4. `mod.rs` — trim the now-unused import list the same way (the trim script is described under Gotchas); the remainder should hold only `Trace`/`Handle`/`Exception`/`Ctx`/`Result`/`Rest*` needs.
-- **After it compiles**: delete `crates/renderer/src/js/scripts/brands.js:2` (`const native = globalThis.Node.prototype;`) and the `interfaceMembers` table plus its per-interface arrays (`brands.js:163-255` and the `members` argument threaded through `define()`), because the generated installers now carry the members. Check `brands.js` for other `interfaceMembers` users before deleting (`grep -n interfaceMembers`).
-- **Then verify**: `tools/check`, `cargo test --workspace`, then the approved slices: `dom/nodes`, the IDL harness for `Document`/`HTMLElement` (`dom/nodes/Document-adoptNode.html`, `dom/nodes/processinginstruction-*` are existing), `html/dom/` (innerText/outerText, `Document.getElementsByName`), and the `dom/idlharness` style slice if available. Compare failure lists against `d78b30e` exactly as before (see Gotchas for how).
+Decisions:
 
-Next (steps 7 and 8):
+- DOM validity algorithms return `TreeError`; the boundary maps it to a
+  DOMException. Messages collapsed to one wording per exception class
+  (unspecified; no WPT delta).
+- Inherent methods on `JsNode` stay `pub(super)`: an invisible inherent method
+  that shadows a generated trait method turns delegation into infinite trait
+  recursion.
+- One `#[rquickjs::methods]` block per class is forced by the macro; it holds
+  only the constructor now. The other members delegate from generated trait
+  impls to inherent `pub(super)` methods.
+- Generated dispatch groups carry `clippy::too_many_lines`: a group batches
+  four members with one receiver borrow.
+- `select_options` uses the owner-checking walk, so nested-select options
+  belong to the inner select (fixes `select-selectedOptions-nesting`).
+- Platform objects: one `JsNode` wrapper per node; same-object members cached
+  per `(node, interface name)`; three prototype-resolution rules kept because
+  they are spec-distinct (ctx realm for standalone classes, node's owning
+  realm for node-associated objects, creator realm first for node wrappers).
+- The attribute entry keeps its own `wrapper` field: per-entry storage, not a
+  map; splitting it would need two structures kept in sync on removal.
 
-1. Finish step 6 per the resume point, commit with the evidence.
-2. **Step 7**: cut the `js` <-> `document` module cycle (`js/world.rs:15` imports `document::{Document, FrameRuntime}`; `document/mod.rs:22` imports `js::{...World}`) by moving `FrameRuntime` (`document/mod.rs:172-187`) down to a neutral module. Add the layer grep to `tools/check`: fail if `src/dom/` or `src/documents.rs` mention `Ctx`, `Value`, `Persistent`, or `JsNode`.
-3. **Step 8**: one platform-object lifecycle. One prototype path (the generator's `host::prototype`, brand kept in the realm), one instance path (collapse `host::instance`, `host::instance_for_node`, `wrap_with_brand`), one generic wrapper cache keyed by interface name replacing `Wrapper` (`js/world.rs:416`, 6 variants) and the three `wrapper`/`intern_wrapper` APIs (`world.rs:130`, `:1623`, `:1991`). Then add the ownership rule to `docs/bindings.md`. Verify with `dom/collections` + `dom/attributes` slices plus `cargo test --workspace`.
-4. **Candidate 2, later pass** (webidl-bindgen): the IDL-to-Rust type mapping is written three times. `contracts.rs:2366` (`native_type`, plus `argument_parameter:1416`, `attribute_result:1731`, `operation_result:1488`, `union_result:1536`), `emit.rs` per-context conversion (`getter_dispatch:721`, `setter_value_conversion:879`, `reflect_setter:996`, `converted_argument:1205`, `operation_argument_at:1260`; contracts.rs:1413-1415 admits "These mirror the conversions in `emit`"), and `javascript.rs:386-456`. `model::Interface` (`model.rs:22`) has 22 fields and carries pre-rendered tokens (`contract: Option<TokenStream>`, `model.rs:23`). Module names are computed twice (`contracts.rs:333`, `emit.rs:1790`). Silent fallbacks: `hook_members` (`database.rs:360-371`) swallows errors into an empty result, `lower_members` skips unimplemented members (`contracts.rs:596-600`, `640-648`), `elect` returns `Ok(())` when no payload owns the prototype (`contracts.rs:164-166`), `legacy_codes` always emits nothing (`emit.rs:2013-2015`), and eight `unreachable!` sites (`emit.rs:740`, `795-813`, `941`, `1033`, `1051`, `1256`, `1362`, `1680`). `validate_sources` (`lib.rs:27`) has no production caller. Direction: one lowering pass whose conversions are a closed enum; the trait contract, the dispatch, and the JS-shim check all render from it. Checks: `cargo test -p webidl-bindgen`, `tools/check`, `tools/webidl/import --check`.
-5. Carried over from the 2026-10-10 note (WPT work, still open): the explicit manifest step (`tools/wpt/manifest.py` calling `load_and_update`, `third_party/wpt/tools/manifest/manifest.py:365`), the `createEvent` init-path proof, per-move suppression (`js/scripts/web/custom_elements.js:88-106,378-390`), and the `dom/nodes` fail-list buckets.
+Follow-ups:
 
-Decisions made:
-
-- Candidate 1 is a layering fix, not a file split. Tree algorithms move below the bindings; the binding layer keeps trait impls, prototypes, and value conversion.
-- Below `js/`: no `Ctx`, no `Value`, no `Persistent`, no `JsNode`.
-- Realm work leaves the dom layer as ordered data (navigables to destroy, `InsertionStep` lists), not callbacks.
-- `JournalEntry` lives in `documents.rs` because the journal is stored on `BlitzDocument`. `TreeError` lives in `dom/mod.rs`; `throw_dom_error` stays at the boundary. `DocumentStore` is the single source of truth for trees.
-- Inherent methods on `JsNode` must be `pub(super)`: an invisible inherent method whose name matches a generated trait method turns a delegation call into infinite trait recursion (Rust prefers the inherent method; visibility failing there is an E0364 cascade).
-- One `#[rquickjs::methods]` block per class is forced by the macro (`MethodImplementor` singleton, `third_party/rquickjs/macro/src/methods.rs:284-330`), but it must hold only the constructor plus members the generated contract cannot carry. No fork change needed.
-- Moved items stay `pub(crate)`/`pub(super)`. No external API change. No new cargo tests for web-platform behavior (WPT owns that).
-- DOMException messages for the validity paths collapsed from per-site prose to the `TreeError` text (one wording per exception class). Messages are unspecified; WPT asserts names and codes; no `dom/nodes` delta.
-- `replace_all_*` now destroys removed child navigables after re-inserting the added nodes. Observable outcomes are identical (nothing creates a frame on append in these paths); no slice delta.
-- `select_options` uses the owner-checking walk (nested-select options belong to the inner select). The three copies now agree; `select-selectedOptions-nesting` passes as a result.
+1. Candidate 2, webidl-bindgen, as its own pass: the IDL-to-Rust type mapping
+   is written three times (`contracts.rs` `native_type` + friends, `emit.rs`
+   per-context conversion, `javascript.rs`). `model::Interface` has 22 fields
+   and carries pre-rendered tokens; module names are computed twice. Silent
+   fallbacks: `hook_members` swallows errors, `lower_members` skips
+   unimplemented members, `elect` returns `Ok(())` with no payload owner,
+   `legacy_codes` always emits nothing, eight `unreachable!` sites,
+   `validate_sources` has no production caller. Direction: one lowering pass
+   with a closed conversion enum; trait contract, dispatch, and the JS-shim
+   check all render from it. Checks: `cargo test -p webidl-bindgen`,
+   `tools/check`, `tools/webidl/import --check`.
+2. WPT work carried over from the 2026-10-10 note: the explicit manifest step
+   (`tools/wpt/manifest.py` calling `load_and_update`), the `createEvent`
+   init-path proof, per-move suppression in
+   `js/scripts/web/custom_elements.js`, and the `dom/nodes` fail-list buckets.
+3. `docs/bindings.md` still documents brands.js-held members (`type`, `files`,
+   `hidden`, URL-decomposition attributes) as cutover gaps; each needs
+   generator support before its shim code can go.
 
 Gotchas:
 
-- **Code moves by name, never by line range.** Ranges go stale between runs and a one-line-short range leaves a stray `}` that makes the generator's `syn` parse fail with "invalid Rust: cannot parse string into token stream" (a build-script failure, not a Rust error). The scripts used in `/tmp/opencode/` (may be gone on a fresh session; re-derive from the patterns): `move_by_name.pl` (regex `^(?:///|//|#\[.*?\]\n)* fn NAME.*?^}\n`, `/ms`, `pub\([a-z()]*\)` aware), `move_impls.pl` (same for `impl ... for JsNode`, plus a flat one-line variant), `move_methods.pl` (same for indented `    fn ` methods inside a macro block, stripping `#[qjs(...)]` only, prefix grouped with `(?>)` to avoid catastrophic backtracking). Always run `nix develop --command rustfmt --edition 2024 --emit stdout <file>` to catch a syntax error before building.
-- **The generator runs at build time**: `crates/renderer/build.rs` parses every `.rs` under `src/js`, so a syntax error anywhere there surfaces as "invalid Rust: cannot parse string into token stream" from the build script.
-- Each generated `<Interface>.rs` module begins `use super::<Payload>;`, so an `include!` must sit in a module that has `JsNode` in scope. That is why all 88 includes stayed in family files that each import `JsNode`.
-- **Unused-import cleanup after a move**: read `cargo check --message-format short` short output, keep lines matching `unused import(s): ...`, and delete those names from the file's use lists (handle `crate::x::y::Name` full paths, braced members in any position, then drop emptied braces and lone commas). It took three passes; one pass per check is fine.
-- **Multi-line `#[expect]`/`#[allow]`** above functions make naive line-range moves lose them; the name-based regexes keep attributes.
-- **Migration of natively installed members** (`document_adopt_node`, `scripts`, `inner_text`, `outer_text`, and the two setters) follows the delegation pattern already used in the family trait impls: keep the algorithm as an inherent `pub(super)` method on `JsNode` and delegate from the trait impl, because the generator only checks names and arity and discovery takes the impl-block signature. Witness: `document.rs` `Document::adopt_node` (`host::NodeReference`, `Ctx<'js>`), `get_scripts`; `element.rs` `HTMLElement::get_inner_text`/`set_inner_text`/`get_outer_text`/`set_outer_text` (`rquickjs::String<'js>`, `&Ctx<'js>` for attributes). The setters' bodies still use the old `Ctx` by value and `LegacyNullString` field access; adapt before expecting the build to pass.
-- No host `python3` and no host `pkg-config`/OpenSSL. Run cargo, `tools/check`, and every runner through `nix develop --command`.
-- WPT `dom/nodes` is flaky in two known ways: `NodeList-static-length-getter-tampered-indexOf-*.html` can error when a group restarts (passes alone on both revisions), and `moveBefore` has timing flakes. Compare the full `▶`-block failure lists (extract with an awk that tracks `▶ Unexpected subtest result in <path>:` and `▶ TIMEOUT/ERROR [expected ...] <path>` headers, then emits `STATUS path :: subtest` for `│ STATUS` lines), not the truncated `needs attention` print, which is capped.
-- `tools/wpt/run --score` keeps the report only when the runner fails or `--save-report` is given; the per-result blocks in the log are the reliable record.
-- `docs/progress.md`: replace binary size, total, and scored groups/slices only.
+- Code moves by name, never by line range. A bad range leaves a stray `}` that
+  surfaces as the build-script error "invalid Rust: cannot parse string into
+  token stream". Parse-check with
+  `nix develop --command rustfmt --edition 2024 --emit stdout <file>` first.
+- The generator runs at build time over every `.rs` under `src/js`.
+- Each generated `<Interface>.rs` starts `use super::<Payload>;`, so an
+  `include!` must sit in a module with `JsNode` in scope.
+- `js/world.rs` `materialize_iframe` leaves frames registered when a World has
+  no frame host (test worlds); a later `take_pending_frames` drain picks them
+  up.
+- No host `python3`, `pkg-config`, or OpenSSL. Run cargo, `tools/check`, and
+  every runner through `nix develop --command`.
+- WPT `dom/nodes` flake patterns: `NodeList-static-length-getter-tampered-*`
+  (passes alone) and `moveBefore` timing. Compare full `▶` failure blocks, not
+  the truncated `needs attention` print.
+- The worker/serviceworker idlharness variants fail at setup on both revisions
+  (pre-existing harness gap); use the window variants when probing.
