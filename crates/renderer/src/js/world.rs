@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
 
@@ -172,6 +173,24 @@ struct ResourceBudget {
 
 const MAX_PENDING_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OBJECT_URL_BYTES: usize = 8 * 1024 * 1024;
+
+/// A version-4 UUID for one object URL, so the URL keeps the File API's shape
+/// and never repeats across realms
+/// (<https://w3c.github.io/FileAPI/#dfn-createObjectURL>).
+fn object_url_id() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut id = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            id.push('-');
+        }
+        let _ = write!(id, "{byte:02x}");
+    }
+    Some(id)
+}
 
 impl RealmRegistry {
     /// Remembers that `world` owns the document `id`.
@@ -581,7 +600,6 @@ pub(crate) struct World {
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
-    next_object_url: u64,
     pub parser_active: bool,
     pub current_script: Option<NodeId>,
     /// Existing elements being synchronously upgraded by a custom-element
@@ -753,7 +771,6 @@ impl World {
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
-            next_object_url: 0,
             parser_active: false,
             current_script: None,
             custom_construction: Vec::new(),
@@ -1474,9 +1491,8 @@ impl World {
         if total > MAX_OBJECT_URL_BYTES {
             return None;
         }
-        let id = self.next_object_url;
-        self.next_object_url = self.next_object_url.wrapping_add(1);
-        let url = format!("blob:{}/{}", self.origin_string(), id);
+        let id = object_url_id()?;
+        let url = format!("blob:{}/{id}", self.origin_string());
         self.object_urls.insert(
             url.clone(),
             ObjectUrlEntry {
