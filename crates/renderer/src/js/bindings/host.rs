@@ -300,6 +300,16 @@ pub(crate) fn reflect_set_double(
 pub(crate) fn instance<'js, T: JsClass<'js>>(ctx: &Ctx<'js>, value: T) -> Result<Class<'js, T>> {
     let prototype = T::prototype(ctx)?
         .ok_or_else(|| Exception::throw_internal(ctx, "native interface has no prototype"))?;
+    instance_proto(value, prototype)
+}
+
+/// Create a platform object bound to `prototype`: the one construction point
+/// for native wrappers
+/// (<https://webidl.spec.whatwg.org/#dfn-platform-object>).
+pub(crate) fn instance_proto<'js, T: JsClass<'js>>(
+    value: T,
+    prototype: Object<'js>,
+) -> Result<Class<'js, T>> {
     Class::instance_proto(value, prototype)
 }
 
@@ -315,7 +325,7 @@ pub(crate) fn instance_for_node<'js, T: JsClass<'js>>(
         .borrow()
         .brand(T::NAME)
         .ok_or_else(|| Exception::throw_internal(ctx, "node owner has no interface prototype"))?;
-    Class::instance_proto(value, prototype.restore(ctx)?)
+    instance_proto(value, prototype.restore(ctx)?)
 }
 
 pub(crate) fn constructor<'js>(

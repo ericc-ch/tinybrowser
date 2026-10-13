@@ -35,7 +35,7 @@ use crate::dom::tree::{
 };
 
 use super::super::adopt_into_document;
-use crate::js::world::{DocumentStreamCommand, NodeReference, Wrapper};
+use crate::js::world::{DocumentStreamCommand, NodeReference};
 
 use crate::ReadyState;
 
@@ -2042,7 +2042,7 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
     pub(super) fn get_scripts<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world(ctx)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::Scripts)
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "HTMLCollection")
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -2056,7 +2056,7 @@ impl JsNode {
         let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
-            Wrapper::Scripts,
+            "HTMLCollection",
             Persistent::save(ctx, weak),
         );
         Ok(value)

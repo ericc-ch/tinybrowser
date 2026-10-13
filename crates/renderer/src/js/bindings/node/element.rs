@@ -30,7 +30,7 @@ use crate::dom::tree::{
 use crate::dom_string::DomString;
 
 use crate::documents::JournalEntry;
-use crate::js::world::{NodeReference, Wrapper};
+use crate::js::world::NodeReference;
 
 use super::JsNode;
 use super::core::{adopt_node, insert_tree_node, insertion_tree_nodes, upgrade_parsed_tree};
@@ -1634,7 +1634,7 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-element-classlist
     pub(super) fn class_list<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world(ctx)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::TokenList)
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "DOMTokenList")
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -1650,7 +1650,7 @@ impl JsNode {
         let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
-            Wrapper::TokenList,
+            "DOMTokenList",
             Persistent::save(ctx, weak),
         );
         Ok(value)
@@ -1659,7 +1659,7 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#concept-domstringmap-pairs
     pub(super) fn dataset<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world_for_node(ctx, self.handle.0)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::Dataset)
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "DOMStringMap")
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -1670,7 +1670,7 @@ impl JsNode {
         let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
-            Wrapper::Dataset,
+            "DOMStringMap",
             Persistent::save(ctx, weak),
         );
         Ok(value)
@@ -1853,9 +1853,7 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-element-attributes
     pub(super) fn attributes<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world_for_node(ctx, self.handle.0)?;
-        if let Some(saved) = world_rc
-            .borrow()
-            .wrapper(self.handle.0, Wrapper::NamedNodeMap)
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "NamedNodeMap")
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -1871,7 +1869,7 @@ impl JsNode {
         let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
-            Wrapper::NamedNodeMap,
+            "NamedNodeMap",
             Persistent::save(ctx, weak),
         );
         Ok(value)
@@ -2330,7 +2328,7 @@ impl JsNode {
         let world_rc = world_for_node(ctx, self.handle.0)?;
         if let Some(saved) = world_rc
             .borrow()
-            .wrapper(self.handle.0, Wrapper::StyleDeclaration)
+            .wrapper(self.handle.0, "CSSStyleDeclaration")
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -2341,7 +2339,7 @@ impl JsNode {
         let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
-            Wrapper::StyleDeclaration,
+            "CSSStyleDeclaration",
             Persistent::save(ctx, weak),
         );
         Ok(value)

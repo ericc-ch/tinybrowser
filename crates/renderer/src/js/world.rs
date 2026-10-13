@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::rc::{Rc, Weak};
 
 use blitz_traits::node_id::NodeId as BlitzNodeId;
@@ -38,7 +39,7 @@ pub(crate) struct RealmRegistry {
     /// One wrapper per node, shared by every realm in this renderer process.
     /// The persistent holds a `WeakRef`, so an unreferenced wrapper can still
     /// be collected.
-    wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
+    wrappers: WrapperCache<NodeId>,
     /// The active child document for each connected iframe container.
     frame_documents: HashMap<NodeId, NodeId>,
     /// The realm that created each node. Adoption changes the node document
@@ -62,6 +63,52 @@ pub(crate) struct RealmRegistry {
 pub(crate) struct PrivateSlots {
     pub(crate) factory: Persistent<Function<'static>>,
     pub(crate) realms: HashSet<usize>,
+}
+
+/// Cached JS platform objects, keyed by whatever identifies the object: a
+/// node for the shared wrapper, a `(node, interface)` pair for the
+/// lazily-created same-object members.
+///
+/// A cache entry holds a `WeakRef` (a `Persistent` to a weak wrapper), so an
+/// unreferenced object can still be collected; callers dereference with
+/// `deref_weak` and rebuild on a miss.
+pub(crate) struct WrapperCache<K> {
+    entries: HashMap<K, Persistent<Value<'static>>>,
+}
+
+impl<K> Default for WrapperCache<K> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash> WrapperCache<K> {
+    pub(crate) fn get(&self, key: &K) -> Option<Persistent<Value<'static>>> {
+        self.entries.get(key).cloned()
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: Persistent<Value<'static>>) {
+        self.entries.insert(key, value);
+    }
+
+    /// Moves an entry to a new key; adoption retargets the caller's wrapper
+    /// to the destination copy
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    pub(crate) fn rekey(&mut self, from: &K, to: K) {
+        if let Some(value) = self.entries.remove(from) {
+            self.entries.insert(to, value);
+        }
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        self.entries.retain(|key, _| keep(key));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl RealmRegistry {
@@ -119,7 +166,7 @@ impl RealmRegistry {
     pub(crate) fn forget_document(&mut self, id: u32) {
         self.attributes.forget_document(id);
         self.documents.remove(&id);
-        self.wrappers.retain(|node, _| node.document_id() != id);
+        self.wrappers.retain(|node| node.document_id() != id);
         self.frame_documents
             .retain(|_, document| document.document_id() != id);
         self.creation_realms
@@ -130,7 +177,7 @@ impl RealmRegistry {
 
     /// The shared wrapper cache entry for `id`, when one exists.
     pub(crate) fn wrapper(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.wrappers.get(&id).cloned()
+        self.wrappers.get(&id)
     }
 
     /// Publishes the wrapper cache entry for `id`.
@@ -147,9 +194,7 @@ impl RealmRegistry {
         if from != to {
             self.adopted_ids.insert(from, to);
         }
-        if let Some(value) = self.wrappers.remove(&from) {
-            self.wrappers.insert(to, value);
-        }
+        self.wrappers.rekey(&from, to);
         if let Some(world) = self.creation_realms.remove(&from) {
             self.creation_realms.insert(to, world);
         }
@@ -413,23 +458,12 @@ pub(crate) struct ObjectUrlEntry {
 ///
 /// Each interface creates its platform object once per element, so
 /// `element.classList === element.classList`; the cache is keyed by node and
-/// interface and cleared whenever the realm's wrappers are invalidated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Wrapper {
-    /// `Element.classList`.
-    TokenList,
-    /// `Element.attributes`.
-    NamedNodeMap,
-    /// `HTMLElement.style`.
-    StyleDeclaration,
-    /// `HTMLElement.dataset`.
-    Dataset,
-    /// `Node.childNodes`.
-    ChildNodes,
-    /// `Document.scripts`.
-    Scripts,
-}
-
+/// the IDL interface name of the object (`DOMTokenList` for
+/// `Element.classList`, `NamedNodeMap` for `Element.attributes`,
+/// `CSSStyleDeclaration` for `HTMLElement.style`, `DOMStringMap` for
+/// `HTMLElement.dataset`, `NodeList` for `Node.childNodes`, `HTMLCollection`
+/// for `Document.scripts`) and cleared whenever the realm's wrappers are
+/// invalidated.
 pub(crate) struct WeakReferences {
     pub(crate) constructor: Persistent<rquickjs::function::Constructor<'static>>,
     pub(crate) deref: Persistent<Function<'static>>,
@@ -506,7 +540,7 @@ pub(crate) struct World {
     next_standalone_target: u64,
     /// Lazily-created platform objects whose identity is one per (node,
     /// interface), so `element.classList === element.classList` and friends.
-    wrappers: HashMap<(NodeId, Wrapper), Persistent<Value<'static>>>,
+    wrappers: WrapperCache<(NodeId, &'static str)>,
     implementations: HashMap<u32, Persistent<Value<'static>>>,
     /// The focused element of each document
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
@@ -674,7 +708,7 @@ impl World {
             listeners: HashMap::new(),
             standalone_targets: HashMap::new(),
             next_standalone_target: 0,
-            wrappers: HashMap::new(),
+            wrappers: WrapperCache::default(),
             implementations: HashMap::new(),
             active_elements: HashMap::new(),
             selections: HashMap::new(),
@@ -1578,18 +1612,22 @@ impl World {
     }
 
     /// One cached platform object, if this realm created it.
-    pub(crate) fn wrapper(&self, id: NodeId, kind: Wrapper) -> Option<Persistent<Value<'static>>> {
-        self.wrappers.get(&(id, kind)).cloned()
+    pub(crate) fn wrapper(
+        &self,
+        id: NodeId,
+        interface: &'static str,
+    ) -> Option<Persistent<Value<'static>>> {
+        self.wrappers.get(&(id, interface))
     }
 
     /// Caches one platform object for the node and interface.
     pub(crate) fn intern_wrapper(
         &mut self,
         id: NodeId,
-        kind: Wrapper,
+        interface: &'static str,
         value: Persistent<Value<'static>>,
     ) {
-        self.wrappers.insert((id, kind), value);
+        self.wrappers.insert((id, interface), value);
     }
 
     /// The focused element of a document, if any.

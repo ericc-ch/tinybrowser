@@ -830,13 +830,27 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 /// `brand`.
 fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value<'js>> {
     let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
-    // A node's relevant realm is the one that created it, even after
-    // `adoptNode` changes its node document
-    // (<https://dom.spec.whatwg.org/#concept-node-adopt>,
-    // <https://github.com/whatwg/dom/issues/977>).
-    // An iframe document created while a parent script runs has no realm yet,
-    // so that world has no brands; use this realm's until that realm exists
-    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+    if let Some(proto) = node_wrapper_prototype(ctx, id, brand)? {
+        class.set_prototype(Some(&proto))?;
+    }
+    Ok(Class::into_value(class))
+}
+
+/// The interface prototype a node's wrapper must use.
+///
+/// A node's relevant realm is the one that created it, even after
+/// `adoptNode` changes its node document
+/// (<https://dom.spec.whatwg.org/#concept-node-adopt>,
+/// <https://github.com/whatwg/dom/issues/977>).
+/// An iframe document created while a parent script runs has no realm yet,
+/// so that world has no brands; fall back to the owning document's realm and
+/// then to this realm until that realm exists
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+fn node_wrapper_prototype<'js>(
+    ctx: &Ctx<'js>,
+    id: NodeId,
+    brand: &str,
+) -> Result<Option<Object<'js>>> {
     let world_rc = world(ctx)?;
     let owner = world_rc.borrow().owner_world(id);
     if let Some(owner) = owner.as_ref() {
@@ -852,10 +866,7 @@ fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value
         .and_then(|creator| creator.borrow().brand(brand))
         .or_else(|| owner.as_ref().and_then(|owner| owner.borrow().brand(brand)))
         .or_else(|| world_rc.borrow().brand(brand));
-    if let Some(proto) = proto {
-        class.set_prototype(Some(&proto.restore(ctx)?))?;
-    }
-    Ok(Class::into_value(class))
+    proto.map(|proto| proto.restore(ctx)).transpose()
 }
 
 /// The element interface for a qualified name

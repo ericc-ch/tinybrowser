@@ -34,7 +34,7 @@ use crate::dom::tree::{
 };
 
 use crate::documents::JournalEntry;
-use crate::js::world::{Handle, NodeReference, Wrapper};
+use crate::js::world::{Handle, NodeReference};
 
 use super::JsNode;
 use super::document::{apply_meta_referrer, clear_nonce_on_connect, prepare_classic_script};
@@ -1056,9 +1056,7 @@ impl JsNode {
     pub(super) fn child_nodes<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         // `[SameObject]`: one NodeList per node.
         let world_rc = world(ctx)?;
-        if let Some(saved) = world_rc
-            .borrow()
-            .wrapper(self.handle.0, Wrapper::ChildNodes)
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "NodeList")
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -1067,7 +1065,7 @@ impl JsNode {
         let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
-            Wrapper::ChildNodes,
+            "NodeList",
             Persistent::save(ctx, weak),
         );
         Ok(value)
