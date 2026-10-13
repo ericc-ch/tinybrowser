@@ -2,13 +2,8 @@
 
 use super::{throw_dom, throw_dom_error, world, world_for_node, wrap_new_document};
 
-use crate::dom::adoption::{
-    ImportSnapshot, adopt_across_store, live_child_ids, materialize_import,
-};
+use crate::dom::adoption::{adopt_across_store, import_snapshot, materialize_import};
 use crate::dom::tree::NodeId;
-
-use blitz_dom::NodeData;
-use markup5ever::QualName;
 
 use rquickjs::{Ctx, Exception, Result, Value};
 
@@ -241,12 +236,12 @@ pub(crate) fn copy_nonce_subtree(
 /// node in the same arena, so the document node itself is never snapshotted.
 pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
-    let (content_type, xml_document, quirks_mode, children) = {
+    let (content_type, xml_document, quirks_mode, snapshots) = {
         let world = world_rc.borrow();
         let Some(parsed) = world.document(id) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        let children = if deep {
+        let snapshots = if deep {
             let root = parsed.document.base.root_node().id;
             parsed
                 .document
@@ -255,10 +250,15 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
                 .map(|node| {
                     node.children
                         .iter()
-                        .copied()
-                        .map(|kid| NodeId {
-                            document: id.document,
-                            node: kid,
+                        .filter_map(|kid| {
+                            import_snapshot(
+                                &parsed.document,
+                                NodeId {
+                                    document: id.document,
+                                    node: *kid,
+                                },
+                                true,
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
@@ -270,15 +270,9 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
             parsed.content_type,
             parsed.xml_document,
             parsed.quirks_mode,
-            children,
+            snapshots,
         )
     };
-    let mut snapshots = Vec::new();
-    for child in children {
-        if let Some(snapshot) = import_snapshot_live(ctx, child, true)? {
-            snapshots.push(snapshot);
-        }
-    }
     let font_ctx = world(ctx)?.borrow().runtime.font_ctx.clone();
     let mut parsed = crate::Parsed::script(content_type, font_ctx);
     parsed.xml_document = xml_document;
@@ -294,133 +288,4 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
             .append_children(root, &[child_id.node]);
     }
     wrap_new_document(ctx, parsed)
-}
-
-/// Snapshots `id` for cross-document cloning
-/// (<https://dom.spec.whatwg.org/#concept-node-clone>).
-pub(crate) fn import_snapshot_live(
-    ctx: &Ctx<'_>,
-    id: NodeId,
-    deep: bool,
-) -> Result<Option<ImportSnapshot>> {
-    let kind = live_kind(ctx, id)?;
-    match kind {
-        LiveKind::None => Ok(None),
-        LiveKind::Ready(snapshot) => Ok(Some(snapshot)),
-        LiveKind::Fragment(children) => {
-            let children = if deep {
-                live_snapshot_children(ctx, children)?
-            } else {
-                Vec::new()
-            };
-            Ok(Some(ImportSnapshot::Fragment(children)))
-        }
-        LiveKind::Element {
-            name,
-            attributes,
-            children,
-        } => {
-            let children = if deep {
-                live_snapshot_children(ctx, children)?
-            } else {
-                Vec::new()
-            };
-            Ok(Some(ImportSnapshot::Element {
-                name,
-                attributes,
-                children,
-            }))
-        }
-    }
-}
-
-/// Classifies one live node for snapshotting: fragments snapshot as
-/// fragments, elements with their name/attributes/children, text and
-/// comments as character data.
-fn live_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<LiveKind> {
-    let owner = world_for_node(ctx, id)?;
-    let world = owner.borrow();
-    let Some(parsed) = world.document(id) else {
-        return Ok(LiveKind::None);
-    };
-    let doc = &parsed.document;
-    if doc.is_fragment(id.node) {
-        return Ok(LiveKind::Fragment(live_child_ids(doc, id)));
-    }
-    Ok(match doc.base.get_node(id.node).map(|node| &node.data) {
-        Some(NodeData::Element(element)) => {
-            // Template children live in the contents fragment.
-            let children = if crate::dom::tree::is_template_tag(&element.name) {
-                element
-                    .template_contents
-                    .map(|fragment| {
-                        live_child_ids(
-                            doc,
-                            NodeId {
-                                document: id.document,
-                                node: fragment,
-                            },
-                        )
-                    })
-                    .unwrap_or_default()
-            } else {
-                live_child_ids(doc, id)
-            };
-            LiveKind::Element {
-                name: element.name.clone(),
-                attributes: element.attrs.iter().cloned().collect(),
-                children,
-            }
-        }
-        Some(NodeData::Text(_)) => {
-            LiveKind::Ready(ImportSnapshot::Text(doc.character_data(id.node)))
-        }
-        Some(NodeData::Comment { .. }) => {
-            LiveKind::Ready(ImportSnapshot::Comment(doc.character_data(id.node)))
-        }
-        Some(NodeData::Doctype {
-            name,
-            public_id,
-            system_id,
-        }) => LiveKind::Ready(ImportSnapshot::DocumentType {
-            name: name.clone(),
-            public_id: public_id.clone(),
-            system_id: system_id.clone(),
-        }),
-        Some(NodeData::ProcessingInstruction { target, .. }) => {
-            LiveKind::Ready(ImportSnapshot::ProcessingInstruction {
-                target: target.clone(),
-                data: doc.character_data(id.node),
-            })
-        }
-        Some(NodeData::CDataSection { .. }) => {
-            LiveKind::Ready(ImportSnapshot::CData(doc.character_data(id.node)))
-        }
-        Some(NodeData::AnonymousBlock(_) | NodeData::Fragment { .. }) => {
-            LiveKind::Fragment(live_child_ids(doc, id))
-        }
-        Some(NodeData::Document(_)) | None => LiveKind::None,
-    })
-}
-
-enum LiveKind {
-    None,
-    Ready(ImportSnapshot),
-    Fragment(Vec<NodeId>),
-    Element {
-        name: QualName,
-        attributes: Vec<blitz_dom::Attribute>,
-        children: Vec<NodeId>,
-    },
-}
-
-/// Deep-snapshots live `children` through their owning realms.
-fn live_snapshot_children(ctx: &Ctx<'_>, children: Vec<NodeId>) -> Result<Vec<ImportSnapshot>> {
-    let mut snapshots = Vec::new();
-    for child in children {
-        if let Some(snapshot) = import_snapshot_live(ctx, child, true)? {
-            snapshots.push(snapshot);
-        }
-    }
-    Ok(snapshots)
 }

@@ -829,10 +829,17 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 /// Instantiates a `JsNode` wrapper with the realm-owner's prototype for
 /// `brand`.
 fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value<'js>> {
-    let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
-    if let Some(proto) = node_wrapper_prototype(ctx, id, brand)? {
-        class.set_prototype(Some(&proto))?;
-    }
+    let value = JsNode { handle: Handle(id) };
+    let class = if let Some(prototype) = node_wrapper_prototype(ctx, id, brand)? {
+        host::instance_proto(value, prototype)?
+    } else {
+        // No brand yet (a frame document whose realm does not exist): the
+        // registered Node class prototype until that realm installs its
+        // brands.
+        let prototype = Class::<JsNode>::prototype(ctx)?
+            .ok_or_else(|| Exception::throw_internal(ctx, "native Node class has no prototype"))?;
+        host::instance_proto(value, prototype)?
+    };
     Ok(Class::into_value(class))
 }
 

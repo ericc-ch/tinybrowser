@@ -231,9 +231,8 @@ pub(crate) fn first_element_with_id(
 /// first matching `form` in tree order when the control is in a document;
 /// otherwise the nearest ancestor `form` is used.
 ///
-/// If the attribute is set but does not identify a `form`, this still falls
-/// through to the ancestor (the spec's `new-form` steps). Chromium leaves the
-/// owner null in that case; the spec algorithm is the one that applies here.
+/// If the attribute is set on a connected element but does not identify a
+/// `form`, the owner is null; the ancestor is not consulted.
 pub(crate) fn form_owner_of(
     base: &blitz_dom::BaseDocument,
     document: u32,
@@ -307,23 +306,21 @@ pub(crate) fn sibling(
             .and_then(|index| siblings.get(index).copied())
     }
 }
-pub(crate) fn is_element(base: &blitz_dom::BaseDocument, id: crate::dom::tree::BlitzId) -> bool {
+
+/// Whether `id` is an element node (including fragment backings, which are
+/// flagged elements).
+pub(crate) fn is_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     base.get_node(id)
         .is_some_and(|node| matches!(node.data, NodeData::Element(_)))
 }
 
-pub(crate) fn is_real_element(
-    doc: &crate::documents::BlitzDocument,
-    id: crate::dom::tree::BlitzId,
-) -> bool {
+/// Whether `id` is an element that is not a fragment backing.
+pub(crate) fn is_real_element(doc: &crate::documents::BlitzDocument, id: BlitzId) -> bool {
     !doc.is_fragment(id) && is_element(&doc.base, id)
 }
 
 /// The root of the tree `id` participates in (itself when detached).
-pub(crate) fn root_of(
-    base: &blitz_dom::BaseDocument,
-    id: crate::dom::tree::BlitzId,
-) -> crate::dom::tree::BlitzId {
+pub(crate) fn root_of(base: &blitz_dom::BaseDocument, id: BlitzId) -> BlitzId {
     let mut root = id;
     while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
         root = parent;
@@ -335,7 +332,7 @@ pub(crate) fn root_of(
 pub(crate) fn ancestor_chain(
     base: &blitz_dom::BaseDocument,
     document: u32,
-    id: crate::dom::tree::BlitzId,
+    id: BlitzId,
 ) -> Vec<NodeId> {
     let mut chain = vec![NodeId { document, node: id }];
     let mut cursor = id;
@@ -354,8 +351,8 @@ pub(crate) fn ancestor_chain(
 pub(crate) fn tree_order(
     base: &blitz_dom::BaseDocument,
     document: u32,
-    a: crate::dom::tree::BlitzId,
-    b: crate::dom::tree::BlitzId,
+    a: BlitzId,
+    b: BlitzId,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let chain_a = ancestor_chain(base, document, a);

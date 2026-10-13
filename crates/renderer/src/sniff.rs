@@ -87,10 +87,18 @@ fn xml_encoding(bytes: &[u8], eof: bool) -> Option<(&'static encoding_rs::Encodi
         return Some((encoding_rs::UTF_8, 0));
     };
     let declaration = &window[..end];
-    Some((
-        xml_encoding_attribute(declaration).unwrap_or(encoding_rs::UTF_8),
-        0,
-    ))
+    let declared = xml_encoding_attribute(declaration).unwrap_or(encoding_rs::UTF_8);
+    // The declaration was read as ASCII, so a UTF-16 label cannot be true:
+    // browsers remap an XML-header encoding to its closest byte-based
+    // equivalent, which for the UTF-16 labels is UTF-8 (Chromium
+    // `TextEncoding::ClosestByteBasedEquivalent`). A document that really is
+    // UTF-16 starts with a BOM or the null-byte pattern handled above.
+    let encoding = if declared == encoding_rs::UTF_16LE || declared == encoding_rs::UTF_16BE {
+        encoding_rs::UTF_8
+    } else {
+        declared
+    };
+    Some((encoding, 0))
 }
 
 /// The `encoding` pseudo-attribute of an XML declaration, resolved as an

@@ -6,10 +6,10 @@ use super::super::{
     WebIdlString, attr_wrapper, child_value, deref_weak, document_base_url_string,
     document_is_html, document_is_html_content, document_url_string, element_at_point,
     elements_by_tag, find_element_by_id, fixup_focus_after_removal, host, host_node_id,
-    import_attr, import_snapshot_live, is_main_document, live_collection, make_weak,
-    new_detached_attr, required_node, schedule_mutation_delivery, set_attribute_sync, throw_dom,
-    throw_dom_error, valid_attribute_local_name, valid_element_local_name, validate_and_extract,
-    with_node_data, world, world_for_node, wrap_new_document_in_world, wrap_node,
+    import_attr, is_main_document, live_collection, make_weak, new_detached_attr, required_node,
+    schedule_mutation_delivery, set_attribute_sync, throw_dom, throw_dom_error,
+    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
+    world, world_for_node, wrap_new_document_in_world, wrap_node,
 };
 use crate::dom::adoption::{ImportSnapshot, import_snapshot, materialize_import};
 use rquickjs::function::Rest;
@@ -35,7 +35,7 @@ use crate::dom::tree::{
 };
 
 use super::super::adopt_into_document;
-use crate::js::world::{DocumentStreamCommand, NodeReference};
+use crate::js::world::{DocumentStreamCommand, NodeReference, SameObject};
 
 use crate::ReadyState;
 
@@ -886,10 +886,14 @@ impl JsNode {
                 "cannot import a document",
             ));
         }
-        let tree = import_snapshot_live(&ctx, source_id, deep)?;
-        let Some(tree) = tree else {
-            return Err(Exception::throw_type(&ctx, "stale node"));
-        };
+        let tree = world_rc
+            .borrow()
+            .store()
+            .get(source_id.document)
+            .and_then(|parsed| {
+                crate::dom::adoption::import_snapshot(&parsed.document, source_id, deep)
+            })
+            .ok_or_else(|| Exception::throw_type(&ctx, "stale node"))?;
         let world = world_rc.borrow();
         let Some(mut target) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
@@ -1897,7 +1901,7 @@ pub(super) fn parse_referrer_policy(content: &str) -> Option<String> {
 /// a classic inline script. Empty scripts return without setting already
 /// started. External and module scripts are not prepared here.
 pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
-    let source = {
+    let (source, base_line) = {
         let world = world(ctx)?;
         let world = world.borrow();
         let Some(parsed) = world.document(id) else {
@@ -1910,9 +1914,9 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             return Ok(());
         }
         match crate::js::script_at(&world, id) {
-            Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline {
-                source, ..
-            })) => source,
+            Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline { source, line })) => {
+                (source, line)
+            }
             _ => return Ok(()),
         }
     };
@@ -1930,7 +1934,18 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     world(ctx)?.borrow_mut().current_script = Some(id);
     let mut options = EvalOptions::default();
     options.strict = false;
-    let _: rquickjs::Result<Value> = ctx.eval_with_options(source, options);
+    if let Err(error) = ctx.eval_with_options::<Value, _>(source, options) {
+        // A script inserted from script reports through the same pipeline as
+        // a parser script: the exception reaches `window.onerror` and the
+        // `error` event instead of staying pending
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script>).
+        let filename = world_for_node(ctx, id)?
+            .borrow()
+            .document_url
+            .as_str()
+            .to_owned();
+        crate::js::report_script_error(ctx, &error, base_line, &filename);
+    }
     world(ctx)?.borrow_mut().current_script = previous;
     Ok(())
 }
@@ -2042,7 +2057,9 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
     pub(super) fn get_scripts<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world(ctx)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "HTMLCollection")
+        if let Some(saved) = world_rc
+            .borrow()
+            .same_object(self.handle.0, SameObject::Scripts)
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -2054,9 +2071,9 @@ impl JsNode {
             Some("HTMLCollection"),
         )?;
         let weak = make_weak(ctx, value.clone())?;
-        world_rc.borrow_mut().intern_wrapper(
+        world_rc.borrow_mut().intern_same_object(
             self.handle.0,
-            "HTMLCollection",
+            SameObject::Scripts,
             Persistent::save(ctx, weak),
         );
         Ok(value)

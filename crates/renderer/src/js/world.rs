@@ -40,6 +40,11 @@ pub(crate) struct RealmRegistry {
     /// The persistent holds a `WeakRef`, so an unreferenced wrapper can still
     /// be collected.
     wrappers: WrapperCache<NodeId>,
+    /// One platform object per `[SameObject]` member, shared by every realm
+    /// in this renderer process like the node wrappers themselves: the
+    /// member object belongs to the node, not to the realm that first read
+    /// it.
+    same_object: WrapperCache<(NodeId, SameObject)>,
     /// The active child document for each connected iframe container.
     frame_documents: HashMap<NodeId, NodeId>,
     /// The realm that created each node. Adoption changes the node document
@@ -66,7 +71,7 @@ pub(crate) struct PrivateSlots {
 }
 
 /// Cached JS platform objects, keyed by whatever identifies the object: a
-/// node for the shared wrapper, a `(node, interface)` pair for the
+/// node for the shared wrapper, a `(node, member)` pair for the
 /// lazily-created same-object members.
 ///
 /// A cache entry holds a `WeakRef` (a `Persistent` to a weak wrapper), so an
@@ -109,6 +114,40 @@ impl<K: Eq + Hash> WrapperCache<K> {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
     }
+}
+
+/// A lazily-created member whose identity is one per node
+/// (`[SameObject]` in IDL).
+///
+/// The cache is keyed by node and member, not by interface: `Document.children`
+/// and `Document.scripts` are both `HTMLCollection`, and `classList`/`relList`
+/// are both `DOMTokenList`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SameObject {
+    /// `Element.classList`.
+    ClassList,
+    /// `Element.attributes`.
+    Attributes,
+    /// `HTMLElement.style`.
+    Style,
+    /// `HTMLElement.dataset`.
+    Dataset,
+    /// `Node.childNodes`.
+    ChildNodes,
+    /// `Document.scripts`.
+    Scripts,
+}
+
+impl SameObject {
+    /// Every member, for rekeying the cache on adoption.
+    pub(crate) const ALL: [SameObject; 6] = [
+        SameObject::ClassList,
+        SameObject::Attributes,
+        SameObject::Style,
+        SameObject::Dataset,
+        SameObject::ChildNodes,
+        SameObject::Scripts,
+    ];
 }
 
 impl RealmRegistry {
@@ -167,6 +206,8 @@ impl RealmRegistry {
         self.attributes.forget_document(id);
         self.documents.remove(&id);
         self.wrappers.retain(|node| node.document_id() != id);
+        self.same_object
+            .retain(|(node, _)| node.document_id() != id);
         self.frame_documents
             .retain(|_, document| document.document_id() != id);
         self.creation_realms
@@ -178,6 +219,25 @@ impl RealmRegistry {
     /// The shared wrapper cache entry for `id`, when one exists.
     pub(crate) fn wrapper(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
         self.wrappers.get(&id)
+    }
+
+    /// The cached `[SameObject]` member for `(id, member)`, when one exists.
+    pub(crate) fn same_object(
+        &self,
+        id: NodeId,
+        member: SameObject,
+    ) -> Option<Persistent<Value<'static>>> {
+        self.same_object.get(&(id, member))
+    }
+
+    /// Publishes the cached `[SameObject]` member.
+    pub(crate) fn intern_same_object(
+        &mut self,
+        id: NodeId,
+        member: SameObject,
+        value: Persistent<Value<'static>>,
+    ) {
+        self.same_object.insert((id, member), value);
     }
 
     /// Publishes the wrapper cache entry for `id`.
@@ -195,6 +255,11 @@ impl RealmRegistry {
             self.adopted_ids.insert(from, to);
         }
         self.wrappers.rekey(&from, to);
+        // The member objects follow the node too, so a held `classList` stays
+        // the element's `classList` across adoption.
+        for member in SameObject::ALL {
+            self.same_object.rekey(&(from, member), (to, member));
+        }
         if let Some(world) = self.creation_realms.remove(&from) {
             self.creation_realms.insert(to, world);
         }
@@ -260,6 +325,7 @@ impl RealmRegistry {
         self.documents.clear();
         self.frames.clear();
         self.wrappers.clear();
+        self.same_object.clear();
         self.frame_documents.clear();
         self.creation_realms.clear();
         self.adopted_ids.clear();
@@ -454,16 +520,6 @@ pub(crate) struct ObjectUrlEntry {
     pub(crate) content_type: Rc<str>,
 }
 
-/// One lazily-created sub-object cached per node.
-///
-/// Each interface creates its platform object once per element, so
-/// `element.classList === element.classList`; the cache is keyed by node and
-/// the IDL interface name of the object (`DOMTokenList` for
-/// `Element.classList`, `NamedNodeMap` for `Element.attributes`,
-/// `CSSStyleDeclaration` for `HTMLElement.style`, `DOMStringMap` for
-/// `HTMLElement.dataset`, `NodeList` for `Node.childNodes`, `HTMLCollection`
-/// for `Document.scripts`) and cleared whenever the realm's wrappers are
-/// invalidated.
 pub(crate) struct WeakReferences {
     pub(crate) constructor: Persistent<rquickjs::function::Constructor<'static>>,
     pub(crate) deref: Persistent<Function<'static>>,
@@ -538,9 +594,6 @@ pub(crate) struct World {
     /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
     standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
     next_standalone_target: u64,
-    /// Lazily-created platform objects whose identity is one per (node,
-    /// interface), so `element.classList === element.classList` and friends.
-    wrappers: WrapperCache<(NodeId, &'static str)>,
     implementations: HashMap<u32, Persistent<Value<'static>>>,
     /// The focused element of each document
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
@@ -708,7 +761,6 @@ impl World {
             listeners: HashMap::new(),
             standalone_targets: HashMap::new(),
             next_standalone_target: 0,
-            wrappers: WrapperCache::default(),
             implementations: HashMap::new(),
             active_elements: HashMap::new(),
             selections: HashMap::new(),
@@ -753,7 +805,6 @@ impl World {
         self.current_script = None;
         self.custom_construction.clear();
         self.listeners.clear();
-        self.wrappers.clear();
         self.implementations.clear();
         self.active_elements.clear();
         self.selections.clear();
@@ -948,8 +999,8 @@ impl World {
     ///
     /// Safe to call while a script runs: it allocates frame identities and
     /// tree entries only. The document and its realm are created later, by
-    /// [`World::materialize_frames`], because `QuickJS` forbids entering a new
-    /// realm while another realm executes.
+    /// the frame host the `document` layer installs, because `QuickJS`
+    /// forbids entering a new realm while another realm executes.
     pub(crate) fn register_pending_frames(&mut self, before: Option<NodeId>) -> Vec<NodeId> {
         let mut created = Vec::new();
         let containers = self.iframe_containers_before(before);
@@ -966,7 +1017,7 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
     ///
     /// Allocates the frame identity only. The nested document is created
-    /// later, by [`World::materialize_frames`].
+    /// later, by the frame host the `document` layer installs.
     pub(crate) fn register_frame_for_container(&mut self, container: NodeId) -> bool {
         if self
             .runtime
@@ -1582,7 +1633,6 @@ impl World {
         self.standalone_targets.clear();
         self.window = None;
         self.next_standalone_target = 0;
-        self.wrappers.clear();
         self.implementations.clear();
         self.brands.clear();
         self.handler_attributes.clear();
@@ -1611,23 +1661,27 @@ impl World {
         self.bridge = None;
     }
 
-    /// One cached platform object, if this realm created it.
-    pub(crate) fn wrapper(
+    /// The cached `[SameObject]` member for `(id, member)`, when this
+    /// renderer process created one.
+    pub(crate) fn same_object(
         &self,
         id: NodeId,
-        interface: &'static str,
+        member: SameObject,
     ) -> Option<Persistent<Value<'static>>> {
-        self.wrappers.get(&(id, interface))
+        self.runtime.registry.borrow().same_object(id, member)
     }
 
-    /// Caches one platform object for the node and interface.
-    pub(crate) fn intern_wrapper(
+    /// Caches one `[SameObject]` member for the node.
+    pub(crate) fn intern_same_object(
         &mut self,
         id: NodeId,
-        interface: &'static str,
+        member: SameObject,
         value: Persistent<Value<'static>>,
     ) {
-        self.wrappers.insert((id, interface), value);
+        self.runtime
+            .registry
+            .borrow_mut()
+            .intern_same_object(id, member, value);
     }
 
     /// The focused element of a document, if any.

@@ -204,10 +204,9 @@ pub(crate) fn siblings_around(
     (previous, next)
 }
 
-/// Records the removal of an already-parented `target`, then detaches it. A
-/// node with no parent is already detached; that is a no-op. The removal
-/// keeps its own `childList` record, so a move reads as removed plus added
-/// (<https://dom.spec.whatwg.org/#concept-node-remove>).
+/// The HTML `iframe` containers in the inclusive subtrees of `roots`, whose
+/// child navigables the caller destroys after releasing the tree borrow.
+#[must_use = "destroy these child navigables after releasing the tree borrow"]
 pub(crate) fn iframe_containers_in_subtrees(
     parsed: &crate::Parsed,
     roots: &[NodeId],
@@ -230,6 +229,10 @@ pub(crate) fn iframe_containers_in_subtrees(
     containers
 }
 
+/// Records the removal of an already-parented `target`, then detaches it. A
+/// node with no parent is already detached; that is a no-op. The removal
+/// keeps its own `childList` record, so a move reads as removed plus added
+/// (<https://dom.spec.whatwg.org/#concept-node-remove>).
 pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
     let document = target.document;
     let (parent, previous, next) = {
@@ -413,6 +416,7 @@ pub(crate) fn splice_parsed(
 /// fragment then records one empty childList on the fragment (the insert
 /// algorithm always queues that record). The parent gets one combined
 /// childList for the swap.
+#[must_use = "destroy these child navigables after releasing the tree borrow"]
 pub(crate) fn replace_all_with_node(
     parsed: &mut crate::Parsed,
     parent: NodeId,
@@ -455,6 +459,7 @@ pub(crate) fn replace_all_with_node(
 /// silently and one record carries the swap. Replacing with the same
 /// contents is silent
 /// (<https://dom.spec.whatwg.org/#concept-node-replace-all>).
+#[must_use = "destroy these child navigables after releasing the tree borrow"]
 pub(crate) fn replace_all_journaled(
     parsed: &mut crate::Parsed,
     parent: NodeId,
@@ -579,6 +584,7 @@ pub(crate) fn collect_html_insertion_steps(
         );
     }
 }
+
 /// The reference child of an insertion must already be parented at the
 /// parent (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
 pub(crate) fn ensure_parented(
@@ -686,6 +692,8 @@ pub(crate) fn ensure_document_content_model(
     Ok(())
 }
 
+/// A doctype child must precede every element child of its parent
+/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
 pub(crate) fn ensure_doctype_position(
     doc: &crate::documents::BlitzDocument,
     parent: NodeId,
@@ -715,6 +723,7 @@ pub(crate) fn ensure_doctype_position(
     }
     Ok(())
 }
+
 /// The `child` argument of `move`, after `moveBefore` rewrites a self-reference
 /// to the node's next sibling
 /// (<https://dom.spec.whatwg.org/#dom-parentnode-movebefore>).

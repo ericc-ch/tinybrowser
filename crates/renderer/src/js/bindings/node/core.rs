@@ -6,7 +6,7 @@ use super::super::{
     character_data, character_data_offset, child_value, clone_document,
     convert_union_nodes_into_node, copy_nonce_subtree, deref_weak, document_is_html_content,
     dom_string, drain_mutation_journal, element_sibling_value, fixup_focus_after_removal,
-    import_snapshot_live, live_collection, make_weak, schedule_mutation_delivery, select_error,
+    live_collection, make_weak, schedule_mutation_delivery, select_error,
     selector_matching_elements, set_character_data, set_pi_data, sibling_value, string_value,
     throw_dom, throw_dom_error, valid_attribute_local_name, with_node_data, world, world_for_node,
     wrap_node,
@@ -34,7 +34,7 @@ use crate::dom::tree::{
 };
 
 use crate::documents::JournalEntry;
-use crate::js::world::{Handle, NodeReference};
+use crate::js::world::{Handle, NodeReference, SameObject};
 
 use super::JsNode;
 use super::document::{apply_meta_referrer, clear_nonce_on_connect, prepare_classic_script};
@@ -883,8 +883,8 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         }
         let iframes = iframe_containers_in_subtrees(&parsed, &[self.handle.0]);
         unlink_journaled(&mut parsed, self.handle.0);
-        world.destroy_child_navigables(&iframes);
         drop(parsed);
+        world.destroy_child_navigables(&iframes);
         drop(world);
         fixup_focus_after_removal(&ctx, self.handle.0)?;
         schedule_mutation_delivery(&ctx)
@@ -1056,16 +1056,18 @@ impl JsNode {
     pub(super) fn child_nodes<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         // `[SameObject]`: one NodeList per node.
         let world_rc = world(ctx)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "NodeList")
+        if let Some(saved) = world_rc
+            .borrow()
+            .same_object(self.handle.0, SameObject::ChildNodes)
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
         }
         let value = live_collection(ctx, self.handle.0, CollectionKind::Children, None)?;
         let weak = make_weak(ctx, value.clone())?;
-        world_rc.borrow_mut().intern_wrapper(
+        world_rc.borrow_mut().intern_same_object(
             self.handle.0,
-            "NodeList",
+            SameObject::ChildNodes,
             Persistent::save(ctx, weak),
         );
         Ok(value)
@@ -1578,7 +1580,13 @@ impl JsNode {
         // equivalent yet; deep clones carry structure only.
         let live = deep || tree_is_fragment(&ctx, self.handle.0);
         let clone = if live {
-            let snapshot = import_snapshot_live(&ctx, self.handle.0, deep)?
+            let snapshot = world_rc
+                .borrow()
+                .store()
+                .get(self.handle.0.document)
+                .and_then(|parsed| {
+                    crate::dom::adoption::import_snapshot(&parsed.document, self.handle.0, deep)
+                })
                 .ok_or_else(|| Exception::throw_type(&ctx, "stale node"))?;
             let owner = world_for_node(&ctx, self.handle.0)?;
             let world = owner.borrow();
@@ -1654,8 +1662,8 @@ impl JsNode {
         }
         let iframes = iframe_containers_in_subtrees(&parsed, &[child]);
         unlink_journaled(&mut parsed, child);
-        world.destroy_child_navigables(&iframes);
         drop(parsed);
+        world.destroy_child_navigables(&iframes);
         drop(world);
         fixup_focus_after_removal(&ctx, child)?;
         schedule_mutation_delivery(&ctx)?;

@@ -30,7 +30,7 @@ use crate::dom::tree::{
 use crate::dom_string::DomString;
 
 use crate::documents::JournalEntry;
-use crate::js::world::NodeReference;
+use crate::js::world::{NodeReference, SameObject};
 
 use super::JsNode;
 use super::core::{adopt_node, insert_tree_node, insertion_tree_nodes, upgrade_parsed_tree};
@@ -1634,7 +1634,9 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-element-classlist
     pub(super) fn class_list<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world(ctx)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "DOMTokenList")
+        if let Some(saved) = world_rc
+            .borrow()
+            .same_object(self.handle.0, SameObject::ClassList)
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -1648,9 +1650,9 @@ impl JsNode {
         )?;
         let value = Class::into_value(class);
         let weak = make_weak(ctx, value.clone())?;
-        world_rc.borrow_mut().intern_wrapper(
+        world_rc.borrow_mut().intern_same_object(
             self.handle.0,
-            "DOMTokenList",
+            SameObject::ClassList,
             Persistent::save(ctx, weak),
         );
         Ok(value)
@@ -1658,8 +1660,10 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-domstringmap-pairs
     pub(super) fn dataset<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world_for_node(ctx, self.handle.0)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "DOMStringMap")
+        let world_rc = world(ctx)?;
+        if let Some(saved) = world_rc
+            .borrow()
+            .same_object(self.handle.0, SameObject::Dataset)
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -1668,9 +1672,9 @@ impl JsNode {
         let element = wrap_node(ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
         let weak = make_weak(ctx, value.clone())?;
-        world_rc.borrow_mut().intern_wrapper(
+        world_rc.borrow_mut().intern_same_object(
             self.handle.0,
-            "DOMStringMap",
+            SameObject::Dataset,
             Persistent::save(ctx, weak),
         );
         Ok(value)
@@ -1852,8 +1856,10 @@ impl JsNode {
 
     // https://dom.spec.whatwg.org/#dom-element-attributes
     pub(super) fn attributes<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world_for_node(ctx, self.handle.0)?;
-        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, "NamedNodeMap")
+        let world_rc = world(ctx)?;
+        if let Some(saved) = world_rc
+            .borrow()
+            .same_object(self.handle.0, SameObject::Attributes)
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -1867,9 +1873,9 @@ impl JsNode {
         )?;
         let value = Class::into_value(class);
         let weak = make_weak(ctx, value.clone())?;
-        world_rc.borrow_mut().intern_wrapper(
+        world_rc.borrow_mut().intern_same_object(
             self.handle.0,
-            "NamedNodeMap",
+            SameObject::Attributes,
             Persistent::save(ctx, weak),
         );
         Ok(value)
@@ -2325,10 +2331,10 @@ impl JsNode {
     }
 
     pub(super) fn style<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world_for_node(ctx, self.handle.0)?;
+        let world_rc = world(ctx)?;
         if let Some(saved) = world_rc
             .borrow()
-            .wrapper(self.handle.0, "CSSStyleDeclaration")
+            .same_object(self.handle.0, SameObject::Style)
             && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
@@ -2337,9 +2343,9 @@ impl JsNode {
         let element = wrap_node(ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
         let weak = make_weak(ctx, value.clone())?;
-        world_rc.borrow_mut().intern_wrapper(
+        world_rc.borrow_mut().intern_same_object(
             self.handle.0,
-            "CSSStyleDeclaration",
+            SameObject::Style,
             Persistent::save(ctx, weak),
         );
         Ok(value)

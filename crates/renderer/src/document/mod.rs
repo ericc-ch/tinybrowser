@@ -577,9 +577,10 @@ impl Document {
         let connected_set: std::collections::HashSet<crate::dom::tree::NodeId> =
             connected.iter().copied().collect();
         let mut iframe_events = Vec::new();
-        // Insertion is World::adopt_pending_frames / materialize_iframe in
-        // tree order with scripts. Scanning connected iframes here would
-        // start parser `src` loads before preceding classic scripts run.
+        // Insertion is the frame-host materialization (`Document`'s pending
+        // frames) / `materialize_iframe` in tree order with scripts. Scanning
+        // connected iframes here would start parser `src` loads before
+        // preceding classic scripts run.
         for container in &known {
             if !connected_set.contains(container) {
                 iframe_events.push(IframeLifecycle::Removed(*container));

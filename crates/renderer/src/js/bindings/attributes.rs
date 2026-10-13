@@ -37,20 +37,34 @@ pub struct JsTokenList {
 
 include!(concat!(env!("OUT_DIR"), "/DOMTokenList.rs"));
 
+impl JsTokenList {
+    /// The element this list belongs to. Adoption keeps the list object, so
+    /// every operation follows the adopted copy
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    fn live_element(&self, ctx: &Ctx<'_>) -> Result<NodeId> {
+        Ok(world(ctx)?
+            .borrow_mut()
+            .registry()
+            .borrow_mut()
+            .live_node_id(self.element.0))
+    }
+}
+
 impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     // https://dom.spec.whatwg.org/#dom-domtokenlist-length
     fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        Ok(class_tokens(ctx, self.element.0)?.len())
+        Ok(class_tokens(ctx, self.live_element(ctx)?)?.len())
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-value
     fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let element = self.live_element(ctx)?;
         let world = world(ctx)?;
         let value = world
             .borrow()
-            .document(self.element.0)
+            .document(element)
             .and_then(|parsed| {
-                crate::dom::tree::attr(&parsed.document.base, self.element.0.node, "class")
+                crate::dom::tree::attr(&parsed.document.base, element.node, "class")
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_default();
@@ -58,12 +72,12 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     }
 
     fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        write_class(ctx, self.element.0, &value.to_string()?)
+        write_class(ctx, self.live_element(ctx)?, &value.to_string()?)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-item
     fn item(&self, ctx: Ctx<'js>, index: u32) -> Result<Option<rquickjs::String<'js>>> {
-        let tokens = class_tokens(&ctx, self.element.0)?;
+        let tokens = class_tokens(&ctx, self.live_element(&ctx)?)?;
         match usize::try_from(index)
             .ok()
             .and_then(|index| tokens.get(index))
@@ -78,7 +92,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         // `contains` does not validate its argument
         // (<https://dom.spec.whatwg.org/#dom-domtokenlist-contains>).
         let token = token.to_string()?;
-        Ok(class_tokens(&ctx, self.element.0)?.contains(&token))
+        Ok(class_tokens(&ctx, self.live_element(&ctx)?)?.contains(&token))
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-add
@@ -90,7 +104,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         for token in &tokens {
             validate_token(&ctx, token)?;
         }
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         for token in tokens {
             if !current.contains(&token) {
                 current.push(token);
@@ -98,7 +112,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         }
         // The update steps run even when no token was added, normalizing
         // the attribute (<https://dom.spec.whatwg.org/#dom-domtokenlist-add>).
-        write_class_tokens(&ctx, self.element.0, &current)
+        write_class_tokens(&ctx, self.live_element(&ctx)?, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-remove
@@ -110,11 +124,11 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         for token in &tokens {
             validate_token(&ctx, token)?;
         }
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         for token in tokens {
             current.retain(|existing| existing != &token);
         }
-        write_class_tokens(&ctx, self.element.0, &current)
+        write_class_tokens(&ctx, self.live_element(&ctx)?, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-toggle
@@ -126,7 +140,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     ) -> Result<bool> {
         let token = token.to_string()?;
         validate_token(&ctx, &token)?;
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         let present = current.contains(&token);
         let should_be_present = force.unwrap_or(!present);
         if should_be_present != present {
@@ -135,7 +149,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
             } else {
                 current.retain(|existing| existing != &token);
             }
-            write_class_tokens(&ctx, self.element.0, &current)?;
+            write_class_tokens(&ctx, self.live_element(&ctx)?, &current)?;
         }
         Ok(should_be_present)
     }
@@ -150,7 +164,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         let old = old.to_string()?;
         let new = new.to_string()?;
         validate_token_pair(&ctx, &old, &new)?;
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         if !current.contains(&old) {
             return Ok(false);
         }
@@ -167,7 +181,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
                 deduped.push(token);
             }
         }
-        write_class_tokens(&ctx, self.element.0, &deduped)?;
+        write_class_tokens(&ctx, self.live_element(&ctx)?, &deduped)?;
         Ok(true)
     }
 
@@ -1038,20 +1052,21 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
     // lowercase. A name that repeats keeps its first attribute.
     // https://dom.spec.whatwg.org/#interface-namednodemap
     fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
-        let html = with_node_data(ctx, self.element.0, |data| {
+        let element = self.live_element(ctx)?;
+        let html = with_node_data(ctx, element, |data| {
             data.and_then(|data| data.downcast_element())
                 .is_some_and(|element| element.name.ns == crate::dom::tree::html_namespace())
         })
         .unwrap_or(false)
-            && super::document::document_is_html_content(ctx, self.element.0);
-        let world_rc = world_for_node(ctx, self.element.0)?;
+            && super::document::document_is_html_content(ctx, element);
+        let world_rc = world_for_node(ctx, element)?;
         let world = world_rc.borrow();
         let mut seen = HashSet::new();
         Ok(world
-            .document(self.element.0)
+            .document(element)
             .map(|parsed| {
                 let base = &parsed.document.base;
-                base.get_node(self.element.0.node)
+                base.get_node(element.node)
                     .and_then(|node| node.data.downcast_element())
                     .map(|element| {
                         element
@@ -1085,27 +1100,40 @@ include!(concat!(env!("OUT_DIR"), "/NamedNodeMap.rs"));
     reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
 )]
 impl JsNamedNodeMap {
+    /// The element this map belongs to. Adoption keeps the map object, so
+    /// every operation follows the adopted copy
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    fn live_element(&self, ctx: &Ctx<'_>) -> Result<NodeId> {
+        Ok(world(ctx)?
+            .borrow_mut()
+            .registry()
+            .borrow_mut()
+            .live_node_id(self.element.0))
+    }
+
     // https://dom.spec.whatwg.org/#dom-namednodemap-length
     fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+        let element = self.live_element(ctx)?;
         let world = world(ctx)?;
         let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.element.0) else {
+        let Some(parsed) = parsed.document(element) else {
             return Ok(0);
         };
         Ok(parsed
             .document
             .base
-            .get_node(self.element.0.node)
+            .get_node(element.node)
             .and_then(|node| node.data.downcast_element())
             .map_or(0, |element| element.attrs.len()))
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-item
     fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
-        let Some(attribute) = attribute_at(&ctx, self.element.0, i64::from(index))? else {
+        let element = self.live_element(&ctx)?;
+        let Some(attribute) = attribute_at(&ctx, element, i64::from(index))? else {
             return Ok(Value::new_null(ctx));
         };
-        match attached_attr_id(&ctx, self.element.0, &attribute.0, &attribute.1)? {
+        match attached_attr_id(&ctx, element, &attribute.0, &attribute.1)? {
             Some(id) => attr_wrapper(&ctx, id),
             None => Ok(Value::new_null(ctx)),
         }
@@ -1117,7 +1145,7 @@ impl JsNamedNodeMap {
         ctx: Ctx<'js>,
         name: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
-        named_item(&ctx, self.element.0, &name.to_string()?)
+        named_item(&ctx, self.live_element(&ctx)?, &name.to_string()?)
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditemns
@@ -1127,8 +1155,9 @@ impl JsNamedNodeMap {
         namespace: OptString,
         local: WebIdlString,
     ) -> Result<Value<'js>> {
+        let element = self.live_element(&ctx)?;
         let namespace = namespace.0.unwrap_or_default();
-        match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
+        match attached_attr_id(&ctx, element, &namespace, &local.0)? {
             Some(id) => attr_wrapper(&ctx, id),
             None => Ok(Value::new_null(ctx)),
         }
@@ -1136,24 +1165,24 @@ impl JsNamedNodeMap {
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditem
     fn set_named_item<'js>(&self, ctx: Ctx<'js>, attr: AttrArgument<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.element.0, &attr.into_value())
+        set_attribute_node(&ctx, self.live_element(&ctx)?, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditemns
     fn set_named_item_ns<'js>(&self, ctx: Ctx<'js>, attr: AttrArgument<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.element.0, &attr.into_value())
+        set_attribute_node(&ctx, self.live_element(&ctx)?, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditem
     fn remove_named_item<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        let element = self.live_element(&ctx)?;
         let world_rc = world(&ctx)?;
-        let Some((namespace, local, id)) =
-            named_attribute_id(&ctx, &world_rc, self.element.0, &name.0)?
+        let Some((namespace, local, id)) = named_attribute_id(&ctx, &world_rc, element, &name.0)?
         else {
             return Err(throw_dom(&ctx, "NotFoundError", "no such attribute"));
         };
         let value = attr_wrapper(&ctx, id)?;
-        remove_attribute_sync(&ctx, self.element.0, &namespace, &local, true)?;
+        remove_attribute_sync(&ctx, element, &namespace, &local, true)?;
         Ok(value)
     }
 
@@ -1164,12 +1193,13 @@ impl JsNamedNodeMap {
         namespace: OptString,
         local: WebIdlString,
     ) -> Result<Value<'js>> {
+        let element = self.live_element(&ctx)?;
         let namespace = namespace.0.unwrap_or_default();
-        let value = match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
+        let value = match attached_attr_id(&ctx, element, &namespace, &local.0)? {
             Some(id) => attr_wrapper(&ctx, id)?,
             None => return Err(throw_dom(&ctx, "NotFoundError", "no such attribute")),
         };
-        remove_attribute_sync(&ctx, self.element.0, &namespace, &local.0, true)?;
+        remove_attribute_sync(&ctx, element, &namespace, &local.0, true)?;
         Ok(value)
     }
 }
@@ -1456,7 +1486,7 @@ pub(crate) fn attr_wrapper<'js>(ctx: &Ctx<'js>, id: u64) -> Result<Value<'js>> {
         .brand("Attr")
         .ok_or_else(|| Exception::throw_internal(ctx, "missing Attr prototype"))?;
     let proto = proto.restore(ctx)?;
-    let class = Class::instance_proto(
+    let class = super::host::instance_proto(
         JsAttr {
             id,
             scope: Handle(state.scope),

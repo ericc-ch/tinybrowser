@@ -145,23 +145,6 @@ pub(crate) fn import_snapshot(
     }
 }
 
-/// The live children of `id` as cross-document handles.
-pub(crate) fn live_child_ids(doc: &BlitzDocument, id: NodeId) -> Vec<NodeId> {
-    doc.base
-        .get_node(id.node)
-        .map(|node| {
-            node.children
-                .iter()
-                .copied()
-                .map(|child| NodeId {
-                    document: id.document,
-                    node: child,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Materializes `snapshot` as detached nodes in `doc` for `document`.
 /// Children are appended without journal recording: the parent
 /// is detached and has no observers yet; the eventual insertion records.

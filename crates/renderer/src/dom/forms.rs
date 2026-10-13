@@ -10,9 +10,7 @@ use blitz_dom::{BaseDocument, NodeData};
 
 use crate::Parsed;
 use crate::dom::text::descendant_text;
-use crate::dom::tree::{
-    BlitzId, NodeId, attr, form_owner_of, html_namespace, is_html_element, tree_order,
-};
+use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_html_element};
 
 /// A control's contribution to the entry list, resolved inside one world
 /// borrow; file controls read their JS `files` after the borrow ends.
@@ -229,8 +227,9 @@ pub(crate) fn pending_entry(
 }
 
 /// The `option` elements in a `select`'s list of options, in tree order:
-/// descendant options whose nearest ancestor `select` is this one, so options
-/// of a nested select belong to the inner select
+/// descendant options whose nearest ancestor `select` is this one. The walk
+/// stops descending at a nested `select`, so its options belong to the inner
+/// select and never to this one, and no per-option owner lookup is needed
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list>).
 pub(crate) fn select_options(base: &BaseDocument, document: u32, select: BlitzId) -> Vec<NodeId> {
     let mut options = Vec::new();
@@ -243,9 +242,13 @@ pub(crate) fn select_options(base: &BaseDocument, document: u32, select: BlitzId
             continue;
         };
         if node.data.downcast_element().is_some_and(|element| {
+            element.name.ns == html_namespace() && element.name.local.as_ref() == "select"
+        }) {
+            continue;
+        }
+        if node.data.downcast_element().is_some_and(|element| {
             element.name.ns == html_namespace() && element.name.local.as_ref() == "option"
-        }) && option_select_owner(base, current) == Some(select)
-        {
+        }) {
             options.push(NodeId {
                 document,
                 node: current,
@@ -376,24 +379,16 @@ pub(crate) fn submission_encoding(label: &str) -> &'static encoding_rs::Encoding
 /// string of the encoded bytes. A character the encoding cannot represent
 /// becomes a numeric character reference, per the Encoding Standard's
 /// `encode` (<https://encoding.spec.whatwg.org/#encode>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-pub(crate) fn encode_form(text: String, label: String) -> String {
-    let (bytes, _, _) = submission_encoding(&label).encode(&text);
+pub(crate) fn encode_form(text: &str, label: &str) -> String {
+    let (bytes, _, _) = submission_encoding(label).encode(text);
     bytes.iter().map(|&byte| char::from(byte)).collect()
 }
 
 /// Percent-encodes `text` for form submission: Encoding Standard `encode`
 /// in `label`, then the urlencoded byte serializer over those bytes
 /// (<https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-pub(crate) fn urlencode_form(text: String, label: String) -> String {
-    let (bytes, _, _) = submission_encoding(&label).encode(&text);
+pub(crate) fn urlencode_form(text: &str, label: &str) -> String {
+    let (bytes, _, _) = submission_encoding(label).encode(text);
     url::form_urlencoded::byte_serialize(bytes.as_ref()).collect()
 }
 
@@ -404,11 +399,16 @@ pub(crate) fn wrap_is_hard(wrap: Option<&str>) -> bool {
     wrap.is_some_and(|wrap| wrap.trim().eq_ignore_ascii_case("hard"))
 }
 
-/// The non-negative integer in `value`, or `None` for an absent or invalid
-/// attribute
+/// The positive integer in `value`, or `None` for an absent, invalid, or
+/// zero value. HTML's parsing rules for non-negative integers accept zero;
+/// callers of this helper (a `textarea`'s `cols`) require a value greater
+/// than zero
 /// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-non-negative-integers>).
 pub(crate) fn parse_positive(value: Option<&str>) -> Option<usize> {
     let parsed = crate::dom::parse::parse_non_negative_integer(value?)?;
+    if parsed == 0 {
+        return None;
+    }
     Some(usize::try_from(parsed).unwrap_or(usize::MAX))
 }
 
@@ -444,17 +444,24 @@ pub(crate) fn trim_label(label: &str) -> &str {
     label.trim_matches(['\t', '\n', '\x0C', '\r', ' '])
 }
 
-/// Radios sharing a `name` in the same document, in tree order, excluding
-/// `except`. Blitz keeps no form-owner model, so the group spans the document
-/// instead of the form (a known cutover gap).
+/// Radios sharing a non-empty `name` in the same document, in tree order,
+/// excluding `except`. An empty or missing name forms no group, so a nameless
+/// radio never unchecks another
+/// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+/// Blitz keeps no form-owner model, so the group spans the document instead
+/// of the form (a known cutover gap).
 pub(crate) fn radio_group_members(
     base: &blitz_dom::BaseDocument,
     document: u32,
     name: &str,
     except: BlitzId,
 ) -> Vec<NodeId> {
+    if name.is_empty() {
+        return Vec::new();
+    }
     let mut group = Vec::new();
     let mut stack = vec![base.root_node().id];
+    // Reverse-push keeps the pop order in tree order.
     while let Some(id) = stack.pop() {
         let Some(node) = base.get_node(id) else {
             continue;
@@ -474,7 +481,6 @@ pub(crate) fn radio_group_members(
         }
         stack.extend(node.children.iter().rev().copied());
     }
-    group.sort_by(|a, b| tree_order(base, document, a.node, b.node));
     group
 }
 

@@ -28,8 +28,9 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
 }
 
 /// The single `Node` wrapper class: one native identity shared by every
-/// node interface. Interface prototypes installed by the family modules
-/// copy its members; the constructor stays illegal.
+/// node interface. Generated contract installers add each interface's
+/// members to the prototype brands.js created; the constructor stays
+/// illegal.
 #[derive(Trace, rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "Node")]
 pub(crate) struct JsNode {

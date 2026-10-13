@@ -634,8 +634,8 @@ pub(super) fn delete_table_row(ctx: &Ctx<'_>, table: NodeId, index: i32) -> Resu
     };
     let iframes = iframe_containers_in_subtrees(&parsed, &[row]);
     unlink_journaled(&mut parsed, row);
-    world.destroy_child_navigables(&iframes);
     drop(parsed);
+    world.destroy_child_navigables(&iframes);
     drop(world);
     fixup_focus_after_removal(ctx, row)?;
     schedule_mutation_delivery(ctx)

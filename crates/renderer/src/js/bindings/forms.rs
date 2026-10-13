@@ -39,10 +39,13 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbSetInputFiles",
         rquickjs::prelude::Func::from(set_input_files),
     )?;
-    globals.set("__tbEncodeForm", rquickjs::prelude::Func::from(encode_form))?;
+    globals.set(
+        "__tbEncodeForm",
+        rquickjs::prelude::Func::from(|text: String, label: String| encode_form(&text, &label)),
+    )?;
     globals.set(
         "__tbUrlEncodeForm",
-        rquickjs::prelude::Func::from(urlencode_form),
+        rquickjs::prelude::Func::from(|text: String, label: String| urlencode_form(&text, &label)),
     )?;
     globals.set(
         "__tbEncodingName",

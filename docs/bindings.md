@@ -55,14 +55,18 @@ documented cutover gaps.
 Lazily-created same-object members (`Element.classList`,
 `Element.attributes`, `HTMLElement.style`, `HTMLElement.dataset`,
 `Node.childNodes`, `Document.scripts`) cache one platform object per
-`(node, interface name)` in the realm's `World`, held weakly so the realm can
-still collect it. Add a new one by caching through `World::wrapper` /
-`intern_wrapper` with the IDL interface name; do not add per-member state
-tables.
+`(node, member)` in `RealmRegistry`, beside the node wrapper and held weakly
+like it. The cache is process-wide, so the member object is the same object
+from every realm, and adoption rekeys it (`RealmRegistry::rekey_wrapper`), so
+a held `classList` follows the adopted copy. Add a new one by caching through
+`World::same_object` / `intern_same_object` with a `SameObject` variant; do
+not add per-member state tables, and do not key by interface name
+(`Document.children` and `Document.scripts` are both `HTMLCollection`).
 
 Construct wrappers through `host::instance` (a standalone interface, prototype
 from `ctx`'s realm) or `host::instance_for_node` (a node-associated interface,
-prototype from the node's owning realm); both funnel into
+prototype from the node's owning realm); node wrappers resolve their brand
+prototype first and then use the same helper. Every path funnels into
 `host::instance_proto`. Do not call `Class::instance_proto` directly, and do
 not copy prototypes from another realm.
 
