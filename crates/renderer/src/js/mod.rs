@@ -11,12 +11,15 @@ mod encoding;
 mod events;
 mod intl;
 mod modules;
+mod runtime;
 mod url_parts;
 pub(crate) mod world;
 
 mod observers;
 mod reactions;
 
+pub(crate) use runtime::FrameRuntime;
+pub use runtime::Stop;
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -32,8 +35,6 @@ use rquickjs::{
 use url::Url;
 
 pub(crate) use world::World;
-
-use crate::document::Stop;
 
 /// Shared `QuickJS` heap cap. Forty live subframe realms need more than
 /// 32MB (measured: `Document-createElement-namespace.html`, 40 parallel

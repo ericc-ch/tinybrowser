@@ -18,7 +18,9 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::RemoteValue;
-use crate::document::{Document, FrameRuntime, Stop, WindowMessage};
+use crate::document::{Document, WindowMessage};
+use crate::js::FrameRuntime;
+use crate::js::Stop;
 
 /// The engine's default frame viewport in device pixels, used until CDP
 /// emulation (or a mount) sets another size.

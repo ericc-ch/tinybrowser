@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use crate::document::Stop;
 use crate::engine::Engine;
+use crate::js::Stop;
 use crate::{BrowserServices, FrameId, Mount, RemoteValue, RendererEvent, TabError};
 
 /// One renderer hosted directly in its caller's process.

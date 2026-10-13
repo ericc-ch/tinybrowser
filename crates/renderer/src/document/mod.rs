@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant as WallClock;
 
@@ -18,8 +17,7 @@ use url::Url;
 
 use crate::Parsed;
 use crate::ReadyState;
-use crate::documents::DocumentStore;
-use crate::js::{DocumentStreamCommand, FrameNavigation, JsRuntimeHandle, RealmRegistry, World};
+use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
 use crate::messaging::SharedHandle;
 use crate::protocol::{
     BrowserServices, DialOutcome, FrameId, Mount, RendererEvent, ScriptFailure, TabError,
@@ -30,6 +28,10 @@ mod drain;
 mod intern;
 
 pub(crate) use crate::js::ScriptValue;
+
+/// A child frame document this document created for the engine to adopt:
+/// frame, `iframe` container, and the document itself.
+pub(crate) type CreatedFrame = (FrameId, crate::dom::tree::NodeId, Document);
 
 /// Concurrent `fetch` jobs one document may keep in flight.
 const MAX_PENDING_JS_FETCHES: usize = 256;
@@ -166,24 +168,38 @@ struct Timer {
     fired: bool,
 }
 
-/// The process-wide handles every frame document shares: services, the JS
-/// heap, the wake handle, the stop flag, and the cross-frame stores.
-#[derive(Clone)]
-pub(crate) struct FrameRuntime {
-    pub(crate) services: Arc<dyn BrowserServices>,
-    pub(crate) js_runtime: JsRuntimeHandle,
-    pub(crate) wake: Arc<Notify>,
-    pub(crate) stop: Arc<Stop>,
-    pub(crate) documents: Rc<RefCell<DocumentStore>>,
-    pub(crate) registry: Rc<RefCell<RealmRegistry>>,
-    pub(crate) shared: SharedHandle,
-    /// Storage changes waiting for the `storage`-event task in their receiving
-    /// frames.
-    pub(crate) pending_storage: Rc<RefCell<Vec<crate::storage::PendingStorageEvent>>>,
-    /// Parley's font context, built once per process: construction scans
-    /// system fonts (~25ms), so every `BaseDocument` clones this instead of
-    /// rescanning. Cloning is cheap; Blitz shares the source cache.
-    pub(crate) font_ctx: parley::FontContext,
+/// Builds and queues the initial `about:blank` document for one connected
+/// `iframe` so `contentDocument` is available in the inserting script
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+///
+/// The nested realm is deferred: `QuickJS` cannot enter a new context while
+/// the parent script still runs.
+fn materialize_iframe_document(
+    world_rc: &Rc<RefCell<World>>,
+    frame: FrameId,
+    container: crate::dom::tree::NodeId,
+    new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
+) {
+    let (runtime, base_url, init_scripts, viewport) = {
+        let world = world_rc.borrow();
+        (
+            world.runtime.clone(),
+            world.document_url.clone(),
+            Rc::clone(&world.init_scripts),
+            world.viewport_size.get(),
+        )
+    };
+    let mut document = Document::with_shared(frame, &runtime, &init_scripts);
+    document.set_viewport_size(viewport);
+    document.load_about_blank_tree(Some(base_url.as_str()));
+    if let Some(root) = document.document_root() {
+        world_rc
+            .borrow()
+            .registry()
+            .borrow_mut()
+            .set_frame_document(container, root);
+    }
+    new_frames.borrow_mut().push((frame, container, document));
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
@@ -257,6 +273,10 @@ pub(crate) struct Document {
     /// document's own `load` event is delayed until they all have
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
     pending_frame_loads: HashSet<crate::dom::tree::NodeId>,
+    /// Child frame documents this document's realm created for the engine to
+    /// adopt
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
+    new_frames: Rc<RefCell<Vec<CreatedFrame>>>,
     /// Whether this document's `load` event has fired.
     load_fired: bool,
     events: Vec<RendererEvent>,
@@ -291,7 +311,7 @@ pub(crate) struct Document {
     response_content_type: Option<String>,
     classic_fetch_in_flight: bool,
     deferred_modules: Vec<(crate::dom::tree::NodeId, crate::js::ScriptSource)>,
-    stop: Arc<Stop>,
+    stop: Arc<crate::js::Stop>,
 }
 
 impl Drop for Document {
@@ -317,6 +337,15 @@ impl Document {
             Rc::clone(init_scripts),
         )));
         runtime.registry.borrow_mut().insert_frame(frame, &world);
+        // Document creation belongs to this layer: the realm asks the frame
+        // host for a child document and never names a document type.
+        let new_frames: Rc<RefCell<Vec<CreatedFrame>>> = Rc::new(RefCell::new(Vec::new()));
+        world.borrow_mut().set_frame_host(Rc::new({
+            let new_frames = Rc::clone(&new_frames);
+            move |world_rc: &Rc<RefCell<World>>, frame, container| {
+                materialize_iframe_document(world_rc, frame, container, &new_frames);
+            }
+        }));
         // Blitz subresources enqueue here and ride carrier dials: the
         // renderer owns no network runtime of its own.
         let (blitz_tx, blitz_rx) = std::sync::mpsc::channel();
@@ -352,6 +381,7 @@ impl Document {
             frame_load_in_flight: false,
             initial_blank: true,
             pending_frame_loads: HashSet::new(),
+            new_frames,
             load_fired: false,
             events: Vec::new(),
             events_overflowed: false,
@@ -445,13 +475,48 @@ impl Document {
     /// later classic scripts define their onload functions
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
     fn adopt_pending_frames_before_node(&mut self, before: Option<crate::dom::tree::NodeId>) {
-        let created = World::adopt_pending_frames(&self.world, before);
+        let created = self.world.borrow_mut().register_pending_frames(before);
+        self.materialize_pending_frames();
         for container in created {
             // The child is loading from this moment on, so this document's
             // `load` event waits for it
             // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
             self.mark_frame_load_pending(container);
         }
+    }
+
+    /// Loads every registered frame document without holding the world
+    /// borrow: pending frames and frame data are taken first, documents load
+    /// unborrowed, and only then are the results published. Loading runs the
+    /// parser, which delivers mutations, which fans out across live worlds;
+    /// holding the world's borrow across that would alias the fan-out
+    /// borrows and panic the renderer.
+    fn materialize_pending_frames(&mut self) {
+        let pending = self.world.borrow_mut().take_pending_frames();
+        if pending.is_empty() {
+            return;
+        }
+        let (runtime, base_url, init_scripts, viewport) = {
+            let world = self.world.borrow();
+            (
+                world.runtime.clone(),
+                world.document_url.clone(),
+                Rc::clone(&world.init_scripts),
+                world.viewport_size.get(),
+            )
+        };
+        let mut loaded = Vec::with_capacity(pending.len());
+        for (frame, container) in pending {
+            let mut document = Document::with_shared(frame, &runtime, &init_scripts);
+            // Frames created from parsed markup share the tab's viewport too.
+            // This path runs before page script, so the realm can exist for
+            // `contentWindow` in the following classic script
+            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+            document.set_viewport_size(viewport);
+            document.load_about_blank(Some(base_url.as_str()));
+            loaded.push((frame, container, document));
+        }
+        self.new_frames.borrow_mut().extend(loaded);
     }
 
     /// Applies writes the realm stored on a child frame's `contentWindow`
@@ -463,8 +528,8 @@ impl Document {
 
     /// Takes the child frames this document's realm created for the engine to
     /// adopt.
-    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, crate::dom::tree::NodeId, Document)> {
-        self.world.borrow_mut().take_new_frames()
+    pub(crate) fn take_new_frames(&mut self) -> Vec<CreatedFrame> {
+        std::mem::take(&mut *self.new_frames.borrow_mut())
     }
 
     /// The document URL used by `about:blank` frames, which inherit the
@@ -2061,40 +2126,5 @@ impl From<crate::js::JsError> for TabError {
             crate::js::JsError::Interrupted => Self::Script(ScriptFailure::Interrupted),
             crate::js::JsError::BadTimerId => Self::Script(ScriptFailure::BadTimerId),
         }
-    }
-}
-
-/// Stop flag shared by a renderer loop, the JS interrupt handler, and dials.
-///
-/// Requesting a stop interrupts running script and marks the flag; every
-/// engine sharing it winds down at its next turn.
-pub struct Stop {
-    flag: AtomicBool,
-}
-
-impl Default for Stop {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Stop {
-    /// A fresh, unset stop flag.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            flag: AtomicBool::new(false),
-        }
-    }
-
-    /// Requests a stop: interrupts `QuickJS` and marks the flag.
-    pub fn request(&self) {
-        self.flag.store(true, Ordering::Relaxed);
-    }
-
-    /// Whether [`Stop::request`] has run.
-    #[must_use]
-    pub fn is_set(&self) -> bool {
-        self.flag.load(Ordering::Relaxed)
     }
 }

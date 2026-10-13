@@ -114,8 +114,8 @@ fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Re
     let bytes = bytes_from_latin1(&source)
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
     let header = (!content_type.trim().is_empty()).then_some(content_type.as_str());
-    let (encoding, bom_len) = crate::document::dial::sniff_encoding(&bytes, header, true)
-        .unwrap_or((encoding_rs::UTF_8, 0));
+    let (encoding, bom_len) =
+        crate::sniff::sniff_encoding(&bytes, header, true).unwrap_or((encoding_rs::UTF_8, 0));
     let mut decoder = encoding.new_decoder_without_bom_handling();
     decode_loop(
         &mut decoder,

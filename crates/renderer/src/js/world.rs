@@ -13,7 +13,7 @@ use crate::documents::JournalEntry;
 use crate::dom::tree::{NodeId, attr, is_connected, is_iframe_element};
 use crate::dom_string::DomString;
 
-use crate::document::{Document, FrameRuntime};
+use crate::js::FrameRuntime;
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
 use crate::storage::PendingStorageEvent;
@@ -435,6 +435,11 @@ pub(crate) struct WeakReferences {
     pub(crate) deref: Persistent<Function<'static>>,
 }
 
+/// Builds a frame document when an `iframe` connects. Installed by the
+/// `document` layer, which owns document creation; the realm calls it without
+/// naming a document type.
+pub(crate) type FrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, NodeId)>;
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -451,8 +456,10 @@ pub(crate) struct World {
     /// Frames whose browsing context was registered inside a script but whose
     /// realm cannot be created until JS execution has stopped.
     pending_frames: Vec<(FrameId, NodeId)>,
-    /// Child frames this realm created for the engine to adopt.
-    new_frames: Vec<(FrameId, NodeId, Document)>,
+    /// Creates a child frame's document when an `iframe` connects. The
+    /// `document` layer installs this hook; the realm asks for a document and
+    /// never names one.
+    frame_host: Option<FrameHost>,
     /// The active document of the frame this realm belongs to.
     document: Option<u32>,
     /// Document ids this realm created. Its logs feed every realm's
@@ -642,7 +649,7 @@ impl World {
             init_scripts,
             viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),
             pending_frames: Vec::new(),
-            new_frames: Vec::new(),
+            frame_host: None,
             document: None,
             owned: HashSet::new(),
             document_url,
@@ -1003,27 +1010,14 @@ impl World {
         })?
     }
 
-    /// Creates the documents and realms for every registered frame.
-    ///
-    /// Borrow discipline: no `World` borrow is held while a frame document
-    /// loads. Loading runs the parser, which delivers mutations, which fans
-    /// out across live worlds; holding this world's borrow across that
-    /// would alias the fan-out borrows and panic the renderer.
-    pub(crate) fn adopt_pending_frames(
-        world_rc: &Rc<RefCell<World>>,
-        before: Option<NodeId>,
-    ) -> Vec<NodeId> {
-        let mut created = world_rc.borrow_mut().register_pending_frames(before);
-        created.extend(Self::materialize_frames(world_rc));
-        created
-    }
-
     /// Creates the initial `about:blank` document for one connected `iframe`
     /// so `contentDocument` is available in the inserting script
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
     ///
     /// The nested realm is deferred: `QuickJS` cannot enter a new context while
-    /// the parent script still runs.
+    /// the parent script still runs. Document creation belongs to the frame
+    /// host the `document` layer installs; a realm built without one just
+    /// leaves the frame registered for a later drain (test worlds).
     pub(crate) fn materialize_iframe(world_rc: &Rc<RefCell<World>>, container: NodeId) -> bool {
         world_rc
             .borrow_mut()
@@ -1045,71 +1039,28 @@ impl World {
                 .frame_document(container)
                 .is_some();
         };
-        let (runtime, base_url, init_scripts, viewport) = {
-            let world = world_rc.borrow();
-            (
-                world.runtime.clone(),
-                world.document_url.clone(),
-                Rc::clone(&world.init_scripts),
-                world.viewport_size.get(),
-            )
-        };
-        let mut document = Document::with_shared(frame, &runtime, &init_scripts);
-        document.set_viewport_size(viewport);
-        document.load_about_blank_tree(Some(base_url.as_str()));
-        if let Some(root) = document.document_root() {
+        let host = world_rc.borrow().frame_host.clone();
+        let Some(host) = host else {
             world_rc
-                .borrow()
-                .registry()
                 .borrow_mut()
-                .set_frame_document(container, root);
-        }
-        world_rc
-            .borrow_mut()
-            .new_frames
-            .push((frame, container, document));
+                .pending_frames
+                .push((frame, container));
+            return false;
+        };
+        host(world_rc, frame, container);
         true
     }
 
-    /// Loads every registered frame document without holding the world
-    /// borrow: pending frames and the base URL are taken first, documents
-    /// load unborrowed, and only then are the results published.
-    fn materialize_frames(world_rc: &Rc<RefCell<World>>) -> Vec<NodeId> {
-        let (pending, runtime, base_url, init_scripts, viewport) = {
-            let mut world = world_rc.borrow_mut();
-            (
-                std::mem::take(&mut world.pending_frames),
-                world.runtime.clone(),
-                world.document_url.clone(),
-                Rc::clone(&world.init_scripts),
-                world.viewport_size.get(),
-            )
-        };
-        let mut loaded = Vec::with_capacity(pending.len());
-        let mut created = Vec::with_capacity(pending.len());
-        for (frame, container) in pending {
-            let mut document = Document::with_shared(frame, &runtime, &init_scripts);
-            // Frames created from parsed markup share the tab's viewport too.
-            // This path runs before page script, so the realm can exist for
-            // `contentWindow` in the following classic script
-            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-            document.set_viewport_size(viewport);
-            document.load_about_blank(Some(base_url.as_str()));
-            loaded.push((frame, container, document));
-            created.push(container);
-        }
-        {
-            let mut world = world_rc.borrow_mut();
-            for (frame, container, document) in loaded {
-                world.new_frames.push((frame, container, document));
-            }
-        }
-        created
+    /// Installs the hook that builds child documents for this realm's
+    /// `iframe`s. Called by the `document` layer when the frame is created.
+    pub(crate) fn set_frame_host(&mut self, host: FrameHost) {
+        self.frame_host = Some(host);
     }
 
-    /// Takes the child frames this realm created for the engine to adopt.
-    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, NodeId, Document)> {
-        std::mem::take(&mut self.new_frames)
+    /// Takes every registered frame waiting for a document, for the frame host
+    /// to materialize.
+    pub(crate) fn take_pending_frames(&mut self) -> Vec<(FrameId, NodeId)> {
+        std::mem::take(&mut self.pending_frames)
     }
 
     /// Connected `iframe`s in tree order that precede `before`, or every

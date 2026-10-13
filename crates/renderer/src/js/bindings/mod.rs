@@ -1575,8 +1575,8 @@ mod realm_tests {
     use url::Url;
 
     use super::{world, wrap_node};
-    use crate::document::Stop;
     use crate::dom::tree::NodeId;
+    use crate::js::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::messaging::Shared;
     use crate::protocol::{
@@ -1676,7 +1676,7 @@ mod realm_tests {
         url: &str,
         html: &str,
     ) -> Rc<RefCell<World>> {
-        let runtime = crate::document::FrameRuntime {
+        let runtime = crate::js::FrameRuntime {
             services: Arc::clone(services),
             js_runtime: js_runtime.handle(),
             wake: Arc::new(tokio::sync::Notify::new()),
