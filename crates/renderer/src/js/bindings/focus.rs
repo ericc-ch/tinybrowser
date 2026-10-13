@@ -60,7 +60,7 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     if element.name.ns != html_namespace() {
         return Ok(false);
     }
-    Ok(match element.name.local.as_ref() {
+    Ok(match element.name.local.as_str() {
         "input" => !is_hidden_input(base, node.node),
         "a" => attr(base, node.node, "href").is_some(),
         "button" | "select" | "textarea" => true,
@@ -135,7 +135,7 @@ fn write_attr(parsed: &mut crate::Parsed, node: NodeId, local: &str, value: Opti
         let name = element
             .attrs
             .iter()
-            .find(|attribute| attribute.name.local.as_ref() == local)
+            .find(|attribute| attribute.name.local.as_str() == local)
             .map_or_else(
                 || QualName::new(None, Namespace::from(""), LocalName::from(local)),
                 |attribute| attribute.name.clone(),
@@ -311,7 +311,7 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
             return Ok(PreActivation::None);
         };
         // Only an `input` has the checkbox/radio activation behavior.
-        if element.name.ns != html_namespace() || element.name.local.as_ref() != "input" {
+        if element.name.ns != html_namespace() || element.name.local.as_str() != "input" {
             return Ok(PreActivation::None);
         }
         input_type(base, node.node)
@@ -368,7 +368,7 @@ fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 .and_then(|tree| tree.data.downcast_element())
                 .is_some_and(|element| {
                     element.name.ns == html_namespace()
-                        && element.name.local.as_ref() == "input"
+                        && element.name.local.as_str() == "input"
                         && matches!(input_type(base, node.node).as_str(), "checkbox" | "radio")
                 })
         })
@@ -414,7 +414,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             let Some(element) = tree.data.downcast_element() else {
                 return Ok(());
             };
-            if element.name.ns != html_namespace() || element.name.local.as_ref() != "input" {
+            if element.name.ns != html_namespace() || element.name.local.as_str() != "input" {
                 return Ok(());
             }
             input_type(base, node.node)
@@ -480,7 +480,7 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         if element.name.ns != html_namespace() {
             return Ok(());
         }
-        let activation = match element.name.local.as_ref() {
+        let activation = match element.name.local.as_str() {
             "input" => match input_type(base, node.node).as_str() {
                 "submit" => Activation::Submit,
                 "reset" => Activation::Reset,

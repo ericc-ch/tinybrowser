@@ -1773,8 +1773,8 @@ pub(crate) fn remove_attribute_sync(
                     .iter()
                     .find(|attribute| {
                         if by_namespace {
-                            attribute.name.ns.as_ref() == namespace
-                                && attribute.name.local.as_ref() == local
+                            attribute.name.ns.as_str() == namespace
+                                && attribute.name.local.as_str() == local
                         } else {
                             qualified_name_eq(&attribute.name, local)
                         }
@@ -1791,16 +1791,16 @@ pub(crate) fn remove_attribute_sync(
                 target: element,
                 // attributeName is the attribute's local name.
                 // https://dom.spec.whatwg.org/#handle-attribute-changes
-                name: name.local.as_ref().to_owned(),
-                namespace: name.ns.as_ref().to_owned(),
+                name: name.local.as_str().to_owned(),
+                namespace: name.ns.as_str().to_owned(),
                 old_value: Some(value.clone()),
             });
         }
         removed
     };
     if let Some((name, value)) = removed {
-        let namespace = name.ns.as_ref().to_owned();
-        let local = name.local.as_ref().to_owned();
+        let namespace = name.ns.as_str().to_owned();
+        let local = name.local.as_str().to_owned();
         // The nonce attribute change steps reset the cryptographic nonce
         // slot on removal (value `null`); only the null-namespace attribute
         // participates
@@ -1836,14 +1836,14 @@ fn element_attribute(
         .attrs
         .iter()
         .find(|attribute| {
-            attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
+            attribute.name.ns.as_str() == namespace && attribute.name.local.as_str() == local
         })?;
     Some((
         attribute
             .name
             .prefix
             .as_ref()
-            .map(markup5ever::Prefix::as_ref)
+            .map(markup5ever::Prefix::as_str)
             .filter(|prefix| !prefix.is_empty())
             .map(ToString::to_string),
         qualified_name(&attribute.name),
@@ -1913,7 +1913,7 @@ pub(crate) fn set_attribute_sync(
             .map(ToOwned::to_owned);
         (name, old_value)
     };
-    let namespace = name.ns.as_ref().to_owned();
+    let namespace = name.ns.as_str().to_owned();
     parsed
         .document
         .base
@@ -1923,7 +1923,7 @@ pub(crate) fn set_attribute_sync(
         target: element,
         // attributeName is the attribute's local name.
         // https://dom.spec.whatwg.org/#handle-attribute-changes
-        name: name.local.as_ref().to_owned(),
+        name: name.local.as_str().to_owned(),
         namespace: namespace.clone(),
         old_value,
     });

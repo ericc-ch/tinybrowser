@@ -103,7 +103,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
         let name = element
             .attrs
             .iter()
-            .find(|attribute| attribute.name.local.as_ref() == "selected")
+            .find(|attribute| attribute.name.local.as_str() == "selected")
             .map_or_else(
                 || QualName::new(None, Namespace::from(""), LocalName::from("selected")),
                 |attribute| attribute.name.clone(),

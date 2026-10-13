@@ -61,7 +61,7 @@ and cycle visibility; sink parse errors carried on the document for
 draining; internal general entities expanded up front with
 billion-laughs bounds; `Node::is_visible` for computed visibility.
 Fixed in our `ericc-ch/html5ever` fork (`third_party/html5ever`,
-`master` is the line, from the byte-identical 0.39.0 base) so far:
+`master` is the line, merged to upstream `main` at 7760920, 0.40.1) so far:
 namespace declarations kept on elements; CDATA sections tokenized and
 built as real nodes; EOF-with-open-elements and PUBLIC-without-SYSTEM
 reported; internal DTD subsets skipped instead of going bogus.

@@ -291,7 +291,7 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
                 blitz_dom::DocumentConfig {
                     base_url: Some(base),
                     font_ctx: Some(font_ctx),
-                    ua_stylesheets: Some(Vec::new()),
+                    ua_stylesheets: Vec::new(),
                     ..blitz_dom::DocumentConfig::default()
                 },
             );

@@ -459,6 +459,7 @@ fn push_mask(
     height: u32,
     parent: Option<&Mask>,
     shape: &impl Shape,
+    rule: Fill,
     transform: Affine,
 ) -> Option<Mask> {
     let path = convert_shape(shape)?;
@@ -469,7 +470,12 @@ fn push_mask(
         )
     };
     let mut mask = parent.cloned().or_else(blank)?;
-    mask.intersect_path(&path, SkiaRule::Winding, true, convert_transform(transform));
+    mask.intersect_path(
+        &path,
+        convert_fill_rule(rule),
+        true,
+        convert_transform(transform),
+    );
     Some(mask)
 }
 
@@ -578,6 +584,7 @@ impl PaintScene for TinySkiaScenePainter {
 
     fn push_layer(
         &mut self,
+        fill: Fill,
         blend: impl Into<BlendMode>,
         alpha: f32,
         transform: Affine,
@@ -593,7 +600,7 @@ impl PaintScene for TinySkiaScenePainter {
             (canvas.width(), canvas.height())
         };
         let parent = self.targets.last().and_then(|target| target.clips.last());
-        let mask = push_mask(width, height, parent, clip, transform);
+        let mask = push_mask(width, height, parent, clip, fill, transform);
         let paint = PixmapPaint {
             opacity: alpha.clamp(0.0, 1.0),
             blend_mode: convert_blend(blend.into()),
@@ -608,14 +615,14 @@ impl PaintScene for TinySkiaScenePainter {
         self.stack.push(StackItem::Layer);
     }
 
-    fn push_clip_layer(&mut self, transform: Affine, clip: &impl Shape) {
+    fn push_clip_layer(&mut self, fill: Fill, transform: Affine, clip: &impl Shape) {
         self.transform = convert_transform(transform);
         let (width, height) = {
             let canvas = &self.targets[0].pixmap;
             (canvas.width(), canvas.height())
         };
         let parent = self.targets.last().and_then(|target| target.clips.last());
-        let Some(mask) = push_mask(width, height, parent, clip, transform) else {
+        let Some(mask) = push_mask(width, height, parent, clip, fill, transform) else {
             self.stack.push(StackItem::Clip { applied: false });
             return;
         };
@@ -908,7 +915,7 @@ mod tests {
     #[test]
     fn clip_layer_masks_content() {
         let mut painter = TinySkiaScenePainter::new(40, 40);
-        painter.push_clip_layer(Affine::IDENTITY, &Rect::new(0.0, 0.0, 10.0, 40.0));
+        painter.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &Rect::new(0.0, 0.0, 10.0, 40.0));
         painter.fill(
             Fill::NonZero,
             Affine::IDENTITY,
@@ -933,6 +940,7 @@ mod tests {
     fn blend_layer_applies_alpha() {
         let mut painter = TinySkiaScenePainter::new(40, 40);
         painter.push_layer(
+            Fill::NonZero,
             peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
             0.5,
             Affine::IDENTITY,
@@ -1072,6 +1080,7 @@ mod tests {
         let filter = anyrender::Filter::single(FilterEffect::blur(3.0));
         let mut painter = TinySkiaScenePainter::new(40, 40);
         painter.push_layer(
+            Fill::NonZero,
             peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcOver),
             1.0,
             Affine::IDENTITY,

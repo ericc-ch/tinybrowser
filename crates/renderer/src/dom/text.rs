@@ -185,7 +185,7 @@ fn is_html_tag(base: &BaseDocument, node: BlitzId, tags: &[&str]) -> bool {
     base.get_node(node).is_some_and(|tree| {
         tree.data.downcast_element().is_some_and(|element| {
             element.name.ns == crate::dom::tree::html_namespace()
-                && tags.contains(&element.name.local.as_ref())
+                && tags.contains(&element.name.local.as_str())
         })
     })
 }
@@ -223,7 +223,7 @@ fn level_of(base: &BaseDocument, node: BlitzId, style: &InlineStyle<'_>) -> Leve
         return Level::Inline;
     };
     let html = element.name.ns == crate::dom::tree::html_namespace();
-    let local = element.name.local.as_ref();
+    let local = element.name.local.as_str();
     // `template` and `noscript` never render, regardless of styling: their
     // content is not elements (noscript) or lives in a separate fragment.
     if html && (local == "template" || local == "noscript") {
@@ -707,7 +707,7 @@ fn collect_node(
             collector.push_text(&transformed, inherited_mode == WhiteSpace::Pre);
         }
         NodeData::Element(element) => {
-            let local: &str = element.name.local.as_ref();
+            let local: &str = element.name.local.as_str();
             let html = element.name.ns == crate::dom::tree::html_namespace();
             let style = InlineStyle::of(base, node);
             let visibility = visibility_of(&style, inherited_visibility);
@@ -904,7 +904,7 @@ fn collect_table(
         };
         let kind = tree.data.downcast_element().and_then(|element| {
             (element.name.ns == crate::dom::tree::html_namespace())
-                .then_some(element.name.local.as_ref())
+                .then_some(element.name.local.as_str())
         });
         // Rows and cells resolve their own box properties so `tbody`/`tr`
         // styles (e.g. `visibility:collapse`) apply to their cells.
@@ -968,7 +968,7 @@ fn collect_row(
         let is_cell = base.get_node(cell).is_some_and(|tree| {
             tree.data.downcast_element().is_some_and(|element| {
                 element.name.ns == crate::dom::tree::html_namespace()
-                    && matches!(element.name.local.as_ref(), "td" | "th")
+                    && matches!(element.name.local.as_str(), "td" | "th")
             })
         });
         if !is_cell {
@@ -1031,7 +1031,7 @@ fn collect_select(
         let kind = base.get_node(child).and_then(|tree| {
             tree.data.downcast_element().and_then(|element| {
                 (element.name.ns == crate::dom::tree::html_namespace())
-                    .then_some(element.name.local.as_ref())
+                    .then_some(element.name.local.as_str())
             })
         });
         match kind {
@@ -1216,7 +1216,7 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
         root = current;
         if let Some(element) = tree.data.downcast_element() {
             let html = element.name.ns == crate::dom::tree::html_namespace();
-            let local = element.name.local.as_ref();
+            let local = element.name.local.as_str();
             if html
                 && crate::dom::tree::attr(base, current, "hidden")
                     .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))

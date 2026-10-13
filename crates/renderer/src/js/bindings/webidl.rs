@@ -216,7 +216,7 @@ fn assemble_nodes_into_node(
 
 /// A selector syntax error is a `SyntaxError` `DOMException`
 /// (<https://dom.spec.whatwg.org/#scope-match-a-selectors-string>).
-pub(crate) fn select_error(ctx: &Ctx<'_>, err: &style_traits::ParseError<'_>) -> rquickjs::Error {
+pub(crate) fn select_error(ctx: &Ctx<'_>, err: &style_traits::ParseError) -> rquickjs::Error {
     throw_dom(ctx, "SyntaxError", &format!("{err:?}"))
 }
 

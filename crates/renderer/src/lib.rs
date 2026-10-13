@@ -95,7 +95,7 @@ impl Parsed {
     pub(crate) fn script(content_type: &'static str, font_ctx: parley::FontContext) -> Self {
         let config = blitz_dom::DocumentConfig {
             font_ctx: Some(font_ctx),
-            ua_stylesheets: Some(Vec::new()),
+            ua_stylesheets: Vec::new(),
             base_url: Some(crate::render::INVALID_BASE_URL.to_owned()),
             ..blitz_dom::DocumentConfig::default()
         };

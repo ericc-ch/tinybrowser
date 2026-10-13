@@ -259,7 +259,7 @@ fn element_name(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&QualName
 /// covered because the walk descends.
 fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     element_name(base, id)
-        .is_some_and(|name| name.ns == html_namespace() && name.local.as_ref() == "option")
+        .is_some_and(|name| name.ns == html_namespace() && name.local.as_str() == "option")
 }
 
 /// The index of the first selected option, or `-1`
@@ -286,7 +286,7 @@ fn set_option_selected(parsed: &mut crate::Parsed, option: NodeId, selected: boo
         let name = element
             .attrs
             .iter()
-            .find(|attribute| attribute.name.local.as_ref() == "selected")
+            .find(|attribute| attribute.name.local.as_str() == "selected")
             .map_or_else(
                 || {
                     QualName::new(
@@ -414,7 +414,7 @@ fn collect_window_named(
             }
             element_name(base, id).is_some_and(|qual| {
                 qual.ns == html_namespace()
-                    && matches!(qual.local.as_ref(), "embed" | "form" | "img" | "object")
+                    && matches!(qual.local.as_str(), "embed" | "form" | "img" | "object")
                     && attr(base, id, "name").is_some_and(|value| value == name)
             })
         })
@@ -434,7 +434,7 @@ fn named_exists(base: &blitz_dom::BaseDocument, scope: BlitzId, name: &str) -> b
         }
         element_name(base, id).is_some_and(|qual| {
             qual.ns == html_namespace()
-                && matches!(qual.local.as_ref(), "embed" | "form" | "img" | "object")
+                && matches!(qual.local.as_str(), "embed" | "form" | "img" | "object")
                 && attr(base, id, "name").is_some_and(|value| value == name)
         })
     })
@@ -451,8 +451,8 @@ fn collect_by_tag_ns(
         .into_iter()
         .filter(|&id| {
             element_name(base, id).is_some_and(|name| {
-                (namespace == "*" || name.ns.as_ref() == namespace)
-                    && (local == "*" || name.local.as_ref() == local)
+                (namespace == "*" || name.ns.as_str() == namespace)
+                    && (local == "*" || name.local.as_str() == local)
             })
         })
         .map(|node| NodeId { document, node })
@@ -508,7 +508,7 @@ fn class_attribute(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&str> 
         .attrs
         .iter()
         .find(|attribute| {
-            attribute.name.ns.as_ref().is_empty() && attribute.name.local.as_ref() == "class"
+            attribute.name.ns.as_str().is_empty() && attribute.name.local.as_str() == "class"
         })
         .map(|attribute| attribute.value.as_str())
 }
@@ -516,7 +516,7 @@ fn class_attribute(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&str> 
 /// Whether `id` is an HTML element named `local`.
 fn html_named(base: &blitz_dom::BaseDocument, id: BlitzId, local: &str) -> bool {
     element_name(base, id)
-        .is_some_and(|name| name.ns == html_namespace() && name.local.as_ref() == local)
+        .is_some_and(|name| name.ns == html_namespace() && name.local.as_str() == local)
 }
 
 /// The HTML child elements of `parent` named in `locals`, in tree order.

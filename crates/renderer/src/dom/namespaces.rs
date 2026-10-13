@@ -81,13 +81,13 @@ pub(crate) fn locate_element_namespace(
         .name
         .prefix
         .as_ref()
-        .map(markup5ever::Prefix::as_ref)
+        .map(markup5ever::Prefix::as_str)
         .filter(|prefix| !prefix.is_empty());
-    if !element.name.ns.as_ref().is_empty() && actual == prefix {
-        return Some(element.name.ns.as_ref().to_owned());
+    if !element.name.ns.as_str().is_empty() && actual == prefix {
+        return Some(element.name.ns.as_str().to_owned());
     }
     for attribute in element.attrs.iter() {
-        if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
+        if attribute.name.ns.as_str() != "http://www.w3.org/2000/xmlns/" {
             continue;
         }
         let declaration = match prefix {
@@ -96,10 +96,10 @@ pub(crate) fn locate_element_namespace(
                     .name
                     .prefix
                     .as_ref()
-                    .is_some_and(|value| value.as_ref() == "xmlns")
-                    && attribute.name.local.as_ref() == prefix
+                    .is_some_and(|value| value.as_str() == "xmlns")
+                    && attribute.name.local.as_str() == prefix
             }
-            None => attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns",
+            None => attribute.name.prefix.is_none() && attribute.name.local.as_str() == "xmlns",
         };
         if declaration {
             return (!attribute.value.is_empty()).then(|| attribute.value.clone());
@@ -140,12 +140,12 @@ pub(crate) fn locate_element_prefix(
     namespace: &str,
 ) -> Option<String> {
     let element = doc.base.get_node(id.node)?.data.downcast_element()?;
-    if element.name.ns.as_ref() == namespace
+    if element.name.ns.as_str() == namespace
         && let Some(prefix) = element
             .name
             .prefix
             .as_ref()
-            .map(markup5ever::Prefix::as_ref)
+            .map(markup5ever::Prefix::as_str)
             .filter(|prefix| !prefix.is_empty())
     {
         return Some(prefix.to_owned());
@@ -155,10 +155,10 @@ pub(crate) fn locate_element_prefix(
             .name
             .prefix
             .as_ref()
-            .is_some_and(|prefix| prefix.as_ref() == "xmlns")
+            .is_some_and(|prefix| prefix.as_str() == "xmlns")
             && attribute.value == namespace
         {
-            return Some(attribute.name.local.as_ref().to_owned());
+            return Some(attribute.name.local.as_str().to_owned());
         }
     }
     parent_element_of(doc, id).and_then(|parent| locate_prefix(doc, parent, namespace))

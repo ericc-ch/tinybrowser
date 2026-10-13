@@ -1214,7 +1214,7 @@ pub(crate) fn script_at(world: &World, id: crate::dom::tree::NodeId) -> Option<S
     let element = node.data.downcast_element()?;
     let name = &element.name;
     if name.ns != crate::dom::tree::html_namespace()
-        || !name.local.as_ref().eq_ignore_ascii_case("script")
+        || !name.local.as_str().eq_ignore_ascii_case("script")
     {
         return None;
     }

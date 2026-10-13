@@ -1612,7 +1612,7 @@ impl JsNode {
     pub(super) fn namespace_uri<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let namespace = with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(element)) => {
-                (!element.name.ns.as_ref().is_empty()).then(|| element.name.ns.to_string())
+                (!element.name.ns.as_str().is_empty()).then(|| element.name.ns.to_string())
             }
             _ => None,
         })?;
@@ -1787,8 +1787,8 @@ impl JsNode {
                         .attrs
                         .iter()
                         .find(|attribute| {
-                            attribute.name.ns.as_ref() == namespace
-                                && attribute.name.local.as_ref() == local
+                            attribute.name.ns.as_str() == namespace
+                                && attribute.name.local.as_str() == local
                         })
                         .map(|attribute| attribute.name.clone())
                 })
@@ -2365,8 +2365,8 @@ pub(super) fn attr_ns_value(
                 .attrs
                 .iter()
                 .find(|attribute| {
-                    attribute.name.ns.as_ref() == namespace
-                        && attribute.name.local.as_ref() == local
+                    attribute.name.ns.as_str() == namespace
+                        && attribute.name.local.as_str() == local
                 })
                 .map(|attribute| attribute.value.clone())
         })
@@ -2649,7 +2649,7 @@ pub(super) fn is_first_summary_child(
             base.get_node(*child).and_then(|tree| {
                 tree.data.downcast_element().and_then(|element| {
                     (element.name.ns == html_namespace()
-                        && element.name.local.as_ref() == "summary")
+                        && element.name.local.as_str() == "summary")
                         .then_some(*child)
                 })
             })
@@ -2732,13 +2732,13 @@ pub(super) fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -
         return 0;
     }
     // The first `summary` child of a `details` is focusable.
-    if element.name.local.as_ref() == "summary"
+    if element.name.local.as_str() == "summary"
         && let Some(parent) = tree.parent
         && is_first_summary_child(base, parent, node)
     {
         return 0;
     }
-    match element.name.local.as_ref() {
+    match element.name.local.as_str() {
         "input" => {
             if crate::dom::tree::attr(base, node, "type")
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))

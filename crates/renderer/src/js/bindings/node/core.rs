@@ -1981,13 +1981,13 @@ pub(in crate::js::bindings) fn compare_node_position(
             .and_then(|candidate| candidate.data.downcast_element())
         {
             for attribute in element.attrs.iter() {
-                if attribute.name.ns.as_ref() == a.namespace
-                    && attribute.name.local.as_ref() == a.local
+                if attribute.name.ns.as_str() == a.namespace
+                    && attribute.name.local.as_str() == a.local
                 {
                     return Ok(IMPLEMENTATION_SPECIFIC | PRECEDING);
                 }
-                if attribute.name.ns.as_ref() == b.namespace
-                    && attribute.name.local.as_ref() == b.local
+                if attribute.name.ns.as_str() == b.namespace
+                    && attribute.name.local.as_str() == b.local
                 {
                     return Ok(IMPLEMENTATION_SPECIFIC | FOLLOWING);
                 }

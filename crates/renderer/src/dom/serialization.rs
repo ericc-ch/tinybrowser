@@ -40,7 +40,7 @@ impl HtmlOutput {
 fn serializes_as_void(name: &QualName) -> bool {
     name.ns == html_namespace()
         && matches!(
-            name.local.as_ref(),
+            name.local.as_str(),
             "area"
                 | "base"
                 | "basefont"
@@ -69,42 +69,42 @@ fn serializes_as_void(name: &QualName) -> bool {
 fn push_html_element_name(output: &mut HtmlOutput, name: &QualName) {
     if name.ns == html_namespace()
         || name.ns == svg_namespace()
-        || name.ns.as_ref() == "http://www.w3.org/1998/Math/MathML"
+        || name.ns.as_str() == "http://www.w3.org/1998/Math/MathML"
     {
-        output.push_str(name.local.as_ref());
+        output.push_str(name.local.as_str());
     } else if let Some(prefix) = name.prefix.as_ref().filter(|prefix| !prefix.is_empty()) {
-        output.push_str(prefix.as_ref());
+        output.push_str(prefix.as_str());
         output.push_str(":");
-        output.push_str(name.local.as_ref());
+        output.push_str(name.local.as_str());
     } else {
-        output.push_str(name.local.as_ref());
+        output.push_str(name.local.as_str());
     }
 }
 
 /// The attribute's HTML-serialized name
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#attribute-s-serialized-name>).
 fn push_html_attribute_name(output: &mut HtmlOutput, name: &QualName) {
-    if name.ns.as_ref().is_empty() {
-        output.push_str(name.local.as_ref());
-    } else if name.ns.as_ref() == "http://www.w3.org/XML/1998/namespace" {
+    if name.ns.as_str().is_empty() {
+        output.push_str(name.local.as_str());
+    } else if name.ns.as_str() == "http://www.w3.org/XML/1998/namespace" {
         output.push_str("xml:");
-        output.push_str(name.local.as_ref());
-    } else if name.ns.as_ref() == "http://www.w3.org/2000/xmlns/" {
-        if name.local.as_ref() == "xmlns" {
+        output.push_str(name.local.as_str());
+    } else if name.ns.as_str() == "http://www.w3.org/2000/xmlns/" {
+        if name.local.as_str() == "xmlns" {
             output.push_str("xmlns");
         } else {
             output.push_str("xmlns:");
-            output.push_str(name.local.as_ref());
+            output.push_str(name.local.as_str());
         }
-    } else if name.ns.as_ref() == "http://www.w3.org/1999/xlink" {
+    } else if name.ns.as_str() == "http://www.w3.org/1999/xlink" {
         output.push_str("xlink:");
-        output.push_str(name.local.as_ref());
+        output.push_str(name.local.as_str());
     } else if let Some(prefix) = name.prefix.as_ref().filter(|prefix| !prefix.is_empty()) {
-        output.push_str(prefix.as_ref());
+        output.push_str(prefix.as_str());
         output.push_str(":");
-        output.push_str(name.local.as_ref());
+        output.push_str(name.local.as_str());
     } else {
-        output.push_str(name.local.as_ref());
+        output.push_str(name.local.as_str());
     }
 }
 
@@ -206,7 +206,7 @@ fn serialize_html_node(
             let raw_text = parent.is_some_and(|name| {
                 name.ns == html_namespace()
                     && matches!(
-                        name.local.as_ref(),
+                        name.local.as_str(),
                         "style"
                             | "script"
                             | "xmp"
@@ -234,7 +234,7 @@ fn serialize_html_node(
             let raw_text = parent.is_some_and(|name| {
                 name.ns == html_namespace()
                     && matches!(
-                        name.local.as_ref(),
+                        name.local.as_str(),
                         "style"
                             | "script"
                             | "xmp"

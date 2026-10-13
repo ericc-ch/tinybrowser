@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 webstorage = { workspace = true }
 # Parser QualNames flow into Blitz as one type, no conversion layer.
-markup5ever = "=0.39.0"
+markup5ever = "=0.40.0"
 encoding_rs = "0.8"
 # Already in Cargo.lock and the shipping binary. Direct deps so renderer can
 # call them: `data-url` for engine data URLs and `atob`,
@@ -47,22 +47,22 @@ rquickjs = { version = "0.14.0", default-features = false, features = ["std", "l
 serde = { version = "1", features = ["derive"] }
 # Style / layout / paint.
 
-parley = { version = "0.11", default-features = false, features = ["libm"] }
+parley = { version = "0.12", default-features = false, features = ["libm"] }
 png = "0.18"
 # SVG `naturalWidth`/`naturalHeight` read Blitz's parsed intrinsic lengths.
 svgtypes = "0.16"
-style = { package = "stylo", version = "0.20" }
-style_traits = { package = "stylo_traits", version = "0.20" }
+style = { package = "stylo", version = "0.22.0" }
+style_traits = { package = "stylo_traits", version = "0.22.0" }
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
 # Pinned exact: beta drift is fast, and Cargo.lock pins the rest.
 # `floats` is not a Blitz default but the published stylo_taffy only
 # initializes `float`/`clear` with it.
-blitz-dom = { version = "=0.3.0-beta.2", features = ["floats"] }
-blitz-html = "=0.3.0-beta.2"
-blitz-paint = "=0.3.0-beta.2"
-anyrender = "=0.13.0"
+blitz-dom = { version = "=0.3.0-beta.3", features = ["floats"] }
+blitz-html = "=0.3.0-beta.3"
+blitz-paint = "=0.3.0-beta.3"
+anyrender = "=0.14.0"
 anyrender_tiny_skia = { path = "../anyrender-tiny-skia" }
-blitz-traits = "=0.3.0-beta.2"
+blitz-traits = "=0.3.0-beta.3"
 # Inflates the build-compressed JS shims (`js::blob`). Same instance `png`
 # already retains, so this adds no new crate to the binary.
 flate2 = "1"

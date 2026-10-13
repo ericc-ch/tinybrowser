@@ -71,7 +71,7 @@ pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
             continue;
         };
         if node.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace() && element.name.local.as_ref() == "base"
+            element.name.ns == html_namespace() && element.name.local.as_str() == "base"
         }) && let Some(value) = attr(base, current, "href")
         {
             href = Some(value.to_owned());

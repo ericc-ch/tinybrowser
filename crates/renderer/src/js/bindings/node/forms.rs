@@ -556,7 +556,7 @@ impl JsNode {
         if element.name.ns != html_namespace() {
             return Ok(String::new());
         }
-        Ok(match element.name.local.as_ref() {
+        Ok(match element.name.local.as_str() {
             "textarea" => {
                 crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node)
                     .to_string_lossy()
@@ -908,7 +908,7 @@ impl JsNode {
                     .and_then(|node| node.data.downcast_element())
                     .is_some_and(|element| {
                         element.name.ns == html_namespace()
-                            && element.name.local.as_ref() == "input"
+                            && element.name.local.as_str() == "input"
                             && attr(base, self.handle.0.node, "type")
                                 .unwrap_or("text")
                                 .trim()

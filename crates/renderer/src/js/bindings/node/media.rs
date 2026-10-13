@@ -55,7 +55,7 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
                             base.get_node(*kid).is_some_and(|candidate| {
                                 candidate.data.downcast_element().is_some_and(|element| {
                                     element.name.ns == html_namespace()
-                                        && element.name.local.as_ref() == "source"
+                                        && element.name.local.as_str() == "source"
                                 })
                             })
                         })

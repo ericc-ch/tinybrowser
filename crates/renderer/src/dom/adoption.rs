@@ -166,7 +166,7 @@ pub(crate) fn materialize_import(
             // Template children materialize into the fresh element's
             // contents fragment, which creation already established.
             let parent = if crate::dom::tree::is_template_tag(name) {
-                doc.base.mutate().ensure_template_contents(blitz_id)
+                doc.base.mutate().template_contents(blitz_id)
             } else {
                 blitz_id
             };

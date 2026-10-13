@@ -49,7 +49,7 @@ pub(crate) fn collect_pending_entries(
         if element.name.ns != html_namespace() {
             continue;
         }
-        let local = element.name.local.as_ref();
+        let local = element.name.local.as_str();
         if !matches!(local, "input" | "textarea" | "select" | "button") {
             continue;
         }
@@ -119,7 +119,7 @@ pub(crate) fn is_disabled(base: &BaseDocument, node: BlitzId) -> bool {
             cursor = base.get_node(current).and_then(|target| target.parent);
             continue;
         }
-        match element.name.local.as_ref() {
+        match element.name.local.as_str() {
             "optgroup" | "select" if attr(base, current, "disabled").is_some() => return true,
             "select" => return false,
             _ => {}
@@ -242,12 +242,12 @@ pub(crate) fn select_options(base: &BaseDocument, document: u32, select: BlitzId
             continue;
         };
         if node.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace() && element.name.local.as_ref() == "select"
+            element.name.ns == html_namespace() && element.name.local.as_str() == "select"
         }) {
             continue;
         }
         if node.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace() && element.name.local.as_ref() == "option"
+            element.name.ns == html_namespace() && element.name.local.as_str() == "option"
         }) {
             options.push(NodeId {
                 document,
@@ -303,9 +303,9 @@ pub(crate) fn option_text(base: &BaseDocument, option: BlitzId) -> String {
             NodeData::Text(data) => text.push_str(&data.content),
             NodeData::CDataSection { contents } => text.push_str(contents),
             NodeData::Element(element) => {
-                let is_script = element.name.local.as_ref().eq_ignore_ascii_case("script")
+                let is_script = element.name.local.as_str().eq_ignore_ascii_case("script")
                     && (element.name.ns == html_namespace()
-                        || element.name.ns.as_ref() == "http://www.w3.org/2000/svg");
+                        || element.name.ns.as_str() == "http://www.w3.org/2000/svg");
                 if !is_script {
                     stack.extend(node.children.iter().rev().copied());
                 }
@@ -469,7 +469,7 @@ pub(crate) fn radio_group_members(
         if id != except
             && node.data.downcast_element().is_some_and(|element| {
                 element.name.ns == html_namespace()
-                    && element.name.local.as_ref() == "input"
+                    && element.name.local.as_str() == "input"
                     && attr(base, id, "type")
                         .unwrap_or("text")
                         .trim()
@@ -494,7 +494,7 @@ pub(crate) fn control_value_len(base: &blitz_dom::BaseDocument, node: BlitzId) -
     else {
         return 0;
     };
-    if element.name.ns == html_namespace() && element.name.local.as_ref() == "textarea" {
+    if element.name.ns == html_namespace() && element.name.local.as_str() == "textarea" {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "control values stay far below u32::MAX"
@@ -527,7 +527,7 @@ pub(crate) fn selection_applies(base: &blitz_dom::BaseDocument, node: BlitzId) -
     if element.name.ns != html_namespace() {
         return false;
     }
-    match element.name.local.as_ref() {
+    match element.name.local.as_str() {
         "textarea" => true,
         "input" => {
             // Only the text-like states support the selection APIs
@@ -560,7 +560,7 @@ pub(crate) fn options_to_deselect(
     else {
         return Vec::new();
     };
-    if element.name.ns != html_namespace() || element.name.local.as_ref() != "option" {
+    if element.name.ns != html_namespace() || element.name.local.as_str() != "option" {
         return Vec::new();
     }
     if attr(base, option, "selected").is_none() {
@@ -595,7 +595,7 @@ pub(crate) fn radios_to_uncheck(base: &BaseDocument, document: u32, input: Blitz
     else {
         return Vec::new();
     };
-    if element.name.ns != html_namespace() || element.name.local.as_ref() != "input" {
+    if element.name.ns != html_namespace() || element.name.local.as_str() != "input" {
         return Vec::new();
     }
     if attr(base, input, "type")

@@ -882,7 +882,7 @@ fn node_wrapper_prototype<'js>(
 /// Other namespaces use the base `Element` interface.
 fn element_interface(name: &QualName) -> &'static str {
     if name.ns == crate::dom::tree::html_namespace() {
-        html_element_interface(name.local.as_ref())
+        html_element_interface(name.local.as_str())
     } else if name.ns == crate::dom::tree::svg_namespace() {
         "SVGElement"
     } else if name.ns == crate::dom::tree::mathml_namespace() {

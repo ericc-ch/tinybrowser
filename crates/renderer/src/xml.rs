@@ -41,7 +41,7 @@ pub(crate) fn parse_document(
         blitz_dom::DocumentConfig {
             base_url: Some(base_url),
             font_ctx: Some(font_ctx),
-            ua_stylesheets: Some(Vec::new()),
+            ua_stylesheets: Vec::new(),
             ..blitz_dom::DocumentConfig::default()
         },
     )

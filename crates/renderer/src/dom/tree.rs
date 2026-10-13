@@ -159,7 +159,7 @@ pub(crate) fn mathml_namespace() -> markup5ever::Namespace {
 pub(crate) fn is_html_tag(data: Option<&blitz_dom::NodeData>, local: &str) -> bool {
     match data {
         Some(blitz_dom::NodeData::Element(element)) => {
-            element.name.ns == html_namespace() && element.name.local.as_ref() == local
+            element.name.ns == html_namespace() && element.name.local.as_str() == local
         }
         _ => false,
     }
@@ -169,7 +169,7 @@ pub(crate) fn is_html_tag(data: Option<&blitz_dom::NodeData>, local: &str) -> bo
 /// contents
 /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
 pub(crate) fn is_template_tag(name: &markup5ever::QualName) -> bool {
-    name.ns == html_namespace() && name.local.as_ref() == "template"
+    name.ns == html_namespace() && name.local.as_str() == "template"
 }
 
 /// The template contents fragment of `id`, when it is a `template` element.

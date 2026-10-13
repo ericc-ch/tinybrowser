@@ -522,7 +522,7 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
                 .document
                 .base
                 .mutate()
-                .ensure_template_contents(self.handle.0.node)
+                .template_contents(self.handle.0.node)
         };
         // The contents may have been adopted into another document since:
         // follow the live id so a previously fetched `content` wrapper and
@@ -996,8 +996,8 @@ impl JsNode {
         let is_body = with_node_data(ctx, id, |data| match data {
             Some(NodeData::Element(element)) => {
                 element.name.ns == html_namespace()
-                    && (element.name.local.as_ref() == "body"
-                        || element.name.local.as_ref() == "frameset")
+                    && (element.name.local.as_str() == "body"
+                        || element.name.local.as_str() == "frameset")
             }
             _ => false,
         })?;
@@ -1548,7 +1548,7 @@ pub(super) fn create_element_named<'js>(
 pub(super) fn html_fragment_context(name: &QualName) -> String {
     if name.ns == svg_namespace() {
         format!("svg {}", name.local)
-    } else if name.ns.as_ref() == "http://www.w3.org/1998/Math/MathML" {
+    } else if name.ns.as_str() == "http://www.w3.org/1998/Math/MathML" {
         format!("math {}", name.local)
     } else {
         name.local.to_string()
@@ -1653,7 +1653,7 @@ pub(super) fn parse_html_fragment_snapshots(
     let mut base = blitz_dom::BaseDocument::new(blitz_dom::DocumentConfig {
         base_url: Some(base_url.to_owned()),
         font_ctx: Some(font_ctx),
-        ua_stylesheets: Some(Vec::new()),
+        ua_stylesheets: Vec::new(),
         ..blitz_dom::DocumentConfig::default()
     });
     let context_id = {
@@ -1735,8 +1735,8 @@ pub(super) fn current_body_child(
             let node = base.get_node(*child)?;
             match &node.data {
                 NodeData::Element(element) => (element.name.ns == html_namespace()
-                    && (element.name.local.as_ref() == "body"
-                        || element.name.local.as_ref() == "frameset"))
+                    && (element.name.local.as_str() == "body"
+                        || element.name.local.as_str() == "frameset"))
                     .then_some(NodeId {
                         document: parsed.id,
                         node: *child,
