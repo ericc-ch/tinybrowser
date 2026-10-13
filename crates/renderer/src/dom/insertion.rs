@@ -11,8 +11,8 @@ use blitz_dom::NodeData;
 use crate::documents::JournalEntry;
 use crate::dom::TreeError;
 use crate::dom::tree::{
-    BlitzId, NodeId, attr, html_namespace, is_html_element, is_iframe_element, mathml_namespace,
-    sibling, svg_namespace,
+    BlitzId, NodeId, attr, html_namespace, is_html_element, is_iframe_element, is_real_element,
+    mathml_namespace, root_of, sibling, svg_namespace,
 };
 
 /// The inserted node's side of ensure pre-insert validity.
@@ -714,4 +714,196 @@ pub(crate) fn ensure_doctype_position(
         return Err(TreeError::Hierarchy);
     }
     Ok(())
+}
+/// The `child` argument of `move`, after `moveBefore` rewrites a self-reference
+/// to the node's next sibling
+/// (<https://dom.spec.whatwg.org/#dom-parentnode-movebefore>).
+pub(crate) enum MoveTarget {
+    /// `child` is null, so the node is appended.
+    End,
+    /// Insert before this child of the destination.
+    Before(NodeId),
+    /// An attribute, which is never parented.
+    Unparented,
+}
+
+/// Preconditions of `move` (<https://dom.spec.whatwg.org/#move>).
+pub(crate) fn ensure_can_move(
+    doc: &crate::documents::BlitzDocument,
+    parent: NodeId,
+    node: NodeId,
+    target: &MoveTarget,
+) -> Result<(), TreeError> {
+    if node.document != parent.document {
+        return Err(TreeError::Hierarchy);
+    }
+    let base = &doc.base;
+    if root_of(base, parent.node) != root_of(base, node.node) {
+        return Err(TreeError::Hierarchy);
+    }
+    // Host-including ancestry (template contents via their host) is checked
+    // inside `ensure_no_cycle`; there are no shadow hosts
+    // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
+    ensure_no_cycle(base, parent.node, node.node)?;
+    let _reference = match target {
+        MoveTarget::Before(child) => {
+            if child.document != parent.document {
+                return Err(TreeError::NotFound);
+            }
+            ensure_parented(base, parent, *child)?;
+            Some(*child)
+        }
+        MoveTarget::Unparented => {
+            return Err(TreeError::NotFound);
+        }
+        MoveTarget::End => None,
+    };
+    let kind = classify_inserted(doc, node.node);
+    let movable = matches!(
+        kind,
+        InsertedNode::Element | InsertedNode::Text | InsertedNode::CharacterData
+    );
+    if !movable {
+        return Err(TreeError::Hierarchy);
+    }
+    let parent_is_document = base.root_node().id == parent.node;
+    if parent_is_document && matches!(kind, InsertedNode::Text) {
+        return Err(TreeError::Hierarchy);
+    }
+    if parent_is_document && matches!(kind, InsertedNode::Element) {
+        // Pre-move validity counts an element child that is not the moved
+        // node: moving the document element itself past a doctype-less
+        // prolog is not a second element
+        // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+        let has_element = base.get_node(parent.node).is_some_and(|root| {
+            root.children
+                .iter()
+                .any(|child| *child != node.node && is_real_element(doc, *child))
+        });
+        if has_element {
+            return Err(TreeError::Hierarchy);
+        }
+    }
+    // The root and ancestor checks make this parent exist. The spec asserts
+    // it (<https://dom.spec.whatwg.org/#move>).
+    if base
+        .get_node(node.node)
+        .and_then(|candidate| candidate.parent)
+        .is_none()
+    {
+        return Err(TreeError::Hierarchy);
+    }
+    Ok(())
+}
+
+/// Applies a validated `move`: detaches `node` and places it at `target`.
+/// The caller owns validity (`ensure_can_move`).
+pub(crate) fn move_parsed(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    node: NodeId,
+    target: &MoveTarget,
+) {
+    let reference = match target {
+        MoveTarget::Before(child) => Some(*child),
+        MoveTarget::End | MoveTarget::Unparented => None,
+    };
+    unlink_journaled(parsed, node);
+    place_journaled(parsed, parent, node, reference);
+}
+
+/// Replaces `old` with the already-adopted `node` (or its children for a
+/// fragment): the node's own unlink keeps a removal record when it moves,
+/// then one combined record carries the replacement
+/// (<https://dom.spec.whatwg.org/#concept-node-replace>). Returns the nodes
+/// the parent gained, for the insertion fixups.
+pub(crate) fn replace_parsed(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    node: NodeId,
+    old: NodeId,
+) -> Vec<NodeId> {
+    if node == old {
+        let reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
+            document: old.document,
+            node: next,
+        });
+        unlink_journaled(parsed, node);
+        place_journaled(parsed, parent, node, reference);
+        return vec![node];
+    }
+    // Let referenceChild be child's next sibling. If that is node, use
+    // node's next sibling instead
+    // (<https://dom.spec.whatwg.org/#concept-node-replace>).
+    let previous = siblings_around(
+        &parsed.document.base,
+        parent.document,
+        parent.node,
+        old.node,
+    )
+    .0;
+    let mut reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
+        document: old.document,
+        node: next,
+    });
+    if reference == Some(node) {
+        reference = sibling(&parsed.document.base, node.node, true).map(|next| NodeId {
+            document: node.document,
+            node: next,
+        });
+    }
+    let (added, fragment) = if parsed.document.is_fragment(node.node) {
+        let moved: Vec<NodeId> = parsed
+            .document
+            .base
+            .get_node(node.node)
+            .map(|backing| {
+                backing
+                    .children
+                    .iter()
+                    .map(|child| NodeId {
+                        document: node.document,
+                        node: *child,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (moved, true)
+    } else {
+        (vec![node], false)
+    };
+    if fragment {
+        parsed.document.record(JournalEntry::ChildList {
+            target: node,
+            added: Vec::new(),
+            removed: added.clone(),
+            previous: None,
+            next: None,
+        });
+    } else {
+        unlink_journaled(parsed, node);
+    }
+    parsed.document.base.mutate().remove_node(old.node);
+    for child in &added {
+        match reference {
+            Some(reference) => parsed
+                .document
+                .base
+                .mutate()
+                .insert_nodes_before(reference.node, &[child.node]),
+            None => parsed
+                .document
+                .base
+                .mutate()
+                .append_children(parent.node, &[child.node]),
+        }
+    }
+    parsed.document.record(JournalEntry::ChildList {
+        target: parent,
+        added: added.clone(),
+        removed: vec![old],
+        previous,
+        next: reference,
+    });
+    added
 }

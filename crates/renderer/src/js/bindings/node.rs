@@ -38,10 +38,11 @@ use crate::js::events;
 use crate::js::world::World;
 
 use crate::dom::insertion::{
-    InsertedNode, InsertionStep, classify_inserted, collect_html_insertion_steps,
-    collect_nonce_elements, ensure_document_content_model, ensure_no_cycle, ensure_parented,
-    iframe_containers_in_subtrees, iframe_fires_initial_load, insert_parsed, place_journaled,
-    replace_all_journaled, replace_all_with_node, siblings_around, unlink_journaled,
+    InsertedNode, InsertionStep, MoveTarget, classify_inserted, collect_html_insertion_steps,
+    collect_nonce_elements, ensure_can_move, ensure_document_content_model, ensure_no_cycle,
+    ensure_parented, iframe_containers_in_subtrees, iframe_fires_initial_load, insert_parsed,
+    move_parsed, place_journaled, replace_all_journaled, replace_all_with_node, replace_parsed,
+    unlink_journaled,
 };
 use crate::dom::tree::{
     BlitzId, NodeId, ancestor_chain, attr, child_ids, element_node_name, form_owner_of,
@@ -1032,18 +1033,6 @@ fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
     adopt_across_documents(ctx, parent, node)
 }
 
-/// The `child` argument of `move`, after `moveBefore` rewrites a self-reference
-/// to the node's next sibling
-/// (<https://dom.spec.whatwg.org/#dom-parentnode-movebefore>).
-enum MoveTarget {
-    /// `child` is null, so the node is appended.
-    End,
-    /// Insert before this child of the destination.
-    Before(NodeId),
-    /// An attribute, which is never parented.
-    Unparented,
-}
-
 /// `ParentNode.moveBefore` (<https://dom.spec.whatwg.org/#dom-parentnode-movebefore>).
 ///
 /// `move` is a separate primitive from insert and remove: it does not adopt,
@@ -1074,19 +1063,24 @@ fn move_before_node(
         }
         Some(NodeReference::Tree(child)) => MoveTarget::Before(child),
     };
-    ensure_can_move(ctx, parent, node, &target)?;
+    ensure_can_move(
+        &world(ctx)?
+            .borrow()
+            .document(parent)
+            .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?
+            .document,
+        parent,
+        node,
+        &target,
+    )
+    .map_err(|error| throw_dom_error(ctx, error))?;
     {
         let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(parent) else {
             return Err(Exception::throw_type(ctx, "stale parent"));
         };
-        let reference = match target {
-            MoveTarget::Before(child) => Some(child),
-            MoveTarget::End | MoveTarget::Unparented => None,
-        };
-        unlink_journaled(&mut parsed, node);
-        place_journaled(&mut parsed, parent, node, reference);
+        move_parsed(&mut parsed, parent, node, &target);
     }
     // A moved `iframe` container keeps its navigable but takes its new
     // position among its siblings, so `window[i]` keeps following container
@@ -1105,104 +1099,6 @@ fn move_before_node(
         note_connected_move(ctx, node)?;
     }
     schedule_mutation_delivery(ctx)
-}
-
-/// Preconditions of `move` (<https://dom.spec.whatwg.org/#move>).
-fn ensure_can_move(ctx: &Ctx<'_>, parent: NodeId, node: NodeId, target: &MoveTarget) -> Result<()> {
-    if node.document != parent.document {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "move crosses shadow-including roots",
-        ));
-    }
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(parent) else {
-        return Err(Exception::throw_type(ctx, "stale parent"));
-    };
-    let doc = &parsed.document;
-    let base = &doc.base;
-    if root_of(base, parent.node) != root_of(base, node.node) {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "move crosses shadow-including roots",
-        ));
-    }
-    // Host-including ancestry (template contents via their host) is checked
-    // inside `ensure_no_cycle`; there are no shadow hosts
-    // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
-    ensure_no_cycle(base, parent.node, node.node).map_err(|error| throw_dom_error(ctx, error))?;
-    let _reference = match target {
-        MoveTarget::Before(child) => {
-            if child.document != parent.document {
-                return Err(throw_dom(
-                    ctx,
-                    "NotFoundError",
-                    "reference is not a child of parent",
-                ));
-            }
-            ensure_parented(base, parent, *child).map_err(|error| throw_dom_error(ctx, error))?;
-            Some(*child)
-        }
-        MoveTarget::Unparented => {
-            return Err(throw_dom(ctx, "NotFoundError", "attributes have no parent"));
-        }
-        MoveTarget::End => None,
-    };
-    let kind = classify_inserted(doc, node.node);
-    let movable = matches!(
-        kind,
-        InsertedNode::Element | InsertedNode::Text | InsertedNode::CharacterData
-    );
-    if !movable {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "node cannot be moved",
-        ));
-    }
-    let parent_is_document = base.root_node().id == parent.node;
-    if parent_is_document && matches!(kind, InsertedNode::Text) {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "text cannot be a child of a document",
-        ));
-    }
-    if parent_is_document && matches!(kind, InsertedNode::Element) {
-        // Pre-move validity counts an element child that is not the moved
-        // node: moving the document element itself past a doctype-less
-        // prolog is not a second element
-        // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-        let has_element = base.get_node(parent.node).is_some_and(|root| {
-            root.children
-                .iter()
-                .any(|child| *child != node.node && is_real_element(doc, *child))
-        });
-        if has_element {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "a document can have only one element child",
-            ));
-        }
-    }
-    // The root and ancestor checks make this parent exist. The spec asserts
-    // it (<https://dom.spec.whatwg.org/#move>).
-    if base
-        .get_node(node.node)
-        .and_then(|candidate| candidate.parent)
-        .is_none()
-    {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "node has no parent",
-        ));
-    }
-    Ok(())
 }
 
 /// Re-sorts the frame of a moved `iframe` container with its new siblings.
@@ -1248,103 +1144,6 @@ fn upgrade_parsed_tree(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     hook.call((wrapped,))
 }
 
-/// Replaces `old` with the already-adopted `node` (or its children for a
-/// fragment): the node's own unlink keeps a removal record when it moves,
-/// then one combined record carries the replacement
-/// (<https://dom.spec.whatwg.org/#concept-node-replace>). Returns the nodes
-/// the parent gained, for the insertion fixups.
-fn replace_parsed(
-    _ctx: &Ctx<'_>,
-    parsed: &mut crate::Parsed,
-    parent: NodeId,
-    node: NodeId,
-    old: NodeId,
-) -> Vec<NodeId> {
-    if node == old {
-        let reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
-            document: old.document,
-            node: next,
-        });
-        unlink_journaled(parsed, node);
-        place_journaled(parsed, parent, node, reference);
-        return vec![node];
-    }
-    // Let referenceChild be child's next sibling. If that is node, use
-    // node's next sibling instead
-    // (<https://dom.spec.whatwg.org/#concept-node-replace>).
-    let previous = siblings_around(
-        &parsed.document.base,
-        parent.document,
-        parent.node,
-        old.node,
-    )
-    .0;
-    let mut reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
-        document: old.document,
-        node: next,
-    });
-    if reference == Some(node) {
-        reference = sibling(&parsed.document.base, node.node, true).map(|next| NodeId {
-            document: node.document,
-            node: next,
-        });
-    }
-    let (added, fragment) = if parsed.document.is_fragment(node.node) {
-        let moved: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(node.node)
-            .map(|backing| {
-                backing
-                    .children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: node.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        (moved, true)
-    } else {
-        (vec![node], false)
-    };
-    if fragment {
-        parsed.document.record(JournalEntry::ChildList {
-            target: node,
-            added: Vec::new(),
-            removed: added.clone(),
-            previous: None,
-            next: None,
-        });
-    } else {
-        unlink_journaled(parsed, node);
-    }
-    parsed.document.base.mutate().remove_node(old.node);
-    for child in &added {
-        match reference {
-            Some(reference) => parsed
-                .document
-                .base
-                .mutate()
-                .insert_nodes_before(reference.node, &[child.node]),
-            None => parsed
-                .document
-                .base
-                .mutate()
-                .append_children(parent.node, &[child.node]),
-        }
-    }
-    parsed.document.record(JournalEntry::ChildList {
-        target: parent,
-        added: added.clone(),
-        removed: vec![old],
-        previous,
-        next: reference,
-    });
-    added
-}
-
 /// Inserts the adopted `node` into `parent` before `reference`, expanding
 /// fragments, journaling the move, and running the insertion fixups. The
 /// caller owns validity and adoption.
@@ -1363,6 +1162,25 @@ fn insert_tree_node(
     reference: Option<NodeId>,
 ) -> Result<()> {
     insert_tree_node_inner(ctx, parent, node, reference, true)
+}
+
+/// Runs the realm side of an insertion after the tree mutation: form-control
+/// fixups, HTML insertion steps (scripts, iframes, referrer policy, nonce
+/// clearing), then observer delivery. The tree work lives in `dom`.
+fn apply_inserted(ctx: &Ctx<'_>, parent: NodeId, moved: &[NodeId], deliver: bool) -> Result<()> {
+    for id in moved {
+        fixup_option_on_insert(ctx, *id)?;
+        fixup_radio_on_insert(ctx, *id)?;
+    }
+    // Insertion steps run while parent is connected. Queue mutation records
+    // first so an inserted script can `takeRecords` its own addition
+    // (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:html-element-insertion-steps>,
+    // <https://dom.spec.whatwg.org/#concept-node-insert>).
+    run_html_insertion_steps(ctx, parent, moved)?;
+    if deliver {
+        schedule_mutation_delivery(ctx)?;
+    }
+    Ok(())
 }
 
 /// Inserts an adopted tree node, recording journal entries for observers.
@@ -1389,15 +1207,7 @@ fn insert_tree_node_inner(
                 insert_parsed(&mut parsed, parent, *child, reference);
             }
         }
-        for id in &moved {
-            fixup_option_on_insert(ctx, *id)?;
-            fixup_radio_on_insert(ctx, *id)?;
-        }
-        run_html_insertion_steps(ctx, parent, &moved)?;
-        if deliver {
-            schedule_mutation_delivery(ctx)?;
-        }
-        return Ok(());
+        return apply_inserted(ctx, parent, &moved, deliver);
     }
     let moved: Vec<NodeId> = {
         let owner = world_for_node(ctx, node)?;
@@ -1432,19 +1242,7 @@ fn insert_tree_node_inner(
         };
         insert_parsed(&mut parsed, parent, node, reference);
     }
-    for id in &moved {
-        fixup_option_on_insert(ctx, *id)?;
-        fixup_radio_on_insert(ctx, *id)?;
-    }
-    // Insertion steps run while parent is connected. Queue mutation records
-    // first so an inserted script can `takeRecords` its own addition
-    // (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:html-element-insertion-steps>,
-    // <https://dom.spec.whatwg.org/#concept-node-insert>).
-    run_html_insertion_steps(ctx, parent, &moved)?;
-    if deliver {
-        schedule_mutation_delivery(ctx)?;
-    }
-    Ok(())
+    apply_inserted(ctx, parent, &moved, deliver)
 }
 
 /// HTML insertion and script children-changed steps after a tree insert, in
@@ -2935,7 +2733,7 @@ impl JsNode {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
             if let Some(current) = current {
-                replace_parsed(ctx, &mut parsed, root_element, node, current);
+                replace_parsed(&mut parsed, root_element, node, current);
                 drop(parsed);
                 drop(world);
                 fixup_focus_after_removal(ctx, current)?;
@@ -4555,7 +4353,7 @@ impl JsNode {
         let replacement = materialize_children(&mut parsed.document, element.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
         let target = element;
-        let added = replace_parsed(ctx, &mut parsed, parent, replacement, target);
+        let added = replace_parsed(&mut parsed, parent, replacement, target);
         drop(parsed);
         drop(world);
         register_inserted_iframes(ctx, &added)?;
@@ -5792,7 +5590,7 @@ impl JsNode {
             let Some(mut parsed) = world.document_mut(parent) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            replace_parsed(&ctx, &mut parsed, parent, node, child)
+            replace_parsed(&mut parsed, parent, node, child)
         };
         fixup_focus_after_removal(&ctx, child)?;
         for id in &moved {
@@ -7470,7 +7268,7 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
             let Some(mut parsed) = world.document_mut(target) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let moved = replace_parsed(&ctx, &mut parsed, parent, node, target);
+            let moved = replace_parsed(&mut parsed, parent, node, target);
             drop(parsed);
             drop(world);
             for id in &moved {
