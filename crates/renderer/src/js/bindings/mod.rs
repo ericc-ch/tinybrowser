@@ -41,11 +41,10 @@ use std::collections::HashMap;
 
 use std::rc::{Rc, Weak};
 
-use std::fmt;
-
 use blitz_dom::NodeData;
 use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
+use crate::dom::TreeError;
 use crate::dom::tree::{NodeId, is_real_element, sibling};
 
 use rquickjs::{
@@ -140,29 +139,6 @@ pub(crate) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::E
     match exception {
         Ok(exception) => ctx.throw(Class::into_value(exception)),
         Err(err) => err,
-    }
-}
-
-/// A refused tree operation, mapped to its DOM exception class
-/// (<https://dom.spec.whatwg.org/#dom-domerror> naming).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum TreeError {
-    /// A handle named a node that no longer exists.
-    Stale,
-    /// The move would place a node inside its own subtree, or the content
-    /// model forbids the operation.
-    Hierarchy,
-    /// The target has no parent to insert beside.
-    NotFound,
-}
-
-impl fmt::Display for TreeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stale => f.write_str("stale node handle"),
-            Self::Hierarchy => f.write_str("hierarchy or content model forbids this operation"),
-            Self::NotFound => f.write_str("target has no parent to insert beside"),
-        }
     }
 }
 

@@ -39,10 +39,9 @@ use crate::js::world::World;
 
 use crate::dom::insertion::{
     InsertedNode, InsertionStep, classify_inserted, collect_html_insertion_steps,
-    collect_nonce_elements, iframe_containers_in_subtrees, iframe_fires_initial_load,
-    insert_parsed, is_doctype, parent_has_doctype, parent_has_element, place_journaled,
-    replace_all_journaled, replace_all_with_node, sibling_doctype_follows,
-    sibling_element_precedes, siblings_around, unlink_journaled,
+    collect_nonce_elements, ensure_document_content_model, ensure_no_cycle, ensure_parented,
+    iframe_containers_in_subtrees, iframe_fires_initial_load, insert_parsed, place_journaled,
+    replace_all_journaled, replace_all_with_node, siblings_around, unlink_journaled,
 };
 use crate::dom::tree::{
     BlitzId, NodeId, ancestor_chain, attr, child_ids, element_node_name, form_owner_of,
@@ -318,10 +317,12 @@ fn insertion_excluding_children(
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
         let base = &parsed.document.base;
         if node.document == parent.document {
-            ensure_no_cycle(ctx, base, parent.node, node.node)?;
+            ensure_no_cycle(base, parent.node, node.node)
+                .map_err(|error| throw_dom_error(ctx, error))?;
         }
         if let Some(reference) = reference {
-            ensure_parented(ctx, base, parent, reference)?;
+            ensure_parented(base, parent, reference)
+                .map_err(|error| throw_dom_error(ctx, error))?;
         }
     }
     // The node itself must be live, resolved in its own document.
@@ -366,189 +367,16 @@ fn insertion_excluding_children(
             .document(parent)
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
         ensure_document_content_model(
-            ctx,
             &parsed.document,
             parent,
             node,
             reference,
             excluded,
             &inserted,
-        )?;
+        )
+        .map_err(|error| throw_dom_error(ctx, error))?;
     }
     Ok((node, reference))
-}
-
-/// The reference child of an insertion must already be parented at the
-/// parent (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-fn ensure_parented(
-    ctx: &Ctx<'_>,
-    base: &blitz_dom::BaseDocument,
-    parent: NodeId,
-    reference: NodeId,
-) -> Result<()> {
-    let parented = reference.document == parent.document
-        && base
-            .get_node(parent.node)
-            .is_some_and(|candidate| candidate.children.contains(&reference.node));
-    if parented {
-        Ok(())
-    } else {
-        Err(throw_dom(
-            ctx,
-            "NotFoundError",
-            "reference is not a child of parent",
-        ))
-    }
-}
-
-/// A node cannot be inserted into its own subtree
-/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-fn ensure_no_cycle(
-    ctx: &Ctx<'_>,
-    base: &blitz_dom::BaseDocument,
-    parent: BlitzId,
-    node: BlitzId,
-) -> Result<()> {
-    // Host-including inclusive ancestry: a template contents fragment counts
-    // as a child of its host, so appending an ancestor of the host into the
-    // fragment is a cycle
-    // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
-    // No shadow hosts exist, so the host link is the only non-parent step.
-    let mut cursor = Some(parent);
-    while let Some(current) = cursor {
-        if current == node {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "node cannot contain itself",
-            ));
-        }
-        cursor = base.get_node(current).and_then(|candidate| {
-            candidate.parent.or(match &candidate.data {
-                NodeData::Fragment { host } => *host,
-                _ => None,
-            })
-        });
-    }
-    Ok(())
-}
-
-/// Document parent rules from ensure pre-insert validity, steps after the
-/// non-document early return
-/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity>).
-///
-/// `excluded` is `childrenToExclude`: `replace` passes the replaced child,
-/// `replaceChildren` passes the parent's current children. The node being
-/// inserted is also left out of the parent's child counts: insert removes it
-/// from its old parent before the parent gains it again, and counting it as
-/// both the existing child and the inserted node rejects a move of the
-/// document element.
-fn ensure_document_content_model(
-    ctx: &Ctx<'_>,
-    doc: &crate::documents::BlitzDocument,
-    parent: NodeId,
-    node: NodeId,
-    reference: Option<NodeId>,
-    excluded: &[BlitzId],
-    inserted: &InsertedNode,
-) -> Result<()> {
-    match inserted {
-        // A text node, including a CDATA section, cannot be a document child.
-        InsertedNode::Text => {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "text cannot be a child of a document",
-            ));
-        }
-        // A comment or processing instruction may be a document child.
-        InsertedNode::CharacterData => return Ok(()),
-        // Unreachable: `Other` throws above for every parent before this
-        // runs. Kept as defense-in-depth so that removing that check fails
-        // closed (HierarchyRequestError) rather than admitting documents or
-        // anonymous blocks as document children.
-        InsertedNode::Other => {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "node cannot be inserted",
-            ));
-        }
-        InsertedNode::Fragment { elements, has_text } => {
-            if *elements > 1 || *has_text {
-                return Err(throw_dom(
-                    ctx,
-                    "HierarchyRequestError",
-                    "document content model violated",
-                ));
-            }
-            if *elements == 0 {
-                return Ok(());
-            }
-        }
-        InsertedNode::Element => {}
-        InsertedNode::Doctype => {
-            return ensure_doctype_position(ctx, doc, parent, node, reference, excluded);
-        }
-    }
-    let parent_has_element = parent_has_element(
-        doc,
-        parent.node,
-        excluded,
-        node.document == parent.document,
-        node.node,
-    );
-    // `ensure_parented` above guarantees same-document-or-absent, but the
-    // filter stays: in release builds a bypassed check must degrade to
-    // append-at-end, never to cross-document slot reads.
-    let child_id = reference.filter(|child| child.document == parent.document);
-    let doctype_follows =
-        child_id.is_some_and(|child| sibling_doctype_follows(doc, parent.node, child.node));
-    let child_is_doctype = child_id
-        .is_some_and(|child| !excluded.contains(&child.node) && is_doctype(doc, child.node));
-    if parent_has_element || doctype_follows || child_is_doctype {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "a document can have only one element child",
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_doctype_position(
-    ctx: &Ctx<'_>,
-    doc: &crate::documents::BlitzDocument,
-    parent: NodeId,
-    node: NodeId,
-    reference: Option<NodeId>,
-    excluded: &[BlitzId],
-) -> Result<()> {
-    let parent_has_doctype = parent_has_doctype(
-        doc,
-        parent.node,
-        excluded,
-        node.document == parent.document,
-        node.node,
-    );
-    let child_id = reference.filter(|child| child.document == parent.document);
-    let element_precedes =
-        child_id.is_some_and(|child| sibling_element_precedes(doc, parent.node, child.node));
-    let parent_has_element = parent_has_element(
-        doc,
-        parent.node,
-        excluded,
-        node.document == parent.document,
-        node.node,
-    );
-    if parent_has_doctype || element_precedes || (child_id.is_none() && parent_has_element) {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "doctype violates the document content model",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn compare_node_position(
@@ -1305,7 +1133,7 @@ fn ensure_can_move(ctx: &Ctx<'_>, parent: NodeId, node: NodeId, target: &MoveTar
     // Host-including ancestry (template contents via their host) is checked
     // inside `ensure_no_cycle`; there are no shadow hosts
     // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
-    ensure_no_cycle(ctx, base, parent.node, node.node)?;
+    ensure_no_cycle(base, parent.node, node.node).map_err(|error| throw_dom_error(ctx, error))?;
     let _reference = match target {
         MoveTarget::Before(child) => {
             if child.document != parent.document {
@@ -1315,7 +1143,7 @@ fn ensure_can_move(ctx: &Ctx<'_>, parent: NodeId, node: NodeId, target: &MoveTar
                     "reference is not a child of parent",
                 ));
             }
-            ensure_parented(ctx, base, parent, *child)?;
+            ensure_parented(base, parent, *child).map_err(|error| throw_dom_error(ctx, error))?;
             Some(*child)
         }
         MoveTarget::Unparented => {

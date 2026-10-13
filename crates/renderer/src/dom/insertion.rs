@@ -9,6 +9,7 @@
 use blitz_dom::NodeData;
 
 use crate::documents::JournalEntry;
+use crate::dom::TreeError;
 use crate::dom::tree::{
     BlitzId, NodeId, attr, html_namespace, is_html_element, is_iframe_element, mathml_namespace,
     sibling, svg_namespace,
@@ -577,4 +578,140 @@ pub(crate) fn collect_html_insertion_steps(
             out,
         );
     }
+}
+/// The reference child of an insertion must already be parented at the
+/// parent (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+pub(crate) fn ensure_parented(
+    base: &blitz_dom::BaseDocument,
+    parent: NodeId,
+    reference: NodeId,
+) -> Result<(), TreeError> {
+    let parented = reference.document == parent.document
+        && base
+            .get_node(parent.node)
+            .is_some_and(|candidate| candidate.children.contains(&reference.node));
+    if parented {
+        Ok(())
+    } else {
+        Err(TreeError::NotFound)
+    }
+}
+
+/// A node cannot be inserted into its own subtree
+/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+pub(crate) fn ensure_no_cycle(
+    base: &blitz_dom::BaseDocument,
+    parent: BlitzId,
+    node: BlitzId,
+) -> Result<(), TreeError> {
+    // Host-including inclusive ancestry: a template contents fragment counts
+    // as a child of its host, so appending an ancestor of the host into the
+    // fragment is a cycle
+    // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
+    // No shadow hosts exist, so the host link is the only non-parent step.
+    let mut cursor = Some(parent);
+    while let Some(current) = cursor {
+        if current == node {
+            return Err(TreeError::Hierarchy);
+        }
+        cursor = base.get_node(current).and_then(|candidate| {
+            candidate.parent.or(match &candidate.data {
+                NodeData::Fragment { host } => *host,
+                _ => None,
+            })
+        });
+    }
+    Ok(())
+}
+
+/// Document parent rules from ensure pre-insert validity, steps after the
+/// non-document early return
+/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity>).
+///
+/// `excluded` is `childrenToExclude`: `replace` passes the replaced child,
+/// `replaceChildren` passes the parent's current children. The node being
+/// inserted is also left out of the parent's child counts: insert removes it
+/// from its old parent before the parent gains it again, and counting it as
+/// both the existing child and the inserted node rejects a move of the
+/// document element.
+pub(crate) fn ensure_document_content_model(
+    doc: &crate::documents::BlitzDocument,
+    parent: NodeId,
+    node: NodeId,
+    reference: Option<NodeId>,
+    excluded: &[BlitzId],
+    inserted: &InsertedNode,
+) -> Result<(), TreeError> {
+    match inserted {
+        // A text node, including a CDATA section, cannot be a document child.
+        // `Other` is unreachable here: the caller rejects it for every parent
+        // before this runs, and it fails closed on the same exception rather
+        // than admitting documents or anonymous blocks as document children.
+        InsertedNode::Text | InsertedNode::Other => {
+            return Err(TreeError::Hierarchy);
+        }
+        // A comment or processing instruction may be a document child.
+        InsertedNode::CharacterData => return Ok(()),
+        InsertedNode::Fragment { elements, has_text } => {
+            if *elements > 1 || *has_text {
+                return Err(TreeError::Hierarchy);
+            }
+            if *elements == 0 {
+                return Ok(());
+            }
+        }
+        InsertedNode::Element => {}
+        InsertedNode::Doctype => {
+            return ensure_doctype_position(doc, parent, node, reference, excluded);
+        }
+    }
+    let parent_has_element = parent_has_element(
+        doc,
+        parent.node,
+        excluded,
+        node.document == parent.document,
+        node.node,
+    );
+    // `ensure_parented` above guarantees same-document-or-absent, but the
+    // filter stays: in release builds a bypassed check must degrade to
+    // append-at-end, never to cross-document slot reads.
+    let child_id = reference.filter(|child| child.document == parent.document);
+    let doctype_follows =
+        child_id.is_some_and(|child| sibling_doctype_follows(doc, parent.node, child.node));
+    let child_is_doctype = child_id
+        .is_some_and(|child| !excluded.contains(&child.node) && is_doctype(doc, child.node));
+    if parent_has_element || doctype_follows || child_is_doctype {
+        return Err(TreeError::Hierarchy);
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_doctype_position(
+    doc: &crate::documents::BlitzDocument,
+    parent: NodeId,
+    node: NodeId,
+    reference: Option<NodeId>,
+    excluded: &[BlitzId],
+) -> Result<(), TreeError> {
+    let parent_has_doctype = parent_has_doctype(
+        doc,
+        parent.node,
+        excluded,
+        node.document == parent.document,
+        node.node,
+    );
+    let child_id = reference.filter(|child| child.document == parent.document);
+    let element_precedes =
+        child_id.is_some_and(|child| sibling_element_precedes(doc, parent.node, child.node));
+    let parent_has_element = parent_has_element(
+        doc,
+        parent.node,
+        excluded,
+        node.document == parent.document,
+        node.node,
+    );
+    if parent_has_doctype || element_precedes || (child_id.is_none() && parent_has_element) {
+        return Err(TreeError::Hierarchy);
+    }
+    Ok(())
 }
