@@ -328,9 +328,10 @@ impl<'js> event_generated::Event<'js> for JsEvent {
 /// (<https://dom.spec.whatwg.org/#interface-eventtarget>).
 ///
 /// Nodes get their own copies of the three methods on the JavaScript `Node`
-/// prototype (`install_brands_js` copies them from the Rust `Node.prototype`),
-/// so these methods only ever see `new EventTarget()` receivers. That matters
-/// because rquickjs methods brand-check their receiver as the defining class.
+/// prototype (the generated `EventTarget` installer wires them from the
+/// `JsNode` implementation), so these methods only ever see `new EventTarget()`
+/// receivers. That matters because rquickjs methods brand-check their receiver
+/// as the defining class.
 #[derive(Trace, rquickjs::JsLifetime)]
 pub struct JsEventTarget {
     id: u64,

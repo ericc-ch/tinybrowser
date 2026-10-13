@@ -1,8 +1,7 @@
 (function() {
-  const native = globalThis.Node.prototype;
   const inputFilesSymbol = host.slots('tinybrowser.input.files');
   function illegal() { throw new TypeError('Illegal constructor'); }
-  function define(name, parent, members, constructible) {
+  function define(name, parent, constructible) {
     const ctor = constructible
       ? function() {
           const value = __tbApply(host.__tb_construct,
@@ -16,14 +15,6 @@
         }
       : function() { return illegal(); };
     const proto = Object.create(parent ? parent.prototype : Object.prototype);
-    for (const member of members) {
-      const descriptor = Object.getOwnPropertyDescriptor(native, member);
-      // Members implemented in script (not on the native wrapper prototype)
-      // are installed separately; only copy what the native provides.
-      if (descriptor === undefined) continue;
-      descriptor.configurable = true;
-      Object.defineProperty(proto, member, descriptor);
-    }
     Object.defineProperty(ctor, 'name', { value: name, configurable: true });
     Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
     Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
@@ -37,16 +28,7 @@
     return ctor;
   }
   const EventTargetInterface = globalThis.EventTarget;
-  const NodeInterface = define('Node', EventTargetInterface, [
-    'addEventListener', 'removeEventListener', 'dispatchEvent',
-    'nodeType', 'nodeName', 'firstChild', 'lastChild', 'nextSibling',
-    'previousSibling', 'parentNode', 'childNodes', 'appendChild',
-    'ownerDocument', 'hasChildNodes', 'nodeValue', 'textContent', 'isSameNode',
-    'isEqualNode', 'contains', 'getRootNode', 'isConnected', 'cloneNode',
-    'insertBefore', 'removeChild', 'replaceChild', 'lookupNamespaceURI',
-    'lookupPrefix', 'isDefaultNamespace', 'normalize',
-    'compareDocumentPosition', 'parentElement'
-  ]);
+  const NodeInterface = define('Node', EventTargetInterface);
   for (const [name, value] of [
     ['ELEMENT_NODE', 1],
     ['ATTRIBUTE_NODE', 2],
@@ -70,67 +52,22 @@
     Object.defineProperty(NodeInterface, name, { value, writable: false, configurable: true });
     Object.defineProperty(NodeInterface.prototype, name, { value, writable: false, configurable: true });
   }
-  const DocumentInterface = define('Document', NodeInterface, [
-    'createElement', 'createElementNS', 'createTextNode', 'createComment',
-    'createProcessingInstruction', 'createCDATASection', 'createAttribute',
-    'createAttributeNS', 'createDocumentFragment', 'createEvent', 'open', 'write', 'close',
-    'getElementById', 'getElementsByTagName',
-    'getElementsByTagNameNS', 'getElementsByClassName',
-    'body', 'head', 'documentElement', 'doctype', 'readyState', 'implementation',
-    'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
-    'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
-    'URL', 'documentURI', 'baseURI', 'location', 'characterSet', 'charset',
-    'inputEncoding', 'contentType', 'compatMode', 'title',
-    'getElementsByName', 'importNode', 'adoptNode', 'currentScript', 'scripts', 'activeElement',
-    'elementFromPoint', 'elementsFromPoint', 'defaultView', 'hasFocus'
-  ], true);
-  const ElementInterface = define('Element', NodeInterface, [
-    'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',
-    'getAttribute',
-    'setAttribute', 'hasAttribute', 'getAttributeNS', 'setAttributeNS',
-    'hasAttributeNS', 'removeAttribute', 'removeAttributeNS',
-    'getAttributeNames', 'toggleAttribute', 'attributes', 'hasAttributes',
-    'getAttributeNode', 'getAttributeNodeNS', 'setAttributeNode',
-    'setAttributeNodeNS', 'removeAttributeNode', 'matches', 'closest',
-    'children',
-    'firstElementChild', 'lastElementChild', 'childElementCount', 'append',
-    'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
-    'before', 'after', 'replaceWith', 'previousElementSibling',
-    'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
-    'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'outerHTML', 'innerHTML', 'style',
-    'remove', 'getBoundingClientRect', 'getClientRects', 'scrollIntoView',
-    'insertAdjacentHTML',
-    'scrollLeft', 'scrollTop',
-    'attachShadow', 'shadowRoot'
-  ]);
-  const XMLDocumentInterface = define('XMLDocument', DocumentInterface, []);
-  const CharacterDataInterface = define('CharacterData', NodeInterface, [
-    'data', 'length', 'substringData', 'appendData', 'insertData', 'deleteData',
-    'replaceData', 'remove', 'before', 'after', 'replaceWith',
-    'previousElementSibling', 'nextElementSibling'
-  ]);
-  const TextInterface = define('Text', CharacterDataInterface, [], true);
-  const CDATASectionInterface = define('CDATASection', TextInterface, []);
-  const ProcessingInstructionInterface = define('ProcessingInstruction', CharacterDataInterface, [
-    'target'
-  ]);
-  const CommentInterface = define('Comment', CharacterDataInterface, [], true);
-  const DocumentTypeInterface = define('DocumentType', NodeInterface, [
-    'remove', 'before', 'after', 'replaceWith', 'name', 'publicId', 'systemId'
-  ]);
-  const DocumentFragmentInterface = define('DocumentFragment', NodeInterface, [
-    'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
-    'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
-    'getElementById'
-  ], true);
-  const ShadowRootInterface = define('ShadowRoot', DocumentFragmentInterface, [
-    'host', 'mode', 'innerHTML', 'activeElement'
-  ]);
-  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur', 'innerText', 'outerText'], true);
-  const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
-  const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
-  const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);
-  const MathMLElementInterface = define('MathMLElement', ElementInterface, []);
+  const DocumentInterface = define('Document', NodeInterface, true);
+  const ElementInterface = define('Element', NodeInterface);
+  const XMLDocumentInterface = define('XMLDocument', DocumentInterface);
+  const CharacterDataInterface = define('CharacterData', NodeInterface);
+  const TextInterface = define('Text', CharacterDataInterface, true);
+  const CDATASectionInterface = define('CDATASection', TextInterface);
+  const ProcessingInstructionInterface = define('ProcessingInstruction', CharacterDataInterface);
+  const CommentInterface = define('Comment', CharacterDataInterface, true);
+  const DocumentTypeInterface = define('DocumentType', NodeInterface);
+  const DocumentFragmentInterface = define('DocumentFragment', NodeInterface, true);
+  const ShadowRootInterface = define('ShadowRoot', DocumentFragmentInterface);
+  const HTMLElementInterface = define('HTMLElement', ElementInterface, true);
+  const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface);
+  const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface);
+  const SVGElementInterface = define('SVGElement', ElementInterface);
+  const MathMLElementInterface = define('MathMLElement', ElementInterface);
   const table = {
     Document: DocumentInterface.prototype,
     XMLDocument: XMLDocumentInterface.prototype,
@@ -151,37 +88,11 @@
   };
   // Every element interface chains to HTMLElement except the media pair,
   // which chains through HTMLMediaElement, and SVG, which chains to Element.
-  // Per-interface members copied from the native wrapper prototype.
-  // `src`, `href`, `name`, and `content` on Element preserve the legacy
-  // generic reflection (any element answered them pre-migration). Per spec
-  // most elements must not expose them, so this is a known spec gap kept
-  // for main-parity until per-element contracts cover every element that
-  // declares them.
+  // Members arrive from the generated contract installers, which run after
+  // this script creates the constructors and prototypes.
   // `type` is defined per interface below; the form-control states live
   // here so each interface exposes exactly the reflecting attributes the
   // spec gives it (<https://html.spec.whatwg.org/#the-disabled-attribute>).
-  const interfaceMembers = {
-    HTMLCanvasElement: ['width', 'height', 'getContext'],
-    HTMLIFrameElement: ['contentDocument', 'contentWindow'],
-    HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
-    HTMLFormElement: ['reset', 'action', 'method', 'enctype', 'encoding', 'target', 'noValidate', 'acceptCharset'],
-    HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple',
-      'checked', 'defaultChecked', 'selectionStart', 'selectionEnd', 'selectionDirection',
-      'indeterminate', 'form',
-      'formAction', 'formMethod', 'formEnctype', 'formTarget', 'formNoValidate',
-      'pattern', 'min', 'max', 'step'],
-    HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',
-      'selectionStart', 'selectionEnd', 'selectionDirection', 'form'],
-    HTMLOptionElement: ['value', 'selected', 'defaultSelected', 'text', 'index', 'disabled',
-      'label', 'form'],
-    HTMLSelectElement: ['value', 'selectedIndex', 'options', 'length', 'multiple', 'disabled',
-      'required', 'name', 'selectedOptions', 'form'],
-    HTMLButtonElement: ['disabled', 'form',
-      'formAction', 'formMethod', 'formEnctype', 'formTarget', 'formNoValidate'],
-    HTMLFieldSetElement: ['disabled', 'form'],
-    HTMLLabelElement: ['form'],
-    HTMLOptGroupElement: ['disabled'],
-  };
   for (const [name, parent] of [
     ['HTMLAnchorElement', HTMLElementInterface],
     ['HTMLAreaElement', HTMLElementInterface],
@@ -252,7 +163,7 @@
     ['HTMLUListElement', HTMLElementInterface],
     ['HTMLVideoElement', HTMLMediaElementInterface],
   ]) {
-    table[name] = define(name, parent, interfaceMembers[name] ?? []).prototype;
+    table[name] = define(name, parent).prototype;
   }
   // URL decomposition IDL attributes
   // (<https://html.spec.whatwg.org/multipage/links.html#url-decomposition-idl-attributes>).

@@ -34,7 +34,8 @@ use crate::dom::tree::{
     svg_namespace,
 };
 
-use crate::js::world::{DocumentStreamCommand, NodeReference};
+use super::super::adopt_into_document;
+use crate::js::world::{DocumentStreamCommand, NodeReference, Wrapper};
 
 use crate::ReadyState;
 
@@ -458,6 +459,16 @@ impl<'js> document_generated::Document<'js> for JsNode {
         arg_1: f64,
     ) -> Result<Vec<Value<'js>>> {
         self.elements_from_point(ctx, arg_0, arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-adoptnode
+    fn adopt_node(&self, ctx: Ctx<'js>, arg_0: host::NodeReference) -> Result<Value<'js>> {
+        self.adopt_node(ctx, arg_0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
+    fn get_scripts(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.get_scripts(ctx)
     }
 }
 
@@ -2020,4 +2031,50 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     htmli_frame_element_generated::install(ctx)?;
     html_frame_element_generated::install(ctx)?;
     Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
+)]
+impl JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
+    pub(super) fn get_scripts<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(ctx)?;
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::Scripts)
+            && let Some(value) = deref_weak(ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let value = live_collection(
+            ctx,
+            self.handle.0,
+            CollectionKind::HtmlScripts,
+            Some("HTMLCollection"),
+        )?;
+        let weak = make_weak(ctx, value.clone())?;
+        world_rc.borrow_mut().intern_wrapper(
+            self.handle.0,
+            Wrapper::Scripts,
+            Persistent::save(ctx, weak),
+        );
+        Ok(value)
+    }
+
+    /// <https://dom.spec.whatwg.org/#dom-document-adoptnode>
+    pub(super) fn adopt_node<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        node: host::NodeReference,
+    ) -> Result<Value<'js>> {
+        match node {
+            NodeReference::Tree(id) => {
+                let adopted = adopt_into_document(&ctx, self.handle.0, id)?;
+                schedule_mutation_delivery(&ctx)?;
+                wrap_node(&ctx, adopted)
+            }
+            NodeReference::Attribute { scope, id } => import_attr(&ctx, self.handle.0, scope, id),
+        }
+    }
 }

@@ -48,8 +48,7 @@ use crate::dom::TreeError;
 use crate::dom::tree::{NodeId, is_real_element, sibling};
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
-    prelude::This,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, prelude::This,
 };
 
 use super::events::{self, JsEvent, JsEventTarget};

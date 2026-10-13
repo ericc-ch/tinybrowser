@@ -5,11 +5,11 @@ use super::super::{
     AttrArgument, CollectionKind, JsNamedNodeMap, JsTokenList, LegacyNullString, NodeContext,
     NodeOrString, OptString, WebIdlString, attached_attr_id, attr_owner, attr_state, attr_wrapper,
     attribute_local_name, attribute_value, blur_node, deref_weak, document_is_html_content,
-    dom_string, element_box, element_click, focus_node, host, host_node_id, is_focusable,
-    js_string_to_utf8, live_collection, make_weak, rect_object, remove_attribute_sync,
-    schedule_mutation_delivery, set_attribute_node, set_attribute_sync, string_value, throw_dom,
-    throw_dom_error, touch_attr, valid_attribute_local_name, validate_and_extract, with_node_data,
-    world, world_for_node, wrap_node,
+    dom_string, element_box, element_click, fixup_focus_after_removal, focus_node, host,
+    host_node_id, is_focusable, js_string_to_utf8, live_collection, make_weak, rect_object,
+    remove_attribute_sync, schedule_mutation_delivery, set_attribute_node, set_attribute_sync,
+    string_value, throw_dom, throw_dom_error, touch_attr, valid_attribute_local_name,
+    validate_and_extract, with_node_data, world, world_for_node, wrap_node,
 };
 use crate::dom::adoption::materialize_children;
 
@@ -19,11 +19,15 @@ use blitz_dom::NodeData;
 
 use rquickjs::{Array, Class, Ctx, Exception, Function, Persistent, Result, Value};
 
-use crate::dom::insertion::{place_journaled, replace_all_journaled, replace_parsed};
+use crate::dom::insertion::{
+    iframe_containers_in_subtrees, place_journaled, replace_all_journaled, replace_parsed,
+    unlink_journaled,
+};
 use crate::dom::serialization;
 use crate::dom::tree::{
     BlitzId, NodeId, element_node_name, html_namespace, qualified_name, sibling,
 };
+use crate::dom_string::DomString;
 
 use crate::documents::JournalEntry;
 use crate::js::world::{NodeReference, Wrapper};
@@ -572,6 +576,26 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetheight
     fn get_offset_height(&self, ctx: &Ctx<'js>) -> Result<i32> {
         self.offset_height(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    fn get_inner_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.get_inner_text(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    fn set_inner_text(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_inner_text(ctx, LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    fn get_outer_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.get_outer_text(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    fn set_outer_text(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_outer_text(ctx, LegacyNullString(value.to_string()?))
     }
 }
 
@@ -1615,7 +1639,7 @@ impl JsNode {
         {
             return Ok(value);
         }
-        let class = super::host::instance_for_node(
+        let class = host::instance_for_node(
             ctx,
             self.handle.0,
             JsTokenList {
@@ -1836,7 +1860,7 @@ impl JsNode {
         {
             return Ok(value);
         }
-        let class = super::host::instance_for_node(
+        let class = host::instance_for_node(
             ctx,
             self.handle.0,
             JsNamedNodeMap {
@@ -2896,3 +2920,183 @@ pub(super) const REFERRER_POLICY_KEYWORDS: &[&str] = &[
 pub(super) const CROSS_ORIGIN_KEYWORDS: &[&str] = &["anonymous", "use-credentials"];
 pub(super) const PRELOAD_KEYWORDS: &[&str] = &["none", "metadata", "auto"];
 pub(super) const LAZY_EAGER_KEYWORDS: &[&str] = &["lazy", "eager"];
+
+impl JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    pub(super) fn get_inner_text<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let text = super::super::inner_text::rendered_text(ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx.clone(), &text)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute
+    pub(super) fn get_outer_text<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let text = super::super::inner_text::rendered_text(ctx, self.handle.0)?;
+        rquickjs::String::from_str(ctx.clone(), &text)
+    }
+
+    /// Setting `outerText` replaces the element with the rendered text
+    /// fragment, then merges with adjacent text siblings (but does not
+    /// fully normalize). Without a parent it throws; the setter is a no-op
+    /// on non-HTML elements, which never install it.
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "outerText setter steps in spec order; splitting them is a refactor, not a lint fix"
+    )]
+    pub(super) fn set_outer_text(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let value = value.0;
+        let parent = {
+            let world = world(ctx)?;
+            let world = world.borrow();
+            world.document(self.handle.0).and_then(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(self.handle.0.node)
+                    .and_then(|node| node.parent)
+                    .map(|parent| NodeId {
+                        document: self.handle.0.document,
+                        node: parent,
+                    })
+            })
+        };
+        let Some(parent) = parent else {
+            return Err(throw_dom(
+                ctx,
+                "NoModificationAllowedError",
+                "outerText needs a parent",
+            ));
+        };
+        // Replacing the document element would put text under `Document`.
+        let is_document_parent = {
+            let world = world(ctx)?;
+            let world = world.borrow();
+            world.document(self.handle.0).is_some_and(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(parent.node)
+                    .is_some_and(|node| matches!(node.data, NodeData::Document(_)))
+            })
+        };
+        if is_document_parent {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "outerText cannot replace the document element",
+            ));
+        }
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        // Child navigables die with the replaced element: collect their
+        // containers before removal, destroy after the borrows drop.
+        let iframes = iframe_containers_in_subtrees(&parsed, &[self.handle.0]);
+        let mut added = crate::dom::text::rendered_text_fragment(&mut parsed, &value, true);
+        for child in &added {
+            place_journaled(&mut parsed, parent, *child, Some(self.handle.0));
+        }
+        unlink_journaled(&mut parsed, self.handle.0);
+        // Merge with the previous text sibling, then the following one.
+        if let Some(first) = added.first().copied() {
+            let previous = sibling(&parsed.document.base, first.node, false).map(|node| NodeId {
+                document: first.document,
+                node,
+            });
+            if let Some(previous) = previous
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, previous.node)
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, first.node)
+            {
+                let previous_text = String::from(parsed.document.character_data(previous.node));
+                let old_value = DomString::from(previous_text.clone());
+                let mut data = previous_text;
+                data.push_str(&String::from(parsed.document.character_data(first.node)));
+                parsed
+                    .document
+                    .base
+                    .mutate()
+                    .set_node_text(previous.node, &data);
+                parsed.document.record(JournalEntry::CharacterData {
+                    target: previous,
+                    old_value,
+                });
+                unlink_journaled(&mut parsed, first);
+                if added.last() == Some(&first) {
+                    added[0] = previous;
+                } else {
+                    added.remove(0);
+                }
+            }
+        }
+        if let Some(last) = added.last().copied() {
+            let next = sibling(&parsed.document.base, last.node, true).map(|node| NodeId {
+                document: last.document,
+                node,
+            });
+            if let Some(next) = next
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, next.node)
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, last.node)
+            {
+                let last_text = String::from(parsed.document.character_data(last.node));
+                let old_value = DomString::from(last_text.clone());
+                let mut data = last_text;
+                data.push_str(&String::from(parsed.document.character_data(next.node)));
+                parsed
+                    .document
+                    .base
+                    .mutate()
+                    .set_node_text(last.node, &data);
+                parsed.document.record(JournalEntry::CharacterData {
+                    target: last,
+                    old_value,
+                });
+                unlink_journaled(&mut parsed, next);
+            }
+        }
+        drop(parsed);
+        drop(world);
+        world_for_node(ctx, self.handle.0)?
+            .borrow()
+            .destroy_child_navigables(&iframes);
+        fixup_focus_after_removal(ctx, self.handle.0)?;
+        schedule_mutation_delivery(ctx)
+    }
+
+    /// Setting `innerText` replaces all children with the rendered text
+    /// fragment: newlines become `br` elements with no empty text around
+    /// them (an all-empty value yields one empty text node)
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps>).
+    pub(super) fn set_inner_text(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let value = value.0;
+        let html = world(ctx)?
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(self.handle.0.node)
+                    .is_some_and(|node| {
+                        node.data
+                            .downcast_element()
+                            .is_some_and(|element| element.name.ns == html_namespace())
+                    })
+            });
+        if !html {
+            return Ok(());
+        }
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let added = crate::dom::text::rendered_text_fragment(&mut parsed, &value, false);
+        let iframes = replace_all_journaled(&mut parsed, self.handle.0, added);
+        drop(parsed);
+        world.destroy_child_navigables(&iframes);
+        drop(world);
+        schedule_mutation_delivery(ctx)
+    }
+}
