@@ -1,9 +1,9 @@
 //! Attribute, class, and handler-attribute objects and plumbing.
 
 use super::{
-    FromJs, OptString, WebIdlString, child_value, deref_weak, make_weak, qualified_name,
-    realm_registry, schedule_mutation_delivery, string_value, throw_dom, with_node_data, world,
-    world_for_node, wrap_node,
+    FromJs, OptString, WebIdlString, child_value, deref_weak, make_weak, realm_registry,
+    schedule_mutation_delivery, string_value, throw_dom, with_node_data, world, world_for_node,
+    wrap_node,
 };
 
 use std::cell::RefCell;
@@ -13,16 +13,16 @@ use std::rc::Rc;
 
 use markup5ever::{LocalName, QualName};
 
-use crate::js::world as js_world;
+use crate::documents::JournalEntry;
+use crate::dom::tree::{NodeId, qualified_name};
 use crate::js::world::{
-    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, JournalEntry,
-    NavigationTarget, NodeId, World,
+    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, NavigationTarget, World,
 };
 use crate::names::qualified_name_eq;
 
 use rquickjs::{Class, Ctx, Exception, Object, Persistent, Result, Value, class::Trace};
 
-use super::node::node_generated;
+use super::node::core::node_generated;
 use crate::js::events::{
     JsEvent, add_listener_parsed, dispatch_event, event_target_generated, listener_callback,
     listener_options, remove_capture, remove_listener_parsed, report_exception,
@@ -37,20 +37,34 @@ pub struct JsTokenList {
 
 include!(concat!(env!("OUT_DIR"), "/DOMTokenList.rs"));
 
+impl JsTokenList {
+    /// The element this list belongs to. Adoption keeps the list object, so
+    /// every operation follows the adopted copy
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    fn live_element(&self, ctx: &Ctx<'_>) -> Result<NodeId> {
+        Ok(world(ctx)?
+            .borrow_mut()
+            .registry()
+            .borrow_mut()
+            .live_node_id(self.element.0))
+    }
+}
+
 impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     // https://dom.spec.whatwg.org/#dom-domtokenlist-length
     fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        Ok(class_tokens(ctx, self.element.0)?.len())
+        Ok(class_tokens(ctx, self.live_element(ctx)?)?.len())
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-value
     fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let element = self.live_element(ctx)?;
         let world = world(ctx)?;
         let value = world
             .borrow()
-            .document(self.element.0)
+            .document(element)
             .and_then(|parsed| {
-                js_world::attr(&parsed.document.base, self.element.0.node, "class")
+                crate::dom::tree::attr(&parsed.document.base, element.node, "class")
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_default();
@@ -58,12 +72,12 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     }
 
     fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        write_class(ctx, self.element.0, &value.to_string()?)
+        write_class(ctx, self.live_element(ctx)?, &value.to_string()?)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-item
     fn item(&self, ctx: Ctx<'js>, index: u32) -> Result<Option<rquickjs::String<'js>>> {
-        let tokens = class_tokens(&ctx, self.element.0)?;
+        let tokens = class_tokens(&ctx, self.live_element(&ctx)?)?;
         match usize::try_from(index)
             .ok()
             .and_then(|index| tokens.get(index))
@@ -78,7 +92,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         // `contains` does not validate its argument
         // (<https://dom.spec.whatwg.org/#dom-domtokenlist-contains>).
         let token = token.to_string()?;
-        Ok(class_tokens(&ctx, self.element.0)?.contains(&token))
+        Ok(class_tokens(&ctx, self.live_element(&ctx)?)?.contains(&token))
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-add
@@ -90,7 +104,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         for token in &tokens {
             validate_token(&ctx, token)?;
         }
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         for token in tokens {
             if !current.contains(&token) {
                 current.push(token);
@@ -98,7 +112,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         }
         // The update steps run even when no token was added, normalizing
         // the attribute (<https://dom.spec.whatwg.org/#dom-domtokenlist-add>).
-        write_class_tokens(&ctx, self.element.0, &current)
+        write_class_tokens(&ctx, self.live_element(&ctx)?, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-remove
@@ -110,11 +124,11 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         for token in &tokens {
             validate_token(&ctx, token)?;
         }
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         for token in tokens {
             current.retain(|existing| existing != &token);
         }
-        write_class_tokens(&ctx, self.element.0, &current)
+        write_class_tokens(&ctx, self.live_element(&ctx)?, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-toggle
@@ -126,7 +140,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     ) -> Result<bool> {
         let token = token.to_string()?;
         validate_token(&ctx, &token)?;
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         let present = current.contains(&token);
         let should_be_present = force.unwrap_or(!present);
         if should_be_present != present {
@@ -135,7 +149,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
             } else {
                 current.retain(|existing| existing != &token);
             }
-            write_class_tokens(&ctx, self.element.0, &current)?;
+            write_class_tokens(&ctx, self.live_element(&ctx)?, &current)?;
         }
         Ok(should_be_present)
     }
@@ -150,7 +164,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         let old = old.to_string()?;
         let new = new.to_string()?;
         validate_token_pair(&ctx, &old, &new)?;
-        let mut current = class_tokens(&ctx, self.element.0)?;
+        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
         if !current.contains(&old) {
             return Ok(false);
         }
@@ -167,7 +181,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
                 deduped.push(token);
             }
         }
-        write_class_tokens(&ctx, self.element.0, &deduped)?;
+        write_class_tokens(&ctx, self.live_element(&ctx)?, &deduped)?;
         Ok(true)
     }
 
@@ -190,7 +204,7 @@ fn class_tokens(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<String>> {
         .borrow()
         .document(id)
         .and_then(|parsed| {
-            js_world::attr(&parsed.document.base, id.node, "class").map(ToOwned::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, id.node, "class").map(ToOwned::to_owned)
         })
         .unwrap_or_default()
         .split_ascii_whitespace()
@@ -246,10 +260,9 @@ fn validate_token_pair(ctx: &Ctx<'_>, old: &str, new: &str) -> Result<()> {
 /// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
 fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()> {
     if tokens.is_empty()
-        && world(ctx)?
-            .borrow()
-            .document(id)
-            .is_none_or(|parsed| js_world::attr(&parsed.document.base, id.node, "class").is_none())
+        && world(ctx)?.borrow().document(id).is_none_or(|parsed| {
+            crate::dom::tree::attr(&parsed.document.base, id.node, "class").is_none()
+        })
     {
         return Ok(());
     }
@@ -508,7 +521,7 @@ impl<'object> JsAttr<'object> {
     pub(super) fn get_root_node<'js>(
         &self,
         ctx: Ctx<'js>,
-        _options: super::node::node_generated::GetRootNodeOptions,
+        _options: super::node::core::node_generated::GetRootNodeOptions,
     ) -> Result<Value<'js>> {
         attr_wrapper(&ctx, self.id)
     }
@@ -657,12 +670,7 @@ impl<'object> JsAttr<'object> {
         let world = world_for_node(&ctx, owner)?;
         let world = world.borrow();
         let found = world.document(owner).and_then(|parsed| {
-            locate_namespace(
-                &parsed.document.base,
-                owner.document,
-                owner,
-                prefix.as_deref(),
-            )
+            crate::dom::namespaces::locate_namespace(&parsed.document, owner, prefix.as_deref())
         });
         match found {
             Some(namespace) => string_value(&ctx, &namespace),
@@ -686,7 +694,7 @@ impl<'object> JsAttr<'object> {
         let world = world_for_node(&ctx, owner)?;
         let world = world.borrow();
         let found = world.document(owner).and_then(|parsed| {
-            locate_prefix(&parsed.document.base, owner.document, owner, &namespace)
+            crate::dom::namespaces::locate_prefix(&parsed.document, owner, &namespace)
         });
         match found {
             Some(prefix) => string_value(&ctx, &prefix),
@@ -1044,20 +1052,21 @@ impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
     // lowercase. A name that repeats keeps its first attribute.
     // https://dom.spec.whatwg.org/#interface-namednodemap
     fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
-        let html = with_node_data(ctx, self.element.0, |data| {
+        let element = self.live_element(ctx)?;
+        let html = with_node_data(ctx, element, |data| {
             data.and_then(|data| data.downcast_element())
-                .is_some_and(|element| element.name.ns == js_world::html_namespace())
+                .is_some_and(|element| element.name.ns == crate::dom::tree::html_namespace())
         })
         .unwrap_or(false)
-            && super::document::document_is_html_content(ctx, self.element.0);
-        let world_rc = world_for_node(ctx, self.element.0)?;
+            && super::document::document_is_html_content(ctx, element);
+        let world_rc = world_for_node(ctx, element)?;
         let world = world_rc.borrow();
         let mut seen = HashSet::new();
         Ok(world
-            .document(self.element.0)
+            .document(element)
             .map(|parsed| {
                 let base = &parsed.document.base;
-                base.get_node(self.element.0.node)
+                base.get_node(element.node)
                     .and_then(|node| node.data.downcast_element())
                     .map(|element| {
                         element
@@ -1091,27 +1100,40 @@ include!(concat!(env!("OUT_DIR"), "/NamedNodeMap.rs"));
     reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
 )]
 impl JsNamedNodeMap {
+    /// The element this map belongs to. Adoption keeps the map object, so
+    /// every operation follows the adopted copy
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    fn live_element(&self, ctx: &Ctx<'_>) -> Result<NodeId> {
+        Ok(world(ctx)?
+            .borrow_mut()
+            .registry()
+            .borrow_mut()
+            .live_node_id(self.element.0))
+    }
+
     // https://dom.spec.whatwg.org/#dom-namednodemap-length
     fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+        let element = self.live_element(ctx)?;
         let world = world(ctx)?;
         let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.element.0) else {
+        let Some(parsed) = parsed.document(element) else {
             return Ok(0);
         };
         Ok(parsed
             .document
             .base
-            .get_node(self.element.0.node)
+            .get_node(element.node)
             .and_then(|node| node.data.downcast_element())
             .map_or(0, |element| element.attrs.len()))
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-item
     fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
-        let Some(attribute) = attribute_at(&ctx, self.element.0, i64::from(index))? else {
+        let element = self.live_element(&ctx)?;
+        let Some(attribute) = attribute_at(&ctx, element, i64::from(index))? else {
             return Ok(Value::new_null(ctx));
         };
-        match attached_attr_id(&ctx, self.element.0, &attribute.0, &attribute.1)? {
+        match attached_attr_id(&ctx, element, &attribute.0, &attribute.1)? {
             Some(id) => attr_wrapper(&ctx, id),
             None => Ok(Value::new_null(ctx)),
         }
@@ -1123,7 +1145,7 @@ impl JsNamedNodeMap {
         ctx: Ctx<'js>,
         name: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
-        named_item(&ctx, self.element.0, &name.to_string()?)
+        named_item(&ctx, self.live_element(&ctx)?, &name.to_string()?)
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditemns
@@ -1133,8 +1155,9 @@ impl JsNamedNodeMap {
         namespace: OptString,
         local: WebIdlString,
     ) -> Result<Value<'js>> {
+        let element = self.live_element(&ctx)?;
         let namespace = namespace.0.unwrap_or_default();
-        match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
+        match attached_attr_id(&ctx, element, &namespace, &local.0)? {
             Some(id) => attr_wrapper(&ctx, id),
             None => Ok(Value::new_null(ctx)),
         }
@@ -1142,24 +1165,24 @@ impl JsNamedNodeMap {
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditem
     fn set_named_item<'js>(&self, ctx: Ctx<'js>, attr: AttrArgument<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.element.0, &attr.into_value())
+        set_attribute_node(&ctx, self.live_element(&ctx)?, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditemns
     fn set_named_item_ns<'js>(&self, ctx: Ctx<'js>, attr: AttrArgument<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.element.0, &attr.into_value())
+        set_attribute_node(&ctx, self.live_element(&ctx)?, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditem
     fn remove_named_item<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        let element = self.live_element(&ctx)?;
         let world_rc = world(&ctx)?;
-        let Some((namespace, local, id)) =
-            named_attribute_id(&ctx, &world_rc, self.element.0, &name.0)?
+        let Some((namespace, local, id)) = named_attribute_id(&ctx, &world_rc, element, &name.0)?
         else {
             return Err(throw_dom(&ctx, "NotFoundError", "no such attribute"));
         };
         let value = attr_wrapper(&ctx, id)?;
-        remove_attribute_sync(&ctx, self.element.0, &namespace, &local, true)?;
+        remove_attribute_sync(&ctx, element, &namespace, &local, true)?;
         Ok(value)
     }
 
@@ -1170,12 +1193,13 @@ impl JsNamedNodeMap {
         namespace: OptString,
         local: WebIdlString,
     ) -> Result<Value<'js>> {
+        let element = self.live_element(&ctx)?;
         let namespace = namespace.0.unwrap_or_default();
-        let value = match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
+        let value = match attached_attr_id(&ctx, element, &namespace, &local.0)? {
             Some(id) => attr_wrapper(&ctx, id)?,
             None => return Err(throw_dom(&ctx, "NotFoundError", "no such attribute")),
         };
-        remove_attribute_sync(&ctx, self.element.0, &namespace, &local.0, true)?;
+        remove_attribute_sync(&ctx, element, &namespace, &local.0, true)?;
         Ok(value)
     }
 }
@@ -1223,7 +1247,7 @@ pub(super) fn attribute_local_name(ctx: &Ctx<'_>, element: NodeId, name: &str) -
     // A missing document falls back to the non-HTML spelling instead of throwing.
     let html = with_node_data(ctx, element, |data| {
         data.and_then(|data| data.downcast_element())
-            .is_some_and(|element| element.name.ns == js_world::html_namespace())
+            .is_some_and(|element| element.name.ns == crate::dom::tree::html_namespace())
     })
     .unwrap_or(false)
         && super::document::document_is_html_content(ctx, element);
@@ -1462,7 +1486,7 @@ pub(crate) fn attr_wrapper<'js>(ctx: &Ctx<'js>, id: u64) -> Result<Value<'js>> {
         .brand("Attr")
         .ok_or_else(|| Exception::throw_internal(ctx, "missing Attr prototype"))?;
     let proto = proto.restore(ctx)?;
-    let class = Class::instance_proto(
+    let class = super::host::instance_proto(
         JsAttr {
             id,
             scope: Handle(state.scope),
@@ -1579,7 +1603,7 @@ const WINDOW_HANDLER_ATTRIBUTES: &[&str] = &[
 fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Result<()> {
     let name = format!("on{typ}");
     let body = world(ctx)?.borrow().document(element).and_then(|parsed| {
-        js_world::attr(&parsed.document.base, element.node, &name).map(ToOwned::to_owned)
+        crate::dom::tree::attr(&parsed.document.base, element.node, &name).map(ToOwned::to_owned)
     });
     let Some(object) = wrap_node(ctx, element)?.as_object().cloned() else {
         return Ok(());
@@ -1589,7 +1613,7 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     // (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
     let is_body = world_for_node(ctx, element).is_ok_and(|owner| {
         owner.borrow().document(element).is_some_and(|parsed| {
-            js_world::is_html_element(&parsed.document.base, element.node, "body")
+            crate::dom::tree::is_html_element(&parsed.document.base, element.node, "body")
         })
     });
     let forwarded = WINDOW_HANDLER_ATTRIBUTES.contains(&name.as_str()) && is_body;
@@ -1659,8 +1683,8 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
             owner.borrow().document(element).map(|parsed| {
                 let base = &parsed.document.base;
                 (
-                    js_world::is_html_element(base, element.node, "iframe"),
-                    js_world::is_html_element(base, element.node, "img"),
+                    crate::dom::tree::is_html_element(base, element.node, "iframe"),
+                    crate::dom::tree::is_html_element(base, element.node, "img"),
                 )
             })
         })
@@ -1673,7 +1697,8 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         .borrow()
         .document(element)
         .and_then(|parsed| {
-            js_world::attr(&parsed.document.base, element.node, "src").map(ToOwned::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, element.node, "src")
+                .map(ToOwned::to_owned)
         })
         .unwrap_or_default();
     // A detached `iframe` has no browsing context yet; insertion reads the
@@ -1682,7 +1707,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     let connected = world
         .borrow()
         .document(element)
-        .is_some_and(|parsed| js_world::is_connected(&parsed.document.base, element.node));
+        .is_some_and(|parsed| crate::dom::tree::is_connected(&parsed.document.base, element.node));
     if !connected {
         return Ok(());
     }
@@ -1703,7 +1728,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
 pub(crate) fn handler_attribute(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<Option<String>> {
     let world = world(ctx)?;
     Ok(world.borrow().document(id).and_then(|parsed| {
-        js_world::attr(&parsed.document.base, id.node, name).map(ToOwned::to_owned)
+        crate::dom::tree::attr(&parsed.document.base, id.node, name).map(ToOwned::to_owned)
     }))
 }
 
@@ -1800,7 +1825,7 @@ pub(crate) fn remove_attribute_sync(
 /// One attribute on an element: its stored `(prefix, qualified name, value)`.
 fn element_attribute(
     base: &blitz_dom::BaseDocument,
-    id: js_world::BlitzId,
+    id: crate::dom::tree::BlitzId,
     namespace: &str,
     local: &str,
 ) -> Option<(Option<String>, String, String)> {
@@ -1829,7 +1854,7 @@ fn element_attribute(
 /// The value of the `(namespace, local)` attribute on `id`, if present.
 fn attribute_ns_value(
     base: &blitz_dom::BaseDocument,
-    id: js_world::BlitzId,
+    id: crate::dom::tree::BlitzId,
     namespace: &str,
     local: &str,
 ) -> Option<String> {
@@ -1884,8 +1909,8 @@ pub(crate) fn set_attribute_sync(
                 },
                 |attribute| attribute.name.clone(),
             );
-        let old_value =
-            js_world::attr_by_qualified_name(base, element.node, local).map(ToOwned::to_owned);
+        let old_value = crate::dom::tree::attr_by_qualified_name(base, element.node, local)
+            .map(ToOwned::to_owned);
         (name, old_value)
     };
     let namespace = name.ns.as_ref().to_owned();
@@ -1921,150 +1946,6 @@ pub(crate) fn set_attribute_sync(
     touch_attr(ctx, element, &namespace, local, value)?;
     after_attribute_change(ctx, element, local)?;
     schedule_mutation_delivery(ctx)
-}
-
-/// The element the namespace lookup starts from: the node itself when it is
-/// an element, the document element for a document, else the parent element
-/// (<https://dom.spec.whatwg.org/#locate-a-namespace>).
-fn namespace_element(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    node: NodeId,
-) -> Option<NodeId> {
-    let data = &base.get_node(node.node)?.data;
-    if data.downcast_element().is_some() {
-        return Some(node);
-    }
-    if let blitz_dom::NodeData::Document(_) = data {
-        base.get_node(node.node)?.children.iter().find_map(|child| {
-            let id = NodeId {
-                document,
-                node: *child,
-            };
-            super::is_element(base, *child).then_some(id)
-        })
-    } else {
-        let parent = base.get_node(node.node)?.parent?;
-        let id = NodeId {
-            document,
-            node: parent,
-        };
-        super::is_element(base, parent).then_some(id)
-    }
-}
-
-/// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
-/// `prefix` walking `cursor`'s inclusive ancestors. Blitz port of the `super`
-/// algorithm, which still targets the pre-cutover tree.
-fn locate_namespace(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    cursor: NodeId,
-    prefix: Option<&str>,
-) -> Option<String> {
-    let mut cursor = namespace_element(base, document, cursor);
-    while let Some(id) = cursor {
-        if let Some(element) = base
-            .get_node(id.node)
-            .and_then(|node| node.data.downcast_element())
-        {
-            match prefix {
-                Some("xml") => {
-                    return Some("http://www.w3.org/XML/1998/namespace".to_owned());
-                }
-                Some("xmlns") => return Some("http://www.w3.org/2000/xmlns/".to_owned()),
-                _ => {}
-            }
-            let actual = element
-                .name
-                .prefix
-                .as_ref()
-                .map(markup5ever::Prefix::as_ref)
-                .filter(|prefix| !prefix.is_empty());
-            if !element.name.ns.as_ref().is_empty() && actual == prefix {
-                return Some(element.name.ns.as_ref().to_owned());
-            }
-            for attribute in element.attrs.iter() {
-                if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
-                    continue;
-                }
-                let declaration = match prefix {
-                    Some(prefix) => {
-                        attribute
-                            .name
-                            .prefix
-                            .as_ref()
-                            .is_some_and(|value| value.as_ref() == "xmlns")
-                            && attribute.name.local.as_ref() == prefix
-                    }
-                    None => {
-                        attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns"
-                    }
-                };
-                if declaration {
-                    return (!attribute.value.is_empty()).then(|| attribute.value.clone());
-                }
-            }
-        }
-        cursor = base
-            .get_node(id.node)
-            .and_then(|node| node.parent)
-            .map(|parent| NodeId {
-                document,
-                node: parent,
-            })
-            .filter(|parent| super::is_element(base, parent.node));
-    }
-    None
-}
-
-/// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
-/// for `namespace` walking `cursor`'s inclusive ancestors. Blitz port of the
-/// `super` algorithm, which still targets the pre-cutover tree.
-fn locate_prefix(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    cursor: NodeId,
-    namespace: &str,
-) -> Option<String> {
-    let mut cursor = namespace_element(base, document, cursor);
-    while let Some(id) = cursor {
-        if let Some(element) = base
-            .get_node(id.node)
-            .and_then(|node| node.data.downcast_element())
-        {
-            if element.name.ns.as_ref() == namespace
-                && let Some(prefix) = element
-                    .name
-                    .prefix
-                    .as_ref()
-                    .map(markup5ever::Prefix::as_ref)
-                    .filter(|prefix| !prefix.is_empty())
-            {
-                return Some(prefix.to_owned());
-            }
-            for attribute in element.attrs.iter() {
-                if attribute
-                    .name
-                    .prefix
-                    .as_ref()
-                    .is_some_and(|prefix| prefix.as_ref() == "xmlns")
-                    && attribute.value == namespace
-                {
-                    return Some(attribute.name.local.as_ref().to_owned());
-                }
-            }
-        }
-        cursor = base
-            .get_node(id.node)
-            .and_then(|node| node.parent)
-            .map(|parent| NodeId {
-                document,
-                node: parent,
-            })
-            .filter(|parent| super::is_element(base, parent.node));
-    }
-    None
 }
 
 /// `setAttributeNode` / `setAttributeNodeNS`

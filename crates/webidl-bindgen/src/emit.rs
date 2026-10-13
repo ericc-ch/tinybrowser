@@ -268,6 +268,10 @@ fn dispatch_groups(
             #first..=#last => #name(&ctx, &receiver, operation, params)
         });
         groups.push(quote! {
+            #[allow(
+                clippy::too_many_lines,
+                reason = "generated from IDL; a dispatch group batches four members with one receiver borrow"
+            )]
             fn #name<'js>(
                 ctx: &Ctx<'js>,
                 receiver: &#payload,

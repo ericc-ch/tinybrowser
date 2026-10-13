@@ -2,17 +2,19 @@
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::rc::{Rc, Weak};
 
 use blitz_traits::node_id::NodeId as BlitzNodeId;
-/// Blitz tree ids, re-exported for helper signatures across the bindings.
-pub(crate) use blitz_traits::node_id::NodeId as BlitzId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
+use crate::documents::DocumentStore;
+use crate::documents::JournalEntry;
+use crate::dom::tree::{NodeId, attr, is_connected, is_iframe_element};
 use crate::dom_string::DomString;
 
-use crate::document::{Document, FrameRuntime};
+use crate::js::FrameRuntime;
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
 use crate::storage::PendingStorageEvent;
@@ -37,7 +39,12 @@ pub(crate) struct RealmRegistry {
     /// One wrapper per node, shared by every realm in this renderer process.
     /// The persistent holds a `WeakRef`, so an unreferenced wrapper can still
     /// be collected.
-    wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
+    wrappers: WrapperCache<NodeId>,
+    /// One platform object per `[SameObject]` member, shared by every realm
+    /// in this renderer process like the node wrappers themselves: the
+    /// member object belongs to the node, not to the realm that first read
+    /// it.
+    same_object: WrapperCache<(NodeId, SameObject)>,
     /// The active child document for each connected iframe container.
     frame_documents: HashMap<NodeId, NodeId>,
     /// The realm that created each node. Adoption changes the node document
@@ -61,6 +68,86 @@ pub(crate) struct RealmRegistry {
 pub(crate) struct PrivateSlots {
     pub(crate) factory: Persistent<Function<'static>>,
     pub(crate) realms: HashSet<usize>,
+}
+
+/// Cached JS platform objects, keyed by whatever identifies the object: a
+/// node for the shared wrapper, a `(node, member)` pair for the
+/// lazily-created same-object members.
+///
+/// A cache entry holds a `WeakRef` (a `Persistent` to a weak wrapper), so an
+/// unreferenced object can still be collected; callers dereference with
+/// `deref_weak` and rebuild on a miss.
+pub(crate) struct WrapperCache<K> {
+    entries: HashMap<K, Persistent<Value<'static>>>,
+}
+
+impl<K> Default for WrapperCache<K> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash> WrapperCache<K> {
+    pub(crate) fn get(&self, key: &K) -> Option<Persistent<Value<'static>>> {
+        self.entries.get(key).cloned()
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: Persistent<Value<'static>>) {
+        self.entries.insert(key, value);
+    }
+
+    /// Moves an entry to a new key; adoption retargets the caller's wrapper
+    /// to the destination copy
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    pub(crate) fn rekey(&mut self, from: &K, to: K) {
+        if let Some(value) = self.entries.remove(from) {
+            self.entries.insert(to, value);
+        }
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        self.entries.retain(|key, _| keep(key));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// A lazily-created member whose identity is one per node
+/// (`[SameObject]` in IDL).
+///
+/// The cache is keyed by node and member, not by interface: `Document.children`
+/// and `Document.scripts` are both `HTMLCollection`, and `classList`/`relList`
+/// are both `DOMTokenList`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SameObject {
+    /// `Element.classList`.
+    ClassList,
+    /// `Element.attributes`.
+    Attributes,
+    /// `HTMLElement.style`.
+    Style,
+    /// `HTMLElement.dataset`.
+    Dataset,
+    /// `Node.childNodes`.
+    ChildNodes,
+    /// `Document.scripts`.
+    Scripts,
+}
+
+impl SameObject {
+    /// Every member, for rekeying the cache on adoption.
+    pub(crate) const ALL: [SameObject; 6] = [
+        SameObject::ClassList,
+        SameObject::Attributes,
+        SameObject::Style,
+        SameObject::Dataset,
+        SameObject::ChildNodes,
+        SameObject::Scripts,
+    ];
 }
 
 impl RealmRegistry {
@@ -118,7 +205,9 @@ impl RealmRegistry {
     pub(crate) fn forget_document(&mut self, id: u32) {
         self.attributes.forget_document(id);
         self.documents.remove(&id);
-        self.wrappers.retain(|node, _| node.document_id() != id);
+        self.wrappers.retain(|node| node.document_id() != id);
+        self.same_object
+            .retain(|(node, _)| node.document_id() != id);
         self.frame_documents
             .retain(|_, document| document.document_id() != id);
         self.creation_realms
@@ -129,7 +218,26 @@ impl RealmRegistry {
 
     /// The shared wrapper cache entry for `id`, when one exists.
     pub(crate) fn wrapper(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.wrappers.get(&id).cloned()
+        self.wrappers.get(&id)
+    }
+
+    /// The cached `[SameObject]` member for `(id, member)`, when one exists.
+    pub(crate) fn same_object(
+        &self,
+        id: NodeId,
+        member: SameObject,
+    ) -> Option<Persistent<Value<'static>>> {
+        self.same_object.get(&(id, member))
+    }
+
+    /// Publishes the cached `[SameObject]` member.
+    pub(crate) fn intern_same_object(
+        &mut self,
+        id: NodeId,
+        member: SameObject,
+        value: Persistent<Value<'static>>,
+    ) {
+        self.same_object.insert((id, member), value);
     }
 
     /// Publishes the wrapper cache entry for `id`.
@@ -146,8 +254,11 @@ impl RealmRegistry {
         if from != to {
             self.adopted_ids.insert(from, to);
         }
-        if let Some(value) = self.wrappers.remove(&from) {
-            self.wrappers.insert(to, value);
+        self.wrappers.rekey(&from, to);
+        // The member objects follow the node too, so a held `classList` stays
+        // the element's `classList` across adoption.
+        for member in SameObject::ALL {
+            self.same_object.rekey(&(from, member), (to, member));
         }
         if let Some(world) = self.creation_realms.remove(&from) {
             self.creation_realms.insert(to, world);
@@ -214,6 +325,7 @@ impl RealmRegistry {
         self.documents.clear();
         self.frames.clear();
         self.wrappers.clear();
+        self.same_object.clear();
         self.frame_documents.clear();
         self.creation_realms.clear();
         self.adopted_ids.clear();
@@ -266,264 +378,6 @@ pub(crate) enum DocumentStreamCommand {
     Open,
     Write(String),
     Close,
-}
-
-/// One node in one document.
-///
-/// Blitz ids are per-tree: two documents can issue the same id. Document
-/// identity rides along so wrapper caches and event maps stay sound across
-/// documents. Replaces the arena handle: same name, same
-/// [`NodeId::document_id`] accessor, new payload.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct NodeId {
-    /// The document store id owning the tree.
-    pub document: u32,
-    /// The node inside that document's tree.
-    pub node: BlitzNodeId,
-}
-
-impl NodeId {
-    /// The document store id owning the tree.
-    pub(crate) fn document_id(self) -> u32 {
-        self.document
-    }
-}
-
-impl std::fmt::Debug for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NodeId({}.{})", self.document, self.node.as_u64())
-    }
-}
-
-impl PartialOrd for NodeId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NodeId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.document, self.node.as_u64()).cmp(&(other.document, other.node.as_u64()))
-    }
-}
-
-/// Whether `node` is connected: its ancestor chain reaches the document root.
-pub(crate) fn is_connected(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
-    let root = base.root_node().id;
-    let mut current = Some(id);
-    while let Some(node_id) = current {
-        if node_id == root {
-            return true;
-        }
-        current = base.get_node(node_id).and_then(|node| node.parent);
-    }
-    false
-}
-
-/// Whether `node` is an HTML `iframe` element.
-pub(crate) fn is_iframe_element(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
-    base.get_node(id).is_some_and(|node| {
-        let blitz_dom::NodeData::Element(element) = &node.data else {
-            return false;
-        };
-        element.name.ns == html_namespace()
-            && element.name.local == markup5ever::local_name!("iframe")
-    })
-}
-
-/// Wrapped children of `node` in `document`, in tree order.
-pub(crate) fn child_ids(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    id: BlitzNodeId,
-) -> Vec<NodeId> {
-    base.get_node(id).map_or_else(Vec::new, |node| {
-        node.children
-            .iter()
-            .map(|child| NodeId {
-                document,
-                node: *child,
-            })
-            .collect()
-    })
-}
-
-/// The value of the first attribute of `id` matching `match_name`.
-fn attr_find(
-    base: &blitz_dom::BaseDocument,
-    id: BlitzNodeId,
-    match_name: impl Fn(&markup5ever::QualName) -> bool,
-) -> Option<&str> {
-    base.get_node(id)?
-        .data
-        .downcast_element()?
-        .attrs
-        .iter()
-        .find(|attribute| match_name(&attribute.name))
-        .map(|attribute| attribute.value.as_str())
-}
-
-/// The value of the attribute named `name` on `id`, when it is an element.
-pub(crate) fn attr<'a>(
-    base: &'a blitz_dom::BaseDocument,
-    id: BlitzNodeId,
-    name: &str,
-) -> Option<&'a str> {
-    let local = markup5ever::LocalName::from(name);
-    attr_find(base, id, |qualified| qualified.local == local)
-}
-
-/// The value of the first attribute whose qualified name is `qualified`.
-///
-/// <https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>
-pub(crate) fn attr_by_qualified_name<'a>(
-    base: &'a blitz_dom::BaseDocument,
-    id: BlitzNodeId,
-    qualified: &str,
-) -> Option<&'a str> {
-    attr_find(base, id, |name| {
-        crate::names::qualified_name_eq(name, qualified)
-    })
-}
-
-/// Whether `local` is an event-handler content attribute name (`on*` with a
-/// non-empty lowercase/digit type). HTML parsing lowercases attribute names,
-/// so `ONCLICK` arrives as `onclick`; the single spelling here keeps the
-/// realm-need walk and handler compilation in agreement.
-pub(crate) fn is_handler_attribute_name(local: &str) -> bool {
-    local.strip_prefix("on").is_some_and(|typ| {
-        !typ.is_empty()
-            && typ
-                .chars()
-                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
-    })
-}
-
-/// The HTML namespace all HTML elements live in.
-pub(crate) fn html_namespace() -> markup5ever::Namespace {
-    markup5ever::ns!(html)
-}
-
-/// The SVG namespace.
-pub(crate) fn svg_namespace() -> markup5ever::Namespace {
-    markup5ever::ns!(svg)
-}
-
-/// The `MathML` namespace.
-pub(crate) fn mathml_namespace() -> markup5ever::Namespace {
-    markup5ever::ns!(mathml)
-}
-
-/// Whether `data` is an HTML element named `local`.
-pub(crate) fn is_html_tag(data: Option<&blitz_dom::NodeData>, local: &str) -> bool {
-    match data {
-        Some(blitz_dom::NodeData::Element(element)) => {
-            element.name.ns == html_namespace() && element.name.local.as_ref() == local
-        }
-        _ => false,
-    }
-}
-
-/// Whether `name` is the HTML `template` tag: the only element with template
-/// contents
-/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
-pub(crate) fn is_template_tag(name: &markup5ever::QualName) -> bool {
-    name.ns == html_namespace() && name.local.as_ref() == "template"
-}
-
-/// The template contents fragment of `id`, when it is a `template` element.
-pub(crate) fn template_contents(
-    base: &blitz_dom::BaseDocument,
-    id: BlitzNodeId,
-) -> Option<BlitzNodeId> {
-    base.get_node(id)?
-        .data
-        .downcast_element()
-        .filter(|element| is_template_tag(&element.name))
-        .and_then(|element| element.template_contents)
-}
-
-/// Whether `node` is an HTML element named `local`.
-pub(crate) fn is_html_element(
-    base: &blitz_dom::BaseDocument,
-    id: BlitzNodeId,
-    local: &str,
-) -> bool {
-    base.get_node(id)
-        .is_some_and(|node| is_html_tag(Some(&node.data), local))
-}
-
-/// First element in tree order whose `id` content attribute is `id`.
-/// An empty ID matches nothing
-/// (<https://dom.spec.whatwg.org/#concept-id>,
-/// <https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid>).
-pub(crate) fn first_element_with_id(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    id: &str,
-) -> Option<NodeId> {
-    if id.is_empty() {
-        return None;
-    }
-    let mut stack = vec![base.root_node().id];
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        if node.data.downcast_element().is_some_and(|element| {
-            element
-                .attr(markup5ever::LocalName::from("id"))
-                .is_some_and(|value| value == id)
-        }) {
-            return Some(NodeId {
-                document,
-                node: current,
-            });
-        }
-        stack.extend(node.children.iter().rev().copied());
-    }
-    None
-}
-
-/// [Reset the form owner](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner)
-/// lookup used by `form` IDL getters: a `form` content attribute names the
-/// first matching `form` in tree order when the control is in a document;
-/// otherwise the nearest ancestor `form` is used.
-///
-/// If the attribute is set but does not identify a `form`, this still falls
-/// through to the ancestor (the spec's `new-form` steps). Chromium leaves the
-/// owner null in that case; the spec algorithm is the one that applies here.
-pub(crate) fn form_owner_of(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    node: BlitzId,
-) -> Option<NodeId> {
-    // Reset-the-form-owner: a present `form` attribute on a connected
-    // element is authoritative. A miss (unknown or empty ID) leaves the
-    // owner null — it does not fall through to the ancestor, and neither
-    // does Chromium nor WPT `form_attribute.html`
-    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#reset-the-form-owner>).
-    if let Some(form_id) = attr(base, node, "form")
-        && is_connected(base, node)
-    {
-        if let Some(found) = first_element_with_id(base, document, form_id)
-            && is_html_element(base, found.node, "form")
-        {
-            return Some(found);
-        }
-        return None;
-    }
-    let mut cursor = base.get_node(node).and_then(|target| target.parent);
-    while let Some(current) = cursor {
-        if is_html_element(base, current, "form") {
-            return Some(NodeId {
-                document,
-                node: current,
-            });
-        }
-        cursor = base.get_node(current).and_then(|target| target.parent);
-    }
-    None
 }
 
 /// One DOM node handle owned by the JS world.
@@ -666,31 +520,15 @@ pub(crate) struct ObjectUrlEntry {
     pub(crate) content_type: Rc<str>,
 }
 
-/// One lazily-created sub-object cached per node.
-///
-/// Each interface creates its platform object once per element, so
-/// `element.classList === element.classList`; the cache is keyed by node and
-/// interface and cleared whenever the realm's wrappers are invalidated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Wrapper {
-    /// `Element.classList`.
-    TokenList,
-    /// `Element.attributes`.
-    NamedNodeMap,
-    /// `HTMLElement.style`.
-    StyleDeclaration,
-    /// `HTMLElement.dataset`.
-    Dataset,
-    /// `Node.childNodes`.
-    ChildNodes,
-    /// `Document.scripts`.
-    Scripts,
-}
-
 pub(crate) struct WeakReferences {
     pub(crate) constructor: Persistent<rquickjs::function::Constructor<'static>>,
     pub(crate) deref: Persistent<Function<'static>>,
 }
+
+/// Builds a frame document when an `iframe` connects. Installed by the
+/// `document` layer, which owns document creation; the realm calls it without
+/// naming a document type.
+pub(crate) type FrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, NodeId)>;
 
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
@@ -708,8 +546,10 @@ pub(crate) struct World {
     /// Frames whose browsing context was registered inside a script but whose
     /// realm cannot be created until JS execution has stopped.
     pending_frames: Vec<(FrameId, NodeId)>,
-    /// Child frames this realm created for the engine to adopt.
-    new_frames: Vec<(FrameId, NodeId, Document)>,
+    /// Creates a child frame's document when an `iframe` connects. The
+    /// `document` layer installs this hook; the realm asks for a document and
+    /// never names one.
+    frame_host: Option<FrameHost>,
     /// The active document of the frame this realm belongs to.
     document: Option<u32>,
     /// Document ids this realm created. Its logs feed every realm's
@@ -754,9 +594,6 @@ pub(crate) struct World {
     /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
     standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
     next_standalone_target: u64,
-    /// Lazily-created platform objects whose identity is one per (node,
-    /// interface), so `element.classList === element.classList` and friends.
-    wrappers: HashMap<(NodeId, Wrapper), Persistent<Value<'static>>>,
     implementations: HashMap<u32, Persistent<Value<'static>>>,
     /// The focused element of each document
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
@@ -899,7 +736,7 @@ impl World {
             init_scripts,
             viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),
             pending_frames: Vec::new(),
-            new_frames: Vec::new(),
+            frame_host: None,
             document: None,
             owned: HashSet::new(),
             document_url,
@@ -924,7 +761,6 @@ impl World {
             listeners: HashMap::new(),
             standalone_targets: HashMap::new(),
             next_standalone_target: 0,
-            wrappers: HashMap::new(),
             implementations: HashMap::new(),
             active_elements: HashMap::new(),
             selections: HashMap::new(),
@@ -969,7 +805,6 @@ impl World {
         self.current_script = None;
         self.custom_construction.clear();
         self.listeners.clear();
-        self.wrappers.clear();
         self.implementations.clear();
         self.active_elements.clear();
         self.selections.clear();
@@ -1085,6 +920,11 @@ impl World {
         .ok()
     }
 
+    /// The tree store, for realm-free algorithms that take `&DocumentStore`.
+    pub(crate) fn store(&self) -> Ref<'_, DocumentStore> {
+        self.runtime.documents.borrow()
+    }
+
     /// Runs `reader` against the tree owning `id`.
     ///
     /// Prefer this to [`World::document`] when a guard would outlive the
@@ -1159,8 +999,8 @@ impl World {
     ///
     /// Safe to call while a script runs: it allocates frame identities and
     /// tree entries only. The document and its realm are created later, by
-    /// [`World::materialize_frames`], because `QuickJS` forbids entering a new
-    /// realm while another realm executes.
+    /// the frame host the `document` layer installs, because `QuickJS`
+    /// forbids entering a new realm while another realm executes.
     pub(crate) fn register_pending_frames(&mut self, before: Option<NodeId>) -> Vec<NodeId> {
         let mut created = Vec::new();
         let containers = self.iframe_containers_before(before);
@@ -1177,7 +1017,7 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
     ///
     /// Allocates the frame identity only. The nested document is created
-    /// later, by [`World::materialize_frames`].
+    /// later, by the frame host the `document` layer installs.
     pub(crate) fn register_frame_for_container(&mut self, container: NodeId) -> bool {
         if self
             .runtime
@@ -1255,27 +1095,14 @@ impl World {
         })?
     }
 
-    /// Creates the documents and realms for every registered frame.
-    ///
-    /// Borrow discipline: no `World` borrow is held while a frame document
-    /// loads. Loading runs the parser, which delivers mutations, which fans
-    /// out across live worlds; holding this world's borrow across that
-    /// would alias the fan-out borrows and panic the renderer.
-    pub(crate) fn adopt_pending_frames(
-        world_rc: &Rc<RefCell<World>>,
-        before: Option<NodeId>,
-    ) -> Vec<NodeId> {
-        let mut created = world_rc.borrow_mut().register_pending_frames(before);
-        created.extend(Self::materialize_frames(world_rc));
-        created
-    }
-
     /// Creates the initial `about:blank` document for one connected `iframe`
     /// so `contentDocument` is available in the inserting script
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
     ///
     /// The nested realm is deferred: `QuickJS` cannot enter a new context while
-    /// the parent script still runs.
+    /// the parent script still runs. Document creation belongs to the frame
+    /// host the `document` layer installs; a realm built without one just
+    /// leaves the frame registered for a later drain (test worlds).
     pub(crate) fn materialize_iframe(world_rc: &Rc<RefCell<World>>, container: NodeId) -> bool {
         world_rc
             .borrow_mut()
@@ -1297,71 +1124,28 @@ impl World {
                 .frame_document(container)
                 .is_some();
         };
-        let (runtime, base_url, init_scripts, viewport) = {
-            let world = world_rc.borrow();
-            (
-                world.runtime.clone(),
-                world.document_url.clone(),
-                Rc::clone(&world.init_scripts),
-                world.viewport_size.get(),
-            )
-        };
-        let mut document = Document::with_shared(frame, &runtime, &init_scripts);
-        document.set_viewport_size(viewport);
-        document.load_about_blank_tree(Some(base_url.as_str()));
-        if let Some(root) = document.document_root() {
+        let host = world_rc.borrow().frame_host.clone();
+        let Some(host) = host else {
             world_rc
-                .borrow()
-                .registry()
                 .borrow_mut()
-                .set_frame_document(container, root);
-        }
-        world_rc
-            .borrow_mut()
-            .new_frames
-            .push((frame, container, document));
+                .pending_frames
+                .push((frame, container));
+            return false;
+        };
+        host(world_rc, frame, container);
         true
     }
 
-    /// Loads every registered frame document without holding the world
-    /// borrow: pending frames and the base URL are taken first, documents
-    /// load unborrowed, and only then are the results published.
-    fn materialize_frames(world_rc: &Rc<RefCell<World>>) -> Vec<NodeId> {
-        let (pending, runtime, base_url, init_scripts, viewport) = {
-            let mut world = world_rc.borrow_mut();
-            (
-                std::mem::take(&mut world.pending_frames),
-                world.runtime.clone(),
-                world.document_url.clone(),
-                Rc::clone(&world.init_scripts),
-                world.viewport_size.get(),
-            )
-        };
-        let mut loaded = Vec::with_capacity(pending.len());
-        let mut created = Vec::with_capacity(pending.len());
-        for (frame, container) in pending {
-            let mut document = Document::with_shared(frame, &runtime, &init_scripts);
-            // Frames created from parsed markup share the tab's viewport too.
-            // This path runs before page script, so the realm can exist for
-            // `contentWindow` in the following classic script
-            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-            document.set_viewport_size(viewport);
-            document.load_about_blank(Some(base_url.as_str()));
-            loaded.push((frame, container, document));
-            created.push(container);
-        }
-        {
-            let mut world = world_rc.borrow_mut();
-            for (frame, container, document) in loaded {
-                world.new_frames.push((frame, container, document));
-            }
-        }
-        created
+    /// Installs the hook that builds child documents for this realm's
+    /// `iframe`s. Called by the `document` layer when the frame is created.
+    pub(crate) fn set_frame_host(&mut self, host: FrameHost) {
+        self.frame_host = Some(host);
     }
 
-    /// Takes the child frames this realm created for the engine to adopt.
-    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, NodeId, Document)> {
-        std::mem::take(&mut self.new_frames)
+    /// Takes every registered frame waiting for a document, for the frame host
+    /// to materialize.
+    pub(crate) fn take_pending_frames(&mut self) -> Vec<(FrameId, NodeId)> {
+        std::mem::take(&mut self.pending_frames)
     }
 
     /// Connected `iframe`s in tree order that precede `before`, or every
@@ -1849,7 +1633,6 @@ impl World {
         self.standalone_targets.clear();
         self.window = None;
         self.next_standalone_target = 0;
-        self.wrappers.clear();
         self.implementations.clear();
         self.brands.clear();
         self.handler_attributes.clear();
@@ -1878,19 +1661,27 @@ impl World {
         self.bridge = None;
     }
 
-    /// One cached platform object, if this realm created it.
-    pub(crate) fn wrapper(&self, id: NodeId, kind: Wrapper) -> Option<Persistent<Value<'static>>> {
-        self.wrappers.get(&(id, kind)).cloned()
+    /// The cached `[SameObject]` member for `(id, member)`, when this
+    /// renderer process created one.
+    pub(crate) fn same_object(
+        &self,
+        id: NodeId,
+        member: SameObject,
+    ) -> Option<Persistent<Value<'static>>> {
+        self.runtime.registry.borrow().same_object(id, member)
     }
 
-    /// Caches one platform object for the node and interface.
-    pub(crate) fn intern_wrapper(
+    /// Caches one `[SameObject]` member for the node.
+    pub(crate) fn intern_same_object(
         &mut self,
         id: NodeId,
-        kind: Wrapper,
+        member: SameObject,
         value: Persistent<Value<'static>>,
     ) {
-        self.wrappers.insert((id, kind), value);
+        self.runtime
+            .registry
+            .borrow_mut()
+            .intern_same_object(id, member, value);
     }
 
     /// The focused element of a document, if any.
@@ -2103,31 +1894,6 @@ pub(super) fn match_observation(
 }
 
 /// One recorded tree mutation, in observer-delivery shape.
-///
-/// Binding and parser call sites push these onto the owning document's
-/// journal; Blitz only tracks a coarse changed set, so the delivery payload
-/// lives here.
-#[derive(Clone, Debug)]
-pub(crate) enum JournalEntry {
-    ChildList {
-        target: NodeId,
-        added: Vec<NodeId>,
-        removed: Vec<NodeId>,
-        previous: Option<NodeId>,
-        next: Option<NodeId>,
-    },
-    Attributes {
-        target: NodeId,
-        name: String,
-        namespace: String,
-        old_value: Option<String>,
-    },
-    CharacterData {
-        target: NodeId,
-        old_value: DomString,
-    },
-}
-
 fn record(
     want_attribute_old_value: bool,
     want_character_data_old_value: bool,

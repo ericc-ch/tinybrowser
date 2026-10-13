@@ -35,6 +35,41 @@ private storage must prevent page-replaced methods, constructors, or inherited
 hooks from observing or mutating browser internals. Rust owns native lifetimes.
 RealmRegistry owns the lifetime of shared weak-slot storage.
 
+## Platform objects
+
+One node has one wrapper: `wrap_node` caches a `JsNode` instance per node in
+`RealmRegistry`, so `===` holds across accesses and interfaces. The wrapper's
+prototype is the brand for its most-derived interface. Resolution order is the
+realm that created the node (adoption keeps it,
+<https://github.com/whatwg/dom/issues/977>), then the realm owning its document,
+then the accessing realm for documents whose realm does not exist yet (an
+`iframe` inserted mid-script).
+
+Interface members arrive from generated contract installers, not handwritten
+member tables. A generated installer fetches the constructor the brands shim
+created and installs the IDL members on its prototype; brands.js builds
+constructors, prototype chains, and only the members the generator cannot lower
+yet (`type`, `files`, `hidden`, URL-decomposition attributes), which stay
+documented cutover gaps.
+
+Lazily-created same-object members (`Element.classList`,
+`Element.attributes`, `HTMLElement.style`, `HTMLElement.dataset`,
+`Node.childNodes`, `Document.scripts`) cache one platform object per
+`(node, member)` in `RealmRegistry`, beside the node wrapper and held weakly
+like it. The cache is process-wide, so the member object is the same object
+from every realm, and adoption rekeys it (`RealmRegistry::rekey_wrapper`), so
+a held `classList` follows the adopted copy. Add a new one by caching through
+`World::same_object` / `intern_same_object` with a `SameObject` variant; do
+not add per-member state tables, and do not key by interface name
+(`Document.children` and `Document.scripts` are both `HTMLCollection`).
+
+Construct wrappers through `host::instance` (a standalone interface, prototype
+from `ctx`'s realm) or `host::instance_for_node` (a node-associated interface,
+prototype from the node's owning realm); node wrappers resolve their brand
+prototype first and then use the same helper. Every path funnels into
+`host::instance_proto`. Do not call `Class::instance_proto` directly, and do
+not copy prototypes from another realm.
+
 ## IDL inputs and implementation contracts
 
 Import an unmodified, pinned upstream IDL snapshot. WPT's `interfaces/` directory

@@ -8,8 +8,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::Parsed;
+use crate::dom::tree::NodeId;
 use crate::dom_string::DomString;
-use crate::js::world::JournalEntry;
 
 use blitz_dom::NodeData;
 
@@ -317,4 +317,30 @@ impl DocumentStore {
     pub(crate) fn remove(&mut self, id: u32) -> Option<Parsed> {
         self.documents.remove(&id)
     }
+}
+
+/// One recorded tree mutation, in observer-delivery shape.
+///
+/// Binding and parser call sites push these onto the owning document's
+/// journal; Blitz only tracks a coarse changed set, so the delivery payload
+/// lives here.
+#[derive(Clone, Debug)]
+pub(crate) enum JournalEntry {
+    ChildList {
+        target: NodeId,
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        previous: Option<NodeId>,
+        next: Option<NodeId>,
+    },
+    Attributes {
+        target: NodeId,
+        name: String,
+        namespace: String,
+        old_value: Option<String>,
+    },
+    CharacterData {
+        target: NodeId,
+        old_value: DomString,
+    },
 }

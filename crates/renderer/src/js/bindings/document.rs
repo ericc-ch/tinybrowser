@@ -1,7 +1,7 @@
 //! Document predicates and URL helpers.
 
 use super::{world, world_for_node};
-use crate::js::world::{NodeId, attr, html_namespace};
+use crate::dom::tree::{NodeId, attr, html_namespace};
 
 use rquickjs::Ctx;
 

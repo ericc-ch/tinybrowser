@@ -114,8 +114,8 @@ fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Re
     let bytes = bytes_from_latin1(&source)
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
     let header = (!content_type.trim().is_empty()).then_some(content_type.as_str());
-    let (encoding, bom_len) = crate::document::dial::sniff_encoding(&bytes, header, true)
-        .unwrap_or((encoding_rs::UTF_8, 0));
+    let (encoding, bom_len) =
+        crate::sniff::sniff_encoding(&bytes, header, true).unwrap_or((encoding_rs::UTF_8, 0));
     let mut decoder = encoding.new_decoder_without_bom_handling();
     decode_loop(
         &mut decoder,
@@ -221,7 +221,7 @@ fn decoder_free(ctx: Ctx<'_>, id: u64) {
 /// `replacement` encoding, which getting an encoding never returns
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
 fn resolve_label(ctx: &Ctx<'_>, label: &str) -> Result<&'static Encoding> {
-    Encoding::for_label(super::bindings::forms::trim_label(label).as_bytes())
+    Encoding::for_label(crate::dom::forms::trim_label(label).as_bytes())
         .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .ok_or_else(|| Exception::throw_range(ctx, "The encoding label is not supported"))
 }

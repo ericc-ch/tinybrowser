@@ -16,6 +16,7 @@ use crate::documents::BlitzDocument;
 
 mod document;
 mod documents;
+mod dom;
 pub mod dom_string;
 mod embedded;
 mod engine;
@@ -26,12 +27,13 @@ mod protocol;
 mod pseudo_attributes;
 mod remote;
 mod render;
+mod sniff;
 mod storage;
 mod xml;
 
-pub use document::Stop;
 pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine};
+pub use js::Stop;
 pub use protocol::{
     BrowserServices, BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialKind,
     DialOutcome, DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost,

@@ -9,7 +9,11 @@ use rquickjs::{
     prelude::Func,
 };
 
-use crate::js::world::{BlitzId, Handle, JournalEntry, NodeId, attr, html_namespace};
+use crate::documents::JournalEntry;
+use crate::dom::forms::{option_selected, select_options};
+use crate::dom::insertion::siblings_around;
+use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace, is_element};
+use crate::js::world::Handle;
 use crate::names::qualified_name_eq;
 use markup5ever::{LocalName, QualName};
 use std::collections::HashSet;
@@ -125,10 +129,10 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
     let base = &parsed.document.base;
     let document = scope.document;
     Ok(match kind {
-        CollectionKind::Children => crate::js::world::child_ids(base, document, scope.node),
-        CollectionKind::ElementChildren => crate::js::world::child_ids(base, document, scope.node)
+        CollectionKind::Children => crate::dom::tree::child_ids(base, document, scope.node),
+        CollectionKind::ElementChildren => crate::dom::tree::child_ids(base, document, scope.node)
             .into_iter()
-            .filter(|kid| super::is_element(base, kid.node))
+            .filter(|kid| is_element(base, kid.node))
             .collect(),
         CollectionKind::ElementsByTag {
             name,
@@ -183,7 +187,7 @@ fn collect_html_scripts(
         if doc.is_fragment(id) {
             continue;
         }
-        if crate::js::world::is_html_element(&doc.base, id, "script")
+        if crate::dom::tree::is_html_element(&doc.base, id, "script")
             && script_is_in_document(doc, id)
         {
             order.push(NodeId { document, node: id });
@@ -256,21 +260,6 @@ fn element_name(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&QualName
 fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     element_name(base, id)
         .is_some_and(|name| name.ns == html_namespace() && name.local.as_ref() == "option")
-}
-
-/// A select's options: the `option` elements in its subtree, in tree order.
-fn select_options(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> Vec<NodeId> {
-    descendants(base, select)
-        .into_iter()
-        .filter(|&id| is_option_element(base, id))
-        .map(|node| NodeId { document, node })
-        .collect()
-}
-
-/// Selectedness is the presence of the `selected` attribute; Blitz keeps no
-/// selectedness slot.
-fn option_selected(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
-    attr(base, id, "selected").is_some()
 }
 
 /// The index of the first selected option, or `-1`
@@ -398,7 +387,7 @@ fn collect_by_name(
     descendants(base, scope)
         .into_iter()
         .filter(|&id| {
-            super::is_element(base, id) && attr(base, id, "name").is_some_and(|value| value == name)
+            is_element(base, id) && attr(base, id, "name").is_some_and(|value| value == name)
         })
         .map(|node| NodeId { document, node })
         .collect()
@@ -486,7 +475,7 @@ fn collect_by_class(
     descendants(base, scope)
         .into_iter()
         .filter(|&id| {
-            if !super::is_element(base, id) {
+            if !is_element(base, id) {
                 return false;
             }
             // The class is the no-namespace `class` attribute, not `*:class`
@@ -537,7 +526,7 @@ fn html_child_elements(
     parent: BlitzId,
     locals: &[&str],
 ) -> Vec<NodeId> {
-    crate::js::world::child_ids(base, document, parent)
+    crate::dom::tree::child_ids(base, document, parent)
         .into_iter()
         .filter(|kid| locals.iter().any(|local| html_named(base, kid.node, local)))
         .collect()
@@ -573,7 +562,7 @@ fn table_rows(base: &blitz_dom::BaseDocument, document: u32, table: BlitzId) -> 
     let mut head = Vec::new();
     let mut body = Vec::new();
     let mut foot = Vec::new();
-    for kid in crate::js::world::child_ids(base, document, table) {
+    for kid in crate::dom::tree::child_ids(base, document, table) {
         if html_named(base, kid.node, "thead") {
             head.extend(table_section_rows(base, document, kid.node));
         } else if html_named(base, kid.node, "tfoot") {
@@ -598,7 +587,7 @@ fn detach_node(parsed: &mut crate::Parsed, target: NodeId) {
         let base = &parsed.document.base;
         let parent = base.get_node(target.node).and_then(|node| node.parent);
         let (previous, next) = parent.map_or((None, None), |parent| {
-            super::node::siblings_around(base, document, parent, target.node)
+            siblings_around(base, document, parent, target.node)
         });
         (parent, previous, next)
     };
@@ -650,9 +639,8 @@ fn insert_node_before(parsed: &mut crate::Parsed, reference: NodeId, child: Node
     let (parent, previous) = {
         let base = &parsed.document.base;
         let parent = base.get_node(reference.node).and_then(|node| node.parent);
-        let previous = parent.and_then(|parent| {
-            super::node::siblings_around(base, document, parent, reference.node).0
-        });
+        let previous =
+            parent.and_then(|parent| siblings_around(base, document, parent, reference.node).0);
         (parent, previous)
     };
     let Some(parent) = parent else {
@@ -683,7 +671,7 @@ fn replace_node(parsed: &mut crate::Parsed, old: NodeId, new: NodeId) {
         let base = &parsed.document.base;
         let parent = base.get_node(old.node).and_then(|node| node.parent);
         let (previous, next) = parent.map_or((None, None), |parent| {
-            super::node::siblings_around(base, document, parent, old.node)
+            siblings_around(base, document, parent, old.node)
         });
         (parent, previous, next)
     };
@@ -805,7 +793,7 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
                 descendants(base, scope.node)
                     .into_iter()
                     .filter(|&id| {
-                        super::is_element(base, id)
+                        is_element(base, id)
                             && attr(base, id, "name").is_some_and(|value| value == name)
                     })
                     .count()

@@ -5,10 +5,9 @@ use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for
 use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
+use crate::documents::JournalEntry;
+use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected};
 use crate::js::world::EventTargetKey;
-use crate::js::world::{
-    BlitzId, JournalEntry, NodeId, attr, form_owner_of, html_namespace, is_connected,
-};
 
 /// The node-removal focus fixup: when the document's focused area is inside
 /// a removed subtree, clear it without firing events
@@ -183,39 +182,19 @@ fn input_type(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
         .to_ascii_lowercase()
 }
 
-/// Radios sharing `node`'s `name` in the same tree, in tree order. Blitz
-/// keeps no form-owner model, so the parser-associated form owner is a known
-/// cutover gap and the group spans the document instead of the form.
-fn radio_group(base: &blitz_dom::BaseDocument, document: u32, node: BlitzId) -> Vec<NodeId> {
-    let name = attr(base, node, "name").unwrap_or_default().to_owned();
-    let mut group = Vec::new();
-    let mut stack = vec![base.root_node().id];
-    // Reverse-push keeps the pop order in tree order.
-    while let Some(id) = stack.pop() {
-        let Some(tree) = base.get_node(id) else {
-            continue;
-        };
-        if tree.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace()
-                && element.name.local.as_ref() == "input"
-                && input_type(base, id) == "radio"
-                && attr(base, id, "name").unwrap_or_default() == name
-        }) {
-            group.push(NodeId { document, node: id });
-        }
-        stack.extend(tree.children.iter().rev().copied());
-    }
-    group.sort_by(|a, b| super::tree_order(base, document, a.node, b.node));
-    group
-}
-
-/// The group's currently checked radio, if any.
+/// The group's currently checked radio, if any. An empty or missing `name`
+/// forms no group, so a nameless radio is only its own group member
+/// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
 fn radio_group_checked(
     base: &blitz_dom::BaseDocument,
     document: u32,
     node: BlitzId,
 ) -> Option<NodeId> {
-    radio_group(base, document, node)
+    if attr(base, node, "checked").is_some() {
+        return Some(NodeId { document, node });
+    }
+    let name = attr(base, node, "name")?;
+    crate::dom::forms::radio_group_members(base, document, name, node)
         .into_iter()
         .find(|member| attr(base, member.node, "checked").is_some())
 }
@@ -451,8 +430,21 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 if attr(&parsed.document.base, node.node, "checked").is_some() {
                     false
                 } else {
-                    for member in radio_group(&parsed.document.base, node.document, node.node) {
-                        set_presence_attr(&mut parsed, member, "checked", member == node);
+                    // The clicked radio joins its group and unchecks the
+                    // rest
+                    // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state>).
+                    let name = attr(&parsed.document.base, node.node, "name")
+                        .unwrap_or_default()
+                        .to_owned();
+                    let members = crate::dom::forms::radio_group_members(
+                        &parsed.document.base,
+                        node.document,
+                        &name,
+                        node.node,
+                    );
+                    set_presence_attr(&mut parsed, node, "checked", true);
+                    for member in members {
+                        set_presence_attr(&mut parsed, member, "checked", false);
                     }
                     true
                 }

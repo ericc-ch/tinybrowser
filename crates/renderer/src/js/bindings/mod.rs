@@ -41,16 +41,14 @@ use std::collections::HashMap;
 
 use std::rc::{Rc, Weak};
 
-use std::fmt;
-
 use blitz_dom::NodeData;
 use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
-use crate::js::world::NodeId;
+use crate::dom::TreeError;
+use crate::dom::tree::{NodeId, is_real_element, sibling};
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
-    prelude::This,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, prelude::This,
 };
 
 use super::events::{self, JsEvent, JsEventTarget};
@@ -140,29 +138,6 @@ pub(crate) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::E
     match exception {
         Ok(exception) => ctx.throw(Class::into_value(exception)),
         Err(err) => err,
-    }
-}
-
-/// A refused tree operation, mapped to its DOM exception class
-/// (<https://dom.spec.whatwg.org/#dom-domerror> naming).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum TreeError {
-    /// A handle named a node that no longer exists.
-    Stale,
-    /// The move would place a node inside its own subtree, or the content
-    /// model forbids the operation.
-    Hierarchy,
-    /// The target has no parent to insert beside.
-    NotFound,
-}
-
-impl fmt::Display for TreeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stale => f.write_str("stale node handle"),
-            Self::Hierarchy => f.write_str("hierarchy or content model forbids this operation"),
-            Self::NotFound => f.write_str("target has no parent to insert beside"),
-        }
     }
 }
 
@@ -623,7 +598,7 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
         let base = &parsed.document.base;
-        super::world::is_connected(base, node.node)
+        crate::dom::tree::is_connected(base, node.node)
             && base
                 .get_node(node.node)
                 .is_some_and(|node| node.data.downcast_element().is_some())
@@ -854,14 +829,35 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 /// Instantiates a `JsNode` wrapper with the realm-owner's prototype for
 /// `brand`.
 fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value<'js>> {
-    let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
-    // A node's relevant realm is the one that created it, even after
-    // `adoptNode` changes its node document
-    // (<https://dom.spec.whatwg.org/#concept-node-adopt>,
-    // <https://github.com/whatwg/dom/issues/977>).
-    // An iframe document created while a parent script runs has no realm yet,
-    // so that world has no brands; use this realm's until that realm exists
-    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+    let value = JsNode { handle: Handle(id) };
+    let class = if let Some(prototype) = node_wrapper_prototype(ctx, id, brand)? {
+        host::instance_proto(value, prototype)?
+    } else {
+        // No brand yet (a frame document whose realm does not exist): the
+        // registered Node class prototype until that realm installs its
+        // brands.
+        let prototype = Class::<JsNode>::prototype(ctx)?
+            .ok_or_else(|| Exception::throw_internal(ctx, "native Node class has no prototype"))?;
+        host::instance_proto(value, prototype)?
+    };
+    Ok(Class::into_value(class))
+}
+
+/// The interface prototype a node's wrapper must use.
+///
+/// A node's relevant realm is the one that created it, even after
+/// `adoptNode` changes its node document
+/// (<https://dom.spec.whatwg.org/#concept-node-adopt>,
+/// <https://github.com/whatwg/dom/issues/977>).
+/// An iframe document created while a parent script runs has no realm yet,
+/// so that world has no brands; fall back to the owning document's realm and
+/// then to this realm until that realm exists
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+fn node_wrapper_prototype<'js>(
+    ctx: &Ctx<'js>,
+    id: NodeId,
+    brand: &str,
+) -> Result<Option<Object<'js>>> {
     let world_rc = world(ctx)?;
     let owner = world_rc.borrow().owner_world(id);
     if let Some(owner) = owner.as_ref() {
@@ -877,10 +873,7 @@ fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value
         .and_then(|creator| creator.borrow().brand(brand))
         .or_else(|| owner.as_ref().and_then(|owner| owner.borrow().brand(brand)))
         .or_else(|| world_rc.borrow().brand(brand));
-    if let Some(proto) = proto {
-        class.set_prototype(Some(&proto.restore(ctx)?))?;
-    }
-    Ok(Class::into_value(class))
+    proto.map(|proto| proto.restore(ctx)).transpose()
 }
 
 /// The element interface for a qualified name
@@ -888,11 +881,11 @@ fn wrap_with_brand<'js>(ctx: &Ctx<'js>, id: NodeId, brand: &str) -> Result<Value
 /// and <https://w3c.github.io/mathml-core/#dom-mathmlelement>).
 /// Other namespaces use the base `Element` interface.
 fn element_interface(name: &QualName) -> &'static str {
-    if name.ns == super::world::html_namespace() {
+    if name.ns == crate::dom::tree::html_namespace() {
         html_element_interface(name.local.as_ref())
-    } else if name.ns == super::world::svg_namespace() {
+    } else if name.ns == crate::dom::tree::svg_namespace() {
         "SVGElement"
-    } else if name.ns == super::world::mathml_namespace() {
+    } else if name.ns == crate::dom::tree::mathml_namespace() {
         "MathMLElement"
     } else {
         "Element"
@@ -1167,7 +1160,7 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
         .borrow()
         .document(id)
         .and_then(|parsed| {
-            super::world::attr(&parsed.document.base, id.node, local).map(str::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, id.node, local).map(str::to_owned)
         })
         .unwrap_or_default())
 }
@@ -1269,7 +1262,7 @@ fn set_character_data_inner(
     }
     parsed
         .document
-        .record(crate::js::world::JournalEntry::CharacterData {
+        .record(crate::documents::JournalEntry::CharacterData {
             target: id,
             old_value,
         });
@@ -1335,25 +1328,6 @@ pub(super) fn sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> R
     child_value(ctx, sibling)
 }
 
-/// The sibling of `id` in `forward` direction, or `None` at the edge.
-pub(super) fn sibling(
-    base: &blitz_dom::BaseDocument,
-    id: super::world::BlitzId,
-    forward: bool,
-) -> Option<super::world::BlitzId> {
-    let node = base.get_node(id)?;
-    let parent = node.parent?;
-    let siblings = &base.get_node(parent)?.children;
-    let position = siblings.iter().position(|sibling| *sibling == id)?;
-    if forward {
-        siblings.get(position + 1).copied()
-    } else {
-        position
-            .checked_sub(1)
-            .and_then(|index| siblings.get(index).copied())
-    }
-}
-
 /// The nearest element sibling in the given direction
 /// (<https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling>).
 pub(super) fn element_sibling_value<'js>(
@@ -1387,120 +1361,6 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
     Ok(rquickjs::String::from_str(ctx.clone(), text)?.into_value())
 }
 
-/// The HTML rules for parsing non-negative integers (ASCII whitespace,
-/// an optional `+`, ASCII digits with trailing garbage ignored), capped at
-/// 2^31 - 1 like unsigned-long reflection: larger values fail, `-0` still
-/// yields `0`
-/// (<https://infra.spec.whatwg.org/#rules-for-parsing-non-negative-integers>).
-pub(crate) fn parse_non_negative_integer(value: &str) -> Option<u32> {
-    match parse_integer(value)? {
-        0 => Some(0),
-        parsed @ 1..=2_147_483_647 => u32::try_from(parsed).ok(),
-        _ => None,
-    }
-}
-
-/// ASCII whitespace for the HTML parsing rules: space, tab, LF, FF, CR.
-/// Notably not vertical tab or other Unicode spaces, which stop parsing
-/// instead of being skipped
-/// (<https://infra.spec.whatwg.org/#ascii-whitespace>).
-fn is_html_whitespace(char: Option<&char>) -> bool {
-    matches!(char, Some(' ' | '\t' | '\n' | '\u{c}' | '\r'))
-}
-
-/// The HTML rules for parsing integers: skip ASCII whitespace, take an
-/// optional sign, require an ASCII digit, then consume digits and ignore
-/// whatever follows them
-/// (<https://infra.spec.whatwg.org/#rules-for-parsing-integers>).
-///
-/// Overflow bails to `None` like a parse failure: reflection sites map both
-/// to the IDL default, so the distinction is unobservable there.
-pub(crate) fn parse_integer(value: &str) -> Option<i32> {
-    let mut chars = value.chars().peekable();
-    while is_html_whitespace(chars.peek()) {
-        chars.next();
-    }
-    let mut sign: i64 = 1;
-    match chars.peek() {
-        Some('-') => {
-            sign = -1;
-            chars.next();
-        }
-        Some('+') => {
-            chars.next();
-        }
-        _ => {}
-    }
-    if !chars.peek().is_some_and(char::is_ascii_digit) {
-        return None;
-    }
-    let mut result: i64 = 0;
-    while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
-        result = result.checked_mul(10)?.checked_add(i64::from(digit))?;
-        chars.next();
-    }
-    let result = result.checked_mul(sign)?;
-    i32::try_from(result).ok()
-}
-
-/// The HTML rules for parsing floating-point number values: skip ASCII
-/// whitespace, take an optional sign, read an integer and fraction part,
-/// then an optional exponent; trailing garbage is ignored
-/// (<https://infra.spec.whatwg.org/#rules-for-parsing-floating-point-number-values>).
-///
-/// Failure and non-finite results both bail to `None`: reflection sites map
-/// either to the IDL default.
-pub(crate) fn parse_double(value: &str) -> Option<f64> {
-    let bytes = value.as_bytes();
-    let mut pos = 0;
-    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\x0c' | b'\r') {
-        pos += 1;
-    }
-    let start = pos;
-    if pos < bytes.len() && (bytes[pos] == b'-' || bytes[pos] == b'+') {
-        pos += 1;
-    }
-    let mut integer_digits = 0_u32;
-    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-        integer_digits += 1;
-        pos += 1;
-    }
-    let mut fraction_digits = 0_u32;
-    if pos < bytes.len() && bytes[pos] == b'.' {
-        pos += 1;
-        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-            fraction_digits += 1;
-            pos += 1;
-        }
-    }
-    if integer_digits == 0 && fraction_digits == 0 {
-        return None;
-    }
-    if pos < bytes.len() && (bytes[pos] == b'e' || bytes[pos] == b'E') {
-        let mut probe = pos + 1;
-        if probe < bytes.len() && (bytes[probe] == b'-' || bytes[probe] == b'+') {
-            probe += 1;
-        }
-        let exponent_start = probe;
-        while probe < bytes.len() && bytes[probe].is_ascii_digit() {
-            probe += 1;
-        }
-        if probe > exponent_start {
-            pos = probe;
-        }
-    }
-    // The scanner above accepts exactly the spec's grammar, so the standard
-    // parser (correctly rounded, with proper overflow handling) converts it:
-    // `0e999999` is 0, `1e999` overflows to infinity (failure here).
-    let parsed: f64 = value[start..pos].parse().ok()?;
-    if parsed.is_finite() {
-        // The value set excludes `-0`: adding `+0` normalizes it.
-        Some(parsed + 0.0)
-    } else {
-        None
-    }
-}
-
 /// Rebinds the `document` global to the realm world's active document. A realm
 /// created while a navigation response was still streaming bound the outgoing
 /// document; the installed one arrives later.
@@ -1522,40 +1382,6 @@ pub(crate) fn dom_string<'js>(
     value: &crate::dom_string::DomString,
 ) -> Result<rquickjs::String<'js>> {
     rquickjs::String::from_utf16(ctx.clone(), &value.units())
-}
-
-/// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
-/// the data of all `Text` descendants in tree order.
-///
-/// Descends only into elements: a `Document` or other non-container child
-/// contributes nothing, so its subtree is not entered. Fragment backings are
-/// plain elements, so fragments are covered.
-pub(super) fn descendant_text(
-    base: &blitz_dom::BaseDocument,
-    id: super::world::BlitzId,
-) -> crate::dom_string::DomString {
-    let mut text = crate::dom_string::DomString::default();
-    let mut stack = base
-        .get_node(id)
-        .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        match &node.data {
-            NodeData::Text(data) => text.push_str(&data.content),
-            // CDATA sections contribute their data to ancestor text content
-            // exactly like text
-            // (<https://dom.spec.whatwg.org/#concept-descendant-text-content>).
-            NodeData::CDataSection { contents } => text.push_str(contents),
-            NodeData::Element(_) => {
-                stack.extend(node.children.iter().rev().copied());
-            }
-            _ => {}
-        }
-    }
-    text
 }
 
 /// Which context a qualified name is validated in
@@ -1671,22 +1497,6 @@ fn is_infra_whitespace(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ')
 }
 
-pub(super) fn element_node_name(name: &QualName, uppercase: bool) -> String {
-    let qualified = qualified_name(name);
-    if uppercase && name.ns == super::world::html_namespace() {
-        qualified.to_ascii_uppercase()
-    } else {
-        qualified
-    }
-}
-
-pub(super) fn qualified_name(name: &QualName) -> String {
-    match &name.prefix {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
-        _ => name.local.to_string(),
-    }
-}
-
 pub(super) fn elements_by_tag<'js>(
     ctx: &Ctx<'js>,
     scope: NodeId,
@@ -1742,102 +1552,10 @@ pub(super) fn live_collection<'js>(
     }
 }
 
-pub(super) fn is_element(base: &blitz_dom::BaseDocument, id: super::world::BlitzId) -> bool {
-    base.get_node(id)
-        .is_some_and(|node| matches!(node.data, NodeData::Element(_)))
-}
-
-pub(super) fn is_real_element(
-    doc: &crate::documents::BlitzDocument,
-    id: super::world::BlitzId,
-) -> bool {
-    !doc.is_fragment(id) && is_element(&doc.base, id)
-}
-
-/// The root of the tree `id` participates in (itself when detached).
-pub(super) fn root_of(
-    base: &blitz_dom::BaseDocument,
-    id: super::world::BlitzId,
-) -> super::world::BlitzId {
-    let mut root = id;
-    while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
-        root = parent;
-    }
-    root
-}
-
-/// `id` followed by its inclusive ancestors, nearest first.
-pub(super) fn ancestor_chain(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    id: super::world::BlitzId,
-) -> Vec<NodeId> {
-    let mut chain = vec![NodeId { document, node: id }];
-    let mut cursor = id;
-    while let Some(parent) = base.get_node(cursor).and_then(|node| node.parent) {
-        chain.push(NodeId {
-            document,
-            node: parent,
-        });
-        cursor = parent;
-    }
-    chain
-}
-
-/// Document order of two nodes in one tree
-/// (<https://dom.spec.whatwg.org/#concept-tree-order>).
-pub(super) fn tree_order(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    a: super::world::BlitzId,
-    b: super::world::BlitzId,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let chain_a = ancestor_chain(base, document, a);
-    let chain_b = ancestor_chain(base, document, b);
-    let mut common = 0;
-    while common < chain_a.len()
-        && common < chain_b.len()
-        && chain_a[chain_a.len() - 1 - common] == chain_b[chain_b.len() - 1 - common]
-    {
-        common += 1;
-    }
-    if common == chain_a.len() {
-        return chain_a.len().cmp(&chain_b.len());
-    }
-    if common == chain_b.len() {
-        return Ordering::Greater;
-    }
-    let Some(parent) = chain_a
-        .len()
-        .checked_sub(common)
-        .and_then(|index| chain_a.get(index))
-    else {
-        return Ordering::Less;
-    };
-    let child_a = chain_a[chain_a.len() - 1 - common];
-    let child_b = chain_b[chain_b.len() - 1 - common];
-    let kids: Vec<NodeId> = base
-        .get_node(parent.node)
-        .map(|node| {
-            node.children
-                .iter()
-                .map(|child| NodeId {
-                    document,
-                    node: *child,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let position_a = kids.iter().position(|&kid| kid == child_a);
-    let position_b = kids.iter().position(|&kid| kid == child_b);
-    position_a.cmp(&position_b)
-}
-
 pub(super) fn find_element_by_id(
     base: &blitz_dom::BaseDocument,
     document: u32,
-    scope: super::world::BlitzId,
+    scope: crate::dom::tree::BlitzId,
     id: &str,
 ) -> Option<NodeId> {
     // An element with an empty ID has no ID, so no element matches
@@ -1875,8 +1593,8 @@ mod realm_tests {
     use url::Url;
 
     use super::{world, wrap_node};
-    use crate::document::Stop;
-    use crate::js::world::NodeId;
+    use crate::dom::tree::NodeId;
+    use crate::js::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::messaging::Shared;
     use crate::protocol::{
@@ -1976,7 +1694,7 @@ mod realm_tests {
         url: &str,
         html: &str,
     ) -> Rc<RefCell<World>> {
-        let runtime = crate::document::FrameRuntime {
+        let runtime = crate::js::FrameRuntime {
             services: Arc::clone(services),
             js_runtime: js_runtime.handle(),
             wake: Arc::new(tokio::sync::Notify::new()),

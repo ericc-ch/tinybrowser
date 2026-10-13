@@ -113,7 +113,7 @@ impl RgbaImage {
 #[derive(Clone, Copy, Debug)]
 pub struct NodeBox {
     /// The element the box was generated for.
-    pub node: crate::js::world::NodeId,
+    pub node: crate::dom::tree::NodeId,
     /// Border box in CSS pixels.
     pub x: f32,
     pub y: f32,

@@ -1,13 +1,14 @@
 //! `DOMImplementation`, DOM parsing, and serialization.
 
 use super::{
-    NodeContext, create_node, detach_for_adopt, import_snapshot, materialize_import,
-    retarget_wrapper, throw_dom, throw_dom_error, validate_and_extract, world, world_for_node,
-    wrap_new_document, wrap_new_document_in_world, wrap_node,
+    NodeContext, create_node, retarget_wrapper, throw_dom, throw_dom_error, validate_and_extract,
+    world, world_for_node, wrap_new_document, wrap_new_document_in_world, wrap_node,
 };
 
+use crate::dom::adoption::{detach_for_adopt, import_snapshot, materialize_import};
+
+use crate::dom::tree::NodeId;
 use crate::js::world::Handle;
-use crate::js::world::NodeId;
 
 use markup5ever::{LocalName, QualName};
 
@@ -222,7 +223,7 @@ fn append_adopted_doctype(ctx: &Ctx<'_>, document: NodeId, doctype: NodeId) -> R
 fn html_element_name(local: &str) -> QualName {
     QualName::new(
         None,
-        crate::js::world::html_namespace(),
+        crate::dom::tree::html_namespace(),
         LocalName::from(local),
     )
 }
@@ -353,8 +354,12 @@ impl<'js> xml_serializer_generated::XMLSerializer<'js> for JsXmlSerializer {
         let text = owner.borrow().document(id).map_or_else(
             crate::dom_string::DomString::default,
             |parsed| {
-                let mut output = super::node::HtmlOutput::default();
-                super::node::serialize_xml_node(&parsed.document, id.node, &mut output);
+                let mut output = crate::dom::serialization::HtmlOutput::default();
+                crate::dom::serialization::serialize_xml_node(
+                    &parsed.document,
+                    id.node,
+                    &mut output,
+                );
                 output.finish()
             },
         );
