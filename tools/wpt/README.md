@@ -4,7 +4,8 @@
 single Python CLI `tools/wpt/cli.py` (`run` | `score` | `rerun` |
 `overnight` | `selftest`); `tools/wpt/run` and `tools/wpt/rerun` are thin
 shims that find a Python before the venv exists (`tools/wpt/retest` is a
-compat alias for `rerun`). The CLI builds the debug binary through cargo on
+compat alias for `rerun`). `tools/wpt/failures` and `tools/wpt/baseline` are
+standalone shell tools for failure-list diffs. The CLI builds the debug binary through cargo on
 every run (cargo's fingerprint no-ops when fresh), and installs the
 wptrunner product into WPT's venv only when the venv is missing or its stamp
 changed: the stamp covers the `wpt run` requirements files (manifest,
@@ -59,6 +60,28 @@ by default (`--include-timeout` adds them): they are usually blocked
 capabilities, and re-running them only pays the timeout. A TIMEOUT that
 appears in a rerun report is always reported and kept, even when the
 selection did not include TIMEOUTs. `--dry-run` lists the selection.
+
+## Baseline comparison
+
+A conformance change is a failure-list diff, not a pass count: run the same
+slice at the base revision and compare. `tools/wpt/failures` extracts the
+canonical list from a `--score` log (`STATUS PATH :: SUBTEST`, sorted and
+deduplicated; a top-level result prints as `STATUS PATH :: [top-level]`).
+`tools/wpt/baseline` runs both sides and prints the diff:
+
+```sh
+# exits 1 when the working tree has failures the revision does not
+./tools/wpt/baseline d78b30e dom/nodes/ -- --processes 8
+# one side already ran: extract and diff by hand
+./tools/wpt/failures /tmp/run.log > /tmp/run.failures
+comm -13 /tmp/base.failures /tmp/run.failures   # failures only in the run
+```
+
+The baseline binary is built in a detached worktree under the temp directory
+(this checkout's build submodules are copied in; the WPT submodule and venv
+stay shared), copied out, and the worktree is removed on exit. Both sides run
+this checkout's WPT, so only the browser differs. The script enters the dev
+shell itself; it prints the temp directory with the two logs.
 
 A test262 report needs the test type repeated, because the default run
 selects testharness and crashtest only:

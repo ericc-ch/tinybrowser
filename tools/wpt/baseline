@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Run a WPT slice at a baseline revision and diff its failure list against the
+# working tree's.
+#
+# Same tests, two browsers: both runs use this checkout's WPT, venv, and
+# manifest; only the browser binary differs. The baseline binary is built in a
+# detached worktree whose build submodules are copied from this checkout, then
+# copied out; this checkout's binary is rebuilt before the runs, so
+# `TINYBROWSER_BINARY` serves each side. The worktree is removed on exit.
+#
+# usage: tools/wpt/baseline REV PATH... [-- upstream wpt flags]
+#
+#   tools/wpt/baseline d78b30e dom/nodes/Document-adoptNode.html
+#   tools/wpt/baseline d78b30e html/dom/ -- --processes 4
+#
+# Exit: 0 no new failures, 1 new failures, 2 usage or setup error.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$root"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: tools/wpt/baseline REV PATH... [-- upstream wpt flags]
+
+  tools/wpt/baseline d78b30e dom/nodes/Document-adoptNode.html
+  tools/wpt/baseline d78b30e html/dom/ -- --processes 4
+
+Exit: 0 no new failures, 1 new failures, 2 usage or setup error.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+if [[ $# -lt 2 ]]; then
+  usage
+  exit 2
+fi
+
+rev="$1"
+shift
+paths=()
+while [[ $# -gt 0 && "$1" != "--" ]]; do
+  paths+=("$1")
+  shift
+done
+if [[ ${#paths[@]} -eq 0 ]]; then
+  echo "baseline: no test paths given" >&2
+  exit 2
+fi
+runner_args=("$@")
+
+if ! git rev-parse --verify --quiet "${rev}^{commit}" >/dev/null; then
+  echo "baseline: $rev is not a commit" >&2
+  exit 2
+fi
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/tinybrowser-baseline.XXXXXX")"
+worktree="$tmp/tree"
+keep_logs=0
+cleanup() {
+  git worktree remove --force "$worktree" >/dev/null 2>&1 || rm -rf "$worktree"
+  [[ "$keep_logs" == 1 ]] || rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+echo "baseline: $rev -> $worktree" >&2
+git worktree add --detach "$worktree" "$rev" >/dev/null
+
+# A linked worktree cannot reuse the cached submodule clones, and the network
+# may not be available, so copy this checkout's build submodules in. The WPT
+# submodule stays empty: the runner falls back to this checkout's WPT (and its
+# venv).
+for sub in third_party/rquickjs third_party/blitz third_party/html5ever; do
+  pinned="$(git rev-parse "$rev:$sub")"
+  actual="$(git -C "$root/$sub" rev-parse HEAD)"
+  if [[ "$pinned" != "$actual" ]]; then
+    echo "baseline: $rev pins $sub at ${pinned:0:12}, this checkout has ${actual:0:12}" >&2
+    echo "baseline: update that submodule to the pinned commit and retry" >&2
+    exit 2
+  fi
+  rm -rf "$worktree/$sub"
+  cp -a "$root/$sub" "$worktree/$sub"
+done
+
+baseline_bin="$tmp/tinybrowser-baseline"
+echo "baseline: building $rev" >&2
+(
+  cd "$worktree"
+  BASE_BIN="$baseline_bin" nix develop --command bash -c \
+    'cargo build -q && cp "$(tools/binary-path)" "$BASE_BIN"'
+)
+
+echo "baseline: rebuilding the working tree" >&2
+nix develop --command cargo build -q
+
+echo "baseline: running the slice at $rev" >&2
+TINYBROWSER_BINARY="$baseline_bin" nix develop --command \
+  tools/wpt/run --score "${paths[@]}" "${runner_args[@]}" \
+  > "$tmp/baseline.log" 2>&1 || true
+echo "baseline: running the slice at the working tree" >&2
+nix develop --command tools/wpt/run --score "${paths[@]}" "${runner_args[@]}" \
+  > "$tmp/current.log" 2>&1 || true
+keep_logs=1
+
+tools/wpt/failures "$tmp/baseline.log" > "$tmp/baseline.failures"
+tools/wpt/failures "$tmp/current.log" > "$tmp/current.failures"
+
+base_count="$(wc -l < "$tmp/baseline.failures")"
+current_count="$(wc -l < "$tmp/current.failures")"
+new="$(comm -13 "$tmp/baseline.failures" "$tmp/current.failures" || true)"
+fixed="$(comm -23 "$tmp/baseline.failures" "$tmp/current.failures" || true)"
+
+echo "baseline $rev: $base_count failing results"
+echo "working tree:   $current_count failing results"
+if [[ -n "$fixed" ]]; then
+  echo
+  echo "only in baseline (fixed):"
+  printf '%s\n' "$fixed" | sed 's/^/  /'
+fi
+if [[ -n "$new" ]]; then
+  echo
+  echo "only in the working tree (new failures):"
+  printf '%s\n' "$new" | sed 's/^/  /'
+  echo
+  echo "logs: $tmp"
+  exit 1
+fi
+echo
+echo "no new failures; logs: $tmp"
+exit 0
