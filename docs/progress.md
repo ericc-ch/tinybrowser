@@ -59,7 +59,7 @@ prolog), serialization, text, and layout treatment; real template
 contents fragments with host links, parser/fragment routing, cloning,
 and cycle visibility; sink parse errors carried on the document for
 draining; internal general entities expanded up front with
-billion-laughs bounds; `Node::is_visible` for computed visibility.
+billion-laughs bounds.
 Fixed in our `ericc-ch/html5ever` fork (`third_party/html5ever`,
 `master` is the line, merged to upstream `main` at 7760920, 0.40.1) so far:
 namespace declarations kept on elements; CDATA sections tokenized and
