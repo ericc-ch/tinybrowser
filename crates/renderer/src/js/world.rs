@@ -1476,7 +1476,7 @@ impl World {
         }
         let id = self.next_object_url;
         self.next_object_url = self.next_object_url.wrapping_add(1);
-        let url = format!("blob:tinybrowser/{id}");
+        let url = format!("blob:{}/{}", self.origin_string(), id);
         self.object_urls.insert(
             url.clone(),
             ObjectUrlEntry {

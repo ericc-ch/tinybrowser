@@ -611,6 +611,8 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
 
 /// Every element's border box from the Blitz layout, in tree order.
 pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate::render::NodeBox>> {
+    use style::computed_values::visibility::T as Visibility;
+
     let world = world_for_node(ctx, document)?;
     let world_ref = world.borrow();
     let Some(mut parsed) = world_ref.document_mut(document) else {
@@ -627,7 +629,9 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
         if node.data.downcast_element().is_some() {
             let position = node.absolute_position(0.0, 0.0);
             let size = node.final_layout().size;
-            let visible = node.is_visible();
+            let visible = node
+                .primary_styles()
+                .is_some_and(|styles| styles.clone_visibility() == Visibility::Visible);
             boxes.push(crate::render::NodeBox {
                 node: NodeId {
                     document: document.document,
