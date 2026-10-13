@@ -221,7 +221,7 @@ fn decoder_free(ctx: Ctx<'_>, id: u64) {
 /// `replacement` encoding, which getting an encoding never returns
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
 fn resolve_label(ctx: &Ctx<'_>, label: &str) -> Result<&'static Encoding> {
-    Encoding::for_label(super::bindings::forms::trim_label(label).as_bytes())
+    Encoding::for_label(crate::dom::forms::trim_label(label).as_bytes())
         .filter(|encoding| *encoding != encoding_rs::REPLACEMENT)
         .ok_or_else(|| Exception::throw_range(ctx, "The encoding label is not supported"))
 }

@@ -10,6 +10,7 @@ use rquickjs::{
 };
 
 use crate::documents::JournalEntry;
+use crate::dom::forms::{option_selected, select_options};
 use crate::dom::insertion::siblings_around;
 use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace, is_element};
 use crate::js::world::Handle;
@@ -259,21 +260,6 @@ fn element_name(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&QualName
 fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     element_name(base, id)
         .is_some_and(|name| name.ns == html_namespace() && name.local.as_ref() == "option")
-}
-
-/// A select's options: the `option` elements in its subtree, in tree order.
-fn select_options(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> Vec<NodeId> {
-    descendants(base, select)
-        .into_iter()
-        .filter(|&id| is_option_element(base, id))
-        .map(|node| NodeId { document, node })
-        .collect()
-}
-
-/// Selectedness is the presence of the `selected` attribute; Blitz keeps no
-/// selectedness slot.
-fn option_selected(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
-    attr(base, id, "selected").is_some()
 }
 
 /// The index of the first selected option, or `-1`

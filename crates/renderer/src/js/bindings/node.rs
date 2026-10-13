@@ -6,17 +6,17 @@ use super::{
     adopt_across_documents, adopt_into_document, attached_attr_id, attr_owner, attr_state,
     attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
     character_data_offset, child_value, clone_document, collection_ids,
-    convert_union_nodes_into_node, copy_nonce_subtree, deref_weak, descendant_text,
-    document_base_url_string, document_is_html, document_is_html_content, document_url_string,
-    dom_string, drain_mutation_journal, element_at_point, element_box, element_click,
-    element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
-    focus_node, host, host_node_id, import_attr, import_snapshot_live, is_focusable,
-    is_main_document, js_string_to_utf8, live_collection, make_weak, new_detached_attr,
-    rect_object, remove_attribute_sync, required_node, schedule_mutation_delivery, select_error,
-    selector_matching_elements, set_attribute_node, set_attribute_sync, set_character_data,
-    set_pi_data, sibling_value, string_value, throw_dom, throw_dom_error, touch_attr,
-    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
-    world, world_for_node, wrap_new_document_in_world, wrap_node,
+    convert_union_nodes_into_node, copy_nonce_subtree, deref_weak, document_base_url_string,
+    document_is_html, document_is_html_content, document_url_string, dom_string,
+    drain_mutation_journal, element_at_point, element_box, element_click, element_sibling_value,
+    elements_by_tag, find_element_by_id, fixup_focus_after_removal, focus_node, host, host_node_id,
+    import_attr, import_snapshot_live, is_focusable, is_main_document, js_string_to_utf8,
+    live_collection, make_weak, new_detached_attr, rect_object, remove_attribute_sync,
+    required_node, schedule_mutation_delivery, select_error, selector_matching_elements,
+    set_attribute_node, set_attribute_sync, set_character_data, set_pi_data, sibling_value,
+    string_value, throw_dom, throw_dom_error, touch_attr, valid_attribute_local_name,
+    valid_element_local_name, validate_and_extract, with_node_data, world, world_for_node,
+    wrap_new_document_in_world, wrap_node,
 };
 use crate::dom::adoption::{
     ImportSnapshot, clone_within_document, import_snapshot, materialize_children,
@@ -1497,29 +1497,7 @@ fn fixup_option_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
         let Some(parsed) = world.document(id) else {
             return Ok(());
         };
-        let base = &parsed.document.base;
-        let Some(element) = base
-            .get_node(id.node)
-            .and_then(|node| node.data.downcast_element())
-        else {
-            return Ok(());
-        };
-        if element.name.ns != html_namespace() || element.name.local.as_ref() != "option" {
-            return Ok(());
-        }
-        if attr(base, id.node, "selected").is_none() {
-            return Ok(());
-        }
-        let Some(owner) = option_select_owner(base, id.document, id.node) else {
-            return Ok(());
-        };
-        if attr(base, owner.node, "multiple").is_some() {
-            return Ok(());
-        }
-        select_options_in(base, id.document, owner.node)
-            .into_iter()
-            .filter(|option| *option != id && attr(base, option.node, "selected").is_some())
-            .collect::<Vec<_>>()
+        crate::dom::forms::options_to_deselect(&parsed.document.base, id.document, id.node)
     };
     for option in siblings {
         remove_attribute_sync(ctx, option, "", "selected", false)?;
@@ -1535,27 +1513,7 @@ fn fixup_radio_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
         let Some(parsed) = world.document(id) else {
             return Ok(());
         };
-        let base = &parsed.document.base;
-        let Some(element) = base
-            .get_node(id.node)
-            .and_then(|node| node.data.downcast_element())
-        else {
-            return Ok(());
-        };
-        if element.name.ns != html_namespace() || element.name.local.as_ref() != "input" {
-            return Ok(());
-        }
-        if attr(base, id.node, "type")
-            .unwrap_or("text")
-            .trim()
-            .eq_ignore_ascii_case("radio")
-            && attr(base, id.node, "checked").is_some()
-        {
-            let name = attr(base, id.node, "name").unwrap_or_default().to_owned();
-            radio_group_members(base, id.document, &name, id.node)
-        } else {
-            Vec::new()
-        }
+        crate::dom::forms::radios_to_uncheck(&parsed.document.base, id.document, id.node)
     };
     for member in group {
         remove_attribute_sync(ctx, member, "", "checked", false)?;
@@ -1563,185 +1521,6 @@ fn fixup_radio_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     Ok(())
 }
 
-/// Radios sharing a `name` in the same document, in tree order, excluding
-/// `except`. Blitz keeps no form-owner model, so the group spans the document
-/// instead of the form (a known cutover gap).
-fn radio_group_members(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    name: &str,
-    except: BlitzId,
-) -> Vec<NodeId> {
-    let mut group = Vec::new();
-    let mut stack = vec![base.root_node().id];
-    while let Some(id) = stack.pop() {
-        let Some(node) = base.get_node(id) else {
-            continue;
-        };
-        if id != except
-            && node.data.downcast_element().is_some_and(|element| {
-                element.name.ns == html_namespace()
-                    && element.name.local.as_ref() == "input"
-                    && attr(base, id, "type")
-                        .unwrap_or("text")
-                        .trim()
-                        .eq_ignore_ascii_case("radio")
-                    && attr(base, id, "name").unwrap_or_default() == name
-            })
-        {
-            group.push(NodeId { document, node: id });
-        }
-        stack.extend(node.children.iter().rev().copied());
-    }
-    group.sort_by(|a, b| tree_order(base, document, a.node, b.node));
-    group
-}
-
-/// The `option` elements under `select` in tree order. Blitz keeps no form
-/// model, so a select's options are the descendant `option` elements.
-fn select_options_in(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    select: BlitzId,
-) -> Vec<NodeId> {
-    let mut options = Vec::new();
-    let mut stack: Vec<BlitzId> = base
-        .get_node(select)
-        .map(|node| node.children.iter().rev().copied().collect())
-        .unwrap_or_default();
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        if node.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace() && element.name.local.as_ref() == "option"
-        }) {
-            options.push(NodeId {
-                document,
-                node: current,
-            });
-        }
-        stack.extend(node.children.iter().rev().copied());
-    }
-    options
-}
-
-/// The `select` owning `option`: its nearest ancestor `select`, if any.
-fn option_select_owner(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    option: BlitzId,
-) -> Option<NodeId> {
-    let mut cursor = base.get_node(option).and_then(|node| node.parent);
-    while let Some(current) = cursor {
-        if crate::dom::tree::is_html_element(base, current, "select") {
-            return Some(NodeId {
-                document,
-                node: current,
-            });
-        }
-        cursor = base.get_node(current).and_then(|node| node.parent);
-    }
-    None
-}
-
-/// An `option`'s value: its `value` attribute, else its text
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
-fn option_value_in(base: &blitz_dom::BaseDocument, option: BlitzId) -> String {
-    attr(base, option, "value").map_or_else(|| option_text_in(base, option), str::to_owned)
-}
-
-/// An `option`'s text: its descendant text with ASCII whitespace stripped and
-/// collapsed, skipping HTML and SVG `script` subtrees
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text>).
-fn option_text_in(base: &blitz_dom::BaseDocument, option: BlitzId) -> String {
-    let mut text = String::new();
-    let mut stack: Vec<BlitzId> = base
-        .get_node(option)
-        .map(|node| node.children.iter().rev().copied().collect())
-        .unwrap_or_default();
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        match &node.data {
-            NodeData::Text(data) => text.push_str(&data.content),
-            NodeData::Element(element) => {
-                let is_script = element.name.local.as_ref().eq_ignore_ascii_case("script")
-                    && (element.name.ns == html_namespace()
-                        || element.name.ns.as_ref() == "http://www.w3.org/2000/svg");
-                if !is_script {
-                    stack.extend(node.children.iter().rev().copied());
-                }
-            }
-            _ => {}
-        }
-    }
-    collapse_option_text(&text)
-}
-
-/// Strips and collapses ASCII whitespace runs to single spaces, dropping
-/// leading and trailing runs.
-fn collapse_option_text(text: &str) -> String {
-    let mut result = String::new();
-    let mut pending_space = false;
-    for character in text.chars() {
-        if character.is_ascii_whitespace() {
-            pending_space = !result.is_empty();
-        } else {
-            if pending_space {
-                result.push(' ');
-                pending_space = false;
-            }
-            result.push(character);
-        }
-    }
-    result
-}
-
-/// A `select`'s value: the first selected option's value, else the empty
-/// string. Blitz keeps selectedness as the `selected` attribute; selecting the
-/// first option by default is a known cutover gap
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
-fn select_value_in(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> String {
-    for option in select_options_in(base, document, select) {
-        if attr(base, option.node, "selected").is_some() {
-            return option_value_in(base, option.node);
-        }
-    }
-    String::new()
-}
-
-/// A control's value length in UTF-16 code units, the basis selection
-/// offsets clamp against: the `value` attribute for inputs, descendant text
-/// for textareas.
-fn control_value_len(base: &blitz_dom::BaseDocument, node: BlitzId) -> u32 {
-    let Some(element) = base
-        .get_node(node)
-        .and_then(|target| target.data.downcast_element())
-    else {
-        return 0;
-    };
-    if element.name.ns == html_namespace() && element.name.local.as_ref() == "textarea" {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "control values stay far below u32::MAX"
-        )]
-        let len = descendant_text(base, node).units().len() as u32;
-        return len;
-    }
-    let len = element
-        .attr(markup5ever::LocalName::from("value"))
-        .unwrap_or_default()
-        .encode_utf16()
-        .count();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "control values stay far below u32::MAX"
-    )]
-    let len = len as u32;
-    len
-}
 /// A control's stored selection start clamped to its value length.
 fn selection_start_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickjs::Result<u32> {
     let world_rc = world(ctx)?;
@@ -1751,7 +1530,10 @@ fn selection_start_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickjs::Result<u
         return Ok(0);
     };
     let (start, _, _) = world.selection_of(id);
-    Ok(start.min(control_value_len(&parsed.document.base, id.node)))
+    Ok(start.min(crate::dom::forms::control_value_len(
+        &parsed.document.base,
+        id.node,
+    )))
 }
 
 /// A control's stored selection end clamped to its value length.
@@ -1762,7 +1544,10 @@ fn selection_end_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickjs::Result<u32
         return Ok(0);
     };
     let (_, end, _) = world.selection_of(id);
-    Ok(end.min(control_value_len(&parsed.document.base, id.node)))
+    Ok(end.min(crate::dom::forms::control_value_len(
+        &parsed.document.base,
+        id.node,
+    )))
 }
 
 /// A control's stored selection direction code.
@@ -1772,39 +1557,10 @@ fn selection_direction_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickjs::Resu
     let Some(parsed) = world.document(id) else {
         return Ok(0);
     };
-    if !selection_applies(&parsed.document.base, id.node) {
+    if !crate::dom::forms::selection_applies(&parsed.document.base, id.node) {
         return Ok(0);
     }
     Ok(world.selection_of(id).2)
-}
-/// Whether text selection applies to a control: textareas always, text-like
-/// inputs only.
-fn selection_applies(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
-    let Some(element) = base
-        .get_node(node)
-        .and_then(|target| target.data.downcast_element())
-    else {
-        return false;
-    };
-    if element.name.ns != html_namespace() {
-        return false;
-    }
-    match element.name.local.as_ref() {
-        "textarea" => true,
-        "input" => {
-            // Only the text-like states support the selection APIs
-            // (<https://html.spec.whatwg.org/multipage/input.html#do-not-apply>).
-            let typ = attr(base, node, "type")
-                .unwrap_or("text")
-                .trim()
-                .to_ascii_lowercase();
-            matches!(
-                typ.as_str(),
-                "" | "text" | "search" | "tel" | "url" | "password"
-            )
-        }
-        _ => false,
-    }
 }
 
 /// The value of the `(namespace, local)` attribute on `id`, if present.
@@ -1826,155 +1582,6 @@ fn attr_ns_value(
                 })
                 .map(|attribute| attribute.value.clone())
         })
-}
-
-/// The parent element of `id`, skipping fragment backings
-/// (<https://dom.spec.whatwg.org/#parent-element>).
-fn parent_element_of(doc: &crate::documents::BlitzDocument, id: NodeId) -> Option<NodeId> {
-    let parent = doc.base.get_node(id.node)?.parent?;
-    is_real_element(doc, parent).then_some(NodeId {
-        document: id.document,
-        node: parent,
-    })
-}
-
-/// The document element of the tree whose root is `id`.
-fn document_element_of(doc: &crate::documents::BlitzDocument, id: NodeId) -> Option<NodeId> {
-    doc.base
-        .get_node(id.node)?
-        .children
-        .iter()
-        .find_map(|child| {
-            is_real_element(doc, *child).then_some(NodeId {
-                document: id.document,
-                node: *child,
-            })
-        })
-}
-
-/// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace).
-fn locate_namespace(
-    doc: &crate::documents::BlitzDocument,
-    node: NodeId,
-    prefix: Option<&str>,
-) -> Option<String> {
-    if doc.is_fragment(node.node) {
-        return None;
-    }
-    let data = &doc.base.get_node(node.node)?.data;
-    if matches!(data, NodeData::Doctype { .. }) {
-        return None;
-    }
-    if matches!(data, NodeData::Document(_)) {
-        return document_element_of(doc, node)
-            .and_then(|element| locate_namespace(doc, element, prefix));
-    }
-    if !is_real_element(doc, node.node) {
-        return parent_element_of(doc, node)
-            .and_then(|element| locate_namespace(doc, element, prefix));
-    }
-    locate_element_namespace(doc, node, prefix)
-}
-
-/// [Locates a namespace](https://dom.spec.whatwg.org/#locate-a-namespace)
-/// for `prefix` from `node`, switching on the node's interface: fragments
-/// and doctypes have none, documents defer to their element.
-fn locate_element_namespace(
-    doc: &crate::documents::BlitzDocument,
-    id: NodeId,
-    prefix: Option<&str>,
-) -> Option<String> {
-    match prefix {
-        Some("xml") => return Some("http://www.w3.org/XML/1998/namespace".to_owned()),
-        Some("xmlns") => return Some("http://www.w3.org/2000/xmlns/".to_owned()),
-        _ => {}
-    }
-    let element = doc.base.get_node(id.node)?.data.downcast_element()?;
-    let actual = element
-        .name
-        .prefix
-        .as_ref()
-        .map(markup5ever::Prefix::as_ref)
-        .filter(|prefix| !prefix.is_empty());
-    if !element.name.ns.as_ref().is_empty() && actual == prefix {
-        return Some(element.name.ns.as_ref().to_owned());
-    }
-    for attribute in element.attrs.iter() {
-        if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
-            continue;
-        }
-        let declaration = match prefix {
-            Some(prefix) => {
-                attribute
-                    .name
-                    .prefix
-                    .as_ref()
-                    .is_some_and(|value| value.as_ref() == "xmlns")
-                    && attribute.name.local.as_ref() == prefix
-            }
-            None => attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns",
-        };
-        if declaration {
-            return (!attribute.value.is_empty()).then(|| attribute.value.clone());
-        }
-    }
-    parent_element_of(doc, id).and_then(|parent| locate_namespace(doc, parent, prefix))
-}
-
-/// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix).
-fn locate_prefix(
-    doc: &crate::documents::BlitzDocument,
-    node: NodeId,
-    namespace: &str,
-) -> Option<String> {
-    if doc.is_fragment(node.node) {
-        return None;
-    }
-    let data = &doc.base.get_node(node.node)?.data;
-    if matches!(data, NodeData::Doctype { .. }) {
-        return None;
-    }
-    if matches!(data, NodeData::Document(_)) {
-        return document_element_of(doc, node)
-            .and_then(|element| locate_prefix(doc, element, namespace));
-    }
-    if !is_real_element(doc, node.node) {
-        return parent_element_of(doc, node)
-            .and_then(|element| locate_prefix(doc, element, namespace));
-    }
-    locate_element_prefix(doc, node, namespace)
-}
-
-/// [Locates a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
-/// for `namespace` from `node`, mirroring the namespace lookup by kind.
-fn locate_element_prefix(
-    doc: &crate::documents::BlitzDocument,
-    id: NodeId,
-    namespace: &str,
-) -> Option<String> {
-    let element = doc.base.get_node(id.node)?.data.downcast_element()?;
-    if element.name.ns.as_ref() == namespace
-        && let Some(prefix) = element
-            .name
-            .prefix
-            .as_ref()
-            .map(markup5ever::Prefix::as_ref)
-            .filter(|prefix| !prefix.is_empty())
-    {
-        return Some(prefix.to_owned());
-    }
-    for attribute in element.attrs.iter() {
-        if attribute
-            .name
-            .prefix
-            .as_ref()
-            .is_some_and(|prefix| prefix.as_ref() == "xmlns")
-            && attribute.value == namespace
-        {
-            return Some(attribute.name.local.as_ref().to_owned());
-        }
-    }
-    parent_element_of(doc, id).and_then(|parent| locate_prefix(doc, parent, namespace))
 }
 
 /// Whether `id` is an HTML `iframe` or `frame` container.
@@ -2006,48 +1613,6 @@ fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
     }
     let world = world(ctx)?;
     Ok(world.borrow().images.get(&id).copied())
-}
-
-/// Splits a rendered-text setter value into text and `br` nodes: `\r\n`
-/// and lone `\r` become `\n`, then every newline becomes a `br` with no
-/// empty text around it. When `pad_empty` and the value is all-empty, yields
-/// one empty text node: `outerText = ""` removes the element but the
-/// sibling-merge step expects a node to merge (proven by
-/// `outertext-setter.html`, fully passing); `innerText = ""` replaces with
-/// nothing.
-fn rendered_text_fragment(parsed: &mut crate::Parsed, value: &str, pad_empty: bool) -> Vec<NodeId> {
-    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
-    if normalized.is_empty() {
-        if !pad_empty {
-            return Vec::new();
-        }
-        let node = parsed.document.create_text(&DomString::default());
-        return vec![NodeId {
-            document: parsed.id,
-            node,
-        }];
-    }
-    let mut added = Vec::new();
-    for (index, part) in normalized.split('\n').enumerate() {
-        if index > 0 {
-            let br = parsed.document.base.mutate().create_element(
-                QualName::new(None, html_namespace(), LocalName::from("br")),
-                Vec::new(),
-            );
-            added.push(NodeId {
-                document: parsed.id,
-                node: br,
-            });
-        }
-        if !part.is_empty() {
-            let node = parsed.document.create_text(&DomString::from(part));
-            added.push(NodeId {
-                document: parsed.id,
-                node,
-            });
-        }
-    }
-    added
 }
 
 /// Current viewport offset for `id`'s document.
@@ -2980,11 +2545,15 @@ impl JsNode {
             return Ok(String::new());
         }
         Ok(match element.name.local.as_ref() {
-            "textarea" => descendant_text(&parsed.document.base, self.handle.0.node)
-                .to_string_lossy()
-                .into_owned(),
-            "select" => select_value_in(base, self.handle.0.document, self.handle.0.node),
-            "option" => option_value_in(base, self.handle.0.node),
+            "textarea" => {
+                crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            "select" => {
+                crate::dom::forms::select_value(base, self.handle.0.document, self.handle.0.node)
+            }
+            "option" => crate::dom::forms::option_value(base, self.handle.0.node),
             _ => attr(base, self.handle.0.node, "value")
                 .unwrap_or_default()
                 .to_owned(),
@@ -3044,7 +2613,7 @@ impl JsNode {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
             let base = &parsed.document.base;
-            select_options_in(base, self.handle.0.document, self.handle.0.node)
+            crate::dom::forms::select_options(base, self.handle.0.document, self.handle.0.node)
         };
         let mut matched = false;
         for option in options {
@@ -3053,7 +2622,7 @@ impl JsNode {
                 let Some(parsed) = world.document(option) else {
                     continue;
                 };
-                option_value_in(&parsed.document.base, option.node) == value
+                crate::dom::forms::option_value(&parsed.document.base, option.node) == value
             };
             if selected {
                 matched = true;
@@ -3075,9 +2644,11 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(descendant_text(&parsed.document.base, self.handle.0.node)
-            .to_string_lossy()
-            .into_owned())
+        Ok(
+            crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
@@ -3098,10 +2669,12 @@ impl JsNode {
             clippy::cast_possible_truncation,
             reason = "a 64-bit string length beyond u32 cannot be produced by this engine"
         )]
-        Ok(descendant_text(&parsed.document.base, self.handle.0.node)
-            .to_string_lossy()
-            .encode_utf16()
-            .count() as u32)
+        Ok(
+            crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node)
+                .to_string_lossy()
+                .encode_utf16()
+                .count() as u32,
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
@@ -3114,8 +2687,8 @@ impl JsNode {
                 return Ok(());
             };
             (
-                selection_applies(&parsed.document.base, self.handle.0.node),
-                control_value_len(&parsed.document.base, self.handle.0.node),
+                crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node),
+                crate::dom::forms::control_value_len(&parsed.document.base, self.handle.0.node),
                 world.selection_of(self.handle.0),
             )
         };
@@ -3144,8 +2717,8 @@ impl JsNode {
                 return Ok(());
             };
             (
-                selection_applies(&parsed.document.base, self.handle.0.node),
-                control_value_len(&parsed.document.base, self.handle.0.node),
+                crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node),
+                crate::dom::forms::control_value_len(&parsed.document.base, self.handle.0.node),
                 world.selection_of(self.handle.0),
             )
         };
@@ -3174,7 +2747,7 @@ impl JsNode {
                 return Ok(());
             };
             (
-                selection_applies(&parsed.document.base, self.handle.0.node),
+                crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node),
                 world.selection_of(self.handle.0),
             )
         };
@@ -3526,7 +3099,12 @@ impl JsNode {
                     let name = attr(base, self.handle.0.node, "name")
                         .unwrap_or_default()
                         .to_owned();
-                    radio_group_members(base, self.handle.0.document, &name, self.handle.0.node)
+                    crate::dom::forms::radio_group_members(
+                        base,
+                        self.handle.0.document,
+                        &name,
+                        self.handle.0.node,
+                    )
                 } else {
                     Vec::new()
                 }
@@ -3578,9 +3156,14 @@ impl JsNode {
                     return Ok(());
                 };
                 let base = &parsed.document.base;
-                match option_select_owner(base, self.handle.0.document, self.handle.0.node) {
+                match crate::dom::forms::option_select_owner(base, self.handle.0.node).map(|node| {
+                    NodeId {
+                        document: self.handle.0.document,
+                        node,
+                    }
+                }) {
                     Some(owner) if attr(base, owner.node, "multiple").is_none() => {
-                        select_options_in(base, self.handle.0.document, owner.node)
+                        crate::dom::forms::select_options(base, self.handle.0.document, owner.node)
                     }
                     _ => Vec::new(),
                 }
@@ -3605,8 +3188,10 @@ impl JsNode {
             .document(self.handle.0)
             .map_or_else(String::new, |parsed| {
                 let base = &parsed.document.base;
-                attr(base, self.handle.0.node, "label")
-                    .map_or_else(|| option_text_in(base, self.handle.0.node), str::to_owned)
+                attr(base, self.handle.0.node, "label").map_or_else(
+                    || crate::dom::forms::option_text(base, self.handle.0.node),
+                    str::to_owned,
+                )
             }))
     }
 
@@ -3618,7 +3203,7 @@ impl JsNode {
         Ok(world
             .document(self.handle.0)
             .map_or_else(String::new, |parsed| {
-                option_text_in(&parsed.document.base, self.handle.0.node)
+                crate::dom::forms::option_text(&parsed.document.base, self.handle.0.node)
             }))
     }
 
@@ -3657,13 +3242,18 @@ impl JsNode {
             return Ok(0);
         };
         let base = &parsed.document.base;
-        let Some(select) = option_select_owner(base, self.handle.0.document, self.handle.0.node)
+        let Some(select) =
+            crate::dom::forms::option_select_owner(base, self.handle.0.node).map(|node| NodeId {
+                document: self.handle.0.document,
+                node,
+            })
         else {
             return Ok(0);
         };
-        for (index, option) in select_options_in(base, self.handle.0.document, select.node)
-            .into_iter()
-            .enumerate()
+        for (index, option) in
+            crate::dom::forms::select_options(base, self.handle.0.document, select.node)
+                .into_iter()
+                .enumerate()
         {
             if option == self.handle.0 {
                 return Ok(i32::try_from(index).unwrap_or(i32::MAX));
@@ -3679,7 +3269,7 @@ impl JsNode {
         let world = world.borrow();
         Ok(world.document(self.handle.0).map_or(-1, |parsed| {
             let base = &parsed.document.base;
-            select_options_in(base, self.handle.0.document, self.handle.0.node)
+            crate::dom::forms::select_options(base, self.handle.0.document, self.handle.0.node)
                 .iter()
                 .position(|option| attr(base, option.node, "selected").is_some())
                 .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
@@ -3694,7 +3284,7 @@ impl JsNode {
             let Some(parsed) = world.document(self.handle.0) else {
                 return Ok(());
             };
-            select_options_in(
+            crate::dom::forms::select_options(
                 &parsed.document.base,
                 self.handle.0.document,
                 self.handle.0.node,
@@ -4100,7 +3690,7 @@ impl JsNode {
         // Child navigables die with the replaced element: collect their
         // containers before removal, destroy after the borrows drop.
         let iframes = iframe_containers_in_subtrees(&parsed, &[self.handle.0]);
-        let mut added = rendered_text_fragment(&mut parsed, &value.0, true);
+        let mut added = crate::dom::text::rendered_text_fragment(&mut parsed, &value.0, true);
         for child in &added {
             place_journaled(&mut parsed, parent, *child, Some(self.handle.0));
         }
@@ -4112,8 +3702,8 @@ impl JsNode {
                 node,
             });
             if let Some(previous) = previous
-                && is_mergeable_text_node(&parsed.document.base, previous.node)
-                && is_mergeable_text_node(&parsed.document.base, first.node)
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, previous.node)
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, first.node)
             {
                 let previous_text = String::from(parsed.document.character_data(previous.node));
                 let old_value = DomString::from(previous_text.clone());
@@ -4142,8 +3732,8 @@ impl JsNode {
                 node,
             });
             if let Some(next) = next
-                && is_mergeable_text_node(&parsed.document.base, next.node)
-                && is_mergeable_text_node(&parsed.document.base, last.node)
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, next.node)
+                && crate::dom::text::is_mergeable_text_node(&parsed.document.base, last.node)
             {
                 let last_text = String::from(parsed.document.character_data(last.node));
                 let old_value = DomString::from(last_text.clone());
@@ -4198,7 +3788,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let added = rendered_text_fragment(&mut parsed, &value.0, false);
+        let added = crate::dom::text::rendered_text_fragment(&mut parsed, &value.0, false);
         let iframes = replace_all_journaled(&mut parsed, self.handle.0, added);
         drop(parsed);
         world.destroy_child_navigables(&iframes);
@@ -4527,7 +4117,8 @@ impl JsNode {
             });
         match kind {
             Some(0) => {
-                let text = descendant_text(&parsed.document.base, self.handle.0.node);
+                let text =
+                    crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node);
                 dom_string(ctx, &text).map(Some)
             }
             Some(1) => {
@@ -4669,7 +4260,10 @@ impl JsNode {
         };
         let title = document_first(&parsed, "title");
         match title {
-            Some(title) => dom_string(ctx, &descendant_text(&parsed.document.base, title.node)),
+            Some(title) => dom_string(
+                ctx,
+                &crate::dom::text::descendant_text(&parsed.document.base, title.node),
+            ),
             None => rquickjs::String::from_str(ctx.clone(), ""),
         }
     }
@@ -5621,7 +5215,11 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match locate_namespace(&parsed.document, self.handle.0, prefix.as_deref()) {
+        match crate::dom::namespaces::locate_namespace(
+            &parsed.document,
+            self.handle.0,
+            prefix.as_deref(),
+        ) {
             Some(namespace) => string_value(&ctx, &namespace),
             None => Ok(Value::new_null(ctx)),
         }
@@ -5646,7 +5244,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match locate_prefix(&parsed.document, self.handle.0, &namespace) {
+        match crate::dom::namespaces::locate_prefix(&parsed.document, self.handle.0, &namespace) {
             Some(prefix) => string_value(&ctx, &prefix),
             None => Ok(Value::new_null(ctx)),
         }
@@ -5668,7 +5266,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        let found = locate_namespace(&parsed.document, self.handle.0, None);
+        let found = crate::dom::namespaces::locate_namespace(&parsed.document, self.handle.0, None);
         Ok(found.as_deref() == namespace.as_deref())
     }
 }
@@ -7408,7 +7006,7 @@ fn reflect_enum(raw: Option<&str>, keywords: &[&str], missing: &str, invalid: &s
 /// otherwise the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_ulong(raw: Option<&str>, default: u32) -> u32 {
-    raw.and_then(super::parse_integer)
+    raw.and_then(crate::dom::parse::parse_integer)
         .and_then(|value| u32::try_from(value).ok())
         .unwrap_or(default)
 }
@@ -7424,7 +7022,7 @@ fn reflect_clamped_ulong(raw: Option<&str>, default: u32, min: u32, max: u32) ->
         return default;
     };
     let mut chars = text.chars().peekable();
-    while super::is_html_whitespace(chars.peek()) {
+    while crate::dom::parse::is_html_whitespace(chars.peek()) {
         chars.next();
     }
     let mut negative = false;
@@ -7456,14 +7054,15 @@ fn reflect_clamped_ulong(raw: Option<&str>, default: u32, min: u32, max: u32) ->
 /// `double` reflection: a floating-point value or the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_double(raw: Option<&str>, default: f64) -> f64 {
-    raw.and_then(super::parse_double).unwrap_or(default)
+    raw.and_then(crate::dom::parse::parse_double)
+        .unwrap_or(default)
 }
 
 /// Limited `double` reflection (used by `progress.max`): a positive
 /// floating-point value or the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
 fn reflect_limited_double(raw: Option<&str>, default: f64) -> f64 {
-    match raw.and_then(super::parse_double) {
+    match raw.and_then(crate::dom::parse::parse_double) {
         Some(value) if value > 0.0 => value,
         _ => default,
     }
@@ -7680,7 +7279,7 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
         };
         let base = &parsed.document.base;
         Ok(crate::dom::tree::attr(base, self.handle.0.node, "tabindex")
-            .and_then(super::parse_integer)
+            .and_then(crate::dom::parse::parse_integer)
             .unwrap_or_else(|| tab_index_default(base, self.handle.0.node)))
     }
 
@@ -8501,7 +8100,7 @@ impl<'js> htmlli_element_generated::HTMLLIElement<'js> for JsNode {
     fn get_value(&self, ctx: &Ctx<'js>) -> Result<i32> {
         Ok(content_attr(ctx, self.handle.0, "value")
             .as_deref()
-            .and_then(super::parse_integer)
+            .and_then(crate::dom::parse::parse_integer)
             .unwrap_or(0))
     }
 
@@ -8547,7 +8146,7 @@ impl<'js> html_marquee_element_generated::HTMLMarqueeElement<'js> for JsNode {
     fn get_loop(&self, ctx: &Ctx<'js>) -> Result<i32> {
         Ok(content_attr(ctx, self.handle.0, "loop")
             .as_deref()
-            .and_then(super::parse_integer)
+            .and_then(crate::dom::parse::parse_integer)
             .unwrap_or(-1))
     }
 
@@ -8675,7 +8274,7 @@ impl<'js> html_progress_element_generated::HTMLProgressElement<'js> for JsNode {
         Ok(
             match content_attr(ctx, self.handle.0, "value")
                 .as_deref()
-                .and_then(super::parse_double)
+                .and_then(crate::dom::parse::parse_double)
             {
                 Some(value) if value > 0.0 => value.min(max),
                 _ => 0.0,
@@ -8710,7 +8309,7 @@ impl<'js> htmlo_list_element_generated::HTMLOListElement<'js> for JsNode {
     fn get_start(&self, ctx: &Ctx<'js>) -> Result<i32> {
         Ok(content_attr(ctx, self.handle.0, "start")
             .as_deref()
-            .and_then(super::parse_integer)
+            .and_then(crate::dom::parse::parse_integer)
             .unwrap_or(1))
     }
 
@@ -8727,7 +8326,7 @@ impl<'js> html_pre_element_generated::HTMLPreElement<'js> for JsNode {
     fn get_width(&self, ctx: &Ctx<'js>) -> Result<i32> {
         Ok(content_attr(ctx, self.handle.0, "width")
             .as_deref()
-            .and_then(super::parse_integer)
+            .and_then(crate::dom::parse::parse_integer)
             .unwrap_or(0))
     }
 
@@ -9175,7 +8774,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
-        if !selection_applies(&parsed.document.base, self.handle.0.node) {
+        if !crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node) {
             return Ok(None);
         }
         drop(parsed);
@@ -9195,7 +8794,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
-        if !selection_applies(&parsed.document.base, self.handle.0.node) {
+        if !crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node) {
             return Ok(None);
         }
         drop(parsed);
@@ -9215,7 +8814,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(None);
         };
-        if !selection_applies(&parsed.document.base, self.handle.0.node) {
+        if !crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node) {
             return Ok(None);
         }
         drop(parsed);
@@ -9739,7 +9338,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
 fn canvas_dimension(ctx: &Ctx<'_>, id: NodeId, attribute: &str, default: u32) -> u32 {
     let value = attribute_value(ctx, id, attribute).unwrap_or_default();
-    super::parse_non_negative_integer(&value).unwrap_or(default)
+    crate::dom::parse::parse_non_negative_integer(&value).unwrap_or(default)
 }
 
 impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
@@ -10467,16 +10066,6 @@ fn whole_text(ctx: &Ctx<'_>, id: NodeId) -> Result<DomString> {
             combined
         })
         .unwrap_or_default())
-}
-
-/// Whether `id` is a `Text` node strictly (not CDATA): the outerText merge
-/// steps only merge `Text`
-/// (<https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute>).
-fn is_mergeable_text_node(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
-    matches!(
-        base.get_node(id).map(|node| &node.data),
-        Some(NodeData::Text(_))
-    )
 }
 
 /// Whether `id` is a text node for `wholeText`: `Text` or `CDATASection`,

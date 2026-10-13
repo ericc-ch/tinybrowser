@@ -13,8 +13,12 @@
 
 pub(crate) mod adoption;
 pub(crate) mod equality;
+pub(crate) mod forms;
 pub(crate) mod insertion;
+pub(crate) mod namespaces;
+pub(crate) mod parse;
 pub(crate) mod serialization;
+pub(crate) mod text;
 pub(crate) mod tree;
 
 /// A refused tree operation, mapped to its DOM exception class

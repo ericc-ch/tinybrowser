@@ -14,7 +14,7 @@ use std::rc::Rc;
 use markup5ever::{LocalName, QualName};
 
 use crate::documents::JournalEntry;
-use crate::dom::tree::{NodeId, is_element, qualified_name};
+use crate::dom::tree::{NodeId, qualified_name};
 use crate::js::world::{
     AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, NavigationTarget, World,
 };
@@ -656,12 +656,7 @@ impl<'object> JsAttr<'object> {
         let world = world_for_node(&ctx, owner)?;
         let world = world.borrow();
         let found = world.document(owner).and_then(|parsed| {
-            locate_namespace(
-                &parsed.document.base,
-                owner.document,
-                owner,
-                prefix.as_deref(),
-            )
+            crate::dom::namespaces::locate_namespace(&parsed.document, owner, prefix.as_deref())
         });
         match found {
             Some(namespace) => string_value(&ctx, &namespace),
@@ -685,7 +680,7 @@ impl<'object> JsAttr<'object> {
         let world = world_for_node(&ctx, owner)?;
         let world = world.borrow();
         let found = world.document(owner).and_then(|parsed| {
-            locate_prefix(&parsed.document.base, owner.document, owner, &namespace)
+            crate::dom::namespaces::locate_prefix(&parsed.document, owner, &namespace)
         });
         match found {
             Some(prefix) => string_value(&ctx, &prefix),
@@ -1921,150 +1916,6 @@ pub(crate) fn set_attribute_sync(
     touch_attr(ctx, element, &namespace, local, value)?;
     after_attribute_change(ctx, element, local)?;
     schedule_mutation_delivery(ctx)
-}
-
-/// The element the namespace lookup starts from: the node itself when it is
-/// an element, the document element for a document, else the parent element
-/// (<https://dom.spec.whatwg.org/#locate-a-namespace>).
-fn namespace_element(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    node: NodeId,
-) -> Option<NodeId> {
-    let data = &base.get_node(node.node)?.data;
-    if data.downcast_element().is_some() {
-        return Some(node);
-    }
-    if let blitz_dom::NodeData::Document(_) = data {
-        base.get_node(node.node)?.children.iter().find_map(|child| {
-            let id = NodeId {
-                document,
-                node: *child,
-            };
-            is_element(base, *child).then_some(id)
-        })
-    } else {
-        let parent = base.get_node(node.node)?.parent?;
-        let id = NodeId {
-            document,
-            node: parent,
-        };
-        is_element(base, parent).then_some(id)
-    }
-}
-
-/// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
-/// `prefix` walking `cursor`'s inclusive ancestors. Blitz port of the `super`
-/// algorithm, which still targets the pre-cutover tree.
-fn locate_namespace(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    cursor: NodeId,
-    prefix: Option<&str>,
-) -> Option<String> {
-    let mut cursor = namespace_element(base, document, cursor);
-    while let Some(id) = cursor {
-        if let Some(element) = base
-            .get_node(id.node)
-            .and_then(|node| node.data.downcast_element())
-        {
-            match prefix {
-                Some("xml") => {
-                    return Some("http://www.w3.org/XML/1998/namespace".to_owned());
-                }
-                Some("xmlns") => return Some("http://www.w3.org/2000/xmlns/".to_owned()),
-                _ => {}
-            }
-            let actual = element
-                .name
-                .prefix
-                .as_ref()
-                .map(markup5ever::Prefix::as_ref)
-                .filter(|prefix| !prefix.is_empty());
-            if !element.name.ns.as_ref().is_empty() && actual == prefix {
-                return Some(element.name.ns.as_ref().to_owned());
-            }
-            for attribute in element.attrs.iter() {
-                if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
-                    continue;
-                }
-                let declaration = match prefix {
-                    Some(prefix) => {
-                        attribute
-                            .name
-                            .prefix
-                            .as_ref()
-                            .is_some_and(|value| value.as_ref() == "xmlns")
-                            && attribute.name.local.as_ref() == prefix
-                    }
-                    None => {
-                        attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns"
-                    }
-                };
-                if declaration {
-                    return (!attribute.value.is_empty()).then(|| attribute.value.clone());
-                }
-            }
-        }
-        cursor = base
-            .get_node(id.node)
-            .and_then(|node| node.parent)
-            .map(|parent| NodeId {
-                document,
-                node: parent,
-            })
-            .filter(|parent| is_element(base, parent.node));
-    }
-    None
-}
-
-/// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
-/// for `namespace` walking `cursor`'s inclusive ancestors. Blitz port of the
-/// `super` algorithm, which still targets the pre-cutover tree.
-fn locate_prefix(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    cursor: NodeId,
-    namespace: &str,
-) -> Option<String> {
-    let mut cursor = namespace_element(base, document, cursor);
-    while let Some(id) = cursor {
-        if let Some(element) = base
-            .get_node(id.node)
-            .and_then(|node| node.data.downcast_element())
-        {
-            if element.name.ns.as_ref() == namespace
-                && let Some(prefix) = element
-                    .name
-                    .prefix
-                    .as_ref()
-                    .map(markup5ever::Prefix::as_ref)
-                    .filter(|prefix| !prefix.is_empty())
-            {
-                return Some(prefix.to_owned());
-            }
-            for attribute in element.attrs.iter() {
-                if attribute
-                    .name
-                    .prefix
-                    .as_ref()
-                    .is_some_and(|prefix| prefix.as_ref() == "xmlns")
-                    && attribute.value == namespace
-                {
-                    return Some(attribute.name.local.as_ref().to_owned());
-                }
-            }
-        }
-        cursor = base
-            .get_node(id.node)
-            .and_then(|node| node.parent)
-            .map(|parent| NodeId {
-                document,
-                node: parent,
-            })
-            .filter(|parent| is_element(base, parent.node));
-    }
-    None
 }
 
 /// `setAttributeNode` / `setAttributeNodeNS`

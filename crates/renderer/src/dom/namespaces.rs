@@ -1,0 +1,165 @@
+//! Namespace lookup: locate-a-namespace and locate-a-namespace-prefix.
+//!
+//! The entry points switch on the node kind (fragments and doctypes have
+//! no namespace, documents defer to their element), then walk inclusive
+//! ancestors through parent elements
+//! (<https://dom.spec.whatwg.org/#locate-a-namespace>).
+
+use blitz_dom::NodeData;
+
+use crate::dom::tree::{NodeId, is_real_element};
+
+/// The parent element of `id`, skipping fragment backings
+/// (<https://dom.spec.whatwg.org/#parent-element>).
+pub(crate) fn parent_element_of(
+    doc: &crate::documents::BlitzDocument,
+    id: NodeId,
+) -> Option<NodeId> {
+    let parent = doc.base.get_node(id.node)?.parent?;
+    is_real_element(doc, parent).then_some(NodeId {
+        document: id.document,
+        node: parent,
+    })
+}
+
+/// The document element of the tree whose root is `id`.
+pub(crate) fn document_element_of(
+    doc: &crate::documents::BlitzDocument,
+    id: NodeId,
+) -> Option<NodeId> {
+    doc.base
+        .get_node(id.node)?
+        .children
+        .iter()
+        .find_map(|child| {
+            is_real_element(doc, *child).then_some(NodeId {
+                document: id.document,
+                node: *child,
+            })
+        })
+}
+
+/// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace).
+pub(crate) fn locate_namespace(
+    doc: &crate::documents::BlitzDocument,
+    node: NodeId,
+    prefix: Option<&str>,
+) -> Option<String> {
+    if doc.is_fragment(node.node) {
+        return None;
+    }
+    let data = &doc.base.get_node(node.node)?.data;
+    if matches!(data, NodeData::Doctype { .. }) {
+        return None;
+    }
+    if matches!(data, NodeData::Document(_)) {
+        return document_element_of(doc, node)
+            .and_then(|element| locate_namespace(doc, element, prefix));
+    }
+    if !is_real_element(doc, node.node) {
+        return parent_element_of(doc, node)
+            .and_then(|element| locate_namespace(doc, element, prefix));
+    }
+    locate_element_namespace(doc, node, prefix)
+}
+
+/// [Locates a namespace](https://dom.spec.whatwg.org/#locate-a-namespace)
+/// for `prefix` from `node`, switching on the node's interface: fragments
+/// and doctypes have none, documents defer to their element.
+pub(crate) fn locate_element_namespace(
+    doc: &crate::documents::BlitzDocument,
+    id: NodeId,
+    prefix: Option<&str>,
+) -> Option<String> {
+    match prefix {
+        Some("xml") => return Some("http://www.w3.org/XML/1998/namespace".to_owned()),
+        Some("xmlns") => return Some("http://www.w3.org/2000/xmlns/".to_owned()),
+        _ => {}
+    }
+    let element = doc.base.get_node(id.node)?.data.downcast_element()?;
+    let actual = element
+        .name
+        .prefix
+        .as_ref()
+        .map(markup5ever::Prefix::as_ref)
+        .filter(|prefix| !prefix.is_empty());
+    if !element.name.ns.as_ref().is_empty() && actual == prefix {
+        return Some(element.name.ns.as_ref().to_owned());
+    }
+    for attribute in element.attrs.iter() {
+        if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
+            continue;
+        }
+        let declaration = match prefix {
+            Some(prefix) => {
+                attribute
+                    .name
+                    .prefix
+                    .as_ref()
+                    .is_some_and(|value| value.as_ref() == "xmlns")
+                    && attribute.name.local.as_ref() == prefix
+            }
+            None => attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns",
+        };
+        if declaration {
+            return (!attribute.value.is_empty()).then(|| attribute.value.clone());
+        }
+    }
+    parent_element_of(doc, id).and_then(|parent| locate_namespace(doc, parent, prefix))
+}
+
+/// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix).
+pub(crate) fn locate_prefix(
+    doc: &crate::documents::BlitzDocument,
+    node: NodeId,
+    namespace: &str,
+) -> Option<String> {
+    if doc.is_fragment(node.node) {
+        return None;
+    }
+    let data = &doc.base.get_node(node.node)?.data;
+    if matches!(data, NodeData::Doctype { .. }) {
+        return None;
+    }
+    if matches!(data, NodeData::Document(_)) {
+        return document_element_of(doc, node)
+            .and_then(|element| locate_prefix(doc, element, namespace));
+    }
+    if !is_real_element(doc, node.node) {
+        return parent_element_of(doc, node)
+            .and_then(|element| locate_prefix(doc, element, namespace));
+    }
+    locate_element_prefix(doc, node, namespace)
+}
+
+/// [Locates a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
+/// for `namespace` from `node`, mirroring the namespace lookup by kind.
+pub(crate) fn locate_element_prefix(
+    doc: &crate::documents::BlitzDocument,
+    id: NodeId,
+    namespace: &str,
+) -> Option<String> {
+    let element = doc.base.get_node(id.node)?.data.downcast_element()?;
+    if element.name.ns.as_ref() == namespace
+        && let Some(prefix) = element
+            .name
+            .prefix
+            .as_ref()
+            .map(markup5ever::Prefix::as_ref)
+            .filter(|prefix| !prefix.is_empty())
+    {
+        return Some(prefix.to_owned());
+    }
+    for attribute in element.attrs.iter() {
+        if attribute
+            .name
+            .prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.as_ref() == "xmlns")
+            && attribute.value == namespace
+        {
+            return Some(attribute.name.local.as_ref().to_owned());
+        }
+    }
+    parent_element_of(doc, id).and_then(|parent| locate_prefix(doc, parent, namespace))
+}
