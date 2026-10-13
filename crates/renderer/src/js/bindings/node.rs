@@ -1,23 +1,26 @@
 //! The single `Node` wrapper class and its members.
 
 use super::{
-    AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap, JsTokenList,
-    LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits, WebIdlString,
-    WebIdlUnsignedLong, adopt_across_documents, adopt_into_document, attached_attr_id, attr_owner,
-    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
-    character_data_offset, child_value, clone_document, clone_within_document, collection_ids,
+    AttrArgument, CollectionKind, JsImplementation, JsNamedNodeMap, JsTokenList, LegacyNullString,
+    NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits, WebIdlString, WebIdlUnsignedLong,
+    adopt_across_documents, adopt_into_document, attached_attr_id, attr_owner, attr_state,
+    attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
+    character_data_offset, child_value, clone_document, collection_ids,
     convert_union_nodes_into_node, copy_nonce_subtree, deref_weak, descendant_text,
     document_base_url_string, document_is_html, document_is_html_content, document_url_string,
     dom_string, drain_mutation_journal, element_at_point, element_box, element_click,
     element_sibling_value, elements_by_tag, find_element_by_id, fixup_focus_after_removal,
-    focus_node, host, host_node_id, import_attr, import_snapshot, import_snapshot_live,
-    is_focusable, is_main_document, js_string_to_utf8, live_collection, make_weak,
-    materialize_children, materialize_import, new_detached_attr, rect_object,
-    remove_attribute_sync, required_node, schedule_mutation_delivery, select_error,
+    focus_node, host, host_node_id, import_attr, import_snapshot_live, is_focusable,
+    is_main_document, js_string_to_utf8, live_collection, make_weak, new_detached_attr,
+    rect_object, remove_attribute_sync, required_node, schedule_mutation_delivery, select_error,
     selector_matching_elements, set_attribute_node, set_attribute_sync, set_character_data,
     set_pi_data, sibling_value, string_value, throw_dom, throw_dom_error, touch_attr,
     valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
     world, world_for_node, wrap_new_document_in_world, wrap_node,
+};
+use crate::dom::adoption::{
+    ImportSnapshot, clone_within_document, import_snapshot, materialize_children,
+    materialize_import,
 };
 use rquickjs::function::Rest;
 

@@ -1,10 +1,11 @@
 //! `DOMImplementation`, DOM parsing, and serialization.
 
 use super::{
-    NodeContext, create_node, detach_for_adopt, import_snapshot, materialize_import,
-    retarget_wrapper, throw_dom, throw_dom_error, validate_and_extract, world, world_for_node,
-    wrap_new_document, wrap_new_document_in_world, wrap_node,
+    NodeContext, create_node, retarget_wrapper, throw_dom, throw_dom_error, validate_and_extract,
+    world, world_for_node, wrap_new_document, wrap_new_document_in_world, wrap_node,
 };
+
+use crate::dom::adoption::{detach_for_adopt, import_snapshot, materialize_import};
 
 use crate::dom::tree::NodeId;
 use crate::js::world::Handle;
