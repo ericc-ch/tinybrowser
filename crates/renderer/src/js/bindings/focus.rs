@@ -5,8 +5,11 @@ use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for
 use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
-use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected};
-use crate::js::world::{EventTargetKey, JournalEntry};
+use crate::documents::JournalEntry;
+use crate::dom::tree::{
+    BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected, tree_order,
+};
+use crate::js::world::EventTargetKey;
 
 /// The node-removal focus fixup: when the document's focused area is inside
 /// a removed subtree, clear it without firing events
@@ -203,7 +206,7 @@ fn radio_group(base: &blitz_dom::BaseDocument, document: u32, node: BlitzId) -> 
         }
         stack.extend(tree.children.iter().rev().copied());
     }
-    group.sort_by(|a, b| super::tree_order(base, document, a.node, b.node));
+    group.sort_by(|a, b| tree_order(base, document, a.node, b.node));
     group
 }
 

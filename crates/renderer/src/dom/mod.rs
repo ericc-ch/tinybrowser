@@ -12,5 +12,6 @@
 //! (<https://dom.spec.whatwg.org/#concept-node-adopt>).
 
 pub(crate) mod equality;
+pub(crate) mod insertion;
 pub(crate) mod serialization;
 pub(crate) mod tree;

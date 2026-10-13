@@ -3,8 +3,8 @@
 use super::{TreeError, throw_dom, throw_dom_error, world, world_for_node, wrap_new_document};
 
 use crate::documents::BlitzDocument;
+use crate::documents::JournalEntry;
 use crate::dom::tree::NodeId;
-use crate::js::world::JournalEntry;
 
 use blitz_dom::NodeData;
 use markup5ever::QualName;

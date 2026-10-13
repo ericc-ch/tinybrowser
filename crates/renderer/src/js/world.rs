@@ -9,6 +9,7 @@ use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
 use crate::documents::DocumentStore;
+use crate::documents::JournalEntry;
 use crate::dom::tree::{NodeId, attr, is_connected, is_iframe_element};
 use crate::dom_string::DomString;
 
@@ -1850,31 +1851,6 @@ pub(super) fn match_observation(
 }
 
 /// One recorded tree mutation, in observer-delivery shape.
-///
-/// Binding and parser call sites push these onto the owning document's
-/// journal; Blitz only tracks a coarse changed set, so the delivery payload
-/// lives here.
-#[derive(Clone, Debug)]
-pub(crate) enum JournalEntry {
-    ChildList {
-        target: NodeId,
-        added: Vec<NodeId>,
-        removed: Vec<NodeId>,
-        previous: Option<NodeId>,
-        next: Option<NodeId>,
-    },
-    Attributes {
-        target: NodeId,
-        name: String,
-        namespace: String,
-        old_value: Option<String>,
-    },
-    CharacterData {
-        target: NodeId,
-        old_value: DomString,
-    },
-}
-
 fn record(
     want_attribute_old_value: bool,
     want_character_data_old_value: bool,

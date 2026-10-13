@@ -9,8 +9,10 @@ use rquickjs::{
     prelude::Func,
 };
 
-use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace};
-use crate::js::world::{Handle, JournalEntry};
+use crate::documents::JournalEntry;
+use crate::dom::insertion::siblings_around;
+use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace, is_element};
+use crate::js::world::Handle;
 use crate::names::qualified_name_eq;
 use markup5ever::{LocalName, QualName};
 use std::collections::HashSet;
@@ -129,7 +131,7 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         CollectionKind::Children => crate::dom::tree::child_ids(base, document, scope.node),
         CollectionKind::ElementChildren => crate::dom::tree::child_ids(base, document, scope.node)
             .into_iter()
-            .filter(|kid| super::is_element(base, kid.node))
+            .filter(|kid| is_element(base, kid.node))
             .collect(),
         CollectionKind::ElementsByTag {
             name,
@@ -399,7 +401,7 @@ fn collect_by_name(
     descendants(base, scope)
         .into_iter()
         .filter(|&id| {
-            super::is_element(base, id) && attr(base, id, "name").is_some_and(|value| value == name)
+            is_element(base, id) && attr(base, id, "name").is_some_and(|value| value == name)
         })
         .map(|node| NodeId { document, node })
         .collect()
@@ -487,7 +489,7 @@ fn collect_by_class(
     descendants(base, scope)
         .into_iter()
         .filter(|&id| {
-            if !super::is_element(base, id) {
+            if !is_element(base, id) {
                 return false;
             }
             // The class is the no-namespace `class` attribute, not `*:class`
@@ -599,7 +601,7 @@ fn detach_node(parsed: &mut crate::Parsed, target: NodeId) {
         let base = &parsed.document.base;
         let parent = base.get_node(target.node).and_then(|node| node.parent);
         let (previous, next) = parent.map_or((None, None), |parent| {
-            super::node::siblings_around(base, document, parent, target.node)
+            siblings_around(base, document, parent, target.node)
         });
         (parent, previous, next)
     };
@@ -651,9 +653,8 @@ fn insert_node_before(parsed: &mut crate::Parsed, reference: NodeId, child: Node
     let (parent, previous) = {
         let base = &parsed.document.base;
         let parent = base.get_node(reference.node).and_then(|node| node.parent);
-        let previous = parent.and_then(|parent| {
-            super::node::siblings_around(base, document, parent, reference.node).0
-        });
+        let previous =
+            parent.and_then(|parent| siblings_around(base, document, parent, reference.node).0);
         (parent, previous)
     };
     let Some(parent) = parent else {
@@ -684,7 +685,7 @@ fn replace_node(parsed: &mut crate::Parsed, old: NodeId, new: NodeId) {
         let base = &parsed.document.base;
         let parent = base.get_node(old.node).and_then(|node| node.parent);
         let (previous, next) = parent.map_or((None, None), |parent| {
-            super::node::siblings_around(base, document, parent, old.node)
+            siblings_around(base, document, parent, old.node)
         });
         (parent, previous, next)
     };
@@ -806,7 +807,7 @@ impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
                 descendants(base, scope.node)
                     .into_iter()
                     .filter(|&id| {
-                        super::is_element(base, id)
+                        is_element(base, id)
                             && attr(base, id, "name").is_some_and(|value| value == name)
                     })
                     .count()

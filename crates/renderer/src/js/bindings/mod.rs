@@ -46,7 +46,7 @@ use std::fmt;
 use blitz_dom::NodeData;
 use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
-use crate::dom::tree::NodeId;
+use crate::dom::tree::{NodeId, is_real_element, sibling};
 
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
@@ -1269,7 +1269,7 @@ fn set_character_data_inner(
     }
     parsed
         .document
-        .record(crate::js::world::JournalEntry::CharacterData {
+        .record(crate::documents::JournalEntry::CharacterData {
             target: id,
             old_value,
         });
@@ -1333,25 +1333,6 @@ pub(super) fn sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> R
         })
     });
     child_value(ctx, sibling)
-}
-
-/// The sibling of `id` in `forward` direction, or `None` at the edge.
-pub(super) fn sibling(
-    base: &blitz_dom::BaseDocument,
-    id: crate::dom::tree::BlitzId,
-    forward: bool,
-) -> Option<crate::dom::tree::BlitzId> {
-    let node = base.get_node(id)?;
-    let parent = node.parent?;
-    let siblings = &base.get_node(parent)?.children;
-    let position = siblings.iter().position(|sibling| *sibling == id)?;
-    if forward {
-        siblings.get(position + 1).copied()
-    } else {
-        position
-            .checked_sub(1)
-            .and_then(|index| siblings.get(index).copied())
-    }
 }
 
 /// The nearest element sibling in the given direction
@@ -1724,98 +1705,6 @@ pub(super) fn live_collection<'js>(
             "unsupported collection interface",
         )),
     }
-}
-
-pub(super) fn is_element(base: &blitz_dom::BaseDocument, id: crate::dom::tree::BlitzId) -> bool {
-    base.get_node(id)
-        .is_some_and(|node| matches!(node.data, NodeData::Element(_)))
-}
-
-pub(super) fn is_real_element(
-    doc: &crate::documents::BlitzDocument,
-    id: crate::dom::tree::BlitzId,
-) -> bool {
-    !doc.is_fragment(id) && is_element(&doc.base, id)
-}
-
-/// The root of the tree `id` participates in (itself when detached).
-pub(super) fn root_of(
-    base: &blitz_dom::BaseDocument,
-    id: crate::dom::tree::BlitzId,
-) -> crate::dom::tree::BlitzId {
-    let mut root = id;
-    while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
-        root = parent;
-    }
-    root
-}
-
-/// `id` followed by its inclusive ancestors, nearest first.
-pub(super) fn ancestor_chain(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    id: crate::dom::tree::BlitzId,
-) -> Vec<NodeId> {
-    let mut chain = vec![NodeId { document, node: id }];
-    let mut cursor = id;
-    while let Some(parent) = base.get_node(cursor).and_then(|node| node.parent) {
-        chain.push(NodeId {
-            document,
-            node: parent,
-        });
-        cursor = parent;
-    }
-    chain
-}
-
-/// Document order of two nodes in one tree
-/// (<https://dom.spec.whatwg.org/#concept-tree-order>).
-pub(super) fn tree_order(
-    base: &blitz_dom::BaseDocument,
-    document: u32,
-    a: crate::dom::tree::BlitzId,
-    b: crate::dom::tree::BlitzId,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let chain_a = ancestor_chain(base, document, a);
-    let chain_b = ancestor_chain(base, document, b);
-    let mut common = 0;
-    while common < chain_a.len()
-        && common < chain_b.len()
-        && chain_a[chain_a.len() - 1 - common] == chain_b[chain_b.len() - 1 - common]
-    {
-        common += 1;
-    }
-    if common == chain_a.len() {
-        return chain_a.len().cmp(&chain_b.len());
-    }
-    if common == chain_b.len() {
-        return Ordering::Greater;
-    }
-    let Some(parent) = chain_a
-        .len()
-        .checked_sub(common)
-        .and_then(|index| chain_a.get(index))
-    else {
-        return Ordering::Less;
-    };
-    let child_a = chain_a[chain_a.len() - 1 - common];
-    let child_b = chain_b[chain_b.len() - 1 - common];
-    let kids: Vec<NodeId> = base
-        .get_node(parent.node)
-        .map(|node| {
-            node.children
-                .iter()
-                .map(|child| NodeId {
-                    document,
-                    node: *child,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let position_a = kids.iter().position(|&kid| kid == child_a);
-    let position_b = kids.iter().position(|&kid| kid == child_b);
-    position_a.cmp(&position_b)
 }
 
 pub(super) fn find_element_by_id(

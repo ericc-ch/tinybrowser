@@ -13,11 +13,10 @@ use std::rc::Rc;
 
 use markup5ever::{LocalName, QualName};
 
-use crate::dom::tree::NodeId;
-use crate::dom::tree::qualified_name;
+use crate::documents::JournalEntry;
+use crate::dom::tree::{NodeId, is_element, qualified_name};
 use crate::js::world::{
-    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, JournalEntry,
-    NavigationTarget, World,
+    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, NavigationTarget, World,
 };
 use crate::names::qualified_name_eq;
 
@@ -1942,7 +1941,7 @@ fn namespace_element(
                 document,
                 node: *child,
             };
-            super::is_element(base, *child).then_some(id)
+            is_element(base, *child).then_some(id)
         })
     } else {
         let parent = base.get_node(node.node)?.parent?;
@@ -1950,7 +1949,7 @@ fn namespace_element(
             document,
             node: parent,
         };
-        super::is_element(base, parent).then_some(id)
+        is_element(base, parent).then_some(id)
     }
 }
 
@@ -2014,7 +2013,7 @@ fn locate_namespace(
                 document,
                 node: parent,
             })
-            .filter(|parent| super::is_element(base, parent.node));
+            .filter(|parent| is_element(base, parent.node));
     }
     None
 }
@@ -2063,7 +2062,7 @@ fn locate_prefix(
                 document,
                 node: parent,
             })
-            .filter(|parent| super::is_element(base, parent.node));
+            .filter(|parent| is_element(base, parent.node));
     }
     None
 }
