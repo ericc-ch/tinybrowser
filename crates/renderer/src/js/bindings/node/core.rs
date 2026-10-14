@@ -1780,7 +1780,7 @@ impl JsNode {
         Ok(found.as_deref() == namespace.as_deref())
     }
 }
-pub(super) fn insertion_tree_nodes(
+pub(in crate::js::bindings) fn insertion_tree_nodes(
     ctx: &Ctx<'_>,
     parent: NodeId,
     node: NodeReference,
@@ -2043,7 +2043,7 @@ pub(super) fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> 
 /// Same-document insert returns `node`. A node from another document adopts
 /// into the parent's document, preserving fragment backings as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
-pub(super) fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
+pub(in crate::js::bindings) fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
     if node.document == parent.document {
         return Ok(node);
     }
@@ -2181,7 +2181,7 @@ pub(in crate::js::bindings) fn insert_converted_node(
     insert_tree_node_inner(ctx, parent, node, None, false)
 }
 
-pub(super) fn insert_tree_node(
+pub(in crate::js::bindings) fn insert_tree_node(
     ctx: &Ctx<'_>,
     parent: NodeId,
     node: NodeId,
@@ -2437,12 +2437,14 @@ pub(super) fn doctype_field(
 ///
 /// The new node is always a `Text` node per the split-a-Text-node steps,
 /// even when `id` is a `CDATASection` (which inherits `Text`). Live ranges
-/// are absent, so those loops are empty.
-pub(super) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
+/// move explicitly below: the generic insert and replacement rules would
+/// corrupt a split, so the insert skips range adjustment and the truncate
+/// writes without it.
+pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
     let units = character_data(ctx, id)?.units().into_owned();
     let offset = character_data_offset(ctx, offset, units.len())?;
     let new_data = DomString::from_utf16(units[offset..].to_vec());
-    let (parent, next) = world(ctx)?
+    let (parent, next, index) = world(ctx)?
         .borrow()
         .with_document(id, |parsed| {
             let base = &parsed.document.base;
@@ -2457,9 +2459,16 @@ pub(super) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> R
                 document: id.document,
                 node,
             });
-            (parent, next)
+            let index = parent.and_then(|parent| {
+                base.get_node(parent.node)
+                    .and_then(|node| {
+                        node.children.iter().position(|sibling| *sibling == id.node)
+                    })
+                    .and_then(|index| u32::try_from(index).ok())
+            });
+            (parent, next, index)
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
     let new_id = {
         let world = world(ctx)?;
         let world = world.borrow();
@@ -2474,14 +2483,105 @@ pub(super) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> R
         }
     };
     if let Some(parent) = parent {
-        // https://dom.spec.whatwg.org/#concept-node-insert
-        insert_tree_node(ctx, parent, new_id, next)?;
+        // Spec-ordered range steps on the pre-insert tree, then an insert
+        // without the generic adjustment, then a truncate the generic
+        // replacement rule would corrupt
+        // (<https://dom.spec.whatwg.org/#concept-text-split>).
+        {
+            let world_rc = world(ctx)?;
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(id) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            crate::dom::range::adjust_for_split(
+                &mut parsed.document.ranges,
+                id,
+                new_id,
+                Some(parent),
+                index.unwrap_or(0),
+                u32::try_from(offset).unwrap_or(u32::MAX),
+            );
+            crate::dom::insertion::place_journaled_without_range_adjust(
+                &mut parsed,
+                parent,
+                new_id,
+                next,
+            );
+            let mut kept = units.clone();
+            kept.drain(offset..);
+            truncate_split_text(
+                &mut parsed,
+                id,
+                &kept,
+                DomString::from_utf16(units),
+            );
+        }
+        apply_inserted(ctx, parent, &[new_id], true)?;
+    } else {
+        {
+            let world_rc = world(ctx)?;
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(id) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            crate::dom::range::adjust_for_split(
+                &mut parsed.document.ranges,
+                id,
+                new_id,
+                None,
+                0,
+                u32::try_from(offset).unwrap_or(u32::MAX),
+            );
+            let mut kept = units.clone();
+            kept.drain(offset..);
+            truncate_split_text(
+                &mut parsed,
+                id,
+                &kept,
+                DomString::from_utf16(units),
+            );
+        }
+        schedule_mutation_delivery(ctx)?;
     }
-    let mut kept = units;
-    kept.drain(offset..);
-    // https://dom.spec.whatwg.org/#concept-cd-replace
-    set_character_data(ctx, id, &DomString::from_utf16(kept))?;
     wrap_node(ctx, new_id)
+}
+
+/// Truncate `id`'s data to `kept` for `splitText`, recording the change. The
+/// range steps already ran, so this writes without the generic replacement
+/// rule that would corrupt a split. Other node kinds cannot reach a split.
+fn truncate_split_text(
+    parsed: &mut crate::Parsed,
+    id: NodeId,
+    kept: &[u16],
+    old_value: DomString,
+) {
+    let wrote = match parsed.document.base.get_node(id.node).map(|node| &node.data) {
+        Some(NodeData::Text(_)) => {
+            parsed.document.base.mutate().set_node_text(
+                id.node,
+                &String::from_utf16_lossy(kept),
+            );
+            true
+        }
+        Some(NodeData::CDataSection { .. }) => {
+            let base = &mut parsed.document.base;
+            base.snapshot_node(id.node);
+            if let Some(NodeData::CDataSection { contents }) =
+                base.get_node_mut(id.node).map(|node| &mut node.data)
+            {
+                contents.clear();
+                contents.push_str(&String::from_utf16_lossy(kept));
+            }
+            true
+        }
+        _ => false,
+    };
+    if wrote {
+        parsed.document.record(JournalEntry::CharacterData {
+            target: id,
+            old_value,
+        });
+    }
 }
 
 /// Concatenates the data of the contiguous `Text` nodes of `id`, in tree

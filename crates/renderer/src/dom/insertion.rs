@@ -243,10 +243,30 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
         });
         (parent, previous, next)
     };
+    let index = parent.and_then(|parent| {
+        parsed
+            .document
+            .base
+            .get_node(parent)
+            .and_then(|node| node.children.iter().position(|sibling| *sibling == target.node))
+            .and_then(|index| u32::try_from(index).ok())
+            .map(|index| (parent, index))
+    });
     let Some(parent) = parent else {
         return;
     };
     parsed.document.base.mutate().remove_node(target.node);
+    if let Some((parent, index)) = index {
+        let base = &parsed.document.base;
+        let ranges = &mut parsed.document.ranges;
+        crate::dom::range::adjust_for_remove(
+            base,
+            ranges,
+            NodeId { document, node: parent },
+            index,
+            target,
+        );
+    }
     parsed.document.record(JournalEntry::ChildList {
         target: NodeId {
             document,
@@ -264,6 +284,41 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
 /// from the old parent during the insert itself, so callers run
 /// `unlink_journaled` first and the removal keeps its own record.
 pub(crate) fn place_journaled(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    child: NodeId,
+    reference: Option<NodeId>,
+) {
+    place_inner(parsed, parent, child, reference);
+    let index = parsed
+        .document
+        .base
+        .get_node(parent.node)
+        .and_then(|node| {
+            node.children
+                .iter()
+                .position(|sibling| *sibling == child.node)
+        })
+        .and_then(|index| u32::try_from(index).ok());
+    if let Some(index) = index {
+        let ranges = &mut parsed.document.ranges;
+        crate::dom::range::adjust_for_insert(ranges, parent, index, 1);
+    }
+}
+
+/// `place_journaled` without live-range adjustment, for `splitText`, whose
+/// spec steps move boundary points itself
+/// (<https://dom.spec.whatwg.org/#concept-text-split>).
+pub(crate) fn place_journaled_without_range_adjust(
+    parsed: &mut crate::Parsed,
+    parent: NodeId,
+    child: NodeId,
+    reference: Option<NodeId>,
+) {
+    place_inner(parsed, parent, child, reference);
+}
+
+fn place_inner(
     parsed: &mut crate::Parsed,
     parent: NodeId,
     child: NodeId,
@@ -400,6 +455,31 @@ pub(crate) fn splice_parsed(
                 .append_children(parent.node, &[child.node]),
         }
     }
+    let count = u32::try_from(moved.len()).unwrap_or(u32::MAX);
+    if count > 0 {
+        let index = match reference {
+            Some(reference) => parsed
+                .document
+                .base
+                .get_node(parent.node)
+                .and_then(|node| {
+                    node.children
+                        .iter()
+                        .position(|sibling| *sibling == reference.node)
+                })
+                .and_then(|index| u32::try_from(index).ok())
+                .unwrap_or(0),
+            None => parsed
+                .document
+                .base
+                .get_node(parent.node)
+                .map_or(0, |node| {
+                    u32::try_from(node.children.len()).unwrap_or(u32::MAX)
+                }),
+        };
+        let ranges = &mut parsed.document.ranges;
+        crate::dom::range::adjust_for_insert(ranges, parent, index, count);
+    }
     parsed.document.record(JournalEntry::ChildList {
         target: parent,
         added: moved,
@@ -480,6 +560,16 @@ pub(crate) fn replace_all_journaled(
         })
         .unwrap_or_default();
     let iframes = iframe_containers_in_subtrees(parsed, &removed);
+    let inserted = !added.is_empty();
+    // Adjust live ranges while the tree links are intact: after `remove_node`
+    // the detached children report no parent, so the descendant check would
+    // miss every point inside them
+    // (<https://dom.spec.whatwg.org/#concept-node-replace-all>).
+    if inserted || !removed.is_empty() {
+        let base = &parsed.document.base;
+        let ranges = &mut parsed.document.ranges;
+        crate::dom::range::adjust_for_replace_all(base, ranges, parent, inserted);
+    }
     for kid in &removed {
         parsed.document.base.mutate().remove_node(kid.node);
     }
@@ -494,7 +584,8 @@ pub(crate) fn replace_all_journaled(
             .mutate()
             .append_children(parent.node, &[child.node]);
     }
-    if !added.is_empty() || !removed.is_empty() {
+    let inserted = !added.is_empty();
+    if inserted || !removed.is_empty() {
         parsed.document.record(JournalEntry::ChildList {
             target: parent,
             added,

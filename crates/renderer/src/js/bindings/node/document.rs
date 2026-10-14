@@ -368,6 +368,11 @@ impl<'js> document_generated::Document<'js> for JsNode {
         self.create_document_fragment(ctx)
     }
 
+    // https://dom.spec.whatwg.org/#dom-document-createrange
+    fn create_range(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        super::super::range::create_range_value(&ctx, self.handle.0)
+    }
+
     // https://dom.spec.whatwg.org/#dom-document-importnode
     fn import_node(
         &self,
@@ -1374,6 +1379,7 @@ pub(super) fn construct_node_in_owner<'js>(
         "DocumentFragment" => {
             create_node(ctx, document()?, |parsed| parsed.document.create_fragment())
         }
+        "Range" => crate::js::bindings::range::new_range(ctx, document()?),
         "Document" => {
             // The `Document` constructor creates an XML document that still
             // implements `Document`, not `XMLDocument`
@@ -1545,13 +1551,19 @@ pub(super) fn create_element_named<'js>(
 /// this qualified name: html5lib's `svg `/`math ` prefixes for foreign
 /// namespaces
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm>).
-pub(super) fn html_fragment_context(name: &QualName) -> String {
+pub(in crate::js::bindings) fn html_fragment_context(name: &QualName) -> String {
     if name.ns == svg_namespace() {
         format!("svg {}", name.local)
     } else if name.ns.as_str() == "http://www.w3.org/1998/Math/MathML" {
         format!("math {}", name.local)
-    } else {
+    } else if name.ns == html_namespace() {
         name.local.to_string()
+    } else {
+        // Preserve foreign-namespace contexts through the `ns:` roundtrip so
+        // fragment parsing sees the real context element name instead of an
+        // HTML impostor
+        // (<https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm>).
+        format!("ns:{}|{}", name.ns, name.local)
     }
 }
 
@@ -1615,7 +1627,7 @@ pub(super) fn place_adjacent_rest(
 /// The base URL and shared font context a fragment scratch document parses
 /// under: the live document's base, so eager subresource loads resolve
 /// instead of panicking in Blitz. Falls back closed when the document is gone.
-pub(super) fn fragment_base_url(ctx: &Ctx<'_>, id: NodeId) -> (String, parley::FontContext) {
+pub(in crate::js::bindings) fn fragment_base_url(ctx: &Ctx<'_>, id: NodeId) -> (String, parley::FontContext) {
     world(ctx)
         .ok()
         .and_then(|world| {
@@ -1637,7 +1649,7 @@ pub(super) fn fragment_base_url(ctx: &Ctx<'_>, id: NodeId) -> (String, parley::F
 
 /// Parses `markup` as an HTML fragment in `context` and snapshots the
 /// resulting nodes for insertion into a document.
-pub(super) fn parse_html_fragment_snapshots(
+pub(in crate::js::bindings) fn parse_html_fragment_snapshots(
     markup: &str,
     context: &str,
     base_url: &str,
@@ -1705,10 +1717,17 @@ pub(super) fn parse_html_fragment_snapshots(
 }
 
 /// The context element name for fragment parsing: html5lib's `svg `/`math `
-/// prefixes select the foreign namespace.
-pub(super) fn fragment_context_name(spec: &str) -> QualName {
+/// prefixes select the foreign namespace. An `ns:<namespace>|<local>` spec
+/// selects an arbitrary namespace, so foreign-namespace contexts keep their
+/// identity instead of collapsing to HTML.
+pub(in crate::js::bindings) fn fragment_context_name(spec: &str) -> QualName {
     const SVG: &str = "http://www.w3.org/2000/svg";
     const MATHML: &str = "http://www.w3.org/1998/Math/MathML";
+    if let Some(rest) = spec.strip_prefix("ns:")
+        && let Some((namespace, local)) = rest.split_once('|')
+    {
+        return QualName::new(None, Namespace::from(namespace), LocalName::from(local));
+    }
     if let Some(local) = spec.strip_prefix("svg ") {
         QualName::new(None, Namespace::from(SVG), LocalName::from(local))
     } else if let Some(local) = spec.strip_prefix("math ") {

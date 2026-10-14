@@ -970,6 +970,15 @@ impl World {
         .ok()
     }
 
+    /// Mutable access to a document by store id, without a node handle, for
+    /// state (such as live ranges) keyed by document alone.
+    pub(crate) fn document_mut_by_id(&self, document: u32) -> Option<RefMut<'_, Parsed>> {
+        RefMut::filter_map(self.runtime.documents.borrow_mut(), |store| {
+            store.get_mut(document)
+        })
+        .ok()
+    }
+
     /// Stores a secondary document and returns its root id.
     pub(crate) fn add_document(&mut self, parsed: Parsed) -> NodeId {
         let node = parsed.document.base.root_node().id;

@@ -39,6 +39,9 @@ pub(crate) struct BlitzDocument {
     /// Script elements whose [already started] flag is set
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
     started_scripts: HashSet<blitz_traits::node_id::NodeId>,
+    /// Live ranges by slot, adjusted by every structural mutation. Slots free
+    /// with the document; see `dom::range::RangeState`.
+    pub ranges: Vec<crate::dom::range::RangeState>,
 }
 
 impl BlitzDocument {
@@ -52,6 +55,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
+            ranges: Vec::new(),
         }
     }
 
@@ -65,6 +69,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
+            ranges: Vec::new(),
         }
     }
 

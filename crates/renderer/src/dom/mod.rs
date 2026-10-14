@@ -17,6 +17,7 @@ pub(crate) mod forms;
 pub(crate) mod insertion;
 pub(crate) mod namespaces;
 pub(crate) mod parse;
+pub(crate) mod range;
 pub(crate) mod serialization;
 pub(crate) mod text;
 pub(crate) mod tree;

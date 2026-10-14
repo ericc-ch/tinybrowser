@@ -19,6 +19,7 @@ mod messaging;
 mod mutation;
 mod node;
 mod parsing;
+mod range;
 mod webidl;
 mod window;
 
@@ -32,6 +33,7 @@ pub(super) use messaging::*;
 pub(super) use mutation::*;
 pub(super) use node::*;
 pub(super) use parsing::*;
+pub(super) use range::*;
 pub(super) use webidl::*;
 pub(super) use window::*;
 
@@ -440,6 +442,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     crate::js::bridge::evaluate(ctx, parsing::install_domparser_ctor_js(ctx)?)?;
     Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
+    Class::<JsRange>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;
     install_host_functions(ctx)?;
     node::install_custom_construction(ctx)?;
@@ -464,6 +467,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     // Generated members land on the brands.js `Node.prototype`; the derived
     // interface prototypes inherit them through the prototype chain.
     node::install(ctx)?;
+    range::install(ctx)?;
     Class::<JsAttr>::define(&globals)?;
     install_collection_brand(ctx)?;
     capture_host_primitives(ctx, &globals, world)?;
@@ -1264,6 +1268,15 @@ fn set_character_data_inner(
             _ => return Ok(()),
         }
     }
+    let old_units = u32::try_from(old_value.units().len()).unwrap_or(u32::MAX);
+    let new_units = u32::try_from(data.units().len()).unwrap_or(u32::MAX);
+    crate::dom::range::adjust_for_replace_data(
+        &mut parsed.document.ranges,
+        id,
+        0,
+        old_units,
+        new_units,
+    );
     parsed
         .document
         .record(crate::documents::JournalEntry::CharacterData {
