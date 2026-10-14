@@ -13,6 +13,8 @@ export interface Daemon {
   pageUrl: string;
   /** The same page reached through `localhost`, for cross-site navigations. */
   crossSitePageUrl: string;
+  /** Cross-origin page with a secret body, for `javascript:` iframe src. */
+  victimUrl: string;
   /** Page with a child frame and tall content, for viewport and clip checks. */
   frameUrl: string;
   /** Deterministic layout page for screenshot assertions. */
@@ -42,6 +44,7 @@ interface Fixtures {
 }
 
 const PAGE = `<!doctype html><title>tiny</title><script src="/lib.js"></script><script>window.ready = false; fetch('/data').then(r => r.text()).then(t => { window.payload = t; window.ready = true; });</script>`;
+const SECRET = `<!doctype html><title>secret</title><body>SECRET_VICTIM</body>`;
 
 /** A child frame plus tall content, for viewport and clip probes. */
 const FRAMES = `<!doctype html><title>frames</title><div style="height:2000px"></div><iframe id="child" src="/frame"></iframe>`;
@@ -172,6 +175,9 @@ export const test = base.extend<Fixtures>({
       if (path === "/page") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(PAGE);
+      } else if (path === "/secret") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(SECRET);
       } else if (path === "/frames") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(FRAMES);
@@ -267,6 +273,7 @@ export const test = base.extend<Fixtures>({
       origin: `http://127.0.0.1:${port}`,
       pageUrl: `http://127.0.0.1:${httpPort}/page`,
       crossSitePageUrl: `http://[::1]:${httpPort}/page`,
+      victimUrl: `http://[::1]:${httpPort}/secret`,
       frameUrl: `http://127.0.0.1:${httpPort}/frames`,
       shotUrl: `http://127.0.0.1:${httpPort}/shot`,
       styledUrl: `http://127.0.0.1:${httpPort}/styled`,

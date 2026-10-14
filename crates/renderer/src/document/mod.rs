@@ -739,12 +739,10 @@ impl Document {
     /// Runs one `javascript:` frame URL's script in the frame's current realm,
     /// replacing the document only when the result is a string. A void
     /// result leaves the document (and its realm) untouched; the script
-    /// observes the page's own state, not a fresh blank realm
+    /// observes the page's own state, not a fresh blank realm. The result
+    /// document keeps the target's URL
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-    pub(crate) fn load_javascript_frame(&mut self, inherited_url: Option<&str>, script: &str) {
-        if let Some(url) = inherited_url {
-            self.apply_document_url(url);
-        }
+    pub(crate) fn load_javascript_frame(&mut self, script: &str) {
         if self.js.is_none() {
             self.ensure_js_ok();
         }

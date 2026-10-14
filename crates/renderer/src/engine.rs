@@ -734,6 +734,20 @@ impl Engine {
                 }
             }
             "javascript" => {
+                // Navigate to a javascript: URL returns when the initiator
+                // is not same origin-domain with the target's active
+                // document
+                // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url>).
+                let same_origin = match (self.frames.get(&parent), self.frames.get(&child)) {
+                    (Some(source), Some(target)) => {
+                        source.world().borrow().document_url.origin()
+                            == target.world().borrow().document_url.origin()
+                    }
+                    _ => false,
+                };
+                if !same_origin {
+                    return;
+                }
                 let script = percent_decode(url.as_str());
                 let script = script
                     .strip_prefix("javascript:")
@@ -749,7 +763,7 @@ impl Engine {
                         // created; a string result still replaces it.
                         document.eval_frame_script(&script);
                     } else {
-                        document.load_javascript_frame(Some(&parent_url), &script);
+                        document.load_javascript_frame(&script);
                     }
                 }
             }
