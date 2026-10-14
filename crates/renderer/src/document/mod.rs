@@ -463,8 +463,8 @@ impl Document {
             .ok()
     }
 
-    /// An object URL's contents, created by this realm
-    /// (<https://w3c.github.io/FileAPI/#dfn-createObjectURL>).
+    /// An object URL's contents, when this document's origin created it
+    /// (<https://w3c.github.io/FileAPI/#blob-url-store>).
     #[must_use]
     pub(crate) fn object_url_contents(&self, url: &str) -> Option<Rc<str>> {
         self.world.borrow().object_url_contents(url)

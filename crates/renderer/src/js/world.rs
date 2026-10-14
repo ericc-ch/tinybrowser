@@ -33,6 +33,10 @@ pub(crate) struct RealmRegistry {
     pub(crate) reactions: super::reactions::CustomElementReactions,
     pub(crate) private_slots: Option<PrivateSlots>,
     budget: Rc<RefCell<ResourceBudget>>,
+    /// Blob URLs for every realm in this renderer process, keyed without a
+    /// fragment
+    /// (<https://w3c.github.io/FileAPI/#blob-url-store>).
+    object_urls: HashMap<String, ObjectUrlEntry>,
     /// The World that owns each document id, for wrapper realm resolution.
     documents: HashMap<u32, Weak<RefCell<World>>>,
     /// The World that owns each frame, for `window.parent` and `event.source`.
@@ -348,10 +352,16 @@ impl RealmRegistry {
         self.frame_documents.clear();
         self.creation_realms.clear();
         self.adopted_ids.clear();
+        self.object_urls.clear();
     }
 
     fn budget(&self) -> Rc<RefCell<ResourceBudget>> {
         Rc::clone(&self.budget)
+    }
+
+    fn object_url(&self, url: &str, origin: &url::Origin) -> Option<&ObjectUrlEntry> {
+        let entry = self.object_urls.get(object_url_key(url))?;
+        (entry.origin == *origin).then_some(entry)
     }
 }
 
@@ -532,11 +542,20 @@ pub(crate) enum EventTargetKey {
 }
 
 /// One `blob:` URL's data and the `Blob.type` it was created from, so a
-/// fetch of the URL can carry a `Content-Type`
-/// (<https://w3c.github.io/FileAPI/#blob-url>).
+/// fetch of the URL can carry a `Content-Type`. `origin` is the creator, and
+/// a lookup from another origin is a miss
+/// (<https://w3c.github.io/FileAPI/#blob-url>,
+/// <https://w3c.github.io/FileAPI/#blob-url-store>).
 pub(crate) struct ObjectUrlEntry {
     pub(crate) contents: Rc<str>,
     pub(crate) content_type: Rc<str>,
+    pub(crate) origin: url::Origin,
+}
+
+/// The Blob URL Store key: the URL without its fragment
+/// (<https://w3c.github.io/FileAPI/#blob-url-store>).
+fn object_url_key(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(head, _)| head)
 }
 
 pub(crate) struct WeakReferences {
@@ -598,7 +617,6 @@ pub(crate) struct World {
     /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
     pub(crate) decoders: HashMap<u64, DecoderSession>,
     document_stream: Vec<DocumentStreamCommand>,
-    object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
     pub parser_active: bool,
     pub current_script: Option<NodeId>,
@@ -721,13 +739,7 @@ impl DecoderSession {
 
 impl Drop for World {
     fn drop(&mut self) {
-        let object_bytes = self
-            .object_urls
-            .values()
-            .map(|entry| entry.contents.len() + entry.content_type.len())
-            .sum::<usize>();
         let mut budget = self.budget.borrow_mut();
-        budget.object_url_bytes = budget.object_url_bytes.saturating_sub(object_bytes);
         let stream_bytes = self
             .document_stream
             .iter()
@@ -769,7 +781,6 @@ impl World {
             input_files: HashMap::new(),
             decoders: HashMap::new(),
             document_stream: Vec::new(),
-            object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
             parser_active: false,
             current_script: None,
@@ -1516,12 +1527,14 @@ impl World {
             return None;
         }
         let id = object_url_id()?;
-        let url = format!("blob:{}/{id}", self.origin_string());
-        self.object_urls.insert(
+        let origin = self.document_url.origin();
+        let url = format!("blob:{}/{id}", origin.ascii_serialization());
+        self.runtime.registry.borrow_mut().object_urls.insert(
             url.clone(),
             ObjectUrlEntry {
                 contents: Rc::from(contents),
                 content_type: Rc::from(content_type),
+                origin,
             },
         );
         budget.object_url_bytes = total;
@@ -1529,19 +1542,31 @@ impl World {
     }
 
     pub(crate) fn object_url_contents(&self, url: &str) -> Option<Rc<str>> {
-        self.object_urls
-            .get(url)
+        let origin = self.document_url.origin();
+        self.runtime
+            .registry
+            .borrow()
+            .object_url(url, &origin)
             .map(|entry| Rc::clone(&entry.contents))
     }
 
     pub(crate) fn object_url_type(&self, url: &str) -> Option<Rc<str>> {
-        self.object_urls
-            .get(url)
+        let origin = self.document_url.origin();
+        self.runtime
+            .registry
+            .borrow()
+            .object_url(url, &origin)
             .map(|entry| Rc::clone(&entry.content_type))
     }
 
     pub(crate) fn revoke_object_url(&mut self, url: &str) {
-        if let Some(entry) = self.object_urls.remove(url) {
+        if let Some(entry) = self
+            .runtime
+            .registry
+            .borrow_mut()
+            .object_urls
+            .remove(object_url_key(url))
+        {
             let mut budget = self.budget.borrow_mut();
             budget.object_url_bytes = budget
                 .object_url_bytes

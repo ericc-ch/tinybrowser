@@ -768,19 +768,26 @@ impl Engine {
                 }
             }
             "blob" => {
-                let contents = self
-                    .frames
-                    .get(&parent)
-                    .and_then(|document| document.object_url_contents(url.as_str()));
-                let content_type = self
-                    .frames
-                    .get(&parent)
-                    .and_then(|document| document.object_url_type(url.as_str()));
+                // A missing Blob URL Store entry is a network error, not an
+                // empty document at the URL's claimed origin
+                // (<https://w3c.github.io/FileAPI/#blob-uri-get>).
+                let mut key = url.clone();
+                key.set_fragment(None);
+                let Some((contents, content_type)) =
+                    self.frames.get(&parent).and_then(|document| {
+                        Some((
+                            document.object_url_contents(key.as_str())?,
+                            document.object_url_type(key.as_str()),
+                        ))
+                    })
+                else {
+                    return;
+                };
                 if let Some(document) = self.frames.get_mut(&child) {
                     document.load_frame_response(
                         &url,
                         content_type.as_deref(),
-                        contents.as_deref().unwrap_or("").as_bytes(),
+                        contents.as_bytes(),
                     );
                 }
             }
