@@ -1914,7 +1914,6 @@ pub(super) fn insertion_excluding_children(
         ensure_document_content_model(
             &parsed.document,
             parent,
-            node,
             reference,
             excluded,
             &inserted,
