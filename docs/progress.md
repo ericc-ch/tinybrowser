@@ -7,7 +7,7 @@ Size method and marginals live in [`docs/size.md`](size.md).
 
 Policy: minimize stripped size on x86_64; no hard cap.
 
-11,052,424 bytes (2026-10-14)
+11,187,720 bytes (2026-10-14)
 
 ```sh
 nix develop --command ./tools/release
@@ -21,7 +21,7 @@ WPT has many test groups (html, css, dom, and more). Each percentage is the pass
 
 The **total** row is pass / (tests − skip) across every directory that produced a report in this overnight dump — not a claim that every WPT file on earth was run. Worker excludes and known-skips stay out of the fail pile.
 
-Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (334/422 on 2026-10-14: 330 pre-Range baseline, +4 files fixed with no new failures; 88 files with failing results remain), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
+Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (337/422 on 2026-10-14: 335 at 8be0cc9c, +2 files fixed — `moveBefore/relevant-mutations`, `moveBefore/moveBefore-selector-matching` — with no new failures; 85 files with failing results remain), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
 nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
@@ -59,7 +59,9 @@ prolog), serialization, text, and layout treatment; real template
 contents fragments with host links, parser/fragment routing, cloning,
 and cycle visibility; sink parse errors carried on the document for
 draining; internal general entities expanded up front with
-billion-laughs bounds.
+billion-laughs bounds; `resolve_undisplayed_style` drops its style context
+inside the layout thread state, so on-demand `getComputedStyle` for
+`display: none` subtrees no longer panics.
 Fixed in our `ericc-ch/html5ever` fork (`third_party/html5ever`,
 `master` is the line, merged to upstream `main` at 7760920, 0.40.1) so far:
 namespace declarations kept on elements; CDATA sections tokenized and
@@ -79,4 +81,6 @@ reported; internal DTD subsets skipped instead of going bogus.
 - `blitz-dom` owns document language internally with no metadata setter, so a response `Content-Language` is not applied.
 - `blitz-html` always parses scripting-disabled (`noscript` as markup); scripting-enabled `noscript`-as-text diverges.
 - `blitz-dom` `NonTSPseudoClass::PlaceholderShown` is hardcoded `false`, so `:placeholder-shown` never matches and placeholder text does not paint (observed: Wikipedia's "Search Wikipedia").
+- `blitz-dom` orders a document's stylesheets by owner node id (the stylist insertion point is the next sheet's node id), so moving a `<link rel=stylesheet>` with `moveBefore` does not change its cascade position: `dom/nodes/moveBefore/stylesheet-cascade-order.html` now reaches its post-move assertion and fails there (`rgb(0, 0, 255)` where `rgb(128, 0, 128)` is required). Sheet order must follow the owner node's document position.
+- `blitz-dom`'s mutator has no move primitive, so `moveBefore` unlinks and re-inserts through the remove/insert paths: a moved `<link rel=stylesheet>` is unloaded and re-fetched, though the DOM `move` algorithm must not run insertion or removing steps. Needs a mutator move primitive that skips those special ops.
 - Proposal tests fail everywhere by design: HTML `<?...?>` stays a bogus comment per the HTML Standard (the PI-attributes proposal expects PI nodes), and two PI value subtests (`axx>`, `some<>`) contradict the spec's own escaping algorithm.
