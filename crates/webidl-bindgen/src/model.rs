@@ -246,6 +246,14 @@ pub(crate) enum ReturnType {
     /// `Promise<undefined>`: the method runs synchronously and the dispatch
     /// resolves the promise (<https://webidl.spec.whatwg.org/#es-promise>).
     PromiseUndefined,
+    /// A `Uint8Array` argument or result. Only the JavaScript emitter lowers
+    /// this shape today; the native side rejects it where it renders
+    /// (<https://webidl.spec.whatwg.org/#es-buffer-source-types>).
+    Uint8Array,
+    /// `unsigned long long`: only JavaScript result dictionaries use this
+    /// shape today; the native side rejects it where it renders
+    /// (<https://webidl.spec.whatwg.org/#idl-unsigned-long-long>).
+    UnsignedLongLong,
     /// IDL `any`: the value passes through with no conversion
     /// (<https://webidl.spec.whatwg.org/#idl-any>).
     Any,

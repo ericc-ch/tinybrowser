@@ -812,6 +812,8 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             | ReturnType::InterfaceSequence
             | ReturnType::StringSequence
             | ReturnType::NullableDocumentType
+            | ReturnType::Uint8Array
+            | ReturnType::UnsignedLongLong
             | ReturnType::Any => {
                 // `any` attributes are rejected at lowering.
                 unreachable!("validated field mapping")

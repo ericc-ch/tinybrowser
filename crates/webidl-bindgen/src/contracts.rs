@@ -2363,12 +2363,17 @@ fn constructor_arguments(
     Ok((arguments, parameters))
 }
 
-fn native_type(
+pub(crate) fn native_type(
     database: &Database<'_>,
     type_: &Type<'_>,
     visited: &mut BTreeSet<String>,
 ) -> Result<ReturnType, Error> {
     match type_ {
+        Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(item)))
+            if item.q_mark.is_none() =>
+        {
+            Ok(ReturnType::Uint8Array)
+        }
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) => {
             Ok(if item.q_mark.is_some() {
                 ReturnType::NullableString
@@ -2387,6 +2392,12 @@ fn native_type(
                 && matches!(item.type_, IntegerType::Short(item) if item.unsigned.is_some()) =>
         {
             Ok(ReturnType::UnsignedShort)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
+            if item.q_mark.is_none()
+                && matches!(item.type_, IntegerType::LongLong(item) if item.unsigned.is_some()) =>
+        {
+            Ok(ReturnType::UnsignedLongLong)
         }
         Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
             if item.q_mark.is_none()
