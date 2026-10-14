@@ -7,7 +7,7 @@ Size method and marginals live in [`docs/size.md`](size.md).
 
 Policy: minimize stripped size on x86_64; no hard cap.
 
-11,187,720 bytes (2026-10-14)
+11,190,312 bytes (2026-10-15)
 
 ```sh
 nix develop --command ./tools/release
@@ -21,7 +21,7 @@ WPT has many test groups (html, css, dom, and more). Each percentage is the pass
 
 The **total** row is pass / (tests − skip) across every directory that produced a report in this overnight dump — not a claim that every WPT file on earth was run. Worker excludes and known-skips stay out of the fail pile.
 
-Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (337/422 on 2026-10-14: 335 at 8be0cc9c, +2 files fixed — `moveBefore/relevant-mutations`, `moveBefore/moveBefore-selector-matching` — with no new failures; 85 files with failing results remain), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
+Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `dom/nodes/` (338/422 on 2026-10-15: 335 at 8be0cc9c, +3 files fixed with no new failures; 84 files with failing results remain), `dom/ranges/` (28/72 files clean on 2026-10-15, 3079 failing results down from 4015 before the live-range hook fixes: the rest are `getSelection`-dependent mutation variants and shadow-DOM files), `css/cssom/getComputedStyle*` (33/56 files clean, 249 failing results from 1104), `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
 nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
@@ -61,7 +61,9 @@ and cycle visibility; sink parse errors carried on the document for
 draining; internal general entities expanded up front with
 billion-laughs bounds; `resolve_undisplayed_style` drops its style context
 inside the layout thread state, so on-demand `getComputedStyle` for
-`display: none` subtrees no longer panics.
+`display: none` subtrees no longer panics; `display: contents` elements
+report computed (not default-layout) values for layout-dependent
+properties, so min/max clamping does not leak into resolved values.
 Fixed in our `ericc-ch/html5ever` fork (`third_party/html5ever`,
 `master` is the line, merged to upstream `main` at 7760920, 0.40.1) so far:
 namespace declarations kept on elements; CDATA sections tokenized and
