@@ -128,6 +128,29 @@ impl<'a> InlineStyle<'a> {
     }
 }
 
+/// Whether `node` is not being rendered for collection: inline
+/// `display:none`, or an HTML `hidden` attribute other than `until-found`
+/// (the UA sheet's `[hidden] { display: none }`).
+/// <https://html.spec.whatwg.org/multipage/interaction.html#the-hidden-attribute>
+fn not_rendered(base: &BaseDocument, node: BlitzId, style: &InlineStyle<'_>) -> bool {
+    style.display_none() || html_hidden(base, node)
+}
+
+/// HTML `hidden` other than `until-found`, which still renders.
+fn html_hidden(base: &BaseDocument, node: BlitzId) -> bool {
+    let Some(tree) = base.get_node(node) else {
+        return false;
+    };
+    let Some(element) = tree.data.downcast_element() else {
+        return false;
+    };
+    if element.name.ns != html_namespace() {
+        return false;
+    }
+    crate::dom::tree::attr(base, node, "hidden")
+        .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))
+}
+
 /// Splits a `style` attribute into declarations on `;` outside single and
 /// double quotes and parentheses. A backslash inside quotes escapes the
 /// next character, so `content: "a\";b"` keeps its `;`.
@@ -714,10 +737,7 @@ fn collect_node(
             // `visibility:hidden` still lays out: recurse so explicitly
             // visible descendants show, but hide this level's own text.
             // (The text arm skips hidden text; breaks still apply.)
-            if html
-                && crate::dom::tree::attr(base, node, "hidden")
-                    .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))
-            {
+            if html_hidden(base, node) {
                 return;
             }
             if html && local == "br" {
@@ -788,7 +808,7 @@ fn collect_node(
                     // all: skip it without forcing breaks of its own (the
                     // surrounding items break already).
                     if html && (local == "option" || local == "optgroup") {
-                        if style.display_none() {
+                        if not_rendered(base, node, &style) {
                             return;
                         }
                         if local == "optgroup" && is_optgroup_ancestor(base, node) {
@@ -895,8 +915,9 @@ fn collect_table(
     let mut first = true;
     while let Some((current, top, inherited, inherited_mode, inherited_transform)) = stack.pop() {
         let style = InlineStyle::of(base, current);
-        // `display:none` subtrees never render, so they contribute no rows.
-        if style.display_none() {
+        // `display:none` and `hidden` subtrees never render, so they
+        // contribute no rows.
+        if not_rendered(base, current, &style) {
             continue;
         }
         let Some(tree) = base.get_node(current) else {
@@ -975,8 +996,9 @@ fn collect_row(
             continue;
         }
         let style = InlineStyle::of(base, cell);
-        // `display:none` cells never render, not even their tab stop.
-        if style.display_none() {
+        // `display:none` and `hidden` cells never render, not even their
+        // tab stop.
+        if not_rendered(base, cell, &style) {
             continue;
         }
         if !cell_first {
@@ -1024,8 +1046,8 @@ fn collect_select(
     };
     for &child in &tree.children {
         let style = InlineStyle::of(base, child);
-        // `display:none` options never render.
-        if style.display_none() {
+        // `display:none` and `hidden` options never render.
+        if not_rendered(base, child, &style) {
             continue;
         }
         let kind = base.get_node(child).and_then(|tree| {
@@ -1217,13 +1239,7 @@ fn being_rendered(base: &BaseDocument, node: BlitzId) -> bool {
         if let Some(element) = tree.data.downcast_element() {
             let html = element.name.ns == crate::dom::tree::html_namespace();
             let local = element.name.local.as_str();
-            if html
-                && crate::dom::tree::attr(base, current, "hidden")
-                    .is_some_and(|value| !value.eq_ignore_ascii_case("until-found"))
-            {
-                return false;
-            }
-            if InlineStyle::of(base, current).display_none() {
+            if not_rendered(base, current, &InlineStyle::of(base, current)) {
                 return false;
             }
             if html
