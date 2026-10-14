@@ -87,10 +87,15 @@ done
 
 baseline_bin="$tmp/tinybrowser-baseline"
 echo "baseline: building $rev" >&2
+# The worktree build gets its own target dir: the machine shares one
+# target dir across checkouts (see ~/.cargo/config.toml), and same-version
+# path dependencies from another revision would otherwise poison this
+# checkout's fingerprints (e.g. an old webidl-bindgen reused by the new
+# build script).
 (
   cd "$worktree"
-  BASE_BIN="$baseline_bin" nix develop --command bash -c \
-    'cargo build -q && cp "$(tools/binary-path)" "$BASE_BIN"'
+  BASE_BIN="$baseline_bin" TARGET_DIR="$tmp/target" nix develop --command bash -c \
+    'export CARGO_TARGET_DIR="$TARGET_DIR"; cargo build -q && cp "$(tools/binary-path)" "$BASE_BIN"'
 )
 
 echo "baseline: rebuilding the working tree" >&2
