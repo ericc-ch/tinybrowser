@@ -526,7 +526,45 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
         "__tb_construct_in_frame",
         rquickjs::prelude::Func::from(construct_node_in_frame),
     )?;
+    crate::js::bridge::object(ctx)?.set(
+        "__tb_resolved_style",
+        rquickjs::prelude::Func::from(resolved_style),
+    )?;
     Ok(())
+}
+
+/// The style engine's resolved value of `property` on `element`, or the empty
+/// string when the element has no style or the property is unknown
+/// (<https://drafts.csswg.org/cssom/#resolved-values>). `getComputedStyle`
+/// falls back to the inline style and then to initial values on an empty
+/// result.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn resolved_style<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    property: rquickjs::String<'js>,
+) -> String {
+    let Ok(world) = world(&ctx) else {
+        return String::new();
+    };
+    let Some(id) = host_node_id(&ctx, &element) else {
+        return String::new();
+    };
+    let property = property.to_string().unwrap_or_default();
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
+        return String::new();
+    };
+    let base = &mut parsed.document.base;
+    // Reading a computed style forces a style flush, so values reflect
+    // mutations made earlier in the same script, including layout-dependent
+    // used values
+    // (<https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle>).
+    base.resolve(0.0);
+    base.resolved_style_value(id.node, &property)
 }
 
 /// The active document's viewport size in CSS pixels, for the live `window`

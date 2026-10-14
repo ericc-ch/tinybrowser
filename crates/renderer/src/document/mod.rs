@@ -266,6 +266,13 @@ pub(crate) struct Document {
     /// starts a fetch and removal drops one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     connected_images: HashSet<crate::dom::tree::NodeId>,
+    /// Connected `<link rel=stylesheet>` elements already reported as loaded,
+    /// with the resolved URL that arrival was for, so a re-fetch after an
+    /// `href` or `rel` change reports again
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#the-link-element>).
+    linked_sheets: HashMap<crate::dom::tree::NodeId, String>,
+    /// Stylesheet generation observed at the last linked-stylesheet scan.
+    stylesheet_generation: u64,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -385,6 +392,8 @@ impl Document {
             image_selected_src: HashMap::new(),
             in_flight_images: HashSet::new(),
             connected_images: HashSet::new(),
+            linked_sheets: HashMap::new(),
+            stylesheet_generation: 0,
             frame_load_sequence: 0,
             frame_load_in_flight: false,
             initial_blank: true,
@@ -1792,7 +1801,67 @@ impl Document {
         crate::render::resolve_until_settled(&mut parsed.document.base);
         drop(parsed);
         drop(world);
+        self.note_linked_stylesheets();
         self.fire_document_load();
+    }
+
+    /// Fires `load` on connected `<link rel=stylesheet>` elements whose sheet
+    /// has arrived. Blitz attaches a sheet to the link node only after the
+    /// response parses, so the sheet's presence is the fetch-complete signal;
+    /// the scan runs when the document's stylesheet generation moved, so image
+    /// and font deliveries pay nothing
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#the-link-element>,
+    /// <https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
+    fn note_linked_stylesheets(&mut self) {
+        let (generation, arrivals, stale) = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return;
+            };
+            let base = &parsed.document.base;
+            let generation = base.stylesheet_generation();
+            if generation == self.stylesheet_generation {
+                return;
+            }
+            let document = parsed.id;
+            let linked = |id: blitz_dom::NodeId| {
+                crate::dom::tree::is_stylesheet_link(base, id)
+                    && base.node_has_stylesheet(id)
+                    && crate::dom::tree::is_connected(base, id)
+            };
+            let arrivals: Vec<(crate::dom::tree::NodeId, String)> = base
+                .stylesheet_owner_nodes()
+                .filter(|id| linked(*id))
+                .filter_map(|id| {
+                    crate::dom::tree::attr(base, id, "href")
+                        .and_then(|href| base.resolve_url(href))
+                        .map(|url| {
+                            (
+                                crate::dom::tree::NodeId { document, node: id },
+                                url.as_str().to_owned(),
+                            )
+                        })
+                })
+                .collect();
+            let stale: Vec<crate::dom::tree::NodeId> = self
+                .linked_sheets
+                .keys()
+                .copied()
+                .filter(|node| node.document != document || !linked(node.node))
+                .collect();
+            (generation, arrivals, stale)
+        };
+        self.stylesheet_generation = generation;
+        for node in stale {
+            self.linked_sheets.remove(&node);
+        }
+        for (element, url) in arrivals {
+            if self.linked_sheets.get(&element) == Some(&url) {
+                continue;
+            }
+            self.linked_sheets.insert(element, url);
+            self.tasks.push_back(Task::NodeLoad(element));
+        }
     }
 
     pub(in crate::document) fn settle_js_fetch(&mut self, id: i32, outcome: Option<DialOutcome>) {

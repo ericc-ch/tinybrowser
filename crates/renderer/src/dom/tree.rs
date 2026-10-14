@@ -72,6 +72,16 @@ pub(crate) fn is_iframe_element(base: &blitz_dom::BaseDocument, id: BlitzNodeId)
     })
 }
 
+/// Whether `node` is a `<link>` whose `rel` lists the `stylesheet` keyword
+/// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
+pub(crate) fn is_stylesheet_link(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
+    is_html_element(base, id, "link")
+        && attr(base, id, "rel").is_some_and(|rel| {
+            rel.split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+        })
+}
+
 /// Wrapped children of `node` in `document`, in tree order.
 pub(crate) fn child_ids(
     base: &blitz_dom::BaseDocument,
