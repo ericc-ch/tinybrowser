@@ -780,16 +780,21 @@ fn transfer_partial_endpoint(
     fragment: NodeId,
     sub: &RangeState,
     node: NodeId,
+    at_start: bool,
     transfer: ContentsTransfer,
 ) -> Result<()> {
     let is_character_data = read_document(ctx, node.document, |base| {
         Ok(ranges::is_character_data(base, node))
     })?;
     if is_character_data {
-        let (offset, at_start) = if node == sub.start.node {
-            (sub.start.offset, true)
+        // The sub-range's start side holds the real start offset when this
+        // is the first partially contained child, and its end side holds
+        // the real end offset when it is the last
+        // (<https://dom.spec.whatwg.org/#concept-range-extract>).
+        let offset = if at_start {
+            sub.start.offset
         } else {
-            (sub.end.offset, false)
+            sub.end.offset
         };
         return transfer_endpoint_text(ctx, fragment, node, offset, at_start, transfer);
     }
@@ -870,7 +875,7 @@ fn produce_contents(
                 })?,
             },
         };
-        transfer_partial_endpoint(ctx, fragment, &sub, first, transfer)?;
+        transfer_partial_endpoint(ctx, fragment, &sub, first, true, transfer)?;
     }
     transfer_middle(ctx, fragment, &contained, transfer)?;
     if let Some(last) = last {
@@ -878,7 +883,7 @@ fn produce_contents(
             start: BoundaryPoint { node: last, offset: 0 },
             end: BoundaryPoint { node: enode, offset: eoff },
         };
-        transfer_partial_endpoint(ctx, fragment, &sub, last, transfer)?;
+        transfer_partial_endpoint(ctx, fragment, &sub, last, false, transfer)?;
     }
     Ok(())
 }
@@ -1467,9 +1472,11 @@ impl<'js> range_generated::Range<'js> for JsRange {
     }
 
     // https://dom.spec.whatwg.org/#dom-range-surroundcontents
-    fn surround_contents(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {        let new_parent = tree_node(&ctx, node)?;
+    fn surround_contents(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
+        let new_parent = tree_node(&ctx, node)?;
         let state = load(&ctx, self.document, self.slot)?;
-        check_surround_parent(&ctx, new_parent)?;
+        // The partially-contained check runs before the newParent type check
+        // (<https://dom.spec.whatwg.org/#dom-range-surroundcontents>).
         read_document(&ctx, state.start.node.document, |base| {
             let ancestor = ranges::common_ancestor(base, state.start.node, state.end.node);
             let (first, _, last) = ranges::ancestor_span(
@@ -1492,6 +1499,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
             }
             Ok(())
         })?;
+        check_surround_parent(&ctx, new_parent)?;
         let fragment = create_fragment_in(&ctx, state.start.node.document)?;
         self.extract_into_slot(&ctx, fragment, &state)?;
         {
@@ -1578,6 +1586,18 @@ impl<'js> abstract_range_generated::AbstractRange<'js> for JsRange {
 /// steps overwrite the points again.
 impl JsRange {
     fn extract_into_slot(&self, ctx: &Ctx<'_>, fragment: NodeId, state: &RangeState) -> Result<()> {
+        // The doctype rejection precedes the range update
+        // (<https://dom.spec.whatwg.org/#concept-range-extract>).
+        if state.start != state.end {
+            let same_text = read_document(ctx, state.start.node.document, |base| {
+                Ok(state.start.node == state.end.node
+                    && ranges::is_character_data(base, state.start.node))
+            })?;
+            if !same_text {
+                let (_, _, _, _, _, contained, _) = span_parts(ctx, state)?;
+                reject_span_doctypes(ctx, &contained, "extracted")?;
+            }
+        }
         let (new_node, new_offset) = read_document(ctx, state.start.node.document, |base| {
             Ok(collapse_point(base, state))
         })?;
