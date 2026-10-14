@@ -1206,6 +1206,7 @@ impl Document {
     /// Runs every registered init script in the fresh realm, before any page
     /// script. A failing script is reported, not fatal.
     fn run_init_scripts(&mut self) {
+        let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         let scripts: Vec<String> = self
             .world
             .borrow()
@@ -1551,6 +1552,7 @@ impl Document {
     /// fetch completed: runs the remaining scripts, then the end-of-parse
     /// steps unless another fetch blocks the walk.
     fn resume_scripts(&mut self) {
+        let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         if self.run_scripts() {
             return;
         }
@@ -1591,6 +1593,7 @@ impl Document {
         if !scripts.is_empty() && !self.ensure_js_ok() {
             return false;
         }
+        let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         for id in scripts {
             if !self.executed_scripts.insert(id) {
                 continue;

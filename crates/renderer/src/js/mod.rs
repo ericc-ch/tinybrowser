@@ -48,10 +48,15 @@ const MAX_RUNTIME_STACK: usize = 512 * 1024;
 /// Wall-clock limit for one top-level entry into JS (a script, a timer or
 /// event callback, a browser evaluation without its own timeout) and its
 /// microtask checkpoint. Past it the interrupt handler aborts the task with
-/// [`JsError::Interrupted`]. It stays well below the browser's 60 s renderer
-/// request timeout, so a runaway task is cut here before the browser gives
-/// up on the renderer.
+/// [`JsError::Interrupted`]. Serial top-level entries in one renderer turn
+/// share [`TURN_SCRIPT_BUDGET`] so they cannot each take a full 20 s and
+/// together hit the browser's 60 s renderer request timeout.
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(20);
+/// Wall-clock cap for one renderer turn (a parser script walk, a batch of
+/// init scripts). Each JS entry still uses [`DEFAULT_SCRIPT_BUDGET`], then
+/// clamps to this deadline so N serial runaways stay well under the 60 s
+/// request timeout in `crates/browser/src/link.rs`.
+const TURN_SCRIPT_BUDGET: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy)]
 enum MicrotaskCheckpoint {
@@ -230,6 +235,10 @@ pub(crate) struct JsRealm {
     /// Nesting depth of [`JsRealm::with_budget`]; reentrant evaluations run
     /// under the outer frame instead of installing their own budget.
     budget_depth: Cell<usize>,
+    /// Deadline for the current renderer turn, shared with [`ScriptTurn`]
+    /// so nested walks do not reset it. `with_budget_outer` clamps each
+    /// entry to this Instant when it is set.
+    turn_deadline: Rc<Cell<Option<Instant>>>,
 }
 
 impl JsRealm {
@@ -250,9 +259,17 @@ impl JsRealm {
             pending_timeouts: Rc::new(RefCell::new(Vec::new())),
             pending_fetches: Rc::new(RefCell::new(Vec::new())),
             budget_depth: Cell::new(0),
+            turn_deadline: Rc::new(Cell::new(None)),
         };
         host.install()?;
         Ok(host)
+    }
+
+    /// Starts a renderer turn on this realm, or joins one already open.
+    ///
+    /// Dropping the last owned guard clears the turn deadline.
+    pub(crate) fn enter_turn(&self) -> ScriptTurn {
+        ScriptTurn::enter(&self.turn_deadline)
     }
 
     pub(crate) fn eval(&self, source: &str) -> Result<String, JsError> {
@@ -718,7 +735,11 @@ impl JsRealm {
         checkpoint: MicrotaskCheckpoint,
         operation: impl FnOnce() -> Result<T, JsError>,
     ) -> Result<T, JsError> {
-        let deadline = deadline.unwrap_or_else(|| Instant::now() + DEFAULT_SCRIPT_BUDGET);
+        let entry = deadline.unwrap_or_else(|| Instant::now() + DEFAULT_SCRIPT_BUDGET);
+        let deadline = self
+            .turn_deadline
+            .get()
+            .map_or(entry, |turn| entry.min(turn));
         let interrupted = Rc::new(Cell::new(false));
         let flag = Rc::clone(&interrupted);
         let stop = Arc::clone(&self.stop);
@@ -1293,6 +1314,35 @@ fn element_text(base: &blitz_dom::BaseDocument, id: crate::dom::tree::BlitzId) -
         }
     }
     text
+}
+
+/// Owns [`JsRealm::turn_deadline`] for one renderer turn. Nested enters keep
+/// the outer Instant; only the owner clears it.
+#[must_use]
+pub(crate) struct ScriptTurn {
+    slot: Rc<Cell<Option<Instant>>>,
+    owned: bool,
+}
+
+impl ScriptTurn {
+    fn enter(slot: &Rc<Cell<Option<Instant>>>) -> Self {
+        let owned = slot.get().is_none();
+        if owned {
+            slot.set(Some(Instant::now() + TURN_SCRIPT_BUDGET));
+        }
+        Self {
+            slot: Rc::clone(slot),
+            owned,
+        }
+    }
+}
+
+impl Drop for ScriptTurn {
+    fn drop(&mut self) {
+        if self.owned {
+            self.slot.set(None);
+        }
+    }
 }
 
 struct ClearInterrupt<'a> {
