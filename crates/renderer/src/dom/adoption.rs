@@ -245,6 +245,46 @@ pub(crate) fn materialize_children(
     })
 }
 
+/// Child pairs of `from`/`to` for a lockstep walk over corresponding trees.
+///
+/// A template's children live in its contents fragment, not as element
+/// children, so the walk descends into it
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+pub(crate) fn lockstep_children(
+    from_base: &blitz_dom::BaseDocument,
+    from: blitz_traits::node_id::NodeId,
+    to_base: &blitz_dom::BaseDocument,
+    to: blitz_traits::node_id::NodeId,
+) -> Vec<(blitz_traits::node_id::NodeId, blitz_traits::node_id::NodeId)> {
+    children_for_walk(from_base, from)
+        .into_iter()
+        .zip(children_for_walk(to_base, to))
+        .collect()
+}
+
+/// A node's children for a lockstep walk: a template's contents fragment
+/// when it has one, otherwise the element children.
+fn children_for_walk(
+    base: &blitz_dom::BaseDocument,
+    id: blitz_traits::node_id::NodeId,
+) -> Vec<blitz_traits::node_id::NodeId> {
+    let template_contents = base
+        .get_node(id)
+        .and_then(|node| node.data.downcast_element())
+        .filter(|element| crate::dom::tree::is_template_tag(&element.name))
+        .and_then(|element| element.template_contents);
+    match template_contents {
+        Some(fragment) => base
+            .get_node(fragment)
+            .map(|node| node.children.to_vec())
+            .unwrap_or_default(),
+        None => base
+            .get_node(id)
+            .map(|node| node.children.to_vec())
+            .unwrap_or_default(),
+    }
+}
+
 /// Detaches `id` from its parent for adoption, recording the removal.
 ///
 /// A node with no parent is already detached; that is a no-op.
@@ -255,7 +295,7 @@ pub(crate) fn detach_for_adopt(
     let Some(parent) = doc.base.get_node(id.node).and_then(|node| node.parent) else {
         return Ok(());
     };
-    let (previous, next) = {
+    let (previous, next, position) = {
         let parent_node = doc.base.get_node(parent).ok_or(TreeError::Stale)?;
         let position = parent_node
             .children
@@ -277,8 +317,19 @@ pub(crate) fn detach_for_adopt(
                 document: id.document,
                 node,
             });
-        (previous, next)
+        (previous, next, position)
     };
+    // Adoption removes the node first, and the remove algorithm runs the
+    // live-range pre-remove steps
+    // (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+    if !doc.ranges.is_empty() {
+        let index = u32::try_from(position).unwrap_or(u32::MAX);
+        let parent_id = NodeId {
+            document: id.document,
+            node: parent,
+        };
+        crate::dom::range::adjust_for_remove(&doc.base, &mut doc.ranges, parent_id, index, id);
+    }
     doc.base.mutate().remove_node(id.node);
     doc.record(JournalEntry::ChildList {
         target: NodeId {
@@ -329,6 +380,12 @@ pub(crate) fn clone_within_document(
     }
     let snapshot = import_snapshot(doc, id, false).ok_or(TreeError::Hierarchy)?;
     let fresh = materialize_import(doc, doc_id, &snapshot)?;
+    // Cloning copies the already-started flag (and the PI map) even when the
+    // clone is shallow: the clone is the node itself, and a later connection
+    // must not run the script again
+    // (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:cloning-steps>).
+    doc.copy_pi_subtree(id.node, fresh.node);
+    doc.copy_script_started(id.node, fresh.node);
     Ok(fresh)
 }
 
@@ -368,19 +425,15 @@ pub(crate) fn adopt_across_store(
             if source.document.script_already_started(from) {
                 to_mark.push(to);
             }
-            let from_children = source
-                .document
-                .base
-                .get_node(from)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            let to_children = target
-                .document
-                .base
-                .get_node(to)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            stack.extend(from_children.into_iter().zip(to_children));
+            // Templates carry their children in a contents fragment, so the
+            // walk follows those too
+            // (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+            stack.extend(lockstep_children(
+                &source.document.base,
+                from,
+                &target.document.base,
+                to,
+            ));
         }
         to_mark
     };

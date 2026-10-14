@@ -238,15 +238,20 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
         });
         (parent, previous, next)
     };
-    let index = parent.and_then(|parent| {
-        parsed
-            .document
-            .base
-            .get_node(parent)
-            .and_then(|node| node.children.iter().position(|sibling| *sibling == target.node))
-            .and_then(|index| u32::try_from(index).ok())
-            .map(|index| (parent, index))
-    });
+    // The index scan only feeds the live-range adjustment.
+    let index = if parsed.document.ranges.is_empty() {
+        None
+    } else {
+        parent.and_then(|parent| {
+            parsed
+                .document
+                .base
+                .get_node(parent)
+                .and_then(|node| node.children.iter().position(|sibling| *sibling == target.node))
+                .and_then(|index| u32::try_from(index).ok())
+                .map(|index| (parent, index))
+        })
+    };
     let Some(parent) = parent else {
         return;
     };
@@ -274,6 +279,26 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
     });
 }
 
+/// Adjusts live ranges for `children` leaving `fragment` through a move into
+/// a new parent. The insert algorithm removes the fragment's children first,
+/// and each removal runs the pre-remove steps; removing in tree order always
+/// takes the first slot
+/// (<https://dom.spec.whatwg.org/#concept-node-insert>).
+pub(crate) fn adjust_children_leaving(
+    parsed: &mut crate::Parsed,
+    fragment: NodeId,
+    children: &[NodeId],
+) {
+    if children.is_empty() || parsed.document.ranges.is_empty() {
+        return;
+    }
+    let base = &parsed.document.base;
+    let ranges = &mut parsed.document.ranges;
+    for child in children {
+        crate::dom::range::adjust_for_remove(base, ranges, fragment, 0, *child);
+    }
+}
+
 /// Inserts the already-adopted `child` into `parent` before `reference` (or
 /// at the end for `None`), recording one `childList` addition. Blitz detaches
 /// from the old parent during the insert itself, so callers run
@@ -285,6 +310,12 @@ pub(crate) fn place_journaled(
     reference: Option<NodeId>,
 ) {
     place_inner(parsed, parent, child, reference);
+    // The index scan only feeds the live-range adjustment, and an append
+    // (null reference) shifts no offsets
+    // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+    if reference.is_none() || parsed.document.ranges.is_empty() {
+        return;
+    }
     let index = parsed
         .document
         .base
@@ -299,18 +330,6 @@ pub(crate) fn place_journaled(
         let ranges = &mut parsed.document.ranges;
         crate::dom::range::adjust_for_insert(ranges, parent, index, 1);
     }
-}
-
-/// `place_journaled` without live-range adjustment, for `splitText`, whose
-/// spec steps move boundary points itself
-/// (<https://dom.spec.whatwg.org/#concept-text-split>).
-pub(crate) fn place_journaled_without_range_adjust(
-    parsed: &mut crate::Parsed,
-    parent: NodeId,
-    child: NodeId,
-    reference: Option<NodeId>,
-) {
-    place_inner(parsed, parent, child, reference);
 }
 
 fn place_inner(
@@ -409,12 +428,32 @@ pub(crate) fn splice_parsed(
     if moved.is_empty() {
         return;
     }
+    // The fragment's children leave it before the insert, and each removal
+    // runs the live-range pre-remove steps
+    // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+    adjust_children_leaving(parsed, fragment, &moved);
     parsed.document.record(JournalEntry::ChildList {
         target: fragment,
         added: Vec::new(),
         removed: moved.clone(),
         previous: None,
         next: None,
+    });
+    // The insert steps shift parent points past the reference child's index
+    // by the node count; the index is the reference's before the insert, and
+    // an append (null child) shifts nothing
+    // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+    let reference_index = reference.and_then(|reference| {
+        parsed
+            .document
+            .base
+            .get_node(parent.node)
+            .and_then(|node| {
+                node.children
+                    .iter()
+                    .position(|sibling| *sibling == reference.node)
+            })
+            .and_then(|index| u32::try_from(index).ok())
     });
     let previous = match reference {
         Some(reference) => {
@@ -450,28 +489,8 @@ pub(crate) fn splice_parsed(
                 .append_children(parent.node, &[child.node]),
         }
     }
-    let count = u32::try_from(moved.len()).unwrap_or(u32::MAX);
-    if count > 0 {
-        let index = match reference {
-            Some(reference) => parsed
-                .document
-                .base
-                .get_node(parent.node)
-                .and_then(|node| {
-                    node.children
-                        .iter()
-                        .position(|sibling| *sibling == reference.node)
-                })
-                .and_then(|index| u32::try_from(index).ok())
-                .unwrap_or(0),
-            None => parsed
-                .document
-                .base
-                .get_node(parent.node)
-                .map_or(0, |node| {
-                    u32::try_from(node.children.len()).unwrap_or(u32::MAX)
-                }),
-        };
+    if let Some(index) = reference_index {
+        let count = u32::try_from(moved.len()).unwrap_or(u32::MAX);
         let ranges = &mut parsed.document.ranges;
         crate::dom::range::adjust_for_insert(ranges, parent, index, count);
     }
@@ -513,6 +532,10 @@ pub(crate) fn replace_all_with_node(
                     .collect()
             })
             .unwrap_or_default();
+        // The children leave the fragment before the insert, and each
+        // removal runs the live-range pre-remove steps
+        // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+        adjust_children_leaving(parsed, node, &moved);
         for child in &moved {
             parsed.document.base.mutate().remove_node(child.node);
         }
@@ -555,15 +578,16 @@ pub(crate) fn replace_all_journaled(
         })
         .unwrap_or_default();
     let iframes = iframe_containers_in_subtrees(parsed, &removed);
-    let inserted = !added.is_empty();
     // Adjust live ranges while the tree links are intact: after `remove_node`
     // the detached children report no parent, so the descendant check would
-    // miss every point inside them
+    // miss every point inside them. Removing every child in tree order leaves
+    // every affected point on `(parent, 0)`, and the following insert before
+    // null shifts nothing
     // (<https://dom.spec.whatwg.org/#concept-node-replace-all>).
-    if inserted || !removed.is_empty() {
+    if !removed.is_empty() && !parsed.document.ranges.is_empty() {
         let base = &parsed.document.base;
         let ranges = &mut parsed.document.ranges;
-        crate::dom::range::adjust_for_replace_all(base, ranges, parent, inserted);
+        crate::dom::range::adjust_for_replace_all(base, ranges, parent);
     }
     for kid in &removed {
         parsed.document.base.mutate().remove_node(kid.node);
@@ -579,8 +603,7 @@ pub(crate) fn replace_all_journaled(
             .mutate()
             .append_children(parent.node, &[child.node]);
     }
-    let inserted = !added.is_empty();
-    if inserted || !removed.is_empty() {
+    if !added.is_empty() || !removed.is_empty() {
         parsed.document.record(JournalEntry::ChildList {
             target: parent,
             added,
@@ -886,6 +909,36 @@ pub(crate) fn move_parsed(
     place_journaled(parsed, parent, node, reference);
 }
 
+/// The index of `child` under `parent`, or `None` when it has none.
+fn child_index(parsed: &crate::Parsed, parent: NodeId, child: Option<NodeId>) -> Option<u32> {
+    let child = child?;
+    parsed
+        .document
+        .base
+        .get_node(parent.node)
+        .and_then(|node| {
+            node.children
+                .iter()
+                .position(|sibling| *sibling == child.node)
+        })
+        .and_then(|index| u32::try_from(index).ok())
+}
+
+/// Runs the live-range pre-remove steps for the old child of a replacement.
+/// The removal itself carries `suppressObservers`, which does not skip them
+/// (<https://dom.spec.whatwg.org/#concept-node-replace>).
+fn adjust_replace_removal(parsed: &mut crate::Parsed, parent: NodeId, old: NodeId) {
+    if parsed.document.ranges.is_empty() {
+        return;
+    }
+    let index = child_index(parsed, parent, Some(old));
+    if let Some(index) = index {
+        let base = &parsed.document.base;
+        let ranges = &mut parsed.document.ranges;
+        crate::dom::range::adjust_for_remove(base, ranges, parent, index, old);
+    }
+}
+
 /// Replaces `old` with the already-adopted `node` (or its children for a
 /// fragment): the node's own unlink keeps a removal record when it moves,
 /// then one combined record carries the replacement
@@ -947,6 +1000,10 @@ pub(crate) fn replace_parsed(
         (vec![node], false)
     };
     if fragment {
+        // The fragment's children leave it through the insert, and each
+        // removal runs the live-range pre-remove steps
+        // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+        adjust_children_leaving(parsed, node, &added);
         parsed.document.record(JournalEntry::ChildList {
             target: node,
             added: Vec::new(),
@@ -957,7 +1014,9 @@ pub(crate) fn replace_parsed(
     } else {
         unlink_journaled(parsed, node);
     }
+    adjust_replace_removal(parsed, parent, old);
     parsed.document.base.mutate().remove_node(old.node);
+    let reference_index = child_index(parsed, parent, reference);
     for child in &added {
         match reference {
             Some(reference) => parsed
@@ -971,6 +1030,11 @@ pub(crate) fn replace_parsed(
                 .mutate()
                 .append_children(parent.node, &[child.node]),
         }
+    }
+    if let Some(index) = reference_index {
+        let count = u32::try_from(added.len()).unwrap_or(u32::MAX);
+        let ranges = &mut parsed.document.ranges;
+        crate::dom::range::adjust_for_insert(ranges, parent, index, count);
     }
     parsed.document.record(JournalEntry::ChildList {
         target: parent,

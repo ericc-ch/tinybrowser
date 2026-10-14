@@ -1,14 +1,17 @@
 //! `Range` and `AbstractRange` (<https://dom.spec.whatwg.org/#ranges>).
 
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::rc::{Rc, Weak};
 
-use rquickjs::{Class, Ctx, Exception, Result, Value, class::Trace};
+use rquickjs::class::{Trace, Tracer};
+use rquickjs::{Class, Ctx, Exception, Result, Value};
 
 use super::{
-    character_data, fixup_focus_after_removal, realm_registry, required_node,
-    schedule_mutation_delivery, set_character_data, throw_dom, throw_dom_error, world,
-    world_for_node, wrap_node,
+    attr_wrapper, character_data, fixup_focus_after_removal, realm_registry,
+    replace_character_data, required_node, schedule_mutation_delivery, set_character_data,
+    throw_dom, throw_dom_error, world, world_for_node, wrap_node,
 };
 use super::host::{NodeReference, instance_proto};
 use super::node::core::{adopt_node, insert_tree_node, insertion_tree_nodes, split_text_node};
@@ -23,14 +26,60 @@ use crate::dom::range as ranges;
 use crate::dom::range::{BoundaryPoint, RangeState};
 use crate::dom::tree::{NodeId, child_ids, sibling};
 use crate::dom_string::DomString;
+use crate::js::world::World;
 
-/// `Range` (and `AbstractRange`) payload: an index into the owning document's
-/// live-range table (<https://dom.spec.whatwg.org/#interface-range>).
+/// `Range` (and `AbstractRange`) payload: a slot in the live-range table of
+/// the document that owns its boundary points
+/// (<https://dom.spec.whatwg.org/#interface-range>).
 #[derive(Trace, rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "Range")]
 pub(crate) struct JsRange {
-    document: u32,
-    slot: usize,
+    registration: Registration,
+    /// A weak handle to the owning realm, for the finalizer that frees the
+    /// slot when the wrapper is collected.
+    owner: Owner,
+}
+
+/// Which document's live-range table holds the range's slot.
+///
+/// `setStart` and `setEnd` accept nodes from any document, and the range
+/// collapses into the new root; the slot then moves to that document, because
+/// mutation hooks only walk the table of the document being mutated. The
+/// setters take `&self`, so the pair is interior-mutable
+/// (<https://dom.spec.whatwg.org/#concept-range-bp-set>).
+struct Registration {
+    document: Cell<u32>,
+    slot: Cell<usize>,
+}
+
+impl<'js> Trace<'js> for Registration {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+/// The realm that owns the slot, held weakly: a wrapper must not keep its
+/// world alive, and the finalizer only frees the slot while the world is
+/// still around.
+struct Owner(Weak<RefCell<World>>);
+
+impl<'js> Trace<'js> for Owner {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+impl Drop for JsRange {
+    fn drop(&mut self) {
+        let Some(world) = self.owner.0.upgrade() else {
+            return;
+        };
+        // A finalizer can run inside any borrow of the world or the store; a
+        // busy world leaves the slot to the document's own teardown.
+        let Ok(world) = world.try_borrow() else {
+            return;
+        };
+        world.try_free_range(
+            self.registration.document.get(),
+            self.registration.slot.get(),
+        );
+    }
 }
 
 include!(concat!(env!("OUT_DIR"), "/Range.rs"));
@@ -60,14 +109,7 @@ impl super::host::SharedClass for JsRange {
 /// it. Backs `new Range()` through the brands constructor.
 pub(crate) fn new_range<'js>(ctx: &Ctx<'js>, root: NodeId) -> Result<Value<'js>> {
     let point = BoundaryPoint { node: root, offset: 0 };
-    let (document, slot) = alloc_range(
-        ctx,
-        root.document,
-        RangeState {
-            start: point,
-            end: point,
-        },
-    )?;
+    let (document, slot) = alloc_range(ctx, root.document, RangeState::collapsed(point))?;
     wrap_range(ctx, document, slot)
 }
 
@@ -90,6 +132,7 @@ fn synthetic_body_name() -> markup5ever::QualName {
 fn contextual_fragment_context(
     ctx: &Ctx<'_>,
     start: NodeId,
+    from_attribute: bool,
 ) -> Result<(NodeId, markup5ever::QualName, &'static str)> {
     let world_rc = world(ctx)?;
     let world = world_rc.borrow();
@@ -99,21 +142,27 @@ fn contextual_fragment_context(
     };
     let content_type = parsed.content_type;
     let base = &parsed.document.base;
-    let name = match base.get_node(start.node).map(|node| &node.data) {
-        Some(blitz_dom::NodeData::Element(element)) => Some((start, element.name.clone())),
-        Some(
-            blitz_dom::NodeData::Text(_)
-            | blitz_dom::NodeData::CDataSection { .. }
-            | blitz_dom::NodeData::Comment { .. },
-        ) => parent_of_raw(base, start).and_then(|parent| {
-            match base.get_node(parent.node).map(|node| &node.data) {
-                Some(blitz_dom::NodeData::Element(element)) => {
-                    Some((parent, element.name.clone()))
+    // An attribute has no parent element, so it has no element context
+    // either.
+    let name = if from_attribute {
+        None
+    } else {
+        match base.get_node(start.node).map(|node| &node.data) {
+            Some(blitz_dom::NodeData::Element(element)) => Some((start, element.name.clone())),
+            Some(
+                blitz_dom::NodeData::Text(_)
+                | blitz_dom::NodeData::CDataSection { .. }
+                | blitz_dom::NodeData::Comment { .. },
+            ) => parent_of_raw(base, start).and_then(|parent| {
+                match base.get_node(parent.node).map(|node| &node.data) {
+                    Some(blitz_dom::NodeData::Element(element)) => {
+                        Some((parent, element.name.clone()))
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        }),
-        _ => None,
+            }),
+            _ => None,
+        }
     };
     let (context, name) = name.unwrap_or((start, synthetic_body_name()));
     Ok((context, name, content_type))
@@ -337,8 +386,14 @@ fn xml_contextual_fragment<'js>(
 
 /// Create a contextual fragment from `markup` for the range's start node
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment>).
-fn create_contextual_fragment<'js>(ctx: &Ctx<'js>, start: NodeId, markup: &str) -> Result<Value<'js>> {
-    let (context, name, content_type) = contextual_fragment_context(ctx, start)?;
+fn create_contextual_fragment<'js>(
+    ctx: &Ctx<'js>,
+    start: NodeId,
+    from_attribute: bool,
+    markup: &str,
+) -> Result<Value<'js>> {
+    let (context, name, content_type) =
+        contextual_fragment_context(ctx, start, from_attribute)?;
     if content_type == "text/html" {
         html_contextual_fragment(ctx, context, markup, &name)
     } else {
@@ -354,14 +409,7 @@ pub(crate) fn create_range_value<'js>(ctx: &Ctx<'js>, document: NodeId) -> Resul
         node: document,
         offset: 0,
     };
-    let (store, slot) = alloc_range(
-        ctx,
-        document.document,
-        RangeState {
-            start: point,
-            end: point,
-        },
-    )?;
+    let (store, slot) = alloc_range(ctx, document.document, RangeState::collapsed(point))?;
     wrap_range(ctx, store, slot)
 }
 
@@ -376,33 +424,69 @@ pub(crate) fn wrap_range<'js>(ctx: &Ctx<'js>, document: u32, slot: usize) -> Res
         .ok_or_else(|| Exception::throw_internal(ctx, "missing Range prototype"))?;
     let proto = proto.restore(ctx)?;
     Ok(Class::into_value(instance_proto(
-        JsRange { document, slot },
+        JsRange {
+            registration: Registration {
+                document: Cell::new(document),
+                slot: Cell::new(slot),
+            },
+            owner: Owner(Rc::downgrade(&world)),
+        },
         proto,
     )?))
 }
 
-fn load(ctx: &Ctx<'_>, document: u32, slot: usize) -> Result<RangeState> {
-    let world_rc = world(ctx)?;
-    let world = world_rc.borrow();
-    let store = world.store();
-    store
-        .get(document)
-        .and_then(|parsed| parsed.document.ranges.get(slot))
-        .copied()
-        .ok_or_else(|| Exception::throw_type(ctx, "stale range"))
-}
+impl JsRange {
+    /// Reads the range's state from its slot.
+    fn load(&self, ctx: &Ctx<'_>) -> Result<RangeState> {
+        let world_rc = world(ctx)?;
+        let world = world_rc.borrow();
+        world
+            .store()
+            .get(self.registration.document.get())
+            .and_then(|parsed| {
+                parsed
+                    .document
+                    .ranges
+                    .get(self.registration.slot.get())
+            })
+            .ok_or_else(|| Exception::throw_type(ctx, "stale range"))
+    }
 
-fn save(ctx: &Ctx<'_>, document: u32, slot: usize, state: RangeState) -> Result<()> {
-    let world_rc = world(ctx)?;
-    let world = world_rc.borrow();
-    let Some(mut parsed) = world.document_mut_by_id(document) else {
-        return Err(Exception::throw_type(ctx, "stale range"));
-    };
-    let Some(entry) = parsed.document.ranges.get_mut(slot) else {
-        return Err(Exception::throw_type(ctx, "stale range"));
-    };
-    *entry = state;
-    Ok(())
+    /// Writes the state back, moving the slot to the boundary points'
+    /// document when they left the document that owns it: mutation hooks
+    /// only walk the table of the document being mutated
+    /// (<https://dom.spec.whatwg.org/#concept-range-bp-set>).
+    fn save(&self, ctx: &Ctx<'_>, state: RangeState) -> Result<()> {
+        let owner = self.registration.document.get();
+        let slot = self.registration.slot.get();
+        let target = state.document();
+        let world_rc = world(ctx)?;
+        let world = world_rc.borrow();
+        if target == owner {
+            let Some(mut parsed) = world.document_mut_by_id(owner) else {
+                return Err(Exception::throw_type(ctx, "stale range"));
+            };
+            if !parsed.document.ranges.set(slot, state) {
+                return Err(Exception::throw_type(ctx, "stale range"));
+            }
+            return Ok(());
+        }
+        {
+            let Some(mut parsed) = world.document_mut_by_id(owner) else {
+                return Err(Exception::throw_type(ctx, "stale range"));
+            };
+            parsed.document.ranges.free(slot);
+        }
+        let fresh = {
+            let Some(mut parsed) = world.document_mut_by_id(target) else {
+                return Err(Exception::throw_type(ctx, "stale range"));
+            };
+            parsed.document.ranges.alloc(state)
+        };
+        self.registration.document.set(target);
+        self.registration.slot.set(fresh);
+        Ok(())
+    }
 }
 
 fn alloc_range(ctx: &Ctx<'_>, document: u32, state: RangeState) -> Result<(u32, usize)> {
@@ -411,20 +495,60 @@ fn alloc_range(ctx: &Ctx<'_>, document: u32, state: RangeState) -> Result<(u32, 
     let Some(mut parsed) = world.document_mut_by_id(document) else {
         return Err(Exception::throw_type(ctx, "stale range"));
     };
-    let slot = ranges::alloc(&mut parsed.document.ranges, state);
+    let slot = parsed.document.ranges.alloc(state);
     Ok((parsed.id, slot))
 }
 
-/// Tree nodes hold boundary points; attribute nodes live outside the Blitz
-/// tree, so they are rejected until points can represent them.
+/// Tree nodes hold boundary points directly; attribute nodes live outside
+/// the Blitz tree and carry their registry id
+/// (<https://dom.spec.whatwg.org/#concept-range-bp>).
 fn tree_node(ctx: &Ctx<'_>, node: NodeReference) -> Result<NodeId> {
-    node.tree().ok_or_else(|| {
-        throw_dom(
-            ctx,
-            "InvalidNodeTypeError",
-            "attribute nodes cannot hold a range boundary",
-        )
-    })
+    node.tree()
+        .ok_or_else(|| throw_dom(ctx, "InvalidNodeTypeError", "the node has no parent"))
+}
+
+/// A validated boundary-point argument: a tree point, or an attribute point
+/// (whose length is zero, so its only offset is 0).
+#[derive(Clone, Copy)]
+enum PointArg {
+    Tree(BoundaryPoint),
+    Attribute(ranges::AttrPoint),
+}
+
+/// Validate one boundary-point argument: a doctype never holds a boundary
+/// point, and the offset must fit the node
+/// (<https://dom.spec.whatwg.org/#concept-range-bp-set>).
+fn check_point(ctx: &Ctx<'_>, node: NodeReference, offset: u32) -> Result<PointArg> {
+    match node {
+        NodeReference::Attribute { scope, id } => {
+            // An attribute is a node of length zero; only offset 0 fits
+            // (<https://dom.spec.whatwg.org/#concept-node-length>).
+            if offset != 0 {
+                return Err(throw_dom(
+                    ctx,
+                    "IndexSizeError",
+                    "an attribute's length is zero",
+                ));
+            }
+            Ok(PointArg::Attribute(ranges::AttrPoint { scope, id }))
+        }
+        NodeReference::Tree(id) => {
+            let point = read_document(ctx, id.document, |base| {
+                if ranges::is_doctype(base, id) {
+                    return Err(throw_dom(
+                        ctx,
+                        "InvalidNodeTypeError",
+                        "a doctype cannot hold a range boundary",
+                    ));
+                }
+                if offset > ranges::node_length(base, id) {
+                    return Err(throw_dom(ctx, "IndexSizeError", "offset is outside the node"));
+                }
+                Ok(BoundaryPoint { node: id, offset })
+            })?;
+            Ok(PointArg::Tree(point))
+        }
+    }
 }
 
 fn read_document<R>(
@@ -441,27 +565,6 @@ fn read_document<R>(
     read(&parsed.document.base)
 }
 
-/// Validate one boundary point: doctypes never hold one, and the offset must
-/// fit the node (<https://dom.spec.whatwg.org/#concept-range-bp>).
-fn check_point(
-    ctx: &Ctx<'_>,
-    base: &blitz_dom::BaseDocument,
-    node: NodeId,
-    offset: u32,
-) -> Result<BoundaryPoint> {
-    if ranges::is_doctype(base, node) {
-        return Err(throw_dom(
-            ctx,
-            "InvalidNodeTypeError",
-            "a doctype cannot hold a range boundary",
-        ));
-    }
-    if offset > ranges::node_length(base, node) {
-        return Err(throw_dom(ctx, "IndexSizeError", "offset is outside the node"));
-    }
-    Ok(BoundaryPoint { node, offset })
-}
-
 /// Whether two nodes share a root, resolving each side in its own arena.
 fn same_tree(ctx: &Ctx<'_>, a: NodeId, b: NodeId) -> Result<bool> {
     if a.document != b.document {
@@ -475,7 +578,12 @@ fn same_tree(ctx: &Ctx<'_>, a: NodeId, b: NodeId) -> Result<bool> {
 /// Set the start, collapsing the end when the roots differ or the new point
 /// passes it (<https://dom.spec.whatwg.org/#concept-range-set-the-start>).
 fn set_start_point(state: &mut RangeState, base: &blitz_dom::BaseDocument, point: BoundaryPoint) {
-    if !ranges::same_root(base, state.start.node, point.node)
+    // An attribute point never shares a root with a tree point, and the
+    // state's flag forces the collapse when the range leaves one
+    // (<https://dom.spec.whatwg.org/#concept-range-bp-set>).
+    let left_attribute = state.attr.take().is_some();
+    if left_attribute
+        || !ranges::same_root(base, state.start.node, point.node)
         || ranges::position(base, point.node.document, point, state.end) == Ordering::Greater
     {
         state.end = point;
@@ -486,12 +594,44 @@ fn set_start_point(state: &mut RangeState, base: &blitz_dom::BaseDocument, point
 /// Set the end, collapsing the start when the roots differ or the new point
 /// precedes it (<https://dom.spec.whatwg.org/#concept-range-set-the-end>).
 fn set_end_point(state: &mut RangeState, base: &blitz_dom::BaseDocument, point: BoundaryPoint) {
-    if !ranges::same_root(base, state.end.node, point.node)
+    let left_attribute = state.attr.take().is_some();
+    if left_attribute
+        || !ranges::same_root(base, state.end.node, point.node)
         || ranges::position(base, point.node.document, point, state.start) == Ordering::Less
     {
         state.start = point;
     }
     state.end = point;
+}
+
+/// Set the start from a validated argument: an attribute point collapses the
+/// range onto the attribute, whose root is itself
+/// (<https://dom.spec.whatwg.org/#concept-range-bp-set>).
+fn apply_start(ctx: &Ctx<'_>, state: &mut RangeState, arg: PointArg) -> Result<()> {
+    match arg {
+        PointArg::Attribute(attr) => {
+            *state = RangeState::attribute(attr);
+            Ok(())
+        }
+        PointArg::Tree(point) => read_document(ctx, point.node.document, |base| {
+            set_start_point(state, base, point);
+            Ok(())
+        }),
+    }
+}
+
+/// Set the end from a validated argument; see `apply_start`.
+fn apply_end(ctx: &Ctx<'_>, state: &mut RangeState, arg: PointArg) -> Result<()> {
+    match arg {
+        PointArg::Attribute(attr) => {
+            *state = RangeState::attribute(attr);
+            Ok(())
+        }
+        PointArg::Tree(point) => read_document(ctx, point.node.document, |base| {
+            set_end_point(state, base, point);
+            Ok(())
+        }),
+    }
 }
 
 /// The index of `child` in its parent, for the sibling-boundary setters.
@@ -508,9 +648,59 @@ fn child_index_of(
         .ok_or_else(|| Exception::throw_type(ctx, "stale range"))
 }
 
+/// The parent and reference child an inserted node lands between
+/// (<https://dom.spec.whatwg.org/#concept-range-insert>): the start node
+/// itself when it takes children, or the start node's parent when the start
+/// is a Text node.
+fn insert_node_target(
+    ctx: &Ctx<'_>,
+    state: &RangeState,
+    arg: NodeId,
+) -> Result<(NodeId, Option<NodeId>)> {
+    read_document(ctx, state.start.node.document, |base| {
+        let start_kind = base.get_node(state.start.node.node).map(|node| &node.data);
+        if matches!(
+            start_kind,
+            Some(
+                blitz_dom::NodeData::ProcessingInstruction { .. }
+                    | blitz_dom::NodeData::Comment { .. }
+            )
+        ) {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "a range starting in a PI or comment takes no nodes",
+            ));
+        }
+        if ranges::is_text(base, state.start.node) && parent_of_raw(base, state.start.node).is_none()
+        {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "a range starting in detached text takes no nodes",
+            ));
+        }
+        if arg == state.start.node {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "a range cannot be inserted into itself",
+            ));
+        }
+        if ranges::is_text(base, state.start.node) {
+            let reference = state.start.node;
+            let parent = parent_of(ctx, base, reference)?;
+            Ok((parent, Some(reference)))
+        } else {
+            let children = child_ids(base, state.start.node.document, state.start.node.node);
+            let reference = children.get(state.start.offset as usize).copied();
+            Ok((state.start.node, reference))
+        }
+    })
+}
+
 /// Clamp an IDL offset into UTF-16 units.
-fn bound(offset: u32, length: usize) -> usize {
-    (offset as usize).min(length)
+fn bound(offset: u32, length: usize) -> usize {    (offset as usize).min(length)
 }
 
 /// The single point deleteContents and extractContents collapse to, from the
@@ -593,15 +783,19 @@ fn move_nodes_out(ctx: &Ctx<'_>, nodes: &[NodeId], fragment: Option<NodeId>) -> 
         iframes.extend(iframe_containers_in_subtrees(&parsed, &[*node]));
     }
     {
-        let world = world_rc.borrow();
         for node in nodes {
-            let Some(mut parsed) = world.document_mut(*node) else {
-                return Err(Exception::throw_type(ctx, "stale range"));
-            };
-            unlink_journaled(&mut parsed, *node);
-            if let Some(fragment) = fragment {
-                place_journaled(&mut parsed, fragment, *node, None);
+            {
+                let world = world_rc.borrow();
+                let Some(mut parsed) = world.document_mut(*node) else {
+                    return Err(Exception::throw_type(ctx, "stale range"));
+                };
+                unlink_journaled(&mut parsed, *node);
+                if let Some(fragment) = fragment {
+                    place_journaled(&mut parsed, fragment, *node, None);
+                }
             }
+            // The focus fixup borrows the world mutably, so it runs after
+            // the tree borrows end.
             fixup_focus_after_removal(ctx, *node)?;
         }
     }
@@ -744,10 +938,20 @@ fn transfer_endpoint_text(
     transfer: ContentsTransfer,
 ) -> Result<()> {
     let data = character_data(ctx, node)?.units().into_owned();
-    let (slice, kept) = split_endpoint_data(data, offset, at_start);
+    let length = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    let (slice, _) = split_endpoint_data(data, offset, at_start);
     clone_into_fragment(ctx, fragment, node, false, Some(slice))?;
     if transfer == ContentsTransfer::Moved {
-        set_character_data(ctx, node, &DomString::from_utf16(kept))?;
+        // The in-range slice leaves the source: the tail for a start
+        // endpoint, the head for an end one, as one `replace data` span so
+        // ranges in the node adjust by it
+        // (<https://dom.spec.whatwg.org/#concept-range-extract>).
+        let (from, count) = if at_start {
+            (offset, length.saturating_sub(offset))
+        } else {
+            (0, offset)
+        };
+        replace_character_data(ctx, node, from, count, &DomString::default())?;
     }
     Ok(())
 }
@@ -858,9 +1062,16 @@ fn produce_contents(
             Some(data[start..end].to_vec()),
         )?;
         if transfer == ContentsTransfer::Moved {
-            let mut kept = data;
-            kept.drain(start..end);
-            set_character_data(ctx, snode, &DomString::from_utf16(kept))?;
+            // One `replace data` span: the range collapses onto the slice
+            // start through the generic rule
+            // (<https://dom.spec.whatwg.org/#concept-range-extract>).
+            replace_character_data(
+                ctx,
+                snode,
+                soff,
+                eoff.saturating_sub(soff),
+                &DomString::default(),
+            )?;
         }
         return Ok(());
     }
@@ -874,6 +1085,7 @@ fn produce_contents(
                     Ok(ranges::node_length(base, first))
                 })?,
             },
+            attr: None,
         };
         transfer_partial_endpoint(ctx, fragment, &sub, first, true, transfer)?;
     }
@@ -882,6 +1094,7 @@ fn produce_contents(
         let sub = RangeState {
             start: BoundaryPoint { node: last, offset: 0 },
             end: BoundaryPoint { node: enode, offset: eoff },
+            attr: None,
         };
         transfer_partial_endpoint(ctx, fragment, &sub, last, false, transfer)?;
     }
@@ -972,7 +1185,12 @@ fn ensure_element_parent(ctx: &Ctx<'_>, new_parent: NodeId) -> Result<()> {
 impl<'js> range_generated::Range<'js> for JsRange {
     // https://dom.spec.whatwg.org/#dom-range-commonancestorcontainer
     fn get_common_ancestor_container(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let state = load(ctx, self.document, self.slot)?;
+        let state = self.load(ctx)?;
+        if let Some(attr) = state.attr {
+            // An attribute's root is itself, so it is its own common ancestor
+            // (<https://dom.spec.whatwg.org/#concept-range-common-ancestor>).
+            return attr_wrapper(ctx, attr.id);
+        }
         if !same_tree(ctx, state.start.node, state.end.node)? {
             return Ok(Value::new_null(ctx.clone()));
         }
@@ -984,32 +1202,22 @@ impl<'js> range_generated::Range<'js> for JsRange {
 
     // https://dom.spec.whatwg.org/#dom-range-setstart
     fn set_start(&self, ctx: Ctx<'js>, node: NodeReference, offset: u32) -> Result<()> {
-        let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
-        read_document(&ctx, id.document, |base| {
-            let point = check_point(&ctx, base, id, offset)?;
-            set_start_point(&mut state, base, point);
-            Ok(())
-        })?;
-        save(&ctx, self.document, self.slot, state)
+        let mut state = self.load(&ctx)?;
+        apply_start(&ctx, &mut state, check_point(&ctx, node, offset)?)?;
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-setend
     fn set_end(&self, ctx: Ctx<'js>, node: NodeReference, offset: u32) -> Result<()> {
-        let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
-        read_document(&ctx, id.document, |base| {
-            let point = check_point(&ctx, base, id, offset)?;
-            set_end_point(&mut state, base, point);
-            Ok(())
-        })?;
-        save(&ctx, self.document, self.slot, state)
+        let mut state = self.load(&ctx)?;
+        apply_end(&ctx, &mut state, check_point(&ctx, node, offset)?)?;
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-setstartbefore
     fn set_start_before(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
         let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
+        let mut state = self.load(&ctx)?;
         read_document(&ctx, id.document, |base| {
             let parent = parent_of(&ctx, base, id)?;
             let index = child_index_of(&ctx, base, parent, id)?;
@@ -1020,13 +1228,13 @@ impl<'js> range_generated::Range<'js> for JsRange {
             );
             Ok(())
         })?;
-        save(&ctx, self.document, self.slot, state)
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-setstartafter
     fn set_start_after(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
         let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
+        let mut state = self.load(&ctx)?;
         read_document(&ctx, id.document, |base| {
             let parent = parent_of(&ctx, base, id)?;
             let index = child_index_of(&ctx, base, parent, id)?;
@@ -1040,13 +1248,13 @@ impl<'js> range_generated::Range<'js> for JsRange {
             );
             Ok(())
         })?;
-        save(&ctx, self.document, self.slot, state)
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-setendbefore
     fn set_end_before(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
         let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
+        let mut state = self.load(&ctx)?;
         read_document(&ctx, id.document, |base| {
             let parent = parent_of(&ctx, base, id)?;
             let index = child_index_of(&ctx, base, parent, id)?;
@@ -1057,13 +1265,13 @@ impl<'js> range_generated::Range<'js> for JsRange {
             );
             Ok(())
         })?;
-        save(&ctx, self.document, self.slot, state)
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-setendafter
     fn set_end_after(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
         let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
+        let mut state = self.load(&ctx)?;
         read_document(&ctx, id.document, |base| {
             let parent = parent_of(&ctx, base, id)?;
             let index = child_index_of(&ctx, base, parent, id)?;
@@ -1077,24 +1285,24 @@ impl<'js> range_generated::Range<'js> for JsRange {
             );
             Ok(())
         })?;
-        save(&ctx, self.document, self.slot, state)
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-collapse
     fn collapse(&self, ctx: Ctx<'js>, to_start: bool) -> Result<()> {
-        let mut state = load(&ctx, self.document, self.slot)?;
+        let mut state = self.load(&ctx)?;
         if to_start {
             state.end = state.start;
         } else {
             state.start = state.end;
         }
-        save(&ctx, self.document, self.slot, state)
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-selectnode
     fn select_node(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
         let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
+        let mut state = self.load(&ctx)?;
         read_document(&ctx, id.document, |base| {
             let parent = parent_of(&ctx, base, id)?;
             let index = child_index_of(&ctx, base, parent, id)?;
@@ -1105,27 +1313,30 @@ impl<'js> range_generated::Range<'js> for JsRange {
             };
             Ok(())
         })?;
-        save(&ctx, self.document, self.slot, state)
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-selectnodecontents
     fn select_node_contents(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
-        let id = tree_node(&ctx, node)?;
-        let mut state = load(&ctx, self.document, self.slot)?;
-        read_document(&ctx, id.document, |base| {
-            if ranges::is_doctype(base, id) {
-                return Err(throw_dom(
-                    &ctx,
-                    "InvalidNodeTypeError",
-                    "a doctype cannot hold a range boundary",
-                ));
+        let mut state = self.load(&ctx)?;
+        match check_point(&ctx, node, 0)? {
+            PointArg::Attribute(attr) => {
+                // An attribute's length is zero, so the selection is its one
+                // point (<https://dom.spec.whatwg.org/#dom-range-selectnodecontents>).
+                state = RangeState::attribute(attr);
             }
-            let length = ranges::node_length(base, id);
-            state.start = BoundaryPoint { node: id, offset: 0 };
-            state.end = BoundaryPoint { node: id, offset: length };
-            Ok(())
-        })?;
-        save(&ctx, self.document, self.slot, state)
+            PointArg::Tree(start) => {
+                let id = start.node;
+                read_document(&ctx, id.document, |base| {
+                    let length = ranges::node_length(base, id);
+                    state.start = BoundaryPoint { node: id, offset: 0 };
+                    state.end = BoundaryPoint { node: id, offset: length };
+                    state.attr = None;
+                    Ok(())
+                })?;
+            }
+        }
+        self.save(&ctx, state)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-compareboundarypoints
@@ -1146,8 +1357,22 @@ impl<'js> range_generated::Range<'js> for JsRange {
                 "unknown boundary comparison",
             ));
         }
-        let other = load(&ctx, source.document, source.slot)?;
-        let state = load(&ctx, self.document, self.slot)?;
+        let other = source.load(&ctx)?;
+        let state = self.load(&ctx)?;
+        // An attribute's root is itself, so attribute points only share a
+        // root with points in the same attribute
+        // (<https://dom.spec.whatwg.org/#concept-range-root>).
+        match (state.attr, other.attr) {
+            (Some(mine), Some(theirs)) if mine == theirs => return Ok(0),
+            (Some(_), _) | (_, Some(_)) => {
+                return Err(throw_dom(
+                    &ctx,
+                    "WrongDocumentError",
+                    "ranges live in different trees",
+                ));
+            }
+            (None, None) => {}
+        }
         if !same_tree(&ctx, state.start.node, other.start.node)? {
             return Err(throw_dom(
                 &ctx,
@@ -1172,8 +1397,8 @@ impl<'js> range_generated::Range<'js> for JsRange {
 
     // https://dom.spec.whatwg.org/#dom-range-clonerange
     fn clone_range(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let state = load(&ctx, self.document, self.slot)?;
-        let (document, slot) = alloc_range(&ctx, self.document, state)?;
+        let state = self.load(&ctx)?;
+        let (document, slot) = alloc_range(&ctx, self.registration.document.get(), state)?;
         wrap_range(&ctx, document, slot)
     }
 
@@ -1184,11 +1409,16 @@ impl<'js> range_generated::Range<'js> for JsRange {
 
     // https://dom.spec.whatwg.org/#dom-range-stringifier
     fn stringifier(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let state = load(ctx, self.document, self.slot)?;
+        let state = self.load(ctx)?;
+        if state.attr.is_some() {
+            // An attribute is not a Text node, so nothing stringifies
+            // (<https://dom.spec.whatwg.org/#dom-range-stringifier>).
+            return rquickjs::String::from_str(ctx.clone(), "");
+        }
         let world_rc = world(ctx)?;
         let world = world_rc.borrow();
         let store = world.store();
-        let Some(parsed) = store.get(self.document) else {
+        let Some(parsed) = store.get(self.registration.document.get()) else {
             return Err(Exception::throw_type(ctx, "stale range"));
         };
         let units = ranges::range_text(&parsed.document, parsed.id, &state);
@@ -1201,9 +1431,9 @@ impl<'js> range_generated::Range<'js> for JsRange {
         ctx: Ctx<'js>,
         arg_0: rquickjs::String<'js>,
     ) -> Result<Value<'js>> {
-        let state = load(&ctx, self.document, self.slot)?;
+        let state = self.load(&ctx)?;
         let markup = arg_0.to_string()?;
-        create_contextual_fragment(&ctx, state.start.node, &markup)
+        create_contextual_fragment(&ctx, state.start.node, state.attr.is_some(), &markup)
     }
 
     // https://dom.spec.whatwg.org/#dom-range-ispointinrange
@@ -1213,49 +1443,88 @@ impl<'js> range_generated::Range<'js> for JsRange {
         node: NodeReference,
         offset: u32,
     ) -> Result<bool> {
-        let id = tree_node(&ctx, node)?;
-        let state = load(&ctx, self.document, self.slot)?;
-        if !same_tree(&ctx, id, state.start.node)? {
+        let state = self.load(&ctx)?;
+        // The root check precedes the doctype and offset checks
+        // (<https://dom.spec.whatwg.org/#dom-range-ispointinrange>).
+        let same_root = match node {
+            NodeReference::Attribute { scope, id } => {
+                state.attr == Some(ranges::AttrPoint { scope, id })
+            }
+            NodeReference::Tree(id) => {
+                state.attr.is_none() && same_tree(&ctx, id, state.start.node)?
+            }
+        };
+        if !same_root {
             return Ok(false);
         }
-        read_document(&ctx, id.document, |base| {
-            let point = check_point(&ctx, base, id, offset)?;
-            Ok(
-                ranges::position(base, id.document, point, state.start) != Ordering::Less
-                    && ranges::position(base, id.document, point, state.end) != Ordering::Greater,
-            )
-        })
+        match check_point(&ctx, node, offset)? {
+            PointArg::Attribute(_) => Ok(true),
+            PointArg::Tree(point) => {
+                let id = point.node;
+                read_document(&ctx, id.document, |base| {
+                    Ok(
+                        ranges::position(base, id.document, point, state.start)
+                            != Ordering::Less
+                            && ranges::position(base, id.document, point, state.end)
+                                != Ordering::Greater,
+                    )
+                })
+            }
+        }
     }
 
     // https://dom.spec.whatwg.org/#dom-range-comparepoint
     fn compare_point(&self, ctx: Ctx<'js>, node: NodeReference, offset: u32) -> Result<i16> {
-        let id = tree_node(&ctx, node)?;
-        let state = load(&ctx, self.document, self.slot)?;
-        if !same_tree(&ctx, id, state.start.node)? {
+        let state = self.load(&ctx)?;
+        // The root check precedes the doctype and offset checks
+        // (<https://dom.spec.whatwg.org/#dom-range-comparepoint>).
+        let same_root = match node {
+            NodeReference::Attribute { scope, id } => {
+                state.attr == Some(ranges::AttrPoint { scope, id })
+            }
+            NodeReference::Tree(id) => {
+                state.attr.is_none() && same_tree(&ctx, id, state.start.node)?
+            }
+        };
+        if !same_root {
             return Err(throw_dom(
                 &ctx,
                 "WrongDocumentError",
                 "the point lives in a different tree",
             ));
         }
-        read_document(&ctx, id.document, |base| {
-            let point = check_point(&ctx, base, id, offset)?;
-            if ranges::position(base, id.document, point, state.start) == Ordering::Less {
-                Ok(-1)
-            } else if ranges::position(base, id.document, point, state.end) == Ordering::Greater
-            {
-                Ok(1)
-            } else {
-                Ok(0)
+        match check_point(&ctx, node, offset)? {
+            PointArg::Attribute(_) => Ok(0),
+            PointArg::Tree(point) => {
+                let id = point.node;
+                read_document(&ctx, id.document, |base| {
+                    if ranges::position(base, id.document, point, state.start) == Ordering::Less {
+                        Ok(-1)
+                    } else if ranges::position(base, id.document, point, state.end)
+                        == Ordering::Greater
+                    {
+                        Ok(1)
+                    } else {
+                        Ok(0)
+                    }
+                })
             }
-        })
+        }
     }
 
     // https://dom.spec.whatwg.org/#dom-range-intersectsnode
     fn intersects_node(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<bool> {
-        let id = tree_node(&ctx, node)?;
-        let state = load(&ctx, self.document, self.slot)?;
-        if !same_tree(&ctx, id, state.start.node)? {
+        let state = self.load(&ctx)?;
+        let id = match node {
+            NodeReference::Attribute { scope, id } => {
+                // An attribute has no parent, so it intersects exactly when it
+                // is the range's own point
+                // (<https://dom.spec.whatwg.org/#dom-range-intersectsnode>).
+                return Ok(state.attr == Some(ranges::AttrPoint { scope, id }));
+            }
+            NodeReference::Tree(id) => id,
+        };
+        if state.attr.is_some() || !same_tree(&ctx, id, state.start.node)? {
             return Ok(false);
         }
         read_document(&ctx, id.document, |base| {
@@ -1284,7 +1553,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
 
     // https://dom.spec.whatwg.org/#dom-range-deletecontents
     fn delete_contents(&self, ctx: Ctx<'js>) -> Result<()> {
-        let state = load(&ctx, self.document, self.slot)?;
+        let state = self.load(&ctx)?;
         if state.start == state.end {
             return Ok(());
         }
@@ -1300,10 +1569,16 @@ impl<'js> range_generated::Range<'js> for JsRange {
             Ok(snode == enode && ranges::is_character_data(base, snode))
         })?;
         if same_text {
-            let data = character_data(&ctx, snode)?.units().into_owned();
-            let mut kept = data;
-            kept.drain(bound(soff, kept.len())..bound(eoff, kept.len()).max(bound(soff, kept.len())));
-            set_character_data(&ctx, snode, &DomString::from_utf16(kept))?;
+            // Replace data with the deleted span; the range collapses onto
+            // its start through the generic rule
+            // (<https://dom.spec.whatwg.org/#dom-range-deletecontents>).
+            replace_character_data(
+                &ctx,
+                snode,
+                soff,
+                eoff.saturating_sub(soff),
+                &DomString::default(),
+            )?;
             return Ok(());
         }
         let (new_node, new_offset, doomed, start_text, end_text) =
@@ -1322,33 +1597,23 @@ impl<'js> range_generated::Range<'js> for JsRange {
             })?;
         // Collapse first; later mutations track every range through the
         // generic hooks.
-        save(
+        self.save(
             &ctx,
-            self.document,
-            self.slot,
-            RangeState {
-                start: BoundaryPoint {
-                    node: new_node,
-                    offset: new_offset,
-                },
-                end: BoundaryPoint {
-                    node: new_node,
-                    offset: new_offset,
-                },
-            },
+            RangeState::collapsed(BoundaryPoint {
+                node: new_node,
+                offset: new_offset,
+            }),
         )?;
         if start_text {
-            let data = character_data(&ctx, snode)?.units().into_owned();
-            let mut kept = data;
-            kept.drain(bound(soff, kept.len())..);
-            set_character_data(&ctx, snode, &DomString::from_utf16(kept))?;
+            // Replace data with the in-range tail
+            // (<https://dom.spec.whatwg.org/#dom-range-deletecontents>).
+            replace_character_data(&ctx, snode, soff, u32::MAX, &DomString::default())?;
         }
         move_nodes_out(&ctx, &doomed, None)?;
         if end_text {
-            let data = character_data(&ctx, enode)?.units().into_owned();
-            let mut kept = data;
-            kept.drain(..bound(eoff, kept.len()));
-            set_character_data(&ctx, enode, &DomString::from_utf16(kept))?;
+            // Replace data with the out-of-range head
+            // (<https://dom.spec.whatwg.org/#dom-range-deletecontents>).
+            replace_character_data(&ctx, enode, 0, eoff, &DomString::default())?;
         }
         schedule_mutation_delivery(&ctx)?;
         Ok(())
@@ -1356,7 +1621,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
 
     // https://dom.spec.whatwg.org/#dom-range-extractcontents
     fn extract_contents(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let state = load(&ctx, self.document, self.slot)?;
+        let state = self.load(&ctx)?;
         let fragment = create_fragment_in(&ctx, state.start.node.document)?;
         self.extract_into_slot(&ctx, fragment, &state)?;
         wrap_node(&ctx, fragment)
@@ -1364,7 +1629,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
 
     // https://dom.spec.whatwg.org/#dom-range-clonecontents
     fn clone_contents(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let state = load(&ctx, self.document, self.slot)?;
+        let state = self.load(&ctx)?;
         let fragment = create_fragment_in(&ctx, state.start.node.document)?;
         clone_into(&ctx, fragment, &state)?;
         wrap_node(&ctx, fragment)
@@ -1372,52 +1637,30 @@ impl<'js> range_generated::Range<'js> for JsRange {
 
     // https://dom.spec.whatwg.org/#dom-range-insertnode
     fn insert_node(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
-        let arg = tree_node(&ctx, node)?;
-        let state = load(&ctx, self.document, self.slot)?;
-        let (parent, reference) = read_document(&ctx, state.start.node.document, |base| {
-            let start_kind = base.get_node(state.start.node.node).map(|node| &node.data);
-            if matches!(
-                start_kind,
-                Some(
-                    blitz_dom::NodeData::ProcessingInstruction { .. }
-                        | blitz_dom::NodeData::Comment { .. }
-                )
-            ) {
+        let arg = match node {
+            NodeReference::Attribute { .. } => {
+                // Pre-insertion validity rejects anything but a fragment,
+                // doctype, element, character data, or PI
+                // (<https://dom.spec.whatwg.org/#concept-node-pre-insert>).
                 return Err(throw_dom(
                     &ctx,
                     "HierarchyRequestError",
-                    "a range starting in a PI or comment takes no nodes",
+                    "an attribute cannot be inserted",
                 ));
             }
-            if ranges::is_text(base, state.start.node)
-                && parent_of_raw(base, state.start.node).is_none()
-            {
-                return Err(throw_dom(
-                    &ctx,
-                    "HierarchyRequestError",
-                    "a range starting in detached text takes no nodes",
-                ));
-            }
-            if arg == state.start.node {
-                return Err(throw_dom(
-                    &ctx,
-                    "HierarchyRequestError",
-                    "a range cannot be inserted into itself",
-                ));
-            }
-            if ranges::is_text(base, state.start.node) {
-                let reference = state.start.node;
-                let parent = parent_of(&ctx, base, reference)?;
-                Ok((parent, Some(reference)))
-            } else {
-                let children =
-                    child_ids(base, state.start.node.document, state.start.node.node);
-                let reference = children
-                    .get(state.start.offset as usize)
-                    .copied();
-                Ok((state.start.node, reference))
-            }
-        })?;
+            NodeReference::Tree(id) => id,
+        };
+        let state = self.load(&ctx)?;
+        if state.attr.is_some() {
+            // An attribute takes no children, so pre-insertion validity fails
+            // (<https://dom.spec.whatwg.org/#concept-range-insert>).
+            return Err(throw_dom(
+                &ctx,
+                "HierarchyRequestError",
+                "an attribute takes no nodes",
+            ));
+        }
+        let (parent, reference) = insert_node_target(&ctx, &state, arg)?;
         let (node, reference) =
             insertion_tree_nodes(&ctx, parent, node, reference.map(NodeReference::Tree))?;
         let node = adopt_node(&ctx, parent, node)?;
@@ -1443,7 +1686,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
         insert_tree_node(&ctx, parent, node, reference)?;
         // A collapsed range selects the inserted content; anything else rode
         // the generic adjustments.
-        let state = load(&ctx, self.document, self.slot)?;
+        let state = self.load(&ctx)?;
         if state.start == state.end {
             let new_offset = read_document(&ctx, parent.document, |base| {
                 Ok(match reference {
@@ -1455,16 +1698,13 @@ impl<'js> range_generated::Range<'js> for JsRange {
                     None => ranges::node_length(base, parent),
                 })
             })?;
-            save(
-                &ctx,
-                self.document,
-                self.slot,
-                RangeState {
+            self.save(&ctx, RangeState {
                     start: state.start,
                     end: BoundaryPoint {
                         node: parent,
                         offset: new_offset,
                     },
+                    attr: None,
                 },
             )?;
         }
@@ -1474,7 +1714,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
     // https://dom.spec.whatwg.org/#dom-range-surroundcontents
     fn surround_contents(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<()> {
         let new_parent = tree_node(&ctx, node)?;
-        let state = load(&ctx, self.document, self.slot)?;
+        let state = self.load(&ctx)?;
         // The partially-contained check runs before the newParent type check
         // (<https://dom.spec.whatwg.org/#dom-range-surroundcontents>).
         read_document(&ctx, state.start.node.document, |base| {
@@ -1532,16 +1772,13 @@ impl<'js> range_generated::Range<'js> for JsRange {
             let index = child_index_of(&ctx, base, parent, new_parent)?;
             Ok((parent, index))
         })?;
-        save(
-            &ctx,
-            self.document,
-            self.slot,
-            RangeState {
+        self.save(&ctx, RangeState {
                 start: BoundaryPoint { node: parent, offset: index },
                 end: BoundaryPoint {
                     node: parent,
                     offset: index.saturating_add(1),
                 },
+                attr: None,
             },
         )?;
         schedule_mutation_delivery(&ctx)?;
@@ -1552,32 +1789,45 @@ impl<'js> range_generated::Range<'js> for JsRange {
 impl<'js> abstract_range_generated::AbstractRange<'js> for JsRange {
     // https://dom.spec.whatwg.org/#dom-abstractrange-startcontainer
     fn get_start_container(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let state = load(ctx, self.document, self.slot)?;
-        wrap_node(ctx, state.start.node)
+        let state = self.load(ctx)?;
+        match state.attr {
+            Some(attr) => attr_wrapper(ctx, attr.id),
+            None => wrap_node(ctx, state.start.node),
+        }
     }
 
     // https://dom.spec.whatwg.org/#dom-abstractrange-startoffset
     fn get_start_offset(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        let offset = load(ctx, self.document, self.slot)?.start.offset;
-        Ok(usize::try_from(offset).unwrap_or(usize::MAX))
+        let state = self.load(ctx)?;
+        if state.attr.is_some() {
+            // An attribute's length is zero, so its offset is always 0.
+            return Ok(0);
+        }
+        Ok(usize::try_from(state.start.offset).unwrap_or(usize::MAX))
     }
 
     // https://dom.spec.whatwg.org/#dom-abstractrange-endcontainer
     fn get_end_container(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let state = load(ctx, self.document, self.slot)?;
-        wrap_node(ctx, state.end.node)
+        let state = self.load(ctx)?;
+        match state.attr {
+            Some(attr) => attr_wrapper(ctx, attr.id),
+            None => wrap_node(ctx, state.end.node),
+        }
     }
 
     // https://dom.spec.whatwg.org/#dom-abstractrange-endoffset
     fn get_end_offset(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        let offset = load(ctx, self.document, self.slot)?.end.offset;
-        Ok(usize::try_from(offset).unwrap_or(usize::MAX))
+        let state = self.load(ctx)?;
+        if state.attr.is_some() {
+            return Ok(0);
+        }
+        Ok(usize::try_from(state.end.offset).unwrap_or(usize::MAX))
     }
 
     // https://dom.spec.whatwg.org/#dom-abstractrange-collapsed
     fn get_collapsed(&self, ctx: &Ctx<'js>) -> Result<bool> {
-        let state = load(ctx, self.document, self.slot)?;
-        Ok(state.start == state.end)
+        let state = self.load(ctx)?;
+        Ok(state.attr.is_some() || state.start == state.end)
     }
 }
 
@@ -1586,35 +1836,31 @@ impl<'js> abstract_range_generated::AbstractRange<'js> for JsRange {
 /// steps overwrite the points again.
 impl JsRange {
     fn extract_into_slot(&self, ctx: &Ctx<'_>, fragment: NodeId, state: &RangeState) -> Result<()> {
+        // A collapsed range returns the empty fragment untouched, which also
+        // keeps an attribute point (and its placeholder) intact
+        // (<https://dom.spec.whatwg.org/#concept-range-extract>).
+        if state.start == state.end {
+            return Ok(());
+        }
         // The doctype rejection precedes the range update
         // (<https://dom.spec.whatwg.org/#concept-range-extract>).
-        if state.start != state.end {
-            let same_text = read_document(ctx, state.start.node.document, |base| {
-                Ok(state.start.node == state.end.node
-                    && ranges::is_character_data(base, state.start.node))
-            })?;
-            if !same_text {
-                let (_, _, _, _, _, contained, _) = span_parts(ctx, state)?;
-                reject_span_doctypes(ctx, &contained, "extracted")?;
-            }
+        let same_text = read_document(ctx, state.start.node.document, |base| {
+            Ok(state.start.node == state.end.node
+                && ranges::is_character_data(base, state.start.node))
+        })?;
+        if !same_text {
+            let (_, _, _, _, _, contained, _) = span_parts(ctx, state)?;
+            reject_span_doctypes(ctx, &contained, "extracted")?;
         }
         let (new_node, new_offset) = read_document(ctx, state.start.node.document, |base| {
             Ok(collapse_point(base, state))
         })?;
-        save(
+        self.save(
             ctx,
-            self.document,
-            self.slot,
-            RangeState {
-                start: BoundaryPoint {
-                    node: new_node,
-                    offset: new_offset,
-                },
-                end: BoundaryPoint {
-                    node: new_node,
-                    offset: new_offset,
-                },
-            },
+            RangeState::collapsed(BoundaryPoint {
+                node: new_node,
+                offset: new_offset,
+            }),
         )?;
         extract_into(ctx, fragment, state)?;
         Ok(())

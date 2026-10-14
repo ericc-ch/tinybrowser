@@ -979,6 +979,21 @@ impl World {
         .ok()
     }
 
+    /// Frees a live-range slot when the document store is free.
+    ///
+    /// The range finalizer runs at an arbitrary point, possibly inside a
+    /// borrow of the store, so a busy store silently leaves the slot to the
+    /// document's own teardown
+    /// (<https://dom.spec.whatwg.org/#concept-range>).
+    pub(crate) fn try_free_range(&self, document: u32, slot: usize) {
+        let Ok(mut documents) = self.runtime.documents.try_borrow_mut() else {
+            return;
+        };
+        if let Some(parsed) = documents.get_mut(document) {
+            parsed.document.ranges.free(slot);
+        }
+    }
+
     /// Stores a secondary document and returns its root id.
     pub(crate) fn add_document(&mut self, parsed: Parsed) -> NodeId {
         let node = parsed.document.base.root_node().id;

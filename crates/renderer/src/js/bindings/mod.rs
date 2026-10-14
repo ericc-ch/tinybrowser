@@ -1212,20 +1212,36 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
 }
 
 /// [Replaces data](https://dom.spec.whatwg.org/#concept-cd-replace) on a
-/// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
+/// `CharacterData` node: `count` code units at `offset` become `data`.
+/// Callers pass the real span (`insertData` uses a zero count, `deleteData`
+/// an empty replacement); live ranges adjust by that span, not by the whole
+/// write.
 ///
 /// The tree stores UTF-8, so lone surrogates land as the replacement
 /// character (see `docs/progress.md`); the algorithms otherwise operate on
 /// UTF-16 code units.
-pub(super) fn set_character_data(
+pub(super) fn replace_character_data(
     ctx: &Ctx<'_>,
     id: NodeId,
+    offset: u32,
+    count: u32,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
     // Replacing data on a processing instruction reparses its attribute map
     // unless the caller already updated the map
     // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
-    set_character_data_inner(ctx, id, data, true)
+    replace_character_data_inner(ctx, id, offset, count, data, true)
+}
+
+/// Whole-data replacement: the `data`, `nodeValue`, and `textContent`
+/// setters, and any internal write whose spec step is "replace data with 0,
+/// the node's length, and data".
+pub(super) fn set_character_data(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    data: &crate::dom_string::DomString,
+) -> Result<()> {
+    replace_character_data_inner(ctx, id, 0, u32::MAX, data, true)
 }
 
 /// Replaces character data without reparsing a processing instruction's
@@ -1237,16 +1253,75 @@ pub(super) fn set_pi_data(
     id: NodeId,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    set_character_data_inner(ctx, id, data, false)
+    replace_character_data_inner(ctx, id, 0, u32::MAX, data, false)
 }
 
-fn set_character_data_inner(
+/// Writes `utf8` as the node's whole data, by kind. Returns false when the
+/// node holds no character data.
+fn write_character_data(
+    base: &mut blitz_dom::BaseDocument,
+    id: NodeId,
+    utf8: &str,
+) -> bool {
+    let Some(node) = base.get_node(id.node) else {
+        return false;
+    };
+    match &node.data {
+        NodeData::Text(_) => {
+            base.mutate().set_node_text(id.node, utf8);
+            true
+        }
+        NodeData::Comment { .. } => {
+            base.snapshot_node(id.node);
+            base.get_node_mut(id.node)
+                .and_then(|node| match &mut node.data {
+                    NodeData::Comment { contents } => Some(contents),
+                    _ => None,
+                })
+                .is_some_and(|contents| {
+                    contents.clear();
+                    contents.push_str(utf8);
+                    true
+                })
+        }
+        NodeData::ProcessingInstruction { .. } => {
+            base.snapshot_node(id.node);
+            base.get_node_mut(id.node)
+                .and_then(|node| match &mut node.data {
+                    NodeData::ProcessingInstruction { contents, .. } => Some(contents),
+                    _ => None,
+                })
+                .is_some_and(|contents| {
+                    contents.clear();
+                    contents.push_str(utf8);
+                    true
+                })
+        }
+        NodeData::CDataSection { .. } => {
+            base.snapshot_node(id.node);
+            base.get_node_mut(id.node)
+                .and_then(|node| match &mut node.data {
+                    NodeData::CDataSection { contents } => Some(contents),
+                    _ => None,
+                })
+                .is_some_and(|contents| {
+                    contents.clear();
+                    contents.push_str(utf8);
+                    true
+                })
+        }
+        _ => false,
+    }
+}
+
+fn replace_character_data_inner(
     ctx: &Ctx<'_>,
     id: NodeId,
+    offset: u32,
+    count: u32,
     data: &crate::dom_string::DomString,
     reparse_pi: bool,
 ) -> Result<()> {
-    let utf8 = data.to_string_lossy().into_owned();
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
     let Some(mut parsed) = owner.document_mut(id) else {
@@ -1267,53 +1342,26 @@ fn set_character_data_inner(
         }
         parsed.document.character_data(id.node)
     };
-    {
-        let base = &mut parsed.document.base;
-        let Some(node) = base.get_node(id.node) else {
-            return Ok(());
-        };
-        match &node.data {
-            NodeData::Text(_) => {
-                base.mutate().set_node_text(id.node, &utf8);
-            }
-            NodeData::Comment { .. } => {
-                base.snapshot_node(id.node);
-                if let Some(NodeData::Comment { contents }) =
-                    base.get_node_mut(id.node).map(|node| &mut node.data)
-                {
-                    contents.clear();
-                    contents.push_str(&utf8);
-                }
-            }
-            NodeData::ProcessingInstruction { .. } => {
-                base.snapshot_node(id.node);
-                if let Some(NodeData::ProcessingInstruction { contents, .. }) =
-                    base.get_node_mut(id.node).map(|node| &mut node.data)
-                {
-                    contents.clear();
-                    contents.push_str(&utf8);
-                }
-            }
-            NodeData::CDataSection { .. } => {
-                base.snapshot_node(id.node);
-                if let Some(NodeData::CDataSection { contents }) =
-                    base.get_node_mut(id.node).map(|node| &mut node.data)
-                {
-                    contents.clear();
-                    contents.push_str(&utf8);
-                }
-            }
-            _ => return Ok(()),
-        }
+    // A count past the end clamps to the node's length
+    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
+    let old_units = old_value.units().into_owned();
+    let offset = (offset as usize).min(old_units.len());
+    let count = (count as usize).min(old_units.len() - offset);
+    let replacement = data.units().into_owned();
+    let mut units = old_units;
+    units.splice(offset..offset + count, replacement.iter().copied());
+    let utf8 = crate::dom_string::DomString::from_utf16(units)
+        .to_string_lossy()
+        .into_owned();
+    if !write_character_data(&mut parsed.document.base, id, &utf8) {
+        return Ok(());
     }
-    let old_units = u32::try_from(old_value.units().len()).unwrap_or(u32::MAX);
-    let new_units = u32::try_from(data.units().len()).unwrap_or(u32::MAX);
     crate::dom::range::adjust_for_replace_data(
         &mut parsed.document.ranges,
         id,
-        0,
-        old_units,
-        new_units,
+        u32::try_from(offset).unwrap_or(u32::MAX),
+        u32::try_from(count).unwrap_or(u32::MAX),
+        u32::try_from(replacement.len()).unwrap_or(u32::MAX),
     );
     parsed
         .document

@@ -39,9 +39,9 @@ pub(crate) struct BlitzDocument {
     /// Script elements whose [already started] flag is set
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
     started_scripts: HashSet<blitz_traits::node_id::NodeId>,
-    /// Live ranges by slot, adjusted by every structural mutation. Slots free
-    /// with the document; see `dom::range::RangeState`.
-    pub ranges: Vec<crate::dom::range::RangeState>,
+    /// Live ranges by slot, adjusted by every structural mutation. Slots
+    /// free with the document; see `dom::range::RangeTable`.
+    pub ranges: crate::dom::range::RangeTable,
 }
 
 impl BlitzDocument {
@@ -55,7 +55,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
-            ranges: Vec::new(),
+            ranges: crate::dom::range::RangeTable::default(),
         }
     }
 
@@ -69,7 +69,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
-            ranges: Vec::new(),
+            ranges: crate::dom::range::RangeTable::default(),
         }
     }
 
@@ -190,17 +190,9 @@ impl BlitzDocument {
             if let Some(attributes) = self.pi_attributes.get(&from).cloned() {
                 self.pi_attributes.insert(to, attributes);
             }
-            let from_children = self
-                .base
-                .get_node(from)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            let to_children = self
-                .base
-                .get_node(to)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            stack.extend(from_children.into_iter().zip(to_children));
+            stack.extend(crate::dom::adoption::lockstep_children(
+                &self.base, from, &self.base, to,
+            ));
         }
     }
 
@@ -299,17 +291,9 @@ impl BlitzDocument {
             if self.started_scripts.contains(&from) {
                 self.started_scripts.insert(to);
             }
-            let from_children = self
-                .base
-                .get_node(from)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            let to_children = self
-                .base
-                .get_node(to)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            stack.extend(from_children.into_iter().zip(to_children));
+            stack.extend(crate::dom::adoption::lockstep_children(
+                &self.base, from, &self.base, to,
+            ));
         }
     }
 }
