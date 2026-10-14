@@ -61,6 +61,14 @@ enum Task {
     PortClosed {
         endpoint: u64,
     },
+    /// A subresource event for one element, queued so a listener attached
+    /// later in the same script still sees it: `update the image data` and the
+    /// stylesheet fetch steps queue a task rather than firing inside the
+    /// mutation that started the request
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
+    /// <https://html.spec.whatwg.org/multipage/semantics.html#the-link-element>).
+    NodeLoad(crate::dom::tree::NodeId),
+    NodeError(crate::dom::tree::NodeId),
 }
 
 /// One posted window message, ready for the target realm's task queue.
@@ -1957,14 +1965,14 @@ impl Document {
             self.in_flight_images.remove(&element);
             self.image_selected_src.remove(&element);
             self.world.borrow_mut().forget_image(element);
-            self.fire_js(|js| js.fire_node_error(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         };
         let Ok(url) = self.resolve_dial_url(&src) else {
             self.in_flight_images.remove(&element);
             self.image_selected_src.remove(&element);
             self.world.borrow_mut().fail_image(element, src);
-            self.fire_js(|js| js.fire_node_error(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         };
         let selected = url.as_str().to_owned();
@@ -1977,8 +1985,7 @@ impl Document {
             self.world
                 .borrow_mut()
                 .store_image_dims(element, width, height, selected);
-            self.fire_js(|js| js.fire_node_load(element));
-            self.fire_document_load();
+            self.tasks.push_back(Task::NodeLoad(element));
             return;
         }
         self.in_flight_images.insert(element);

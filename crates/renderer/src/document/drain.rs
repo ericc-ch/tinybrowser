@@ -200,6 +200,15 @@ impl Document {
                 ports,
             } => self.deliver_port_message(endpoint, &payload, &ports),
             Task::PortClosed { endpoint } => self.deliver_port_close(endpoint),
+            Task::NodeLoad(element) => {
+                self.fire_node_load(element);
+                self.fire_document_load();
+            }
+            Task::NodeError(element) => {
+                self.fire_js(|js| js.fire_node_error(element));
+                self.adopt_js_work();
+                self.fire_document_load();
+            }
         }
     }
 

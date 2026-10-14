@@ -2095,6 +2095,7 @@ pub(super) fn move_before_node(
         &target,
     )
     .map_err(|error| throw_dom_error(ctx, error))?;
+    let old_parent = tree_parent(ctx, node)?;
     {
         let world = world(ctx)?;
         let world = world.borrow();
@@ -2103,6 +2104,10 @@ pub(super) fn move_before_node(
         };
         move_parsed(&mut parsed, parent, node, &target);
     }
+    // The `img`/`source` moving steps run inside the move, before custom
+    // element reactions and mutation records
+    // (<https://dom.spec.whatwg.org/#move>).
+    note_picture_move(ctx, node, old_parent, parent)?;
     // A moved `iframe` container keeps its navigable but takes its new
     // position among its siblings, so `window[i]` keeps following container
     // tree order.
@@ -2120,6 +2125,57 @@ pub(super) fn move_before_node(
         note_connected_move(ctx, node)?;
     }
     schedule_mutation_delivery(ctx)
+}
+
+/// Runs the `img` and `source` moving steps for a node moved by
+/// `ParentNode.moveBefore`: a move across a `picture` boundary changes the
+/// image's source set, which counts as a relevant mutation and re-runs
+/// "update the image data" for the affected `img`
+/// (<https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element>,
+/// <https://html.spec.whatwg.org/multipage/embedded-content.html#the-source-element>,
+/// <https://html.spec.whatwg.org/multipage/images.html#relevant-mutations>).
+///
+/// The spec's moving steps name only the old parent, but a shipped engine
+/// reloads when the move brings the element under a `picture` too: Firefox
+/// fires a second `load` for an `img` moved into a `picture`, so both sides of
+/// the boundary count.
+fn note_picture_move(
+    ctx: &Ctx<'_>,
+    moved: NodeId,
+    old_parent: Option<NodeId>,
+    new_parent: NodeId,
+) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let mut updates = Vec::new();
+    {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.document(moved) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let is_picture = |id: NodeId| is_html_element(base, id.node, "picture");
+        if is_html_element(base, moved.node, "img") {
+            if old_parent.is_some_and(is_picture) || is_picture(new_parent) {
+                updates.push(moved);
+            }
+        } else if is_html_element(base, moved.node, "source") {
+            for picture in [old_parent, Some(new_parent)].into_iter().flatten() {
+                if !is_picture(picture) {
+                    continue;
+                }
+                updates.extend(
+                    child_ids(base, moved.document, picture.node)
+                        .into_iter()
+                        .filter(|child| is_html_element(base, child.node, "img")),
+                );
+            }
+        }
+    }
+    let mut world = world_rc.borrow_mut();
+    for element in updates {
+        world.queue_image_update(element);
+    }
+    Ok(())
 }
 
 /// Re-sorts the frame of a moved `iframe` container with its new siblings.
