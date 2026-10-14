@@ -1478,15 +1478,12 @@ impl Document {
         };
         let base = &mut parsed.document.base;
         crate::render::resolve_until_settled(base);
-        if let Some(root) = base
-            .root_node()
-            .children
-            .first()
-            .and_then(|id| base.get_node(*id))
-        {
-            content.0 = content.0.max(root.scroll_width());
-            content.1 = content.1.max(root.scroll_height());
-        }
+        // The document element is the scrolling element
+        // (<https://drafts.csswg.org/cssom-view/#scrolling-element>); the
+        // root's first child can be a doctype, which has no layout.
+        let root = base.root_element();
+        content.0 = content.0.max(root.scroll_width());
+        content.1 = content.1.max(root.scroll_height());
         content
     }
 
