@@ -195,21 +195,26 @@
         return host.__tb_resolved_style(element, name);
       };
       const read = name => {
-        const value = inline.getPropertyValue(name);
-        if (value !== '') return value;
+        // The resolved value comes first: it carries the cascade, `!important`
+        // declarations, and layout-dependent used values. The inline
+        // declaration is only a fallback for elements the engine has no style
+        // for (a detached element, or a property outside its tables).
+        // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
         const engine = resolved(name);
         if (engine !== '') return engine;
+        const value = inline.getPropertyValue(name);
+        if (value !== '') return value;
         return __tbInitialValues[String(name).toLowerCase()] ?? '';
       };
       return new Proxy(inline, {
         get(target, property, receiver) {
           if (typeof property !== 'string') return Reflect.get(target, property, receiver);
           if (property === 'getPropertyValue') return read;
-          const value = Reflect.get(target, property, receiver);
-          if (value !== undefined && value !== null && value !== '') return value;
           const kebab = property.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
           const engine = resolved(kebab);
           if (engine !== '') return engine;
+          const value = Reflect.get(target, property, receiver);
+          if (value !== undefined && value !== null && value !== '') return value;
           if (kebab in __tbInitialValues) return __tbInitialValues[kebab];
           return value;
         },
