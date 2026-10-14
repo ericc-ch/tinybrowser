@@ -1581,6 +1581,14 @@ impl Document {
             if !self.executed_scripts.insert(id) {
                 continue;
             }
+            // Mirror the run into the tree's already-started flag: the
+            // binding layer's prepare step checks that flag, so without
+            // this every move, clone, or adopt of a parser-run script
+            // would execute it again
+            // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+            if let Some(mut parsed) = self.world.borrow().document_mut(id) {
+                parsed.document.mark_script_started(id.node);
+            }
             // Iframes that precede this script in tree order already have
             // browsing contexts; later ones wait, matching incremental
             // insertion

@@ -281,6 +281,37 @@ impl BlitzDocument {
     pub(crate) fn mark_script_started(&mut self, id: blitz_traits::node_id::NodeId) -> bool {
         self.started_scripts.insert(id)
     }
+
+    /// Copies the already-started flag of `from` onto `to`, then walks both
+    /// subtrees in lockstep. Cloning sets the copy's flag from the original
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:cloning-steps>).
+    pub(crate) fn copy_script_started(
+        &mut self,
+        from: blitz_traits::node_id::NodeId,
+        to: blitz_traits::node_id::NodeId,
+    ) {
+        // Pure tax when no script ever started: skip the walk entirely.
+        if self.started_scripts.is_empty() {
+            return;
+        }
+        let mut stack = vec![(from, to)];
+        while let Some((from, to)) = stack.pop() {
+            if self.started_scripts.contains(&from) {
+                self.started_scripts.insert(to);
+            }
+            let from_children = self
+                .base
+                .get_node(from)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            let to_children = self
+                .base
+                .get_node(to)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            stack.extend(from_children.into_iter().zip(to_children));
+        }
+    }
 }
 
 /// Every document tree the renderer process holds, keyed by document id.

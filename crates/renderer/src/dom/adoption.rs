@@ -309,13 +309,19 @@ pub(crate) fn clone_within_document(
     // (<https://dom.spec.whatwg.org/#concept-node-clone>).
     if doc.is_fragment(id.node) {
         let snapshot = import_snapshot(doc, id, deep).ok_or(TreeError::Hierarchy)?;
-        return materialize_import(doc, doc_id, &snapshot);
+        let fresh = materialize_import(doc, doc_id, &snapshot)?;
+        // Snapshots carry no side-table state: the already-started flag
+        // follows the same lockstep as the PI map.
+        doc.copy_pi_subtree(id.node, fresh.node);
+        doc.copy_script_started(id.node, fresh.node);
+        return Ok(fresh);
     }
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
         // Blitz copies node data only; the PI attribute map lives beside
         // the tree and follows in lockstep.
         doc.copy_pi_subtree(id.node, cloned);
+        doc.copy_script_started(id.node, cloned);
         return Ok(NodeId {
             document: doc_id,
             node: cloned,
@@ -346,6 +352,43 @@ pub(crate) fn adopt_across_store(
         .get_mut(node.document)
         .ok_or(TreeError::Stale)
         .and_then(|parsed| detach_for_adopt(&mut parsed.document, node))?;
-    let target = store.get_mut(parent.document).ok_or(TreeError::Stale)?;
-    materialize_import(&mut target.document, parent.document, &snapshot)
+    // Adoption moves the node: the already-started flag travels with it.
+    // Materialize first, then walk source and copy in lockstep collecting
+    // flagged targets; detachment keeps subtree links, so the walk aligns.
+    let fresh = {
+        let target = store.get_mut(parent.document).ok_or(TreeError::Stale)?;
+        materialize_import(&mut target.document, parent.document, &snapshot)?
+    };
+    let to_mark = {
+        let source = store.get(node.document).ok_or(TreeError::Stale)?;
+        let target = store.get(parent.document).ok_or(TreeError::Stale)?;
+        let mut to_mark = Vec::new();
+        let mut stack = vec![(node.node, fresh.node)];
+        while let Some((from, to)) = stack.pop() {
+            if source.document.script_already_started(from) {
+                to_mark.push(to);
+            }
+            let from_children = source
+                .document
+                .base
+                .get_node(from)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            let to_children = target
+                .document
+                .base
+                .get_node(to)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            stack.extend(from_children.into_iter().zip(to_children));
+        }
+        to_mark
+    };
+    if !to_mark.is_empty() {
+        let target = store.get_mut(parent.document).ok_or(TreeError::Stale)?;
+        for id in to_mark {
+            target.document.mark_script_started(id);
+        }
+    }
+    Ok(fresh)
 }
