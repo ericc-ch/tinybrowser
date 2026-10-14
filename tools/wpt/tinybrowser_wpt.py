@@ -26,6 +26,13 @@ from wptrunner.executors.executorwebdriver import (
     WebDriverTestharnessExecutor,
 )
 from wptrunner.products import Product
+from wptrunner import wpttest
+
+# Upstream gives a file with `<meta name=timeout content=long>` 60 s before the
+# runner abandons it. Under the `wpt` profile every passing long file in this
+# engine finishes in single seconds, so cap the budget at 30 s; a hang costs
+# half a minute instead of a minute (wptrunner adds its 5 s extra on top).
+wpttest.Test.long_timeout = 30
 
 __wptrunner__ = {
     "product": "tinybrowser",

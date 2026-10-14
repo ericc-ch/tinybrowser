@@ -6,7 +6,7 @@ use super::super::{
     character_data, character_data_offset, child_value, clone_document,
     convert_union_nodes_into_node, copy_nonce_subtree, deref_weak, document_is_html_content,
     dom_string, drain_mutation_journal, element_sibling_value, fixup_focus_after_removal,
-    live_collection, make_weak, schedule_mutation_delivery, select_error,
+    live_collection, make_weak, replace_character_data, schedule_mutation_delivery, select_error,
     selector_matching_elements, set_character_data, set_pi_data, sibling_value, string_value,
     throw_dom, throw_dom_error, valid_attribute_local_name, with_node_data, world, world_for_node,
     wrap_node,
@@ -277,36 +277,39 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
 
     // https://dom.spec.whatwg.org/#dom-characterdata-appenddata
     fn append_data(&self, ctx: Ctx<'js>, data: rquickjs::String<'js>) -> Result<()> {
-        let mut current = character_data(&ctx, self.handle.0)?;
-        current.push_dom(&crate::dom_string::DomString::from_utf16(data.to_utf16()?));
-        set_character_data(&ctx, self.handle.0, &current)
+        let length = character_data(&ctx, self.handle.0)?.units().len();
+        replace_character_data(
+            &ctx,
+            self.handle.0,
+            u32::try_from(length).unwrap_or(u32::MAX),
+            0,
+            &crate::dom_string::DomString::from_utf16(data.to_utf16()?),
+        )
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-insertdata
     fn insert_data(&self, ctx: Ctx<'js>, offset: u32, data: rquickjs::String<'js>) -> Result<()> {
-        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
-        let offset = character_data_offset(&ctx, offset, units.len())?;
-        let insert = data.to_utf16()?;
-        units.splice(offset..offset, insert.iter().copied());
-        set_character_data(
+        let length = character_data(&ctx, self.handle.0)?.units().len();
+        character_data_offset(&ctx, offset, length)?;
+        replace_character_data(
             &ctx,
             self.handle.0,
-            &crate::dom_string::DomString::from_utf16(units),
+            offset,
+            0,
+            &crate::dom_string::DomString::from_utf16(data.to_utf16()?),
         )
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-deletedata
     fn delete_data(&self, ctx: Ctx<'js>, offset: u32, count: u32) -> Result<()> {
-        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
-        let offset = character_data_offset(&ctx, offset, units.len())?;
-        let end = offset
-            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
-            .min(units.len());
-        units.drain(offset..end);
-        set_character_data(
+        let length = character_data(&ctx, self.handle.0)?.units().len();
+        character_data_offset(&ctx, offset, length)?;
+        replace_character_data(
             &ctx,
             self.handle.0,
-            &crate::dom_string::DomString::from_utf16(units),
+            offset,
+            count,
+            &crate::dom_string::DomString::default(),
         )
     }
 
@@ -318,17 +321,14 @@ impl<'js> character_data_generated::CharacterData<'js> for JsNode {
         count: u32,
         data: rquickjs::String<'js>,
     ) -> Result<()> {
-        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
-        let offset = character_data_offset(&ctx, offset, units.len())?;
-        let end = offset
-            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
-            .min(units.len());
-        let replacement = data.to_utf16()?;
-        units.splice(offset..end, replacement.iter().copied());
-        set_character_data(
+        let length = character_data(&ctx, self.handle.0)?.units().len();
+        character_data_offset(&ctx, offset, length)?;
+        replace_character_data(
             &ctx,
             self.handle.0,
-            &crate::dom_string::DomString::from_utf16(units),
+            offset,
+            count,
+            &crate::dom_string::DomString::from_utf16(data.to_utf16()?),
         )
     }
 }
@@ -1421,27 +1421,50 @@ impl JsNode {
                         })
                         .unwrap_or_default();
                     let mut joined = DomString::from(previous_content.clone());
+                    // The merge target's current length is the accumulated
+                    // length the normalize steps shift points by
+                    // (<https://dom.spec.whatwg.org/#dom-node-normalize>).
+                    let length = u32::try_from(joined.units().len()).unwrap_or(u32::MAX);
                     joined.push_str(&content);
-                    let old_value = DomString::from(previous_content);
+                    let target = NodeId {
+                        document,
+                        node: previous,
+                    };
+                    let dying = NodeId {
+                        document,
+                        node: kid,
+                    };
+                    if !parsed.document.ranges.is_empty() {
+                        let index = parsed
+                            .document
+                            .base
+                            .get_node(container)
+                            .and_then(|node| node.children.iter().position(|child| *child == kid))
+                            .and_then(|index| u32::try_from(index).ok());
+                        if let Some(index) = index {
+                            crate::dom::range::adjust_for_normalize(
+                                &mut parsed.document.ranges,
+                                target,
+                                dying,
+                                NodeId {
+                                    document,
+                                    node: container,
+                                },
+                                index,
+                                length,
+                            );
+                        }
+                    }
                     parsed
                         .document
                         .base
                         .mutate()
                         .set_node_text(previous, &joined.to_string_lossy());
                     parsed.document.record(JournalEntry::CharacterData {
-                        target: NodeId {
-                            document,
-                            node: previous,
-                        },
-                        old_value,
+                        target,
+                        old_value: DomString::from(previous_content),
                     });
-                    unlink_journaled(
-                        &mut parsed,
-                        NodeId {
-                            document,
-                            node: kid,
-                        },
-                    );
+                    unlink_journaled(&mut parsed, dying);
                 } else {
                     merged = Some(kid);
                 }
@@ -1780,7 +1803,7 @@ impl JsNode {
         Ok(found.as_deref() == namespace.as_deref())
     }
 }
-pub(super) fn insertion_tree_nodes(
+pub(in crate::js::bindings) fn insertion_tree_nodes(
     ctx: &Ctx<'_>,
     parent: NodeId,
     node: NodeReference,
@@ -1914,7 +1937,6 @@ pub(super) fn insertion_excluding_children(
         ensure_document_content_model(
             &parsed.document,
             parent,
-            node,
             reference,
             excluded,
             &inserted,
@@ -2043,7 +2065,7 @@ pub(super) fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> 
 /// Same-document insert returns `node`. A node from another document adopts
 /// into the parent's document, preserving fragment backings as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
-pub(super) fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
+pub(in crate::js::bindings) fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
     if node.document == parent.document {
         return Ok(node);
     }
@@ -2059,8 +2081,9 @@ pub(super) fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<
 ///
 /// `move` is a separate primitive from insert and remove: it does not adopt,
 /// and it does not run the insertion or removing steps
-/// (<https://dom.spec.whatwg.org/#move>). Live ranges, node iterators, and
-/// shadow-tree slot assignment are absent here, so those loops are empty.
+/// (<https://dom.spec.whatwg.org/#move>). Live ranges ride the unlink and
+/// place adjustments; node iterators and shadow-tree slot assignment are
+/// absent here, so those loops are empty.
 pub(super) fn move_before_node(
     ctx: &Ctx<'_>,
     parent: NodeId,
@@ -2096,6 +2119,7 @@ pub(super) fn move_before_node(
         &target,
     )
     .map_err(|error| throw_dom_error(ctx, error))?;
+    let old_parent = tree_parent(ctx, node)?;
     {
         let world = world(ctx)?;
         let world = world.borrow();
@@ -2104,6 +2128,10 @@ pub(super) fn move_before_node(
         };
         move_parsed(&mut parsed, parent, node, &target);
     }
+    // The `img`/`source` moving steps run inside the move, before custom
+    // element reactions and mutation records
+    // (<https://dom.spec.whatwg.org/#move>).
+    note_picture_move(ctx, node, old_parent, parent)?;
     // A moved `iframe` container keeps its navigable but takes its new
     // position among its siblings, so `window[i]` keeps following container
     // tree order.
@@ -2121,6 +2149,57 @@ pub(super) fn move_before_node(
         note_connected_move(ctx, node)?;
     }
     schedule_mutation_delivery(ctx)
+}
+
+/// Runs the `img` and `source` moving steps for a node moved by
+/// `ParentNode.moveBefore`: a move across a `picture` boundary changes the
+/// image's source set, which counts as a relevant mutation and re-runs
+/// "update the image data" for the affected `img`
+/// (<https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element>,
+/// <https://html.spec.whatwg.org/multipage/embedded-content.html#the-source-element>,
+/// <https://html.spec.whatwg.org/multipage/images.html#relevant-mutations>).
+///
+/// The spec's moving steps name only the old parent, but a shipped engine
+/// reloads when the move brings the element under a `picture` too: Firefox
+/// fires a second `load` for an `img` moved into a `picture`, so both sides of
+/// the boundary count.
+fn note_picture_move(
+    ctx: &Ctx<'_>,
+    moved: NodeId,
+    old_parent: Option<NodeId>,
+    new_parent: NodeId,
+) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let mut updates = Vec::new();
+    {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.document(moved) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let is_picture = |id: NodeId| is_html_element(base, id.node, "picture");
+        if is_html_element(base, moved.node, "img") {
+            if old_parent.is_some_and(is_picture) || is_picture(new_parent) {
+                updates.push(moved);
+            }
+        } else if is_html_element(base, moved.node, "source") {
+            for picture in [old_parent, Some(new_parent)].into_iter().flatten() {
+                if !is_picture(picture) {
+                    continue;
+                }
+                updates.extend(
+                    child_ids(base, moved.document, picture.node)
+                        .into_iter()
+                        .filter(|child| is_html_element(base, child.node, "img")),
+                );
+            }
+        }
+    }
+    let mut world = world_rc.borrow_mut();
+    for element in updates {
+        world.queue_image_update(element);
+    }
+    Ok(())
 }
 
 /// Re-sorts the frame of a moved `iframe` container with its new siblings.
@@ -2181,7 +2260,7 @@ pub(in crate::js::bindings) fn insert_converted_node(
     insert_tree_node_inner(ctx, parent, node, None, false)
 }
 
-pub(super) fn insert_tree_node(
+pub(in crate::js::bindings) fn insert_tree_node(
     ctx: &Ctx<'_>,
     parent: NodeId,
     node: NodeId,
@@ -2436,13 +2515,16 @@ pub(super) fn doctype_field(
 /// (<https://dom.spec.whatwg.org/#concept-text-split>).
 ///
 /// The new node is always a `Text` node per the split-a-Text-node steps,
-/// even when `id` is a `CDATASection` (which inherits `Text`). Live ranges
-/// are absent, so those loops are empty.
-pub(super) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
+/// even when `id` is a `CDATASection` (which inherits `Text`). The insert
+/// carries the generic range adjustment (spec step 7.1); the split steps
+/// then move node points over and bump the equal parent slot; the truncate
+/// writes without the generic replacement rule, which the split steps have
+/// already accounted for.
+pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
     let units = character_data(ctx, id)?.units().into_owned();
     let offset = character_data_offset(ctx, offset, units.len())?;
     let new_data = DomString::from_utf16(units[offset..].to_vec());
-    let (parent, next) = world(ctx)?
+    let (parent, next, index) = world(ctx)?
         .borrow()
         .with_document(id, |parsed| {
             let base = &parsed.document.base;
@@ -2457,9 +2539,16 @@ pub(super) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> R
                 document: id.document,
                 node,
             });
-            (parent, next)
+            let index = parent.and_then(|parent| {
+                base.get_node(parent.node)
+                    .and_then(|node| {
+                        node.children.iter().position(|sibling| *sibling == id.node)
+                    })
+                    .and_then(|index| u32::try_from(index).ok())
+            });
+            (parent, next, index)
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
     let new_id = {
         let world = world(ctx)?;
         let world = world.borrow();
@@ -2474,14 +2563,106 @@ pub(super) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> R
         }
     };
     if let Some(parent) = parent {
-        // https://dom.spec.whatwg.org/#concept-node-insert
-        insert_tree_node(ctx, parent, new_id, next)?;
+        // Spec order: the insert shifts parent points past the new node's
+        // slot (7.1), the split steps move node points over and bump the
+        // equal slot (7.2-7.5), then the truncate writes without the
+        // generic replacement rule
+        // (<https://dom.spec.whatwg.org/#concept-text-split>).
+        {
+            let world_rc = world(ctx)?;
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(id) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            crate::dom::insertion::place_journaled(&mut parsed, parent, new_id, next);
+            crate::dom::range::adjust_for_split(
+                &mut parsed.document.ranges,
+                id,
+                new_id,
+                parent,
+                index.unwrap_or(0),
+                u32::try_from(offset).unwrap_or(u32::MAX),
+            );
+            let mut kept = units.clone();
+            kept.drain(offset..);
+            truncate_split_text(
+                &mut parsed,
+                id,
+                &kept,
+                DomString::from_utf16(units),
+            );
+        }
+        apply_inserted(ctx, parent, &[new_id], true)?;
+    } else {
+        {
+            let world_rc = world(ctx)?;
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(id) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            // Without a parent the split's range steps do not run at all, so
+            // the trailing `replace data` rule collapses the points past the
+            // split offset
+            // (<https://dom.spec.whatwg.org/#concept-text-split>).
+            let offset_units = u32::try_from(offset).unwrap_or(u32::MAX);
+            let count = u32::try_from(units.len().saturating_sub(offset)).unwrap_or(u32::MAX);
+            crate::dom::range::adjust_for_replace_data(
+                &mut parsed.document.ranges,
+                id,
+                offset_units,
+                count,
+                0,
+            );
+            let mut kept = units.clone();
+            kept.drain(offset..);
+            truncate_split_text(
+                &mut parsed,
+                id,
+                &kept,
+                DomString::from_utf16(units),
+            );
+        }
+        schedule_mutation_delivery(ctx)?;
     }
-    let mut kept = units;
-    kept.drain(offset..);
-    // https://dom.spec.whatwg.org/#concept-cd-replace
-    set_character_data(ctx, id, &DomString::from_utf16(kept))?;
     wrap_node(ctx, new_id)
+}
+
+/// Truncate `id`'s data to `kept` for `splitText`, recording the change. The
+/// range steps already ran, so this writes without the generic replacement
+/// rule that would corrupt a split. Other node kinds cannot reach a split.
+fn truncate_split_text(
+    parsed: &mut crate::Parsed,
+    id: NodeId,
+    kept: &[u16],
+    old_value: DomString,
+) {
+    let wrote = match parsed.document.base.get_node(id.node).map(|node| &node.data) {
+        Some(NodeData::Text(_)) => {
+            parsed.document.base.mutate().set_node_text(
+                id.node,
+                &String::from_utf16_lossy(kept),
+            );
+            true
+        }
+        Some(NodeData::CDataSection { .. }) => {
+            let base = &mut parsed.document.base;
+            base.snapshot_node(id.node);
+            if let Some(NodeData::CDataSection { contents }) =
+                base.get_node_mut(id.node).map(|node| &mut node.data)
+            {
+                contents.clear();
+                contents.push_str(&String::from_utf16_lossy(kept));
+            }
+            true
+        }
+        _ => false,
+    };
+    if wrote {
+        parsed.document.record(JournalEntry::CharacterData {
+            target: id,
+            old_value,
+        });
+    }
 }
 
 /// Concatenates the data of the contiguous `Text` nodes of `id`, in tree

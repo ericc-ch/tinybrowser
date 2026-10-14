@@ -7,9 +7,10 @@ use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
 use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList};
 use weedle::interface::InterfaceMember;
-use weedle::types::{NonAnyType, SingleType, Type};
 
+use crate::contracts::native_type;
 use crate::database::Database;
+use crate::model::ReturnType;
 use crate::{Error, Javascript, Source};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -217,7 +218,7 @@ fn lower_members(
                         "JS constructor overloads are not supported yet".into(),
                     ));
                 }
-                let (required, conversion) = arguments(&member.args.body.list)?;
+                let (required, conversion) = arguments(database, &member.args.body.list)?;
                 signature(
                     &mut implemented,
                     "constructor",
@@ -238,13 +239,14 @@ fn lower_members(
                 }
                 let name = member.identifier.0;
                 signature(&mut implemented, name, Kind::Get, 0)?;
-                let result = output(database, &member.type_.type_, "value")?;
+                let lowered = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
+                let result = output(database, &lowered, "value")?;
                 members.push(format!(
                     "[{name:?}, 'get', 0, args => [], (value, realm) => {result}]"
                 ));
                 if member.readonly.is_none() {
                     signature(&mut implemented, name, Kind::Set, 1)?;
-                    let converted = input(&member.type_.type_, "args[0]", false)?;
+                    let converted = input(&lowered, "args[0]", false)?;
                     members.push(format!(
                         "[{name:?}, 'set', 1, args => [{converted}], (value, realm) => undefined]"
                     ));
@@ -271,10 +273,13 @@ fn lower_members(
                     Kind::Method,
                     member.args.body.list.len(),
                 )?;
-                let (required, conversion) = arguments(&member.args.body.list)?;
+                let (required, conversion) = arguments(database, &member.args.body.list)?;
                 let result = match &member.return_type {
                     weedle::types::ReturnType::Undefined(_) => "undefined".into(),
-                    weedle::types::ReturnType::Type(type_) => output(database, type_, "value")?,
+                    weedle::types::ReturnType::Type(type_) => {
+                        let lowered = native_type(database, type_, &mut BTreeSet::new())?;
+                        output(database, &lowered, "value")?
+                    }
                 };
                 members.push(format!(
                     "[{name:?}, 'method', {required}, args => {conversion}, (value, realm) => {result}]"
@@ -334,7 +339,10 @@ fn attributes(list: Option<&ExtendedAttributeList<'_>>, supported: &[&str]) -> R
     Ok(())
 }
 
-fn arguments(arguments: &[weedle::argument::Argument<'_>]) -> Result<(usize, String), Error> {
+fn arguments(
+    database: &Database<'_>,
+    arguments: &[weedle::argument::Argument<'_>],
+) -> Result<(usize, String), Error> {
     let mut conversions = Vec::new();
     let mut required = 0;
     let mut optional = false;
@@ -350,25 +358,20 @@ fn arguments(arguments: &[weedle::argument::Argument<'_>]) -> Result<(usize, Str
         // would otherwise consult the page-controlled `Array.prototype`.
         let present = format!("args.length > {index}");
         let value = format!("{present} ? args[{index}] : undefined");
-        let converted = input(&argument.type_.type_, &value, allow_shared)?;
+        let lowered = native_type(database, &argument.type_.type_, &mut BTreeSet::new())?;
+        let converted = input(&lowered, &value, allow_shared)?;
         let converted = match (&argument.optional, &argument.default) {
             (None, None) if !optional => {
                 required += 1;
-                input(
-                    &argument.type_.type_,
-                    &format!("args[{index}]"),
-                    allow_shared,
-                )?
+                input(&lowered, &format!("args[{index}]"), allow_shared)?
             }
             (Some(_), Some(default)) => {
                 optional = true;
                 let weedle::literal::DefaultValue::String(default) = &default.value else {
                     return Err(Error("JS argument defaults are not supported yet".into()));
                 };
-                match &argument.type_.type_ {
-                    Type::Single(SingleType::NonAny(
-                        NonAnyType::DOMString(_) | NonAnyType::USVString(_),
-                    )) => {}
+                match &lowered {
+                    ReturnType::String | ReturnType::UsvString => {}
                     _ => return Err(Error("JS string defaults require string arguments".into())),
                 }
                 format!(
@@ -383,39 +386,31 @@ fn arguments(arguments: &[weedle::argument::Argument<'_>]) -> Result<(usize, Str
     Ok((required, format!("[{}]", conversions.join(","))))
 }
 
-fn input(type_: &Type<'_>, value: &str, allow_shared: bool) -> Result<String, Error> {
+fn input(type_: &ReturnType, value: &str, allow_shared: bool) -> Result<String, Error> {
     // https://webidl.spec.whatwg.org/#es-type-mapping
     match type_ {
-        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item)))
-            if item.q_mark.is_none() && !allow_shared =>
-        {
-            Ok(format!("__tbIDLString({value})"))
-        }
-        Type::Single(SingleType::NonAny(NonAnyType::USVString(item)))
-            if item.q_mark.is_none() && !allow_shared =>
-        {
-            Ok(format!("__tbIDLUSVString({value})"))
-        }
-        Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(item))) if item.q_mark.is_none() => {
-            Ok(format!("__tbIDLUint8Array({value}, {allow_shared})"))
-        }
+        // `AllowShared` is meaningless on a copied string; only the argument
+        // conversion differs from the native side.
+        ReturnType::String if !allow_shared => Ok(format!("__tbIDLString({value})")),
+        ReturnType::UsvString if !allow_shared => Ok(format!("__tbIDLUSVString({value})")),
+        ReturnType::Uint8Array => Ok(format!("__tbIDLUint8Array({value}, {allow_shared})")),
         _ => Err(Error(format!(
             "JS argument type is not supported yet: {type_:?}"
         ))),
     }
 }
 
-fn output(database: &Database<'_>, type_: &Type<'_>, value: &str) -> Result<String, Error> {
+fn output(database: &Database<'_>, type_: &ReturnType, value: &str) -> Result<String, Error> {
     // https://webidl.spec.whatwg.org/#es-to-js-dictionary
     match type_ {
-        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
+        ReturnType::String => {
             Ok(format!("__tbIDLResult({value}, 'string')"))
         }
-        Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(item))) if item.q_mark.is_none() => {
+        ReturnType::Uint8Array => {
             Ok(format!("__tbIDLRealmUint8Array({value}, false, realm)"))
         }
-        Type::Single(SingleType::NonAny(NonAnyType::Identifier(item))) if item.q_mark.is_none() => {
-            let dictionary = database.dictionary(item.type_.0)?;
+        ReturnType::Dictionary(name) => {
+            let dictionary = database.dictionary(name)?;
             attributes(dictionary.attributes.as_ref(), &[])?;
             if dictionary.inheritance.is_some() {
                 return Err(Error(
@@ -426,9 +421,11 @@ fn output(database: &Database<'_>, type_: &Type<'_>, value: &str) -> Result<Stri
             for member in dictionary.members.body {
                 attributes(member.attributes.as_ref(), &[])?;
                 attributes(member.type_.attributes.as_ref(), &[])?;
+                let lowered =
+                    native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
                 if member.required.is_some()
                     || member.default.is_some()
-                    || !matches!(member.type_.type_, Type::Single(SingleType::NonAny(NonAnyType::Integer(integer))) if integer.q_mark.is_none() && matches!(integer.type_, weedle::types::IntegerType::LongLong(integer) if integer.unsigned.is_some()))
+                    || !matches!(lowered, ReturnType::UnsignedLongLong)
                 {
                     return Err(Error(
                         "JS result dictionary fields are not supported yet".into(),

@@ -908,16 +908,21 @@ def build_binary() -> Path:
         eprint(f"wpt: using prebuilt TINYBROWSER_BINARY without a freshness check: {override}")
         return Path(override)
     out = subprocess.run(
-        [str(ROOT / "tools" / "binary-path")],
+        [str(ROOT / "tools" / "binary-path"), "--profile", "wpt"],
         cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
     )
     binary = Path(out.stdout.decode(errors="replace").strip())
+    # The `wpt` profile (see the root Cargo.toml) keeps dev's assertions but
+    # optimizes the code: file timeouts must measure the engine, not a `-O0`
+    # build spending the budget inside QuickJS.
     eprint("wpt: building tinybrowser (cargo no-ops when fresh)")
     # cargo's fingerprint tracks every compiled input; a failure means the
     # binary would be stale, so refuse instead of running against it.
-    ret = subprocess.run(["cargo", "build", "-q", "--offline"], cwd=str(ROOT)).returncode
+    ret = subprocess.run(
+        ["cargo", "build", "-q", "--profile", "wpt", "--offline"], cwd=str(ROOT)
+    ).returncode
     if ret != 0:
-        ret = subprocess.run(["cargo", "build", "-q"], cwd=str(ROOT)).returncode
+        ret = subprocess.run(["cargo", "build", "-q", "--profile", "wpt"], cwd=str(ROOT)).returncode
     if ret != 0:
         eprint("wpt: cargo build failed; refusing to run against a stale binary")
         raise SystemExit(1)

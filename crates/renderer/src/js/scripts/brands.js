@@ -63,6 +63,8 @@
   const DocumentTypeInterface = define('DocumentType', NodeInterface);
   const DocumentFragmentInterface = define('DocumentFragment', NodeInterface, true);
   const ShadowRootInterface = define('ShadowRoot', DocumentFragmentInterface);
+  const AbstractRangeInterface = define('AbstractRange');
+  const RangeInterface = define('Range', AbstractRangeInterface, true);
   const HTMLElementInterface = define('HTMLElement', ElementInterface, true);
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface);
@@ -80,6 +82,8 @@
     DocumentType: DocumentTypeInterface.prototype,
     DocumentFragment: DocumentFragmentInterface.prototype,
     ShadowRoot: ShadowRootInterface.prototype,
+    AbstractRange: AbstractRangeInterface.prototype,
+    Range: RangeInterface.prototype,
     HTMLElement: HTMLElementInterface.prototype,
     HTMLUnknownElement: HTMLUnknownElementInterface.prototype,
     HTMLMediaElement: HTMLMediaElementInterface.prototype,

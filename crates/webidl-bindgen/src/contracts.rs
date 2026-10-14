@@ -610,7 +610,7 @@ fn lower_members(
                     Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
                 ) && interface
                     .stringifier
-                    .replace(interface.attributes.len())
+                    .replace(model::Stringifier::Attribute(interface.attributes.len()))
                     .is_some()
                 {
                     return Err(Error("multiple stringifiers are not supported".into()));
@@ -660,8 +660,27 @@ fn lower_members(
             | InterfaceMember::Iterable(_)
             | InterfaceMember::AsyncIterable(_)
             | InterfaceMember::Maplike(_)
-            | InterfaceMember::Setlike(_)
-            | InterfaceMember::Stringifier(_) => {}
+            | InterfaceMember::Setlike(_) => {}
+            InterfaceMember::Stringifier(member) => {
+                // An anonymous `stringifier;` lowers to a `toString` method
+                // the implementation provides; anything else stays absent.
+                validate_empty_attributes(member.attributes.as_ref())?;
+                if !implementation.methods.contains_key("stringifier") {
+                    continue;
+                }
+                check_method_signature(&implementation.methods, "stringifier", 0, "stringifier")?;
+                if interface
+                    .stringifier
+                    .replace(model::Stringifier::Method)
+                    .is_some()
+                {
+                    return Err(Error("multiple stringifiers are not supported".into()));
+                }
+                remaining.remove("stringifier");
+                methods.push(
+                    quote! { fn stringifier(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>>; },
+                );
+            }
         }
     }
     interface.properties =
@@ -1455,6 +1474,8 @@ fn argument_parameter(
         }
         ReturnType::Boolean if optional && boolean_default.is_none() => quote! { Option<bool> },
         ReturnType::Boolean => quote! { bool },
+        ReturnType::UnsignedShort => quote! { u16 },
+        ReturnType::Short => quote! { i16 },
         ReturnType::UnsignedLong => quote! { u32 },
         ReturnType::Long => quote! { i32 },
         ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
@@ -1511,6 +1532,7 @@ fn operation_result(
                     Ok((OperationResult::PromiseUndefined, quote! { () }))
                 }
                 ReturnType::UnsignedShort => Ok((OperationResult::UnsignedShort, quote! { u16 })),
+                ReturnType::Short => Ok((OperationResult::Short, quote! { i16 })),
                 ReturnType::Long => Ok((OperationResult::Long, quote! { i32 })),
                 ReturnType::InterfaceSequence => {
                     Ok((OperationResult::Sequence, quote! { Vec<Value<'js>> }))
@@ -2363,12 +2385,17 @@ fn constructor_arguments(
     Ok((arguments, parameters))
 }
 
-fn native_type(
+pub(crate) fn native_type(
     database: &Database<'_>,
     type_: &Type<'_>,
     visited: &mut BTreeSet<String>,
 ) -> Result<ReturnType, Error> {
     match type_ {
+        Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(item)))
+            if item.q_mark.is_none() =>
+        {
+            Ok(ReturnType::Uint8Array)
+        }
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) => {
             Ok(if item.q_mark.is_some() {
                 ReturnType::NullableString
@@ -2387,6 +2414,18 @@ fn native_type(
                 && matches!(item.type_, IntegerType::Short(item) if item.unsigned.is_some()) =>
         {
             Ok(ReturnType::UnsignedShort)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
+            if item.q_mark.is_none()
+                && matches!(item.type_, IntegerType::Short(item) if item.unsigned.is_none()) =>
+        {
+            Ok(ReturnType::Short)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
+            if item.q_mark.is_none()
+                && matches!(item.type_, IntegerType::LongLong(item) if item.unsigned.is_some()) =>
+        {
+            Ok(ReturnType::UnsignedLongLong)
         }
         Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
             if item.q_mark.is_none()

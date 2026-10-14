@@ -142,9 +142,10 @@
   });
   // A computed style always resolves: an unset property reports its initial
   // value, not the empty string
-  // (<https://drafts.csswg.org/cssom/#resolved-values>). The engine has no
-  // full cascade in script yet, so this covers the initial values clients
-  // read (visibility for actionability, boxes for geometry).
+  // (<https://drafts.csswg.org/cssom/#resolved-values>). The style engine's
+  // resolved value is authoritative when it has one; the inline style and then
+  // the initial-value table below cover what it does not resolve (custom
+  // properties, properties outside the supported set).
   const __tbInitialValues = {
     visibility: 'visible',
     display: 'inline',
@@ -189,19 +190,31 @@
       if (typeof inline.getPropertyValue !== 'function') {
         inline.getPropertyValue = function(name) { return this[name] ?? ''; };
       }
+      const resolved = name => {
+        if (!element || typeof element.nodeType !== 'number') return '';
+        return host.__tb_resolved_style(element, name);
+      };
+      const read = name => {
+        // The resolved value comes first: it carries the cascade, `!important`
+        // declarations, and layout-dependent used values. The inline
+        // declaration is only a fallback for elements the engine has no style
+        // for (a detached element, or a property outside its tables).
+        // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
+        const engine = resolved(name);
+        if (engine !== '') return engine;
+        const value = inline.getPropertyValue(name);
+        if (value !== '') return value;
+        return __tbInitialValues[String(name).toLowerCase()] ?? '';
+      };
       return new Proxy(inline, {
         get(target, property, receiver) {
           if (typeof property !== 'string') return Reflect.get(target, property, receiver);
-          if (property === 'getPropertyValue') {
-            return name => {
-              const value = target.getPropertyValue(name);
-              if (value !== '') return value;
-              return __tbInitialValues[String(name).toLowerCase()] ?? '';
-            };
-          }
+          if (property === 'getPropertyValue') return read;
+          const kebab = property.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
+          const engine = resolved(kebab);
+          if (engine !== '') return engine;
           const value = Reflect.get(target, property, receiver);
           if (value !== undefined && value !== null && value !== '') return value;
-          const kebab = property.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
           if (kebab in __tbInitialValues) return __tbInitialValues[kebab];
           return value;
         },

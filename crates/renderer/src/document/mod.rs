@@ -61,6 +61,14 @@ enum Task {
     PortClosed {
         endpoint: u64,
     },
+    /// A subresource event for one element, queued so a listener attached
+    /// later in the same script still sees it: `update the image data` and the
+    /// stylesheet fetch steps queue a task rather than firing inside the
+    /// mutation that started the request
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
+    /// <https://html.spec.whatwg.org/multipage/semantics.html#the-link-element>).
+    NodeLoad(crate::dom::tree::NodeId),
+    NodeError(crate::dom::tree::NodeId),
 }
 
 /// One posted window message, ready for the target realm's task queue.
@@ -258,6 +266,13 @@ pub(crate) struct Document {
     /// starts a fetch and removal drops one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     connected_images: HashSet<crate::dom::tree::NodeId>,
+    /// Connected `<link rel=stylesheet>` elements already reported as loaded,
+    /// with the resolved URL that arrival was for, so a re-fetch after an
+    /// `href` or `rel` change reports again
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#the-link-element>).
+    linked_sheets: HashMap<crate::dom::tree::NodeId, String>,
+    /// Stylesheet generation observed at the last linked-stylesheet scan.
+    stylesheet_generation: u64,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -377,6 +392,8 @@ impl Document {
             image_selected_src: HashMap::new(),
             in_flight_images: HashSet::new(),
             connected_images: HashSet::new(),
+            linked_sheets: HashMap::new(),
+            stylesheet_generation: 0,
             frame_load_sequence: 0,
             frame_load_in_flight: false,
             initial_blank: true,
@@ -1461,15 +1478,12 @@ impl Document {
         };
         let base = &mut parsed.document.base;
         crate::render::resolve_until_settled(base);
-        if let Some(root) = base
-            .root_node()
-            .children
-            .first()
-            .and_then(|id| base.get_node(*id))
-        {
-            content.0 = content.0.max(root.scroll_width());
-            content.1 = content.1.max(root.scroll_height());
-        }
+        // The document element is the scrolling element
+        // (<https://drafts.csswg.org/cssom-view/#scrolling-element>); the
+        // root's first child can be a doctype, which has no layout.
+        let root = base.root_element();
+        content.0 = content.0.max(root.scroll_width());
+        content.1 = content.1.max(root.scroll_height());
         content
     }
 
@@ -1580,6 +1594,14 @@ impl Document {
         for id in scripts {
             if !self.executed_scripts.insert(id) {
                 continue;
+            }
+            // Mirror the run into the tree's already-started flag: the
+            // binding layer's prepare step checks that flag, so without
+            // this every move, clone, or adopt of a parser-run script
+            // would execute it again
+            // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+            if let Some(mut parsed) = self.world.borrow().document_mut(id) {
+                parsed.document.mark_script_started(id.node);
             }
             // Iframes that precede this script in tree order already have
             // browsing contexts; later ones wait, matching incremental
@@ -1776,7 +1798,67 @@ impl Document {
         crate::render::resolve_until_settled(&mut parsed.document.base);
         drop(parsed);
         drop(world);
+        self.note_linked_stylesheets();
         self.fire_document_load();
+    }
+
+    /// Fires `load` on connected `<link rel=stylesheet>` elements whose sheet
+    /// has arrived. Blitz attaches a sheet to the link node only after the
+    /// response parses, so the sheet's presence is the fetch-complete signal;
+    /// the scan runs when the document's stylesheet generation moved, so image
+    /// and font deliveries pay nothing
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#the-link-element>,
+    /// <https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
+    fn note_linked_stylesheets(&mut self) {
+        let (generation, arrivals, stale) = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return;
+            };
+            let base = &parsed.document.base;
+            let generation = base.stylesheet_generation();
+            if generation == self.stylesheet_generation {
+                return;
+            }
+            let document = parsed.id;
+            let linked = |id: blitz_dom::NodeId| {
+                crate::dom::tree::is_stylesheet_link(base, id)
+                    && base.node_has_stylesheet(id)
+                    && crate::dom::tree::is_connected(base, id)
+            };
+            let arrivals: Vec<(crate::dom::tree::NodeId, String)> = base
+                .stylesheet_owner_nodes()
+                .filter(|id| linked(*id))
+                .filter_map(|id| {
+                    crate::dom::tree::attr(base, id, "href")
+                        .and_then(|href| base.resolve_url(href))
+                        .map(|url| {
+                            (
+                                crate::dom::tree::NodeId { document, node: id },
+                                url.as_str().to_owned(),
+                            )
+                        })
+                })
+                .collect();
+            let stale: Vec<crate::dom::tree::NodeId> = self
+                .linked_sheets
+                .keys()
+                .copied()
+                .filter(|node| node.document != document || !linked(node.node))
+                .collect();
+            (generation, arrivals, stale)
+        };
+        self.stylesheet_generation = generation;
+        for node in stale {
+            self.linked_sheets.remove(&node);
+        }
+        for (element, url) in arrivals {
+            if self.linked_sheets.get(&element) == Some(&url) {
+                continue;
+            }
+            self.linked_sheets.insert(element, url);
+            self.tasks.push_back(Task::NodeLoad(element));
+        }
     }
 
     pub(in crate::document) fn settle_js_fetch(&mut self, id: i32, outcome: Option<DialOutcome>) {
@@ -1949,14 +2031,14 @@ impl Document {
             self.in_flight_images.remove(&element);
             self.image_selected_src.remove(&element);
             self.world.borrow_mut().forget_image(element);
-            self.fire_js(|js| js.fire_node_error(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         };
         let Ok(url) = self.resolve_dial_url(&src) else {
             self.in_flight_images.remove(&element);
             self.image_selected_src.remove(&element);
             self.world.borrow_mut().fail_image(element, src);
-            self.fire_js(|js| js.fire_node_error(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         };
         let selected = url.as_str().to_owned();
@@ -1969,8 +2051,7 @@ impl Document {
             self.world
                 .borrow_mut()
                 .store_image_dims(element, width, height, selected);
-            self.fire_js(|js| js.fire_node_load(element));
-            self.fire_document_load();
+            self.tasks.push_back(Task::NodeLoad(element));
             return;
         }
         self.in_flight_images.insert(element);

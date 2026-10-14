@@ -14,6 +14,7 @@
   const enqueueReaction = host.__tbEnqueueCustomReaction;
   const pushReactions = host.__tbPushCustomReactions;
   const popReactions = host.__tbPopCustomReactions;
+  const noteDefined = host.__tbNoteCustomDefined;
   const nativeApply = Reflect.apply;
   const nativeConstruct = Reflect.construct;
   const MapConstructor = Map;
@@ -86,6 +87,10 @@
   // https://dom.spec.whatwg.org/#move
   // https://html.spec.whatwg.org/multipage/custom-elements.html#enqueue-a-custom-element-callback-reaction
   function noteConnectedMove(node) {
+    // With no definitions there are no upgraded elements, so the walk would
+    // find nothing; skipping it also keeps `atomicMoves` free of marks that
+    // only the observer hook would consume.
+    if (definitions.size === 0) return;
     atomicMoves.add(node);
     visitElements(node, function(element) {
       if (!upgraded.has(element) || !isConnected(element)) return;
@@ -219,6 +224,8 @@
         const definition = { name, constructor, observed, callbacks };
         definitions.set(name, definition);
         constructors.set(constructor, name);
+        noteDefined();
+        ensureObserving();
         upgradeTree(document);
         const waiter = pending.get(name);
         if (waiter) {
@@ -310,6 +317,10 @@
   host.__tbUpgradeParsedTree = function(root) {
     if (!isConnected(root)) return;
     upgradeFromNodeDocument(root);
+    // The walk below only enqueues upgrades for this realm's definitions;
+    // with none it is pure cost, and `upgradeFromNodeDocument` above has
+    // already delegated to a foreign registry if there is one.
+    if (definitions.size === 0) return;
     pushReactions();
     try { upgradeTree(root); } finally { popReactions(); }
   };
@@ -414,5 +425,10 @@
   const observerOptions = {
     subtree: true, childList: true, attributes: true, attributeOldValue: true,
   };
-  nativeApply(observe, observer, [document, observerOptions]);
+  let observing = false;
+  function ensureObserving() {
+    if (observing) return;
+    observing = true;
+    nativeApply(observe, observer, [document, observerOptions]);
+  }
 }

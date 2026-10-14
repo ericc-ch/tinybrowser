@@ -38,7 +38,8 @@ pub(crate) struct Interface {
     /// Unions referenced by lowered members, deduplicated by name.
     pub(crate) unions: Vec<Union>,
     pub(crate) properties: PropertyHooks,
-    pub(crate) stringifier: Option<usize>,
+    /// How `toString` stringifies: an attribute index or a provided method.
+    pub(crate) stringifier: Option<Stringifier>,
     pub(crate) indexed_setter: Option<IndexedSetter>,
     /// Spec mixin members installed on each named interface's prototype
     /// instead of one interface that shares the payload.
@@ -58,6 +59,13 @@ pub(crate) enum PropertyHooks {
         unenumerable: bool,
         override_builtins: bool,
     },
+}
+
+/// How an interface stringifies for `toString`: a stringifier attribute, or
+/// an anonymous `stringifier;` the implementation provides as a method.
+pub(crate) enum Stringifier {
+    Attribute(usize),
+    Method,
 }
 
 pub(crate) enum InterfaceKind {
@@ -104,6 +112,8 @@ pub(crate) enum OperationResult {
     NullableString,
     Boolean,
     UnsignedShort,
+    /// IDL `short`, an `i16`.
+    Short,
     Long,
     /// The method returns a union; the dispatch converts it with `IntoJs`.
     Union,
@@ -215,6 +225,8 @@ pub(crate) enum ReturnType {
     UnsignedShort,
     UnsignedLong,
     Long,
+    /// IDL `short`, an `i16`.
+    Short,
     Boolean,
     /// Nullable `unsigned long`: `null` or `undefined` convert to `None`
     /// (<https://webidl.spec.whatwg.org/#js-nullable-type>).
@@ -246,6 +258,14 @@ pub(crate) enum ReturnType {
     /// `Promise<undefined>`: the method runs synchronously and the dispatch
     /// resolves the promise (<https://webidl.spec.whatwg.org/#es-promise>).
     PromiseUndefined,
+    /// A `Uint8Array` argument or result. Only the JavaScript emitter lowers
+    /// this shape today; the native side rejects it where it renders
+    /// (<https://webidl.spec.whatwg.org/#es-buffer-source-types>).
+    Uint8Array,
+    /// `unsigned long long`: only JavaScript result dictionaries use this
+    /// shape today; the native side rejects it where it renders
+    /// (<https://webidl.spec.whatwg.org/#idl-unsigned-long-long>).
+    UnsignedLongLong,
     /// IDL `any`: the value passes through with no conversion
     /// (<https://webidl.spec.whatwg.org/#idl-any>).
     Any,

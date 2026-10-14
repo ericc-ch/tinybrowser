@@ -1314,7 +1314,7 @@ Object.defineProperty(globalThis, 'name', {
   const names = [
     'Event', 'EventTarget', 'Node', 'DOMException', 'Attr', 'NamedNodeMap',
     'TokenList', 'Implementation', 'DOMParser', 'XMLSerializer', 'MutationObserver',
-    'MutationRecord', 'MessageEvent', 'MessagePort', 'MessageChannel', 'Headers',
+    'MutationRecord', 'AbstractRange', 'Range', 'MessageEvent', 'MessagePort', 'MessageChannel', 'Headers',
     'Request', 'Response', 'Blob', 'File', 'FileList', 'FileReader', 'ProgressEvent',
     'XMLHttpRequest', 'XMLHttpRequestUpload',
     'ReadableStream', 'TextDecoder', 'TextEncoder', 'URL', 'URLSearchParams',

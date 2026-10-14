@@ -39,6 +39,9 @@ pub(crate) struct BlitzDocument {
     /// Script elements whose [already started] flag is set
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
     started_scripts: HashSet<blitz_traits::node_id::NodeId>,
+    /// Live ranges by slot, adjusted by every structural mutation. Slots
+    /// free with the document; see `dom::range::RangeTable`.
+    pub ranges: crate::dom::range::RangeTable,
 }
 
 impl BlitzDocument {
@@ -52,6 +55,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
+            ranges: crate::dom::range::RangeTable::default(),
         }
     }
 
@@ -65,6 +69,7 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
+            ranges: crate::dom::range::RangeTable::default(),
         }
     }
 
@@ -185,17 +190,9 @@ impl BlitzDocument {
             if let Some(attributes) = self.pi_attributes.get(&from).cloned() {
                 self.pi_attributes.insert(to, attributes);
             }
-            let from_children = self
-                .base
-                .get_node(from)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            let to_children = self
-                .base
-                .get_node(to)
-                .map(|node| node.children.clone())
-                .unwrap_or_default();
-            stack.extend(from_children.into_iter().zip(to_children));
+            stack.extend(crate::dom::adoption::lockstep_children(
+                &self.base, from, &self.base, to,
+            ));
         }
     }
 
@@ -275,6 +272,29 @@ impl BlitzDocument {
     /// Sets the already-started flag. Returns whether this was the first set.
     pub(crate) fn mark_script_started(&mut self, id: blitz_traits::node_id::NodeId) -> bool {
         self.started_scripts.insert(id)
+    }
+
+    /// Copies the already-started flag of `from` onto `to`, then walks both
+    /// subtrees in lockstep. Cloning sets the copy's flag from the original
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:cloning-steps>).
+    pub(crate) fn copy_script_started(
+        &mut self,
+        from: blitz_traits::node_id::NodeId,
+        to: blitz_traits::node_id::NodeId,
+    ) {
+        // Pure tax when no script ever started: skip the walk entirely.
+        if self.started_scripts.is_empty() {
+            return;
+        }
+        let mut stack = vec![(from, to)];
+        while let Some((from, to)) = stack.pop() {
+            if self.started_scripts.contains(&from) {
+                self.started_scripts.insert(to);
+            }
+            stack.extend(crate::dom::adoption::lockstep_children(
+                &self.base, from, &self.base, to,
+            ));
+        }
     }
 }
 

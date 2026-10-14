@@ -144,7 +144,7 @@ fn member_tables(interface: &Interface) -> TokenStream {
         .count();
         quote! { host::Member { name: #name, kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: #length } } }
     });
-    let stringifier = interface.stringifier.map(|_| {
+    let stringifier = interface.stringifier.as_ref().map(|_| {
         let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
         quote! { host::Member { name: "toString", kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: 0 } } }
     });
@@ -242,13 +242,22 @@ fn dispatch_groups(
         let id = interface.attributes.len() * 2 + index + 1;
         arms.push((id, true, operation_dispatch(id, operation, interface)));
     }
-    if let Some(index) = interface.stringifier {
+    if let Some(stringifier) = &interface.stringifier {
         let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
-        arms.push((
-            id,
-            false,
-            getter_dispatch(id, &interface.attributes[index], interface),
-        ));
+        let body = match stringifier {
+            crate::model::Stringifier::Attribute(index) => {
+                getter_dispatch(id, &interface.attributes[*index], interface)
+            }
+            // An anonymous `stringifier;` calls the provided method and
+            // converts the string result.
+            crate::model::Stringifier::Method => quote! {
+                #id => {
+                    let result: rquickjs::String = receiver.stringifier(&ctx)?;
+                    rquickjs::IntoJs::into_js(result, &ctx)
+                }
+            },
+        };
+        arms.push((id, false, body));
     }
     let mut routes = Vec::new();
     let mut groups = Vec::new();
@@ -812,6 +821,9 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             | ReturnType::InterfaceSequence
             | ReturnType::StringSequence
             | ReturnType::NullableDocumentType
+            | ReturnType::Uint8Array
+            | ReturnType::UnsignedLongLong
+            | ReturnType::Short
             | ReturnType::Any => {
                 // `any` attributes are rejected at lowering.
                 unreachable!("validated field mapping")
@@ -836,6 +848,34 @@ fn long_from_value() -> TokenStream {
             // https://webidl.spec.whatwg.org/#es-long
             let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
             converted.0
+        }
+    }
+}
+
+/// Yields the `WebIDL` `unsigned short` conversion of the fetched `value`.
+fn ushort_from_value() -> TokenStream {
+    quote! {
+        {
+            // https://webidl.spec.whatwg.org/#es-unsigned-short
+            // Wrapping arithmetic, like the `cast_unsigned` conversions
+            // above: the remainder always fits, so the fallback is dead.
+            let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+            u16::try_from(converted.0.rem_euclid(65536)).unwrap_or(u16::MAX)
+        }
+    }
+}
+
+/// Yields the `WebIDL` `short` conversion of the fetched `value`.
+fn short_from_value() -> TokenStream {
+    quote! {
+        {
+            // https://webidl.spec.whatwg.org/#es-short
+            // Wrapping arithmetic, like the `cast_unsigned` conversions
+            // above: the remainder always fits, so the fallback is dead.
+            let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+            u16::try_from(converted.0.rem_euclid(65536))
+                .map(u16::cast_signed)
+                .unwrap_or(0)
         }
     }
 }
@@ -1143,6 +1183,10 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
             let result: u16 = #call?;
             rquickjs::IntoJs::into_js(result, &ctx)
         },
+        OperationResult::Short => quote! {
+            let result: i16 = #call?;
+            rquickjs::IntoJs::into_js(result, &ctx)
+        },
         OperationResult::Long => quote! {
             let result: i32 = #call?;
             rquickjs::IntoJs::into_js(result, &ctx)
@@ -1183,20 +1227,17 @@ fn operation_argument(
 }
 
 /// An optional union argument's IDL default, materialized as the value
-/// before conversion, mirroring boolean defaults.
+/// before conversion where the default differs from `undefined`.
+///
+/// `undefined` already converts to an empty dictionary's defaults, so the
+/// `{}` default needs no materialization
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>).
 fn union_default_value(argument: &OperationArgument) -> TokenStream {
     match argument.union_default {
-        None => quote! {},
+        None | Some(UnionDefault::EmptyDictionary) => quote! {},
         Some(UnionDefault::Boolean(default)) => quote! {
             let value = if value.is_undefined() {
                 Value::new_bool(ctx.clone(), #default)
-            } else {
-                value
-            };
-        },
-        Some(UnionDefault::EmptyDictionary) => quote! {
-            let value = if value.is_undefined() {
-                rquickjs::Object::new(ctx.clone())?.into_value()
             } else {
                 value
             };
@@ -1335,35 +1376,31 @@ fn operation_argument_at(
             }
         }
         ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
+        ReturnType::UnsignedShort => {
+            numeric_argument(&fetch, variable, &ushort_from_value())
+        }
+        ReturnType::Short => numeric_argument(&fetch, variable, &short_from_value()),
         ReturnType::UnsignedLong => {
-            let convert = ulong_from_value();
-            quote! {
-                #fetch
-                let #variable = #convert;
-            }
+            numeric_argument(&fetch, variable, &ulong_from_value())
         }
-        ReturnType::Long => {
-            let convert = long_from_value();
-            quote! {
-                #fetch
-                let #variable = #convert;
-            }
-        }
-        ReturnType::Double => {
-            let convert = double_from_value();
-            quote! {
-                #fetch
-                let #variable = #convert;
-            }
-        }
+        ReturnType::Long => numeric_argument(&fetch, variable, &long_from_value()),
+        ReturnType::Double => numeric_argument(&fetch, variable, &double_from_value()),
         ReturnType::RestrictedDouble => {
-            let convert = restricted_double_from_value();
-            quote! {
-                #fetch
-                let #variable = #convert;
-            }
+            numeric_argument(&fetch, variable, &restricted_double_from_value())
         }
         _ => unreachable!("validated operation argument"),
+    }
+}
+
+/// Fetches one value and converts it with a numeric `*_from_value` helper.
+fn numeric_argument(
+    fetch: &TokenStream,
+    variable: &proc_macro2::Ident,
+    convert: &TokenStream,
+) -> TokenStream {
+    quote! {
+        #fetch
+        let #variable = #convert;
     }
 }
 
