@@ -9,7 +9,9 @@ standalone shell tools for failure-list diffs. The CLI builds the
 `wpt`-profile binary through cargo on
 every run (cargo's fingerprint no-ops when fresh): dev's assertions with
 `opt-level = 2`, so file timeouts measure the engine instead of a `-O0`
-QuickJS spending the whole budget. It installs the
+QuickJS spending the whole budget. Long-timeout files (`<meta name=timeout
+content=long>`) get 30 s instead of upstream's 60 s: every passing long file
+here finishes in single seconds, so a hang costs half a minute. It installs the
 wptrunner product into WPT's venv only when the venv is missing or its stamp
 changed: the stamp covers the `wpt run` requirements files (manifest,
 wptrunner, serve), `tools/wpt/pyproject.toml`, the python version, and the
@@ -125,7 +127,7 @@ In `docs/progress.md`, replace the latest total and scored groups only.
 | HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. Actions/bless/permissions are engine-red foundations; BiDi later. |
 | Parallel processes | CPU count unless the command sets `--processes`, `--fully-parallel`, or `-f`. Each process gets its own browser and ports. `--fully-parallel`/`-f` is separate: every test is its own group, so the browser restarts per test. The count actually used is echoed as `wpt: processes N`. |
-| Longest-first split | The default split gives each process one fixed queue with no work stealing; upstream fills it by test-id hash, so one process can draw several 60 s tests. With known durations the harness assigns tests longest-first to the least-loaded process instead (`wpt: longest-first split, N tests with known durations`); tests never timed cost the median. Every run records its per-test durations in `~/.cache/tinybrowser/wpt-durations.json`, so the second run of a slice is balanced. `TINYBROWSER_WPT_DURATIONS=REPORT.json` reads durations from any `--log-wptreport` output instead; `TINYBROWSER_WPT_DURATIONS=` (empty) keeps the hash split. `--run-by-dir`, `--test-groups`, and `-f` keep their upstream grouping. |
+| Longest-first split | The default split gives each process one fixed queue with no work stealing; upstream fills it by test-id hash, so one process can draw several long tests. With known durations the harness assigns tests longest-first to the least-loaded process instead (`wpt: longest-first split, N tests with known durations`); tests never timed cost the median. Every run records its per-test durations in `~/.cache/tinybrowser/wpt-durations.json`, so the second run of a slice is balanced. `TINYBROWSER_WPT_DURATIONS=REPORT.json` reads durations from any `--log-wptreport` output instead; `TINYBROWSER_WPT_DURATIONS=` (empty) keeps the hash split. `--run-by-dir`, `--test-groups`, and `-f` keep their upstream grouping. |
 | Skips and locks | The venv install holds the shared-venv lock only around an install that is still needed, then releases it before tests; a run that skips the install takes no lock. A run that lets wpt rewrite the shared manifest holds a manifest lock for the whole invocation; `--no-manifest-update` runs stay parallel. Runs passing `--install-browser`, `--install-webdriver`, `--manifest-download`, or `--install-fonts` hold the venv lock throughout, since wpt itself then writes into the venv. |
 
 ## Blocked on engine capabilities
