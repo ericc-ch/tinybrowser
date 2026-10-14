@@ -1227,20 +1227,17 @@ fn operation_argument(
 }
 
 /// An optional union argument's IDL default, materialized as the value
-/// before conversion, mirroring boolean defaults.
+/// before conversion where the default differs from `undefined`.
+///
+/// `undefined` already converts to an empty dictionary's defaults, so the
+/// `{}` default needs no materialization
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>).
 fn union_default_value(argument: &OperationArgument) -> TokenStream {
     match argument.union_default {
-        None => quote! {},
+        None | Some(UnionDefault::EmptyDictionary) => quote! {},
         Some(UnionDefault::Boolean(default)) => quote! {
             let value = if value.is_undefined() {
                 Value::new_bool(ctx.clone(), #default)
-            } else {
-                value
-            };
-        },
-        Some(UnionDefault::EmptyDictionary) => quote! {
-            let value = if value.is_undefined() {
-                rquickjs::Object::new(ctx.clone())?.into_value()
             } else {
                 value
             };

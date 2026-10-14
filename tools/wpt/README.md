@@ -5,8 +5,11 @@ single Python CLI `tools/wpt/cli.py` (`run` | `score` | `rerun` |
 `overnight` | `selftest`); `tools/wpt/run` and `tools/wpt/rerun` are thin
 shims that find a Python before the venv exists (`tools/wpt/retest` is a
 compat alias for `rerun`). `tools/wpt/failures` and `tools/wpt/baseline` are
-standalone shell tools for failure-list diffs. The CLI builds the debug binary through cargo on
-every run (cargo's fingerprint no-ops when fresh), and installs the
+standalone shell tools for failure-list diffs. The CLI builds the
+`wpt`-profile binary through cargo on
+every run (cargo's fingerprint no-ops when fresh): dev's assertions with
+`opt-level = 2`, so file timeouts measure the engine instead of a `-O0`
+QuickJS spending the whole budget. It installs the
 wptrunner product into WPT's venv only when the venv is missing or its stamp
 changed: the stamp covers the `wpt run` requirements files (manifest,
 wptrunner, serve), `tools/wpt/pyproject.toml`, the python version, and the

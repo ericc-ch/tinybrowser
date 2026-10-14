@@ -94,12 +94,23 @@ echo "baseline: building $rev" >&2
 # build script).
 (
   cd "$worktree"
-  BASE_BIN="$baseline_bin" TARGET_DIR="$tmp/target" nix develop --command bash -c \
-    'export CARGO_TARGET_DIR="$TARGET_DIR"; cargo build -q && cp "$(tools/binary-path)" "$BASE_BIN"'
+  # The `wpt` profile arrives with ec99fb4c; older revisions take the same
+  # settings through cargo's dev-profile env override, so both sides of a
+  # diff build with the same optimization level.
+  BASE_BIN="$baseline_bin" TARGET_DIR="$tmp/target" nix develop --command bash -c '
+    export CARGO_TARGET_DIR="$TARGET_DIR"
+    if grep -q "^\[profile\.wpt\]" Cargo.toml; then
+      cargo build -q --profile wpt
+      cp "$(tools/binary-path --profile wpt)" "$BASE_BIN"
+    else
+      CARGO_PROFILE_DEV_OPT_LEVEL=2 cargo build -q
+      cp "$(tools/binary-path)" "$BASE_BIN"
+    fi
+  '
 )
 
 echo "baseline: rebuilding the working tree" >&2
-nix develop --command cargo build -q
+nix develop --command cargo build -q --profile wpt
 
 echo "baseline: running the slice at $rev" >&2
 TINYBROWSER_BINARY="$baseline_bin" nix develop --command \

@@ -1,7 +1,7 @@
 //! Agent-owned custom-element reaction scopes and the retained shim bridge.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::dom::tree::NodeId;
@@ -28,11 +28,16 @@ pub(crate) struct CustomElementReactions {
     backup_scheduled: bool,
     collecting: bool,
     hooks: BTreeMap<FrameId, Persistent<Function<'static>>>,
+    /// Frames with at least one custom element definition. Collection calls
+    /// a frame's hook only then: with no definitions every upgrade, notify,
+    /// and attribute path inside is a no-op walk over mutation records.
+    defined: BTreeSet<FrameId>,
 }
 
 impl CustomElementReactions {
     pub(crate) fn forget_frame(&mut self, frame: FrameId) {
         self.hooks.remove(&frame);
+        self.defined.remove(&frame);
         self.element_reactions.retain(|_, reactions| {
             reactions.retain(|reaction| reaction.owner != frame);
             !reactions.is_empty()
@@ -80,11 +85,14 @@ fn collect(ctx: &Ctx<'_>) -> Result<()> {
             return Ok(());
         }
         registry.reactions.collecting = true;
+        // Frames without a definition have nothing to collect: every
+        // reaction source is gated on one.
         registry
             .reactions
             .hooks
-            .values()
-            .cloned()
+            .iter()
+            .filter(|(frame, _)| registry.reactions.defined.contains(frame))
+            .map(|(_, hook)| hook.clone())
             .collect::<Vec<_>>()
     };
     let result = (|| {
@@ -96,6 +104,21 @@ fn collect(ctx: &Ctx<'_>) -> Result<()> {
     })();
     registry.borrow_mut().reactions.collecting = false;
     result
+}
+
+/// Marks the current frame as having a custom element definition, opening
+/// the collection gate in `collect`.
+fn note_defined(ctx: &Ctx<'_>) -> Result<()> {
+    let world = world(ctx)?;
+    let frame = world.borrow().frame();
+    world
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .reactions
+        .defined
+        .insert(frame);
+    Ok(())
 }
 
 fn push(ctx: &Ctx<'_>) -> Result<()> {
@@ -173,6 +196,7 @@ enum Bridge {
     Push,
     Pop,
     DeliverBackup,
+    NoteDefined,
 }
 
 fn dispatch<'js>(operation: host::Operation, params: &Params<'_, 'js>) -> Result<Value<'js>> {
@@ -181,6 +205,7 @@ fn dispatch<'js>(operation: host::Operation, params: &Params<'_, 'js>) -> Result
         1 => Bridge::Push,
         2 => Bridge::Pop,
         3 => Bridge::DeliverBackup,
+        4 => Bridge::NoteDefined,
         _ => {
             return Err(Exception::throw_internal(
                 params.ctx(),
@@ -197,6 +222,7 @@ impl Bridge {
         match self {
             Self::Push => push(ctx)?,
             Self::Pop => pop(ctx)?,
+            Self::NoteDefined => note_defined(ctx)?,
             Self::DeliverBackup => {
                 let registry = world(ctx)?.borrow().registry();
                 loop {
@@ -292,6 +318,7 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
         ("__tbEnqueueCustomReaction", 0),
         ("__tbPushCustomReactions", 1),
         ("__tbPopCustomReactions", 2),
+        ("__tbNoteCustomDefined", 4),
     ] {
         super::bridge::object(ctx)?.set(
             name,
@@ -319,6 +346,7 @@ pub(crate) fn capture(ctx: &Ctx<'_>) -> Result<()> {
         "__tbEnqueueCustomReaction",
         "__tbPushCustomReactions",
         "__tbPopCustomReactions",
+        "__tbNoteCustomDefined",
     ] {
         super::bridge::object(ctx)?.remove(name)?;
     }

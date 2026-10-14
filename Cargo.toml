@@ -128,3 +128,12 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# ─── WPT profile ──────────────────────────────────────────────────────────────
+# Conformance runs measure the engine against testharness file timeouts. A
+# debug build spends that budget inside a `-O0` QuickJS interpreter, so slow
+# matrix files time out on the build mode instead of the engine. Keep dev's
+# assertions and overflow checks, optimize the code.
+[profile.wpt]
+inherits = "dev"
+opt-level = 2

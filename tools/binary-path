@@ -2,16 +2,23 @@
 # Print the path of a built binary, resolving cargo's target directory so a
 # custom `build.target-dir` or CARGO_TARGET_DIR still points at it.
 #
-# usage: tools/binary-path [--release] [name]   (default: debug tinybrowser)
+# usage: tools/binary-path [--release | --profile NAME] [name]
+#        (default: debug tinybrowser)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 PROFILE=debug
-if [ "${1:-}" = "--release" ]; then
-  PROFILE=release
-  shift
-fi
+case "${1:-}" in
+  --release)
+    PROFILE=release
+    shift
+    ;;
+  --profile)
+    PROFILE="${2:?--profile needs a name}"
+    shift 2
+    ;;
+esac
 NAME="${1:-tinybrowser}"
 
 TARGET_DIR="$(cargo metadata --no-deps --format-version 1 \
