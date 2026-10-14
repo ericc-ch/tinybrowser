@@ -519,7 +519,7 @@ pub(crate) fn adjust_for_split(
     ranges: &mut RangeTable,
     node: NodeId,
     new_node: NodeId,
-    parent: Option<NodeId>,
+    parent: NodeId,
     index: u32,
     offset: u32,
 ) {
@@ -529,12 +529,8 @@ pub(crate) fn adjust_for_split(
                 point.node = new_node;
                 point.offset -= offset;
             }
-        }
-        if let Some(parent) = parent {
-            for point in [&mut range.start, &mut range.end] {
-                if point.node == parent && point.offset == index.saturating_add(1) {
-                    point.offset += 1;
-                }
+            if point.node == parent && point.offset == index.saturating_add(1) {
+                point.offset += 1;
             }
         }
     }

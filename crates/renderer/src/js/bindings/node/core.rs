@@ -2579,7 +2579,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
                 &mut parsed.document.ranges,
                 id,
                 new_id,
-                Some(parent),
+                parent,
                 index.unwrap_or(0),
                 u32::try_from(offset).unwrap_or(u32::MAX),
             );
