@@ -75,3 +75,35 @@ test("javascript: iframe src still runs in a same-origin child", async ({ daemon
 
   await browser.close();
 });
+
+test("opaque about:blank rejects data: and file: history URLs", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+
+  const result = await page.evaluate(() => {
+    const rejected = (spec: string) => {
+      try {
+        history.pushState({}, "", spec);
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    const dataRejected = rejected("data:text/html,x");
+    const fileRejected = rejected("file:///tmp/x");
+    let fragmentOk = false;
+    try {
+      history.pushState({}, "", "#frag");
+      fragmentOk = location.hash === "#frag";
+    } catch {
+      fragmentOk = false;
+    }
+    return { dataRejected, fileRejected, fragmentOk, href: location.href };
+  });
+
+  expect(result.dataRejected).toBe(true);
+  expect(result.fileRejected).toBe(true);
+  expect(result.fragmentOk).toBe(true);
+
+  await browser.close();
+});

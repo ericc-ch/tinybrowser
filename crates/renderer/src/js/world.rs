@@ -576,6 +576,71 @@ fn object_url_key(url: &str) -> &str {
     url.split_once('#').map_or(url, |(head, _)| head)
 }
 
+fn same_document_url(document_url: &Url, url: &Url) -> bool {
+    let mut own = document_url.clone();
+    let mut other = url.clone();
+    own.set_fragment(None);
+    other.set_fragment(None);
+    own == other
+}
+
+/// Opaque captured-origin match: never `Url::origin()`, which is a new
+/// `Origin::Opaque` for `about:blank`, `data:`, and `file:`.
+fn opaque_url_matches(
+    document_url: &Url,
+    captured: &url::Origin,
+    url: &Url,
+    blob_origin: Option<&url::Origin>,
+) -> bool {
+    if same_document_url(document_url, url) {
+        return true;
+    }
+    url.scheme() == "blob" && blob_origin.is_some_and(|origin| origin == captured)
+}
+
+#[cfg(test)]
+mod origin_match_tests {
+    use super::{Url, opaque_url_matches};
+
+    #[test]
+    fn opaque_about_blank_rejects_data_and_file() {
+        let document_url = Url::parse("about:blank").expect("about:blank");
+        let origin = document_url.origin();
+        assert!(!opaque_url_matches(
+            &document_url,
+            &origin,
+            &Url::parse("data:text/html,x").expect("data"),
+            None,
+        ));
+        assert!(!opaque_url_matches(
+            &document_url,
+            &origin,
+            &Url::parse("file:///tmp/x").expect("file"),
+            None,
+        ));
+        assert!(opaque_url_matches(
+            &document_url,
+            &origin,
+            &Url::parse("about:blank").expect("about:blank"),
+            None,
+        ));
+        assert!(opaque_url_matches(
+            &document_url,
+            &origin,
+            &Url::parse("about:blank#frag").expect("fragment"),
+            None,
+        ));
+        let blob = Url::parse("blob:null/00000000-0000-4000-8000-000000000000").expect("blob");
+        assert!(!opaque_url_matches(&document_url, &origin, &blob, None));
+        assert!(opaque_url_matches(
+            &document_url,
+            &origin,
+            &blob,
+            Some(&origin),
+        ));
+    }
+}
+
 pub(crate) struct WeakReferences {
     pub(crate) constructor: Persistent<rquickjs::function::Constructor<'static>>,
     pub(crate) deref: Persistent<Function<'static>>,
@@ -1297,12 +1362,26 @@ impl World {
     }
 
     /// Whether `url` is same-origin with this document's captured origin.
-    /// Tuple origins compare with `Url::origin()`; opaque origins cannot,
-    /// because that call allocates a new `Origin::Opaque` each time.
+    /// Tuple origins compare with `Url::origin()`. Opaque origins cannot:
+    /// `about:blank`, `data:`, and `file:` each allocate a new `Origin::Opaque`.
+    /// Those match only this document's own URL, or a blob URL whose stored
+    /// origin is this captured origin.
     pub(crate) fn url_matches_origin(&self, url: &Url) -> bool {
         match self.origin {
             url::Origin::Tuple(..) => url.origin() == self.origin,
-            url::Origin::Opaque(_) => !matches!(url.origin(), url::Origin::Tuple(..)),
+            url::Origin::Opaque(_) => {
+                let blob_origin = if url.scheme() == "blob" {
+                    self.runtime
+                        .registry
+                        .borrow()
+                        .object_urls
+                        .get(object_url_key(url.as_str()))
+                        .map(|entry| entry.origin.clone())
+                } else {
+                    None
+                };
+                opaque_url_matches(&self.document_url, &self.origin, url, blob_origin.as_ref())
+            }
         }
     }
 
