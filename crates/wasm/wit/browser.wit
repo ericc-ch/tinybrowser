@@ -197,8 +197,12 @@ interface engine {
         /// Evaluates `source` in the main frame and returns its string
         /// coercion. Throws surface as the error side.
         eval: func(source: string) -> result<string, string>;
-        /// Advances the page one turn: runs every ready task, then returns
-        /// milliseconds until the next timer, or none when idle.
+        /// Advances the page one turn: runs ready tasks until the script
+        /// budget, then returns milliseconds until the next timer.
+        ///
+        /// Zero means ready work is still queued. Timers already moved into
+        /// the task queue have no deadline, so `none` would stop the host.
+        /// The host steps again immediately. `none` means the page is idle.
         ///
         /// The return value is measured after the work, so the two answers
         /// cannot disagree: a timer the page just armed is included, and a

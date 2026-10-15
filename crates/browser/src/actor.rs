@@ -958,14 +958,12 @@ impl Tab {
 
     /// Mounts a `data:` document as the top-level page.
     async fn commit_data_navigation(&mut self, url: Url) -> bool {
-        let Some((content_type, body)) = renderer::decode_data_url(url.as_str()) else {
+        // Shared with subframe dials: reject a raw URL past the data-URL
+        // ceiling before decode, then reject a decoded body past the cap.
+        let Some((content_type, body)) = renderer::decode_data_url_bounded(url.as_str()) else {
             self.navigation_failed = true;
             return false;
         };
-        if body.len() > MAX_RESPONSE_BODY_BYTES {
-            self.navigation_failed = true;
-            return false;
-        }
         let site = Site::for_url(&url).unwrap_or_else(|| Site::opaque(self.id));
         let mut history = self.history.clone();
         if !history.navigate(url.clone(), self.traversal.take()) {
