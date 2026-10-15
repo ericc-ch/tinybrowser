@@ -20,7 +20,7 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
 
 - clippy and embedded JS (`tools/check`), `cargo test --workspace`.
 - Unless already inside the dev shell, run direct Cargo commands and runners that build the browser through `nix develop --command`; the host shell may not expose `pkg-config` or OpenSSL. `tools/check` already enters the Nix shell for clippy.
-- When adding or changing `unsafe`: `tools/check miri` (pure-Rust) and `tools/check valgrind` (FFI / renderer / net).
+- When adding or changing `unsafe`: `tools/check valgrind` (FFI / renderer / net).
 
 ## Dependencies
 
@@ -62,7 +62,7 @@ For Web API implementation or binding changes, read
 
 Never maintain handwritten `unsafe`: no `unsafe {}`, `unsafe fn`, `unsafe trait`, `unsafe impl`, or `#[allow(unsafe_code)]` in tinybrowser-owned code, unless:
 
-- The runtime safety is proven (a `// SAFETY:` invariant a reviewer can check, tests that exercise it, and Miri or a sanitizer where the tooling can see the code)
+- The runtime safety is proven (a `// SAFETY:` invariant a reviewer can check, tests that exercise it, and `tools/check valgrind` for FFI / renderer / net)
 - No safe alternative is as simple, clear, or fast.
   Unsafe code maintained by upstream dependencies is allowed, including code emitted into this workspace by an upstream derive or bindings generator such as rquickjs or wit-bindgen.
   Narrow `#[expect(...)]` attributes with a written reason may wrap an upstream generator invocation for lints in its emitted code; never place handwritten unsafe inside the same scope. Do not manually edit or locally fork generated unsafe code; doing so makes it ours.
@@ -72,6 +72,7 @@ Never maintain handwritten `unsafe`: no `unsafe {}`, `unsafe fn`, `unsafe trait`
 - No need to care about breaking changes, full rewrites, churns, etc. they are always fine. When code fights you, assume it is wrong: zoom out, fix the design, don't patch around it.
 - Web-platform behavior comes from the WHATWG specs, not from our tests or guesses. Start every implementation and review of a conformance claim from the governing spec. Cite the spec at the implementation site with an anchor link, for example `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`. Follow the spec's exact algorithm order, even when our tests disagree. Fix the test, not the spec.
 - Upstream deficiencies are never worked around: when Blitz (or any other upstream dependency) drops or cannot represent something the spec requires, do not build side-channels that compensate for it. Note the gap as a known-fail under `Upstream Blitz bugs` in `docs/progress.md`, keep our code simple, and let the tests fail honestly. If such workaround code already exists in a branch under review, remove it completely instead of fixing it.
+- Only modify a fork when that fork is the right place for the fix. When the same thing is implemented twice, upstream wins: keep the more upstream copy and delete the duplicate.
 - For how a browser actually behaves, read a shipped engine implementation. Start with Chromium, then read Firefox when Chromium does not cover the case. Do not clone these repositories. When the spec and a shipped browser disagree, state the disagreement in a code comment and follow the browser that matches the spec algorithm.
 - Decisions live in commit messages.
 - Do experimentations in `/tmp/`. Scratch builds, size probes, throwaway JS/Rust experiments, etc.

@@ -282,8 +282,13 @@ impl CookieJar {
         // request URI's directory, which has no such cap:
         // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
         // The record names its own domain, so require the canonical form the
-        // jar writes rather than trusting a raw attribute.
-        let domain = canonicalize_domain_attr(&record.domain)?;
+        // jar writes rather than trusting a raw attribute. Host-only IPv6
+        // stores `ip.to_string()` (`::1`, no brackets); `Host::parse` only
+        // accepts IPv6 in brackets, so canonicalize an IP literal first.
+        let domain = match record.domain.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.to_string(),
+            Err(_) => canonicalize_domain_attr(&record.domain)?,
+        };
         if record.domain != domain {
             return None;
         }
@@ -1486,6 +1491,21 @@ mod tests {
         let records = jar.snapshot();
         assert_eq!(records.len(), 1);
         assert!(records[0].path.len() > 1024);
+
+        let mut restored = CookieJar::default();
+        restored.restore(records, at(NOW));
+        assert_eq!(restored.cookie_string(http(&page, at(NOW))), "a=1");
+    }
+
+    #[test]
+    fn restore_keeps_an_ipv6_host_only_cookie() {
+        let page = url("http://[::1]:8000/");
+        let mut jar = CookieJar::default();
+        assert!(jar.store("a=1; Max-Age=3600", http(&page, at(NOW))));
+        let records = jar.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].domain, "::1");
+        assert!(records[0].host_only);
 
         let mut restored = CookieJar::default();
         restored.restore(records, at(NOW));
