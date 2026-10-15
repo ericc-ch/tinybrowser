@@ -1,82 +1,21 @@
-# tinybrowser
+We are building the smallest, lightest, and fastest headless browser for AI agents.
+Maximize web spec conformance per byte.
 
-We are building the smallest and lightest headless browser for AI agents.
-The goal is to maximize conformance per byte.
+- WHATWG specs are ground truth. Start every implementation and review from the spec. Follow exact algorithm order and cite the spec URL at the implementation site.
+- Heavily reference mature engines. Read Chromium/Firefox sources first (see `docs/engines.md`). Never clone these repositories. When the spec and a shipped browser disagree, state the disagreement in a code comment and follow the browser that matches the spec algorithm.
+- Breaking changes, churn, and rewrites are always welcome. When code fights you, zoom out and fix the architectural design. Do not work or patch around it.
+- No lint silencing. Fix the underlying design flaw instead of suppressing compiler or lint diagnostics.
+- Handwritten `unsafe` is prohibited unless runtime safety is proven (`// SAFETY:` invariant, Miri/valgrind checks via `tools/check`) and no safe alternative is as simple, clear, or fast.
+- Let upstream bugs fail honestly. Never build tinybrowser workarounds for upstream engine bugs; record gaps under `Upstream issues` in `docs/progress.md`.
+- Keep feedback loop fast. Cargo tests cover tinybrowser internals only (`cargo test --workspace`); never test web-platform spec conformance in cargo tests. Run the smallest slice that answers the question (single files or directories, never full suites). Never run long or whole-suite test runs without explicit approval.
+- Commit messages should also record decisions.
+- Throwaway experiments belong in `/tmp/`.
 
-In `docs/progress.md`, replace the latest binary size, the latest total, and scored groups only.
+## Pointers
 
-## Testing and conformance
-
-- Cargo tests cover tinybrowser-specific behavior only (`cargo test --workspace`).
-- Web-platform conformance is WPT (`tools/wpt/run`, `tools/wpt/run --score`, `tools/wpt/rerun`).
-- Extra runners: Blink CDP (`tools/cdp-tests/run`), Playwright (`tools/playwright/run`), test262 (`tools/intl/test262`).
-- Keep the WPT feedback loop fast: run the smallest slice that answers the question (single files or dirs, never suites); rerun only failures with `rerun`.
-- Conformance deltas are failure-list diffs, not pass counts: `tools/wpt/baseline REV PATHS` runs a slice at a revision and prints fixed and new failures; `tools/wpt/failures` extracts one list from a log.
-- No suite or slice runs without being asked. Anything longer than minutes needs explicit approval.
-
-Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo test that asserts web-platform behavior or duplicates a WPT case. If a spec regression would only be caught by a cargo test, the missing WPT run is the bug.
-
-## Checks
-
-- clippy and embedded JS (`tools/check`), `cargo test --workspace`.
-- Unless already inside the dev shell, run direct Cargo commands and runners that build the browser through `nix develop --command`; the host shell may not expose `pkg-config` or OpenSSL. `tools/check` already enters the Nix shell for clippy.
-- When adding or changing `unsafe`: `tools/check valgrind` (FFI / renderer / net).
-
-## Dependencies
-
-- Engine forks, one maintained branch each (`master` is the line). Fixes stay
-  downstream; do not submit an upstream PR.
-  - QuickJS-NG fork `github.com/ericc-ch/quickjs`. Checked out as the nested
-    `sys/quickjs` submodule inside the rquickjs checkout below.
-  - rquickjs fork `github.com/ericc-ch/rquickjs`. Checked out as the
-    `third_party/rquickjs` submodule (recursive) and wired in via
-    `[patch.crates-io]` path entries. It is its own workspace, excluded from
-    the tinybrowser workspace, so its lint config stays separate.
-  - Blitz fork `github.com/ericc-ch/blitz`. Checked out as the
-    `third_party/blitz` submodule and wired in via `[patch.crates-io]` path
-    entries for `blitz-dom`, `blitz-html`, `blitz-paint`, and `blitz-traits`.
-    It is its own workspace, excluded from the tinybrowser workspace, so its
-    lint config stays separate.
-  - xml5ever fork `github.com/ericc-ch/html5ever` (Servo's parser monorepo).
-    Checked out as the `third_party/html5ever` submodule and wired in via a
-    `[patch.crates-io]` path entry for `xml5ever` only: it builds against
-    registry markup5ever so the atom/tendril/TreeSink types stay unified.
-    Excluded from the tinybrowser workspace all the same.
-  - Pull upstream inside the submodule, push the fork branch there, then bump
-    the submodule pointer in tinybrowser. Push before pinning: a pointer to
-    an unpushed commit breaks every other checkout at init time (`not our
-    ref`). Confirm the commit is on the remote with
-    `git ls-remote origin <sha>` inside the submodule before recording it.
-    Fresh clones and worktrees need
-    `git submodule update --init --recursive`.
-
-- Use pinned upstream WebIDL extracts as the interface contract. Implementations
-  follow standardized names and generated contracts. Do not maintain explicit
-  mapping tables, per-member overrides, or modified spec declarations.
-  Implementation follows IDL, never the reverse: do not edit IDL to match our code.
-
-For Web API implementation or binding changes, read
-`docs/bindings.md` for JS/Rust ownership, IDL inputs, and coverage rules.
-
-## Working rules
-
-Never maintain handwritten `unsafe`: no `unsafe {}`, `unsafe fn`, `unsafe trait`, `unsafe impl`, or `#[allow(unsafe_code)]` in tinybrowser-owned code, unless:
-
-- The runtime safety is proven (a `// SAFETY:` invariant a reviewer can check, tests that exercise it, and `tools/check valgrind` for FFI / renderer / net)
-- No safe alternative is as simple, clear, or fast.
-  Unsafe code maintained by upstream dependencies is allowed, including code emitted into this workspace by an upstream derive or bindings generator such as rquickjs or wit-bindgen.
-  Narrow `#[expect(...)]` attributes with a written reason may wrap an upstream generator invocation for lints in its emitted code; never place handwritten unsafe inside the same scope. Do not manually edit or locally fork generated unsafe code; doing so makes it ours.
-  The workspace otherwise `deny`s `unsafe_code`.
-
-- Never silence the compiler or a lint to make an error go away. When a check fires, find the design flaw it points at and fix that. An `#[allow]`/`unwrap`-style escape needs a written justification at the same spot and is a last resort.
-- No need to care about breaking changes, full rewrites, churns, etc. they are always fine. When code fights you, assume it is wrong: zoom out, fix the design, don't patch around it.
-- Web-platform behavior comes from the WHATWG specs, not from our tests or guesses. Start every implementation and review of a conformance claim from the governing spec. Cite the spec at the implementation site with an anchor link, for example `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`. Follow the spec's exact algorithm order, even when our tests disagree. Fix the test, not the spec.
-- Upstream deficiencies are never worked around: when Blitz (or any other upstream dependency) drops or cannot represent something the spec requires, do not build side-channels that compensate for it. Note the gap as a known-fail under `Upstream Blitz bugs` in `docs/progress.md`, keep our code simple, and let the tests fail honestly. If such workaround code already exists in a branch under review, remove it completely instead of fixing it.
-- Only modify a fork when that fork is the right place for the fix. When the same thing is implemented twice, upstream wins: keep the more upstream copy and delete the duplicate.
-- For how a browser actually behaves, read a shipped engine implementation. Start with Chromium, then read Firefox when Chromium does not cover the case. Do not clone these repositories. When the spec and a shipped browser disagree, state the disagreement in a code comment and follow the browser that matches the spec algorithm.
-- Decisions live in commit messages.
-- Do experimentations in `/tmp/`. Scratch builds, size probes, throwaway JS/Rust experiments, etc.
-
-## Reference
-
-- Project notes live in the Obsidian vault at `~/Documents/obsidian/everything/projects/tinybrowser/`.
+- **Web API bindings & IDL**: Read `docs/bindings.md` for JS/Rust ownership, WebIDL contracts, and platform objects.
+- **Engine behavior**: Read `docs/engines.md` to search and fetch Chromium/Firefox sources without cloning.
+- **Engine forks & submodules**: Read `third_party/VENDORED.md` for submodule maintenance, fork branches, and update workflows.
+- **WPT & conformance harness**: Read `tools/wpt/README.md` for test runners, scoring, and failure diffing.
+- **Binary size & architecture log**: See `docs/size.md` and `docs/decisions.md`.
+- **Project notes**: `~/Documents/obsidian/everything/projects/tinybrowser/`
