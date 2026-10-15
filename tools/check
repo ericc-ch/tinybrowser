@@ -25,10 +25,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Default Valgrind: logging, then the `render` module tests
-# (empty-document smokes). Not the full QuickJS renderer suite.
-# Valgrind covers Stylo hooks via the `blitz-dom` dependency
-# through `renderer::render` tests.
+# `tools/check valgrind` with no crate names runs the workspace test suite.
+# Named crates are a narrower run.
 
 usage() {
   echo "usage: tools/check [clippy|valgrind [crate...]]" >&2
@@ -113,14 +111,11 @@ case "${1:-clippy}" in
   valgrind)
     shift
     if [ "$#" -eq 0 ]; then
-      # Two invocations: a filter after `-p logging -p renderer` would skip
-      # logging. Keep the renderer filter so QuickJS tests stay off the default.
-      valgrind_test -p logging
-      valgrind_test -p renderer render::
-      exit 0
+      valgrind_test --workspace
+    else
+      mapfile -t args < <(crate_args "$@")
+      valgrind_test "${args[@]}"
     fi
-    mapfile -t args < <(crate_args "$@")
-    valgrind_test "${args[@]}"
     ;;
   *)
     usage
