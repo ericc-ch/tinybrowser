@@ -4,16 +4,22 @@
 
 ## WPT
 
-Overnight 2026-09-27 tip 6ec8696c8df2
-testharness+crashtest, --exclude=worker
+CI 2026-10-15 run 38732775601 (wpt.yml, 20 chunks), --exclude=worker
+testharness+crashtest+reftest+test262
 
-pass 5064
-expfail 33
-unexp 21463
-timeout 3661
-crash 121
-error 5661
+pass 63197
+expfail 31
+unexp 45799
+timeout 5914
+crash 2
+error 3981
 skip 78
-tests 36081
+tests 119002
 
-Total 14.1% = pass / (tests - skip)
+per type (pass / tests)
+testharness 5144 / 34819 = 14.8%
+crashtest 1879 / 2031 = 92.5%
+reftest 13378 / 28492 = 47.0%
+test262 42796 / 53660 = 79.8%
+
+Total 53.1% = pass / (tests - skip)
