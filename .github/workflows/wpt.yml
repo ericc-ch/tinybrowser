@@ -41,10 +41,14 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_WPT_DEBUG: "false"
+  # Mirrors the flake devShell: link the runner's OpenSSL instead of building
+  # a vendored copy (the vendored one needs perl and minutes, and links the
+  # static copy where local builds link the system one).
+  OPENSSL_NO_VENDOR: "1"
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       chunks: ${{ steps.plan.outputs.chunks }}
@@ -56,10 +60,15 @@ jobs:
         run: echo "chunks=[$(seq -s, 1 "$CHUNKS")]" >> "$GITHUB_OUTPUT"
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: System libraries
+        run: >
+          sudo apt-get update -qq &&
+          sudo apt-get install -y -qq --no-install-recommends
+          libfontconfig1-dev libssl-dev pkg-config
       - name: Submodules (build inputs only, shallow)
         run: >
           git submodule update --init --recursive --depth 1 --jobs 4
@@ -69,6 +78,13 @@ jobs:
           cargo build --profile wpt --locked
           cp "$(./tools/binary-path --profile wpt)" tinybrowser-wpt
           ls -l tinybrowser-wpt
+      - name: Check runtime libraries
+        run: |
+          missing="$(ldd tinybrowser-wpt | grep 'not found' || true)"
+          if [[ -n "$missing" ]]; then
+            echo "::error::missing runtime libraries in the runner image:"$'\n'"$missing"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: tinybrowser-wpt
@@ -78,7 +94,7 @@ jobs:
   wpt:
     name: chunk ${{ matrix.chunk }}/${{ inputs.chunks }}
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
       fail-fast: false
@@ -122,7 +138,7 @@ jobs:
     name: score
     needs: [plan, wpt]
     if: ${{ !cancelled() && needs.wpt.result != 'skipped' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
