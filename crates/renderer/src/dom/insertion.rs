@@ -778,7 +778,7 @@ pub(crate) fn ensure_document_content_model(
             return ensure_doctype_position(doc, parent, reference, excluded);
         }
     }
-    let parent_has_element = parent_has_element(doc, parent.node, excluded);
+    let has_element = parent_has_element(doc, parent.node, excluded);
     // `ensure_parented` above guarantees same-document-or-absent, but the
     // filter stays: in release builds a bypassed check must degrade to
     // append-at-end, never to cross-document slot reads.
@@ -787,7 +787,7 @@ pub(crate) fn ensure_document_content_model(
         child_id.is_some_and(|child| sibling_doctype_follows(doc, parent.node, child.node));
     let child_is_doctype = child_id
         .is_some_and(|child| !excluded.contains(&child.node) && is_doctype(doc, child.node));
-    if parent_has_element || doctype_follows || child_is_doctype {
+    if has_element || doctype_follows || child_is_doctype {
         return Err(TreeError::Hierarchy);
     }
     Ok(())
@@ -801,12 +801,12 @@ pub(crate) fn ensure_doctype_position(
     reference: Option<NodeId>,
     excluded: &[BlitzId],
 ) -> Result<(), TreeError> {
-    let parent_has_doctype = parent_has_doctype(doc, parent.node, excluded);
+    let has_doctype = parent_has_doctype(doc, parent.node, excluded);
     let child_id = reference.filter(|child| child.document == parent.document);
     let element_precedes =
         child_id.is_some_and(|child| sibling_element_precedes(doc, parent.node, child.node));
-    let parent_has_element = parent_has_element(doc, parent.node, excluded);
-    if parent_has_doctype || element_precedes || (child_id.is_none() && parent_has_element) {
+    let has_element = parent_has_element(doc, parent.node, excluded);
+    if has_doctype || element_precedes || (child_id.is_none() && has_element) {
         return Err(TreeError::Hierarchy);
     }
     Ok(())
@@ -842,19 +842,18 @@ pub(crate) fn ensure_can_move(
     // inside `ensure_no_cycle`; there are no shadow hosts
     // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
     ensure_no_cycle(base, parent.node, node.node)?;
-    let _reference = match target {
+    match target {
         MoveTarget::Before(child) => {
             if child.document != parent.document {
                 return Err(TreeError::NotFound);
             }
             ensure_parented(base, parent, *child)?;
-            Some(*child)
         }
         MoveTarget::Unparented => {
             return Err(TreeError::NotFound);
         }
-        MoveTarget::End => None,
-    };
+        MoveTarget::End => {}
+    }
     let kind = classify_inserted(doc, node.node);
     let movable = matches!(
         kind,

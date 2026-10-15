@@ -42,14 +42,8 @@
   // <https://html.spec.whatwg.org/multipage/semantics.html#the-link-element:create-a-css-style-sheet>).
   // Created while the element is connected so an earlier script in the same
   // insert can observe `sheet` after the style/link node's insertion steps
-  // and before that script's post-connection steps.
-  //
-  // `cssRules` is a length-only stub: WPT pins `sheet` and
-  // `cssRules.length`, not indexed rules, and real `CSSRule` objects need
-  // the style engine's parsed rules. The brace count approximates top-level
-  // style rules (nested at-rules, braces in strings/comments/URLs, and
-  // `@import` miscount); indexed access stays `undefined` until the stub is
-  // replaced with the real list.
+  // and before that script's post-connection steps. `cssRules` is not
+  // implemented yet (see `__tbAssociatedSheet`).
   const __tbSheets = new WeakMap();
   // Captured at realm init: the sheet getters brand-check against it, and
   // pages may replace the global afterwards.

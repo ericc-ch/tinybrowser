@@ -492,7 +492,7 @@ impl<'js> html_table_element_generated::HTMLTableElement<'js> for JsNode {
 }
 
 impl<'js> html_table_section_element_generated::HTMLTableSectionElement<'js> for JsNode {
-    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-tr-cells>
+    /// <https://html.spec.whatwg.org/multipage/tables.html#dom-tbody-rows>
     fn get_rows(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             ctx,
