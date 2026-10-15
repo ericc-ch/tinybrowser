@@ -825,7 +825,7 @@ impl Document {
         if script.is_empty() {
             return;
         }
-        let violations = self.navigation_script_violations(policy, source);
+        let violations = Self::navigation_script_violations(policy, source);
         if !violations.is_empty()
             && let Some(target) = self.document_node()
         {
@@ -1800,7 +1800,6 @@ impl Document {
     }
 
     fn navigation_script_violations(
-        &self,
         policy: &crate::csp::List,
         source: &str,
     ) -> Vec<crate::csp::Violation> {
@@ -2481,9 +2480,7 @@ impl Document {
     fn subresource_target(&self, url: &Url) -> Option<crate::dom::tree::NodeId> {
         let candidates: Vec<(crate::dom::tree::NodeId, String)> = {
             let world = self.world.borrow();
-            let Some(parsed) = world.main_document() else {
-                return None;
-            };
+            let parsed = world.main_document()?;
             let base = &parsed.document.base;
             let document = parsed.id;
             let mut candidates = Vec::new();

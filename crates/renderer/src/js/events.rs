@@ -798,8 +798,8 @@ pub(crate) fn construct_security_policy_violation_event<'js>(
 /// readonly attributes set as own properties, so both constructor-created
 /// (slot-backed getters) and user-agent events read the same values
 /// (<https://w3c.github.io/webappsec-csp/#report-violation>).
-pub(crate) fn fire_security_policy_violation<'js>(
-    ctx: &Ctx<'js>,
+pub(crate) fn fire_security_policy_violation(
+    ctx: &Ctx<'_>,
     target: EventTargetKey,
     violation: &crate::csp::Violation,
 ) -> Result<()> {

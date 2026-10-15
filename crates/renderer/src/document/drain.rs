@@ -226,15 +226,25 @@ impl Document {
             }
             self.record_event(event);
         }
+        self.adopt_pending_timers();
+        self.adopt_pending_fetches();
+        let images = self.world.borrow_mut().take_image_updates();
+        for element in images {
+            self.queue_image(element, true);
+        }
+        self.adopt_pending_scripts();
+        let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
+        for (target, violations) in violations {
+            self.fire_csp_violations(target, &violations);
+        }
+    }
+
+    /// Adopts timer starts and cancels from the realm.
+    fn adopt_pending_timers(&mut self) {
         let timeouts = self
             .js
             .as_ref()
             .map(crate::js::JsRealm::take_pending_timeouts)
-            .unwrap_or_default();
-        let fetches = self
-            .js
-            .as_ref()
-            .map(crate::js::JsRealm::take_pending_fetches)
             .unwrap_or_default();
         let cancels: HashSet<i32> = self
             .js
@@ -260,6 +270,18 @@ impl Document {
             let id = self.schedule_timer(timeout.delay);
             self.js_timer_slots.insert(id, timeout.js_id);
         }
+    }
+
+    /// Adopts `fetch` calls and cancels from the realm. The connect check
+    /// runs here, the one place every page request leaves the renderer,
+    /// instead of in each JS API
+    /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
+    fn adopt_pending_fetches(&mut self) {
+        let fetches = self
+            .js
+            .as_ref()
+            .map(crate::js::JsRealm::take_pending_fetches)
+            .unwrap_or_default();
         let fetch_cancels: HashSet<_> =
             std::mem::take(&mut self.world.borrow_mut().pending_fetch_cancels)
                 .into_iter()
@@ -286,9 +308,6 @@ impl Document {
                 continue;
             }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
-                // The connect check lives here, the one place every page
-                // request leaves the renderer, instead of in each JS API
-                // (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
                 let violations =
                     self.subresource_violations(&url, crate::csp::Destination::Connect);
                 if !violations.is_empty()
@@ -320,12 +339,11 @@ impl Document {
                 self.settle_js_fetch(fetch.js_id, None);
             }
         }
-        let images = self.world.borrow_mut().take_image_updates();
-        for element in images {
-            self.queue_image(element, true);
-        }
-        // Connected `<script src>` elements queued their prepare steps from
-        // script; the fetch starts here.
+    }
+
+    /// Starts fetches for connected `<script src>` elements whose prepare
+    /// steps were queued from script.
+    fn adopt_pending_scripts(&mut self) {
         let scripts = self.world.borrow_mut().take_pending_scripts();
         for element in scripts {
             let src = self
@@ -370,10 +388,6 @@ impl Document {
                 url,
                 initiator,
             ));
-        }
-        let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
-        for (target, violations) in violations {
-            self.fire_csp_violations(target, &violations);
         }
     }
 
