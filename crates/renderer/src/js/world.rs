@@ -703,6 +703,9 @@ pub(crate) struct World {
     /// Violations produced where dispatching is unsafe (inside the module
     /// loader), flushed by the drain.
     pub(crate) pending_csp_violations: Vec<(NodeId, Vec<crate::csp::Violation>)>,
+    /// Script elements the HTML parser inserted; script insertion clears the
+    /// bit (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    pub(crate) parser_inserted: HashSet<NodeId>,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
@@ -885,6 +888,7 @@ impl World {
             image_updates: Vec::new(),
             pending_scripts: Vec::new(),
             pending_csp_violations: Vec::new(),
+            parser_inserted: HashSet::new(),
             input_files: HashMap::new(),
             decoders: HashMap::new(),
             document_stream: Vec::new(),
@@ -949,6 +953,7 @@ impl World {
         self.image_updates.clear();
         self.pending_scripts.clear();
         self.pending_csp_violations.clear();
+        self.parser_inserted.clear();
         self.clear_images();
         self.remote_ids.clear();
         self.remote_nodes.clear();
@@ -1586,6 +1591,37 @@ impl World {
         violations: Vec<crate::csp::Violation>,
     ) {
         self.pending_csp_violations.push((target, violations));
+    }
+
+    /// Appends one in-head `meta` policy the first time it is seen
+    /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
+    pub(crate) fn apply_meta_policy(&mut self, id: NodeId) {
+        if self.applied_csp_metas.contains(&id) {
+            return;
+        }
+        let content = self
+            .document(id)
+            .and_then(|parsed| crate::csp::meta_policy(&parsed.document.base, id.node));
+        if let Some(content) = content
+            && self.applied_csp_metas.insert(id)
+        {
+            self.csp.push_meta(&content);
+        }
+    }
+
+    /// Marks a script element the HTML parser inserted
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    pub(crate) fn mark_parser_inserted(&mut self, id: NodeId) {
+        self.parser_inserted.insert(id);
+    }
+
+    /// Clears the parser-inserted flag: script insertion unsets it.
+    pub(crate) fn clear_parser_inserted(&mut self, id: NodeId) {
+        self.parser_inserted.remove(&id);
+    }
+
+    pub(crate) fn is_parser_inserted(&self, id: NodeId) -> bool {
+        self.parser_inserted.contains(&id)
     }
 
     /// Records the file list a script assigned to a `type=file` input.

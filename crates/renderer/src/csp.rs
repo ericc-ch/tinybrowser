@@ -377,20 +377,12 @@ fn policy_inline_violation(policy: &Policy, inline: &InlineScript<'_>) -> bool {
 /// extracted (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
 #[must_use]
 pub(crate) fn combined_header(headers: &[(String, String)], name: &str) -> Option<String> {
-    let mut values = Vec::new();
-    for (header, value) in headers {
-        if header.eq_ignore_ascii_case(name) {
-            let value = value.trim();
-            if !value.is_empty() {
-                values.push(value.to_owned());
-            }
-        }
-    }
-    if values.is_empty() {
-        None
-    } else {
-        Some(values.join(", "))
-    }
+    net::combined_header(
+        headers
+            .iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str()),
+    )
 }
 
 /// `meta http-equiv=content-security-policy` content when the element is in
@@ -1080,4 +1072,154 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
     }
     let (head, tail) = value.split_at(prefix.len());
     head.eq_ignore_ascii_case(prefix).then_some(tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(spec: &str) -> Url {
+        Url::parse(spec).expect("test URL")
+    }
+
+    fn inline(source: &str, parser_inserted: bool) -> InlineScript<'_> {
+        InlineScript {
+            source,
+            nonce: "",
+            nonceable: false,
+            parser_inserted,
+            kind: InlineKind::Script,
+        }
+    }
+
+    #[test]
+    fn directive_names_lowercase_and_first_occurrence_wins() {
+        let list = List::from_headers(Some("script-SRC 'self'; SCRIPT-SRC 'none'"), None);
+        let origin = url("https://example.test/").origin();
+        let document_url = url("https://example.test/page");
+        // The duplicate `'none'` must not override the first `'self'`.
+        assert!(list
+            .check_request(
+                &origin,
+                &document_url,
+                &url("https://example.test/a.js"),
+                Destination::Script,
+                None,
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn non_ascii_directives_are_dropped() {
+        let list = List::from_headers(Some("script-src \u{e9}"), None);
+        let origin = url("https://example.test/").origin();
+        let document_url = url("https://example.test/page");
+        // The only token is not ASCII, so the policy parses empty and allows.
+        assert!(list
+            .check_request(
+                &origin,
+                &document_url,
+                &url("https://other.test/a.js"),
+                Destination::Script,
+                None,
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn wildcard_host_matches_subdomains_only() {
+        assert!(host_part_matches(
+            "*.example.test",
+            &url("https://a.example.test/")
+        ));
+        assert!(!host_part_matches(
+            "*.example.test",
+            &url("https://example.test/")
+        ));
+    }
+
+    #[test]
+    fn ports_compare_with_scheme_defaults() {
+        assert!(port_part_matches(
+            Some(&PortPart::Star),
+            &url("https://example.test:8443/")
+        ));
+        assert!(port_part_matches(
+            Some(&PortPart::Number(443)),
+            &url("https://example.test/")
+        ));
+        assert!(!port_part_matches(
+            Some(&PortPart::Number(443)),
+            &url("http://example.test/")
+        ));
+    }
+
+    #[test]
+    fn paths_match_exactly_or_by_directory() {
+        assert!(path_part_matches("/a/b", "/a/b"));
+        assert!(!path_part_matches("/a/b", "/a/c"));
+        assert!(path_part_matches("/a/", "/a/b"));
+        assert!(!path_part_matches("/a", "/a/b"));
+        assert!(!path_part_matches("/a/b/", "/a/b"));
+    }
+
+    #[test]
+    fn percent_encoded_paths_decode_before_comparing() {
+        assert!(path_part_matches("/%61/b", "/a/b"));
+        assert!(path_part_matches("/a%2Fb", "/a%2Fb"));
+    }
+
+    #[test]
+    fn self_matches_secure_variants() {
+        let origin = url("http://example.test/").origin();
+        let document_url = url("http://example.test/page");
+        assert!(self_matches(&url("http://example.test/a"), &origin, &document_url));
+        assert!(self_matches(
+            &url("https://example.test/a"),
+            &origin,
+            &document_url
+        ));
+        assert!(self_matches(&url("ws://example.test/a"), &origin, &document_url));
+        assert!(!self_matches(&url("http://other.test/a"), &origin, &document_url));
+    }
+
+    #[test]
+    fn base64_value_accepts_both_alphabets_and_padding() {
+        assert!(is_base64_value("abc-123_"));
+        assert!(is_base64_value("YWJj=="));
+        assert!(!is_base64_value("a=b"));
+        assert!(!is_base64_value(""));
+    }
+
+    #[test]
+    fn hash_sources_match_their_digest() {
+        // sha256("t1.done();"), the digest the WPT unsafe-hashes fixtures use.
+        let expression = "'sha256-wmuLCpoj8EMqfQlPnt5NIMgKkCK62CxAkAiewI0zZps='";
+        assert!(hash_matches(expression, "t1.done();"));
+        assert!(!hash_matches(expression, "t2.done();"));
+    }
+
+    #[test]
+    fn strict_dynamic_allows_script_insertion_and_blocks_parser_insertion() {
+        let list = vec!["'strict-dynamic'".to_owned()];
+        assert!(element_matches(&list, &inline("run();", false)));
+        assert!(!element_matches(&list, &inline("run();", true)));
+    }
+
+    #[test]
+    fn unsafe_hashes_gates_hashes_for_non_script_inline() {
+        let hash = "'sha256-wmuLCpoj8EMqfQlPnt5NIMgKkCK62CxAkAiewI0zZps='";
+        let attribute = InlineScript {
+            source: "t1.done();",
+            nonce: "",
+            nonceable: false,
+            parser_inserted: false,
+            kind: InlineKind::ScriptAttribute,
+        };
+        assert!(!element_matches(&[hash.to_owned()], &attribute));
+        assert!(element_matches(
+            &["'unsafe-hashes'".to_owned(), hash.to_owned()],
+            &attribute
+        ));
+    }
 }

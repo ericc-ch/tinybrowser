@@ -14,5 +14,5 @@ mod websocket;
 pub use client::{Agent, AgentOptions, Body, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method};
+pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method, combined_header};
 pub use websocket::{WebSocket, WsEvent, WsMessage};

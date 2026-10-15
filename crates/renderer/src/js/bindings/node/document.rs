@@ -1988,29 +1988,10 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
 /// `meta http-equiv=content-security-policy` insertion appends one policy
 /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-content-security-policy>).
 pub(super) fn apply_meta_csp(ctx: &Ctx<'_>, id: NodeId) {
-    let content = {
-        let Ok(world) = world(ctx) else {
-            return;
-        };
-        let world = world.borrow();
-        if world.applied_csp_metas.contains(&id) {
-            return;
-        }
-        let Some(parsed) = world.document(id) else {
-            return;
-        };
-        crate::csp::meta_policy(&parsed.document.base, id.node)
-    };
-    let Some(content) = content else {
-        return;
-    };
     let Ok(world) = world(ctx) else {
         return;
     };
-    let mut world = world.borrow_mut();
-    if world.applied_csp_metas.insert(id) {
-        world.csp.push_meta(&content);
-    }
+    world.borrow_mut().apply_meta_policy(id);
 }
 
 /// A referrer-policy `content` value normalized to its canonical token,
@@ -2063,6 +2044,9 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             _ => return Ok(()),
         }
     };
+    // Script insertion clears the parser-inserted flag
+    // (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    world(ctx)?.borrow_mut().clear_parser_inserted(id);
     let (source, base_line) = match kind {
         Kind::Inline(source, line) => (source, line),
         Kind::External => {

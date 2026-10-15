@@ -1524,6 +1524,7 @@ impl Document {
             // frame's size before the realm evaluates anything.
             self.apply_viewport();
             self.install_response_csp();
+            self.mark_parser_scripts();
             if skip_js {
                 return true;
             }
@@ -1534,7 +1535,38 @@ impl Document {
             self.apply_viewport();
             self.bind_realm_document();
             self.install_response_csp();
+            self.mark_parser_scripts();
             true
+        }
+    }
+
+    /// Marks every script element of the freshly parsed tree as
+    /// parser-inserted
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    fn mark_parser_scripts(&mut self) {
+        let scripts: Vec<crate::dom::tree::NodeId> = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return;
+            };
+            let base = &parsed.document.base;
+            let document = parsed.id;
+            let mut scripts = Vec::new();
+            let mut stack = vec![base.root_node().id];
+            while let Some(node) = stack.pop() {
+                let Some(tree) = base.get_node(node) else {
+                    continue;
+                };
+                stack.extend(tree.children.iter().copied());
+                if crate::dom::tree::is_html_element(base, node, "script") {
+                    scripts.push(crate::dom::tree::NodeId { document, node });
+                }
+            }
+            scripts
+        };
+        let mut world = self.world.borrow_mut();
+        for id in scripts {
+            world.mark_parser_inserted(id);
         }
     }
 
@@ -1705,23 +1737,7 @@ impl Document {
     /// Appends one in-head `meta` policy the first time it is seen
     /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
     fn apply_meta_csp(&mut self, id: crate::dom::tree::NodeId) {
-        let content = {
-            let world = self.world.borrow();
-            if world.applied_csp_metas.contains(&id) {
-                return;
-            }
-            let Some(parsed) = world.document(id) else {
-                return;
-            };
-            crate::csp::meta_policy(&parsed.document.base, id.node)
-        };
-        let Some(content) = content else {
-            return;
-        };
-        let mut world = self.world.borrow_mut();
-        if world.applied_csp_metas.insert(id) {
-            world.csp.push_meta(&content);
-        }
+        self.world.borrow_mut().apply_meta_policy(id);
     }
 
     pub(in crate::document) fn inline_script_violations(
@@ -1731,6 +1747,7 @@ impl Document {
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
         let slot = world.nonce_slots.get(&id).map(String::as_str);
+        let parser_inserted = world.is_parser_inserted(id);
         let (nonce, nonceable) = world.document(id).map_or_else(
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
@@ -1739,7 +1756,7 @@ impl Document {
             source,
             nonce: &nonce,
             nonceable,
-            parser_inserted: true,
+            parser_inserted,
             kind: crate::csp::InlineKind::Script,
         })
     }
@@ -1765,6 +1782,7 @@ impl Document {
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
         let slot = world.nonce_slots.get(&id).map(String::as_str);
+        let parser_inserted = world.is_parser_inserted(id);
         let (nonce, _) = world.document(id).map_or_else(
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
@@ -1776,7 +1794,7 @@ impl Document {
             crate::csp::Destination::Script,
             Some(crate::csp::ScriptRequest {
                 nonce: &nonce,
-                parser_inserted: true,
+                parser_inserted,
             }),
         )
     }

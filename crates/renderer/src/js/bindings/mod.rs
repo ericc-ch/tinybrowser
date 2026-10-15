@@ -2113,6 +2113,8 @@ mod realm_tests {
             .mount_for_test(&crate::protocol::Mount {
                 url: "https://example.test/".into(),
                 content_type: Some("text/html".into()),
+                content_security_policy: None,
+                content_security_policy_report_only: None,
                 body: html.as_bytes().to_vec(),
                 history: crate::protocol::HistorySnapshot::default(),
                 viewport: None,

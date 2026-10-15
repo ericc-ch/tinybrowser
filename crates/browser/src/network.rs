@@ -428,21 +428,11 @@ fn sends_default_ua_client_hints(url: &Url) -> bool {
 
 /// Combined list-header values for `name`, comma-joined.
 fn list_header(headers: &net::HeaderMap, name: &str) -> Option<String> {
-    let mut values = Vec::new();
-    for value in headers.get_all(name) {
-        let Ok(text) = std::str::from_utf8(value) else {
-            continue;
-        };
-        let text = text.trim();
-        if !text.is_empty() {
-            values.push(text.to_owned());
-        }
-    }
-    if values.is_empty() {
-        None
-    } else {
-        Some(values.join(", "))
-    }
+    net::combined_header(
+        headers
+            .get_all(name)
+            .filter_map(|value| std::str::from_utf8(value).ok()),
+    )
 }
 
 /// `Content-Type` from response `headers`, when it is UTF-8.
