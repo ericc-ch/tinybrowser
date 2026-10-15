@@ -1,7 +1,7 @@
 # WPT harness
 
 tools/wpt/run runs wpt run against tinybrowser. All logic in
-tools/wpt/cli.py (run | score | rerun | overnight | selftest).
+tools/wpt/cli.py (run | score | rerun | merge | overnight | selftest).
 Builds the wpt-profile binary via cargo each run; TINYBROWSER_BINARY
 uses a prebuilt binary as-is.
 
