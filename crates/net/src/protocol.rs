@@ -92,6 +92,17 @@ impl HeaderMap {
         Ok(())
     }
 
+    /// Appends a field that came off the network. A response field value is
+    /// any byte sequence; the strict value checks on [`HeaderMap::insert`]
+    /// belong to author-provided values, not to bytes a server sent
+    /// (<https://fetch.spec.whatwg.org/#concept-header-list-extract>).
+    pub(crate) fn insert_wire(&mut self, name: &str, value: impl Into<Vec<u8>>) {
+        self.entries.push(Entry {
+            name: name.to_owned(),
+            value: value.into(),
+        });
+    }
+
     /// Removes every field whose name matches `name`, case-insensitively.
     pub fn remove(&mut self, name: &str) {
         self.entries
@@ -203,5 +214,22 @@ impl Method {
 impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HeaderMap;
+
+    #[test]
+    fn wire_values_keep_control_bytes_author_values_do_not() {
+        let value = b"text/html;charset=\x0bgbk".to_vec();
+        let mut map = HeaderMap::new();
+        assert!(map.insert("content-type", value.clone()).is_err());
+        map.insert_wire("content-type", value);
+        assert_eq!(
+            map.get("content-type"),
+            Some(&b"text/html;charset=\x0bgbk"[..])
+        );
     }
 }

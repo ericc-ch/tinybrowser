@@ -272,7 +272,7 @@ impl TabNetworkHandle {
                         || (!name.eq_ignore_ascii_case("set-cookie")
                             && !name.eq_ignore_ascii_case("set-cookie2"))
                 })
-                .map(|(name, value)| (name.to_owned(), String::from_utf8_lossy(value).into_owned()))
+                .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
                 .collect();
             let body = if request.read_body {
                 response
@@ -438,6 +438,13 @@ fn list_header(headers: &net::HeaderMap, name: &str) -> Option<String> {
     )
 }
 
+/// Header values are byte sequences; each byte is exposed as the same code
+/// point so the page never sees a replacement character
+/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
+fn isomorphic_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
 /// Whether any `X-Content-Type-Options` value is `nosniff`.
 fn header_nosniff(headers: &net::HeaderMap) -> bool {
     headers.get_all("x-content-type-options").any(|value| {
@@ -445,12 +452,11 @@ fn header_nosniff(headers: &net::HeaderMap) -> bool {
     })
 }
 
-/// `Content-Type` from response `headers`, when it is UTF-8.
+/// `Content-Type` from response `headers`, exposed the way the page sees it:
+/// each byte is the same code point
+/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
 fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
-    headers
-        .get("content-type")
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .map(str::to_owned)
+    headers.get("content-type").map(isomorphic_decode)
 }
 
 /// Network-boundary `Referer` check: rejects only a true downgrade (https

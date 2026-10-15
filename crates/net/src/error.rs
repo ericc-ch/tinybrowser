@@ -45,9 +45,6 @@ pub enum LimitExceeded {
 /// The request or response could not be represented as HTTP.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolError {
-    /// A response header name or value is not a valid HTTP field.
-    #[error("backend produced an unrepresentable header")]
-    UnrepresentableHeader,
     /// The URL, method, or assembled request was rejected.
     #[error("backend rejected the assembled request")]
     RejectedRequest,
