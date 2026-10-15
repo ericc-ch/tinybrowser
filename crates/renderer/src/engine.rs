@@ -1141,19 +1141,29 @@ pub fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
     Some((url.mime_type().to_string(), body))
 }
 
+/// Room for `data:` plus a MIME type before the comma.
+///
+/// A percent-encoded payload uses three characters per body byte (`%XX`).
+/// The raw ceiling is three times [`MAX_RESPONSE_BODY_BYTES`] plus this
+/// allowance, so a body that fits the cap is not rejected for its encoding.
+const DATA_URL_PREFIX_ALLOWANCE: usize = 1024;
+
 /// Decodes a `data:` URL that fits the response body cap.
 ///
 /// The raw-length check runs before decode. A `data:` URL is materialized
-/// entirely in this process, and base64 plus the MIME prefix can make the
-/// URL longer than its body, so the raw ceiling is twice
-/// [`MAX_RESPONSE_BODY_BYTES`]. The decoded body is then held to that cap.
-/// `None` means the raw URL is past the ceiling, the URL is not decodable,
-/// or the body is past the cap.
+/// entirely in this process. Percent-encoding is the long form: one body
+/// byte is `%XX`. Base64 is shorter (~4/3). The raw ceiling is three times
+/// [`MAX_RESPONSE_BODY_BYTES`] plus [`DATA_URL_PREFIX_ALLOWANCE`]. The
+/// decoded body is then held to the cap. `None` means the raw URL is past
+/// the ceiling, the URL is not decodable, or the body is past the cap.
 ///
 /// <https://fetch.spec.whatwg.org/#data-url-processor>
 #[must_use]
 pub fn decode_data_url_bounded(raw: &str) -> Option<(String, Vec<u8>)> {
-    if raw.len() > crate::protocol::MAX_RESPONSE_BODY_BYTES.saturating_mul(2) {
+    let raw_ceiling = crate::protocol::MAX_RESPONSE_BODY_BYTES
+        .saturating_mul(3)
+        .saturating_add(DATA_URL_PREFIX_ALLOWANCE);
+    if raw.len() > raw_ceiling {
         return None;
     }
     let (content_type, body) = decode_data_url(raw)?;
@@ -1213,12 +1223,12 @@ mod data_url_tests {
     }
 
     #[test]
-    fn rejects_a_raw_url_past_twice_the_body_cap() {
-        let raw = format!(
-            "data:text/plain,{}",
-            "x".repeat(MAX_RESPONSE_BODY_BYTES.saturating_mul(2))
-        );
-        assert!(raw.len() > MAX_RESPONSE_BODY_BYTES.saturating_mul(2));
+    fn rejects_a_raw_url_past_the_ceiling() {
+        let raw_ceiling = MAX_RESPONSE_BODY_BYTES
+            .saturating_mul(3)
+            .saturating_add(super::DATA_URL_PREFIX_ALLOWANCE);
+        let raw = format!("data:text/plain,{}", "x".repeat(raw_ceiling));
+        assert!(raw.len() > raw_ceiling);
         assert!(decode_data_url_bounded(&raw).is_none());
     }
 
@@ -1228,7 +1238,26 @@ mod data_url_tests {
             "data:text/plain,{}",
             "x".repeat(MAX_RESPONSE_BODY_BYTES.saturating_add(1))
         );
-        assert!(raw.len() <= MAX_RESPONSE_BODY_BYTES.saturating_mul(2));
+        assert!(decode_data_url_bounded(&raw).is_none());
+    }
+
+    fn percent_encoded(bytes: usize) -> String {
+        let mut raw = String::with_capacity("data:text/plain,".len() + bytes.saturating_mul(3));
+        raw.push_str("data:text/plain,");
+        raw.push_str(&"%00".repeat(bytes));
+        raw
+    }
+
+    #[test]
+    fn accepts_a_percent_encoded_body_just_under_the_cap() {
+        let raw = percent_encoded(MAX_RESPONSE_BODY_BYTES - 1);
+        let (_content_type, body) = decode_data_url_bounded(&raw).expect("under the cap");
+        assert_eq!(body.len(), MAX_RESPONSE_BODY_BYTES - 1);
+    }
+
+    #[test]
+    fn rejects_a_percent_encoded_body_just_over_the_cap() {
+        let raw = percent_encoded(MAX_RESPONSE_BODY_BYTES + 1);
         assert!(decode_data_url_bounded(&raw).is_none());
     }
 }

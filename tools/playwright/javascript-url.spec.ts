@@ -127,12 +127,7 @@ test("a blob URL iframe is same-origin with its opaque creator", async ({ daemon
       iframe.addEventListener("load", () => resolve(), { once: true });
     });
     iframe.src = url;
-    await Promise.race([
-      loaded,
-      new Promise<void>((resolve) => {
-        setTimeout(resolve, 1000);
-      }),
-    ]);
+    await loaded;
     const child = iframe.contentDocument;
     let sameOrigin = false;
     try {

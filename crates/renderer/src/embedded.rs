@@ -82,18 +82,10 @@ impl EmbeddedRenderer {
 
     /// Drains until `deadline`. Returns whether ready work stayed queued.
     ///
-    /// `drain_ready_until` already stops at `deadline`. The loop matters
-    /// when that call returns early with work still queued and the budget
-    /// has time left.
+    /// [`Engine::drain_ready_until`] returns true only after `deadline` has
+    /// passed, so one call spends the budget.
     fn drain_until(&mut self, deadline: std::time::Instant) -> bool {
-        let yielded = loop {
-            if !self.engine.drain_ready_until(deadline) {
-                break false;
-            }
-            if std::time::Instant::now() >= deadline {
-                break true;
-            }
-        };
+        let yielded = self.engine.drain_ready_until(deadline);
         self.ready_queued = yielded;
         yielded
     }

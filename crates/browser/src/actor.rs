@@ -958,8 +958,8 @@ impl Tab {
 
     /// Mounts a `data:` document as the top-level page.
     async fn commit_data_navigation(&mut self, url: Url) -> bool {
-        // Shared with subframe dials: reject a raw URL past twice the body
-        // cap before decode, then reject a decoded body past the cap.
+        // Shared with subframe dials: reject a raw URL past the data-URL
+        // ceiling before decode, then reject a decoded body past the cap.
         let Some((content_type, body)) = renderer::decode_data_url_bounded(url.as_str()) else {
             self.navigation_failed = true;
             return false;
