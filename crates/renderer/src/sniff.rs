@@ -1,4 +1,4 @@
-//! HTML/XML response encoding sniffing (realm-free).
+//! HTML/XML response encoding sniffing and the resource MIME sniff (realm-free).
 //!
 //! The encoding-sniffing algorithm reads a byte-order mark, a transport
 //! charset, an XML declaration, or an HTML prescan, in that order
@@ -207,3 +207,677 @@ fn prescan_charset(body: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     }
     None
 }
+
+/// Bytes read for the [resource header](https://mimesniff.spec.whatwg.org/#read-the-resource-header).
+pub(crate) const RESOURCE_HEADER_LEN: usize = 1445;
+
+/// Sniff flags for one response. `http` enables the Apache `text/plain` check,
+/// which applies only to an HTTP `Content-Type`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MimeGuard {
+    pub no_sniff: bool,
+    pub http: bool,
+}
+
+/// Computed MIME type for a browsing context
+/// (<https://mimesniff.spec.whatwg.org/#mime-type-sniffing-algorithm>).
+///
+/// `supplied` is the raw `Content-Type` (or data-URL type). `apache_bug` is
+/// set only for an HTTP header that is byte-for-byte one of the legacy Apache
+/// `text/plain` values
+/// (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
+#[must_use]
+pub(crate) fn sniff_mime(
+    header: &[u8],
+    supplied: Option<&str>,
+    no_sniff: bool,
+    apache_bug: bool,
+) -> String {
+    let parsed = supplied.and_then(parse_mime);
+    if parsed.as_ref().is_some_and(|mime| mime.html() || mime.xml()) {
+        return supplied.unwrap_or("text/html").to_owned();
+    }
+    let unknown = parsed.is_none()
+        || parsed.as_ref().is_some_and(|mime| {
+            matches!(
+                mime.essence.as_str(),
+                "unknown/unknown" | "application/unknown" | "*/*"
+            )
+        });
+    if unknown {
+        return identify_unknown(header, !no_sniff);
+    }
+    if no_sniff {
+        return supplied.unwrap_or_default().to_owned();
+    }
+    if apache_bug {
+        return text_or_binary(header).to_owned();
+    }
+    if parsed
+        .as_ref()
+        .is_some_and(|mime| mime.image() && supported_image(&mime.essence))
+        && let Some(matched) = match_image(header)
+    {
+        return matched.to_owned();
+    }
+    if parsed
+        .as_ref()
+        .is_some_and(|mime| mime.av() && supported_av(&mime.essence))
+        && let Some(matched) = match_av(header)
+    {
+        return matched.to_owned();
+    }
+    supplied.unwrap_or_default().to_owned()
+}
+
+/// Whether an HTTP `Content-Type` value is one of the Apache bug byte sequences.
+#[must_use]
+pub(crate) fn apache_bug_content_type(value: &str) -> bool {
+    matches!(
+        value,
+        "text/plain"
+            | "text/plain; charset=ISO-8859-1"
+            | "text/plain; charset=iso-8859-1"
+            | "text/plain; charset=UTF-8"
+    )
+}
+
+/// `X-Content-Type-Options: nosniff` on a header list.
+#[must_use]
+pub(crate) fn headers_nosniff(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-content-type-options")
+            && value.trim().eq_ignore_ascii_case("nosniff")
+    })
+}
+
+struct ParsedMime {
+    essence: String,
+}
+
+impl ParsedMime {
+    fn html(&self) -> bool {
+        self.essence == "text/html"
+    }
+
+    fn xml(&self) -> bool {
+        let subtype = self.essence.split_once('/').map_or("", |(_, subtype)| subtype);
+        subtype == "xml" || subtype.ends_with("+xml")
+    }
+
+    fn image(&self) -> bool {
+        self.essence.starts_with("image/")
+    }
+
+    fn av(&self) -> bool {
+        self.essence.starts_with("audio/")
+            || self.essence.starts_with("video/")
+            || self.essence == "application/ogg"
+    }
+}
+
+fn parse_mime(header: &str) -> Option<ParsedMime> {
+    let trimmed = trim_http_ws(header);
+    let essence_raw = trimmed
+        .split_once(';')
+        .map_or(trimmed, |(essence, _)| essence);
+    let essence = trim_http_ws(essence_raw).to_ascii_lowercase();
+    let (kind, subtype) = essence.split_once('/')?;
+    if kind.is_empty() || subtype.is_empty() || !is_http_token(kind) || !is_http_token(subtype) {
+        return None;
+    }
+    Some(ParsedMime { essence })
+}
+
+fn identify_unknown(header: &[u8], scriptable: bool) -> String {
+    if scriptable && let Some(found) = match_rows(header, SCRIPTABLE) {
+        return found.to_owned();
+    }
+    if let Some(found) = match_rows(header, BINARY_PLAIN) {
+        return found.to_owned();
+    }
+    if let Some(found) = match_image(header) {
+        return found.to_owned();
+    }
+    if let Some(found) = match_av(header) {
+        return found.to_owned();
+    }
+    if let Some(found) = match_rows(header, ARCHIVE) {
+        return found.to_owned();
+    }
+    if header.iter().copied().any(is_binary_byte) {
+        "application/octet-stream".to_owned()
+    } else {
+        "text/plain".to_owned()
+    }
+}
+
+fn text_or_binary(header: &[u8]) -> &'static str {
+    if header.len() >= 2 && (header.starts_with(&[0xFE, 0xFF]) || header.starts_with(&[0xFF, 0xFE]))
+    {
+        return "text/plain";
+    }
+    if header.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return "text/plain";
+    }
+    if header.iter().copied().any(is_binary_byte) {
+        "application/octet-stream"
+    } else {
+        "text/plain"
+    }
+}
+
+fn supported_image(essence: &str) -> bool {
+    matches!(
+        essence,
+        "image/x-icon" | "image/bmp" | "image/gif" | "image/webp" | "image/png" | "image/jpeg"
+    )
+}
+
+fn supported_av(essence: &str) -> bool {
+    matches!(
+        essence,
+        "audio/aiff"
+            | "audio/mpeg"
+            | "application/ogg"
+            | "audio/midi"
+            | "video/avi"
+            | "audio/wave"
+            | "video/mp4"
+            | "video/webm"
+    )
+}
+
+struct Row {
+    pattern: &'static [u8],
+    mask: &'static [u8],
+    whitespace: bool,
+    terminal: bool,
+    mime: &'static str,
+}
+
+fn match_rows(header: &[u8], rows: &[Row]) -> Option<&'static str> {
+    rows.iter().find_map(|row| {
+        matches_pattern(header, row.pattern, row.mask, row.whitespace, row.terminal)
+            .then_some(row.mime)
+    })
+}
+
+/// <https://mimesniff.spec.whatwg.org/#pattern-matching-algorithm>
+fn matches_pattern(
+    input: &[u8],
+    pattern: &[u8],
+    mask: &[u8],
+    whitespace: bool,
+    terminal: bool,
+) -> bool {
+    let mut index = 0;
+    if whitespace {
+        while input
+            .get(index)
+            .is_some_and(|byte| is_whitespace_byte(*byte))
+        {
+            index += 1;
+        }
+    }
+    for (pattern_index, pattern_byte) in pattern.iter().enumerate() {
+        let Some(byte) = input.get(index) else {
+            return false;
+        };
+        let Some(mask_byte) = mask.get(pattern_index) else {
+            return false;
+        };
+        if byte & mask_byte != *pattern_byte {
+            return false;
+        }
+        index += 1;
+    }
+    if terminal {
+        return input
+            .get(index)
+            .is_some_and(|byte| is_tag_terminating(*byte));
+    }
+    true
+}
+
+fn match_image(header: &[u8]) -> Option<&'static str> {
+    match_rows(header, IMAGE)
+}
+
+fn match_av(header: &[u8]) -> Option<&'static str> {
+    match_rows(header, AUDIO_VIDEO)
+        .or_else(|| mp4_signature(header).then_some("video/mp4"))
+        .or_else(|| webm_signature(header).then_some("video/webm"))
+        .or_else(|| mp3_signature(header).then_some("audio/mpeg"))
+}
+
+fn mp4_signature(sequence: &[u8]) -> bool {
+    if sequence.len() < 12 {
+        return false;
+    }
+    let box_size = u32::from_be_bytes([sequence[0], sequence[1], sequence[2], sequence[3]]);
+    let box_size = usize::try_from(box_size).unwrap_or(usize::MAX);
+    if sequence.len() < box_size || !box_size.is_multiple_of(4) {
+        return false;
+    }
+    if sequence.get(4..8) != Some(b"ftyp".as_slice()) {
+        return false;
+    }
+    if sequence.get(8..11) == Some(b"mp4".as_slice()) {
+        return true;
+    }
+    let mut bytes_read = 16;
+    while bytes_read < box_size {
+        if sequence.get(bytes_read..bytes_read.saturating_add(3)) == Some(b"mp4".as_slice()) {
+            return true;
+        }
+        bytes_read += 4;
+    }
+    false
+}
+
+fn webm_signature(sequence: &[u8]) -> bool {
+    if sequence.get(..4) != Some([0x1A, 0x45, 0xDF, 0xA3].as_slice()) {
+        return false;
+    }
+    let mut iter = 4;
+    while iter < sequence.len() && iter < 38 {
+        if sequence.get(iter..iter.saturating_add(2)) == Some([0x42, 0x82].as_slice()) {
+            iter += 2;
+            let Some(number_size) = parse_vint(sequence, iter) else {
+                return false;
+            };
+            iter += number_size;
+            if iter >= sequence.len().saturating_sub(4) {
+                return false;
+            }
+            if padded_webm(sequence, iter) {
+                return true;
+            }
+        }
+        iter += 1;
+    }
+    false
+}
+
+/// `parse a vint` starting at `start`.
+///
+/// The published steps set `index` to 0 and then never read the start
+/// parameter (<https://mimesniff.spec.whatwg.org/#parse-a-vint>). That
+/// ignores the offset. Chromium's `ParseVint` starts at the given index,
+/// which is the reading that matches "starting at index iter".
+fn parse_vint(sequence: &[u8], start: usize) -> Option<usize> {
+    let mut mask = 0x80_u16;
+    let mut number_size = 1;
+    let mut index = start;
+    while number_size < 8 && number_size < sequence.len() {
+        let byte = u16::from(*sequence.get(index)?);
+        if byte & mask != 0 {
+            break;
+        }
+        mask >>= 1;
+        number_size += 1;
+        index += 1;
+    }
+    Some(number_size)
+}
+
+fn padded_webm(sequence: &[u8], offset: usize) -> bool {
+    let Some(slice) = sequence.get(offset..) else {
+        return false;
+    };
+    let leading = slice
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(slice.len());
+    slice
+        .get(leading..)
+        .is_some_and(|rest| rest.starts_with(b"webm"))
+}
+
+fn mp3_signature(sequence: &[u8]) -> bool {
+    if !mp3_header(sequence, 0) {
+        return false;
+    }
+    let Some(skipped) = mp3_frame_size(sequence, 0) else {
+        return false;
+    };
+    // The published comparison is `skipped-bytes > s - length`, which is
+    // negative. The following header has to land inside the resource, so
+    // the bound is the bytes still available
+    // (<https://mimesniff.spec.whatwg.org/#signature-for-mp3-without-id3>).
+    if skipped < 4 || skipped > sequence.len() {
+        return false;
+    }
+    mp3_header(sequence, skipped)
+}
+
+fn mp3_header(sequence: &[u8], offset: usize) -> bool {
+    let Some(bytes) = sequence.get(offset..offset.saturating_add(4)) else {
+        return false;
+    };
+    if bytes[0] != 0xFF || bytes[1] & 0xE0 != 0xE0 {
+        return false;
+    }
+    let layer = (bytes[1] & 0x06) >> 1;
+    if layer == 0 {
+        return false;
+    }
+    let bit_rate = (bytes[2] & 0xF0) >> 4;
+    if bit_rate == 15 {
+        return false;
+    }
+    let sample_rate = (bytes[2] & 0x0C) >> 2;
+    if sample_rate == 3 {
+        return false;
+    }
+    4 - layer == 3
+}
+
+fn mp3_frame_size(sequence: &[u8], offset: usize) -> Option<usize> {
+    let bytes = sequence.get(offset..offset.saturating_add(4))?;
+    let version = (bytes[1] & 0x18) >> 3;
+    let bitrate_index = usize::from((bytes[2] & 0xF0) >> 4);
+    let bitrate = if version & 0x01 == 0 {
+        *MP3_RATES.get(bitrate_index)?
+    } else {
+        *MP25_RATES.get(bitrate_index)?
+    };
+    let sample_index = usize::from((bytes[2] & 0x0C) >> 2);
+    let mut sample_rate = *SAMPLE_RATES.get(sample_index)?;
+    if version == 2 {
+        sample_rate /= 2;
+    } else if version == 0 {
+        sample_rate /= 4;
+    }
+    if sample_rate == 0 {
+        return None;
+    }
+    let scale = if version == 1 { 72 } else { 144 };
+    let mut size = bitrate * scale / sample_rate;
+    if (bytes[2] & 0x02) >> 1 != 0 {
+        size += 1;
+    }
+    Some(size)
+}
+
+const MP3_RATES: [usize; 15] = [
+    0, 32_000, 40_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000, 128_000, 160_000, 192_000,
+    224_000, 256_000, 320_000,
+];
+const MP25_RATES: [usize; 15] = [
+    0, 8_000, 16_000, 24_000, 32_000, 40_000, 48_000, 56_000, 64_000, 80_000, 96_000, 112_000,
+    128_000, 144_000, 160_000,
+];
+const SAMPLE_RATES: [usize; 3] = [44_100, 48_000, 32_000];
+
+fn is_binary_byte(byte: u8) -> bool {
+    (0x00..=0x08).contains(&byte)
+        || byte == 0x0B
+        || (0x0E..=0x1A).contains(&byte)
+        || (0x1C..=0x1F).contains(&byte)
+}
+
+fn is_whitespace_byte(byte: u8) -> bool {
+    matches!(byte, 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+}
+
+fn is_tag_terminating(byte: u8) -> bool {
+    matches!(byte, 0x20 | 0x3E)
+}
+
+fn trim_http_ws(value: &str) -> &str {
+    value.trim_matches(|character: char| ['\t', '\n', '\u{000c}', '\r', ' '].contains(&character))
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
+        })
+}
+
+const fn row(
+    pattern: &'static [u8],
+    mask: &'static [u8],
+    whitespace: bool,
+    terminal: bool,
+    mime: &'static str,
+) -> Row {
+    assert!(pattern.len() == mask.len());
+    Row {
+        pattern,
+        mask,
+        whitespace,
+        terminal,
+        mime,
+    }
+}
+
+const SCRIPTABLE: &[Row] = &[
+    row(
+        b"<!DOCTYPE HTML",
+        b"\xFF\xFF\xDF\xDF\xDF\xDF\xDF\xDF\xDF\xFF\xDF\xDF\xDF\xDF",
+        true,
+        true,
+        "text/html",
+    ),
+    row(b"<HTML", b"\xFF\xDF\xDF\xDF\xDF", true, true, "text/html"),
+    row(b"<HEAD", b"\xFF\xDF\xDF\xDF\xDF", true, true, "text/html"),
+    row(
+        b"<SCRIPT",
+        b"\xFF\xDF\xDF\xDF\xDF\xDF\xDF",
+        true,
+        true,
+        "text/html",
+    ),
+    row(
+        b"<IFRAME",
+        b"\xFF\xDF\xDF\xDF\xDF\xDF\xDF",
+        true,
+        true,
+        "text/html",
+    ),
+    row(b"<H1", b"\xFF\xDF\xFF", true, true, "text/html"),
+    row(b"<DIV", b"\xFF\xDF\xDF\xDF", true, true, "text/html"),
+    row(b"<FONT", b"\xFF\xDF\xDF\xDF\xDF", true, true, "text/html"),
+    row(
+        b"<TABLE",
+        b"\xFF\xDF\xDF\xDF\xDF\xDF",
+        true,
+        true,
+        "text/html",
+    ),
+    row(b"<A", b"\xFF\xDF", true, true, "text/html"),
+    row(
+        b"<STYLE",
+        b"\xFF\xDF\xDF\xDF\xDF\xDF",
+        true,
+        true,
+        "text/html",
+    ),
+    row(
+        b"<TITLE",
+        b"\xFF\xDF\xDF\xDF\xDF\xDF",
+        true,
+        true,
+        "text/html",
+    ),
+    row(b"<B", b"\xFF\xDF", true, true, "text/html"),
+    row(b"<BODY", b"\xFF\xDF\xDF\xDF\xDF", true, true, "text/html"),
+    row(b"<BR", b"\xFF\xDF\xDF", true, true, "text/html"),
+    row(b"<P", b"\xFF\xDF", true, true, "text/html"),
+    row(b"<!--", b"\xFF\xFF\xFF\xFF", true, true, "text/html"),
+    row(b"<?xml", b"\xFF\xFF\xFF\xFF\xFF", true, false, "text/xml"),
+    row(
+        b"%PDF-",
+        b"\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "application/pdf",
+    ),
+];
+
+const BINARY_PLAIN: &[Row] = &[
+    row(
+        b"%!PS-Adobe-",
+        b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "application/postscript",
+    ),
+    row(
+        &[0xFE, 0xFF, 0x00, 0x00],
+        &[0xFF, 0xFF, 0x00, 0x00],
+        false,
+        false,
+        "text/plain",
+    ),
+    row(
+        &[0xFF, 0xFE, 0x00, 0x00],
+        &[0xFF, 0xFF, 0x00, 0x00],
+        false,
+        false,
+        "text/plain",
+    ),
+    row(
+        &[0xEF, 0xBB, 0xBF, 0x00],
+        &[0xFF, 0xFF, 0xFF, 0x00],
+        false,
+        false,
+        "text/plain",
+    ),
+];
+
+const IMAGE: &[Row] = &[
+    row(
+        &[0x00, 0x00, 0x01, 0x00],
+        &[0xFF, 0xFF, 0xFF, 0xFF],
+        false,
+        false,
+        "image/x-icon",
+    ),
+    row(
+        &[0x00, 0x00, 0x02, 0x00],
+        &[0xFF, 0xFF, 0xFF, 0xFF],
+        false,
+        false,
+        "image/x-icon",
+    ),
+    row(b"BM", b"\xFF\xFF", false, false, "image/bmp"),
+    row(
+        b"GIF87a",
+        b"\xFF\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "image/gif",
+    ),
+    row(
+        b"GIF89a",
+        b"\xFF\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "image/gif",
+    ),
+    row(
+        b"RIFF\0\0\0\0WEBPVP",
+        b"\xFF\xFF\xFF\xFF\0\0\0\0\xFF\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "image/webp",
+    ),
+    row(
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        false,
+        false,
+        "image/png",
+    ),
+    row(
+        &[0xFF, 0xD8, 0xFF],
+        &[0xFF, 0xFF, 0xFF],
+        false,
+        false,
+        "image/jpeg",
+    ),
+];
+
+const AUDIO_VIDEO: &[Row] = &[
+    row(
+        b"FORM\0\0\0\0AIFF",
+        b"\xFF\xFF\xFF\xFF\0\0\0\0\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "audio/aiff",
+    ),
+    row(b"ID3", b"\xFF\xFF\xFF", false, false, "audio/mpeg"),
+    row(
+        b"OggS\0",
+        b"\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "application/ogg",
+    ),
+    row(
+        b"MThd\0\0\0\x06",
+        b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "audio/midi",
+    ),
+    row(
+        b"RIFF\0\0\0\0AVI ",
+        b"\xFF\xFF\xFF\xFF\0\0\0\0\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "video/avi",
+    ),
+    row(
+        b"RIFF\0\0\0\0WAVE",
+        b"\xFF\xFF\xFF\xFF\0\0\0\0\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "audio/wave",
+    ),
+];
+
+const ARCHIVE: &[Row] = &[
+    row(
+        &[0x1F, 0x8B, 0x08],
+        &[0xFF, 0xFF, 0xFF],
+        false,
+        false,
+        "application/x-gzip",
+    ),
+    row(
+        &[0x50, 0x4B, 0x03, 0x04],
+        &[0xFF, 0xFF, 0xFF, 0xFF],
+        false,
+        false,
+        "application/zip",
+    ),
+    row(
+        b"Rar!\x1A\x07\x00",
+        b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF",
+        false,
+        false,
+        "application/x-rar-compressed",
+    ),
+];

@@ -205,6 +205,12 @@ pub struct ResponseStart {
     /// Combined `Content-Security-Policy-Report-Only` header.
     #[serde(default)]
     pub content_security_policy_report_only: Option<String>,
+    /// `X-Content-Type-Options: nosniff` on the response.
+    #[serde(default)]
+    pub no_sniff: bool,
+    /// The body came from HTTP, so the Apache `text/plain` check applies.
+    #[serde(default)]
+    pub http_response: bool,
     /// Session history applied before the new realm parses response bytes.
     pub history: renderer::HistorySnapshot,
     /// Emulated viewport size to apply before the document lays out, when the
@@ -496,6 +502,8 @@ mod tests {
                         content_type: Some("text/html".into()),
                         content_security_policy: None,
                         content_security_policy_report_only: None,
+                        no_sniff: false,
+                        http_response: true,
                         history: renderer::HistorySnapshot::default(),
                         viewport: None,
                         init_scripts: Vec::new(),
@@ -666,6 +674,8 @@ mod tests {
                     content_type: Some("text/html".into()),
                     content_security_policy: None,
                     content_security_policy_report_only: None,
+                    no_sniff: false,
+                    http_response: true,
                     history: renderer::HistorySnapshot::default(),
                     viewport: None,
                     init_scripts: Vec::new(),

@@ -173,6 +173,10 @@ impl Engine {
                 head.content_security_policy.as_deref(),
                 head.content_security_policy_report_only.as_deref(),
             ),
+            crate::sniff::MimeGuard {
+                no_sniff: head.no_sniff,
+                http: head.http_response,
+            },
         );
         Ok(())
     }
@@ -882,7 +886,13 @@ impl Engine {
             return;
         };
         if let Some(document) = self.frames.get_mut(&child) {
-            document.load_frame_response(url, Some(content_type.as_str()), &body, policy);
+            document.load_frame_response(
+                url,
+                Some(content_type.as_str()),
+                &body,
+                policy,
+                crate::sniff::MimeGuard::default(),
+            );
         }
     }
 
@@ -911,6 +921,7 @@ impl Engine {
                 contents.as_bytes(),
                 origin,
                 policy,
+                crate::sniff::MimeGuard::default(),
             );
         }
     }

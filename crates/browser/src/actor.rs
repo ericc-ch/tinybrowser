@@ -725,6 +725,8 @@ impl Tab {
             content_type: Some("text/html; charset=utf-8".to_owned()),
             content_security_policy: None,
             content_security_policy_report_only: None,
+            no_sniff: false,
+            http_response: false,
             body: html.as_bytes().to_vec(),
             history: self.history.snapshot(),
             viewport: Some(self.viewport),
@@ -981,6 +983,8 @@ impl Tab {
             init_scripts: self.init_scripts.clone(),
             content_security_policy: None,
             content_security_policy_report_only: None,
+            no_sniff: false,
+            http_response: false,
         };
         if let Err(error) = self.mount(&site, 200, mount).await {
             logging::error!(
@@ -1081,6 +1085,8 @@ impl Tab {
             content_security_policy_report_only: outcome
                 .content_security_policy_report_only
                 .clone(),
+            no_sniff: outcome.no_sniff,
+            http_response: true,
             body: Vec::new(),
             history: history.snapshot(),
             viewport: Some(self.viewport),
@@ -1208,6 +1214,8 @@ fn blank_mount() -> Mount {
         content_type: Some("text/html; charset=utf-8".into()),
         content_security_policy: None,
         content_security_policy_report_only: None,
+        no_sniff: false,
+        http_response: false,
         body: b"<!doctype html><title></title>".to_vec(),
         history: HistorySnapshot::default(),
         viewport: None,

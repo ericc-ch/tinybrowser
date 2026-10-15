@@ -247,6 +247,12 @@ pub struct Mount {
     /// Combined `Content-Security-Policy-Report-Only` header.
     #[serde(default)]
     pub content_security_policy_report_only: Option<String>,
+    /// `X-Content-Type-Options: nosniff` on the response.
+    #[serde(default)]
+    pub no_sniff: bool,
+    /// The body came from HTTP, so the Apache `text/plain` check applies.
+    #[serde(default)]
+    pub http_response: bool,
     /// Raw document bytes; the renderer decodes them.
     #[serde(skip, default)]
     pub body: Vec<u8>,
@@ -276,6 +282,10 @@ pub struct ResponseHead {
     pub content_security_policy: Option<String>,
     /// Combined `Content-Security-Policy-Report-Only` header.
     pub content_security_policy_report_only: Option<String>,
+    /// `X-Content-Type-Options: nosniff` on the response.
+    pub no_sniff: bool,
+    /// The body came from HTTP, so the Apache `text/plain` check applies.
+    pub http_response: bool,
     /// Session history visible in the newly opened document.
     pub history: HistorySnapshot,
     /// Emulated viewport size to apply before the document lays out, when the

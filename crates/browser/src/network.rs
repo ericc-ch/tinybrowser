@@ -29,6 +29,7 @@ pub(crate) struct NavOutcome {
     pub content_type: Option<String>,
     pub content_security_policy: Option<String>,
     pub content_security_policy_report_only: Option<String>,
+    pub no_sniff: bool,
     pub body: net::Body,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -176,6 +177,7 @@ impl TabNetworkHandle {
         let content_security_policy = list_header(headers, "content-security-policy");
         let content_security_policy_report_only =
             list_header(headers, "content-security-policy-report-only");
+        let no_sniff = header_nosniff(headers);
         let body = response.into_body();
         Ok(NavOutcome {
             status,
@@ -183,6 +185,7 @@ impl TabNetworkHandle {
             content_type,
             content_security_policy,
             content_security_policy_report_only,
+            no_sniff,
             body,
             _permit: permits,
         })
@@ -433,6 +436,13 @@ fn list_header(headers: &net::HeaderMap, name: &str) -> Option<String> {
             .get_all(name)
             .filter_map(|value| std::str::from_utf8(value).ok()),
     )
+}
+
+/// Whether any `X-Content-Type-Options` value is `nosniff`.
+fn header_nosniff(headers: &net::HeaderMap) -> bool {
+    headers.get_all("x-content-type-options").any(|value| {
+        std::str::from_utf8(value).is_ok_and(|text| text.trim().eq_ignore_ascii_case("nosniff"))
+    })
 }
 
 /// `Content-Type` from response `headers`, when it is UTF-8.

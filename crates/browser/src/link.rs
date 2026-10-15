@@ -292,6 +292,8 @@ impl RendererHandle {
             content_type: mount.content_type.clone(),
             content_security_policy: mount.content_security_policy.clone(),
             content_security_policy_report_only: mount.content_security_policy_report_only.clone(),
+            no_sniff: mount.no_sniff,
+            http_response: mount.http_response,
             history: mount.history.clone(),
             viewport: mount.viewport,
             init_scripts: mount.init_scripts.clone(),
