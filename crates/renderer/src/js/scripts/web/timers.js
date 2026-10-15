@@ -33,7 +33,7 @@ const __tbTimer = (handler, ms, args, repeat) => {
     try {
       if (typeof callback === 'function') {
         __tbApply(callback, globalThis, args);
-      } else {
+      } else if (host.__tbCspAllowsEval(callback)) {
         (0, eval)(callback);
       }
     } finally {

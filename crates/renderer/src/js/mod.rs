@@ -538,6 +538,20 @@ impl JsRealm {
         })
     }
 
+    /// Dispatches one trusted `securitypolicyviolation` event per violation.
+    pub(crate) fn fire_csp_violations(
+        &self,
+        target: crate::dom::tree::NodeId,
+        violations: &[crate::csp::Violation],
+    ) -> Result<(), JsError> {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
+            self.context.with(|ctx| {
+                bindings::fire_csp_violations(&ctx, target, violations)?;
+                Ok(())
+            })
+        })
+    }
+
     /// Decodes and dispatches one posted window message in this realm.
     ///
     /// Returns `false` when the payload cannot be decoded, which the engine
@@ -828,6 +842,7 @@ impl JsRealm {
                 "KeyboardEvent",
                 "MessageEvent",
                 "MouseEvent",
+                "SecurityPolicyViolationEvent",
                 "StorageEvent",
                 "TextEvent",
                 "TouchEvent",
@@ -897,11 +912,53 @@ impl JsRealm {
         let csp_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbCspAllowsConnect",
-            Func::from(move |url: String| {
-                let world = csp_world.borrow();
-                world
-                    .csp
-                    .allows_connect(&world.origin, &world.document_url, &url)
+            Func::from(move |ctx: Ctx<'_>, url: String| -> rquickjs::Result<bool> {
+                let violations = {
+                    let world = csp_world.borrow();
+                    world
+                        .csp
+                        .check_connect(&world.origin, &world.document_url, &url)
+                };
+                if !violations.is_empty() {
+                    let target = csp_world.borrow().with_main_document(|parsed| {
+                        crate::dom::tree::NodeId {
+                            document: parsed.id,
+                            node: parsed.document.base.root_node().id,
+                        }
+                    });
+                    if let Some(target) = target {
+                        bindings::fire_csp_violations(&ctx, target, &violations)?;
+                    }
+                }
+                Ok(!crate::csp::blocks(&violations))
+            }),
+        )?;
+        let eval_world = world.clone();
+        bridge::object(ctx)?.set(
+            "__tbCspAllowsEval",
+            Func::from(move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
+                let violations = {
+                    let world = eval_world.borrow();
+                    world.csp.check_inline(&crate::csp::InlineScript {
+                        source: &source,
+                        nonce: "",
+                        nonceable: false,
+                        parser_inserted: false,
+                        kind: crate::csp::InlineKind::Evaluation,
+                    })
+                };
+                if !violations.is_empty() {
+                    let target = eval_world.borrow().with_main_document(|parsed| {
+                        crate::dom::tree::NodeId {
+                            document: parsed.id,
+                            node: parsed.document.base.root_node().id,
+                        }
+                    });
+                    if let Some(target) = target {
+                        bindings::fire_csp_violations(&ctx, target, &violations)?;
+                    }
+                }
+                Ok(!crate::csp::blocks(&violations))
             }),
         )?;
         bridge::object(ctx)?.set(

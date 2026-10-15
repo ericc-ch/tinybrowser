@@ -773,18 +773,31 @@ impl Document {
     /// observes the page's own state, not a fresh blank realm. The result
     /// document keeps the target's URL
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-    pub(crate) fn load_javascript_frame(&mut self, script: &str) {
+    pub(crate) fn load_javascript_frame(&mut self, script: &str, source: &str) {
         if self.js.is_none() {
             self.ensure_js_ok();
         }
-        self.eval_frame_script(script);
+        self.eval_frame_script(script, source);
     }
 
     /// Runs one `javascript:` URL script in this frame's realm. A string
     /// result replaces the document with that string parsed as HTML
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-    pub(crate) fn eval_frame_script(&mut self, script: &str) {
-        if script.is_empty() || !self.navigation_script_allowed(script) {
+    ///
+    /// `source` is the serialized `javascript:` URL, which is what CSP source
+    /// matching and hashes use
+    /// (<https://w3c.github.io/webappsec-csp/#should-block-navigation-request>).
+    pub(crate) fn eval_frame_script(&mut self, script: &str, source: &str) {
+        if script.is_empty() {
+            return;
+        }
+        let violations = self.navigation_script_violations(source);
+        if !violations.is_empty()
+            && let Some(target) = self.document_node()
+        {
+            self.fire_csp_violations(target, &violations);
+        }
+        if crate::csp::blocks(&violations) {
             return;
         }
         match self.eval(script) {
@@ -1695,39 +1708,47 @@ impl Document {
         }
     }
 
-    fn inline_script_allowed(&self, source: &str, id: crate::dom::tree::NodeId) -> bool {
+    pub(in crate::document) fn inline_script_violations(
+        &self,
+        source: &str,
+        id: crate::dom::tree::NodeId,
+    ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
         let (nonce, nonceable) = world.document(id).map_or_else(
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
         );
-        world.csp.allows_inline(&crate::csp::InlineScript {
+        world.csp.check_inline(&crate::csp::InlineScript {
             source,
             nonce: &nonce,
             nonceable,
             parser_inserted: true,
-            navigation: false,
+            kind: crate::csp::InlineKind::Script,
         })
     }
 
-    fn navigation_script_allowed(&self, source: &str) -> bool {
+    fn navigation_script_violations(&self, source: &str) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
-        world.csp.allows_inline(&crate::csp::InlineScript {
+        world.csp.check_inline(&crate::csp::InlineScript {
             source,
             nonce: "",
             nonceable: false,
             parser_inserted: false,
-            navigation: true,
+            kind: crate::csp::InlineKind::Navigation,
         })
     }
 
-    fn script_url_allowed(&self, url: &Url, id: crate::dom::tree::NodeId) -> bool {
+    pub(in crate::document) fn script_url_violations(
+        &self,
+        url: &Url,
+        id: crate::dom::tree::NodeId,
+    ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
         let (nonce, _) = world.document(id).map_or_else(
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
         );
-        world.csp.allows_request(
+        world.csp.check_request(
             &world.origin,
             &world.document_url,
             url,
@@ -1737,6 +1758,25 @@ impl Document {
                 parser_inserted: true,
             }),
         )
+    }
+
+    /// The main document's root node, the violation target for checks that
+    /// are not attributable to an element.
+    fn document_node(&self) -> Option<crate::dom::tree::NodeId> {
+        self.world.borrow().with_main_document(|parsed| {
+            crate::dom::tree::NodeId {
+                document: parsed.id,
+                node: parsed.document.base.root_node().id,
+            }
+        })
+    }
+
+    /// Dispatches the `securitypolicyviolation` events a check produced.
+    pub(in crate::document) fn fire_csp_violations(&mut self, target: crate::dom::tree::NodeId, violations: &[crate::csp::Violation]) {
+        if violations.is_empty() {
+            return;
+        }
+        self.fire_js(|js| js.fire_csp_violations(target, violations));
     }
 
     /// Runs every not-yet-executed script in tree order, stopping (returning
@@ -1813,14 +1853,23 @@ impl Document {
                     source,
                     line,
                 })) => {
-                    if self.inline_script_allowed(&source, id) {
-                        let filename = self.url.as_str().to_owned();
-                        self.eval_classic(&source, Some(id), line, &filename);
+                    let violations = self.inline_script_violations(&source, id);
+                    if !violations.is_empty() {
+                        self.fire_csp_violations(id, &violations);
                     }
+                    if crate::csp::blocks(&violations) {
+                        continue;
+                    }
+                    let filename = self.url.as_str().to_owned();
+                    self.eval_classic(&source, Some(id), line, &filename);
                 }
                 Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
                     if let Ok(url) = self.resolve_dial_url(&src) {
-                        if !self.script_url_allowed(&url, id) {
+                        let violations = self.script_url_violations(&url, id);
+                        if !violations.is_empty() {
+                            self.fire_csp_violations(id, &violations);
+                        }
+                        if crate::csp::blocks(&violations) {
                             continue;
                         }
                         self.classic_fetch_in_flight = true;
@@ -1905,6 +1954,9 @@ impl Document {
                         let source = String::from_utf8_lossy(&outcome.body);
                         let filename = outcome.final_url.clone();
                         self.eval_classic(&source, Some(element), 1, &filename);
+                        self.fire_js(|js| js.fire_node_load(element));
+                    } else {
+                        self.fire_js(|js| js.fire_node_error(element));
                     }
                     self.resume_scripts();
                 }
@@ -1970,9 +2022,10 @@ impl Document {
                     self.settle_js_fetch(id, None);
                 }
             }
-            DialContext::ClassicScript { epoch, .. } => {
+            DialContext::ClassicScript { element, epoch } => {
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
+                    self.fire_js(|js| js.fire_node_error(element));
                     self.resume_scripts();
                 }
             }
@@ -2104,7 +2157,11 @@ impl Document {
         for (index, (element, source)) in modules.into_iter().enumerate() {
             let result = match source {
                 crate::js::ScriptSource::Inline { source, .. } => {
-                    if !self.inline_script_allowed(&source, element) {
+                    let violations = self.inline_script_violations(&source, element);
+                    if !violations.is_empty() {
+                        self.fire_csp_violations(element, &violations);
+                    }
+                    if crate::csp::blocks(&violations) {
                         continue;
                     }
                     let name = format!("{}#inline-module-{index}", self.url);
@@ -2113,11 +2170,18 @@ impl Document {
                         .map_or(Ok(()), |js| js.eval_inline_module(&name, &source))
                 }
                 crate::js::ScriptSource::Src(src) => match self.resolve_dial_url(&src) {
-                    Ok(url) if !self.script_url_allowed(&url, element) => continue,
-                    Ok(url) => self
-                        .js
-                        .as_ref()
-                        .map_or(Ok(()), |js| js.eval_external_module(url.as_str())),
+                    Ok(url) => {
+                        let violations = self.script_url_violations(&url, element);
+                        if !violations.is_empty() {
+                            self.fire_csp_violations(element, &violations);
+                        }
+                        if crate::csp::blocks(&violations) {
+                            continue;
+                        }
+                        self.js
+                            .as_ref()
+                            .map_or(Ok(()), |js| js.eval_external_module(url.as_str()))
+                    }
                     Err(_) => Err(crate::js::JsError::Engine(
                         "invalid module script URL".into(),
                     )),

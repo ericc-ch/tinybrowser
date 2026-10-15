@@ -426,6 +426,14 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         rquickjs::prelude::Func::from(events::init_custom_event),
     )?;
     crate::js::bridge::evaluate(ctx, events::install_custom_event_js(ctx)?)?;
+    crate::js::bridge::object(ctx)?.set(
+        "__tb_new_security_policy_violation_event",
+        rquickjs::prelude::Func::from(events::construct_security_policy_violation_event),
+    )?;
+    crate::js::bridge::evaluate(
+        ctx,
+        events::install_security_policy_violation_event_js(ctx)?,
+    )?;
     Class::<JsEventTarget>::define(&globals)?;
     events::install_event_target_bridge(ctx)?;
     crate::js::bridge::evaluate(ctx, events::install_event_target_ctor_js(ctx)?)?;

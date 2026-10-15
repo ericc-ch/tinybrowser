@@ -2039,7 +2039,11 @@ pub(super) fn parse_referrer_policy(content: &str) -> Option<String> {
 /// a classic inline script. Empty scripts return without setting already
 /// started. External and module scripts are not prepared here.
 pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
-    let (source, base_line) = {
+    enum Kind {
+        Inline(String, u32),
+        External,
+    }
+    let kind = {
         let world = world(ctx)?;
         let world = world.borrow();
         let Some(parsed) = world.document(id) else {
@@ -2053,9 +2057,27 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
         }
         match crate::js::script_at(&world, id) {
             Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline { source, line })) => {
-                (source, line)
+                Kind::Inline(source, line)
             }
+            Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(_))) => Kind::External,
             _ => return Ok(()),
+        }
+    };
+    let (source, base_line) = match kind {
+        Kind::Inline(source, line) => (source, line),
+        Kind::External => {
+            // The fetch starts in `Document::adopt_js_work`; an already
+            // started element must not schedule a second load
+            // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+            let world = world(ctx)?;
+            {
+                let world = world.borrow();
+                if let Some(mut parsed) = world.document_mut(id) {
+                    parsed.document.mark_script_started(id.node);
+                }
+            }
+            world.borrow_mut().queue_script(id);
+            return Ok(());
         }
     };
     if source.is_empty() {
@@ -2068,22 +2090,25 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             parsed.document.mark_script_started(id.node);
         }
     }
-    let allowed = {
+    let violations = {
         let world = world(ctx)?;
         let world = world.borrow();
         let (nonce, nonceable) = world.document(id).map_or_else(
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
         );
-        world.csp.allows_inline(&crate::csp::InlineScript {
+        world.csp.check_inline(&crate::csp::InlineScript {
             source: &source,
             nonce: &nonce,
             nonceable,
             parser_inserted: false,
-            navigation: false,
+            kind: crate::csp::InlineKind::Script,
         })
     };
-    if !allowed {
+    if !violations.is_empty() {
+        super::super::fire_csp_violations(ctx, id, &violations)?;
+    }
+    if crate::csp::blocks(&violations) {
         return Ok(());
     }
     let previous = world(ctx)?.borrow().current_script;

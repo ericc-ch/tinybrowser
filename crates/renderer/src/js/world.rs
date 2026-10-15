@@ -697,6 +697,9 @@ pub(crate) struct World {
     frame_navigations: Vec<FrameNavigation>,
     /// Connected `<img>` elements whose `src` changed inside script.
     image_updates: Vec<NodeId>,
+    /// Connected `<script src>` elements whose fetch prepare steps queued a
+    /// load (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    pending_scripts: Vec<NodeId>,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
@@ -874,6 +877,7 @@ impl World {
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
+            pending_scripts: Vec::new(),
             input_files: HashMap::new(),
             decoders: HashMap::new(),
             document_stream: Vec::new(),
@@ -935,6 +939,7 @@ impl World {
         self.selections.clear();
         self.frame_navigations.clear();
         self.image_updates.clear();
+        self.pending_scripts.clear();
         self.clear_images();
         self.remote_ids.clear();
         self.remote_nodes.clear();
@@ -1551,6 +1556,17 @@ impl World {
 
     pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
         std::mem::take(&mut self.image_updates)
+    }
+
+    /// Queues a connected `<script src>` element for its fetch prepare steps.
+    pub(crate) fn queue_script(&mut self, element: NodeId) {
+        if !self.pending_scripts.contains(&element) {
+            self.pending_scripts.push(element);
+        }
+    }
+
+    pub(crate) fn take_pending_scripts(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.pending_scripts)
     }
 
     /// Records the file list a script assigned to a `type=file` input.

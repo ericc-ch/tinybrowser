@@ -783,6 +783,7 @@ impl Engine {
                     .strip_prefix("javascript:")
                     .unwrap_or(&script)
                     .to_owned();
+                let source = url.as_str().to_owned();
                 let initial = self
                     .frames
                     .get(&child)
@@ -791,9 +792,9 @@ impl Engine {
                     if initial {
                         // The script runs in the document the browser already
                         // created; a string result still replaces it.
-                        document.eval_frame_script(&script);
+                        document.eval_frame_script(&script, &source);
                     } else {
-                        document.load_javascript_frame(&script);
+                        document.load_javascript_frame(&script, &source);
                     }
                 }
             }

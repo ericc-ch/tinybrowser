@@ -21,7 +21,7 @@ enum Source {
 
 /// Whether a policy blocks or is only monitored.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Disposition {
+pub(crate) enum Disposition {
     Enforce,
     Report,
 }
@@ -31,6 +31,40 @@ enum Disposition {
 struct Policy {
     directives: Vec<(String, Vec<String>)>,
     disposition: Disposition,
+    /// The serialized policy as delivered, reported as `originalPolicy`
+    /// (<https://w3c.github.io/webappsec-csp/#parse-serialized-policy>).
+    serialized: String,
+}
+
+/// A decision to block (or, for report-only policies, to report) one check.
+/// Callers dispatch one `securitypolicyviolation` event per violation
+/// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+pub(crate) struct Violation {
+    /// The directive that blocked, after fallback: `script-src-elem` from a
+    /// `script-src` policy reports `script-src`
+    /// (<https://w3c.github.io/webappsec-csp/#violation-effective-directive>).
+    pub effective_directive: String,
+    pub original_policy: String,
+    pub disposition: Disposition,
+    /// The blocked URL, or `inline` / `eval` for non-fetch checks.
+    pub blocked_uri: String,
+    /// First 40 characters of an inline script or style, when applicable.
+    pub sample: Option<String>,
+}
+
+impl Violation {
+    /// Whether this violation blocks; report-only policies only report
+    /// (<https://w3c.github.io/webappsec-csp/#disposition>).
+    #[must_use]
+    pub(crate) fn blocks(&self) -> bool {
+        self.disposition == Disposition::Enforce
+    }
+}
+
+/// True when any violation comes from an enforced policy.
+#[must_use]
+pub(crate) fn blocks(violations: &[Violation]) -> bool {
+    violations.iter().any(Violation::blocks)
 }
 
 /// The document's CSP list and the origin `'self'` is resolved against.
@@ -39,9 +73,10 @@ pub(crate) struct List {
     policies: Vec<Policy>,
 }
 
-/// Inline script being checked.
+/// Inline content being checked: an inline script, `javascript:` navigation,
+/// event handler, style block, or style attribute.
 pub(crate) struct InlineScript<'a> {
-    /// Script source, or the `javascript:` script text.
+    /// Script or style source.
     pub source: &'a str,
     /// Element `nonce` attribute, empty when there is none.
     pub nonce: &'a str,
@@ -49,8 +84,21 @@ pub(crate) struct InlineScript<'a> {
     pub nonceable: bool,
     /// Parser-inserted scripts do not get the `'strict-dynamic'` bypass.
     pub parser_inserted: bool,
-    /// `javascript:` navigation uses the navigation inline type.
-    pub navigation: bool,
+    /// What kind of inline behavior is being checked.
+    pub kind: InlineKind,
+}
+
+/// The behavior an inline check governs.
+#[derive(Clone, Copy)]
+pub(crate) enum InlineKind {
+    /// Inline classic script (`script-src-elem`).
+    Script,
+    /// `javascript:` navigation (`script-src-elem`).
+    Navigation,
+    /// Event handler content attribute (`script-src-attr`).
+    ScriptAttribute,
+    /// `eval()` / `Function()` (`script-src`).
+    Evaluation,
 }
 
 /// Destination used by the pre-request check this browser enforces.
@@ -60,6 +108,43 @@ pub(crate) enum Destination {
     Connect,
     /// Classic and module script requests (`script-src-elem`).
     Script,
+}
+
+impl Destination {
+    /// The effective directive for this destination
+    /// (<https://w3c.github.io/webappsec-csp/#effective-directive>).
+    fn effective_directive(self) -> &'static str {
+        match self {
+            Self::Connect => "connect-src",
+            Self::Script => "script-src-elem",
+        }
+    }
+}
+
+impl InlineScript<'_> {
+    /// The effective directive for this inline check.
+    fn effective_directive(&self) -> &'static str {
+        match self.kind {
+            InlineKind::Script | InlineKind::Navigation => "script-src-elem",
+            InlineKind::ScriptAttribute => "script-src-attr",
+            InlineKind::Evaluation => "script-src",
+        }
+    }
+
+    /// `blockedURI` for an inline check: `inline`, or `eval` for evaluation
+    /// (<https://w3c.github.io/webappsec-csp/#violation-blocked-uri>).
+    fn blocked_uri(&self) -> String {
+        match self.kind {
+            InlineKind::Evaluation => "eval".to_owned(),
+            _ => "inline".to_owned(),
+        }
+    }
+
+    /// First 40 characters of the source
+    /// (<https://w3c.github.io/webappsec-csp/#violation-sample>).
+    fn sample(&self) -> String {
+        self.source.chars().take(40).collect()
+    }
 }
 
 /// Metadata for a script request.
@@ -105,52 +190,142 @@ impl List {
         }
     }
 
-    /// Whether `url` may be fetched for `destination`.
+    /// The violations `url` produces for `destination`, one per policy. An
+    /// empty result allows the request; report-only policies appear without
+    /// blocking
+    /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
     #[must_use]
-    pub(crate) fn allows_request(
+    pub(crate) fn check_request(
         &self,
         origin: &Origin,
         document_url: &Url,
         url: &Url,
         destination: Destination,
         script: Option<ScriptRequest<'_>>,
-    ) -> bool {
-        let effective = match destination {
-            Destination::Connect => "connect-src",
-            Destination::Script => "script-src-elem",
-        };
-        self.policies.iter().all(|policy| {
-            policy.disposition == Disposition::Report
-                || !policy_blocks_request(policy, origin, document_url, url, effective, script)
-        })
+    ) -> Vec<Violation> {
+        let effective = destination.effective_directive();
+        let mut violations = Vec::new();
+        for policy in &self.policies {
+            if policy_request_violation(policy, origin, document_url, url, destination, script) {
+                violations.push(Violation {
+                    effective_directive: effective.to_owned(),
+                    original_policy: policy.serialized.clone(),
+                    disposition: policy.disposition,
+                    blocked_uri: url.as_str().to_owned(),
+                    sample: None,
+                });
+            }
+        }
+        violations
     }
 
-    /// Whether an inline classic script or `javascript:` navigation may run.
+    /// The violations an inline classic script or `javascript:` navigation
+    /// produces
+    /// (<https://w3c.github.io/webappsec-csp/#should-elements-inline-type-behavior-be-blocked-by-content-security-policy>).
     #[must_use]
-    pub(crate) fn allows_inline(&self, inline: &InlineScript<'_>) -> bool {
-        self.policies.iter().all(|policy| {
-            policy.disposition == Disposition::Report || !policy_blocks_inline(policy, inline)
-        })
+    pub(crate) fn check_inline(&self, inline: &InlineScript<'_>) -> Vec<Violation> {
+        let effective = inline.effective_directive();
+        let mut violations = Vec::new();
+        for policy in &self.policies {
+            if policy_inline_violation(policy, inline) {
+                violations.push(Violation {
+                    effective_directive: effective.to_owned(),
+                    original_policy: policy.serialized.clone(),
+                    disposition: policy.disposition,
+                    blocked_uri: inline.blocked_uri(),
+                    sample: Some(inline.sample()),
+                });
+            }
+        }
+        violations
     }
 
-    /// `fetch` and `XMLHttpRequest` pre-request check. An unparseable URL is
-    /// blocked only when an enforced `connect-src` (or `default-src`) would
-    /// actually run.
+    /// The violations a `fetch` or `XMLHttpRequest` request produces. An
+    /// unparseable URL is blocked only when an enforced `connect-src` (or
+    /// `default-src`) would actually run.
     #[must_use]
-    pub(crate) fn allows_connect(&self, origin: &Origin, document_url: &Url, url: &str) -> bool {
+    pub(crate) fn check_connect(
+        &self,
+        origin: &Origin,
+        document_url: &Url,
+        url: &str,
+    ) -> Vec<Violation> {
         match Url::parse(url) {
-            Ok(url) => self.allows_request(origin, document_url, &url, Destination::Connect, None),
-            Err(_) => !self.policies.iter().any(|policy| {
-                policy.disposition == Disposition::Enforce && connect_directive_executes(policy)
-            }),
+            Ok(url) => self.check_request(
+                origin,
+                document_url,
+                &url,
+                Destination::Connect,
+                None,
+            ),
+            Err(_) => self
+                .policies
+                .iter()
+                .filter(|policy| {
+                    policy.disposition == Disposition::Enforce
+                        && connect_directive_executes(policy)
+                })
+                .map(|policy| Violation {
+                    effective_directive: "connect-src".to_owned(),
+                    original_policy: policy.serialized.clone(),
+                    disposition: policy.disposition,
+                    blocked_uri: url.to_owned(),
+                    sample: None,
+                })
+                .collect(),
         }
     }
 }
 
+/// Whether the fallback directive chain for `destination` violates `policy`
+/// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
+fn policy_request_violation(
+    policy: &Policy,
+    origin: &Origin,
+    document_url: &Url,
+    url: &Url,
+    destination: Destination,
+    script: Option<ScriptRequest<'_>>,
+) -> bool {
+    let effective = destination.effective_directive();
+    for &name in fallback_names(effective) {
+        let Some(list) = directive_value(policy, name) else {
+            continue;
+        };
+        // A directive lower in the fallback chain only executes when no
+        // higher-priority directive is present; the loop order guarantees
+        // that, so the first present directive decides.
+        let check = if name == "default-src" { effective } else { name };
+        return request_check_blocks(check, list, origin, document_url, url, script);
+    }
+    false
+}
+
+/// Whether the fallback chain for the inline kind violates `policy`.
+fn policy_inline_violation(policy: &Policy, inline: &InlineScript<'_>) -> bool {
+    let effective = inline.effective_directive();
+    for &name in fallback_names(effective) {
+        let Some(list) = directive_value(policy, name) else {
+            continue;
+        };
+        let check = if name == "default-src" { effective } else { name };
+        return inline_check_blocks(check, list, inline);
+    }
+    false
+}
+
+/// The first fallback directive the policy actually defines, i.e. the
+/// directive that would run `should_execute` would pick
+/// (<https://w3c.github.io/webappsec-csp/#should-directive-execute>).
+fn first_present_directive(policy: &Policy, effective: &str) -> Option<&'static str> {
+    fallback_names(effective)
+        .iter()
+        .copied()
+        .find(|name| directive_value(policy, name).is_some())
+}
+
 fn connect_directive_executes(policy: &Policy) -> bool {
-    fallback_names("connect-src").iter().any(|name| {
-        directive_value(policy, name).is_some() && should_execute("connect-src", name, policy)
-    })
+    first_present_directive(policy, "connect-src").is_some()
 }
 
 /// Joins every occurrence of `name` with `", "`, the way a list header is
@@ -276,34 +451,8 @@ fn parse_serialized(serialized: &str, _source: Source, disposition: Disposition)
     Policy {
         directives,
         disposition,
+        serialized: trim_ascii(serialized).to_owned(),
     }
-}
-
-fn policy_blocks_request(
-    policy: &Policy,
-    origin: &Origin,
-    document_url: &Url,
-    url: &Url,
-    effective: &str,
-    script: Option<ScriptRequest<'_>>,
-) -> bool {
-    for &name in fallback_names(effective) {
-        let Some(list) = directive_value(policy, name) else {
-            continue;
-        };
-        if !should_execute(effective, name, policy) {
-            continue;
-        }
-        let check = if name == "default-src" {
-            effective
-        } else {
-            name
-        };
-        if request_check_blocks(check, list, origin, document_url, url, script) {
-            return true;
-        }
-    }
-    false
 }
 
 fn request_check_blocks(
@@ -329,44 +478,43 @@ fn request_check_blocks(
     !url_matches_list(url, list, origin, document_url, 0)
 }
 
-fn policy_blocks_inline(policy: &Policy, inline: &InlineScript<'_>) -> bool {
-    let effective = "script-src-elem";
-    for &name in fallback_names(effective) {
-        let Some(list) = directive_value(policy, name) else {
-            continue;
-        };
-        if !should_execute(effective, name, policy) {
-            continue;
-        }
-        let check = if name == "default-src" {
-            effective
-        } else {
-            name
-        };
-        if (check == "script-src-elem" || check == "script-src") && !element_matches(list, inline) {
-            return true;
-        }
+/// The inline check for one directive
+/// (<https://w3c.github.io/webappsec-csp/#should-block-inline>).
+fn inline_check_blocks(name: &str, list: &[String], inline: &InlineScript<'_>) -> bool {
+    if matches!(inline.kind, InlineKind::Evaluation) {
+        return name == "script-src" && evaluation_blocks(list, inline.source);
+    }
+    if name == "script-src-elem" || name == "script-src" || name == "script-src-attr" {
+        return !element_matches(list, inline);
     }
     false
 }
 
-/// <https://w3c.github.io/webappsec-csp/#should-directive-execute>
-fn should_execute(effective: &str, directive: &str, policy: &Policy) -> bool {
-    for &fallback in fallback_names(effective) {
-        if directive == fallback {
-            return true;
-        }
-        if directive_value(policy, fallback).is_some() {
-            return false;
-        }
+/// Whether a source list blocks compiling `source`
+/// (<https://w3c.github.io/webappsec-csp/#can-compile-strings>): only
+/// `'unsafe-eval'` and matching hash-sources allow evaluation.
+fn evaluation_blocks(list: &[String], source: &str) -> bool {
+    if has_keyword(list, "'unsafe-eval'") {
+        return false;
     }
-    false
+    !list.iter().any(|expression| hash_matches(expression, source))
 }
 
 fn fallback_names(effective: &str) -> &'static [&'static str] {
     match effective {
         "script-src-elem" => &["script-src-elem", "script-src", "default-src"],
+        "script-src-attr" => &["script-src-attr", "script-src", "default-src"],
+        "script-src" => &["script-src", "default-src"],
+        "style-src-elem" => &["style-src-elem", "style-src", "default-src"],
+        "style-src-attr" => &["style-src-attr", "style-src", "default-src"],
+        "worker-src" => &["worker-src", "child-src", "script-src", "default-src"],
         "connect-src" => &["connect-src", "default-src"],
+        "manifest-src" => &["manifest-src", "default-src"],
+        "object-src" => &["object-src", "default-src"],
+        "frame-src" => &["frame-src", "child-src", "default-src"],
+        "media-src" => &["media-src", "default-src"],
+        "font-src" => &["font-src", "default-src"],
+        "img-src" => &["img-src", "default-src"],
         _ => &[],
     }
 }
@@ -398,20 +546,24 @@ fn has_keyword(list: &[String], keyword: &str) -> bool {
 
 /// <https://w3c.github.io/webappsec-csp/#match-element-to-source-list>
 fn element_matches(list: &[String], inline: &InlineScript<'_>) -> bool {
-    if allows_all_inline(list) {
+    if allows_all_inline(list, inline.kind) {
         return true;
     }
-    let type_is_script = !inline.navigation;
-    if type_is_script && inline.nonceable && nonce_matches(inline.nonce, list) {
+    // Nonces apply to inline script and style elements, not to attributes of
+    // either element or to `javascript:` navigations
+    // (<https://w3c.github.io/webappsec-csp/#match-element-to-source-list>).
+    let nonce_applies = matches!(inline.kind, InlineKind::Script);
+    if nonce_applies && inline.nonceable && nonce_matches(inline.nonce, list) {
         return true;
     }
     let unsafe_hashes = has_keyword(list, "'unsafe-hashes'");
-    if !type_is_script && !unsafe_hashes {
+    let hash_applies = matches!(inline.kind, InlineKind::Script) || unsafe_hashes;
+    if !hash_applies {
         return false;
     }
     for expression in list {
         if expression.eq_ignore_ascii_case("'strict-dynamic'")
-            && type_is_script
+            && matches!(inline.kind, InlineKind::Script)
             && !inline.parser_inserted
         {
             return true;
@@ -424,13 +576,17 @@ fn element_matches(list: &[String], inline: &InlineScript<'_>) -> bool {
 }
 
 /// <https://w3c.github.io/webappsec-csp/#allow-all-inline>
-fn allows_all_inline(list: &[String]) -> bool {
+fn allows_all_inline(list: &[String], kind: InlineKind) -> bool {
     let mut allow = false;
     for expression in list {
         if is_nonce_source(expression) || is_hash_source(expression) {
             return false;
         }
-        if expression.eq_ignore_ascii_case("'strict-dynamic'") {
+        if matches!(
+            kind,
+            InlineKind::Script | InlineKind::ScriptAttribute | InlineKind::Navigation
+        ) && expression.eq_ignore_ascii_case("'strict-dynamic'")
+        {
             return false;
         }
         if expression.eq_ignore_ascii_case("'unsafe-inline'") {
