@@ -22,6 +22,12 @@
 name: WPT
 
 on:
+  schedule:
+    # Every day at 00:00 UTC (01:00 in Zurich winter, 02:00 in summer).
+    # Scheduled runs never see dispatch inputs, so all three defaults live
+    # in the env block below as well; GitHub pauses the timer after 60 days
+    # without repository activity, and manual runs stay available.
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       chunks:
@@ -55,6 +61,11 @@ env:
   # a vendored copy (the vendored one needs perl and minutes, and links the
   # static copy where local builds link the system one).
   OPENSSL_NO_VENDOR: "1"
+  # Dispatch inputs are empty on scheduled runs, so every use goes through
+  # these; the defaults match the workflow_dispatch inputs above.
+  WPT_CHUNKS: ${{ inputs.chunks || '20' }}
+  WPT_TEST_TYPES: ${{ inputs.test-types || 'testharness crashtest reftest test262' }}
+  WPT_EXCLUDE: ${{ inputs.exclude || 'worker' }}
 
 jobs:
   plan:
@@ -65,14 +76,12 @@ jobs:
     steps:
       - id: plan
         name: Build the chunk list
-        env:
-          CHUNKS: ${{ inputs.chunks }}
         run: |
-          if [[ ! "$CHUNKS" =~ ^[1-9][0-9]*$ ]] || (( CHUNKS > 256 )); then
-            echo "::error::chunks must be an integer in 1..256 (got '$CHUNKS')"
+          if [[ ! "$WPT_CHUNKS" =~ ^[1-9][0-9]*$ ]] || (( WPT_CHUNKS > 256 )); then
+            echo "::error::chunks must be an integer in 1..256 (got '$WPT_CHUNKS')"
             exit 1
           fi
-          echo "chunks=[$(seq -s, 1 "$CHUNKS")]" >> "$GITHUB_OUTPUT"
+          echo "chunks=[$(seq -s, 1 "$WPT_CHUNKS")]" >> "$GITHUB_OUTPUT"
 
   build:
     runs-on: ubuntu-24.04
@@ -135,7 +144,7 @@ jobs:
           retention-days: 3
 
   wpt:
-    name: chunk ${{ matrix.chunk }}/${{ inputs.chunks }}
+    name: chunk ${{ matrix.chunk }}/${{ strategy.job-total }}
     needs: [plan, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -177,16 +186,13 @@ jobs:
           TINYBROWSER_BINARY: ${{ github.workspace }}/tinybrowser-wpt
           REPORT: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.json
           RAW: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.raw.log
-          EXCLUDES: ${{ inputs.exclude }}
-          TEST_TYPES: ${{ inputs.test-types }}
-          CHUNKS: ${{ inputs.chunks }}
         run: |
           set -euo pipefail
           chmod +x "$TINYBROWSER_BINARY"
           excludes=()
-          for value in $EXCLUDES; do excludes+=("--exclude=$value"); done
+          for value in $WPT_EXCLUDE; do excludes+=("--exclude=$value"); done
           types=()
-          for value in $TEST_TYPES; do types+=("$value"); done
+          for value in $WPT_TEST_TYPES; do types+=("$value"); done
           if (( ${#types[@]} == 0 )); then
             echo "::error::test-types is empty; nothing would run"
             exit 1
@@ -195,7 +201,7 @@ jobs:
             --log-wptreport "$REPORT" \
             --log-raw "$RAW" \
             --no-fail-on-unexpected \
-            --total-chunks "$CHUNKS" \
+            --total-chunks "$WPT_CHUNKS" \
             --this-chunk "${{ matrix.chunk }}" \
             "${excludes[@]}" \
             --test-types "${types[@]}"
@@ -229,13 +235,11 @@ jobs:
           path: reports
           merge-multiple: true
       - name: Merge chunk reports
-        env:
-          CHUNKS: ${{ inputs.chunks }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           reports=(reports/*.json)
-          echo "downloaded ${#reports[@]}/$CHUNKS chunk reports"
+          echo "downloaded ${#reports[@]}/$WPT_CHUNKS chunk reports"
           if (( ${#reports[@]} == 0 )); then
             echo "::error::no chunk reports to merge"
             exit 1
@@ -244,20 +248,16 @@ jobs:
           # table render, but turns the run red instead of hiding the chunk.
           python3 tools/wpt/cli.py merge --strict-skips "${reports[@]}" \
             --out merged.json | tee summary.txt
-          if (( ${#reports[@]} != CHUNKS )); then
-            echo "::error::incomplete run: ${#reports[@]} of $CHUNKS chunk reports"
+          if (( ${#reports[@]} != WPT_CHUNKS )); then
+            echo "::error::incomplete run: ${#reports[@]} of $WPT_CHUNKS chunk reports"
             exit 1
           fi
       - name: Run page summary
         if: ${{ !cancelled() && hashFiles('summary.txt') != '' }}
-        env:
-          TEST_TYPES: ${{ inputs.test-types }}
-          CHUNKS: ${{ inputs.chunks }}
-          EXCLUDE: ${{ inputs.exclude }}
         run: |
           {
             printf '## WPT — %s (%s chunks, exclude: %s)\n' \
-              "$TEST_TYPES" "$CHUNKS" "$EXCLUDE"
+              "$WPT_TEST_TYPES" "$WPT_CHUNKS" "$WPT_EXCLUDE"
             echo
             echo '```'
             cat summary.txt
