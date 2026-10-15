@@ -21,25 +21,214 @@
 // associated CSS style sheet for `<style>` and `<link rel=stylesheet>`.
 // https://drafts.csswg.org/cssom/#the-cssstylesheet-interface
 {
-  // Owner element of an associated sheet. Constructable sheets have none;
-  // their rule list stays the script-side array `replaceSync` writes.
-  const __tbSheetOwners = new WeakMap();
-  const __tbRulePath = path => path.join(',');
-  function __tbRuleInfo(owner, path) {
-    return host.__tb_sheet_rule_info(owner, __tbRulePath(path));
+  // Captured at realm init so a page-patched builtin cannot retarget a rule
+  // path or swallow an exception.
+  const __tbReflectGet = Reflect.get;
+  const __tbBind = Function.prototype.bind;
+  const __tbDomException = globalThis.DOMException;
+  const __tbCharCodeAt = String.prototype.charCodeAt;
+  const __tbSheetsById = new Map();
+  const __tbRulePath = path => __tbArray.join(path, ',');
+  function __tbIllegal() {
+    throw new TypeError('Illegal constructor');
   }
-  // Live `CSSRuleList` over the style engine's parsed rules
-  // (<https://drafts.csswg.org/cssom/#the-cssrulelist-interface>).
-  function __tbLiveRuleList(owner, path, sheet, parentRule) {
+  function CSSRule() { __tbIllegal(); }
+  function CSSStyleRule() { __tbIllegal(); }
+  function CSSGroupingRule() { __tbIllegal(); }
+  function CSSConditionRule() { __tbIllegal(); }
+  function CSSMediaRule() { __tbIllegal(); }
+  function CSSSupportsRule() { __tbIllegal(); }
+  function CSSImportRule() { __tbIllegal(); }
+  function CSSFontFaceRule() { __tbIllegal(); }
+  function CSSKeyframesRule() { __tbIllegal(); }
+  function CSSKeyframeRule() { __tbIllegal(); }
+  function CSSStyleDeclaration() { __tbIllegal(); }
+  CSSStyleRule.prototype = Object.create(CSSRule.prototype);
+  CSSGroupingRule.prototype = Object.create(CSSRule.prototype);
+  CSSConditionRule.prototype = Object.create(CSSGroupingRule.prototype);
+  CSSMediaRule.prototype = Object.create(CSSConditionRule.prototype);
+  CSSSupportsRule.prototype = Object.create(CSSConditionRule.prototype);
+  CSSImportRule.prototype = Object.create(CSSRule.prototype);
+  CSSFontFaceRule.prototype = Object.create(CSSRule.prototype);
+  CSSKeyframesRule.prototype = Object.create(CSSRule.prototype);
+  CSSKeyframeRule.prototype = Object.create(CSSRule.prototype);
+  const __tbRulePrototype = {
+    CSSStyleRule, CSSGroupingRule, CSSConditionRule, CSSMediaRule, CSSSupportsRule,
+    CSSImportRule, CSSFontFaceRule, CSSKeyframesRule, CSSKeyframeRule, CSSRule,
+  };
+  for (const name of Object.keys(__tbRulePrototype)) {
+    __tbDefineProperty(globalThis, name, {
+      value: __tbRulePrototype[name], writable: true, configurable: true,
+    });
+    __tbDefineProperty(globalThis, 'CSSStyleDeclaration', {
+      value: CSSStyleDeclaration, writable: true, configurable: true,
+    });
+  }
+  function __tbSamePath(left, right) {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index++) {
+      if (left[index] !== right[index]) return false;
+    }
+    return true;
+  }
+  function __tbUnder(entry, listPath) {
+    if (entry.path.length <= listPath.length) return false;
+    for (let index = 0; index < listPath.length; index++) {
+      if (entry.path[index] !== listPath[index]) return false;
+    }
+    return true;
+  }
+  function __tbRequireClean(sheet) {
+    const state = host.__tb_sheet_origin_state(sheet.__tbOwner, sheet.__tbId);
+    if (state === 0) throw new __tbDomException('cross-origin stylesheet', 'SecurityError');
+    if (state < 0) throw new __tbDomException('stylesheet is gone', 'InvalidStateError');
+  }
+  function __tbCanonicalIndex(property) {
+    if (typeof property !== 'string' || property.length === 0) return false;
+    if (property.length > 1 && __tbApply(__tbCharCodeAt, property, [0]) === 0x30) return false;
+    let value = 0;
+    for (let index = 0; index < property.length; index++) {
+      const code = __tbApply(__tbCharCodeAt, property, [index]);
+      if (code < 0x30 || code > 0x39) return false;
+      value = value * 10 + (code - 0x30);
+      if (value >= 4294967295) return false;
+    }
+    return true;
+  }
+  function __tbStyle(sheet, entry) {
+    const style = Object.create(CSSStyleDeclaration.prototype);
+    const pathKey = () => __tbRulePath(entry.path);
+    __tbDefineProperty(style, 'cssText', {
+      get() {
+        if (entry.detached) return '';
+        return host.__tb_sheet_style_css_text(sheet.__tbOwner, sheet.__tbId, pathKey());
+      },
+      enumerable: true, configurable: true,
+    });
+    __tbDefineProperty(style, 'length', {
+      get() {
+        if (entry.detached) return 0;
+        const names = host.__tb_sheet_style_names(sheet.__tbOwner, sheet.__tbId, pathKey());
+        return names ? names.length : 0;
+      },
+      enumerable: true, configurable: true,
+    });
+    style.getPropertyValue = function(name) {
+      if (entry.detached) return '';
+      const found = host.__tb_sheet_style_get_property(sheet.__tbOwner, sheet.__tbId, pathKey(), String(name));
+      return found ? found.value : '';
+    };
+    style.getPropertyPriority = function(name) {
+      if (entry.detached) return '';
+      const found = host.__tb_sheet_style_get_property(sheet.__tbOwner, sheet.__tbId, pathKey(), String(name));
+      return found && found.important ? 'important' : '';
+    };
+    style.setProperty = function(name, value, priority) {
+      if (entry.detached) return;
+      host.__tb_sheet_style_set_property(
+        sheet.__tbOwner, sheet.__tbId, pathKey(), String(name),
+        value == null ? '' : String(value), String(priority) === 'important',
+      );
+    };
+    style.item = function(index) {
+      if (arguments.length < 1) throw new TypeError('item requires 1 argument');
+      if (entry.detached) return '';
+      const names = host.__tb_sheet_style_names(sheet.__tbOwner, sheet.__tbId, pathKey()) || [];
+      index = index >>> 0;
+      return index < names.length ? names[index] : '';
+    };
+    return style;
+  }
+  function __tbCachedRule(sheet, path, parentRule) {
+    for (const entry of sheet.__tbRules) {
+      if (!entry.detached && __tbSamePath(entry.path, path)) return entry.rule;
+    }
+    const entry = { path: path.slice(), detached: false, frozenText: '', rule: null, list: null, style: null };
+    const rule = Object.create(CSSRule.prototype);
+    const read = () => {
+      if (entry.detached) return null;
+      return host.__tb_sheet_rule_info(sheet.__tbOwner, sheet.__tbId, __tbRulePath(entry.path));
+    };
+    const info = read() || { interface: 'CSSRule', type: 0, cssText: '', hasChildRules: false, hasStyle: false };
+    const ctor = __tbRulePrototype[info.interface] || CSSRule;
+    __tbSetPrototypeOf(rule, ctor.prototype);
+    __tbDefineProperty(rule, 'type', { get() { const next = read(); return next ? next.type : info.type; }, enumerable: true, configurable: true });
+    __tbDefineProperty(rule, 'cssText', {
+      get() { return entry.detached ? entry.frozenText : (read() || {}).cssText || ''; },
+      enumerable: true, configurable: true,
+    });
+    __tbDefineProperty(rule, 'parentRule', { get() { return parentRule; }, enumerable: true, configurable: true });
+    __tbDefineProperty(rule, 'parentStyleSheet', {
+      get() { return entry.detached ? null : sheet; },
+      enumerable: true, configurable: true,
+    });
+    if (info.selectorText !== undefined) {
+      __tbDefineProperty(rule, 'selectorText', {
+        get() { const next = read(); return next && next.selectorText ? next.selectorText : ''; },
+        enumerable: true, configurable: true,
+      });
+    }
+    if (info.conditionText !== undefined) {
+      __tbDefineProperty(rule, 'conditionText', {
+        get() { const next = read(); return next && next.conditionText ? next.conditionText : ''; },
+        enumerable: true, configurable: true,
+      });
+    }
+    for (const key of ['keyText', 'name', 'href', 'media']) {
+      if (info[key] === undefined) continue;
+      const attribute = key;
+      __tbDefineProperty(rule, attribute, {
+        get() { const next = read(); return next && next[attribute] ? next[attribute] : ''; },
+        enumerable: true, configurable: true,
+      });
+    }
+    if (info.hasChildRules) {
+      __tbDefineProperty(rule, 'cssRules', {
+        get() {
+          if (entry.list === null) entry.list = __tbLiveRuleList(sheet, entry, rule);
+          return entry.list;
+        },
+        enumerable: true, configurable: true,
+      });
+      rule.insertRule = function(text, index) {
+        return __tbInsert(sheet, entry.path, text, index, arguments.length);
+      };
+      rule.deleteRule = function(index) {
+        return __tbDelete(sheet, entry.path, index, arguments.length);
+      };
+    }
+    if (info.hasStyle) {
+      __tbDefineProperty(rule, 'style', {
+        get() {
+          if (entry.style === null) entry.style = __tbStyle(sheet, entry);
+          return entry.style;
+        },
+        enumerable: true, configurable: true,
+      });
+    }
+    entry.rule = rule;
+    sheet.__tbRules.push(entry);
+    return rule;
+  }
+  // Live `CSSRuleList`. `item` returns the same CSSRule for as long as that
+  // rule exists (<https://drafts.csswg.org/cssom/#the-cssrulelist-interface>).
+  function __tbLiveRuleList(sheet, parentEntry, parentRule) {
+    const listPath = () => parentEntry ? parentEntry.path : [];
     const list = {
       get length() {
-        const count = host.__tb_sheet_rule_count(owner, __tbRulePath(path));
+        if (parentEntry && parentEntry.detached) return 0;
+        __tbRequireClean(sheet);
+        const count = host.__tb_sheet_rule_count(sheet.__tbOwner, sheet.__tbId, __tbRulePath(listPath()));
         return count < 0 ? 0 : count;
       },
       item(index) {
-        index = Number(index);
-        if (!(index >= 0 && index < this.length)) return null;
-        return __tbLiveRule(owner, path.concat(index), sheet, parentRule);
+        if (arguments.length < 1) throw new TypeError('item requires 1 argument');
+        if (parentEntry && parentEntry.detached) return null;
+        __tbRequireClean(sheet);
+        index = index >>> 0;
+        if (index >= this.length) return null;
+        const path = __tbApply(__tbArray.concat, listPath(), [index]);
+        return __tbCachedRule(sheet, path, parentRule);
       },
     };
     list[Symbol.iterator] = function* () {
@@ -47,77 +236,74 @@
     };
     return new Proxy(list, {
       get(target, property, receiver) {
-        if (typeof property === 'string' && /^\d+$/.test(property)) {
-          const item = target.item(Number(property));
+        if (__tbCanonicalIndex(property)) {
+          const item = target.item(property >>> 0);
           return item === null ? undefined : item;
         }
-        const value = Reflect.get(target, property, receiver);
-        return typeof value === 'function' ? value.bind(target) : value;
+        const value = __tbApply(__tbReflectGet, Reflect, [target, property, receiver]);
+        return typeof value === 'function' ? __tbApply(__tbBind, value, [target]) : value;
       },
     });
   }
-  function __tbLiveRule(owner, path, sheet, parentRule) {
-    const read = () => __tbRuleInfo(owner, path) || { cssText: '', type: 0, hasChildRules: false, hasStyle: false };
-    const rule = {
-      get type() { return read().type; },
-      get cssText() { return read().cssText; },
-      get parentRule() { return parentRule; },
-      get parentStyleSheet() { return sheet; },
-      get selectorText() { return read().selectorText || ''; },
-      get conditionText() { return read().conditionText || ''; },
-      get cssRules() {
-        return __tbLiveRuleList(owner, path, sheet, rule);
-      },
-      get style() {
-        if (!read().hasStyle) return null;
-        return {
-          get cssText() { return host.__tb_sheet_style_css_text(owner, __tbRulePath(path)); },
-          getPropertyValue(name) {
-            const text = this.cssText;
-            const wanted = String(name).toLowerCase();
-            for (const part of text.split(';')) {
-              const separator = part.indexOf(':');
-              if (separator < 0) continue;
-              if (part.slice(0, separator).trim().toLowerCase() === wanted) {
-                return part.slice(separator + 1).trim();
-              }
-            }
-            return '';
-          },
-        };
-      },
-    };
-    return rule;
+  function __tbInsert(sheet, listPath, text, index, arity) {
+    if (arity < 1) throw new TypeError('insertRule requires 1 argument');
+    __tbRequireClean(sheet);
+    index = arity < 2 ? 0 : (index >>> 0);
+    const inserted = host.__tb_sheet_insert_rule(sheet.__tbOwner, sheet.__tbId, __tbRulePath(listPath), String(text), index);
+    for (const entry of sheet.__tbRules) {
+      if (entry.detached || !__tbUnder(entry, listPath)) continue;
+      if (entry.path[listPath.length] >= index) entry.path[listPath.length] += 1;
+    }
+    return inserted;
+  }
+  function __tbDelete(sheet, listPath, index, arity) {
+    if (arity < 1) throw new TypeError('deleteRule requires 1 argument');
+    __tbRequireClean(sheet);
+    index = index >>> 0;
+    for (const entry of sheet.__tbRules) {
+      if (entry.detached || !__tbUnder(entry, listPath)) continue;
+      if (entry.path[listPath.length] !== index) continue;
+      const info = host.__tb_sheet_rule_info(sheet.__tbOwner, sheet.__tbId, __tbRulePath(entry.path));
+      entry.frozenText = info ? info.cssText : '';
+      entry.detached = true;
+    }
+    host.__tb_sheet_delete_rule(sheet.__tbOwner, sheet.__tbId, __tbRulePath(listPath), index);
+    for (const entry of sheet.__tbRules) {
+      if (entry.detached || !__tbUnder(entry, listPath)) continue;
+      if (entry.path[listPath.length] > index) entry.path[listPath.length] -= 1;
+    }
   }
   class CSSStyleSheet {
     constructor() {
       this.cssRules = [];
+      this.__tbRules = [];
     }
     replaceSync(text) {
-      if (__tbApply(__tbWeakMapGet, __tbSheetOwners, [this]) !== undefined) {
-        throw new DOMException('associated sheet is not constructable', 'NotSupportedError');
+      if (this.__tbId !== undefined) {
+        throw new __tbDomException('associated sheet is not constructable', 'NotAllowedError');
       }
       const cssText = String(text);
       this.cssRules = cssText ? [{ cssText }] : [];
     }
     replace(text) {
-      this.replaceSync(text);
-      return Promise.resolve(this);
+      try {
+        this.replaceSync(text);
+        return Promise.resolve(this);
+      } catch (error) {
+        return Promise.reject(error);
+      }
     }
     insertRule(rule, index) {
-      const owner = __tbApply(__tbWeakMapGet, __tbSheetOwners, [this]);
-      if (owner === undefined) {
-        throw new DOMException('constructable sheet has no parsed rule list', 'NotSupportedError');
+      if (this.__tbId === undefined) {
+        throw new __tbDomException('constructable sheet has no parsed rule list', 'NotSupportedError');
       }
-      if (index === undefined) index = 0;
-      return host.__tb_sheet_insert_rule(owner, '', String(rule), Number(index));
+      return __tbInsert(this, [], rule, index, arguments.length);
     }
     deleteRule(index) {
-      const owner = __tbApply(__tbWeakMapGet, __tbSheetOwners, [this]);
-      if (owner === undefined) {
-        throw new DOMException('constructable sheet has no parsed rule list', 'NotSupportedError');
+      if (this.__tbId === undefined) {
+        throw new __tbDomException('constructable sheet has no parsed rule list', 'NotSupportedError');
       }
-      host.__tb_sheet_delete_rule(owner, '', Number(index));
+      __tbDelete(this, [], index, arguments.length);
     }
   }
   Object.defineProperty(globalThis, 'CSSStyleSheet', {
@@ -131,9 +317,8 @@
   // insert can observe `sheet` after the style/link node's insertion steps
   // and before that script's post-connection steps. `cssRules` reads the
   // style engine's parsed list for that owner node.
-  const __tbSheets = new WeakMap();
-  // Captured at realm init: the sheet getters brand-check against it, and
-  // pages may replace the global afterwards.
+  // The brand check uses the node kind. Pages may replace the global
+  // afterwards.
   const __tbCssomBrand = value => {
     // Realm-agnostic: cross-realm elements fail `instanceof` against this
     // realm's `Element`, so check the node kind instead. A forged
@@ -145,24 +330,26 @@
   };
   function __tbAssociatedSheet(element) {
     __tbCssomBrand(element);
-    let sheet = __tbApply(__tbWeakMapGet, __tbSheets, [element]);
+    const id = host.__tb_node_sheet_id(element);
+    if (!(id >= 1)) return null;
+    let sheet = __tbSheetsById.get(id);
     if (sheet !== undefined) return sheet;
     sheet = new CSSStyleSheet();
-    __tbApply(__tbWeakMapSet, __tbSheetOwners, [sheet, element]);
+    sheet.__tbId = id;
+    sheet.__tbOwner = element;
     // The constructor's own array is the constructable-sheet list. An
     // associated sheet's `cssRules` is the engine's list instead
     // (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-cssrules>).
     delete sheet.cssRules;
-    let rules = null;
     __tbDefineProperty(sheet, 'cssRules', {
       get() {
-        if (rules === null) rules = __tbLiveRuleList(element, [], sheet, null);
-        return rules;
+        if (sheet.__tbList === undefined) sheet.__tbList = __tbLiveRuleList(sheet, null, null);
+        return sheet.__tbList;
       },
       enumerable: true,
       configurable: true,
     });
-    __tbApply(__tbWeakMapSet, __tbSheets, [element, sheet]);
+    __tbSheetsById.set(id, sheet);
     return sheet;
   }
   Object.defineProperty(globalThis.HTMLStyleElement.prototype, 'sheet', {
