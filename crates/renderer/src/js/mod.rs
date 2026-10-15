@@ -1355,10 +1355,8 @@ impl Drop for ClearInterrupt<'_> {
     }
 }
 
-/// `Referer` for a page `fetch()` at call time
-/// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-/// The `Referer` header for a request to `request_url`, decided from the
-/// document's referrer policy
+/// The `Referer` header for a page `fetch()` to `request_url`, decided at
+/// call time from the document's referrer policy
 /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
 /// Credentials and fragments never leave; local-scheme (`about:`, `blob:`,
 /// `data:`) documents send nothing; an empty policy means
