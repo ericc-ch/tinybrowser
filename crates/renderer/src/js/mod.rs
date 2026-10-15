@@ -927,34 +927,16 @@ impl JsRealm {
                 fetch_referrer(&world, &request_url)
             }),
         )?;
-        let eval_world = world.clone();
+        // Parse a MIME type and serialize it back, the Blob `type` and
+        // `Content-Type` reads use the result
+        // (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>).
         bridge::object(ctx)?.set(
-            "__tbCspAllowsEval",
-            Func::from(move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
-                let violations = {
-                    let world = eval_world.borrow();
-                    world.csp.check_inline(&crate::csp::InlineScript {
-                        source: &source,
-                        nonce: "",
-                        nonceable: false,
-                        parser_inserted: false,
-                        kind: crate::csp::InlineKind::Evaluation,
-                    })
-                };
-                if !violations.is_empty() {
-                    let target = eval_world.borrow().with_main_document(|parsed| {
-                        crate::dom::tree::NodeId {
-                            document: parsed.id,
-                            node: parsed.document.base.root_node().id,
-                        }
-                    });
-                    if let Some(target) = target {
-                        bindings::fire_csp_violations(&ctx, target, &violations)?;
-                    }
-                }
-                Ok(!crate::csp::blocks(&violations))
+            "__tbParseMimeType",
+            Func::from(|value: String| -> String {
+                crate::sniff::parse_serialized_mime_type(&value)
             }),
         )?;
+        Self::install_csp_host_functions(ctx, world)?;
         bridge::object(ctx)?.set(
             "__queueFetch",
             Func::from(
@@ -984,6 +966,44 @@ impl JsRealm {
                     Ok::<(), rquickjs::Error>(())
                 },
             ),
+        )?;
+        Ok(())
+    }
+
+    /// The CSP checks the shim calls where the Rust choke points cannot run:
+    /// evaluation reads the initiating document's policy
+    /// (<https://w3c.github.io/webappsec-csp/#should-block-inline>).
+    fn install_csp_host_functions(
+        ctx: &Ctx<'_>,
+        world: &Rc<RefCell<World>>,
+    ) -> Result<(), JsError> {
+        let eval_world = world.clone();
+        bridge::object(ctx)?.set(
+            "__tbCspAllowsEval",
+            Func::from(move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
+                let violations = {
+                    let world = eval_world.borrow();
+                    world.csp.check_inline(&crate::csp::InlineScript {
+                        source: &source,
+                        nonce: "",
+                        nonceable: false,
+                        parser_inserted: false,
+                        kind: crate::csp::InlineKind::Evaluation,
+                    })
+                };
+                if !violations.is_empty() {
+                    let target = eval_world.borrow().with_main_document(|parsed| {
+                        crate::dom::tree::NodeId {
+                            document: parsed.id,
+                            node: parsed.document.base.root_node().id,
+                        }
+                    });
+                    if let Some(target) = target {
+                        bindings::fire_csp_violations(&ctx, target, &violations)?;
+                    }
+                }
+                Ok(!crate::csp::blocks(&violations))
+            }),
         )?;
         Ok(())
     }

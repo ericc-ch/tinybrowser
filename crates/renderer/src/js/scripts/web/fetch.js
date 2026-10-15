@@ -3,6 +3,17 @@
 const __tbHeadersData = host.slots('tinybrowser.headers.data');
 const __tbResponseData = host.slots('tinybrowser.response.data');
 const __tbRequestData = host.slots('tinybrowser.request.data');
+// A header value is a byte sequence with no 0x00, 0x0A, or 0x0D, and a JS
+// string holds it with one code point per byte
+// (<https://fetch.spec.whatwg.org/#concept-header-value>).
+const __tbHeaderValue = value => {
+  value = String(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code === 0x00 || code === 0x0A || code === 0x0D || code > 0xFF) throw new TypeError('Invalid header value');
+  }
+  return value;
+};
 // https://fetch.spec.whatwg.org/#concept-method-normalize
 const __tbRequestMethod = value => {
   const method = String(value);
@@ -24,15 +35,15 @@ globalThis.Headers = class Headers {
         for (const pair of init) {
           const values = Array.from(pair);
           if (values.length !== 2) throw new TypeError('Header pairs must contain two values');
-           __tbArray.push(entries, [String(values[0]).toLowerCase(), String(values[1]).trim()]);
+           __tbArray.push(entries, [String(values[0]).toLowerCase(), __tbHeaderValue(values[1])]);
         }
       } else {
-        for (const name of Object.keys(init)) __tbArray.push(entries, [name.toLowerCase(), String(init[name]).trim()]);
+        for (const name of Object.keys(init)) __tbArray.push(entries, [name.toLowerCase(), __tbHeaderValue(init[name])]);
       }
     }
     __tbHeadersData.set(this, entries);
   }
-  append(name, value) { __tbArray.push(__tbBrand(this, __tbHeadersData), [String(name).toLowerCase(), String(value).trim()]); }
+  append(name, value) { __tbArray.push(__tbBrand(this, __tbHeadersData), [String(name).toLowerCase(), __tbHeaderValue(value)]); }
   delete(name) {
     const entries = __tbBrand(this, __tbHeadersData);
     name = String(name).toLowerCase();
@@ -54,7 +65,7 @@ globalThis.Headers = class Headers {
   has(name) { return this.get(name) !== null; }
   set(name, value) {
     this.delete(name);
-    __tbArray.push(__tbBrand(this, __tbHeadersData), [String(name).toLowerCase(), String(value).trim()]);
+    __tbArray.push(__tbBrand(this, __tbHeadersData), [String(name).toLowerCase(), __tbHeaderValue(value)]);
   }
   forEach(callback, thisArg) {
     const entries = __tbBrand(this, __tbHeadersData);
@@ -172,15 +183,25 @@ globalThis.Request = class Request {
     // A Request keeps a blob URL's data alive, so fetching it still works
     // after revokeObjectURL (<https://w3c.github.io/FileAPI/#lifeTime>).
     if (blob === null && url.indexOf('blob:') === 0) blob = __tbLookupObjectUrl(url);
-    __tbRequestData.set(this, { url, method, blob, headers, body });
+    __tbRequestData.set(this, { url, method, blob, headers, body, bodyUsed: false });
   }
   get url() { return __tbBrand(this, __tbRequestData).url; }
   get method() { return __tbBrand(this, __tbRequestData).method; }
   get headers() { return __tbBrand(this, __tbRequestData).headers; }
+  get bodyUsed() { return __tbBrand(this, __tbRequestData).bodyUsed; }
+  // https://fetch.spec.whatwg.org/#dom-body-blob
+  blob() {
+    const data = __tbBrand(this, __tbRequestData);
+    if (data.bodyUsed) return Promise.reject(new TypeError('body already used'));
+    data.bodyUsed = true;
+    const type = data.headers.get('content-type');
+    const bytes = data.body === null ? Promise.resolve(new Uint8Array(0)) : __tbResponseBytes(data.body);
+    return bytes.then(value => new Blob([value], { type: type === null ? '' : type }));
+  }
   clone() {
     const data = __tbBrand(this, __tbRequestData);
     const copy = Object.create(globalThis.Request.prototype);
-    __tbRequestData.set(copy, { url: data.url, method: data.method, blob: data.blob, headers: new globalThis.Headers(data.headers), body: data.body });
+    __tbRequestData.set(copy, { url: data.url, method: data.method, blob: data.blob, headers: new globalThis.Headers(data.headers), body: data.body, bodyUsed: false });
     return copy;
   }
 };

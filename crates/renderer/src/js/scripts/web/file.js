@@ -68,8 +68,8 @@ const __tbEndings = value => {
 };
 const __tbBlobType = value => {
   if (value === undefined) return '';
-  value = String(value);
-  return [...value].some(character => character < ' ' || character > '~') ? '' : value;
+  // https://w3c.github.io/FileAPI/#dfn-type
+  return host.__tbParseMimeType(String(value));
 };
 const __tbBlobBytes = (converted, endings) => {
   const chunks = __tbArray.map(converted, part => typeof part === 'string'
@@ -99,7 +99,7 @@ globalThis.Blob = class Blob {
       type = __tbBlobType(options.type);
     }
     const bytes = __tbBlobBytes(converted, endings);
-    __tbBlobData.set(this, { bytes, type: type.toLowerCase() });
+    __tbBlobData.set(this, { bytes, type });
   }
   get size() { return __tbBrand(this, __tbBlobData).bytes.length; }
   get type() { return __tbBrand(this, __tbBlobData).type; }
@@ -136,11 +136,7 @@ globalThis.Blob = class Blob {
       relativeEnd = relativeEnd < 0 ? Math.max(size + relativeEnd, 0) : Math.min(relativeEnd, size);
     }
     const span = Math.max(relativeEnd - relativeStart, 0);
-    let type = '';
-    if (hasContentType) {
-      type = String(contentType);
-      if ([...type].some(character => character < ' ' || character > '~')) type = '';
-    }
+    const type = hasContentType ? __tbBlobType(contentType) : '';
     return new Blob([__tbBytesCopy(data.bytes, relativeStart, relativeStart + span)], { type });
   }
   // https://w3c.github.io/FileAPI/#dom-blob-stream

@@ -35,6 +35,11 @@ rejected, customized built-in elements are rejected. Shadow-scoped
 styles, composed-event retargeting, and form-control state are upstream
 gaps (docs/upstream.md).
 
+`Request` exposes `blob()` only of the body-consumption methods; `text`,
+`json`, `arrayBuffer`, and `bytes` are missing. A `text/plain` document
+is still parsed as HTML, so markup served as plain text renders instead
+of showing as text (WPT `mimesniff/sniffing/`).
+
 CSP `eval`/`Function` gating shadows the globals in JS because the
 engine has no compilation hook; direct `eval` therefore evaluates
 indirectly (global scope) even when allowed. Blocking and report

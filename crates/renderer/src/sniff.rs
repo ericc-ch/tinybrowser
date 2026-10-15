@@ -161,23 +161,19 @@ fn bom_prefix(bytes: &[u8]) -> bool {
 /// (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>,
 /// <https://encoding.spec.whatwg.org/#concept-encoding-get>).
 fn charset_from_content_type(content_type: &str) -> Option<&'static encoding_rs::Encoding> {
-    if let Ok(mime) = content_type.parse::<mime::Mime>() {
-        if let Some(charset) = mime.get_param(mime::CHARSET) {
-            return encoding_rs::Encoding::for_label(charset.as_str().as_bytes());
-        }
-        return None;
-    }
-    // `mime` fails the whole parse on a parameter without `=`; the charset
-    // after it is still usable, so fall back to a tolerant scan rather than
-    // mis-decoding a labeled response.
-    content_type.split(';').skip(1).find_map(|parameter| {
-        let (name, value) = parameter.split_once('=')?;
-        if !name.trim().eq_ignore_ascii_case("charset") {
-            return None;
-        }
-        let label = value.trim().trim_matches(['\'', '"']);
-        encoding_rs::Encoding::for_label(label.as_bytes())
-    })
+    let parsed = parse_mime_type(content_type)?;
+    let (_, value) = parsed
+        .parameters
+        .iter()
+        .find(|(name, _)| name == "charset")?;
+    // "Get an encoding" removes leading and trailing ASCII whitespace from
+    // the label before matching
+    // (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
+    encoding_rs::Encoding::for_label(
+        value
+            .trim_matches(|character: char| character.is_ascii_whitespace())
+            .as_bytes(),
+    )
 }
 
 fn prescan_charset(body: &[u8]) -> Option<&'static encoding_rs::Encoding> {
@@ -233,7 +229,7 @@ pub(crate) fn sniff_mime(
     no_sniff: bool,
     apache_bug: bool,
 ) -> String {
-    let parsed = supplied.and_then(parse_mime);
+    let parsed = supplied.and_then(parse_mime_type);
     if parsed.as_ref().is_some_and(|mime| mime.html() || mime.xml()) {
         return supplied.unwrap_or("text/html").to_owned();
     }
@@ -291,11 +287,17 @@ pub(crate) fn headers_nosniff(headers: &[(String, String)]) -> bool {
     })
 }
 
-struct ParsedMime {
+/// A MIME type record
+/// (<https://mimesniff.spec.whatwg.org/#mime-type-representation>).
+struct MimeType {
     essence: String,
+    /// Parameter names are ASCII-lowercased at parse; a later duplicate is
+    /// dropped
+    /// (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>).
+    parameters: Vec<(String, String)>,
 }
 
-impl ParsedMime {
+impl MimeType {
     fn html(&self) -> bool {
         self.essence == "text/html"
     }
@@ -314,19 +316,161 @@ impl ParsedMime {
             || self.essence.starts_with("video/")
             || self.essence == "application/ogg"
     }
+
+    /// Serialize a MIME type
+    /// (<https://mimesniff.spec.whatwg.org/#serialize-a-mime-type>).
+    fn serialize(&self) -> String {
+        let mut serialization = self.essence.clone();
+        for (name, value) in &self.parameters {
+            serialization.push(';');
+            serialization.push_str(name);
+            serialization.push('=');
+            if value.is_empty() || !is_http_token(value) {
+                serialization.push('"');
+                for character in value.chars() {
+                    if character == '"' || character == '\\' {
+                        serialization.push('\\');
+                    }
+                    serialization.push(character);
+                }
+                serialization.push('"');
+            } else {
+                serialization.push_str(value);
+            }
+        }
+        serialization
+    }
 }
 
-fn parse_mime(header: &str) -> Option<ParsedMime> {
-    let trimmed = trim_http_ws(header);
-    let essence_raw = trimmed
-        .split_once(';')
-        .map_or(trimmed, |(essence, _)| essence);
-    let essence = trim_http_ws(essence_raw).to_ascii_lowercase();
-    let (kind, subtype) = essence.split_once('/')?;
-    if kind.is_empty() || subtype.is_empty() || !is_http_token(kind) || !is_http_token(subtype) {
+/// Parse a MIME type
+/// (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>). `type` and
+/// `subtype` are ASCII-lowercased; parameter values keep their case.
+fn parse_mime_type(input: &str) -> Option<MimeType> {
+    let characters: Vec<char> = trim_http_ws(input).chars().collect();
+    let mut position = 0;
+
+    let mut kind = String::new();
+    while position < characters.len() && characters[position] != '/' {
+        kind.push(characters[position]);
+        position += 1;
+    }
+    if kind.is_empty() || !is_http_token(&kind) || position == characters.len() {
         return None;
     }
-    Some(ParsedMime { essence })
+    position += 1; // Skip `/`.
+
+    let mut subtype = String::new();
+    while position < characters.len() && characters[position] != ';' {
+        subtype.push(characters[position]);
+        position += 1;
+    }
+    while subtype.chars().last().is_some_and(is_http_whitespace) {
+        subtype.pop();
+    }
+    if subtype.is_empty() || !is_http_token(&subtype) {
+        return None;
+    }
+
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    while position < characters.len() {
+        position += 1; // Skip `;`.
+        while position < characters.len() && is_http_whitespace(characters[position]) {
+            position += 1;
+        }
+        let mut name = String::new();
+        while position < characters.len() && characters[position] != ';' && characters[position] != '='
+        {
+            name.push(characters[position]);
+            position += 1;
+        }
+        let name = name.to_ascii_lowercase();
+        if position < characters.len() {
+            if characters[position] == ';' {
+                continue;
+            }
+            position += 1; // Skip `=`.
+        }
+        if position == characters.len() {
+            break;
+        }
+        let value = if characters[position] == '"' {
+            let value = collect_http_quoted_string(&characters, &mut position);
+            // Anything between the closing quote and the next `;` is dropped.
+            while position < characters.len() && characters[position] != ';' {
+                position += 1;
+            }
+            value
+        } else {
+            let mut value = String::new();
+            while position < characters.len() && characters[position] != ';' {
+                value.push(characters[position]);
+                position += 1;
+            }
+            while value.chars().last().is_some_and(is_http_whitespace) {
+                value.pop();
+            }
+            if value.is_empty() {
+                continue;
+            }
+            value
+        };
+        if !name.is_empty()
+            && is_http_token(&name)
+            && value.chars().all(is_http_quoted_string_token)
+            && !parameters.iter().any(|(existing, _)| *existing == name)
+        {
+            parameters.push((name, value));
+        }
+    }
+
+    Some(MimeType {
+        essence: format!(
+            "{}/{}",
+            kind.to_ascii_lowercase(),
+            subtype.to_ascii_lowercase()
+        ),
+        parameters,
+    })
+}
+
+/// Parse then serialize `input`, or the empty string when it is not a MIME
+/// type. The Blob `type` and response-derived strings use this
+/// (<https://w3c.github.io/FileAPI/#dfn-type>).
+#[must_use]
+pub(crate) fn parse_serialized_mime_type(input: &str) -> String {
+    parse_mime_type(input).map_or_else(String::new, |mime| mime.serialize())
+}
+
+/// Collect an HTTP quoted string with `extract-value` true
+/// (<https://fetch.spec.whatwg.org/#collect-an-http-quoted-string>). The
+/// position points at the opening `"`.
+fn collect_http_quoted_string(characters: &[char], position: &mut usize) -> String {
+    *position += 1;
+    let mut value = String::new();
+    loop {
+        while *position < characters.len()
+            && characters[*position] != '"'
+            && characters[*position] != '\\'
+        {
+            value.push(characters[*position]);
+            *position += 1;
+        }
+        if *position == characters.len() {
+            return value;
+        }
+        let quote_or_backslash = characters[*position];
+        *position += 1;
+        if quote_or_backslash == '\\' {
+            if *position == characters.len() {
+                value.push('\\');
+                return value;
+            }
+            value.push(characters[*position]);
+            *position += 1;
+            continue;
+        }
+        return value;
+    }
 }
 
 fn identify_unknown(header: &[u8], scriptable: bool) -> String {
@@ -626,32 +770,49 @@ fn is_tag_terminating(byte: u8) -> bool {
     matches!(byte, 0x20 | 0x3E)
 }
 
+/// HTTP whitespace
+/// (<https://fetch.spec.whatwg.org/#http-whitespace>): TAB, LF, CR, SP.
+fn is_http_whitespace(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\r' | ' ')
+}
+
 fn trim_http_ws(value: &str) -> &str {
-    value.trim_matches(|character: char| ['\t', '\n', '\u{000c}', '\r', ' '].contains(&character))
+    value.trim_matches(is_http_whitespace)
+}
+
+/// An HTTP token code point
+/// (<https://mimesniff.spec.whatwg.org/#http-token-code-point>).
+fn is_http_token_char(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '!' | '#'
+                | '$'
+                | '%'
+                | '&'
+                | '\''
+                | '*'
+                | '+'
+                | '-'
+                | '.'
+                | '^'
+                | '_'
+                | '`'
+                | '|'
+                | '~'
+        )
 }
 
 fn is_http_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(
-                    character,
-                    '!' | '#'
-                        | '$'
-                        | '%'
-                        | '&'
-                        | '\''
-                        | '*'
-                        | '+'
-                        | '-'
-                        | '.'
-                        | '^'
-                        | '_'
-                        | '`'
-                        | '|'
-                        | '~'
-                )
-        })
+    !value.is_empty() && value.chars().all(is_http_token_char)
+}
+
+/// An HTTP quoted-string token code point
+/// (<https://mimesniff.spec.whatwg.org/#http-quoted-string-token-code-point>).
+fn is_http_quoted_string_token(character: char) -> bool {
+    character == '\t'
+        || ('\u{20}'..='\u{7e}').contains(&character)
+        || ('\u{80}'..='\u{ff}').contains(&character)
 }
 
 const fn row(
@@ -881,3 +1042,89 @@ const ARCHIVE: &[Row] = &[
         "application/x-rar-compressed",
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(input: &str) -> String {
+        parse_serialized_mime_type(input)
+    }
+
+    #[test]
+    fn case_is_normalized_but_parameter_values_keep_their_case() {
+        assert_eq!(parsed("TEXT/HTML;CHARSET=GBK"), "text/html;charset=GBK");
+    }
+
+    #[test]
+    fn an_incomplete_parameter_does_not_fail_the_parse() {
+        assert_eq!(parsed("text/html;"), "text/html");
+        assert_eq!(parsed("text/html;charset="), "text/html");
+        assert_eq!(parsed("text/html;a"), "text/html");
+    }
+
+    #[test]
+    fn values_that_are_not_tokens_are_quoted_on_write() {
+        assert_eq!(parsed("text/html;charset=gbk("), "text/html;charset=\"gbk(\"");
+        assert_eq!(parsed("text/html;charset= gbk"), "text/html;charset=\" gbk\"");
+        assert_eq!(
+            parsed("text/html;charset= \"gbk\""),
+            "text/html;charset=\" \\\"gbk\\\"\""
+        );
+        assert_eq!(parsed("text/html;x=(;charset=gbk"), "text/html;x=\"(\";charset=gbk");
+        assert_eq!(
+            parsed("text/html;charset=();charset=GBK"),
+            "text/html;charset=\"()\""
+        );
+    }
+
+    #[test]
+    fn quoted_values_are_unescaped_then_requoted_when_needed() {
+        assert_eq!(
+            parsed("text/html;charset=\"shift_jis\""),
+            "text/html;charset=shift_jis"
+        );
+        assert_eq!(
+            parsed("text/html;charset=\"a\\\"b\""),
+            "text/html;charset=\"a\\\"b\""
+        );
+        // Anything between the closing quote and the next `;` is dropped.
+        assert_eq!(
+            parsed("text/html;charset=\"shift_jis\"iso-2022-jp"),
+            "text/html;charset=shift_jis"
+        );
+    }
+
+    #[test]
+    fn a_space_between_the_name_and_the_equals_drops_the_parameter() {
+        assert_eq!(parsed("text/html;charset =gbk"), "text/html");
+    }
+
+    #[test]
+    fn duplicate_parameters_keep_the_first() {
+        assert_eq!(
+            parsed("text/html;charset=gbk;charset=windows-1255"),
+            "text/html;charset=gbk"
+        );
+    }
+
+    #[test]
+    fn whitespace_around_separators_follows_the_algorithm() {
+        assert_eq!(parsed("text/html ;charset=gbk"), "text/html;charset=gbk");
+        assert_eq!(parsed("text/html; charset=gbk"), "text/html;charset=gbk");
+        assert_eq!(parsed(" text/html "), "text/html");
+    }
+
+    #[test]
+    fn invalid_types_serialize_to_nothing() {
+        for input in ["", "/", "text/", "/html", "text /html", "text/ html", "text/html\u{000c}"] {
+            assert_eq!(parsed(input), "", "{input:?}");
+        }
+        assert_eq!(parsed("*/*"), "*/*");
+    }
+
+    #[test]
+    fn a_parameter_value_outside_the_quoted_string_set_is_dropped() {
+        assert_eq!(parsed("text/html;charset=a\u{0100}"), "text/html");
+    }
+}
