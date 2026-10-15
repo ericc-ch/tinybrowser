@@ -31,6 +31,7 @@ Lone surrogates survive in JS but read back as U+FFFD from the DOM
 ## Missing surfaces
 
 No workers or service-workers, no canvas or WebGL, sync XHR is
+<<<<<<< HEAD
 rejected, customized built-in elements are rejected. Shadow DOM and
 form-control state are upstream gaps (docs/upstream.md).
 
@@ -39,3 +40,7 @@ declaration accessors. Still open: constructable `insertRule` /
 `deleteRule` throw `NotSupportedError`, and a cross-origin `<link>` is
 never origin-clean because the fetch path does not record a CORS
 approval. Conformance for this surface is WPT `css/cssom/`.
+=======
+rejected, customized built-in elements are rejected. Shadow-scoped
+styles and form-control state are upstream gaps (docs/upstream.md).
+>>>>>>> e2c5f8d (dom: shadow roots and moveBefore without reload)

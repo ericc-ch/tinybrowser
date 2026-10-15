@@ -522,13 +522,15 @@ fn node_interface_matches(
         "Node" | "EventTarget" => data.is_some(),
         "Document" => matches!(data, Some(NodeData::Document(_))),
         "XMLDocument" => matches!(data, Some(NodeData::Document(_))) && xml_document,
-        // Blitz has no shadow roots, so `ShadowRoot` never matches. Fragments
-        // are real `Fragment` nodes or flagged backing elements.
+        // A shadow root is a document fragment
+        // (<https://dom.spec.whatwg.org/#interface-shadowroot>).
         "DocumentFragment" => {
-            matches!(data, Some(NodeData::Fragment { .. }))
-                || (matches!(data, Some(NodeData::Element(_))) && is_fragment)
+            matches!(
+                data,
+                Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. })
+            ) || (matches!(data, Some(NodeData::Element(_))) && is_fragment)
         }
-        "ShadowRoot" => false,
+        "ShadowRoot" => matches!(data, Some(NodeData::ShadowRoot { .. })),
         // `DocumentFragment` implements neither `Element` nor `ChildNode`:
         // fragment backings are plain elements under the hood, so every
         // Element-family check below excludes them
@@ -575,7 +577,12 @@ fn node_interface_matches(
         }
         "ParentNode" => matches!(
             data,
-            Some(NodeData::Document(_) | NodeData::Element(_) | NodeData::Fragment { .. })
+            Some(
+                NodeData::Document(_)
+                    | NodeData::Element(_)
+                    | NodeData::Fragment { .. }
+                    | NodeData::ShadowRoot { .. }
+            )
         ),
         // `ChildNode` includes `DocumentType`, `Element`, and `CharacterData`
         // (<https://dom.spec.whatwg.org/#interface-childnode>), but never a

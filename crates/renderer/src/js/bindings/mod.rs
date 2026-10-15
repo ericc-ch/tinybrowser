@@ -860,6 +860,7 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
         }),
         Some(NodeData::Element(_)) if is_fragment => Some("DocumentFragment"),
         Some(NodeData::Fragment { .. }) => Some("DocumentFragment"),
+        Some(NodeData::ShadowRoot { .. }) => Some("ShadowRoot"),
         Some(NodeData::Element(element)) => Some(element_interface(&element.name)),
         Some(NodeData::Text(_)) => Some("Text"),
         Some(NodeData::CDataSection { .. }) => Some("CDATASection"),
@@ -1260,11 +1261,7 @@ pub(super) fn set_pi_data(
 
 /// Writes `utf8` as the node's whole data, by kind. Returns false when the
 /// node holds no character data.
-fn write_character_data(
-    base: &mut blitz_dom::BaseDocument,
-    id: NodeId,
-    utf8: &str,
-) -> bool {
+fn write_character_data(base: &mut blitz_dom::BaseDocument, id: NodeId, utf8: &str) -> bool {
     let Some(node) = base.get_node(id.node) else {
         return false;
     };
