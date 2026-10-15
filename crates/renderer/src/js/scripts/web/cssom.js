@@ -17,20 +17,107 @@
     get: () => __tbViewportSize()[1], configurable: true,
   });
 
-// Constructable stylesheet surface used by component libraries.
+// Constructable stylesheet surface used by component libraries, plus the
+// associated CSS style sheet for `<style>` and `<link rel=stylesheet>`.
 // https://drafts.csswg.org/cssom/#the-cssstylesheet-interface
 {
+  // Owner element of an associated sheet. Constructable sheets have none;
+  // their rule list stays the script-side array `replaceSync` writes.
+  const __tbSheetOwners = new WeakMap();
+  const __tbRulePath = path => path.join(',');
+  function __tbRuleInfo(owner, path) {
+    return host.__tb_sheet_rule_info(owner, __tbRulePath(path));
+  }
+  // Live `CSSRuleList` over the style engine's parsed rules
+  // (<https://drafts.csswg.org/cssom/#the-cssrulelist-interface>).
+  function __tbLiveRuleList(owner, path, sheet, parentRule) {
+    const list = {
+      get length() {
+        const count = host.__tb_sheet_rule_count(owner, __tbRulePath(path));
+        return count < 0 ? 0 : count;
+      },
+      item(index) {
+        index = Number(index);
+        if (!(index >= 0 && index < this.length)) return null;
+        return __tbLiveRule(owner, path.concat(index), sheet, parentRule);
+      },
+    };
+    list[Symbol.iterator] = function* () {
+      for (let index = 0; index < this.length; index++) yield this.item(index);
+    };
+    return new Proxy(list, {
+      get(target, property, receiver) {
+        if (typeof property === 'string' && /^\d+$/.test(property)) {
+          const item = target.item(Number(property));
+          return item === null ? undefined : item;
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  }
+  function __tbLiveRule(owner, path, sheet, parentRule) {
+    const read = () => __tbRuleInfo(owner, path) || { cssText: '', type: 0, hasChildRules: false, hasStyle: false };
+    const rule = {
+      get type() { return read().type; },
+      get cssText() { return read().cssText; },
+      get parentRule() { return parentRule; },
+      get parentStyleSheet() { return sheet; },
+      get selectorText() { return read().selectorText || ''; },
+      get conditionText() { return read().conditionText || ''; },
+      get cssRules() {
+        return __tbLiveRuleList(owner, path, sheet, rule);
+      },
+      get style() {
+        if (!read().hasStyle) return null;
+        return {
+          get cssText() { return host.__tb_sheet_style_css_text(owner, __tbRulePath(path)); },
+          getPropertyValue(name) {
+            const text = this.cssText;
+            const wanted = String(name).toLowerCase();
+            for (const part of text.split(';')) {
+              const separator = part.indexOf(':');
+              if (separator < 0) continue;
+              if (part.slice(0, separator).trim().toLowerCase() === wanted) {
+                return part.slice(separator + 1).trim();
+              }
+            }
+            return '';
+          },
+        };
+      },
+    };
+    return rule;
+  }
   class CSSStyleSheet {
     constructor() {
       this.cssRules = [];
     }
     replaceSync(text) {
+      if (__tbApply(__tbWeakMapGet, __tbSheetOwners, [this]) !== undefined) {
+        throw new DOMException('associated sheet is not constructable', 'NotSupportedError');
+      }
       const cssText = String(text);
       this.cssRules = cssText ? [{ cssText }] : [];
     }
     replace(text) {
       this.replaceSync(text);
       return Promise.resolve(this);
+    }
+    insertRule(rule, index) {
+      const owner = __tbApply(__tbWeakMapGet, __tbSheetOwners, [this]);
+      if (owner === undefined) {
+        throw new DOMException('constructable sheet has no parsed rule list', 'NotSupportedError');
+      }
+      if (index === undefined) index = 0;
+      return host.__tb_sheet_insert_rule(owner, '', String(rule), Number(index));
+    }
+    deleteRule(index) {
+      const owner = __tbApply(__tbWeakMapGet, __tbSheetOwners, [this]);
+      if (owner === undefined) {
+        throw new DOMException('constructable sheet has no parsed rule list', 'NotSupportedError');
+      }
+      host.__tb_sheet_delete_rule(owner, '', Number(index));
     }
   }
   Object.defineProperty(globalThis, 'CSSStyleSheet', {
@@ -42,8 +129,8 @@
   // <https://html.spec.whatwg.org/multipage/semantics.html#the-link-element:create-a-css-style-sheet>).
   // Created while the element is connected so an earlier script in the same
   // insert can observe `sheet` after the style/link node's insertion steps
-  // and before that script's post-connection steps. `cssRules` is not
-  // implemented yet (see `__tbAssociatedSheet`).
+  // and before that script's post-connection steps. `cssRules` reads the
+  // style engine's parsed list for that owner node.
   const __tbSheets = new WeakMap();
   // Captured at realm init: the sheet getters brand-check against it, and
   // pages may replace the global afterwards.
@@ -60,18 +147,21 @@
     __tbCssomBrand(element);
     let sheet = __tbApply(__tbWeakMapGet, __tbSheets, [element]);
     if (sheet !== undefined) return sheet;
-    // Honest stub: the engine exposes no parsed rule list yet, so reading
-    // `length` (or anything else) throws instead of reporting a plausible
-    // wrong number. Fails loudly per the no-workaround policy until real
-    // rules are wired; `sheet` identity itself still works.
-    const cssRules = {};
-    __tbDefineProperty(cssRules, 'length', {
-      get() { throw new Error('CSSRuleList not implemented'); },
+    sheet = new CSSStyleSheet();
+    __tbApply(__tbWeakMapSet, __tbSheetOwners, [sheet, element]);
+    // The constructor's own array is the constructable-sheet list. An
+    // associated sheet's `cssRules` is the engine's list instead
+    // (<https://drafts.csswg.org/cssom/#dom-cssstylesheet-cssrules>).
+    delete sheet.cssRules;
+    let rules = null;
+    __tbDefineProperty(sheet, 'cssRules', {
+      get() {
+        if (rules === null) rules = __tbLiveRuleList(element, [], sheet, null);
+        return rules;
+      },
       enumerable: true,
       configurable: true,
     });
-    sheet = new CSSStyleSheet();
-    sheet.cssRules = cssRules;
     __tbApply(__tbWeakMapSet, __tbSheets, [element, sheet]);
     return sheet;
   }
