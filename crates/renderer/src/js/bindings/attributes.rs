@@ -1677,7 +1677,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     if local != "src" {
         return Ok(());
     }
-    let (is_iframe, is_img) = world_for_node(ctx, element)
+    let (is_iframe, is_img, is_script) = world_for_node(ctx, element)
         .ok()
         .and_then(|owner| {
             owner.borrow().document(element).map(|parsed| {
@@ -1685,11 +1685,12 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
                 (
                     crate::dom::tree::is_html_element(base, element.node, "iframe"),
                     crate::dom::tree::is_html_element(base, element.node, "img"),
+                    crate::dom::tree::is_html_element(base, element.node, "script"),
                 )
             })
         })
-        .unwrap_or((false, false));
-    if !is_iframe && !is_img {
+        .unwrap_or((false, false, false));
+    if !is_iframe && !is_img && !is_script {
         return Ok(());
     }
     let world = world(ctx)?;
@@ -1718,8 +1719,12 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
                 NavigationTarget::Container(element),
                 spec,
             ));
-    } else {
+    } else if is_img {
         world.borrow_mut().queue_image_update(element);
+    } else {
+        // `src` set on a connected classic script runs the prepare steps,
+        // including the fetch when the element is not already started.
+        world.borrow_mut().queue_script(element);
     }
     Ok(())
 }

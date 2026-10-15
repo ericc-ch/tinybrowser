@@ -685,6 +685,10 @@ pub(crate) struct World {
     /// Document referrer policy from a `meta name=referrer` insertion
     /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
     pub(crate) referrer_policy: String,
+    /// Active Content Security Policy list for this document.
+    pub(crate) csp: crate::csp::List,
+    /// `meta` elements whose policy was already appended.
+    pub(crate) applied_csp_metas: HashSet<NodeId>,
     pub(crate) history: crate::protocol::HistorySnapshot,
     pub(crate) pending_history: Vec<crate::protocol::RendererEvent>,
     pub pending_cancels: Vec<i32>,
@@ -693,6 +697,15 @@ pub(crate) struct World {
     frame_navigations: Vec<FrameNavigation>,
     /// Connected `<img>` elements whose `src` changed inside script.
     image_updates: Vec<NodeId>,
+    /// Connected `<script src>` elements whose fetch prepare steps queued a
+    /// load (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    pending_scripts: Vec<NodeId>,
+    /// Violations produced where dispatching is unsafe (inside the module
+    /// loader), flushed by the drain.
+    pub(crate) pending_csp_violations: Vec<(NodeId, Vec<crate::csp::Violation>)>,
+    /// Script elements the HTML parser inserted; script insertion clears the
+    /// bit (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    pub(crate) parser_inserted: HashSet<NodeId>,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
@@ -782,6 +795,9 @@ pub(crate) struct World {
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
     pub(crate) image_broken: HashSet<NodeId>,
+    /// Elements whose current request already dispatched its `error` event,
+    /// so a later scan does not repeat it.
+    pub(crate) image_error_reported: HashSet<NodeId>,
     /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
     /// without touching the content attribute
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
@@ -861,6 +877,8 @@ impl World {
             origin: document_url.origin(),
             document_url,
             referrer_policy: String::new(),
+            csp: crate::csp::List::default(),
+            applied_csp_metas: HashSet::new(),
             history: crate::protocol::HistorySnapshot::default(),
             pending_history: Vec::new(),
             pending_cancels: Vec::new(),
@@ -868,6 +886,9 @@ impl World {
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
+            pending_scripts: Vec::new(),
+            pending_csp_violations: Vec::new(),
+            parser_inserted: HashSet::new(),
             input_files: HashMap::new(),
             decoders: HashMap::new(),
             document_stream: Vec::new(),
@@ -901,6 +922,7 @@ impl World {
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
             image_broken: HashSet::new(),
+            image_error_reported: HashSet::new(),
             nonce_slots: HashMap::new(),
         }
     }
@@ -920,6 +942,7 @@ impl World {
         self.document = Some(id);
         self.owned.insert(id);
         self.referrer_policy.clear();
+        self.applied_csp_metas.clear();
         self.current_script = None;
         self.custom_construction.clear();
         self.listeners.clear();
@@ -928,6 +951,9 @@ impl World {
         self.selections.clear();
         self.frame_navigations.clear();
         self.image_updates.clear();
+        self.pending_scripts.clear();
+        self.pending_csp_violations.clear();
+        self.parser_inserted.clear();
         self.clear_images();
         self.remote_ids.clear();
         self.remote_nodes.clear();
@@ -1546,6 +1572,58 @@ impl World {
         std::mem::take(&mut self.image_updates)
     }
 
+    /// Queues a connected `<script src>` element for its fetch prepare steps.
+    pub(crate) fn queue_script(&mut self, element: NodeId) {
+        if !self.pending_scripts.contains(&element) {
+            self.pending_scripts.push(element);
+        }
+    }
+
+    pub(crate) fn take_pending_scripts(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.pending_scripts)
+    }
+
+    /// Queues violations for targets the caller cannot dispatch into (the
+    /// module loader runs inside QuickJS).
+    pub(crate) fn queue_csp_violations(
+        &mut self,
+        target: NodeId,
+        violations: Vec<crate::csp::Violation>,
+    ) {
+        self.pending_csp_violations.push((target, violations));
+    }
+
+    /// Appends one in-head `meta` policy the first time it is seen
+    /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
+    pub(crate) fn apply_meta_policy(&mut self, id: NodeId) {
+        if self.applied_csp_metas.contains(&id) {
+            return;
+        }
+        let content = self
+            .document(id)
+            .and_then(|parsed| crate::csp::meta_policy(&parsed.document.base, id.node));
+        if let Some(content) = content
+            && self.applied_csp_metas.insert(id)
+        {
+            self.csp.push_meta(&content);
+        }
+    }
+
+    /// Marks a script element the HTML parser inserted
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    pub(crate) fn mark_parser_inserted(&mut self, id: NodeId) {
+        self.parser_inserted.insert(id);
+    }
+
+    /// Clears the parser-inserted flag: script insertion unsets it.
+    pub(crate) fn clear_parser_inserted(&mut self, id: NodeId) {
+        self.parser_inserted.remove(&id);
+    }
+
+    pub(crate) fn is_parser_inserted(&self, id: NodeId) -> bool {
+        self.parser_inserted.contains(&id)
+    }
+
     /// Records the file list a script assigned to a `type=file` input.
     pub(crate) fn set_input_files(&mut self, id: NodeId, files: Vec<Persistent<Value<'static>>>) {
         self.input_files.insert(id, files);
@@ -1562,6 +1640,7 @@ impl World {
     pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
         self.image_loading.insert(element);
         self.image_broken.remove(&element);
+        self.image_error_reported.remove(&element);
         if !self.images.contains_key(&element) {
             self.image_current_src.insert(element, url);
         }
@@ -1592,10 +1671,27 @@ impl World {
         self.image_broken.insert(element);
     }
 
+    /// Whether `element`'s current request already failed for `url`, so a
+    /// later scan must not register a waiter that no delivery will settle.
+    pub(crate) fn image_failed(&self, element: NodeId, url: &str) -> bool {
+        self.image_broken.contains(&element)
+            && self
+                .image_current_src
+                .get(&element)
+                .is_some_and(|current| current == url)
+    }
+
+    /// Records the first `error` event for `element`'s current request.
+    /// Returns false when it was already reported.
+    pub(crate) fn report_image_error(&mut self, element: NodeId) -> bool {
+        self.image_error_reported.insert(element)
+    }
+
     pub(crate) fn forget_image(&mut self, element: NodeId) {
         self.image_loading.remove(&element);
         self.image_current_src.remove(&element);
         self.image_broken.remove(&element);
+        self.image_error_reported.remove(&element);
         self.images.remove(&element);
     }
 
@@ -1604,6 +1700,7 @@ impl World {
         self.image_loading.clear();
         self.image_current_src.clear();
         self.image_broken.clear();
+        self.image_error_reported.clear();
     }
 
     pub(crate) fn queue_document_stream(

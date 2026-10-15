@@ -240,3 +240,16 @@ pub(crate) fn fire_node_load(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
 pub(crate) fn fire_node_error(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     events::fire_trusted(ctx, EventTargetKey::Node(id), "error", false, false)
 }
+
+/// Dispatches one trusted `securitypolicyviolation` event per blocked policy
+/// at `target` (<https://w3c.github.io/webappsec-csp/#report-violation>).
+pub(crate) fn fire_csp_violations(
+    ctx: &Ctx<'_>,
+    target: NodeId,
+    violations: &[crate::csp::Violation],
+) -> Result<()> {
+    for violation in violations {
+        events::fire_security_policy_violation(ctx, EventTargetKey::Node(target), violation)?;
+    }
+    Ok(())
+}

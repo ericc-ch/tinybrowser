@@ -37,7 +37,9 @@ use crate::documents::JournalEntry;
 use crate::js::world::{Handle, NodeReference, SameObject};
 
 use super::JsNode;
-use super::document::{apply_meta_referrer, clear_nonce_on_connect, prepare_classic_script};
+use super::document::{
+    apply_meta_csp, apply_meta_referrer, clear_nonce_on_connect, prepare_classic_script,
+};
 use super::element::{argument_node_ids, sibling_not_in, tree_parent};
 use super::forms::{fixup_option_on_insert, fixup_radio_on_insert};
 
@@ -2426,7 +2428,10 @@ pub(super) fn run_html_insertion_steps(
                 }
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
-            InsertionStep::MetaReferrer(id) => apply_meta_referrer(ctx, id),
+            InsertionStep::Meta(id) => {
+                apply_meta_referrer(ctx, id);
+                apply_meta_csp(ctx, id);
+            }
         }
     }
     // Spec gates this on a header-delivered CSP

@@ -13,6 +13,9 @@ pub(crate) struct BlitzFetch {
     pub id: u64,
     /// Absolute URL to fetch.
     pub url: url::Url,
+    /// What the fetch is for, so the document can apply per-destination
+    /// policy (<https://fetch.spec.whatwg.org/#concept-request-destination>).
+    pub kind: blitz_traits::net::RequestKind,
 }
 
 /// Delivery target for one fetch: Blitz's response handler, counted so the
@@ -41,12 +44,13 @@ impl CountingHandler {
     fn file(
         in_flight: &std::sync::Arc<AtomicUsize>,
         url: url::Url,
+        kind: blitz_traits::net::RequestKind,
         handler: Box<dyn blitz_traits::net::NetHandler>,
     ) -> (Self, BlitzFetch) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let fetch = BlitzFetch { id, url };
+        let fetch = BlitzFetch { id, url, kind };
         (
             Self {
                 inner: Some(handler),
@@ -88,7 +92,8 @@ impl blitz_traits::net::NetProvider for TinyNetProvider {
         request: blitz_traits::net::Request,
         handler: Box<dyn blitz_traits::net::NetHandler>,
     ) {
-        let (counting, fetch) = CountingHandler::file(&self.in_flight, request.url, handler);
+        let (counting, fetch) =
+            CountingHandler::file(&self.in_flight, request.url, request.kind, handler);
         // The document drains the queue on its thread; a disconnected
         // receiver means teardown, and the count already covers the drop.
         let _ = self.tx.send((fetch, counting));

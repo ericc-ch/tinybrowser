@@ -661,7 +661,7 @@ pub(crate) fn collect_nonce_elements(
 pub(crate) enum InsertionStep {
     Iframe(NodeId),
     Script(NodeId),
-    MetaReferrer(NodeId),
+    Meta(NodeId),
 }
 
 /// Initial about:blank iframes fire `load` from insertion steps. An iframe
@@ -683,7 +683,7 @@ pub(crate) fn collect_html_insertion_steps(
     } else if is_iframe_element(base, id.node) {
         out.push(InsertionStep::Iframe(id));
     } else if is_html_element(base, id.node, "meta") {
-        out.push(InsertionStep::MetaReferrer(id));
+        out.push(InsertionStep::Meta(id));
     }
     let children: Vec<BlitzId> = base
         .get_node(id.node)

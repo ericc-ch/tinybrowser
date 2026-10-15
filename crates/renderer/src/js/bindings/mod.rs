@@ -426,6 +426,14 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         rquickjs::prelude::Func::from(events::init_custom_event),
     )?;
     crate::js::bridge::evaluate(ctx, events::install_custom_event_js(ctx)?)?;
+    crate::js::bridge::object(ctx)?.set(
+        "__tb_new_security_policy_violation_event",
+        rquickjs::prelude::Func::from(events::construct_security_policy_violation_event),
+    )?;
+    crate::js::bridge::evaluate(
+        ctx,
+        events::install_security_policy_violation_event_js(ctx)?,
+    )?;
     Class::<JsEventTarget>::define(&globals)?;
     events::install_event_target_bridge(ctx)?;
     crate::js::bridge::evaluate(ctx, events::install_event_target_ctor_js(ctx)?)?;
@@ -2063,6 +2071,8 @@ mod realm_tests {
                     history: crate::protocol::HistorySnapshot::default(),
                     viewport: None,
                     init_scripts: Vec::new(),
+                    content_security_policy: None,
+                    content_security_policy_report_only: None,
                 },
             )
             .expect("mount");
@@ -2103,6 +2113,8 @@ mod realm_tests {
             .mount_for_test(&crate::protocol::Mount {
                 url: "https://example.test/".into(),
                 content_type: Some("text/html".into()),
+                content_security_policy: None,
+                content_security_policy_report_only: None,
                 body: html.as_bytes().to_vec(),
                 history: crate::protocol::HistorySnapshot::default(),
                 viewport: None,

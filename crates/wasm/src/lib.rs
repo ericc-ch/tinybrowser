@@ -108,6 +108,8 @@ impl GuestTab for Tab {
         let mount = Mount {
             url,
             content_type: Some("text/html; charset=utf-8".into()),
+            content_security_policy: None,
+            content_security_policy_report_only: None,
             body: html.into_bytes(),
             history: renderer::HistorySnapshot::default(),
             viewport: None,

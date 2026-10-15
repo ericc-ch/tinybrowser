@@ -182,6 +182,18 @@ struct Timer {
 ///
 /// The nested realm is deferred: `QuickJS` cannot enter a new context while
 /// the parent script still runs.
+/// Maps a Blitz request kind onto the CSP destination it is checked as.
+fn subresource_destination(
+    kind: blitz_traits::net::RequestKind,
+) -> Option<crate::csp::Destination> {
+    match kind {
+        blitz_traits::net::RequestKind::Stylesheet => Some(crate::csp::Destination::StyleSheet),
+        blitz_traits::net::RequestKind::Image => Some(crate::csp::Destination::Img),
+        blitz_traits::net::RequestKind::Font => Some(crate::csp::Destination::Font),
+        blitz_traits::net::RequestKind::Other => None,
+    }
+}
+
 fn materialize_iframe_document(
     world_rc: &Rc<RefCell<World>>,
     frame: FrameId,
@@ -201,6 +213,8 @@ fn materialize_iframe_document(
     let mut document = Document::with_shared(frame, &runtime, &init_scripts);
     document.set_viewport_size(viewport);
     document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
+    let inherited = world_rc.borrow().csp.clone();
+    document.world().borrow_mut().csp = inherited;
     if let Some(root) = document.document_root() {
         world_rc
             .borrow()
@@ -325,6 +339,14 @@ pub(crate) struct Document {
     /// select the XML parser; anything else, including a script's
     /// `document.open()`, stays HTML.
     response_content_type: Option<String>,
+    /// `Content-Security-Policy` and `Content-Security-Policy-Report-Only`
+    /// from the response being parsed, parsed once
+    /// (<https://w3c.github.io/webappsec-csp/#parse-response-csp>).
+    response_policy: crate::csp::List,
+    /// When set, [`Document::install_parsed`] replaces the world's policy
+    /// with the response headers. A script's `document.open()` leaves it
+    /// unset so the existing policy survives.
+    csp_from_response: bool,
     classic_fetch_in_flight: bool,
     deferred_modules: Vec<(crate::dom::tree::NodeId, crate::js::ScriptSource)>,
     stop: Arc<crate::js::Stop>,
@@ -415,6 +437,8 @@ impl Document {
             decoder: None,
             character_set: "UTF-8",
             response_content_type: None,
+            response_policy: crate::csp::List::default(),
+            csp_from_response: false,
             classic_fetch_in_flight: false,
             deferred_modules: Vec::new(),
             stop: Arc::clone(&runtime.stop),
@@ -531,6 +555,7 @@ impl Document {
             )
         };
         let mut loaded = Vec::with_capacity(pending.len());
+        let inherited = self.world.borrow().csp.clone();
         for (frame, container) in pending {
             let mut document = Document::with_shared(frame, &runtime, &init_scripts);
             // Frames created from parsed markup share the tab's viewport too.
@@ -539,6 +564,7 @@ impl Document {
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
             document.set_viewport_size(viewport);
             document.load_about_blank(Some(base_url.as_str()), Some(origin.clone()));
+            document.world().borrow_mut().csp = inherited.clone();
             loaded.push((frame, container, document));
         }
         self.new_frames.borrow_mut().extend(loaded);
@@ -743,8 +769,9 @@ impl Document {
         url: &Url,
         content_type: Option<&str>,
         body: &[u8],
+        policy: crate::csp::List,
     ) {
-        self.load_response_body(url, content_type, body);
+        self.load_response_body(url, content_type, body, policy);
         // Nested HTML documents without scripts skip a realm at parse;
         // `fire_ready_frame_loads` creates one when the parent is not in the
         // encoding-label burst
@@ -760,18 +787,41 @@ impl Document {
     /// observes the page's own state, not a fresh blank realm. The result
     /// document keeps the target's URL
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-    pub(crate) fn load_javascript_frame(&mut self, script: &str) {
+    pub(crate) fn load_javascript_frame(
+        &mut self,
+        script: &str,
+        source: &str,
+        policy: &crate::csp::List,
+    ) {
         if self.js.is_none() {
             self.ensure_js_ok();
         }
-        self.eval_frame_script(script);
+        self.eval_frame_script(script, source, policy);
     }
 
     /// Runs one `javascript:` URL script in this frame's realm. A string
     /// result replaces the document with that string parsed as HTML
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-    pub(crate) fn eval_frame_script(&mut self, script: &str) {
+    ///
+    /// `source` is the serialized `javascript:` URL, which is what CSP source
+    /// matching and hashes use
+    /// (<https://w3c.github.io/webappsec-csp/#should-block-navigation-request>).
+    pub(crate) fn eval_frame_script(
+        &mut self,
+        script: &str,
+        source: &str,
+        policy: &crate::csp::List,
+    ) {
         if script.is_empty() {
+            return;
+        }
+        let violations = self.navigation_script_violations(policy, source);
+        if !violations.is_empty()
+            && let Some(target) = self.document_node()
+        {
+            self.fire_csp_violations(target, &violations);
+        }
+        if crate::csp::blocks(&violations) {
             return;
         }
         match self.eval(script) {
@@ -1045,7 +1095,15 @@ impl Document {
             self.viewport_size = (width, height);
         }
         self.world.borrow_mut().history = mount.history.clone();
-        self.load_response_body(&url, mount.content_type.as_deref(), &mount.body);
+        self.load_response_body(
+            &url,
+            mount.content_type.as_deref(),
+            &mount.body,
+            crate::csp::List::from_headers(
+                mount.content_security_policy.as_deref(),
+                mount.content_security_policy_report_only.as_deref(),
+            ),
+        );
         Ok(())
     }
 
@@ -1066,6 +1124,8 @@ impl Document {
         self.decoder = decoder;
         self.parser_owner = owner;
         self.response_content_type = None;
+        self.response_policy = crate::csp::List::default();
+        self.csp_from_response = false;
         self.active_buffer = Some(input.to_owned());
         // A new parse starts undecided: without this an `about:blank` or
         // `document.open()` document inherits the previous response's
@@ -1083,6 +1143,7 @@ impl Document {
         url: Option<&Url>,
         content_type: Option<&str>,
         viewport: Option<(u32, u32)>,
+        policy: crate::csp::List,
     ) {
         self.reset_js_realm();
         if let Some((width, height)) = viewport {
@@ -1104,12 +1165,20 @@ impl Document {
             Some(dial::ResponseDecoder::new(content_type.map(str::to_owned))),
         );
         self.response_content_type = content_type.map(str::to_owned);
+        self.response_policy = policy;
+        self.csp_from_response = true;
     }
 
     /// Starts a document from a complete response: new realm, the response's
     /// URL, and the whole body.
-    fn load_response_body(&mut self, url: &Url, content_type: Option<&str>, body: &[u8]) {
-        self.load_response_body_with_origin(url, content_type, body, None);
+    fn load_response_body(
+        &mut self,
+        url: &Url,
+        content_type: Option<&str>,
+        body: &[u8],
+        policy: crate::csp::List,
+    ) {
+        self.load_response_body_with_origin(url, content_type, body, None, policy);
     }
 
     /// [`Document::load_response_body`] that stores `origin` instead of
@@ -1123,8 +1192,9 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         origin: Option<url::Origin>,
+        policy: crate::csp::List,
     ) {
-        self.begin_response(Some(url), content_type, None);
+        self.begin_response(Some(url), content_type, None, policy);
         if let Some(origin) = origin {
             self.world
                 .borrow_mut()
@@ -1141,8 +1211,9 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         origin: url::Origin,
+        policy: crate::csp::List,
     ) {
-        self.load_response_body_with_origin(url, content_type, body, Some(origin));
+        self.load_response_body_with_origin(url, content_type, body, Some(origin), policy);
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
@@ -1452,6 +1523,8 @@ impl Document {
             // Style resolution and scripts both read the viewport; apply the
             // frame's size before the realm evaluates anything.
             self.apply_viewport();
+            self.install_response_csp();
+            self.mark_parser_scripts();
             if skip_js {
                 return true;
             }
@@ -1461,8 +1534,49 @@ impl Document {
             self.register_document(document);
             self.apply_viewport();
             self.bind_realm_document();
+            self.install_response_csp();
+            self.mark_parser_scripts();
             true
         }
+    }
+
+    /// Marks every script element of the freshly parsed tree as
+    /// parser-inserted
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    fn mark_parser_scripts(&mut self) {
+        let scripts: Vec<crate::dom::tree::NodeId> = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return;
+            };
+            let base = &parsed.document.base;
+            let document = parsed.id;
+            let mut scripts = Vec::new();
+            let mut stack = vec![base.root_node().id];
+            while let Some(node) = stack.pop() {
+                let Some(tree) = base.get_node(node) else {
+                    continue;
+                };
+                stack.extend(tree.children.iter().copied());
+                if crate::dom::tree::is_html_element(base, node, "script") {
+                    scripts.push(crate::dom::tree::NodeId { document, node });
+                }
+            }
+            scripts
+        };
+        let mut world = self.world.borrow_mut();
+        for id in scripts {
+            world.mark_parser_inserted(id);
+        }
+    }
+
+    /// Replaces the world's policy with the response headers when this parse
+    /// came from a navigation. `document.open()` leaves the flag unset.
+    fn install_response_csp(&mut self) {
+        if !self.csp_from_response {
+            return;
+        }
+        self.world.borrow_mut().csp = self.response_policy.clone();
     }
 
     /// Rebinds the realm's `document` global to the installed document and
@@ -1620,39 +1734,139 @@ impl Document {
         self.fire_document_end();
     }
 
-    // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext
-    // https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
-    //
+    /// Appends one in-head `meta` policy the first time it is seen
+    /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
+    fn apply_meta_csp(&mut self, id: crate::dom::tree::NodeId) {
+        self.world.borrow_mut().apply_meta_policy(id);
+    }
+
+    pub(in crate::document) fn inline_script_violations(
+        &self,
+        source: &str,
+        id: crate::dom::tree::NodeId,
+    ) -> Vec<crate::csp::Violation> {
+        let world = self.world.borrow();
+        let slot = world.nonce_slots.get(&id).map(String::as_str);
+        let parser_inserted = world.is_parser_inserted(id);
+        let (nonce, nonceable) = world.document(id).map_or_else(
+            || (String::new(), false),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
+        );
+        world.csp.check_inline(&crate::csp::InlineScript {
+            source,
+            nonce: &nonce,
+            nonceable,
+            parser_inserted,
+            kind: crate::csp::InlineKind::Script,
+        })
+    }
+
+    fn navigation_script_violations(
+        &self,
+        policy: &crate::csp::List,
+        source: &str,
+    ) -> Vec<crate::csp::Violation> {
+        policy.check_inline(&crate::csp::InlineScript {
+            source,
+            nonce: "",
+            nonceable: false,
+            parser_inserted: false,
+            kind: crate::csp::InlineKind::Navigation,
+        })
+    }
+
+    pub(in crate::document) fn script_url_violations(
+        &self,
+        url: &Url,
+        id: crate::dom::tree::NodeId,
+    ) -> Vec<crate::csp::Violation> {
+        let world = self.world.borrow();
+        let slot = world.nonce_slots.get(&id).map(String::as_str);
+        let parser_inserted = world.is_parser_inserted(id);
+        let (nonce, _) = world.document(id).map_or_else(
+            || (String::new(), false),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
+        );
+        world.csp.check_request(
+            &world.origin,
+            &world.document_url,
+            url,
+            crate::csp::Destination::Script,
+            Some(crate::csp::ScriptRequest {
+                nonce: &nonce,
+                parser_inserted,
+            }),
+        )
+    }
+
+    /// The main document's root node, the violation target for checks that
+    /// are not attributable to an element.
+    pub(in crate::document) fn document_node(&self) -> Option<crate::dom::tree::NodeId> {
+        self.world.borrow().with_main_document(|parsed| {
+            crate::dom::tree::NodeId {
+                document: parsed.id,
+                node: parsed.document.base.root_node().id,
+            }
+        })
+    }
+
+    /// Dispatches the `securitypolicyviolation` events a check produced.
+    pub(in crate::document) fn fire_csp_violations(&mut self, target: crate::dom::tree::NodeId, violations: &[crate::csp::Violation]) {
+        if violations.is_empty() {
+            return;
+        }
+        self.fire_js(|js| js.fire_csp_violations(target, violations));
+    }
+
     /// Runs every not-yet-executed script in tree order, stopping (returning
     /// true) when a `src` fetch starts: the fetch completion resumes the
     /// walk, so later scripts still run in order
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#pending-parsing-blocking-script>).
+    ///
+    /// <https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext>
+    /// <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>
     fn run_scripts(&mut self) -> bool {
-        let scripts: Vec<crate::dom::tree::NodeId> = {
+        enum Step {
+            Meta(crate::dom::tree::NodeId),
+            Script(crate::dom::tree::NodeId),
+        }
+        let steps: Vec<Step> = {
             let world = self.world.borrow();
             let Some(parsed) = world.main_document() else {
                 return false;
             };
             let base = &parsed.document.base;
             let document = parsed.id;
-            let mut scripts = Vec::new();
+            let mut steps = Vec::new();
             let mut stack = vec![base.root_node().id];
             while let Some(id) = stack.pop() {
                 let Some(node) = base.get_node(id) else {
                     continue;
                 };
+                let node_id = crate::dom::tree::NodeId { document, node: id };
+                if crate::csp::meta_policy(base, id).is_some() {
+                    steps.push(Step::Meta(node_id));
+                }
                 if crate::dom::tree::is_html_element(base, id, "script") {
-                    scripts.push(crate::dom::tree::NodeId { document, node: id });
+                    steps.push(Step::Script(node_id));
                 }
                 stack.extend(node.children.iter().rev().copied());
             }
-            scripts
+            steps
         };
-        if !scripts.is_empty() && !self.ensure_js_ok() {
+        let has_script = steps.iter().any(|step| matches!(step, Step::Script(_)));
+        if has_script && !self.ensure_js_ok() {
             return false;
         }
         let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
-        for id in scripts {
+        for step in steps {
+            let id = match step {
+                Step::Meta(id) => {
+                    self.apply_meta_csp(id);
+                    continue;
+                }
+                Step::Script(id) => id,
+            };
             if !self.executed_scripts.insert(id) {
                 continue;
             }
@@ -1678,11 +1892,25 @@ impl Document {
                     source,
                     line,
                 })) => {
+                    let violations = self.inline_script_violations(&source, id);
+                    if !violations.is_empty() {
+                        self.fire_csp_violations(id, &violations);
+                    }
+                    if crate::csp::blocks(&violations) {
+                        continue;
+                    }
                     let filename = self.url.as_str().to_owned();
                     self.eval_classic(&source, Some(id), line, &filename);
                 }
                 Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
                     if let Ok(url) = self.resolve_dial_url(&src) {
+                        let violations = self.script_url_violations(&url, id);
+                        if !violations.is_empty() {
+                            self.fire_csp_violations(id, &violations);
+                        }
+                        if crate::csp::blocks(&violations) {
+                            continue;
+                        }
                         self.classic_fetch_in_flight = true;
                         let initiator = self.url.clone();
                         self.queued_dials.push(QueuedDial::get(
@@ -1752,7 +1980,18 @@ impl Document {
                     status: outcome.status,
                 });
                 if epoch == self.js_epoch {
-                    self.settle_js_fetch(id, Some(outcome));
+                    // Post-request check: a redirect may have landed on a URL
+                    // the source list does not allow
+                    // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+                    let blocked = self.response_url_blocked(
+                        &outcome.final_url,
+                        crate::csp::Destination::Connect,
+                    );
+                    if blocked {
+                        self.settle_js_fetch(id, None);
+                    } else {
+                        self.settle_js_fetch(id, Some(outcome));
+                    }
                 }
             }
             DialContext::ClassicScript { element, epoch } => {
@@ -1765,6 +2004,9 @@ impl Document {
                         let source = String::from_utf8_lossy(&outcome.body);
                         let filename = outcome.final_url.clone();
                         self.eval_classic(&source, Some(element), 1, &filename);
+                        self.fire_js(|js| js.fire_node_load(element));
+                    } else {
+                        self.fire_js(|js| js.fire_node_error(element));
                     }
                     self.resume_scripts();
                 }
@@ -1785,7 +2027,21 @@ impl Document {
                 self.record_event(RendererEvent::Navigated {
                     url: url.to_string(),
                 });
-                self.load_frame_response(&url, outcome.content_type.as_deref(), &outcome.body);
+                let policy = crate::csp::List::from_headers(
+                    crate::csp::combined_header(&outcome.headers, "content-security-policy")
+                        .as_deref(),
+                    crate::csp::combined_header(
+                        &outcome.headers,
+                        "content-security-policy-report-only",
+                    )
+                    .as_deref(),
+                );
+                self.load_frame_response(
+                    &url,
+                    outcome.content_type.as_deref(),
+                    &outcome.body,
+                    policy,
+                );
             }
             DialContext::BlitzResource { id } => {
                 // Stale deliveries are harmless: the handler reports into
@@ -1819,9 +2075,10 @@ impl Document {
                     self.settle_js_fetch(id, None);
                 }
             }
-            DialContext::ClassicScript { epoch, .. } => {
+            DialContext::ClassicScript { element, epoch } => {
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
+                    self.fire_js(|js| js.fire_node_error(element));
                     self.resume_scripts();
                 }
             }
@@ -1839,6 +2096,29 @@ impl Document {
                 if let Some(handler) = self.blitz_handlers.remove(&id) {
                     let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
                     Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
+                    let target = Url::parse(&request_url)
+                        .ok()
+                        .and_then(|url| self.subresource_target(&url));
+                    let is_image = target.is_some_and(|element| {
+                        self.world.borrow().document(element).is_some_and(|parsed| {
+                            crate::dom::tree::is_html_element(
+                                &parsed.document.base,
+                                element.node,
+                                "img",
+                            )
+                        })
+                    });
+                    if let Some(element) = target {
+                        // A failed request must be visible to later scans; a
+                        // waiterless element would otherwise re-register a
+                        // waiter that never settles. Images report their
+                        // `error` through the lifecycle; other elements here.
+                        if is_image {
+                            self.world.borrow_mut().fail_image(element, request_url.clone());
+                        } else {
+                            self.tasks.push_back(Task::NodeError(element));
+                        }
+                    }
                     self.settle_blitz_layout();
                     self.settle_image_waiters(&request_url);
                 }
@@ -1953,16 +2233,31 @@ impl Document {
         for (index, (element, source)) in modules.into_iter().enumerate() {
             let result = match source {
                 crate::js::ScriptSource::Inline { source, .. } => {
+                    let violations = self.inline_script_violations(&source, element);
+                    if !violations.is_empty() {
+                        self.fire_csp_violations(element, &violations);
+                    }
+                    if crate::csp::blocks(&violations) {
+                        continue;
+                    }
                     let name = format!("{}#inline-module-{index}", self.url);
                     self.js
                         .as_ref()
                         .map_or(Ok(()), |js| js.eval_inline_module(&name, &source))
                 }
                 crate::js::ScriptSource::Src(src) => match self.resolve_dial_url(&src) {
-                    Ok(url) => self
-                        .js
-                        .as_ref()
-                        .map_or(Ok(()), |js| js.eval_external_module(url.as_str())),
+                    Ok(url) => {
+                        let violations = self.script_url_violations(&url, element);
+                        if !violations.is_empty() {
+                            self.fire_csp_violations(element, &violations);
+                        }
+                        if crate::csp::blocks(&violations) {
+                            continue;
+                        }
+                        self.js
+                            .as_ref()
+                            .map_or(Ok(()), |js| js.eval_external_module(url.as_str()))
+                    }
                     Err(_) => Err(crate::js::JsError::Engine(
                         "invalid module script URL".into(),
                     )),
@@ -2045,6 +2340,40 @@ impl Document {
                 self.settle_image_waiters(&url);
                 continue;
             }
+            // Per-destination policy: a blocked stylesheet, image, or font is
+            // never dialed; the handler receives empty bytes so Blitz
+            // releases the resource as failed
+            // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
+            if let Some(destination) = subresource_destination(fetch.kind) {
+                let violations = self.subresource_violations(&fetch.url, destination);
+                let target = self
+                    .subresource_target(&fetch.url)
+                    .or_else(|| self.document_node());
+                if !violations.is_empty()
+                    && let Some(target) = target
+                {
+                    self.fire_csp_violations(target, &violations);
+                }
+                if crate::csp::blocks(&violations) {
+                    Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
+                    if let Some(element) = target {
+                        if matches!(destination, crate::csp::Destination::Img) {
+                            // The image lifecycle reports the error when the
+                            // DOM walk reaches the element, so scripts that
+                            // precede it have run.
+                            self.world.borrow_mut().fail_image(element, url.clone());
+                        } else {
+                            // A blocked element load fails with an `error`
+                            // event
+                            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fetching-resources>).
+                            self.tasks.push_back(Task::NodeError(element));
+                        }
+                    }
+                    self.settle_blitz_layout();
+                    self.settle_image_waiters(&url);
+                    continue;
+                }
+            }
             self.blitz_request_urls.insert(fetch.id, url);
             self.blitz_handlers.insert(fetch.id, handler);
             // The Fetch initiator is the document, not the fetch target: the
@@ -2058,6 +2387,98 @@ impl Document {
                 initiator,
             ));
         }
+    }
+
+    /// Whether the response URL of a completed request violates the policy
+    /// after redirects, firing the violations. Paths are ignored, as the
+    /// post-request check requires
+    /// (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+    pub(in crate::document) fn response_url_blocked(
+        &mut self,
+        final_url: &str,
+        destination: crate::csp::Destination,
+    ) -> bool {
+        let Ok(url) = Url::parse(final_url) else {
+            return false;
+        };
+        let violations = {
+            let world = self.world.borrow();
+            world.csp.check_redirected_request(
+                &world.origin,
+                &world.document_url,
+                &url,
+                destination,
+            )
+        };
+        if !violations.is_empty()
+            && let Some(target) = self.document_node()
+        {
+            self.fire_csp_violations(target, &violations);
+        }
+        crate::csp::blocks(&violations)
+    }
+
+    /// The violations a Blitz subresource fetch produces.
+    pub(in crate::document) fn subresource_violations(
+        &self,
+        url: &Url,
+        destination: crate::csp::Destination,
+    ) -> Vec<crate::csp::Violation> {
+        let world = self.world.borrow();
+        world.csp.check_request(
+            &world.origin,
+            &world.document_url,
+            url,
+            destination,
+            None,
+        )
+    }
+
+    /// The element whose subresource load `url` is: a `<link>` or `<img>`
+    /// whose resolved URL matches, when the fetch came from markup.
+    fn subresource_target(&self, url: &Url) -> Option<crate::dom::tree::NodeId> {
+        let candidates: Vec<(crate::dom::tree::NodeId, String)> = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return None;
+            };
+            let base = &parsed.document.base;
+            let document = parsed.id;
+            let mut candidates = Vec::new();
+            let mut stack = vec![base.root_node().id];
+            while let Some(id) = stack.pop() {
+                let Some(node) = base.get_node(id) else {
+                    continue;
+                };
+                stack.extend(node.children.iter().copied());
+                let Some(element) = node.data.downcast_element() else {
+                    continue;
+                };
+                if element.name.ns != crate::dom::tree::html_namespace() {
+                    continue;
+                }
+                let attribute = match element.name.local.as_str() {
+                    "link" => "href",
+                    "img" => "src",
+                    _ => continue,
+                };
+                if let Some(spec) = crate::dom::tree::attr(base, id, attribute) {
+                    candidates.push((
+                        crate::dom::tree::NodeId { document, node: id },
+                        spec.to_owned(),
+                    ));
+                }
+            }
+            candidates
+        };
+        for (id, spec) in candidates {
+            if let Ok(resolved) = self.resolve_dial_url(&spec)
+                && resolved == *url
+            {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Registers the current `<img>` request as a waiter on Blitz image
@@ -2103,6 +2524,18 @@ impl Document {
             return;
         };
         let selected = url.as_str().to_owned();
+        // A request that already failed (blocked or network error) must not
+        // register a waiter: no delivery will ever settle it, which would
+        // hold the load event forever. The failure reports its `error` event
+        // here, in parser order, instead of when the block decided.
+        if self.world.borrow().image_failed(element, &selected) {
+            self.in_flight_images.remove(&element);
+            self.image_selected_src.remove(&element);
+            if self.world.borrow_mut().report_image_error(element) {
+                self.tasks.push_back(Task::NodeError(element));
+            }
+            return;
+        }
         self.image_selected_src.insert(element, selected.clone());
         self.world
             .borrow_mut()
@@ -2155,7 +2588,9 @@ impl Document {
                 self.fire_js(|js| js.fire_node_load(*element));
             } else {
                 self.world.borrow_mut().fail_image(*element, selected);
-                self.fire_js(|js| js.fire_node_error(*element));
+                if self.world.borrow_mut().report_image_error(*element) {
+                    self.fire_js(|js| js.fire_node_error(*element));
+                }
             }
             self.adopt_js_work();
         }

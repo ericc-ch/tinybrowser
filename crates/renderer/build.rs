@@ -33,6 +33,10 @@ const SINGLES: &[(&str, &str)] = &[
         "custom_event.deflate",
         "src/js/scripts/events/custom_event.js",
     ),
+    (
+        "security_policy_violation_event.deflate",
+        "src/js/scripts/events/security_policy_violation_event.js",
+    ),
 ];
 
 /// Wrapper around the concatenated web bundle, matching the previous

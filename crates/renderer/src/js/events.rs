@@ -744,6 +744,99 @@ pub(crate) fn install_custom_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     super::blob::decompress(ctx, INSTALL_CUSTOM_EVENT_DEFLATE, &CACHE)
 }
 
+pub(crate) const INSTALL_SECURITY_POLICY_VIOLATION_EVENT_DEFLATE: &[u8] =
+    include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/js_blobs/security_policy_violation_event.deflate"
+    ));
+
+/// The `SecurityPolicyViolationEvent` shim, inflated once per process.
+pub(crate) fn install_security_policy_violation_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    super::blob::decompress(ctx, INSTALL_SECURITY_POLICY_VIOLATION_EVENT_DEFLATE, &CACHE)
+}
+
+/// The `new SecurityPolicyViolationEvent(type, eventInitDict)` constructor,
+/// called from the JavaScript wrapper so instances can carry
+/// `SecurityPolicyViolationEvent.prototype`
+/// (<https://w3c.github.io/webappsec-csp/#securitypolicyviolationevent>).
+///
+/// The wrapper owns the readonly attributes and arity; this native owns the
+/// `EventInit` conversions.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+pub(crate) fn construct_security_policy_violation_event<'js>(
+    ctx: Ctx<'js>,
+    args: Rest<Value<'js>>,
+) -> Result<Value<'js>> {
+    let mut args = args.0.into_iter();
+    let Some(typ) = args.next() else {
+        return Err(Exception::throw_type(
+            &ctx,
+            "1 argument required, but only 0 present",
+        ));
+    };
+    let typ = bindings::webidl_to_string(&ctx, typ)?;
+    let init = args
+        .next()
+        .unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+    let init = event_generated::EventInit::from_object(&ctx, &init)?;
+    let class = realm_event(&ctx, JsEvent::from_init(typ, &init))?;
+    if bindings::world(&ctx)?
+        .borrow()
+        .event_ctors
+        .contains_key("SecurityPolicyViolationEvent")
+    {
+        set_exposed_event_prototype(&ctx, &class, "SecurityPolicyViolationEvent")?;
+    }
+    Ok(Class::into_value(class))
+}
+
+/// Fires one trusted `securitypolicyviolation` event at `target` with the
+/// readonly attributes set as own properties, so both constructor-created
+/// (slot-backed getters) and user-agent events read the same values
+/// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+pub(crate) fn fire_security_policy_violation<'js>(
+    ctx: &Ctx<'js>,
+    target: EventTargetKey,
+    violation: &crate::csp::Violation,
+) -> Result<()> {
+    let event = realm_event(
+        ctx,
+        JsEvent::trusted("securitypolicyviolation", true, false),
+    )?;
+    if bindings::world(ctx)?
+        .borrow()
+        .event_ctors
+        .contains_key("SecurityPolicyViolationEvent")
+    {
+        set_exposed_event_prototype(ctx, &event, "SecurityPolicyViolationEvent")?;
+    }
+    let document_url = bindings::world(ctx)?.borrow().document_url.as_str().to_owned();
+    // Own data properties, because the shim's prototype accessors are
+    // readonly and an assigning set would throw
+    // (<https://webidl.spec.whatwg.org/#idl-read-only-attributes>).
+    event.prop("documentURI", document_url)?;
+    event.prop("referrer", String::new())?;
+    event.prop("blockedURI", violation.blocked_uri.clone())?;
+    event.prop("violatedDirective", violation.effective_directive.clone())?;
+    event.prop("effectiveDirective", violation.effective_directive.clone())?;
+    event.prop("originalPolicy", violation.original_policy.clone())?;
+    event.prop("sourceFile", String::new())?;
+    event.prop("sample", violation.sample.clone().unwrap_or_default())?;
+    event.prop(
+        "disposition",
+        if violation.blocks() { "enforce" } else { "report" },
+    )?;
+    event.prop("statusCode", 0u16)?;
+    event.prop("lineNumber", 0u32)?;
+    event.prop("columnNumber", 0u32)?;
+    dispatch(ctx, target, &event, None)?;
+    Ok(())
+}
+
 /// Appends one listener to a target's list in a chosen realm, so
 /// `contentWindow.addEventListener` runs in the caller's realm and still
 /// registers on the frame's window
@@ -1535,6 +1628,34 @@ pub(crate) fn compile_handler_function<'js>(
     constructor.construct((params.join(","), body.to_owned()))
 }
 
+/// Whether an event handler content attribute may run
+/// (<https://w3c.github.io/webappsec-csp/#should-block-inline>). The event
+/// targets the element that carries the attribute.
+fn handler_attribute_allowed<'js>(
+    ctx: &Ctx<'js>,
+    target: &Value<'js>,
+    source: &str,
+) -> Result<bool> {
+    let Some(id) = bindings::host_node_id(ctx, target) else {
+        return Ok(true);
+    };
+    let violations = {
+        let world = bindings::world(ctx)?;
+        let world = world.borrow();
+        world.csp.check_inline(&crate::csp::InlineScript {
+            source,
+            nonce: "",
+            nonceable: false,
+            parser_inserted: false,
+            kind: crate::csp::InlineKind::ScriptAttribute,
+        })
+    };
+    if !violations.is_empty() {
+        bindings::fire_csp_violations(ctx, id, &violations)?;
+    }
+    Ok(!crate::csp::blocks(&violations))
+}
+
 /// Calls a target's `on<type>` handler attribute, if one is assigned
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
 ///
@@ -1545,8 +1666,7 @@ fn call_handler_attribute<'js>(
     target: Option<&Value<'js>>,
     typ: &str,
     event: &Value<'js>,
-) -> Result<()> {
-    let Some(object) = target.and_then(|target| target.as_object()) else {
+) -> Result<()> {    let Some(object) = target.and_then(|target| target.as_object()) else {
         return Ok(());
     };
     let name = format!("on{typ}");
@@ -1554,6 +1674,10 @@ fn call_handler_attribute<'js>(
     if handler.as_function().is_none()
         && let Some(source) = handler_attribute_source(ctx, object, &name)?
     {
+        if !handler_attribute_allowed(ctx, object.as_value(), &source)? {
+            object.set(name.as_str(), Value::new_null(ctx.clone()))?;
+            return Ok(());
+        }
         // A handler content attribute compiles to a function whose body is
         // the attribute value and whose `this` is the object. `onerror` takes
         // the spec's five arguments, not the usual single event argument

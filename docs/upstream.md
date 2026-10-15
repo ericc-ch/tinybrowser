@@ -16,6 +16,7 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 - c3581533 let xml5ever expand internal general entities. The 797-line bounds module belongs to the parser crate that owns the DTD subset.
 - 791d7655 drop the on-demand style context inside the layout state. SequentialTaskList::drop asserts the state, so getComputedStyle on display:none panicked as soon as the context dropped.
 - 9f10f12e display:contents generates no box for resolved values. Per CSSOM, no box means the resolved value is the computed value; it reported 0px and leaked min/max clamping in.
+- 19672f4f tag requests with their resource kind (stylesheets, images, fonts). Per-destination policy (CSP `img-src` / `style-src` / `font-src`) cannot be applied from the URL alone; the embedder would have to guess the destination.
 
 ### html5ever (third_party/html5ever, master)
 

@@ -286,6 +286,21 @@ impl Document {
                 continue;
             }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
+                // The connect check lives here, the one place every page
+                // request leaves the renderer, instead of in each JS API
+                // (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
+                let violations =
+                    self.subresource_violations(&url, crate::csp::Destination::Connect);
+                if !violations.is_empty()
+                    && let Some(target) = self.document_node()
+                {
+                    self.fire_csp_violations(target, &violations);
+                }
+                if crate::csp::blocks(&violations) {
+                    self.record_event(RendererEvent::FetchFailed);
+                    self.settle_js_fetch(fetch.js_id, None);
+                    continue;
+                }
                 let initiator = self.url.clone();
                 self.queued_dials.push(QueuedDial {
                     context: DialContext::JsFetch {
@@ -308,6 +323,57 @@ impl Document {
         let images = self.world.borrow_mut().take_image_updates();
         for element in images {
             self.queue_image(element, true);
+        }
+        // Connected `<script src>` elements queued their prepare steps from
+        // script; the fetch starts here.
+        let scripts = self.world.borrow_mut().take_pending_scripts();
+        for element in scripts {
+            let src = self
+                .world
+                .borrow()
+                .with_document(element, |parsed| {
+                    crate::dom::tree::attr(&parsed.document.base, element.node, "src")
+                        .map(str::to_owned)
+                })
+                .flatten();
+            let Some(src) = src else {
+                continue;
+            };
+            let started = self
+                .world
+                .borrow()
+                .with_document(element, |parsed| {
+                    parsed.document.script_already_started(element.node)
+                })
+                .unwrap_or(false);
+            if started {
+                continue;
+            }
+            let Ok(url) = self.resolve_dial_url(&src) else {
+                self.fire_js(|js| js.fire_node_error(element));
+                continue;
+            };
+            let violations = self.script_url_violations(&url, element);
+            if !violations.is_empty() {
+                self.fire_csp_violations(element, &violations);
+            }
+            if crate::csp::blocks(&violations) {
+                self.fire_js(|js| js.fire_node_error(element));
+                continue;
+            }
+            let initiator = self.url.clone();
+            self.queued_dials.push(QueuedDial::get(
+                DialContext::ClassicScript {
+                    element,
+                    epoch: self.js_epoch,
+                },
+                url,
+                initiator,
+            ));
+        }
+        let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
+        for (target, violations) in violations {
+            self.fire_csp_violations(target, &violations);
         }
     }
 

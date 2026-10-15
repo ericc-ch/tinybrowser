@@ -165,7 +165,15 @@ impl Engine {
         let document = self.frame_mut(frame)?;
         document.world().borrow_mut().history = head.history.clone();
         let url = Url::parse(&head.url).ok();
-        document.begin_response(url.as_ref(), head.content_type.as_deref(), head.viewport);
+        document.begin_response(
+            url.as_ref(),
+            head.content_type.as_deref(),
+            head.viewport,
+            crate::csp::List::from_headers(
+                head.content_security_policy.as_deref(),
+                head.content_security_policy_report_only.as_deref(),
+            ),
+        );
         Ok(())
     }
 
@@ -719,6 +727,24 @@ impl Engine {
         self.mark_frame_load_pending(container, parent);
     }
 
+    /// The policy a local-scheme document inherits from its initiator
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
+    fn inherited_policy(&self, parent: FrameId) -> crate::csp::List {
+        self.frames
+            .get(&parent)
+            .map(|document| document.world().borrow().csp.clone())
+            .unwrap_or_default()
+    }
+
+    /// Gives a frame's freshly installed local-scheme document the
+    /// initiator's policy.
+    fn inherit_policy(&self, child: FrameId, parent: FrameId) {
+        let policy = self.inherited_policy(parent);
+        if let Some(document) = self.frames.get(&child) {
+            document.world().borrow_mut().csp = policy;
+        }
+    }
+
     /// Keeps a frame's initial `about:blank` document while it still has one,
     /// so a script-set realm survives; otherwise installs the inherited blank.
     fn keep_initial_blank(&mut self, child: FrameId, parent: FrameId) {
@@ -733,6 +759,7 @@ impl Engine {
             .get(&child)
             .is_some_and(Document::is_initial_blank)
         {
+            self.inherit_policy(child, parent);
             return;
         }
         let Some(document) = self.frames.get_mut(&child) else {
@@ -742,6 +769,7 @@ impl Engine {
             Some((url, origin)) => document.load_about_blank(Some(&url), Some(origin)),
             None => document.load_about_blank(Some("about:blank"), None),
         }
+        self.inherit_policy(child, parent);
     }
 
     /// Starts the load one resolved frame URL names, dispatching on its scheme
@@ -757,20 +785,7 @@ impl Engine {
     ) {
         match url.scheme() {
             "about" => self.keep_initial_blank(child, parent),
-            "data" => {
-                if let Some((content_type, body)) = decode_data_url(url.as_str()) {
-                    if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_frame_response(&url, Some(content_type.as_str()), &body);
-                    }
-                } else {
-                    // A malformed data URL fails the navigation; the frame
-                    // stays on its current document
-                    // (<https://fetch.spec.whatwg.org/#data-url-processor>).
-                    if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_about_blank(None, None);
-                    }
-                }
-            }
+            "data" => self.load_data_frame(child, parent, &url),
             "javascript" => {
                 // Navigate to a javascript: URL returns when the initiator
                 // is not same origin-domain with the target's active
@@ -790,49 +805,30 @@ impl Engine {
                     .strip_prefix("javascript:")
                     .unwrap_or(&script)
                     .to_owned();
+                let source = url.as_str().to_owned();
                 let initial = self
                     .frames
                     .get(&child)
                     .is_some_and(Document::is_initial_blank);
+                // The inline check for a `javascript:` navigation uses the
+                // initiator's policy, not the target frame's
+                // (<https://w3c.github.io/webappsec-csp/#should-block-navigation-request>).
+                let policy = self
+                    .frames
+                    .get(&parent)
+                    .map(|document| document.world().borrow().csp.clone())
+                    .unwrap_or_default();
                 if let Some(document) = self.frames.get_mut(&child) {
                     if initial {
                         // The script runs in the document the browser already
                         // created; a string result still replaces it.
-                        document.eval_frame_script(&script);
+                        document.eval_frame_script(&script, &source, &policy);
                     } else {
-                        document.load_javascript_frame(&script);
+                        document.load_javascript_frame(&script, &source, &policy);
                     }
                 }
             }
-            "blob" => {
-                // A missing Blob URL Store entry is a network error, not an
-                // empty document at the URL's claimed origin
-                // (<https://w3c.github.io/FileAPI/#blob-uri-get>).
-                // The child's origin is the entry's creator, not
-                // `Url::origin()` of the blob URL
-                // (<https://w3c.github.io/FileAPI/#blob-url-entry>).
-                let mut key = url.clone();
-                key.set_fragment(None);
-                let loaded = self.frames.get(&parent).and_then(|document| {
-                    let key = key.as_str();
-                    Some((
-                        document.object_url_contents(key)?,
-                        document.object_url_type(key),
-                        document.object_url_origin(key)?,
-                    ))
-                });
-                let Some((contents, content_type, origin)) = loaded else {
-                    return;
-                };
-                if let Some(document) = self.frames.get_mut(&child) {
-                    document.load_frame_response_with_origin(
-                        &url,
-                        content_type.as_deref(),
-                        contents.as_bytes(),
-                        origin,
-                    );
-                }
-            }
+            "blob" => self.load_blob_frame(child, parent, &url),
             "http" | "https" => {
                 let initiator = self
                     .frames
@@ -868,7 +864,54 @@ impl Engine {
                 if let Some(document) = self.frames.get_mut(&child) {
                     document.load_about_blank(None, None);
                 }
+                self.inherit_policy(child, parent);
             }
+        }
+    }
+
+    /// A `data:` frame URL decodes in-process. A malformed URL fails the
+    /// navigation and leaves the frame on its current document
+    /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
+    fn load_data_frame(&mut self, child: FrameId, parent: FrameId, url: &Url) {
+        let policy = self.inherited_policy(parent);
+        let Some((content_type, body)) = decode_data_url(url.as_str()) else {
+            if let Some(document) = self.frames.get_mut(&child) {
+                document.load_about_blank(None, None);
+            }
+            self.inherit_policy(child, parent);
+            return;
+        };
+        if let Some(document) = self.frames.get_mut(&child) {
+            document.load_frame_response(url, Some(content_type.as_str()), &body, policy);
+        }
+    }
+
+    /// A `blob:` frame URL reads the parent's Blob URL Store. A missing entry
+    /// is a network error. The child's origin is the entry's creator
+    /// (<https://w3c.github.io/FileAPI/#blob-url-entry>).
+    fn load_blob_frame(&mut self, child: FrameId, parent: FrameId, url: &Url) {
+        let mut key = url.clone();
+        key.set_fragment(None);
+        let loaded = self.frames.get(&parent).and_then(|document| {
+            let key = key.as_str();
+            Some((
+                document.object_url_contents(key)?,
+                document.object_url_type(key),
+                document.object_url_origin(key)?,
+            ))
+        });
+        let Some((contents, content_type, origin)) = loaded else {
+            return;
+        };
+        let policy = self.inherited_policy(parent);
+        if let Some(document) = self.frames.get_mut(&child) {
+            document.load_frame_response_with_origin(
+                url,
+                content_type.as_deref(),
+                contents.as_bytes(),
+                origin,
+                policy,
+            );
         }
     }
 

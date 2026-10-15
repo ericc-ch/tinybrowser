@@ -2,6 +2,18 @@ use std::borrow::Cow;
 use std::fmt;
 
 #[must_use]
+/// Joins every occurrence of a list header's values with `", "`, the way a
+/// list header is extracted
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
+pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    let values: Vec<&str> = values.map(str::trim).filter(|v| !v.is_empty()).collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(", "))
+    }
+}
+
 pub(crate) fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(

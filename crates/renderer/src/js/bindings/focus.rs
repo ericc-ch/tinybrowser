@@ -8,6 +8,7 @@ use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 use crate::documents::JournalEntry;
 use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected};
 use crate::js::world::EventTargetKey;
+use crate::js::{FrameNavigation, NavigationTarget};
 
 /// The node-removal focus fixup: when the document's focused area is inside
 /// a removed subtree, clear it without firing events
@@ -393,6 +394,9 @@ enum Activation {
     Submit,
     Reset,
     ToggleCheckedness,
+    /// Follow an `a`/`area` hyperlink in place
+    /// (<https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-a-element:activation-behaviour>).
+    Link,
 }
 
 /// The checkbox/radio activation behavior: toggle (checkbox) or set (radio)
@@ -494,6 +498,10 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 "reset" => Activation::Reset,
                 _ => Activation::Submit,
             },
+            // An anchor without `href` has no activation behavior.
+            "a" | "area" if crate::dom::tree::attr(base, node.node, "href").is_some() => {
+                Activation::Link
+            }
             _ => Activation::None,
         };
         let form = form_owner_of(base, node.document, node.node);
@@ -502,6 +510,34 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     match activation {
         Activation::None => Ok(()),
         Activation::ToggleCheckedness => toggle_checkedness(ctx, node),
+        Activation::Link => {
+            let (spec, target) = {
+                let world = world.borrow();
+                let Some(parsed) = world.document(node) else {
+                    return Ok(());
+                };
+                let base = &parsed.document.base;
+                (
+                    crate::dom::tree::attr(base, node.node, "href").map(str::to_owned),
+                    crate::dom::tree::attr(base, node.node, "target").map(str::to_owned),
+                )
+            };
+            let Some(spec) = spec else {
+                return Ok(());
+            };
+            // A named or `_blank` target needs a browsing context this engine
+            // does not create; only the default and `_self` navigate in place.
+            if target
+                .is_some_and(|target| !target.is_empty() && !target.eq_ignore_ascii_case("_self"))
+            {
+                return Ok(());
+            }
+            world.borrow_mut().queue_frame_navigation(FrameNavigation::get(
+                NavigationTarget::SelfFrame,
+                spec,
+            ));
+            Ok(())
+        }
         Activation::Submit | Activation::Reset => {
             let Some(form) = form else {
                 return Ok(());
@@ -531,7 +567,7 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                         let _ = ctx.catch();
                     }
                 }
-                Activation::None | Activation::ToggleCheckedness => {}
+                Activation::None | Activation::ToggleCheckedness | Activation::Link => {}
             }
             Ok(())
         }

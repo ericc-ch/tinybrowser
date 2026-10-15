@@ -27,6 +27,8 @@ pub(crate) struct NavOutcome {
     pub status: u16,
     pub final_url: Url,
     pub content_type: Option<String>,
+    pub content_security_policy: Option<String>,
+    pub content_security_policy_report_only: Option<String>,
     pub body: net::Body,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -169,12 +171,18 @@ impl TabNetworkHandle {
             .map_err(|error| dial_failure(&error))?;
         let status = response.status();
         let final_url = response.final_url().clone();
-        let content_type = content_type_header(response.headers());
+        let headers = response.headers();
+        let content_type = content_type_header(headers);
+        let content_security_policy = list_header(headers, "content-security-policy");
+        let content_security_policy_report_only =
+            list_header(headers, "content-security-policy-report-only");
         let body = response.into_body();
         Ok(NavOutcome {
             status,
             final_url,
             content_type,
+            content_security_policy,
+            content_security_policy_report_only,
             body,
             _permit: permits,
         })
@@ -416,6 +424,15 @@ fn sends_default_ua_client_hints(url: &Url) -> bool {
         }
         None => false,
     }
+}
+
+/// Combined list-header values for `name`, comma-joined.
+fn list_header(headers: &net::HeaderMap, name: &str) -> Option<String> {
+    net::combined_header(
+        headers
+            .get_all(name)
+            .filter_map(|value| std::str::from_utf8(value).ok()),
+    )
 }
 
 /// `Content-Type` from response `headers`, when it is UTF-8.
