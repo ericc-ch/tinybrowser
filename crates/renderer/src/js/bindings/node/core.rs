@@ -1192,9 +1192,9 @@ impl JsNode {
             .base
             .get_node(self.handle.0.node)
             .map(|node| match &node.data {
-                NodeData::Element(_)
-                | NodeData::Fragment { .. }
-                | NodeData::ShadowRoot { .. } => 0u8,
+                NodeData::Element(_) | NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => {
+                    0u8
+                }
                 NodeData::Text(_)
                 | NodeData::Comment { .. }
                 | NodeData::ProcessingInstruction { .. }
@@ -1203,8 +1203,7 @@ impl JsNode {
             });
         match kind {
             Some(0) => {
-                let text =
-                    crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node);
+                let text = parsed.document.descendant_dom_text(self.handle.0.node);
                 dom_string(ctx, &text).map(Some)
             }
             Some(1) => {
@@ -1941,14 +1940,8 @@ pub(super) fn insertion_excluding_children(
         let parsed = owner
             .document(parent)
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
-        ensure_document_content_model(
-            &parsed.document,
-            parent,
-            reference,
-            excluded,
-            &inserted,
-        )
-        .map_err(|error| throw_dom_error(ctx, error))?;
+        ensure_document_content_model(&parsed.document, parent, reference, excluded, &inserted)
+            .map_err(|error| throw_dom_error(ctx, error))?;
     }
     Ok((node, reference))
 }
@@ -2072,7 +2065,11 @@ pub(super) fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> 
 /// Same-document insert returns `node`. A node from another document adopts
 /// into the parent's document, preserving fragment backings as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
-pub(in crate::js::bindings) fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
+pub(in crate::js::bindings) fn adopt_node(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeId,
+) -> Result<NodeId> {
     if node.document == parent.document {
         return Ok(node);
     }
@@ -2527,7 +2524,11 @@ pub(super) fn doctype_field(
 /// then move node points over and bump the equal parent slot; the truncate
 /// writes without the generic replacement rule, which the split steps have
 /// already accounted for.
-pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
+pub(in crate::js::bindings) fn split_text_node<'js>(
+    ctx: &Ctx<'js>,
+    id: NodeId,
+    offset: u32,
+) -> Result<Value<'js>> {
     let units = character_data(ctx, id)?.units().into_owned();
     let offset = character_data_offset(ctx, offset, units.len())?;
     let new_data = DomString::from_utf16(units[offset..].to_vec());
@@ -2548,9 +2549,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
             });
             let index = parent.and_then(|parent| {
                 base.get_node(parent.node)
-                    .and_then(|node| {
-                        node.children.iter().position(|sibling| *sibling == id.node)
-                    })
+                    .and_then(|node| node.children.iter().position(|sibling| *sibling == id.node))
                     .and_then(|index| u32::try_from(index).ok())
             });
             (parent, next, index)
@@ -2592,12 +2591,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
             );
             let mut kept = units.clone();
             kept.drain(offset..);
-            truncate_split_text(
-                &mut parsed,
-                id,
-                &kept,
-                DomString::from_utf16(units),
-            );
+            truncate_split_text(&mut parsed, id, &kept, DomString::from_utf16(units));
         }
         apply_inserted(ctx, parent, &[new_id], true)?;
     } else {
@@ -2622,12 +2616,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
             );
             let mut kept = units.clone();
             kept.drain(offset..);
-            truncate_split_text(
-                &mut parsed,
-                id,
-                &kept,
-                DomString::from_utf16(units),
-            );
+            truncate_split_text(&mut parsed, id, &kept, DomString::from_utf16(units));
         }
         schedule_mutation_delivery(ctx)?;
     }
@@ -2637,18 +2626,19 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
 /// Truncate `id`'s data to `kept` for `splitText`, recording the change. The
 /// range steps already ran, so this writes without the generic replacement
 /// rule that would corrupt a split. Other node kinds cannot reach a split.
-fn truncate_split_text(
-    parsed: &mut crate::Parsed,
-    id: NodeId,
-    kept: &[u16],
-    old_value: DomString,
-) {
-    let wrote = match parsed.document.base.get_node(id.node).map(|node| &node.data) {
+fn truncate_split_text(parsed: &mut crate::Parsed, id: NodeId, kept: &[u16], old_value: DomString) {
+    let wrote = match parsed
+        .document
+        .base
+        .get_node(id.node)
+        .map(|node| &node.data)
+    {
         Some(NodeData::Text(_)) => {
-            parsed.document.base.mutate().set_node_text(
-                id.node,
-                &String::from_utf16_lossy(kept),
-            );
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_node_text(id.node, &String::from_utf16_lossy(kept));
             true
         }
         Some(NodeData::CDataSection { .. }) => {
