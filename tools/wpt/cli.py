@@ -23,7 +23,6 @@ Grammar (all subcommands): test paths and our flags come first; a literal
 
 from __future__ import annotations
 
-import argparse
 import fcntl
 import hashlib
 import heapq
@@ -40,7 +39,9 @@ import sys
 import tempfile
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any, TypeVar
 
 ROOT = Path(__file__).resolve().parents[2]
 CLI = Path(__file__).resolve()
@@ -56,7 +57,9 @@ HTTP_ONLY = ("http", "ws")
 
 # wptrunner `--exclude` is a URL prefix, so `--exclude=worker` misses
 # `.any.worker.html` / `.worker.html` variants generated from `.any.js`.
-WORKER_VARIANT = re.compile(r"\.(any\.)?(sharedworker|serviceworker|worker)(-module)?\.html$")
+WORKER_VARIANT = re.compile(
+    r"\.(any\.)?(sharedworker|serviceworker|worker)(-module)?\.html$"
+)
 
 # File-level statuses with their own bucket; anything else not-a-pass is
 # classified by the report's `expected` field.
@@ -104,8 +107,11 @@ def cache_dir() -> Path:
 def git(args: list[str], cwd: Path | None = None) -> str | None:
     try:
         out = subprocess.run(
-            ["git", *args], cwd=str(cwd or ROOT),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+            ["git", *args],
+            cwd=str(cwd or ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
         )
     except OSError:
         return None
@@ -116,7 +122,8 @@ def git(args: list[str], cwd: Path | None = None) -> str | None:
 
 # --- worker-variant filter (pure; selftested) ---
 
-def exclude_skips_worker_variants(exclude: object) -> bool:
+
+def exclude_skips_worker_variants(exclude: Iterable[str] | None) -> bool:
     return bool(exclude and any(item.strip("/") == "worker" for item in exclude))
 
 
@@ -126,11 +133,18 @@ def is_worker_variant_url(url: str) -> bool:
 
 # --- option matching (mirrors wpt's allow_abbrev) ---
 
+
 def has_option(option: str, args: list[str]) -> bool:
     for arg in args:
         if arg == option or arg.startswith(option + "="):
             return True
-        if option.startswith("--") and arg.startswith("--") and "=" not in arg and len(arg) >= 4 and option.startswith(arg):
+        if (
+            option.startswith("--")
+            and arg.startswith("--")
+            and "=" not in arg
+            and len(arg) >= 4
+            and option.startswith(arg)
+        ):
             return True
     return False
 
@@ -149,6 +163,7 @@ def opt_value(args: list[str], option: str) -> str | None:
 
 
 # --- WPT checkout ---
+
 
 def resolve_wpt_root() -> Path:
     override = os.environ.get("TINYBROWSER_WPT_ROOT")
@@ -181,11 +196,14 @@ def check_pin(wpt: Path) -> int:
             eprint("Update the checkout, or set TINYBROWSER_WPT_ALLOW_PIN_MISMATCH=1.")
             return 1
     elif pinned and pinned != (actual or ""):
-        eprint(f"WPT pin mismatch ignored: running {actual or 'an unknown revision'}, worktree pins {pinned}")
+        eprint(
+            f"WPT pin mismatch ignored: running {actual or 'an unknown revision'}, worktree pins {pinned}"
+        )
     return 0
 
 
 # --- locks (shared venv + shared manifest) ---
+
 
 def acquire_lock(name: str, what: str | None = None, timeout_s: int = 1800):
     if os.environ.get("TINYBROWSER_WPT_NO_LOCK", "0") == "1":
@@ -228,6 +246,7 @@ def release_lock(handle) -> None:
 
 # --- venv (upstream requirements + editable adapter) ---
 
+
 def venv_python(venv: Path) -> Path:
     return venv / "bin" / "python"
 
@@ -239,7 +258,9 @@ def venv_stamp_payload(wpt: Path, venv: Path) -> str:
         try:
             out = subprocess.run(
                 [str(exe), "-c", "import sys; print(sys.version)"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
             )
             lines.append(out.stdout.decode(errors="replace").strip() or "no-python")
         except OSError:
@@ -271,18 +292,33 @@ def install_venv(wpt: Path, venv: Path) -> None:
     exe = venv_python(venv)
     if not (exe.is_file() and os.access(exe, os.X_OK)):
         if os.environ.get("TINYBROWSER_WPT_VENV"):
-            eprint(f"WPT virtualenv not found at {venv}; TINYBROWSER_WPT_VENV must name one")
+            eprint(
+                f"WPT virtualenv not found at {venv}; TINYBROWSER_WPT_VENV must name one"
+            )
             raise SystemExit(1)
-        subprocess.run(["uv", "venv", "--seed", str(venv), "--python", "3.12"], check=True)
+        subprocess.run(
+            ["uv", "venv", "--seed", str(venv), "--python", "3.12"], check=True
+        )
     # uv seeds only pip on Python 3.12; WPT's per-run requirements check
     # needs pkg_resources, or it shells out to pip for every file.
-    requirements = [arg for rel in WPT_RUN_REQUIREMENTS for arg in ("-r", str(wpt / rel))]
+    requirements = [
+        arg for rel in WPT_RUN_REQUIREMENTS for arg in ("-r", str(wpt / rel))
+    ]
     subprocess.run(
         ["uv", "pip", "install", "--python", str(exe), "-q", SETUPTOOLS, *requirements],
         check=True,
     )
     subprocess.run(
-        ["uv", "pip", "install", "--python", str(exe), "-q", "-e", str(ROOT / "tools" / "wpt")],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(exe),
+            "-q",
+            "-e",
+            str(ROOT / "tools" / "wpt"),
+        ],
         check=True,
     )
     (venv / ".tinybrowser-wpt-stamp").write_text(venv_stamp_payload(wpt, venv) + "\n")
@@ -305,6 +341,7 @@ def ensure_venv(wpt: Path, venv: Path) -> None:
 
 # --- manifest (whole-tree inventory; skip the walk when unchanged) ---
 
+
 def tree_state(wpt: Path) -> list[str]:
     """The checkout's content: HEAD plus hashes of every changed or
     untracked file. Taken before a run so an edit made while tests run is
@@ -326,8 +363,11 @@ def tree_state(wpt: Path) -> list[str]:
 
     try:
         proc = subprocess.run(
-            ["git", "diff", "HEAD", "--name-only", "-z"], cwd=str(wpt),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+            ["git", "diff", "HEAD", "--name-only", "-z"],
+            cwd=str(wpt),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
         )
         names = [p for p in proc.stdout.decode(errors="replace").split("\0") if p]
         parts.extend(hashed(names))
@@ -335,8 +375,11 @@ def tree_state(wpt: Path) -> list[str]:
         pass
     try:
         proc = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=str(wpt),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=str(wpt),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
         )
         names = [p for p in proc.stdout.decode(errors="replace").split("\0") if p]
         parts.extend(hashed(names))
@@ -387,8 +430,15 @@ def write_manifest_stamp(wpt: Path, manifest: Path, tree: list[str]) -> None:
 def manifest_parses(exe: Path, manifest: Path) -> bool:
     try:
         out = subprocess.run(
-            [str(exe), "-c", "import json,sys; json.load(open(sys.argv[1]))", str(manifest)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            [
+                str(exe),
+                "-c",
+                "import json,sys; json.load(open(sys.argv[1]))",
+                str(manifest),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
         )
         return out.returncode == 0
     except OSError:
@@ -397,7 +447,10 @@ def manifest_parses(exe: Path, manifest: Path) -> bool:
 
 # --- argument grammars ---
 
-def split_run_argv(argv: list[str]) -> tuple[list[str], bool, bool, list[str], str | None]:
+
+def split_run_argv(
+    argv: list[str],
+) -> tuple[list[str], bool, bool, list[str], str | None]:
     """paths + our flags vs verbatim upstream extras.
 
     Our flags: --score, --dry-run. Anything else starting with `-` (or the
@@ -413,7 +466,7 @@ def split_run_argv(argv: list[str]) -> tuple[list[str], bool, bool, list[str], s
     while i < len(argv):
         arg = argv[i]
         if arg == "--":
-            extras.extend(argv[i + 1:])
+            extras.extend(argv[i + 1 :])
             break
         if arg == "--score":
             score = True
@@ -426,9 +479,20 @@ def split_run_argv(argv: list[str]) -> tuple[list[str], bool, bool, list[str], s
                 while j < len(argv) and argv[j] in KNOWN_TEST_TYPE_SET:
                     values.append(argv[j])
                     j += 1
-                if j < len(argv) and not argv[j].startswith("-") and "/" not in argv[j] and "." not in argv[j]:
-                    return [], False, False, [], (
-                        f"unknown --test-types value '{argv[j]}'; expected one of: {KNOWN_TEST_TYPES}"
+                if (
+                    j < len(argv)
+                    and not argv[j].startswith("-")
+                    and "/" not in argv[j]
+                    and "." not in argv[j]
+                ):
+                    return (
+                        [],
+                        False,
+                        False,
+                        [],
+                        (
+                            f"unknown --test-types value '{argv[j]}'; expected one of: {KNOWN_TEST_TYPES}"
+                        ),
                     )
                 i = j - 1
             extras.extend(values)
@@ -472,13 +536,19 @@ def hoist_paths_after_test_types(
             if token == "-" or "/" in token or "." in token:
                 paths.append(token)
             else:
-                return paths, [], (
-                    f"unknown --test-types value '{token}'; expected one of: {KNOWN_TEST_TYPES}"
+                return (
+                    paths,
+                    [],
+                    (
+                        f"unknown --test-types value '{token}'; expected one of: {KNOWN_TEST_TYPES}"
+                    ),
                 )
     return paths, out, None
 
 
-def split_score_argv(argv: list[str]) -> tuple[Path | None, Path | None, list[str], list[str], bool, str | None]:
+def split_score_argv(
+    argv: list[str],
+) -> tuple[Path | None, Path | None, list[str], list[str], bool, str | None]:
     report: Path | None = None
     save_report: Path | None = None
     paths: list[str] = []
@@ -488,17 +558,33 @@ def split_score_argv(argv: list[str]) -> tuple[Path | None, Path | None, list[st
     while i < len(argv):
         arg = argv[i]
         if arg == "--":
-            extra = list(argv[i + 1:])
+            extra = list(argv[i + 1 :])
             break
-        if arg in ("--report", "--save-report") or arg.startswith(("--report=", "--save-report=")):
+        if arg in ("--report", "--save-report") or arg.startswith(
+            ("--report=", "--save-report=")
+        ):
             option, value = arg.split("=", 1) if "=" in arg else (arg, None)
             if value is None:
                 if i + 1 >= len(argv):
-                    return report, save_report, paths, [], f"{option} needs a file"
+                    return (
+                        report,
+                        save_report,
+                        paths,
+                        extra,
+                        dry_run,
+                        f"{option} needs a file",
+                    )
                 value = argv[i + 1]
                 i += 1
             if not value:
-                return report, save_report, paths, [], f"{option} needs a file"
+                return (
+                    report,
+                    save_report,
+                    paths,
+                    extra,
+                    dry_run,
+                    f"{option} needs a file",
+                )
             if option == "--report":
                 report = Path(value)
             else:
@@ -516,7 +602,9 @@ def split_score_argv(argv: list[str]) -> tuple[Path | None, Path | None, list[st
     return report, save_report, paths, extra, dry_run, None
 
 
-def parse_rerun_argv(argv: list[str]) -> tuple[Path | None, bool, bool, Path | None, list[str], str | None]:
+def parse_rerun_argv(
+    argv: list[str],
+) -> tuple[Path | None, bool, bool, Path | None, list[str], str | None]:
     usage = "rerun REPORT [--include-timeout] [--dry-run] [--save-report FILE] [-- runner args...]"
     report: Path | None = None
     include_timeout = False
@@ -527,8 +615,22 @@ def parse_rerun_argv(argv: list[str]) -> tuple[Path | None, bool, bool, Path | N
         arg = argv[i]
         if arg == "--":
             if report is None:
-                return None, include_timeout, dry_run, save_report, list(argv[i + 1:]), usage
-            return report, include_timeout, dry_run, save_report, list(argv[i + 1:]), None
+                return (
+                    None,
+                    include_timeout,
+                    dry_run,
+                    save_report,
+                    list(argv[i + 1 :]),
+                    usage,
+                )
+            return (
+                report,
+                include_timeout,
+                dry_run,
+                save_report,
+                list(argv[i + 1 :]),
+                None,
+            )
         if arg == "--include-timeout":
             include_timeout = True
         elif arg == "--dry-run":
@@ -536,20 +638,48 @@ def parse_rerun_argv(argv: list[str]) -> tuple[Path | None, bool, bool, Path | N
         elif arg == "--save-report" or arg.startswith("--save-report="):
             if arg == "--save-report":
                 if i + 1 >= len(argv):
-                    return report, include_timeout, dry_run, None, [], "--save-report needs a file"
+                    return (
+                        report,
+                        include_timeout,
+                        dry_run,
+                        None,
+                        [],
+                        "--save-report needs a file",
+                    )
                 save_report = Path(argv[i + 1])
                 i += 1
             else:
                 value = arg.split("=", 1)[1]
                 if not value:
-                    return report, include_timeout, dry_run, None, [], "--save-report needs a file"
+                    return (
+                        report,
+                        include_timeout,
+                        dry_run,
+                        None,
+                        [],
+                        "--save-report needs a file",
+                    )
                 save_report = Path(value)
         elif arg.startswith("-"):
-            return report, include_timeout, dry_run, save_report, list(argv[i:]), "runner options must follow a literal `--`"
+            return (
+                report,
+                include_timeout,
+                dry_run,
+                save_report,
+                list(argv[i:]),
+                "runner options must follow a literal `--`",
+            )
         elif report is None:
             report = Path(arg)
         else:
-            return report, include_timeout, dry_run, save_report, [], f"unexpected argument {arg}"
+            return (
+                report,
+                include_timeout,
+                dry_run,
+                save_report,
+                [],
+                f"unexpected argument {arg}",
+            )
         i += 1
     if report is None:
         return None, include_timeout, dry_run, save_report, [], usage
@@ -557,6 +687,7 @@ def parse_rerun_argv(argv: list[str]) -> tuple[Path | None, bool, bool, Path | N
 
 
 # --- report primitives (score + rerun share these) ---
+
 
 def group_of(test: str) -> str:
     parts = [p for p in test.split("/") if p]
@@ -575,7 +706,9 @@ def unexpected_subs(subtests: list) -> list[dict]:
     return [s for s in subtests if s.get("status") != "SKIP" and not is_expected(s)]
 
 
-def classify_results(results: list[dict]) -> tuple[dict[str, dict[str, int]], list[tuple[str, str, str]]]:
+def classify_results(
+    results: list[dict],
+) -> tuple[dict[str, dict[str, int]], list[tuple[str, str, str]]]:
     rows: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     attention: list[tuple[str, str, str]] = []
     for result in results:
@@ -601,7 +734,9 @@ def classify_results(results: list[dict]) -> tuple[dict[str, dict[str, int]], li
                 message = (result.get("message") or "").strip()
                 attention.append((test, "", f"{status} {message}".strip()))
             for sub in mismatched:
-                attention.append((test, sub.get("name", "?"), sub.get("status", "ERROR")))
+                attention.append(
+                    (test, sub.get("name", "?"), sub.get("status", "ERROR"))
+                )
         elif sub_failed:
             row["expected_fail"] += 1
         elif status in ("PASS", "OK"):
@@ -618,7 +753,9 @@ def summarize(report: Path) -> int:
         eprint(f"cannot read report {report}: {error}")
         return 1
     except json.JSONDecodeError as error:
-        eprint(f"report {report} is not valid JSON ({error}); the runner probably failed before writing results")
+        eprint(
+            f"report {report} is not valid JSON ({error}); the runner probably failed before writing results"
+        )
         return 1
     results = data.get("results", [])
     if not results:
@@ -672,7 +809,11 @@ def needs_retest(result: dict, include_timeout: bool) -> bool:
 
 def failing_tests(report: Path, include_timeout: bool) -> list[str]:
     data = json.loads(report.read_text())
-    return [r["test"] for r in data.get("results", []) if r.get("test") and needs_retest(r, include_timeout)]
+    return [
+        r["test"]
+        for r in data.get("results", [])
+        if r.get("test") and needs_retest(r, include_timeout)
+    ]
 
 
 def rerun_status(remaining: int, runner_exit: int) -> tuple[int, bool]:
@@ -684,6 +825,7 @@ def rerun_status(remaining: int, runner_exit: int) -> tuple[int, bool]:
 
 
 # --- longest-first split (durations from earlier runs) ---
+
 
 def durations_source() -> Path | None:
     """The wptreport-shaped file whose per-test durations drive the split.
@@ -706,30 +848,39 @@ def read_durations(report: Path) -> dict[str, float]:
     return {
         r["test"]: float(r["duration"])
         for r in data.get("results", [])
-        if r.get("test") and isinstance(r.get("duration"), (int, float)) and r["duration"] > 0
+        if r.get("test")
+        and isinstance(r.get("duration"), (int, float))
+        and r["duration"] > 0
     }
 
 
 def write_durations(cache: Path, durations: dict[str, float]) -> None:
     merged = read_durations(cache)
     merged.update(durations)
-    results = [{"test": test, "duration": round(ms)} for test, ms in sorted(merged.items())]
+    results = [
+        {"test": test, "duration": round(ms)} for test, ms in sorted(merged.items())
+    ]
     try:
-        with tempfile.NamedTemporaryFile("w", dir=cache.parent, prefix=cache.name, delete=False) as out:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=cache.parent, prefix=cache.name, delete=False
+        ) as out:
             json.dump({"results": results}, out)
         os.replace(out.name, cache)
     except OSError as error:
         eprint(f"wpt: cannot record test durations in {cache}: {error}")
 
 
-def longest_first(costs: dict[str, float], buckets: int) -> list[list[str]]:
+_K = TypeVar("_K")
+
+
+def longest_first(costs: dict[_K, float], buckets: int) -> list[list[_K]]:
     """LPT: hand each test, longest first, to the least-loaded bucket.
 
     Bucket order is longest first too, so stragglers start early. Ties
     break on the test id, so the split is deterministic for a given input.
     """
     loads = [(0.0, i) for i in range(buckets)]
-    out: list[list[str]] = [[] for _ in range(buckets)]
+    out: list[list[_K]] = [[] for _ in range(buckets)]
     for test in sorted(costs, key=lambda t: (-costs[t], t)):
         load, i = heapq.heappop(loads)
         out[i].append(test)
@@ -754,7 +905,10 @@ class DurationRecorder:
 
 # --- in-venv runner ---
 
-def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRecorder) -> None:
+
+def patch_wpt(
+    wpt_root: Path, durations: dict[str, float], recorder: DurationRecorder
+) -> None:
     sys.path.insert(0, str(wpt_root))
     from tools import localpaths  # noqa: F401
     from tools.wpt import run as wpt_run
@@ -768,11 +922,11 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
             return
         check_environ(product)
 
-    wpt_run.check_environ = skip_tinybrowser_hosts
+    wpt_run.check_environ = skip_tinybrowser_hosts  # ty: ignore[invalid-assignment] -- intentional narrowing patch; upstream is untyped, product is always str, verified by every run
 
     get_ports = ConfigBuilder._get_ports
 
-    def skip_tls_ports_without_ssl(self, data):
+    def skip_tls_ports_without_ssl(self, data) -> dict:
         ports = get_ports(self, data)
         ssl_type = data.get("ssl", {}).get("type", "none")
         if not sslutils.get_cls(ssl_type).ssl_enabled:
@@ -783,7 +937,7 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
                     ports.pop(scheme, None)
         return ports
 
-    ConfigBuilder._get_ports = skip_tls_ports_without_ssl
+    ConfigBuilder._get_ports = skip_tls_ports_without_ssl  # ty: ignore[invalid-assignment] -- intentional runtime patch of untyped upstream; verified by every run
 
     from wptrunner import testloader
 
@@ -805,11 +959,17 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
                         continue
                 yield test_type, test_path, tests
 
-    testloader.TestFilter = TinybrowserTestFilter
+    testloader.TestFilter: type[testloader.TestFilter] = TinybrowserTestFilter
 
     from wptrunner.browsers import base as browser_base
 
-    def wait_for_webdriver(logger, host, port, timeout=60, server_process=None):
+    def wait_for_webdriver(
+        logger: Any,
+        host: str,
+        port: int,
+        timeout: int | float = 60,
+        server_process: Any = None,
+    ) -> bool:
         """`wait_for_service`, polling every 10 ms instead of 500 ms.
 
         The tinybrowser WebDriver listens ~75 ms after spawn, so upstream's
@@ -829,7 +989,7 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
             return True
         raise OSError(f"Service is unavailable: {host}:{port}")
 
-    browser_base.wait_for_service = wait_for_webdriver
+    browser_base.wait_for_service = wait_for_webdriver  # ty: ignore[invalid-assignment] -- intentional runtime patch; polling interval is the whole point, verified by every run
 
     from wptrunner import wptlogging
 
@@ -841,7 +1001,7 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
             logger.add_handler(recorder)
         return logger
 
-    wptlogging.LoggerManager.__enter__ = enter_recording_logger
+    wptlogging.LoggerManager.__enter__ = enter_recording_logger  # ty: ignore[invalid-assignment] -- intentional runtime patch; return type lives in venv-only mozlog, verified by every run
 
     class LongestFirstSource(testloader.SingleTestSource):
         """Default (no `--run-by-dir`/`-f`) split, balanced by past durations.
@@ -855,7 +1015,9 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
         """
 
         def make_queue(self, tests_by_type):
-            tests = {(key, t.id): t for key, group in tests_by_type.items() for t in group}
+            tests = {
+                (key, t.id): t for key, group in tests_by_type.items() for t in group
+            }
             known = [durations[test_id] for _, test_id in tests if test_id in durations]
             if not known:
                 return super().make_queue(tests_by_type)
@@ -874,19 +1036,28 @@ def patch_wpt(wpt_root: Path, durations: dict[str, float], recorder: DurationRec
                         tests[item].update_metadata(metadata.extra)
                         queue.append(tests[item])
                     cost = sum(costs[item] for item in items)
-                    groups.append((cost, testloader.TestGroup(queue, subsuite, test_type, metadata)))
+                    groups.append(
+                        (
+                            cost,
+                            testloader.TestGroup(queue, subsuite, test_type, metadata),
+                        )
+                    )
             groups.sort(key=lambda entry: entry[0], reverse=True)
             test_queue = testloader.WriteQueue()
             for _, group in groups:
                 test_queue.put(group)
-            return test_queue.to_read(), self.process_count(self.kwargs["processes"], len(groups))
+            return test_queue.to_read(), self.process_count(
+                self.kwargs["processes"], len(groups)
+            )
 
-    testloader.SingleTestSource = LongestFirstSource
+    testloader.SingleTestSource: type[testloader.SingleTestSource] = LongestFirstSource
 
 
 def inner_main(argv: list[str]) -> int:
     """Runs under the venv python: patch upstream, then `wpt run`."""
-    wpt_root = Path(os.environ.get("TINYBROWSER_WPT_ROOT") or ROOT / "third_party" / "wpt")
+    wpt_root = Path(
+        os.environ.get("TINYBROWSER_WPT_ROOT") or ROOT / "third_party" / "wpt"
+    )
     source = durations_source()
     recorder = DurationRecorder()
     patch_wpt(wpt_root, read_durations(source) if source else {}, recorder)
@@ -902,14 +1073,20 @@ def inner_main(argv: list[str]) -> int:
 
 # --- `run` (setup, then exec or spawn the venv python) ---
 
+
 def build_binary() -> Path:
     override = os.environ.get("TINYBROWSER_BINARY")
     if override:
-        eprint(f"wpt: using prebuilt TINYBROWSER_BINARY without a freshness check: {override}")
+        eprint(
+            f"wpt: using prebuilt TINYBROWSER_BINARY without a freshness check: {override}"
+        )
         return Path(override)
     out = subprocess.run(
         [str(ROOT / "tools" / "binary-path"), "--profile", "wpt"],
-        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
     )
     binary = Path(out.stdout.decode(errors="replace").strip())
     # The `wpt` profile (see the root Cargo.toml) keeps dev's assertions but
@@ -922,7 +1099,9 @@ def build_binary() -> Path:
         ["cargo", "build", "-q", "--profile", "wpt", "--offline"], cwd=str(ROOT)
     ).returncode
     if ret != 0:
-        ret = subprocess.run(["cargo", "build", "-q", "--profile", "wpt"], cwd=str(ROOT)).returncode
+        ret = subprocess.run(
+            ["cargo", "build", "-q", "--profile", "wpt"], cwd=str(ROOT)
+        ).returncode
     if ret != 0:
         eprint("wpt: cargo build failed; refusing to run against a stale binary")
         raise SystemExit(1)
@@ -938,13 +1117,21 @@ def finalize_run_args(wpt: Path, extras: list[str]) -> list[str]:
         # land the 40MB walk output in our baselines dir; pin it at the WPT
         # checkout so the stamp, lock, and mtime gate track the file wpt uses.
         args = ["--manifest", str(wpt / "MANIFEST.json"), *args]
-    if not has_option("--pause-after-test", args) and not has_option("--no-pause-after-test", args):
+    if not has_option("--pause-after-test", args) and not has_option(
+        "--no-pause-after-test", args
+    ):
         args = ["--no-pause-after-test", *args]
-    if not has_option("--no-restart-on-unexpected", args) and not has_option("--restart-on-unexpected", args):
+    if not has_option("--no-restart-on-unexpected", args) and not has_option(
+        "--restart-on-unexpected", args
+    ):
         args = ["--no-restart-on-unexpected", *args]
     if not has_option("--ssl-type", args):
         args = ["--ssl-type=openssl", *args]
-    if not has_option("--processes", args) and not has_option("--fully-parallel", args) and not has_option("-f", args):
+    if (
+        not has_option("--processes", args)
+        and not has_option("--fully-parallel", args)
+        and not has_option("-f", args)
+    ):
         # Uncapped: one browser per core. Explicit --processes still wins.
         procs = os.cpu_count() or 1
         args.extend(["--processes", str(procs)])
@@ -958,19 +1145,34 @@ def finalize_run_args(wpt: Path, extras: list[str]) -> list[str]:
 def check_type_drift(exe: Path) -> None:
     try:
         out = subprocess.run(
-            [str(exe), "-c",
-             "import sys; sys.path.insert(0, 'tools/wptrunner'); "
-             "from wptrunner import wpttest; print(' '.join(sorted(wpttest.enabled_tests)))"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+            [
+                str(exe),
+                "-c",
+                "import sys; sys.path.insert(0, 'tools/wptrunner'); "
+                "from wptrunner import wpttest; print(' '.join(sorted(wpttest.enabled_tests)))",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
         )
         actual = out.stdout.decode(errors="replace").strip()
     except OSError:
         return
     if actual and actual != KNOWN_TEST_TYPES:
-        eprint(f"wpt: KNOWN_TEST_TYPES drifts from wpttest.enabled_tests ({actual}); update tools/wpt/cli.py")
+        eprint(
+            f"wpt: KNOWN_TEST_TYPES drifts from wpttest.enabled_tests ({actual}); update tools/wpt/cli.py"
+        )
 
 
-def run_wpt(wpt: Path, venv: Path, exe: Path, binary: Path, final_args: list[str], manifest: Path, record: int) -> int:
+def run_wpt(
+    wpt: Path,
+    venv: Path,
+    exe: Path,
+    binary: Path,
+    final_args: list[str],
+    manifest: Path,
+    record: int,
+) -> int:
     inner_argv = ["--binary", str(binary), "tinybrowser", *final_args]
     manifest_lock = None
     if not has_option_exact("--no-manifest-update", final_args):
@@ -984,7 +1186,9 @@ def run_wpt(wpt: Path, venv: Path, exe: Path, binary: Path, final_args: list[str
         or has_option_exact("--manifest-download", final_args)
         or has_option("--install-fonts", final_args)
     ):
-        venv_lock = acquire_lock(f"wpt-{sha16(str(venv.resolve()))}.lock", what=f"venv {venv}")
+        venv_lock = acquire_lock(
+            f"wpt-{sha16(str(venv.resolve()))}.lock", what=f"venv {venv}"
+        )
 
     for i, arg in enumerate(final_args):
         if arg == "--processes" and i + 1 < len(final_args):
@@ -1016,7 +1220,9 @@ def run_wpt(wpt: Path, venv: Path, exe: Path, binary: Path, final_args: list[str
     tree_before = tree_state(wpt) if record == 1 and manifest_locked else []
     try:
         child = subprocess.Popen(
-            [str(exe), str(CLI), "_inner", *inner_argv], cwd=str(wpt), close_fds=True,
+            [str(exe), str(CLI), "_inner", *inner_argv],
+            cwd=str(wpt),
+            close_fds=True,
         )
     except OSError as error:
         release_lock(venv_lock)
@@ -1073,13 +1279,15 @@ def run_main(argv: list[str]) -> int:
         paths, final, error = hoist_paths_after_test_types(paths, final)
         if error:
             return die("run", error, 2)
-        print(f"$ {wpt}/wpt run --binary <tinybrowser> tinybrowser {shlex.join([*paths, *final])}")
+        print(
+            f"$ {wpt}/wpt run --binary <tinybrowser> tinybrowser {shlex.join([*paths, *final])}"
+        )
         return 0
 
     wpt = resolve_wpt_root()
     if not (wpt / "wpt").is_file():
         eprint(f"WPT checkout not found at {wpt}")
-        eprint(f"Initialize it with: git submodule update --init third_party/wpt")
+        eprint("Initialize it with: git submodule update --init third_party/wpt")
         eprint("or point TINYBROWSER_WPT_ROOT at an initialized checkout.")
         return 1
     wpt = Path(os.path.realpath(wpt))
@@ -1123,7 +1331,10 @@ def run_main(argv: list[str]) -> int:
 
 # --- `score` ---
 
-def score_run(paths: list[str], extra: list[str], save_report: Path | None) -> tuple[Path, int]:
+
+def score_run(
+    paths: list[str], extra: list[str], save_report: Path | None
+) -> tuple[Path, int]:
     if save_report is not None:
         report = save_report
         report.parent.mkdir(parents=True, exist_ok=True)
@@ -1131,7 +1342,16 @@ def score_run(paths: list[str], extra: list[str], save_report: Path | None) -> t
         handle, name = tempfile.mkstemp(prefix="wpt-report-", suffix=".json")
         os.close(handle)
         report = Path(name)
-    command = [sys.executable, str(CLI), "run", *paths, "--log-wptreport", str(report), "--no-fail-on-unexpected", *extra]
+    command = [
+        sys.executable,
+        str(CLI),
+        "run",
+        *paths,
+        "--log-wptreport",
+        str(report),
+        "--no-fail-on-unexpected",
+        *extra,
+    ]
     eprint(f"$ {shlex.join(command)}")
     exit_code = subprocess.run(command, cwd=str(ROOT), stdout=sys.stderr).returncode
     if exit_code != 0:
@@ -1139,12 +1359,16 @@ def score_run(paths: list[str], extra: list[str], save_report: Path | None) -> t
     return report, exit_code
 
 
-def finish_scored_run(report_path: Path, runner_exit: int, save_report: Path | None, started: float) -> int:
+def finish_scored_run(
+    report_path: Path, runner_exit: int, save_report: Path | None, started: float
+) -> int:
     """Shared score/overnight tail: keep-or-delete, summarize, wall time."""
     keep_report = runner_exit != 0 or save_report is not None
     try:
         if runner_exit != 0:
-            eprint(f"runner failed with exit {runner_exit}; report kept at {report_path}")
+            eprint(
+                f"runner failed with exit {runner_exit}; report kept at {report_path}"
+            )
             summarize(report_path)
             return runner_exit
         if keep_report:
@@ -1164,15 +1388,29 @@ def score_main(argv: list[str]) -> int:
     if error:
         return die("run --score", error, 2)
     if report is not None and save_report is not None:
-        return die("run --score", "--report summarizes an existing report; do not combine it with --save-report", 2)
+        return die(
+            "run --score",
+            "--report summarizes an existing report; do not combine it with --save-report",
+            2,
+        )
     if has_option("--skip-timeout", extra):
-        return die("run --score", "--skip-timeout is a dev-loop flag for `run`; a score must run expected TIMEOUTs", 2)
+        return die(
+            "run --score",
+            "--skip-timeout is a dev-loop flag for `run`; a score must run expected TIMEOUTs",
+            2,
+        )
     if report is not None:
         if paths or extra or dry_run:
-            return die("run --score", "--report summarizes an existing report; give no test paths", 2)
+            return die(
+                "run --score",
+                "--report summarizes an existing report; give no test paths",
+                2,
+            )
         return summarize(report)
     if dry_run:
-        eprint(f"$ {CLI} run {shlex.join([*paths, '--log-wptreport', '<tmp>', '--no-fail-on-unexpected', *extra])}")
+        eprint(
+            f"$ {CLI} run {shlex.join([*paths, '--log-wptreport', '<tmp>', '--no-fail-on-unexpected', *extra])}"
+        )
         return 0
     if not paths:
         return die("run --score", "give test paths or --report FILE", 2)
@@ -1186,7 +1424,10 @@ def score_main(argv: list[str]) -> int:
 
 # --- `rerun` ---
 
-def rerun_spawn(tests: list[str], extra: list[str], save_report: Path | None) -> tuple[Path, int]:
+
+def rerun_spawn(
+    tests: list[str], extra: list[str], save_report: Path | None
+) -> tuple[Path, int]:
     handle, name = tempfile.mkstemp(prefix="wpt-rerun-", suffix=".txt")
     os.close(handle)
     include_file = Path(name)
@@ -1199,10 +1440,15 @@ def rerun_spawn(tests: list[str], extra: list[str], save_report: Path | None) ->
         os.close(handle)
         report = Path(out_name)
     command = [
-        sys.executable, str(CLI), "run",
-        "--include-file", str(include_file),
-        "--log-wptreport", str(report),
-        "--no-fail-on-unexpected", *extra,
+        sys.executable,
+        str(CLI),
+        "run",
+        "--include-file",
+        str(include_file),
+        "--log-wptreport",
+        str(report),
+        "--no-fail-on-unexpected",
+        *extra,
     ]
     eprint(f"$ {shlex.join(command)}")
     try:
@@ -1270,6 +1516,7 @@ def rerun_main(argv: list[str]) -> int:
 
 # --- `overnight` (full-suite run + score; needs approval per AGENTS.md) ---
 
+
 def overnight_main(argv: list[str]) -> int:
     save_report: Path | None = None
     extra: list[str] = []
@@ -1279,7 +1526,7 @@ def overnight_main(argv: list[str]) -> int:
     while i < len(rest):
         arg = rest[i]
         if arg == "--":
-            extra = rest[i + 1:]
+            extra = rest[i + 1 :]
             break
         if arg == "--save-report" or arg.startswith("--save-report="):
             option, value = arg.split("=", 1) if "=" in arg else (arg, None)
@@ -1300,9 +1547,15 @@ def overnight_main(argv: list[str]) -> int:
             return die("overnight", f"unexpected argument {arg}", 2)
         i += 1
     if has_option("--skip-timeout", extra):
-        return die("overnight", "--skip-timeout is a dev-loop flag for `run`; a score must run expected TIMEOUTs", 2)
+        return die(
+            "overnight",
+            "--skip-timeout is a dev-loop flag for `run`; a score must run expected TIMEOUTs",
+            2,
+        )
     if dry_run:
-        eprint(f"$ {CLI} run --log-wptreport <report> --no-fail-on-unexpected {shlex.join(extra)}")
+        eprint(
+            f"$ {CLI} run --log-wptreport <report> --no-fail-on-unexpected {shlex.join(extra)}"
+        )
         return 0
     started = time.monotonic()
     try:
@@ -1313,6 +1566,7 @@ def overnight_main(argv: list[str]) -> int:
 
 
 # --- selftest ---
+
 
 def _selftest() -> None:
     assert exclude_skips_worker_variants(["worker"])
@@ -1337,13 +1591,27 @@ def _selftest() -> None:
     assert not has_option_exact("--manifest", ["--manif", "x"])
 
     paths, score, dry, extras, err = split_run_argv(["dom/nodes/", "--exclude=worker"])
-    assert err is None and paths == ["dom/nodes/"] and extras == ["--exclude=worker"] and not score and not dry
-    paths, score, dry, extras, err = split_run_argv(["--score", "dom/", "--", "--processes", "4"])
-    assert err is None and score and paths == ["dom/"] and extras == ["--processes", "4"]
+    assert (
+        err is None
+        and paths == ["dom/nodes/"]
+        and extras == ["--exclude=worker"]
+        and not score
+        and not dry
+    )
+    paths, score, dry, extras, err = split_run_argv(
+        ["--score", "dom/", "--", "--processes", "4"]
+    )
+    assert (
+        err is None and score and paths == ["dom/"] and extras == ["--processes", "4"]
+    )
     paths, score, dry, extras, err = split_run_argv(
         ["--test-types", "reftest", "css/", "--", "--processes", "2"]
     )
-    assert err is None and paths == ["css/"] and extras == ["--test-types", "reftest", "--processes", "2"]
+    assert (
+        err is None
+        and paths == ["css/"]
+        and extras == ["--test-types", "reftest", "--processes", "2"]
+    )
     _, _, _, _, err = split_run_argv(["--test-types", "testharnes", "dom/"])
     assert err is not None
 
@@ -1352,47 +1620,95 @@ def _selftest() -> None:
     paths, extras, err = hoist_paths_after_test_types(
         [], ["--processes", "4", "--test-types", "reftest", "dom/nodes/"]
     )
-    assert err is None and paths == ["dom/nodes/"] and extras == ["--processes", "4", "--test-types", "reftest"]
+    assert (
+        err is None
+        and paths == ["dom/nodes/"]
+        and extras == ["--processes", "4", "--test-types", "reftest"]
+    )
     _, _, err = hoist_paths_after_test_types([], ["--test-types", "testharnes", "dom/"])
     assert err is not None  # typo fails loudly instead of running the wrong set
     _, _, err = hoist_paths_after_test_types([], ["--test-types", "testharnes"])
     assert err is not None
 
     rows, attention = classify_results(
-        [{"test": "/html/foo.html", "status": "PASS", "expected": "FAIL", "subtests": [], "duration": 0}]
+        [
+            {
+                "test": "/html/foo.html",
+                "status": "PASS",
+                "expected": "FAIL",
+                "subtests": [],
+                "duration": 0,
+            }
+        ]
     )
-    assert rows["html/foo.html"]["unexpected"] == 1 and attention == [("/html/foo.html", "", "PASS")]
+    assert rows["html/foo.html"]["unexpected"] == 1 and attention == [
+        ("/html/foo.html", "", "PASS")
+    ]
     rows, attention = classify_results(
-        [{"test": "/dom/bar.html", "status": "OK",
-          "subtests": [{"name": "a", "status": "FAIL"},
-                       {"name": "b", "status": "PASS", "expected": "FAIL"}],
-          "duration": 0}]
+        [
+            {
+                "test": "/dom/bar.html",
+                "status": "OK",
+                "subtests": [
+                    {"name": "a", "status": "FAIL"},
+                    {"name": "b", "status": "PASS", "expected": "FAIL"},
+                ],
+                "duration": 0,
+            }
+        ]
     )
-    assert rows["dom/bar.html"]["unexpected"] == 1 and attention == [("/dom/bar.html", "b", "PASS")]
+    assert rows["dom/bar.html"]["unexpected"] == 1 and attention == [
+        ("/dom/bar.html", "b", "PASS")
+    ]
     rows, attention = classify_results(
-        [{"test": "/dom/ok.html", "status": "OK",
-          "subtests": [{"name": "a", "status": "PASS"}], "duration": 0}]
+        [
+            {
+                "test": "/dom/ok.html",
+                "status": "OK",
+                "subtests": [{"name": "a", "status": "PASS"}],
+                "duration": 0,
+            }
+        ]
     )
     assert rows["dom/ok.html"]["pass"] == 1 and attention == []
     rows, attention = classify_results(
-        [{"test": "/dom/fail.html", "status": "FAIL",
-          "subtests": [{"name": "a", "status": "FAIL"}], "duration": 0}]
+        [
+            {
+                "test": "/dom/fail.html",
+                "status": "FAIL",
+                "subtests": [{"name": "a", "status": "FAIL"}],
+                "duration": 0,
+            }
+        ]
     )
     assert rows["dom/fail.html"]["expected_fail"] == 1 and attention == []
 
     ok = {"test": "/dom/ok.html", "status": "PASS"}
-    skip = {"test": "/wasm/x.any.js", "status": "SKIP", "message": "does not support jsshell"}
+    skip = {
+        "test": "/wasm/x.any.js",
+        "status": "SKIP",
+        "message": "does not support jsshell",
+    }
     timeout = {"test": "/WebCryptoAPI/x.html", "status": "TIMEOUT"}
     error = {"test": "/html/y.html", "status": "ERROR", "expected": "OK"}
     failed = {"test": "/FileAPI/z.html", "status": "FAIL", "expected": "PASS"}
     baselined = {"test": "/dom/baselined.html", "status": "FAIL"}
     unpinned = {"test": "/dom/fixed.html", "status": "PASS", "expected": "FAIL"}
-    sub = {"test": "/dom/s.html", "status": "OK",
-           "subtests": [{"name": "a", "status": "FAIL", "expected": "PASS"}]}
-    sub_baselined = {"test": "/dom/sb.html", "status": "OK",
-                     "subtests": [{"name": "a", "status": "FAIL"}]}
-    expected = {"test": "/dom/e.html", "status": "OK",
-                "subtests": [{"name": "a", "status": "PASS", "expected": "FAIL"}]}
+    sub = {
+        "test": "/dom/s.html",
+        "status": "OK",
+        "subtests": [{"name": "a", "status": "FAIL", "expected": "PASS"}],
+    }
+    sub_baselined = {
+        "test": "/dom/sb.html",
+        "status": "OK",
+        "subtests": [{"name": "a", "status": "FAIL"}],
+    }
+    expected = {
+        "test": "/dom/e.html",
+        "status": "OK",
+        "subtests": [{"name": "a", "status": "PASS", "expected": "FAIL"}],
+    }
     assert not needs_retest(ok, include_timeout=False)
     assert not needs_retest(skip, include_timeout=False)
     assert not needs_retest(timeout, include_timeout=False)
@@ -1409,7 +1725,8 @@ def _selftest() -> None:
     assert rerun_status(2, 0) == (1, True)
 
     assert longest_first({"a": 60, "b": 10, "c": 10, "d": 10, "e": 30, "f": 30}, 2) == [
-        ["a", "b", "d"], ["e", "f", "c"]
+        ["a", "b", "d"],
+        ["e", "f", "c"],
     ]
     assert longest_first({"a": 1}, 3) == [["a"], [], []]
     recorder = DurationRecorder()
@@ -1418,11 +1735,22 @@ def _selftest() -> None:
     recorder({"action": "test_end", "test": "/b.html", "time": 1300})
     assert recorder.durations == {"/a.html": 250}
 
-    report, save, paths, extra, dry, err = split_score_argv(["FileAPI/", "--save-report", "/tmp/x.json", "--", "--exclude=worker"])
-    assert report is None and save == Path("/tmp/x.json") and paths == ["FileAPI/"] and extra == ["--exclude=worker"] and not dry and err is None
+    report, save, paths, extra, dry, err = split_score_argv(
+        ["FileAPI/", "--save-report", "/tmp/x.json", "--", "--exclude=worker"]
+    )
+    assert (
+        report is None
+        and save == Path("/tmp/x.json")
+        and paths == ["FileAPI/"]
+        and extra == ["--exclude=worker"]
+        and not dry
+        and err is None
+    )
     report, save, paths, extra, dry, err = split_score_argv(["--dry-run", "dom/"])
     assert dry and paths == ["dom/"] and err is None
-    r, _, _, _, _, err = parse_rerun_argv(["r.json", "--include-timeout", "--", "--processes", "8"])
+    r, _, _, _, _, err = parse_rerun_argv(
+        ["r.json", "--include-timeout", "--", "--processes", "8"]
+    )
     assert r == Path("r.json") and err is None
     assert parse_rerun_argv([])[5] is not None
 
@@ -1471,7 +1799,11 @@ def main(argv: list[str] | None = None) -> int:
         _selftest()
         eprint("selftest: ok")
         return 0
-    return die("wpt", f"unknown command {command}; expected run | score | rerun | overnight | selftest", 2)
+    return die(
+        "wpt",
+        f"unknown command {command}; expected run | score | rerun | overnight | selftest",
+        2,
+    )
 
 
 if __name__ == "__main__":

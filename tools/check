@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Workspace checks: clippy, embedded JS syntax, rustdoc, Valgrind.
+# Workspace checks: clippy, embedded JS syntax, rustdoc, Python, Valgrind.
 #
 #   clippy    stable shell. Workspace lints, then `node --check` on JavaScript
 #            `include_str!`'d into the renderer, then the realm-free layer
@@ -7,7 +7,9 @@
 #            JsNode), then `cargo doc --no-deps --document-private-items`
 #            (intra-doc link lints are denied workspace-wide, so a bare or
 #            stale path fails here instead of shipping, private items
-#            included). Always run this.
+#            included), then the Astral Python stack on tools/wpt
+#            (`ruff check`, `ruff format --check`, `ty check`, all via uvx
+#            with versions pinned below). Always run this.
 #   valgrind nightly shell. Runs test binaries under Valgrind's memcheck,
 #            including the C QuickJS build. It sees heap misuse and
 #            uninitialized reads across the FFI boundary but does not model
@@ -94,6 +96,27 @@ run_docs() {
   nix develop --command cargo doc --workspace --no-deps --document-private-items
 }
 
+# Astral pins for the tools/wpt Python stack (ruff = lint + format, ty =
+# types). Bump together after `uvx <tool>@<version>` proves green.
+RUFF_PIN="ruff@0.14.8"
+TY_PIN="ty@0.0.9"
+
+run_py() {
+  if ! command -v uvx >/dev/null 2>&1; then
+    echo "uvx is required to lint tools/wpt (used for the WPT venv already)" >&2
+    exit 1
+  fi
+  uvx "$RUFF_PIN" check tools/wpt
+  uvx "$RUFF_PIN" format --check tools/wpt
+  if [[ ! -f third_party/wpt/wpt ]]; then
+    # ty resolves upstream modules through extra-paths into the checkout
+    # (see tools/wpt/pyproject.toml); without it only ruff can run.
+    echo "py: skipping ty, WPT checkout missing (git submodule update --init third_party/wpt)" >&2
+    return 0
+  fi
+  uvx "$TY_PIN" check --project tools/wpt tools/wpt/cli.py tools/wpt/tinybrowser_wpt.py
+}
+
 valgrind_test() {
   nix develop .#check --command env \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
@@ -107,6 +130,7 @@ case "${1:-clippy}" in
     run_js
     run_layers
     run_docs
+    run_py
     ;;
   valgrind)
     shift

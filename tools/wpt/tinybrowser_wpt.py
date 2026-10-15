@@ -16,7 +16,11 @@ import shutil
 import sys
 import tempfile
 
-from wptrunner.browsers.base import WebDriverBrowser, get_timeout_multiplier, require_arg
+from wptrunner.browsers.base import (
+    WebDriverBrowser,
+    get_timeout_multiplier,  # noqa: F401 -- used via the __wptrunner__ name below
+    require_arg,
+)
 from wptrunner.executors import executor_kwargs as base_executor_kwargs
 from wptrunner.executors.base import PytestExecutor  # noqa: F401
 from wptrunner.executors.executorwebdriver import (
@@ -96,7 +100,15 @@ def env_options():
 
 
 class TinyBrowser(WebDriverBrowser):
-    def __init__(self, logger, binary, webdriver_host="127.0.0.1", binary_args=None, ca_cert_path=None, **kwargs):
+    def __init__(
+        self,
+        logger,
+        binary,
+        webdriver_host="127.0.0.1",
+        binary_args=None,
+        ca_cert_path=None,
+        **kwargs,
+    ):
         args = list(binary_args or [])
         self._profile_root = None
         self._ca_cert_path = ca_cert_path

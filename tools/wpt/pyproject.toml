@@ -13,3 +13,12 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["tinybrowser_wpt"]
+
+[tool.ty.environment]
+# patch_wpt imports upstream only after sys.path gains the WPT checkout at
+# runtime; these paths let ty resolve the same modules statically.
+extra-paths = [
+    "../../third_party/wpt",
+    "../../third_party/wpt/tools/wptrunner",
+    "../../third_party/wpt/tools/wptserve",
+]
