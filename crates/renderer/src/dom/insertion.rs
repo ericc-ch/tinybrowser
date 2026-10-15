@@ -247,7 +247,11 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
                 .document
                 .base
                 .get_node(parent)
-                .and_then(|node| node.children.iter().position(|sibling| *sibling == target.node))
+                .and_then(|node| {
+                    node.children
+                        .iter()
+                        .position(|sibling| *sibling == target.node)
+                })
                 .and_then(|index| u32::try_from(index).ok())
                 .map(|index| (parent, index))
         })
@@ -262,7 +266,10 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
         crate::dom::range::adjust_for_remove(
             base,
             ranges,
-            NodeId { document, node: parent },
+            NodeId {
+                document,
+                node: parent,
+            },
             index,
             target,
         );
@@ -732,6 +739,7 @@ pub(crate) fn ensure_no_cycle(
         cursor = base.get_node(current).and_then(|candidate| {
             candidate.parent.or(match &candidate.data {
                 NodeData::Fragment { host } => *host,
+                NodeData::ShadowRoot { host, .. } => Some(*host),
                 _ => None,
             })
         });
@@ -892,7 +900,9 @@ pub(crate) fn ensure_can_move(
     Ok(())
 }
 
-/// Applies a validated `move`: detaches `node` and places it at `target`.
+/// Applies a validated `move`: reparents `node` without the insertion or
+/// removing steps
+/// (<https://dom.spec.whatwg.org/#concept-node-move>).
 /// The caller owns validity (`ensure_can_move`).
 pub(crate) fn move_parsed(
     parsed: &mut crate::Parsed,
@@ -904,8 +914,91 @@ pub(crate) fn move_parsed(
         MoveTarget::Before(child) => Some(*child),
         MoveTarget::End | MoveTarget::Unparented => None,
     };
-    unlink_journaled(parsed, node);
-    place_journaled(parsed, parent, node, reference);
+    let document = node.document;
+    let (old_parent, previous, next, index) = {
+        let base = &parsed.document.base;
+        let old_parent = base
+            .get_node(node.node)
+            .and_then(|candidate| candidate.parent);
+        let (previous, next) = old_parent.map_or((None, None), |old_parent| {
+            siblings_around(base, document, old_parent, node.node)
+        });
+        let index = if parsed.document.ranges.is_empty() {
+            None
+        } else {
+            old_parent.and_then(|old_parent| {
+                base.get_node(old_parent)
+                    .and_then(|candidate| {
+                        candidate
+                            .children
+                            .iter()
+                            .position(|sibling| *sibling == node.node)
+                    })
+                    .and_then(|index| u32::try_from(index).ok())
+                    .map(|index| (old_parent, index))
+            })
+        };
+        (old_parent, previous, next, index)
+    };
+    parsed
+        .document
+        .base
+        .mutate()
+        .move_node(node.node, parent.node, reference.map(|id| id.node));
+    if let Some((old_parent, index)) = index {
+        let base = &parsed.document.base;
+        let ranges = &mut parsed.document.ranges;
+        crate::dom::range::adjust_for_remove(
+            base,
+            ranges,
+            NodeId {
+                document,
+                node: old_parent,
+            },
+            index,
+            node,
+        );
+    }
+    if let Some(old_parent) = old_parent {
+        parsed.document.record(JournalEntry::ChildList {
+            target: NodeId {
+                document,
+                node: old_parent,
+            },
+            added: Vec::new(),
+            removed: vec![node],
+            previous,
+            next,
+        });
+    }
+    let added_previous = sibling(&parsed.document.base, node.node, false).map(|previous| NodeId {
+        document,
+        node: previous,
+    });
+    parsed.document.record(JournalEntry::ChildList {
+        target: parent,
+        added: vec![node],
+        removed: Vec::new(),
+        previous: added_previous,
+        next: reference,
+    });
+    if reference.is_some() && !parsed.document.ranges.is_empty() {
+        let index = parsed
+            .document
+            .base
+            .get_node(parent.node)
+            .and_then(|candidate| {
+                candidate
+                    .children
+                    .iter()
+                    .position(|sibling| *sibling == node.node)
+            })
+            .and_then(|index| u32::try_from(index).ok());
+        if let Some(index) = index {
+            let ranges = &mut parsed.document.ranges;
+            crate::dom::range::adjust_for_insert(ranges, parent, index, 1);
+        }
+    }
 }
 
 /// The index of `child` under `parent`, or `None` when it has none.

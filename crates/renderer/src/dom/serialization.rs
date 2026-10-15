@@ -197,7 +197,7 @@ fn serialize_html_node(
             serialize_html_element(doc, id, &name, &attributes, output);
         }
         // A fragment serializes as its children.
-        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
+        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => {
             for child in node.children.clone() {
                 serialize_html_node(doc, child, parent, output);
             }
@@ -432,7 +432,7 @@ pub(crate) fn serialize_xml_node(doc: &BlitzDocument, id: BlitzId, output: &mut 
             output.push_str(contents);
             output.push_str("]]>");
         }
-        NodeData::Fragment { .. } => {
+        NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => {
             for child in node.children.clone() {
                 serialize_xml_node(doc, child, output);
             }

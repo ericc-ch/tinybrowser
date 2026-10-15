@@ -1241,32 +1241,110 @@ impl JsNode {
         ctx: Ctx<'js>,
         init: super::element::element_generated::ShadowRootInit,
     ) -> Result<Value<'js>> {
-        let _ = (self, init);
-        // Known gap: Blitz has no shadow DOM, so no element can host a shadow
-        // root. Every call throws instead of handing back a half-built root.
-        Err(throw_dom(
+        let closed = matches!(
+            init.mode,
+            super::element::element_generated::ShadowRootMode::Closed
+        );
+        let id = self.handle.0;
+        let world_rc = world(&ctx)?;
+        let shadow = {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(id) else {
+                return Err(Exception::throw_type(&ctx, "stale node"));
+            };
+            let eligible = parsed
+                .document
+                .base
+                .get_node(id.node)
+                .and_then(|node| node.element_data())
+                .is_some_and(|element| {
+                    element.name.ns == html_namespace()
+                        && valid_shadow_host(element.name.local.as_ref())
+                        && element.shadow_root.is_none()
+                });
+            if !eligible {
+                // A non-HTML element, a name that cannot host a shadow, or an
+                // element that already hosts one
+                // (<https://dom.spec.whatwg.org/#dom-element-attachshadow>).
+                return Err(throw_dom(
+                    &ctx,
+                    "NotSupportedError",
+                    "element cannot host a shadow root",
+                ));
+            }
+            parsed
+                .document
+                .base
+                .mutate()
+                .attach_shadow_root(id.node, closed)
+        };
+        wrap_node(
             &ctx,
-            "NotSupportedError",
-            "shadow DOM is not supported",
-        ))
+            NodeId {
+                document: id.document,
+                node: shadow,
+            },
+        )
     }
 
+    // https://dom.spec.whatwg.org/#dom-element-shadowroot
     pub(super) fn shadow_root<'js>(&self, ctx: &Ctx<'js>) -> Value<'js> {
-        // Known gap: Blitz has no shadow DOM, so elements never host a shadow
-        // root.
-        Value::new_null(ctx.clone())
+        let id = self.handle.0;
+        let found = world(ctx).ok().and_then(|world| {
+            let world = world.borrow();
+            let parsed = world.document(id)?;
+            let node = parsed.document.base.get_node(id.node)?;
+            let element = node.element_data()?;
+            let shadow = element.shadow_root?;
+            let closed = matches!(
+                parsed.document.base.get_node(shadow).map(|node| &node.data),
+                Some(NodeData::ShadowRoot { closed: true, .. })
+            );
+            if closed { None } else { Some(shadow) }
+        });
+        match found {
+            Some(shadow) => wrap_node(
+                ctx,
+                NodeId {
+                    document: id.document,
+                    node: shadow,
+                },
+            )
+            .unwrap_or_else(|_| Value::new_null(ctx.clone())),
+            None => Value::new_null(ctx.clone()),
+        }
     }
 
+    // https://dom.spec.whatwg.org/#dom-shadowroot-host
     pub(super) fn host<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        // Known gap: Blitz has no shadow DOM, so no node is ever a shadow
-        // root. The brand check rejects every receiver first.
-        Err(Exception::throw_type(ctx, "not a shadow root"))
+        let id = self.handle.0;
+        let host = with_node_data(ctx, id, |data| match data {
+            Some(NodeData::ShadowRoot { host, .. }) => Some(*host),
+            _ => None,
+        })?;
+        let Some(host) = host else {
+            return Err(Exception::throw_type(ctx, "not a shadow root"));
+        };
+        wrap_node(
+            ctx,
+            NodeId {
+                document: id.document,
+                node: host,
+            },
+        )
     }
 
+    // https://dom.spec.whatwg.org/#dom-shadowroot-mode
     pub(super) fn mode(&self, ctx: &Ctx<'_>) -> Result<String> {
-        // Known gap: Blitz has no shadow DOM, so no node is ever a shadow
-        // root. The brand check rejects every receiver first.
-        Err(Exception::throw_type(ctx, "not a shadow root"))
+        let id = self.handle.0;
+        let mode = with_node_data(ctx, id, |data| match data {
+            Some(NodeData::ShadowRoot { closed, .. }) => {
+                Some(if *closed { "closed" } else { "open" })
+            }
+            _ => None,
+        })?;
+        mode.map(str::to_owned)
+            .ok_or_else(|| Exception::throw_type(ctx, "not a shadow root"))
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
@@ -2119,4 +2197,67 @@ impl JsNode {
             NodeReference::Attribute { scope, id } => import_attr(&ctx, self.handle.0, scope, id),
         }
     }
+}
+
+/// Names that may host a shadow root, plus a valid custom element name
+/// (<https://html.spec.whatwg.org/multipage/dom.html#valid-shadow-host-name>,
+/// <https://html.spec.whatwg.org/multipage/custom-elements.html#valid-custom-element-name>).
+fn valid_shadow_host(local: &str) -> bool {
+    matches!(
+        local,
+        "article"
+            | "aside"
+            | "blockquote"
+            | "body"
+            | "div"
+            | "footer"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "main"
+            | "nav"
+            | "p"
+            | "section"
+            | "span"
+            | "search"
+    ) || valid_custom_element_name(local)
+}
+
+fn valid_custom_element_name(local: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "annotation-xml",
+        "color-profile",
+        "font-face",
+        "font-face-src",
+        "font-face-uri",
+        "font-face-format",
+        "font-face-name",
+        "missing-glyph",
+    ];
+    if FORBIDDEN.contains(&local) {
+        return false;
+    }
+    let mut chars = local.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    let mut hyphen = false;
+    for ch in local.chars() {
+        if ch == '-' {
+            hyphen = true;
+            continue;
+        }
+        let ok = ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '.');
+        if !ok {
+            return false;
+        }
+    }
+    hyphen
 }

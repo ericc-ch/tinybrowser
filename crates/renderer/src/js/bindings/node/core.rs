@@ -950,7 +950,7 @@ impl JsNode {
             Some(NodeData::Document(_)) => Ok(9),
             Some(NodeData::Doctype { .. }) => Ok(10),
             Some(NodeData::CDataSection { .. }) => Ok(4),
-            Some(NodeData::Fragment { .. }) => Ok(11),
+            Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }) => Ok(11),
             Some(NodeData::AnonymousBlock(_)) | None => {
                 Err(Exception::throw_type(ctx, "stale node"))
             }
@@ -979,7 +979,9 @@ impl JsNode {
             Some(NodeData::ProcessingInstruction { target, .. }) => Ok(target.clone()),
             Some(NodeData::Comment { .. }) => Ok("#comment".into()),
             Some(NodeData::Doctype { name, .. }) => Ok(name.clone()),
-            Some(NodeData::Fragment { .. }) => Ok("#document-fragment".into()),
+            Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }) => {
+                Ok("#document-fragment".into())
+            }
             Some(NodeData::Document(_)) => Ok("#document".into()),
             Some(NodeData::AnonymousBlock(_)) | None => {
                 Err(Exception::throw_type(ctx, "stale node"))
@@ -1190,7 +1192,9 @@ impl JsNode {
             .base
             .get_node(self.handle.0.node)
             .map(|node| match &node.data {
-                NodeData::Element(_) | NodeData::Fragment { .. } => 0u8,
+                NodeData::Element(_)
+                | NodeData::Fragment { .. }
+                | NodeData::ShadowRoot { .. } => 0u8,
                 NodeData::Text(_)
                 | NodeData::Comment { .. }
                 | NodeData::ProcessingInstruction { .. }
@@ -1859,9 +1863,12 @@ pub(super) fn insertion_excluding_children(
         // element case.
         // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
         let parent_is_document = base.root_node().id == parent.node;
-        let parent_is_fragment = base
-            .get_node(parent.node)
-            .is_some_and(|node| matches!(node.data, NodeData::Fragment { .. }));
+        let parent_is_fragment = base.get_node(parent.node).is_some_and(|node| {
+            matches!(
+                node.data,
+                NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }
+            )
+        });
         if !parent_is_document && !is_element(base, parent.node) && !parent_is_fragment {
             return Err(throw_dom(
                 ctx,

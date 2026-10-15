@@ -133,7 +133,7 @@ pub(crate) fn import_snapshot(
             })
         }
         NodeData::CDataSection { .. } => Some(ImportSnapshot::CData(doc.character_data(id.node))),
-        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
+        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => {
             let children = if deep {
                 snapshot_children(doc, id.document, node.children.iter().copied())
             } else {
