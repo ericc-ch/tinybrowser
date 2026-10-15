@@ -52,11 +52,12 @@ const MAX_RUNTIME_STACK: usize = 512 * 1024;
 /// share [`TURN_SCRIPT_BUDGET`] so they cannot each take a full 20 s and
 /// together hit the browser's 60 s renderer request timeout.
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(20);
-/// Wall-clock cap for one renderer turn (a parser script walk, a batch of
-/// init scripts). Each JS entry still uses [`DEFAULT_SCRIPT_BUDGET`], then
-/// clamps to this deadline so N serial runaways stay well under the 60 s
+/// Wall-clock cap for one renderer turn: a parser script walk, a batch of
+/// init scripts, or one drain of ready tasks from the session's inbox wait
+/// back to the next wait. Each JS entry still uses [`DEFAULT_SCRIPT_BUDGET`],
+/// then clamps to this deadline so N serial runaways stay well under the 60 s
 /// request timeout in `crates/browser/src/link.rs`.
-const TURN_SCRIPT_BUDGET: Duration = Duration::from_secs(45);
+pub const TURN_SCRIPT_BUDGET: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy)]
 enum MicrotaskCheckpoint {
@@ -251,6 +252,9 @@ impl JsRealm {
         runtime.set_memory_limit(MAX_RUNTIME_MEMORY);
         runtime.set_max_stack_size(MAX_RUNTIME_STACK);
         let context = Context::full(&runtime)?;
+        // Every realm in the renderer process shares the engine's cell, so
+        // one drain deadline covers tasks that run in frames created later.
+        let turn_deadline = Rc::clone(&world.borrow().runtime.turn_deadline);
         let host = Self {
             runtime,
             context,
@@ -259,7 +263,7 @@ impl JsRealm {
             pending_timeouts: Rc::new(RefCell::new(Vec::new())),
             pending_fetches: Rc::new(RefCell::new(Vec::new())),
             budget_depth: Cell::new(0),
-            turn_deadline: Rc::new(Cell::new(None)),
+            turn_deadline,
         };
         host.install()?;
         Ok(host)
@@ -1326,9 +1330,13 @@ pub(crate) struct ScriptTurn {
 
 impl ScriptTurn {
     fn enter(slot: &Rc<Cell<Option<Instant>>>) -> Self {
+        Self::enter_at(slot, Instant::now() + TURN_SCRIPT_BUDGET)
+    }
+
+    pub(crate) fn enter_at(slot: &Rc<Cell<Option<Instant>>>, deadline: Instant) -> Self {
         let owned = slot.get().is_none();
         if owned {
-            slot.set(Some(Instant::now() + TURN_SCRIPT_BUDGET));
+            slot.set(Some(deadline));
         }
         Self {
             slot: Rc::clone(slot),

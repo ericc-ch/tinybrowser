@@ -67,6 +67,7 @@ impl Engine {
             registry: Rc::new(RefCell::new(RealmRegistry::default())),
             shared: Rc::new(RefCell::new(crate::messaging::Shared::default())),
             pending_storage: Rc::new(RefCell::new(Vec::new())),
+            turn_deadline: Rc::new(std::cell::Cell::new(None)),
             font_ctx: parley::FontContext::default(),
         };
         let main = Document::with_shared(FrameId::MAIN, &runtime, &init_scripts);
@@ -374,8 +375,22 @@ impl Engine {
         Ok(events)
     }
 
-    /// Runs every immediately ready task in every frame. Never blocks.
-    pub fn drain_ready(&mut self) {
+    /// Runs every immediately ready task in every frame until the shared
+    /// script deadline. Never blocks.
+    ///
+    /// Returns whether ready work was left queued because the deadline passed.
+    /// The session then reads its inbox before draining again, so a batch of
+    /// runaway timers cannot hold the renderer past the request timeout.
+    #[must_use]
+    pub fn drain_ready(&mut self) -> bool {
+        self.drain_ready_until(std::time::Instant::now() + crate::TURN_SCRIPT_BUDGET)
+    }
+
+    /// [`Engine::drain_ready`] bounded by `deadline`.
+    ///
+    /// Returns whether ready work remains queued after `deadline`.
+    #[must_use]
+    pub fn drain_ready_until(&mut self, deadline: std::time::Instant) -> bool {
         // Reconcile around every task so a task that inserts an iframe is
         // visible to the next task: `contentDocument` is non-null from the
         // task after the connection, not inside the connecting task itself
@@ -385,12 +400,26 @@ impl Engine {
         // different frames must run in send order, and draining one frame dry
         // would let a later message overtake an earlier one
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#task-queue>).
+        //
+        // One deadline covers the whole drain. Each task still has its own
+        // entry budget, clamped to this instant, and a task that would start
+        // after the instant stays queued.
+        let _turn = self.runtime.open_turn(deadline);
         self.reconcile_frames();
         loop {
+            if self.runtime.stop.is_set() {
+                return false;
+            }
+            if std::time::Instant::now() >= deadline {
+                return self.has_ready_work();
+            }
             self.drain_storage_events();
             let mut ran = false;
             let frames: Vec<FrameId> = self.frames.keys().copied().collect();
             for frame in frames {
+                if std::time::Instant::now() >= deadline {
+                    return self.has_ready_work();
+                }
                 let more = match self.frames.get_mut(&frame) {
                     Some(document) => document.drain_step(),
                     None => false,
@@ -404,6 +433,11 @@ impl Engine {
                 break;
             }
         }
+        false
+    }
+
+    fn has_ready_work(&self) -> bool {
+        self.frames.values().any(Document::has_ready_work)
     }
 
     /// Queues one remote `postMessage` payload on the main frame's task
@@ -663,10 +697,6 @@ impl Engine {
             .tree
             .parent(child)
             .unwrap_or(child);
-        let parent_url = self
-            .frames
-            .get(&parent)
-            .map_or_else(|| String::from("about:blank"), Document::inherited_url);
         let resolved = (!spec.is_empty())
             .then(|| {
                 self.frames
@@ -676,12 +706,12 @@ impl Engine {
             .flatten();
         let Some(url) = resolved else {
             // About:blank, the initial document of every frame without a
-            // usable `src`, inherits the parent's URL here so its origin does
+            // usable `src`, inherits the parent's captured origin
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
             // A frame the engine just created is already on that document;
             // reloading it would throw away its realm and anything a script
             // has already set on it.
-            self.keep_initial_blank(child, &parent_url);
+            self.keep_initial_blank(child, parent);
             self.mark_frame_load_pending(container, parent);
             return;
         };
@@ -691,14 +721,26 @@ impl Engine {
 
     /// Keeps a frame's initial `about:blank` document while it still has one,
     /// so a script-set realm survives; otherwise installs the inherited blank.
-    fn keep_initial_blank(&mut self, child: FrameId, parent_url: &str) {
-        if !self
+    fn keep_initial_blank(&mut self, child: FrameId, parent: FrameId) {
+        let inherited = self.frames.get(&parent).map(|document| {
+            (
+                document.inherited_url(),
+                document.world().borrow().origin.clone(),
+            )
+        });
+        if self
             .frames
             .get(&child)
             .is_some_and(Document::is_initial_blank)
-            && let Some(document) = self.frames.get_mut(&child)
         {
-            document.load_about_blank(Some(parent_url));
+            return;
+        }
+        let Some(document) = self.frames.get_mut(&child) else {
+            return;
+        };
+        match inherited {
+            Some((url, origin)) => document.load_about_blank(Some(&url), Some(origin)),
+            None => document.load_about_blank(Some("about:blank"), None),
         }
     }
 
@@ -713,12 +755,8 @@ impl Engine {
         body: &[u8],
         content_type: Option<&str>,
     ) {
-        let parent_url = self
-            .frames
-            .get(&parent)
-            .map_or_else(|| String::from("about:blank"), Document::inherited_url);
         match url.scheme() {
-            "about" => self.keep_initial_blank(child, &parent_url),
+            "about" => self.keep_initial_blank(child, parent),
             "data" => {
                 if let Some((content_type, body)) = decode_data_url(url.as_str()) {
                     if let Some(document) = self.frames.get_mut(&child) {
@@ -729,7 +767,7 @@ impl Engine {
                     // stays on its current document
                     // (<https://fetch.spec.whatwg.org/#data-url-processor>).
                     if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_about_blank(None);
+                        document.load_about_blank(None, None);
                     }
                 }
             }
@@ -770,23 +808,28 @@ impl Engine {
                 // A missing Blob URL Store entry is a network error, not an
                 // empty document at the URL's claimed origin
                 // (<https://w3c.github.io/FileAPI/#blob-uri-get>).
+                // The child's origin is the entry's creator, not
+                // `Url::origin()` of the blob URL
+                // (<https://w3c.github.io/FileAPI/#blob-url-entry>).
                 let mut key = url.clone();
                 key.set_fragment(None);
-                let Some((contents, content_type)) =
-                    self.frames.get(&parent).and_then(|document| {
-                        Some((
-                            document.object_url_contents(key.as_str())?,
-                            document.object_url_type(key.as_str()),
-                        ))
-                    })
-                else {
+                let loaded = self.frames.get(&parent).and_then(|document| {
+                    let key = key.as_str();
+                    Some((
+                        document.object_url_contents(key)?,
+                        document.object_url_type(key),
+                        document.object_url_origin(key)?,
+                    ))
+                });
+                let Some((contents, content_type, origin)) = loaded else {
                     return;
                 };
                 if let Some(document) = self.frames.get_mut(&child) {
-                    document.load_frame_response(
+                    document.load_frame_response_with_origin(
                         &url,
                         content_type.as_deref(),
                         contents.as_bytes(),
+                        origin,
                     );
                 }
             }
@@ -823,7 +866,7 @@ impl Engine {
             }
             _ => {
                 if let Some(document) = self.frames.get_mut(&child) {
-                    document.load_about_blank(None);
+                    document.load_about_blank(None, None);
                 }
             }
         }
@@ -1091,7 +1134,8 @@ impl Engine {
 /// An empty MIME defaults to `text/plain;charset=US-ASCII`, as the Fetch
 /// processor requires; every success carries a MIME, so callers never see
 /// `None` content types from this function.
-pub(crate) fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
+#[must_use]
+pub fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
     let url = data_url::DataUrl::process(raw).ok()?;
     let (body, _fragment) = url.decode_to_vec().ok()?;
     Some((url.mime_type().to_string(), body))

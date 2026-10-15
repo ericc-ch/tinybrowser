@@ -1278,11 +1278,14 @@ impl JsNode {
         let root = world.borrow().frame_document(self.handle.0);
         match root {
             Some(root) => {
-                let parent_origin = world.borrow().document_url.origin();
+                // Captured origins: `Url::origin()` is a new opaque value for
+                // `about:blank`, `data:`, and `blob:`
+                // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+                let parent_origin = world.borrow().origin.clone();
                 let child_origin = world
                     .borrow()
                     .owner_world(root)
-                    .map(|child| child.borrow().document_url.origin());
+                    .map(|child| child.borrow().origin.clone());
                 if child_origin.is_some_and(|origin| origin == parent_origin) {
                     wrap_node(&ctx, root)
                 } else {
@@ -1627,7 +1630,10 @@ pub(super) fn place_adjacent_rest(
 /// The base URL and shared font context a fragment scratch document parses
 /// under: the live document's base, so eager subresource loads resolve
 /// instead of panicking in Blitz. Falls back closed when the document is gone.
-pub(in crate::js::bindings) fn fragment_base_url(ctx: &Ctx<'_>, id: NodeId) -> (String, parley::FontContext) {
+pub(in crate::js::bindings) fn fragment_base_url(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+) -> (String, parley::FontContext) {
     world(ctx)
         .ok()
         .and_then(|world| {

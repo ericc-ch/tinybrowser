@@ -764,7 +764,7 @@ impl Tab {
         let url = Url::parse(spec)
             .or_else(|_| self.document_url.join(spec))
             .map_err(|_| TabError::InvalidUrl { spec: spec.into() })?;
-        if url.scheme() != "http" && url.scheme() != "https" {
+        if !matches!(url.scheme(), "http" | "https" | "data") {
             return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
@@ -939,6 +939,60 @@ impl Tab {
             .or_else(|| self.site.clone())
             .unwrap_or_else(|| Site::opaque(self.id));
         self.mount(&site, 200, mount).await
+    }
+
+    /// Takes a pending `data:` navigation so it can be committed without a dial.
+    ///
+    /// `data:` is decoded in-process
+    /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
+    fn take_data_navigation(&mut self) -> Option<Url> {
+        let data = self
+            .nav
+            .as_ref()
+            .is_some_and(|nav| !nav.submitted && nav.url.scheme() == "data");
+        if !data {
+            return None;
+        }
+        self.nav.take().map(|nav| nav.url)
+    }
+
+    /// Mounts a `data:` document as the top-level page.
+    async fn commit_data_navigation(&mut self, url: Url) -> bool {
+        let Some((content_type, body)) = renderer::decode_data_url(url.as_str()) else {
+            self.navigation_failed = true;
+            return false;
+        };
+        if body.len() > MAX_RESPONSE_BODY_BYTES {
+            self.navigation_failed = true;
+            return false;
+        }
+        let site = Site::for_url(&url).unwrap_or_else(|| Site::opaque(self.id));
+        let mut history = self.history.clone();
+        if !history.navigate(url.clone(), self.traversal.take()) {
+            self.navigation_failed = true;
+            return false;
+        }
+        let mount = Mount {
+            url: url.to_string(),
+            content_type: Some(content_type),
+            body,
+            history: history.snapshot(),
+            viewport: Some(self.viewport),
+            init_scripts: self.init_scripts.clone(),
+        };
+        if let Err(error) = self.mount(&site, 200, mount).await {
+            logging::error!(
+                target: "browser::tab",
+                "data navigation mount failed for {}: {error}",
+                log_url(&url)
+            );
+            self.navigation_failed = true;
+            return false;
+        }
+        self.history = history;
+        self.document_url = url;
+        self.navigation_failed = false;
+        true
     }
 
     fn launch_navigation(&mut self) {
@@ -1177,6 +1231,16 @@ async fn coordinator_loop(
     let mut cancelled_order = VecDeque::new();
     let mut delivery_rx = Some(delivery_rx);
     loop {
+        if let Some(url) = tab.take_data_navigation() {
+            let mounted = tab.commit_data_navigation(url).await;
+            tab.record_event(if mounted {
+                TabEvent::Navigated
+            } else {
+                TabEvent::NavigationFailed
+            })
+            .await;
+            continue;
+        }
         tab.launch_navigation();
         let deadline = next_waiter_deadline(&waiters);
         let wake = {

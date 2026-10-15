@@ -5,10 +5,13 @@
 //! engine events and replies become wire messages.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
 
-use renderer::{Engine, FrameId, MAX_RESPONSE_BODY_BYTES, ResponseHead, Stop, TabError};
+use renderer::{
+    Engine, FrameId, MAX_RESPONSE_BODY_BYTES, ResponseHead, Stop, TURN_SCRIPT_BUDGET, TabError,
+};
 use tokio::sync::Notify;
 
 use super::{AssignmentServices, ChannelServices};
@@ -40,28 +43,56 @@ pub(super) async fn run(
     let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
     let mut responses = ResponseStreams::default();
     loop {
-        if !drain_engines(&mut engines, outbox) || stop.is_set() {
+        if stop.is_set() {
             stop.request();
             break;
         }
-        let deadline = engines.values().filter_map(Engine::next_deadline).min();
-        tokio::select! {
-            received = inbox.recv() => {
-                if !handle_host(
-                    received,
-                    &mut engines,
-                    &mut responses,
-                    outbox,
-                    &services,
-                    stop,
-                    &wake,
-                ) {
-                    stop.request();
-                    break;
+        match drain_engines(&mut engines, outbox) {
+            Drained::Failed => {
+                stop.request();
+                break;
+            }
+            // The script deadline passed with ready work still queued. Read
+            // one waiting command, then drain again, so the inbox is serviced
+            // between slices instead of after every timer has run.
+            Drained::Yielded => match poll_inbox(&mut inbox).await {
+                Polled::Empty => {}
+                Polled::Received(received) => {
+                    if !handle_host(
+                        received,
+                        &mut engines,
+                        &mut responses,
+                        outbox,
+                        &services,
+                        stop,
+                        &wake,
+                    ) {
+                        stop.request();
+                        break;
+                    }
+                }
+            },
+            Drained::Idle => {
+                let deadline = engines.values().filter_map(Engine::next_deadline).min();
+                tokio::select! {
+                    received = inbox.recv() => {
+                        if !handle_host(
+                            received,
+                            &mut engines,
+                            &mut responses,
+                            outbox,
+                            &services,
+                            stop,
+                            &wake,
+                        ) {
+                            stop.request();
+                            break;
+                        }
+                    }
+                    () = wake.notified() => {}
+                    () = wait_for_deadline(deadline) => {}
                 }
             }
-            () = wake.notified() => {}
-            () = wait_for_deadline(deadline) => {}
         }
     }
     for (_, mut engine) in engines {
@@ -292,18 +323,58 @@ fn queue_storage_event(
     }
 }
 
-/// Runs every engine's ready work and publishes what it produced.
+/// What one drain of every engine produced.
+enum Drained {
+    /// Nothing ready remains; wait for the inbox, a wake, or a timer.
+    Idle,
+    /// The shared script deadline passed with ready work still queued.
+    Yielded,
+    /// Publishing an engine's events failed.
+    Failed,
+}
+
+/// One non-blocking look at the host inbox.
+enum Polled {
+    /// No frame is waiting.
+    Empty,
+    /// A frame, or `None` when the inbox is closed.
+    Received(Option<ToRenderer>),
+}
+
+/// Reads a host frame if one is already queued.
+async fn poll_inbox(inbox: &mut exchange::Receiver<ToRenderer>) -> Polled {
+    tokio::select! {
+        biased;
+        received = inbox.recv() => Polled::Received(received),
+        () = ready(()) => Polled::Empty,
+    }
+}
+
+/// Runs every engine's ready work under one script deadline and publishes
+/// what it produced.
 fn drain_engines(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     outbox: &exchange::BlockingSender<FromRenderer>,
-) -> bool {
+) -> Drained {
+    let deadline = std::time::Instant::now() + TURN_SCRIPT_BUDGET;
+    let mut yielded = false;
     for (assignment, engine) in engines {
-        engine.drain_ready();
+        if std::time::Instant::now() >= deadline {
+            yielded = true;
+            break;
+        }
+        if engine.drain_ready_until(deadline) {
+            yielded = true;
+        }
         if !publish(*assignment, engine, outbox) {
-            return false;
+            return Drained::Failed;
         }
     }
-    true
+    if yielded {
+        Drained::Yielded
+    } else {
+        Drained::Idle
+    }
 }
 
 /// One streamed top-level response: which engine and frame it feeds, and how

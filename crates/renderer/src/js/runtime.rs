@@ -5,10 +5,11 @@
 //! beside the realm bookkeeping it carries so that `document` and `engine`
 //! read it from below rather than defining it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use tokio::sync::Notify;
 
@@ -33,10 +34,22 @@ pub(crate) struct FrameRuntime {
     /// Storage changes waiting for the `storage`-event task in their receiving
     /// frames.
     pub(crate) pending_storage: Rc<RefCell<Vec<crate::storage::PendingStorageEvent>>>,
+    /// Deadline for the current renderer turn, shared by every realm. A drain
+    /// sets it once; serial tasks clamp to it instead of each taking a fresh
+    /// budget (`ScriptTurn`).
+    pub(crate) turn_deadline: Rc<Cell<Option<Instant>>>,
     /// Parley's font context, built once per process: construction scans
     /// system fonts (~25ms), so every `BaseDocument` clones this instead of
     /// rescanning. Cloning is cheap; Blitz shares the source cache.
     pub(crate) font_ctx: parley::FontContext,
+}
+
+impl FrameRuntime {
+    /// Opens one turn on the shared deadline. Nested enters join it; dropping
+    /// the owner clears the cell.
+    pub(crate) fn open_turn(&self, deadline: Instant) -> super::ScriptTurn {
+        super::ScriptTurn::enter_at(&self.turn_deadline, deadline)
+    }
 }
 
 /// Stop flag shared by a renderer loop, the JS interrupt handler, and dials.

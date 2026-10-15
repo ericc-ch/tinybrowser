@@ -33,7 +33,7 @@ impl EmbeddedRenderer {
     /// The engine rejected the mount.
     pub fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
         self.engine.mount_frame(FrameId::MAIN, mount)?;
-        self.engine.drain_ready();
+        let _yielded = self.engine.drain_ready();
         Ok(())
     }
 
@@ -62,7 +62,7 @@ impl EmbeddedRenderer {
 
     /// Runs every immediately ready page task without blocking.
     pub fn drain_ready(&mut self) {
-        self.engine.drain_ready();
+        let _yielded = self.engine.drain_ready();
     }
 
     /// Removes and returns all pending main-frame events.

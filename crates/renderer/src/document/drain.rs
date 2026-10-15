@@ -23,11 +23,24 @@ impl Document {
         self.launch_queued_dials();
         self.adopt_dial_completions();
         if let Some(task) = self.tasks.pop_front() {
+            // Joins the drain's turn when one is open, so serial tasks share
+            // its deadline. A task outside a drain still opens its own turn.
             let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
             self.run_task(task);
             return !self.stop.is_set();
         }
         false
+    }
+
+    /// Whether a task is queued or a timer is already due.
+    pub(crate) fn has_ready_work(&self) -> bool {
+        if !self.tasks.is_empty() {
+            return true;
+        }
+        let now = Instant::now();
+        self.timers
+            .iter()
+            .any(|timer| !timer.fired && timer.when <= now)
     }
 
     fn adopt_dial_completions(&mut self) {
