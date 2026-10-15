@@ -1,9 +1,9 @@
 # WPT harness
 
 tools/wpt/run runs wpt run against tinybrowser. All logic in
-tools/wpt/cli.py (run | score | rerun | merge | overnight | selftest).
-Builds the wpt-profile binary via cargo each run; TINYBROWSER_BINARY
-uses a prebuilt binary as-is.
+tools/wpt/cli.py (run | score | rerun | merge | manifest | overnight |
+selftest). Builds the wpt-profile binary via cargo each run;
+TINYBROWSER_BINARY uses a prebuilt binary as-is.
 
     nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
     nix develop --command ./tools/wpt/run --score dom/nodes/ -- --processes 4

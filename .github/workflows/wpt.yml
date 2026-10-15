@@ -4,11 +4,13 @@
 # rerunning anything.
 #
 # Shape: one build (stylo makes a cold build long) fans the same wpt-profile
-# binary out to `chunks` jobs. Each job runs one upstream dir_hash chunk of
-# the manifest (wptrunner hashes the test directory, so a directory is never
-# split across jobs); the score job folds the reports into one table on the
-# run page. CARGO_PROFILE_WPT_DEBUG=false is a CI-only tweak for the 14 GB
-# runner disk: the wpt profile keeps its assertions either way.
+# binary out to `chunks` jobs, and walks the test tree once (cli.py
+# manifest) so chunk jobs can skip that walk. Each job runs one upstream
+# dir_hash chunk of the shared manifest (wptrunner hashes the test
+# directory, so a directory is never split across jobs); the score job folds
+# the reports into one table on the run page. A chunk that died before
+# writing its report is skipped there with a warning, turns the run red, and
+# its raw log still says how far it got.
 #
 # Defaults: the four test types tinybrowser can run today (testharness,
 # crashtest, reftest, test262) over the whole tree. print-reftest is out (no
@@ -23,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       chunks:
-        description: Matrix size; mirrors upstream --total-chunks.
+        description: Matrix size; mirrors upstream --total-chunks (1..256).
         type: string
         default: "20"
       test-types:
@@ -39,13 +41,16 @@ permissions:
   contents: read
 
 concurrency:
-  # One live run per ref; a new dispatch supersedes the old one.
+  # Queue, never cancel: a long run must not die because dispatch was hit
+  # twice, and a cancelled run uploads no artifacts at all.
   group: wpt-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_WPT_DEBUG: "false"
+  # Line tables keep panic and crash backtraces usable (file:line) at a
+  # fraction of full debuginfo; the 14 GB runner disk stays comfortable.
+  CARGO_PROFILE_WPT_DEBUG: "line-tables-only"
   # Mirrors the flake devShell: link the runner's OpenSSL instead of building
   # a vendored copy (the vendored one needs perl and minutes, and links the
   # static copy where local builds link the system one).
@@ -62,7 +67,12 @@ jobs:
         name: Build the chunk list
         env:
           CHUNKS: ${{ inputs.chunks }}
-        run: echo "chunks=[$(seq -s, 1 "$CHUNKS")]" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ ! "$CHUNKS" =~ ^[1-9][0-9]*$ ]] || (( CHUNKS > 256 )); then
+            echo "::error::chunks must be an integer in 1..256 (got '$CHUNKS')"
+            exit 1
+          fi
+          echo "chunks=[$(seq -s, 1 "$CHUNKS")]" >> "$GITHUB_OUTPUT"
 
   build:
     runs-on: ubuntu-24.04
@@ -75,9 +85,20 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends
           libfontconfig1-dev libssl-dev pkg-config
       - name: Submodules (build inputs only, shallow)
-        run: >
-          git submodule update --init --recursive --depth 1 --jobs 4
-          third_party/blitz third_party/rquickjs third_party/html5ever
+        run: |
+          git submodule update --init --depth 1 --jobs 4 \
+            third_party/blitz third_party/rquickjs third_party/html5ever
+          # rquickjs needs its nested quickjs; html5ever's rcdom fixtures
+          # are test data, so recursing into everything only costs time.
+          git -C third_party/rquickjs submodule update --init --depth 1 sys/quickjs
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
       - name: Build the wpt profile
         run: |
           cargo build --profile wpt --locked
@@ -90,10 +111,27 @@ jobs:
             echo "::error::missing runtime libraries in the runner image:"$'\n'"$missing"
             exit 1
           fi
+      - uses: astral-sh/setup-uv@v10.3.0
+      - name: WPT manifest (built once for every chunk)
+        run: |
+          git submodule update --init --depth 1 third_party/wpt
+          python3 tools/wpt/cli.py manifest
+          mkdir -p wpt-manifest
+          cp third_party/wpt/MANIFEST.json wpt-manifest/
+          if compgen -G "$HOME/.cache/tinybrowser/wpt-manifest-*.stamp" > /dev/null; then
+            cp "$HOME"/.cache/tinybrowser/wpt-manifest-*.stamp wpt-manifest/
+          else
+            echo "::warning::no manifest stamp; every chunk will walk the tree itself"
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: tinybrowser-wpt
           path: tinybrowser-wpt
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wpt-manifest
+          path: wpt-manifest/
           retention-days: 3
 
   wpt:
@@ -109,28 +147,58 @@ jobs:
       - uses: actions/checkout@v7
       - name: WPT checkout (pinned, shallow)
         run: git submodule update --init --depth 1 third_party/wpt
-      # uv materializes CPython 3.12 and the adapter venv on first use;
-      # the chunk itself never compiles.
+      # uv materializes CPython and the adapter venv on first use; the chunk
+      # itself never compiles.
       - uses: astral-sh/setup-uv@v10.3.0
       - uses: actions/download-artifact@v8
         with:
           name: tinybrowser-wpt
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: wpt-manifest
+          path: wpt-manifest
+      - name: Shared manifest (skips the per-chunk tree walk)
+        run: |
+          if [[ -f wpt-manifest/MANIFEST.json ]]; then
+            cp wpt-manifest/MANIFEST.json third_party/wpt/MANIFEST.json
+          else
+            echo "::warning::no shared manifest; this chunk walks the tree itself"
+          fi
+          mkdir -p "$HOME/.cache/tinybrowser"
+          cp wpt-manifest/*.stamp "$HOME/.cache/tinybrowser/" 2>/dev/null \
+            || echo "::warning::no manifest stamp; this chunk walks the tree itself"
       - name: Run chunk ${{ matrix.chunk }}
+        # Deliberately below the job timeout: a step timeout fails the step
+        # (later steps still run) instead of cancelling the job, and the
+        # streaming raw log already holds everything the chunk finished.
+        timeout-minutes: 135
         env:
           TINYBROWSER_BINARY: ${{ github.workspace }}/tinybrowser-wpt
           REPORT: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.json
+          RAW: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.raw.log
           EXCLUDES: ${{ inputs.exclude }}
+          TEST_TYPES: ${{ inputs.test-types }}
+          CHUNKS: ${{ inputs.chunks }}
         run: |
+          set -euo pipefail
           chmod +x "$TINYBROWSER_BINARY"
           excludes=()
-          for value in $EXCLUDES; do excludes+=(--exclude="$value"); done
+          for value in $EXCLUDES; do excludes+=("--exclude=$value"); done
+          types=()
+          for value in $TEST_TYPES; do types+=("$value"); done
+          if (( ${#types[@]} == 0 )); then
+            echo "::error::test-types is empty; nothing would run"
+            exit 1
+          fi
           ./tools/wpt/run -- \
             --log-wptreport "$REPORT" \
+            --log-raw "$RAW" \
             --no-fail-on-unexpected \
-            --total-chunks "${{ inputs.chunks }}" \
+            --total-chunks "$CHUNKS" \
             --this-chunk "${{ matrix.chunk }}" \
             "${excludes[@]}" \
-            --test-types ${{ inputs.test-types }}
+            --test-types "${types[@]}"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
@@ -138,6 +206,14 @@ jobs:
           path: wpt-report-${{ matrix.chunk }}.json
           if-no-files-found: error
           retention-days: 7
+      - name: Raw log (partial chunks still explain themselves)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: wpt-raw-${{ matrix.chunk }}
+          path: wpt-report-${{ matrix.chunk }}.raw.log
+          if-no-files-found: ignore
+          retention-days: 3
 
   score:
     name: score
@@ -164,16 +240,24 @@ jobs:
             echo "::error::no chunk reports to merge"
             exit 1
           fi
-          python3 tools/wpt/cli.py merge "${reports[@]}" --out merged.json | tee summary.txt
+          # --strict-skips: an empty or truncated chunk report still lets the
+          # table render, but turns the run red instead of hiding the chunk.
+          python3 tools/wpt/cli.py merge --strict-skips "${reports[@]}" \
+            --out merged.json | tee summary.txt
           if (( ${#reports[@]} != CHUNKS )); then
             echo "::error::incomplete run: ${#reports[@]} of $CHUNKS chunk reports"
             exit 1
           fi
       - name: Run page summary
         if: ${{ !cancelled() && hashFiles('summary.txt') != '' }}
+        env:
+          TEST_TYPES: ${{ inputs.test-types }}
+          CHUNKS: ${{ inputs.chunks }}
+          EXCLUDE: ${{ inputs.exclude }}
         run: |
           {
-            echo "## WPT — ${{ inputs.test-types }} (${{ inputs.chunks }} chunks, exclude: ${{ inputs.exclude }})"
+            printf '## WPT — %s (%s chunks, exclude: %s)\n' \
+              "$TEST_TYPES" "$CHUNKS" "$EXCLUDE"
             echo
             echo '```'
             cat summary.txt

@@ -7,6 +7,7 @@ scheduling, driving, and reporting. This file owns the phases around it:
 * `score`  — run a set, then print one row per directory + attention list.
 * `rerun`  — re-run only the attention set from a saved wptreport.
 * `merge`  — fold the chunk reports of a CI run into one score.
+* `manifest` — one manifest walk for a chunked CI run (build job).
 * `overnight` — full-suite run + score (needs explicit approval per AGENTS.md).
 
 `tinybrowser_wpt.py` stays separate: upstream imports it as the
@@ -24,9 +25,11 @@ Grammar (all subcommands): test paths and our flags come first; a literal
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import heapq
+import io
 import json
 import os
 import re
@@ -687,36 +690,41 @@ def parse_rerun_argv(
     return report, include_timeout, dry_run, save_report, [], None
 
 
-def parse_merge_argv(argv: list[str]) -> tuple[list[Path], Path | None, str | None]:
+def parse_merge_argv(
+    argv: list[str],
+) -> tuple[list[Path], Path | None, bool, str | None]:
     reports: list[Path] = []
     out: Path | None = None
+    strict = False
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "--out" or arg.startswith("--out="):
             if arg == "--out":
                 if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
-                    return reports, None, "--out needs a file"
+                    return reports, None, strict, "--out needs a file"
                 out = Path(argv[i + 1])
                 i += 1
             else:
                 value = arg.split("=", 1)[1]
                 if not value:
-                    return reports, None, "--out needs a file"
+                    return reports, None, strict, "--out needs a file"
                 out = Path(value)
+        elif arg == "--strict-skips":
+            strict = True
         elif arg.startswith("-"):
             return (
                 reports,
                 out,
-                f"merge takes report files, not {arg} "
-                "(chunk flags belong to `run`)",
+                strict,
+                f"merge takes report files, not {arg} (chunk flags belong to `run`)",
             )
         else:
             reports.append(Path(arg))
         i += 1
-    if len(reports) < 2:
-        return reports, out, "merge needs at least two report files"
-    return reports, out, None
+    if not reports:
+        return reports, out, strict, "merge needs at least one report file"
+    return reports, out, strict, None
 
 
 # --- report primitives (score + rerun share these) ---
@@ -802,6 +810,9 @@ def summarize(report: Path) -> int:
 
 
 def summarize_results(results: list[dict]) -> int:
+    if not results:
+        eprint("no results to summarize")
+        return 1
     rows, attention = classify_results(results)
     width = max(len(name) for name in rows)
     header = (
@@ -868,46 +879,145 @@ def rerun_status(remaining: int, runner_exit: int) -> tuple[int, bool]:
 # --- `merge` (chunk reports of a CI run -> one report, one score) ---
 
 
-def read_report_results(report: Path) -> tuple[list[dict], str | None]:
+def load_report(report: Path) -> tuple[dict | None, str | None]:
+    """The parsed chunk report, or why it cannot be used at all.
+
+    wptreport only materializes its JSON at suite_end, so a chunk whose
+    harness died early (job/step timeout, segfault, wptserve failing to
+    bind) leaves an empty or truncated file. `merge` treats that as a
+    skipped report: the score job's report-count check is what fails the
+    run, and one bad file must not cost the table for the other chunks.
+    """
     try:
-        data = json.loads(report.read_text())
+        text = report.read_text()
     except OSError as error:
-        return [], f"cannot read report {report}: {error}"
+        return None, f"cannot read {report}: {error}"
+    try:
+        data = json.loads(text)
     except json.JSONDecodeError as error:
-        return [], f"report {report} is not valid JSON ({error})"
-    results = data.get("results") or []
-    if not results:
-        return [], f"no results in report {report}"
-    return results, None
+        return None, f"{report} is not valid JSON ({error})"
+    if not isinstance(data, dict):
+        return None, f"{report} is not a wptreport object ({type(data).__name__})"
+    return data, None
+
+
+def fold_reports(
+    loaded: list[tuple[Path, dict]],
+) -> tuple[dict | None, list[str], str | None]:
+    """Fold per-chunk wptreports into one, preserving run metadata.
+
+    Returns (merged, warnings, error). The only hard error is a duplicate
+    `test`/`subsuite` pair: upstream dir_hash chunking puts every test in
+    exactly one chunk, so an overlap means the chunking and the reports
+    disagree and folding would double-count. run_info and subsuites come
+    from the first report that has them (chunk jobs are separate runners;
+    a disagreement is a warning), and the time bounds span every report.
+    """
+    results: list[dict] = []
+    where: dict[tuple[str, str], int] = {}
+    warnings: list[str] = []
+    run_info: dict | None = None
+    subsuites: dict = {}
+    starts: list[float] = []
+    ends: list[float] = []
+    empty: list[Path] = []
+    for index, (report, data) in enumerate(loaded):
+        chunk = data.get("results")
+        if chunk is None:
+            chunk = []
+        if not isinstance(chunk, list):
+            warnings.append(f"{report}: results is not a list; skipped")
+            continue
+        if not chunk:
+            # A chunk legitimately runs zero tests (narrow test-types, big
+            # chunks value, everything excluded); warn, never fail.
+            empty.append(report)
+        for result in chunk:
+            if not isinstance(result, dict) or not result.get("test"):
+                return None, warnings, f"a result in {report} has no test id"
+            key = (result.get("subsuite") or "", result["test"])
+            if key in where:
+                first = where[key]
+                if first == index:
+                    return None, warnings, f"{result['test']} appears twice in {report}"
+                return (
+                    None,
+                    warnings,
+                    f"{result['test']} appears in {loaded[first][0]} and {report}",
+                )
+            where[key] = index
+            results.append(result)
+        info = data.get("run_info")
+        if isinstance(info, dict):
+            if run_info is None:
+                run_info = info
+            elif info != run_info:
+                warnings.append(f"{report}: run_info differs from the first report")
+        elif info is not None:
+            warnings.append(f"{report}: run_info is not an object; ignored")
+        for key, value in (data.get("subsuites") or {}).items():
+            if key not in subsuites:
+                subsuites[key] = value
+            elif subsuites[key] != value:
+                warnings.append(f"{report}: subsuite {key!r} differs; first wins")
+        for name, times in (("time_start", starts), ("time_end", ends)):
+            value = data.get(name)
+            if isinstance(value, (int, float)):
+                times.append(value)
+    if empty:
+        warnings.append("no results in " + ", ".join(str(report) for report in empty))
+    # subsuites entries carry their own verdicts upstream; the empty
+    # subsuite is the only one today and says nothing beyond its key.
+    merged: dict = {
+        "results": sorted(
+            results, key=lambda result: (result.get("subsuite") or "", result["test"])
+        )
+    }
+    if run_info is not None:
+        merged["run_info"] = run_info
+    if subsuites:
+        merged["subsuites"] = subsuites
+    if starts:
+        merged["time_start"] = min(starts)
+    if ends:
+        merged["time_end"] = max(ends)
+    return merged, warnings, None
 
 
 def merge_main(argv: list[str]) -> int:
-    reports, out, error = parse_merge_argv(argv)
+    reports, out, strict, error = parse_merge_argv(argv)
     if error:
         return die("merge", error, 2)
-    results: list[dict] = []
-    seen: set[str] = set()
+    loaded: list[tuple[Path, dict]] = []
+    skipped = 0
     for report in reports:
-        chunk, error = read_report_results(report)
-        if error:
-            return die("merge", error, 2)
-        for result in chunk:
-            test = result.get("test")
-            if not test:
-                return die("merge", f"a result in {report} has no test id", 2)
-            if test in seen:
-                # Upstream dir_hash chunking puts every test in exactly one
-                # chunk, so an overlap means the chunking and the reports
-                # disagree; folding anyway would double-count the test.
-                return die("merge", f"{test} appears in more than one report", 2)
-            seen.add(test)
-            results.append(result)
-    results.sort(key=lambda result: result["test"])
+        data, problem = load_report(report)
+        if data is None:
+            eprint(f"wpt: merge: skipping {problem}")
+            skipped += 1
+            continue
+        loaded.append((report, data))
+    if not loaded:
+        return die("merge", f"no usable report among {len(reports)}", 2)
+    merged, warnings, error = fold_reports(loaded)
+    for warning in warnings:
+        eprint(f"wpt: merge: {warning}")
+    if error:
+        return die("merge", error, 2)
+    assert merged is not None
     if out is not None:
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"results": results}))
-        eprint(f"merged {len(reports)} reports -> {out} ({len(results)} results)")
-    return summarize_results(results)
+        out.write_text(json.dumps(merged))
+        eprint(
+            f"merged {len(loaded)} reports -> {out} ({len(merged['results'])} results)"
+        )
+    code = summarize_results(merged["results"])
+    if strict and skipped:
+        # The table is out and --out is written; the caller (CI score job)
+        # turns an unusable chunk report into a red run without losing it.
+        eprint(f"wpt: merge: {skipped} of {len(reports)} chunk reports were unusable")
+        return code or 2
+    return code
 
 
 # --- longest-first split (durations from earlier runs) ---
@@ -1415,6 +1525,71 @@ def run_main(argv: list[str]) -> int:
     return run_wpt(wpt, venv, exe, binary, [*paths, *final], manifest, record)
 
 
+# --- `manifest` (one walk for a whole chunked CI run) ---
+
+
+def manifest_main(argv: list[str]) -> int:
+    """`manifest` — build MANIFEST.json and its stamp once per CI run.
+
+    A chunked CI run has one build job and N chunk jobs; without this,
+    every chunk walks the whole test tree to rebuild the manifest. The
+    build job runs this and uploads both files; each chunk drops them into
+    place, cli.py's staleness check (same HEAD, same clean tree, same
+    manifest) passes --no-manifest-update, and the walk happens once. The
+    stamp is only an optimization: a stamp that does not match makes
+    chunks walk exactly as they did before.
+    """
+    if argv:
+        return die("manifest", "manifest takes no arguments", 2)
+    wpt = resolve_wpt_root()
+    if not (wpt / "wpt").is_file():
+        eprint(f"WPT checkout not found at {wpt}")
+        eprint("Initialize it with: git submodule update --init third_party/wpt")
+        eprint("or point TINYBROWSER_WPT_ROOT at an initialized checkout.")
+        return 1
+    wpt = Path(os.path.realpath(wpt))
+    os.environ["TINYBROWSER_WPT_ROOT"] = str(wpt)
+    if check_pin(wpt) != 0:
+        return 1
+    venv = Path(os.environ.get("TINYBROWSER_WPT_VENV") or wpt / "_venv3")
+    eprint(f"wpt: {wpt}")
+    eprint(f"venv: {venv}")
+    ensure_venv(wpt, venv)
+    exe = venv_python(venv)
+    os.chdir(wpt)
+    try:
+        os.execv(str(exe), [str(exe), str(CLI), "_manifest"])
+    except OSError as error:
+        return die("manifest", f"cannot exec {exe}: {error}")
+    raise AssertionError("unreachable")
+
+
+def manifest_inner_main(argv: list[str]) -> int:
+    """The `manifest` body, under the venv python (manifest has its own
+    requirements). The tree snapshot is taken before the walk: the stamp
+    must describe the tree the walk saw, not what the run left behind."""
+    if argv:
+        return die("manifest", "manifest takes no arguments", 2)
+    wpt = Path(os.environ["TINYBROWSER_WPT_ROOT"])
+    manifest = wpt / "MANIFEST.json"
+    tree_before = tree_state(wpt)
+    try:
+        sys.path.insert(0, str(wpt))
+        # Upstream's bootstrap puts tools/third_party (atomicwrites, attrs,
+        # ...) on sys.path; the manifest package imports from there.
+        from tools import localpaths  # noqa: F401
+        from tools.manifest import manifest as manifest_pkg
+    except ImportError as error:
+        return die("manifest", f"cannot import the manifest package: {error}", 1)
+
+    manifest_pkg.load_and_update(str(wpt), str(manifest), "/")
+    if not manifest_parses(Path(sys.executable), manifest):
+        return die("manifest", f"{manifest} does not parse", 1)
+    write_manifest_stamp(wpt, manifest, tree_before)
+    eprint(f"wpt: manifest {manifest} ({manifest.stat().st_size} bytes)")
+    return 0
+
+
 # --- `score` ---
 
 
@@ -1844,19 +2019,125 @@ def _selftest() -> None:
     assert r == Path("r.json") and err is None
     assert parse_rerun_argv([])[5] is not None
 
-    reports, out, err = parse_merge_argv(["a.json", "b.json", "--out", "m.json"])
+    reports, out, strict, err = parse_merge_argv(
+        ["a.json", "b.json", "--out", "m.json", "--strict-skips"]
+    )
     assert (
         reports == [Path("a.json"), Path("b.json")]
         and out == Path("m.json")
+        and strict
         and err is None
     )
     assert parse_merge_argv(["a.json", "b.json"])[1] is None
-    assert parse_merge_argv(["a.json"])[2] is not None
-    assert parse_merge_argv(["a.json", "b.json", "--out"])[2] is not None
-    assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[2] is not None
+    assert parse_merge_argv(["a.json"])[3] is None  # one report is a valid merge
+    assert parse_merge_argv([])[3] is not None
+    assert parse_merge_argv(["a.json", "b.json", "--out"])[3] is not None
+    assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[3] is not None
+
+    _selftest_merge()
 
 
-TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | overnight | selftest
+def _selftest_merge() -> None:
+    """Fabricated chunk reports: merge survives the failure modes CI has."""
+    info = {"product": "tinybrowser", "os": "linux"}
+
+    def chunk(results, **top):
+        data = {"results": results}
+        data.update(top)
+        return json.dumps(data)
+
+    def result(test, subsuite=None):
+        out = {"test": test, "status": "PASS", "subtests": []}
+        if subsuite is not None:
+            out["subsuite"] = subsuite
+        return out
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        a, b = tmp / "a.json", tmp / "b.json"
+        corrupt, empty = tmp / "corrupt.json", tmp / "empty.json"
+        a.write_text(
+            chunk(
+                [result("/b.html"), result("/a.html")],
+                run_info=info,
+                time_start=10,
+                time_end=20,
+            )
+        )
+        b.write_text(
+            chunk([result("/c.html")], run_info=info, time_start=5, time_end=30)
+        )
+        corrupt.write_text('{"results": [')
+        empty.write_text(chunk([]))
+
+        merged_path = tmp / "merged.json"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            assert merge_main([str(a), str(b), "--out", str(merged_path)]) == 0
+        merged = json.loads(merged_path.read_text())
+        assert [r["test"] for r in merged["results"]] == [
+            "/a.html",
+            "/b.html",
+            "/c.html",
+        ]
+        assert merged["run_info"] == info
+        assert merged["time_start"] == 5 and merged["time_end"] == 30
+
+        # A dead chunk is skipped, the rest still scores.
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            assert merge_main([str(corrupt), str(empty), str(a)]) == 0
+        assert "skipping" in stderr.getvalue()
+        assert "no results in" in stderr.getvalue()
+        assert "TOTAL" in stdout.getvalue()
+
+        # --strict-skips: the table still prints, the merge still fails.
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            assert merge_main(["--strict-skips", str(corrupt), str(a)]) == 2
+        assert "TOTAL" in stdout.getvalue()
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            assert merge_main(["--strict-skips", str(a)]) == 0
+
+        # A duplicate (subsuite, test) is the only hard error; inside one
+        # report it says "twice", across reports it names both.
+        dup = tmp / "dup.json"
+        dup.write_text(chunk([result("/a.html")]))
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            assert merge_main([str(a), str(dup)]) == 2
+        assert f"/a.html appears in {a} and {dup}" in stderr.getvalue()
+        twice = tmp / "twice.json"
+        twice.write_text(chunk([result("/a.html"), result("/a.html")]))
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            assert merge_main([str(twice)]) == 2
+        assert f"/a.html appears twice in {twice}" in stderr.getvalue()
+        one, two = tmp / "one.json", tmp / "two.json"
+        one.write_text(chunk([result("/a.html", subsuite="one")]))
+        two.write_text(chunk([result("/a.html", subsuite="two")]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert merge_main([str(one), str(two)]) == 0
+
+        # Nothing usable is an error; a lone empty report has no table.
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            assert merge_main([str(corrupt)]) == 2
+            assert merge_main([str(empty)]) == 1
+
+
+TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | manifest | overnight | selftest
 
   run PATH... [--score] [--dry-run] [-- upstream-flags...]
     Run WPT. Upstream flags follow `--` (or start implicitly at the first
@@ -1866,9 +2147,15 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | overnight |
     Summarize an existing report (--report) or run then summarize.
   rerun REPORT [--include-timeout] [--dry-run] [--save-report FILE] [-- runner...]
     Re-run only the attention set from a wptreport.
-  merge REPORT... [--out FILE]
-    Fold the chunk reports of one CI run into a single score. Overlapping
-    reports are refused; --out also writes the merged wptreport.
+  merge REPORT... [--out FILE] [--strict-skips]
+    Fold the chunk reports of one CI run into a single score. Reports that
+    are missing, corrupt, or empty are skipped with a warning; overlapping
+    tests are refused. --out writes the merged wptreport, keeping run_info,
+    subsuites, and the time bounds. --strict-skips exits 2 after printing
+    the table when any report was unusable, so a dead chunk still fails CI.
+  manifest
+    Build MANIFEST.json plus its stamp once per chunked CI run, so chunk
+    jobs can skip the tree walk. The stamp only ever makes runs faster.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest
@@ -1898,10 +2185,14 @@ def main(argv: list[str] | None = None) -> int:
         return rerun_main(rest)
     if command == "merge":
         return merge_main(rest)
+    if command == "manifest":
+        return manifest_main(rest)
     if command == "overnight":
         return overnight_main(rest)
     if command == "_inner":
         return inner_main(rest)
+    if command == "_manifest":
+        return manifest_inner_main(rest)
     if command == "selftest":
         _selftest()
         eprint("selftest: ok")
