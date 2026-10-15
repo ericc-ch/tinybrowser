@@ -22,7 +22,7 @@ from wptrunner.browsers.base import (
     require_arg,
 )
 from wptrunner.executors import executor_kwargs as base_executor_kwargs
-from wptrunner.executors.base import PytestExecutor  # noqa: F401
+from wptrunner.executors.base import PytestExecutor
 from wptrunner.executors.executorwebdriver import (
     WebDriverCrashtestExecutor,
     WebDriverProtocol,
@@ -32,11 +32,26 @@ from wptrunner.executors.executorwebdriver import (
 from wptrunner.products import Product
 from wptrunner import wpttest
 
-# Upstream gives a file with `<meta name=timeout content=long>` 60 s before the
-# runner abandons it. Under the `wpt` profile every passing long file in this
-# engine finishes in single seconds, so cap the budget at 30 s; a hang costs
-# half a minute instead of a minute (wptrunner adds its 5 s extra on top).
-wpttest.Test.long_timeout = 30
+# ── WPT timeout policy — tweak these numbers, nothing else ───────────────────
+# The runner abandons a test at (budget + EXTRA_TIMEOUT) seconds and reports
+# TIMEOUT. Normal files get DEFAULT_TIMEOUT; files declaring
+# `<meta name=timeout content=long>` get LONG_TIMEOUT in its place. Slow and
+# hanging are the same failure here, so both budgets sit far below the page's
+# own clock (testharness.js: 10 s normal / 60 s long) — the runner kill has to
+# land first or that clock stays the binding one.
+DEFAULT_TIMEOUT = 3  # seconds; upstream 10
+LONG_TIMEOUT = 5  # seconds; upstream 60
+EXTRA_TIMEOUT = 2  # seconds; upstream 5
+
+wpttest.Test.default_timeout = DEFAULT_TIMEOUT
+wpttest.Test.long_timeout = LONG_TIMEOUT
+# wdspec/aamtest subclass Test but carry their own budgets upstream (25/180);
+# they run through the upstream PytestExecutor, so its grace moves too.
+wpttest.WdspecTest.default_timeout = DEFAULT_TIMEOUT
+wpttest.WdspecTest.long_timeout = LONG_TIMEOUT
+wpttest.AamSpecTest.default_timeout = DEFAULT_TIMEOUT
+wpttest.AamSpecTest.long_timeout = LONG_TIMEOUT
+PytestExecutor.extra_timeout = EXTRA_TIMEOUT
 
 __wptrunner__ = {
     "product": "tinybrowser",
@@ -173,12 +188,14 @@ class TinyBrowserProtocol(WebDriverProtocol):
 class TinyBrowserTestharnessExecutor(WebDriverTestharnessExecutor):
     supports_testdriver = True
     protocol_cls = TinyBrowserProtocol
+    extra_timeout = EXTRA_TIMEOUT
 
 
 class TinyBrowserCrashtestExecutor(WebDriverCrashtestExecutor):
     """Crashtests only need the page to load and settle without dying."""
 
     protocol_cls = TinyBrowserProtocol
+    extra_timeout = EXTRA_TIMEOUT
 
 
 class TinyBrowserRefTestExecutor(WebDriverRefTestExecutor):
@@ -190,3 +207,4 @@ class TinyBrowserRefTestExecutor(WebDriverRefTestExecutor):
     """
 
     protocol_cls = TinyBrowserProtocol
+    extra_timeout = EXTRA_TIMEOUT

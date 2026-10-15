@@ -19,7 +19,8 @@ A conformance change is a failure-list diff: failures extracts the
 canonical list, baseline runs both sides in a detached worktree (exit 1
 on new failures). Metadata-expected TIMEOUTs: --skip-timeout in dev
 only; score/overnight refuse it. overnight needs explicit approval.
-Update the docs/progress.md total after scoring.
+Update the docs/progress.md total after scoring. Timeout policy
+(DEFAULT/LONG/EXTRA seconds) lives at the top of tinybrowser_wpt.py.
 
 Enabled: testharness (multi-window, same-site frames), crashtest,
 reftest (screenshot compare, 800x600), test262 (generated wrappers),
