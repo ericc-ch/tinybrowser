@@ -685,6 +685,10 @@ pub(crate) struct World {
     /// Document referrer policy from a `meta name=referrer` insertion
     /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
     pub(crate) referrer_policy: String,
+    /// Active Content Security Policy list for this document.
+    pub(crate) csp: crate::csp::List,
+    /// `meta` elements whose policy was already appended.
+    pub(crate) applied_csp_metas: HashSet<NodeId>,
     pub(crate) history: crate::protocol::HistorySnapshot,
     pub(crate) pending_history: Vec<crate::protocol::RendererEvent>,
     pub pending_cancels: Vec<i32>,
@@ -861,6 +865,8 @@ impl World {
             origin: document_url.origin(),
             document_url,
             referrer_policy: String::new(),
+            csp: crate::csp::List::default(),
+            applied_csp_metas: HashSet::new(),
             history: crate::protocol::HistorySnapshot::default(),
             pending_history: Vec::new(),
             pending_cancels: Vec::new(),
@@ -920,6 +926,7 @@ impl World {
         self.document = Some(id);
         self.owned.insert(id);
         self.referrer_policy.clear();
+        self.applied_csp_metas.clear();
         self.current_script = None;
         self.custom_construction.clear();
         self.listeners.clear();

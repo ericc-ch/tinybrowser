@@ -2063,6 +2063,8 @@ mod realm_tests {
                     history: crate::protocol::HistorySnapshot::default(),
                     viewport: None,
                     init_scripts: Vec::new(),
+                    content_security_policy: None,
+                    content_security_policy_report_only: None,
                 },
             )
             .expect("mount");

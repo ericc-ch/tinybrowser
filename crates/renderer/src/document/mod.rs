@@ -325,6 +325,14 @@ pub(crate) struct Document {
     /// select the XML parser; anything else, including a script's
     /// `document.open()`, stays HTML.
     response_content_type: Option<String>,
+    /// `Content-Security-Policy` from the response being parsed.
+    response_csp: Option<String>,
+    /// `Content-Security-Policy-Report-Only` from the response being parsed.
+    response_csp_report: Option<String>,
+    /// When set, [`Document::install_parsed`] replaces the world's policy
+    /// with the response headers. A script's `document.open()` leaves it
+    /// unset so the existing policy survives.
+    csp_from_response: bool,
     classic_fetch_in_flight: bool,
     deferred_modules: Vec<(crate::dom::tree::NodeId, crate::js::ScriptSource)>,
     stop: Arc<crate::js::Stop>,
@@ -415,6 +423,9 @@ impl Document {
             decoder: None,
             character_set: "UTF-8",
             response_content_type: None,
+            response_csp: None,
+            response_csp_report: None,
+            csp_from_response: false,
             classic_fetch_in_flight: false,
             deferred_modules: Vec::new(),
             stop: Arc::clone(&runtime.stop),
@@ -743,8 +754,10 @@ impl Document {
         url: &Url,
         content_type: Option<&str>,
         body: &[u8],
+        csp: Option<&str>,
+        csp_report: Option<&str>,
     ) {
-        self.load_response_body(url, content_type, body);
+        self.load_response_body(url, content_type, body, csp, csp_report);
         // Nested HTML documents without scripts skip a realm at parse;
         // `fire_ready_frame_loads` creates one when the parent is not in the
         // encoding-label burst
@@ -771,7 +784,7 @@ impl Document {
     /// result replaces the document with that string parsed as HTML
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
     pub(crate) fn eval_frame_script(&mut self, script: &str) {
-        if script.is_empty() {
+        if script.is_empty() || !self.navigation_script_allowed(script) {
             return;
         }
         match self.eval(script) {
@@ -1045,7 +1058,13 @@ impl Document {
             self.viewport_size = (width, height);
         }
         self.world.borrow_mut().history = mount.history.clone();
-        self.load_response_body(&url, mount.content_type.as_deref(), &mount.body);
+        self.load_response_body(
+            &url,
+            mount.content_type.as_deref(),
+            &mount.body,
+            mount.content_security_policy.as_deref(),
+            mount.content_security_policy_report_only.as_deref(),
+        );
         Ok(())
     }
 
@@ -1066,6 +1085,9 @@ impl Document {
         self.decoder = decoder;
         self.parser_owner = owner;
         self.response_content_type = None;
+        self.response_csp = None;
+        self.response_csp_report = None;
+        self.csp_from_response = false;
         self.active_buffer = Some(input.to_owned());
         // A new parse starts undecided: without this an `about:blank` or
         // `document.open()` document inherits the previous response's
@@ -1083,6 +1105,8 @@ impl Document {
         url: Option<&Url>,
         content_type: Option<&str>,
         viewport: Option<(u32, u32)>,
+        csp: Option<&str>,
+        csp_report: Option<&str>,
     ) {
         self.reset_js_realm();
         if let Some((width, height)) = viewport {
@@ -1104,12 +1128,22 @@ impl Document {
             Some(dial::ResponseDecoder::new(content_type.map(str::to_owned))),
         );
         self.response_content_type = content_type.map(str::to_owned);
+        self.response_csp = csp.map(str::to_owned);
+        self.response_csp_report = csp_report.map(str::to_owned);
+        self.csp_from_response = true;
     }
 
     /// Starts a document from a complete response: new realm, the response's
     /// URL, and the whole body.
-    fn load_response_body(&mut self, url: &Url, content_type: Option<&str>, body: &[u8]) {
-        self.load_response_body_with_origin(url, content_type, body, None);
+    fn load_response_body(
+        &mut self,
+        url: &Url,
+        content_type: Option<&str>,
+        body: &[u8],
+        csp: Option<&str>,
+        csp_report: Option<&str>,
+    ) {
+        self.load_response_body_with_origin(url, content_type, body, None, csp, csp_report);
     }
 
     /// [`Document::load_response_body`] that stores `origin` instead of
@@ -1123,8 +1157,10 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         origin: Option<url::Origin>,
+        csp: Option<&str>,
+        csp_report: Option<&str>,
     ) {
-        self.begin_response(Some(url), content_type, None);
+        self.begin_response(Some(url), content_type, None, csp, csp_report);
         if let Some(origin) = origin {
             self.world
                 .borrow_mut()
@@ -1141,8 +1177,10 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         origin: url::Origin,
+        csp: Option<&str>,
+        csp_report: Option<&str>,
     ) {
-        self.load_response_body_with_origin(url, content_type, body, Some(origin));
+        self.load_response_body_with_origin(url, content_type, body, Some(origin), csp, csp_report);
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
@@ -1452,6 +1490,7 @@ impl Document {
             // Style resolution and scripts both read the viewport; apply the
             // frame's size before the realm evaluates anything.
             self.apply_viewport();
+            self.install_response_csp();
             if skip_js {
                 return true;
             }
@@ -1461,8 +1500,22 @@ impl Document {
             self.register_document(document);
             self.apply_viewport();
             self.bind_realm_document();
+            self.install_response_csp();
             true
         }
+    }
+
+    /// Replaces the world's policy with the response headers when this parse
+    /// came from a navigation. `document.open()` leaves the flag unset.
+    fn install_response_csp(&mut self) {
+        if !self.csp_from_response {
+            return;
+        }
+        let list = crate::csp::List::from_headers(
+            self.response_csp.as_deref(),
+            self.response_csp_report.as_deref(),
+        );
+        self.world.borrow_mut().csp = list;
     }
 
     /// Rebinds the realm's `document` global to the installed document and
@@ -1620,39 +1673,121 @@ impl Document {
         self.fire_document_end();
     }
 
-    // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext
-    // https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
-    //
+    /// Appends one in-head `meta` policy the first time it is seen
+    /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
+    fn apply_meta_csp(&mut self, id: crate::dom::tree::NodeId) {
+        let content = {
+            let world = self.world.borrow();
+            if world.applied_csp_metas.contains(&id) {
+                return;
+            }
+            let Some(parsed) = world.document(id) else {
+                return;
+            };
+            crate::csp::meta_policy(&parsed.document.base, id.node)
+        };
+        let Some(content) = content else {
+            return;
+        };
+        let mut world = self.world.borrow_mut();
+        if world.applied_csp_metas.insert(id) {
+            world.csp.push_meta(&content);
+        }
+    }
+
+    fn inline_script_allowed(&self, source: &str, id: crate::dom::tree::NodeId) -> bool {
+        let world = self.world.borrow();
+        let (nonce, nonceable) = world.document(id).map_or_else(
+            || (String::new(), false),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
+        );
+        world.csp.allows_inline(&crate::csp::InlineScript {
+            source,
+            nonce: &nonce,
+            nonceable,
+            parser_inserted: true,
+            navigation: false,
+        })
+    }
+
+    fn navigation_script_allowed(&self, source: &str) -> bool {
+        let world = self.world.borrow();
+        world.csp.allows_inline(&crate::csp::InlineScript {
+            source,
+            nonce: "",
+            nonceable: false,
+            parser_inserted: false,
+            navigation: true,
+        })
+    }
+
+    fn script_url_allowed(&self, url: &Url, id: crate::dom::tree::NodeId) -> bool {
+        let world = self.world.borrow();
+        let (nonce, _) = world.document(id).map_or_else(
+            || (String::new(), false),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
+        );
+        world.csp.allows_request(
+            &world.origin,
+            &world.document_url,
+            url,
+            crate::csp::Destination::Script,
+            Some(crate::csp::ScriptRequest {
+                nonce: &nonce,
+                parser_inserted: true,
+            }),
+        )
+    }
+
     /// Runs every not-yet-executed script in tree order, stopping (returning
     /// true) when a `src` fetch starts: the fetch completion resumes the
     /// walk, so later scripts still run in order
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#pending-parsing-blocking-script>).
+    ///
+    /// <https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext>
+    /// <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>
     fn run_scripts(&mut self) -> bool {
-        let scripts: Vec<crate::dom::tree::NodeId> = {
+        enum Step {
+            Meta(crate::dom::tree::NodeId),
+            Script(crate::dom::tree::NodeId),
+        }
+        let steps: Vec<Step> = {
             let world = self.world.borrow();
             let Some(parsed) = world.main_document() else {
                 return false;
             };
             let base = &parsed.document.base;
             let document = parsed.id;
-            let mut scripts = Vec::new();
+            let mut steps = Vec::new();
             let mut stack = vec![base.root_node().id];
             while let Some(id) = stack.pop() {
                 let Some(node) = base.get_node(id) else {
                     continue;
                 };
+                let node_id = crate::dom::tree::NodeId { document, node: id };
+                if crate::csp::meta_policy(base, id).is_some() {
+                    steps.push(Step::Meta(node_id));
+                }
                 if crate::dom::tree::is_html_element(base, id, "script") {
-                    scripts.push(crate::dom::tree::NodeId { document, node: id });
+                    steps.push(Step::Script(node_id));
                 }
                 stack.extend(node.children.iter().rev().copied());
             }
-            scripts
+            steps
         };
-        if !scripts.is_empty() && !self.ensure_js_ok() {
+        let has_script = steps.iter().any(|step| matches!(step, Step::Script(_)));
+        if has_script && !self.ensure_js_ok() {
             return false;
         }
         let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
-        for id in scripts {
+        for step in steps {
+            let id = match step {
+                Step::Meta(id) => {
+                    self.apply_meta_csp(id);
+                    continue;
+                }
+                Step::Script(id) => id,
+            };
             if !self.executed_scripts.insert(id) {
                 continue;
             }
@@ -1678,11 +1813,16 @@ impl Document {
                     source,
                     line,
                 })) => {
-                    let filename = self.url.as_str().to_owned();
-                    self.eval_classic(&source, Some(id), line, &filename);
+                    if self.inline_script_allowed(&source, id) {
+                        let filename = self.url.as_str().to_owned();
+                        self.eval_classic(&source, Some(id), line, &filename);
+                    }
                 }
                 Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
                     if let Ok(url) = self.resolve_dial_url(&src) {
+                        if !self.script_url_allowed(&url, id) {
+                            continue;
+                        }
                         self.classic_fetch_in_flight = true;
                         let initiator = self.url.clone();
                         self.queued_dials.push(QueuedDial::get(
@@ -1785,7 +1925,18 @@ impl Document {
                 self.record_event(RendererEvent::Navigated {
                     url: url.to_string(),
                 });
-                self.load_frame_response(&url, outcome.content_type.as_deref(), &outcome.body);
+                let csp = crate::csp::combined_header(&outcome.headers, "content-security-policy");
+                let report = crate::csp::combined_header(
+                    &outcome.headers,
+                    "content-security-policy-report-only",
+                );
+                self.load_frame_response(
+                    &url,
+                    outcome.content_type.as_deref(),
+                    &outcome.body,
+                    csp.as_deref(),
+                    report.as_deref(),
+                );
             }
             DialContext::BlitzResource { id } => {
                 // Stale deliveries are harmless: the handler reports into
@@ -1953,12 +2104,16 @@ impl Document {
         for (index, (element, source)) in modules.into_iter().enumerate() {
             let result = match source {
                 crate::js::ScriptSource::Inline { source, .. } => {
+                    if !self.inline_script_allowed(&source, element) {
+                        continue;
+                    }
                     let name = format!("{}#inline-module-{index}", self.url);
                     self.js
                         .as_ref()
                         .map_or(Ok(()), |js| js.eval_inline_module(&name, &source))
                 }
                 crate::js::ScriptSource::Src(src) => match self.resolve_dial_url(&src) {
+                    Ok(url) if !self.script_url_allowed(&url, element) => continue,
                     Ok(url) => self
                         .js
                         .as_ref()

@@ -1985,6 +1985,34 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
     world.borrow_mut().referrer_policy = policy;
 }
 
+/// `meta http-equiv=content-security-policy` insertion appends one policy
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-content-security-policy>).
+pub(super) fn apply_meta_csp(ctx: &Ctx<'_>, id: NodeId) {
+    let content = {
+        let Ok(world) = world(ctx) else {
+            return;
+        };
+        let world = world.borrow();
+        if world.applied_csp_metas.contains(&id) {
+            return;
+        }
+        let Some(parsed) = world.document(id) else {
+            return;
+        };
+        crate::csp::meta_policy(&parsed.document.base, id.node)
+    };
+    let Some(content) = content else {
+        return;
+    };
+    let Ok(world) = world(ctx) else {
+        return;
+    };
+    let mut world = world.borrow_mut();
+    if world.applied_csp_metas.insert(id) {
+        world.csp.push_meta(&content);
+    }
+}
+
 /// A referrer-policy `content` value normalized to its canonical token,
 /// or `None` when the value names no policy. The legacy meta values map to
 /// their modern tokens
@@ -2039,6 +2067,24 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
         if let Some(mut parsed) = world.document_mut(id) {
             parsed.document.mark_script_started(id.node);
         }
+    }
+    let allowed = {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let (nonce, nonceable) = world.document(id).map_or_else(
+            || (String::new(), false),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
+        );
+        world.csp.allows_inline(&crate::csp::InlineScript {
+            source: &source,
+            nonce: &nonce,
+            nonceable,
+            parser_inserted: false,
+            navigation: false,
+        })
+    };
+    if !allowed {
+        return Ok(());
     }
     let previous = world(ctx)?.borrow().current_script;
     world(ctx)?.borrow_mut().current_script = Some(id);

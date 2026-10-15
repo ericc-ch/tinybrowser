@@ -427,6 +427,10 @@ impl ResponseStreams {
             &ResponseHead {
                 url: response.final_url.clone(),
                 content_type: response.content_type.clone(),
+                content_security_policy: response.content_security_policy.clone(),
+                content_security_policy_report_only: response
+                    .content_security_policy_report_only
+                    .clone(),
                 history: response.history.clone(),
                 viewport: response.viewport,
                 init_scripts: response.init_scripts.clone(),

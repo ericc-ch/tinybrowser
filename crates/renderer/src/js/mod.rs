@@ -894,6 +894,16 @@ impl JsRealm {
                 fetch_referrer(&world, &request_url)
             }),
         )?;
+        let csp_world = world.clone();
+        bridge::object(ctx)?.set(
+            "__tbCspAllowsConnect",
+            Func::from(move |url: String| {
+                let world = csp_world.borrow();
+                world
+                    .csp
+                    .allows_connect(&world.origin, &world.document_url, &url)
+            }),
+        )?;
         bridge::object(ctx)?.set(
             "__queueFetch",
             Func::from(

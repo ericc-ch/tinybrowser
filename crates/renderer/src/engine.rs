@@ -165,7 +165,13 @@ impl Engine {
         let document = self.frame_mut(frame)?;
         document.world().borrow_mut().history = head.history.clone();
         let url = Url::parse(&head.url).ok();
-        document.begin_response(url.as_ref(), head.content_type.as_deref(), head.viewport);
+        document.begin_response(
+            url.as_ref(),
+            head.content_type.as_deref(),
+            head.viewport,
+            head.content_security_policy.as_deref(),
+            head.content_security_policy_report_only.as_deref(),
+        );
         Ok(())
     }
 
@@ -757,20 +763,7 @@ impl Engine {
     ) {
         match url.scheme() {
             "about" => self.keep_initial_blank(child, parent),
-            "data" => {
-                if let Some((content_type, body)) = decode_data_url(url.as_str()) {
-                    if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_frame_response(&url, Some(content_type.as_str()), &body);
-                    }
-                } else {
-                    // A malformed data URL fails the navigation; the frame
-                    // stays on its current document
-                    // (<https://fetch.spec.whatwg.org/#data-url-processor>).
-                    if let Some(document) = self.frames.get_mut(&child) {
-                        document.load_about_blank(None, None);
-                    }
-                }
-            }
+            "data" => self.load_data_frame(child, &url),
             "javascript" => {
                 // Navigate to a javascript: URL returns when the initiator
                 // is not same origin-domain with the target's active
@@ -804,35 +797,7 @@ impl Engine {
                     }
                 }
             }
-            "blob" => {
-                // A missing Blob URL Store entry is a network error, not an
-                // empty document at the URL's claimed origin
-                // (<https://w3c.github.io/FileAPI/#blob-uri-get>).
-                // The child's origin is the entry's creator, not
-                // `Url::origin()` of the blob URL
-                // (<https://w3c.github.io/FileAPI/#blob-url-entry>).
-                let mut key = url.clone();
-                key.set_fragment(None);
-                let loaded = self.frames.get(&parent).and_then(|document| {
-                    let key = key.as_str();
-                    Some((
-                        document.object_url_contents(key)?,
-                        document.object_url_type(key),
-                        document.object_url_origin(key)?,
-                    ))
-                });
-                let Some((contents, content_type, origin)) = loaded else {
-                    return;
-                };
-                if let Some(document) = self.frames.get_mut(&child) {
-                    document.load_frame_response_with_origin(
-                        &url,
-                        content_type.as_deref(),
-                        contents.as_bytes(),
-                        origin,
-                    );
-                }
-            }
+            "blob" => self.load_blob_frame(child, parent, &url),
             "http" | "https" => {
                 let initiator = self
                     .frames
@@ -869,6 +834,50 @@ impl Engine {
                     document.load_about_blank(None, None);
                 }
             }
+        }
+    }
+
+    /// A `data:` frame URL decodes in-process. A malformed URL fails the
+    /// navigation and leaves the frame on its current document
+    /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
+    fn load_data_frame(&mut self, child: FrameId, url: &Url) {
+        let Some((content_type, body)) = decode_data_url(url.as_str()) else {
+            if let Some(document) = self.frames.get_mut(&child) {
+                document.load_about_blank(None, None);
+            }
+            return;
+        };
+        if let Some(document) = self.frames.get_mut(&child) {
+            document.load_frame_response(url, Some(content_type.as_str()), &body, None, None);
+        }
+    }
+
+    /// A `blob:` frame URL reads the parent's Blob URL Store. A missing entry
+    /// is a network error. The child's origin is the entry's creator
+    /// (<https://w3c.github.io/FileAPI/#blob-url-entry>).
+    fn load_blob_frame(&mut self, child: FrameId, parent: FrameId, url: &Url) {
+        let mut key = url.clone();
+        key.set_fragment(None);
+        let loaded = self.frames.get(&parent).and_then(|document| {
+            let key = key.as_str();
+            Some((
+                document.object_url_contents(key)?,
+                document.object_url_type(key),
+                document.object_url_origin(key)?,
+            ))
+        });
+        let Some((contents, content_type, origin)) = loaded else {
+            return;
+        };
+        if let Some(document) = self.frames.get_mut(&child) {
+            document.load_frame_response_with_origin(
+                url,
+                content_type.as_deref(),
+                contents.as_bytes(),
+                origin,
+                None,
+                None,
+            );
         }
     }
 

@@ -14,6 +14,7 @@ use markup5ever::interface::QuirksMode;
 
 use crate::documents::BlitzDocument;
 
+mod csp;
 mod document;
 mod documents;
 mod dom;
