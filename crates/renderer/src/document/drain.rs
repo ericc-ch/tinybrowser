@@ -135,6 +135,7 @@ impl Document {
                         Some((content_type, body)) => {
                             self.finish_dial(super::CompletedDial {
                                 context: dial.context,
+                                request_url: dial.url.to_string(),
                                 outcome: crate::protocol::DialOutcome {
                                     status: 200,
                                     final_url: dial.url.to_string(),
@@ -238,7 +239,7 @@ impl Document {
         for element in images {
             self.queue_image(element, true);
         }
-        self.adopt_pending_scripts();
+        self.queue_dynamic_scripts();
         let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
         for (target, violations) in violations {
             self.fire_csp_violations(target, &violations);
@@ -298,6 +299,78 @@ impl Document {
                 cancel();
             }
         }
+        self.queue_js_fetches(fetches, &fetch_cancels);
+        let images = self.world.borrow_mut().take_image_updates();
+        for element in images {
+            self.queue_image(element, true);
+        }
+        self.queue_dynamic_scripts();
+        let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
+        for (target, violations) in violations {
+            self.fire_csp_violations(target, &violations);
+        }
+    }
+
+    /// Connected `<script src>` elements queued their prepare steps from
+    /// script; the fetch starts here.
+    fn queue_dynamic_scripts(&mut self) {
+        let scripts = self.world.borrow_mut().take_pending_scripts();
+        for element in scripts {
+            let src = self
+                .world
+                .borrow()
+                .with_document(element, |parsed| {
+                    crate::dom::tree::attr(&parsed.document.base, element.node, "src")
+                        .map(str::to_owned)
+                })
+                .flatten();
+            let Some(src) = src else {
+                continue;
+            };
+            let started = self
+                .world
+                .borrow()
+                .with_document(element, |parsed| {
+                    parsed.document.script_already_started(element.node)
+                })
+                .unwrap_or(false);
+            if started {
+                continue;
+            }
+            let Ok(url) = self.resolve_dial_url(&src) else {
+                self.fire_js(|js| js.fire_node_error(element));
+                continue;
+            };
+            let violations = self.script_url_violations(&url, element);
+            if !violations.is_empty() {
+                self.fire_csp_violations(element, &violations);
+            }
+            if crate::csp::blocks(&violations) {
+                self.fire_js(|js| js.fire_node_error(element));
+                continue;
+            }
+            let initiator = self.url.clone();
+            let mut dial = QueuedDial::get(
+                DialContext::ClassicScript {
+                    element,
+                    epoch: self.js_epoch,
+                },
+                url,
+                initiator,
+            );
+            dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
+            self.queued_dials.push(dial);
+        }
+    }
+
+    /// Queues page `fetch` / XHR dials. The connect check is here, where the
+    /// request leaves the renderer
+    /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
+    fn queue_js_fetches(
+        &mut self,
+        fetches: Vec<crate::js::PendingJsFetch>,
+        fetch_cancels: &HashSet<i32>,
+    ) {
         for fetch in fetches {
             if fetch_cancels.contains(&fetch.js_id) {
                 continue;
@@ -339,61 +412,12 @@ impl Document {
                     content_type: fetch.content_type,
                     headers: fetch.headers,
                     referrer: fetch.referrer,
+                    csp: Some(self.redirect_gate(crate::csp::Destination::Connect)),
                 });
             } else {
                 self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, None);
             }
-        }
-    }
-
-    /// Starts fetches for connected `<script src>` elements whose prepare
-    /// steps were queued from script.
-    fn adopt_pending_scripts(&mut self) {
-        let scripts = self.world.borrow_mut().take_pending_scripts();
-        for element in scripts {
-            let src = self
-                .world
-                .borrow()
-                .with_document(element, |parsed| {
-                    crate::dom::tree::attr(&parsed.document.base, element.node, "src")
-                        .map(str::to_owned)
-                })
-                .flatten();
-            let Some(src) = src else {
-                continue;
-            };
-            let started = self
-                .world
-                .borrow()
-                .with_document(element, |parsed| {
-                    parsed.document.script_already_started(element.node)
-                })
-                .unwrap_or(false);
-            if started {
-                continue;
-            }
-            let Ok(url) = self.resolve_dial_url(&src) else {
-                self.fire_js(|js| js.fire_node_error(element));
-                continue;
-            };
-            let violations = self.script_url_violations(&url, element);
-            if !violations.is_empty() {
-                self.fire_csp_violations(element, &violations);
-            }
-            if crate::csp::blocks(&violations) {
-                self.fire_js(|js| js.fire_node_error(element));
-                continue;
-            }
-            let initiator = self.url.clone();
-            self.queued_dials.push(QueuedDial::get(
-                DialContext::ClassicScript {
-                    element,
-                    epoch: self.js_epoch,
-                },
-                url,
-                initiator,
-            ));
         }
     }
 

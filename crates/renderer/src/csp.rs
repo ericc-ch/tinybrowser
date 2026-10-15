@@ -9,6 +9,7 @@
 //! <https://w3c.github.io/webappsec-csp/#should-elements-inline-type-behavior-be-blocked-by-content-security-policy>
 
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use url::{Host, Origin, Url};
 
@@ -20,14 +21,14 @@ enum Source {
 }
 
 /// Whether a policy blocks or is only monitored.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Disposition {
     Enforce,
     Report,
 }
 
 /// One parsed policy: directive names in source order, first occurrence wins.
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Policy {
     directives: Vec<(String, Vec<String>)>,
     disposition: Disposition,
@@ -68,7 +69,7 @@ pub(crate) fn blocks(violations: &[Violation]) -> bool {
 }
 
 /// The document's CSP list and the origin `'self'` is resolved against.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct List {
     policies: Vec<Policy>,
 }
@@ -102,7 +103,7 @@ pub(crate) enum InlineKind {
 }
 
 /// Destination used by the pre-request check this browser enforces.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Destination {
     /// `fetch` and `XMLHttpRequest` (`connect-src`).
     Connect,
@@ -256,28 +257,7 @@ impl List {
         destination: Destination,
         script: Option<ScriptRequest<'_>>,
     ) -> Vec<Violation> {
-        let effective = destination.effective();
-        let mut violations = Vec::new();
-        for policy in &self.policies {
-            if policy_request_violation(
-                policy,
-                origin,
-                document_url,
-                url,
-                destination,
-                script,
-                0,
-            ) {
-                violations.push(Violation {
-                    effective_directive: effective.name().to_owned(),
-                    original_policy: policy.serialized.clone(),
-                    disposition: policy.disposition,
-                    blocked_uri: url.as_str().to_owned(),
-                    sample: None,
-                });
-            }
-        }
-        violations
+        self.violations(origin, document_url, url, destination, script, 0)
     }
 
     /// The violations a response URL produces after redirects: the
@@ -291,6 +271,18 @@ impl List {
         url: &Url,
         destination: Destination,
     ) -> Vec<Violation> {
+        self.violations(origin, document_url, url, destination, None, 1)
+    }
+
+    fn violations(
+        &self,
+        origin: &Origin,
+        document_url: &Url,
+        url: &Url,
+        destination: Destination,
+        script: Option<ScriptRequest<'_>>,
+        redirects: u32,
+    ) -> Vec<Violation> {
         let effective = destination.effective();
         let mut violations = Vec::new();
         for policy in &self.policies {
@@ -300,8 +292,8 @@ impl List {
                 document_url,
                 url,
                 destination,
-                None,
-                1,
+                script,
+                redirects,
             ) {
                 violations.push(Violation {
                     effective_directive: effective.name().to_owned(),
@@ -337,6 +329,74 @@ impl List {
     }
 }
 
+/// Tuple origin carried with a dial. An opaque document origin is `None`,
+/// and `'self'` then matches only the document URL.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TupleOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl TupleOrigin {
+    fn from_origin(origin: &Origin) -> Option<Self> {
+        match origin {
+            Origin::Tuple(scheme, host, port) => Some(Self {
+                scheme: scheme.clone(),
+                host: host.to_string(),
+                port: *port,
+            }),
+            Origin::Opaque(_) => None,
+        }
+    }
+
+    fn to_origin(&self) -> Origin {
+        let host = Host::parse(&self.host).unwrap_or(Host::Domain(self.host.clone()));
+        Origin::Tuple(self.scheme.clone(), host, self.port)
+    }
+}
+
+/// The policy a subresource dial carries so every redirect hop is checked
+/// before it is followed. `None` on a dial skips the check, which is how a
+/// document navigation is sent.
+///
+/// <https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RedirectGate {
+    list: List,
+    origin: Option<TupleOrigin>,
+    destination: Destination,
+}
+
+impl RedirectGate {
+    pub(crate) fn new(list: List, origin: &Origin, destination: Destination) -> Self {
+        Self {
+            list,
+            origin: TupleOrigin::from_origin(origin),
+            destination,
+        }
+    }
+
+    /// Whether `url` may be fetched. `redirects` is `0` for the original URL
+    /// and at least `1` after a redirect, which skips path matching.
+    /// Report-only policies do not refuse the hop.
+    #[must_use]
+    pub fn allows(&self, document_url: &Url, url: &Url, redirects: u32) -> bool {
+        let origin = self
+            .origin
+            .as_ref()
+            .map_or_else(Origin::new_opaque, TupleOrigin::to_origin);
+        !blocks(&self.list.violations(
+            &origin,
+            document_url,
+            url,
+            self.destination,
+            None,
+            redirects,
+        ))
+    }
+}
+
 /// Whether the fallback directive chain for `destination` violates `policy`
 /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
 fn policy_request_violation(
@@ -356,7 +416,15 @@ fn policy_request_violation(
         // A directive lower in the fallback chain only executes when no
         // higher-priority directive is present; the loop order guarantees
         // that, so the first present directive decides.
-        return request_check_blocks(effective, list, origin, document_url, url, script, redirects);
+        return request_check_blocks(
+            effective,
+            list,
+            origin,
+            document_url,
+            url,
+            script,
+            redirects,
+        );
     }
     false
 }
@@ -509,9 +577,7 @@ fn request_check_blocks(
     // The post-request (redirect) check is URL-only, so a policy with
     // `'strict-dynamic'` does not block every response
     // (<https://w3c.github.io/webappsec-csp/#script-pre-request>).
-    if redirects == 0
-        && matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc)
-    {
+    if redirects == 0 && matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc) {
         let script = script.unwrap_or(ScriptRequest {
             nonce: "",
             parser_inserted: true,
@@ -532,9 +598,10 @@ fn inline_check_blocks(effective: Effective, list: &[String], inline: &InlineScr
     match effective {
         Effective::ScriptSrc => evaluation_blocks(list, inline.source),
         Effective::ScriptSrcElem | Effective::ScriptSrcAttr => !element_matches(list, inline),
-        Effective::StyleSrcElem | Effective::ConnectSrc | Effective::ImgSrc | Effective::FontSrc => {
-            false
-        }
+        Effective::StyleSrcElem
+        | Effective::ConnectSrc
+        | Effective::ImgSrc
+        | Effective::FontSrc => false,
     }
 }
 
@@ -545,7 +612,9 @@ fn evaluation_blocks(list: &[String], source: &str) -> bool {
     if has_keyword(list, "'unsafe-eval'") {
         return false;
     }
-    !list.iter().any(|expression| hash_matches(expression, source))
+    !list
+        .iter()
+        .any(|expression| hash_matches(expression, source))
 }
 
 fn directive_value<'a>(policy: &'a Policy, name: &str) -> Option<&'a [String]> {
@@ -1098,15 +1167,16 @@ mod tests {
         let origin = url("https://example.test/").origin();
         let document_url = url("https://example.test/page");
         // The duplicate `'none'` must not override the first `'self'`.
-        assert!(list
-            .check_request(
+        assert!(
+            list.check_request(
                 &origin,
                 &document_url,
                 &url("https://example.test/a.js"),
                 Destination::Script,
                 None,
             )
-            .is_empty());
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1115,15 +1185,16 @@ mod tests {
         let origin = url("https://example.test/").origin();
         let document_url = url("https://example.test/page");
         // The only token is not ASCII, so the policy parses empty and allows.
-        assert!(list
-            .check_request(
+        assert!(
+            list.check_request(
                 &origin,
                 &document_url,
                 &url("https://other.test/a.js"),
                 Destination::Script,
                 None,
             )
-            .is_empty());
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1164,6 +1235,39 @@ mod tests {
     }
 
     #[test]
+    fn split_host_port_table() {
+        let cases = [
+            ("example.test", Some(("example.test", None))),
+            ("example.test:443", Some(("example.test", Some(443u16)))),
+            ("example.test:", None),
+            ("example.test:abc", None),
+            ("example.test:99999", None),
+        ];
+        for (input, expect) in cases {
+            let parsed = split_host_port(input);
+            match expect {
+                None => assert!(parsed.is_none(), "{input}"),
+                Some((host, None)) => {
+                    let (got, port) = parsed.expect(input);
+                    assert_eq!(got, host, "{input}");
+                    assert!(port.is_none(), "{input}");
+                }
+                Some((host, Some(number))) => {
+                    let (got, port) = parsed.expect(input);
+                    assert_eq!(got, host, "{input}");
+                    assert!(
+                        matches!(port, Some(PortPart::Number(value)) if value == number),
+                        "{input}"
+                    );
+                }
+            }
+        }
+        let (host, port) = split_host_port("example.test:*").expect("star");
+        assert_eq!(host, "example.test");
+        assert!(matches!(port, Some(PortPart::Star)));
+    }
+
+    #[test]
     fn percent_encoded_paths_decode_before_comparing() {
         assert!(path_part_matches("/%61/b", "/a/b"));
         assert!(path_part_matches("/a%2Fb", "/a%2Fb"));
@@ -1173,14 +1277,26 @@ mod tests {
     fn self_matches_secure_variants() {
         let origin = url("http://example.test/").origin();
         let document_url = url("http://example.test/page");
-        assert!(self_matches(&url("http://example.test/a"), &origin, &document_url));
+        assert!(self_matches(
+            &url("http://example.test/a"),
+            &origin,
+            &document_url
+        ));
         assert!(self_matches(
             &url("https://example.test/a"),
             &origin,
             &document_url
         ));
-        assert!(self_matches(&url("ws://example.test/a"), &origin, &document_url));
-        assert!(!self_matches(&url("http://other.test/a"), &origin, &document_url));
+        assert!(self_matches(
+            &url("ws://example.test/a"),
+            &origin,
+            &document_url
+        ));
+        assert!(!self_matches(
+            &url("http://other.test/a"),
+            &origin,
+            &document_url
+        ));
     }
 
     #[test]

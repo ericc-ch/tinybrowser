@@ -744,11 +744,10 @@ pub(crate) fn install_custom_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     super::blob::decompress(ctx, INSTALL_CUSTOM_EVENT_DEFLATE, &CACHE)
 }
 
-pub(crate) const INSTALL_SECURITY_POLICY_VIOLATION_EVENT_DEFLATE: &[u8] =
-    include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/js_blobs/security_policy_violation_event.deflate"
-    ));
+pub(crate) const INSTALL_SECURITY_POLICY_VIOLATION_EVENT_DEFLATE: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/js_blobs/security_policy_violation_event.deflate"
+));
 
 /// The `SecurityPolicyViolationEvent` shim, inflated once per process.
 pub(crate) fn install_security_policy_violation_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
@@ -814,7 +813,11 @@ pub(crate) fn fire_security_policy_violation(
     {
         set_exposed_event_prototype(ctx, &event, "SecurityPolicyViolationEvent")?;
     }
-    let document_url = bindings::world(ctx)?.borrow().document_url.as_str().to_owned();
+    let document_url = bindings::world(ctx)?
+        .borrow()
+        .document_url
+        .as_str()
+        .to_owned();
     // Own data properties, because the shim's prototype accessors are
     // readonly and an assigning set would throw
     // (<https://webidl.spec.whatwg.org/#idl-read-only-attributes>).
@@ -828,7 +831,11 @@ pub(crate) fn fire_security_policy_violation(
     event.prop("sample", violation.sample.clone().unwrap_or_default())?;
     event.prop(
         "disposition",
-        if violation.blocks() { "enforce" } else { "report" },
+        if violation.blocks() {
+            "enforce"
+        } else {
+            "report"
+        },
     )?;
     event.prop("statusCode", 0u16)?;
     event.prop("lineNumber", 0u32)?;
@@ -1666,7 +1673,8 @@ fn call_handler_attribute<'js>(
     target: Option<&Value<'js>>,
     typ: &str,
     event: &Value<'js>,
-) -> Result<()> {    let Some(object) = target.and_then(|target| target.as_object()) else {
+) -> Result<()> {
+    let Some(object) = target.and_then(|target| target.as_object()) else {
         return Ok(());
     };
     let name = format!("on{typ}");

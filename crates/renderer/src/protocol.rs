@@ -407,6 +407,11 @@ pub struct DialRequest {
     /// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>).
     #[serde(default)]
     pub timeout_ms: u64,
+    /// Enforced CSP for this subresource dial. `None` skips the check, which
+    /// is how a document navigation is sent. The network re-checks every
+    /// redirect hop with it.
+    #[serde(default)]
+    pub csp: Option<Box<crate::RedirectGate>>,
 }
 
 fn default_dial_method() -> String {

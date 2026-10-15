@@ -81,6 +81,15 @@ impl Guest for Component {
                 chain.url = source;
                 match next_hop(&chain, &response) {
                     Ok(Some(next)) => {
+                        let redirects = chain.followed.saturating_add(1);
+                        if let Some(csp) = &chain.csp {
+                            let document = chain.initiator.clone().unwrap_or_else(|| next.clone());
+                            if !csp.allows(&document, &next, redirects) {
+                                // The renderer reports `final_url` and drops the body.
+                                completion(Ok(csp_blocked(&next)));
+                                return true;
+                            }
+                        }
                         chain.followed = chain.followed.saturating_add(1);
                         chain.cross_site_redirect |= !schemeful_same_site(&chain.url, &next);
                         chain.url = next;
@@ -215,6 +224,8 @@ struct Chain {
     followed: u32,
     /// Whether any hop so far moved to another site.
     cross_site_redirect: bool,
+    /// Policy checked before each redirect is followed.
+    csp: Option<renderer::RedirectGate>,
 }
 
 struct PendingFetch {
@@ -385,6 +396,18 @@ fn next_hop(chain: &Chain, response: &FetchResponse) -> Result<Option<Url>, Dial
     Ok(Some(next))
 }
 
+/// A redirect the policy refused. Status 0 is not a response the page can
+/// use; `final_url` is the blocked hop so the renderer can report it.
+fn csp_blocked(url: &Url) -> DialOutcome {
+    DialOutcome {
+        status: 0,
+        final_url: url.to_string(),
+        content_type: None,
+        headers: Vec::new(),
+        body: Vec::new(),
+    }
+}
+
 fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOutcome, DialFailure> {
     if response.body.len() > MAX_RESPONSE_BODY_BYTES {
         return Err(DialFailure::Limit);
@@ -457,6 +480,7 @@ impl NetworkHost for WasmServices {
                 read_body: request.read_body,
                 followed: 0,
                 cross_site_redirect: false,
+                csp: request.csp.as_deref().cloned(),
             },
             completion,
         );

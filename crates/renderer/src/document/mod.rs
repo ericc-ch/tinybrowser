@@ -103,6 +103,8 @@ pub(crate) enum DialContext {
     /// critical hold.
     BlitzResource {
         id: u64,
+        /// `style-src-elem`, `img-src`, or `font-src` for this fetch.
+        destination: Option<crate::csp::Destination>,
     },
 }
 
@@ -121,6 +123,9 @@ pub(crate) struct QueuedDial {
     pub(crate) headers: Vec<(String, String)>,
     /// Browser-generated `Referer` URL. `None` omits the header.
     pub(crate) referrer: Option<String>,
+    /// Policy the network re-checks on every redirect. `None` for a document
+    /// navigation, which this check does not cover.
+    pub(crate) csp: Option<crate::RedirectGate>,
 }
 
 impl QueuedDial {
@@ -135,6 +140,7 @@ impl QueuedDial {
             content_type: None,
             headers: Vec::new(),
             referrer: None,
+            csp: None,
         }
     }
 }
@@ -143,6 +149,9 @@ impl QueuedDial {
 pub(crate) struct CompletedDial {
     pub(crate) context: DialContext,
     pub(crate) outcome: DialOutcome,
+    /// URL the dial asked for, so a response can tell a redirect from the
+    /// original hop.
+    pub(crate) request_url: String,
 }
 
 /// Who feeds the active parser, and therefore who may end it.
@@ -724,6 +733,7 @@ impl Document {
             content_type,
             headers: Vec::new(),
             referrer,
+            csp: None,
         });
     }
 
@@ -1857,16 +1867,20 @@ impl Document {
     /// The main document's root node, the violation target for checks that
     /// are not attributable to an element.
     pub(in crate::document) fn document_node(&self) -> Option<crate::dom::tree::NodeId> {
-        self.world.borrow().with_main_document(|parsed| {
-            crate::dom::tree::NodeId {
+        self.world
+            .borrow()
+            .with_main_document(|parsed| crate::dom::tree::NodeId {
                 document: parsed.id,
                 node: parsed.document.base.root_node().id,
-            }
-        })
+            })
     }
 
     /// Dispatches the `securitypolicyviolation` events a check produced.
-    pub(in crate::document) fn fire_csp_violations(&mut self, target: crate::dom::tree::NodeId, violations: &[crate::csp::Violation]) {
+    pub(in crate::document) fn fire_csp_violations(
+        &mut self,
+        target: crate::dom::tree::NodeId,
+        violations: &[crate::csp::Violation],
+    ) {
         if violations.is_empty() {
             return;
         }
@@ -1968,14 +1982,16 @@ impl Document {
                         }
                         self.classic_fetch_in_flight = true;
                         let initiator = self.url.clone();
-                        self.queued_dials.push(QueuedDial::get(
+                        let mut dial = QueuedDial::get(
                             DialContext::ClassicScript {
                                 element: id,
                                 epoch: self.js_epoch,
                             },
                             url,
                             initiator,
-                        ));
+                        );
+                        dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
+                        self.queued_dials.push(dial);
                         return true;
                     }
                 }
@@ -2028,7 +2044,12 @@ impl Document {
     }
 
     pub(in crate::document) fn finish_dial(&mut self, done: CompletedDial) {
-        let CompletedDial { context, outcome } = done;
+        let CompletedDial {
+            context,
+            outcome,
+            request_url,
+        } = done;
+        let redirected = outcome.final_url != request_url;
         match context {
             DialContext::JsFetch { id, epoch } => {
                 self.record_event(RendererEvent::Fetch {
@@ -2038,10 +2059,12 @@ impl Document {
                     // Post-request check: a redirect may have landed on a URL
                     // the source list does not allow
                     // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
-                    let blocked = self.response_url_blocked(
-                        &outcome.final_url,
-                        crate::csp::Destination::Connect,
-                    );
+                    let blocked = redirected
+                        && self.response_url_blocked(
+                            &outcome.final_url,
+                            crate::csp::Destination::Connect,
+                            None,
+                        );
                     if blocked {
                         self.settle_js_fetch(id, None);
                     } else {
@@ -2055,7 +2078,17 @@ impl Document {
                 });
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
-                    if (200..300).contains(&outcome.status) {
+                    // A redirect may have landed outside `script-src`. The
+                    // network refuses that hop; this is the report, and the
+                    // check for a host that already followed.
+                    // <https://w3c.github.io/webappsec-csp/#should-block-response>
+                    let blocked = redirected
+                        && self.response_url_blocked(
+                            &outcome.final_url,
+                            crate::csp::Destination::Script,
+                            Some(element),
+                        );
+                    if !blocked && (200..300).contains(&outcome.status) {
                         let source = String::from_utf8_lossy(&outcome.body);
                         let filename = outcome.final_url.clone();
                         self.eval_classic(&source, Some(element), 1, &filename);
@@ -2102,28 +2135,60 @@ impl Document {
                     },
                 );
             }
-            DialContext::BlitzResource { id } => {
-                // Stale deliveries are harmless: the handler reports into
-                // Blitz's own channel, which a dropped tree no longer drains.
-                if (200..300).contains(&outcome.status) {
-                    self.subresource_bytes
-                        .insert(outcome.final_url.clone(), outcome.body.clone());
-                }
-                if let Some(handler) = self.blitz_handlers.remove(&id) {
-                    let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
-                    Box::new(handler).bytes(
-                        outcome.final_url.clone(),
-                        blitz_traits::net::Bytes::from(outcome.body),
-                    );
-                    // The arrival changes style or layout; apply it now so the
-                    // tree is current for the next capture instead of waiting
-                    // for one to pump the resolve loop.
-                    self.settle_blitz_layout();
-                    self.settle_image_waiters(&request_url);
-                }
+            DialContext::BlitzResource { id, destination } => {
+                self.deliver_blitz_resource(id, destination, &outcome, redirected);
             }
         }
         self.adopt_js_work();
+    }
+
+    /// Hands one Blitz subresource response to its handler. A redirect the
+    /// policy refuses is a failed load: empty bytes, and an `error` on the
+    /// element when the tree has one.
+    fn deliver_blitz_resource(
+        &mut self,
+        id: u64,
+        destination: Option<crate::csp::Destination>,
+        outcome: &DialOutcome,
+        redirected: bool,
+    ) {
+        let blocked = redirected
+            && destination.is_some_and(|destination| {
+                self.response_url_blocked(&outcome.final_url, destination, None)
+            });
+        if !blocked && (200..300).contains(&outcome.status) {
+            self.subresource_bytes
+                .insert(outcome.final_url.clone(), outcome.body.clone());
+        }
+        let Some(handler) = self.blitz_handlers.remove(&id) else {
+            return;
+        };
+        let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
+        if blocked {
+            Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
+            let element = Url::parse(&request_url)
+                .ok()
+                .and_then(|url| self.subresource_target(&url));
+            if let Some(element) = element {
+                if destination == Some(crate::csp::Destination::Img) {
+                    self.world
+                        .borrow_mut()
+                        .fail_image(element, request_url.clone());
+                } else {
+                    self.tasks.push_back(Task::NodeError(element));
+                }
+            }
+        } else {
+            Box::new(handler).bytes(
+                outcome.final_url.clone(),
+                blitz_traits::net::Bytes::from(outcome.body.clone()),
+            );
+        }
+        // The arrival changes style or layout; apply it now so the tree is
+        // current for the next capture instead of waiting for one to pump
+        // the resolve loop.
+        self.settle_blitz_layout();
+        self.settle_image_waiters(&request_url);
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
@@ -2149,7 +2214,7 @@ impl Document {
                     self.frame_load_in_flight = false;
                 }
             }
-            DialContext::BlitzResource { id } => {
+            DialContext::BlitzResource { id, destination: _ } => {
                 // Deliver empty bytes so Blitz releases the resource as
                 // failed instead of holding it pending forever.
                 if let Some(handler) = self.blitz_handlers.remove(&id) {
@@ -2173,7 +2238,9 @@ impl Document {
                         // waiter that never settles. Images report their
                         // `error` through the lifecycle; other elements here.
                         if is_image {
-                            self.world.borrow_mut().fail_image(element, request_url.clone());
+                            self.world
+                                .borrow_mut()
+                                .fail_image(element, request_url.clone());
                         } else {
                             self.tasks.push_back(Task::NodeError(element));
                         }
@@ -2403,7 +2470,8 @@ impl Document {
             // never dialed; the handler receives empty bytes so Blitz
             // releases the resource as failed
             // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
-            if let Some(destination) = subresource_destination(fetch.kind) {
+            let destination = subresource_destination(fetch.kind);
+            if let Some(destination) = destination {
                 let violations = self.subresource_violations(&fetch.url, destination);
                 let target = self
                     .subresource_target(&fetch.url)
@@ -2440,12 +2508,22 @@ impl Document {
             // as initiator and the document corrects it here
             // (<https://fetch.spec.whatwg.org/#concept-request-initiator>).
             let initiator = self.url.clone();
-            self.queued_dials.push(QueuedDial::get(
-                DialContext::BlitzResource { id: fetch.id },
+            let mut dial = QueuedDial::get(
+                DialContext::BlitzResource {
+                    id: fetch.id,
+                    destination,
+                },
                 fetch.url,
                 initiator,
-            ));
+            );
+            dial.csp = destination.map(|destination| self.redirect_gate(destination));
+            self.queued_dials.push(dial);
         }
+    }
+
+    fn redirect_gate(&self, destination: crate::csp::Destination) -> crate::RedirectGate {
+        let world = self.world.borrow();
+        crate::RedirectGate::new(world.csp.clone(), &world.origin, destination)
     }
 
     /// Whether the response URL of a completed request violates the policy
@@ -2456,6 +2534,7 @@ impl Document {
         &mut self,
         final_url: &str,
         destination: crate::csp::Destination,
+        target: Option<crate::dom::tree::NodeId>,
     ) -> bool {
         let Ok(url) = Url::parse(final_url) else {
             return false;
@@ -2470,7 +2549,7 @@ impl Document {
             )
         };
         if !violations.is_empty()
-            && let Some(target) = self.document_node()
+            && let Some(target) = target.or_else(|| self.document_node())
         {
             self.fire_csp_violations(target, &violations);
         }
@@ -2484,13 +2563,9 @@ impl Document {
         destination: crate::csp::Destination,
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
-        world.csp.check_request(
-            &world.origin,
-            &world.document_url,
-            url,
-            destination,
-            None,
-        )
+        world
+            .csp
+            .check_request(&world.origin, &world.document_url, url, destination, None)
     }
 
     /// The element whose subresource load `url` is: a `<link>` or `<img>`

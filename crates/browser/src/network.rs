@@ -261,11 +261,13 @@ impl TabNetworkHandle {
             outbound.initiator_kind = InitiatorKind::Fetch;
             outbound.initiator = Some(initiator.clone());
             outbound.deadline = Some(deadline);
-            let response = self
-                .agent
-                .send(outbound)
-                .await
-                .map_err(|error| dial_failure(&error))?;
+            let blocked_redirect = watch_redirects(request, initiator, &mut outbound);
+            let response = match self.agent.send(outbound).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return refused_redirect(&blocked_redirect).ok_or_else(|| dial_failure(&error));
+                }
+            };
             let status = response.status();
             let final_url = response.final_url().to_string();
             let content_type = content_type_header(response.headers());
@@ -361,6 +363,47 @@ fn forbidden_page_header(name: &str, value: &str) -> bool {
             method.trim().to_ascii_lowercase().as_str(),
             "connect" | "trace" | "track"
         )
+    })
+}
+
+/// Records a redirect the policy refuses, and refuses the hop.
+///
+/// The stored URL comes back as a status-0 outcome so the renderer can fire
+/// `securitypolicyviolation` and drop the body.
+/// <https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>
+fn watch_redirects(
+    request: &DialRequest,
+    initiator: &Url,
+    outbound: &mut Request,
+) -> Arc<std::sync::Mutex<Option<Url>>> {
+    let blocked = Arc::new(std::sync::Mutex::new(None));
+    if let Some(csp) = request.csp.clone() {
+        let document_url = initiator.clone();
+        let blocked = Arc::clone(&blocked);
+        outbound.on_redirect = Some(Arc::new(move |next, redirects| {
+            if csp.allows(&document_url, next, redirects) {
+                return true;
+            }
+            *blocked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next.clone());
+            false
+        }));
+    }
+    blocked
+}
+
+fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutcome> {
+    let url = blocked
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()?;
+    Some(DialOutcome {
+        status: 0,
+        final_url: url.to_string(),
+        content_type: None,
+        headers: Vec::new(),
+        body: Vec::new(),
     })
 }
 

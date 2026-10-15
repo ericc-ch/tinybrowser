@@ -577,6 +577,7 @@ mod tests {
                         headers: Vec::new(),
                         referrer: None,
                         timeout_ms: 0,
+                        csp: None,
                     })),
                 },
             },

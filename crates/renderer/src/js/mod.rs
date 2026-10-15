@@ -1554,6 +1554,7 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         headers: request.headers,
         referrer: request.referrer,
         timeout_ms: u64::from(millis(request.timeout)),
+        csp: None,
     });
     match outcome {
         // The header list stays as served; nothing is sniffed into it
