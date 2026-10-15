@@ -263,15 +263,26 @@ impl List {
     /// The violations a response URL produces after redirects: the
     /// post-request check re-runs the source lists with paths ignored
     /// (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+    ///
+    /// `blocked_url` is the request's URL, not the redirect target. The
+    /// violation reports that URL so the page never learns where the hop
+    /// went (<https://w3c.github.io/webappsec-csp/#create-violation-for-request>).
     #[must_use]
     pub(crate) fn check_redirected_request(
         &self,
         origin: &Origin,
         document_url: &Url,
-        url: &Url,
+        response_url: &Url,
+        blocked_url: &Url,
         destination: Destination,
     ) -> Vec<Violation> {
-        self.violations(origin, document_url, url, destination, None, 1)
+        let mut violations =
+            self.violations(origin, document_url, response_url, destination, None, 1);
+        let blocked = blocked_url.as_str().to_owned();
+        for violation in &mut violations {
+            violation.blocked_uri.clone_from(&blocked);
+        }
+        violations
     }
 
     fn violations(

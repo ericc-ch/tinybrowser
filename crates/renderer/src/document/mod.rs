@@ -2062,6 +2062,7 @@ impl Document {
                     let blocked = redirected
                         && self.response_url_blocked(
                             &outcome.final_url,
+                            &request_url,
                             crate::csp::Destination::Connect,
                             None,
                         );
@@ -2085,6 +2086,7 @@ impl Document {
                     let blocked = redirected
                         && self.response_url_blocked(
                             &outcome.final_url,
+                            &request_url,
                             crate::csp::Destination::Script,
                             Some(element),
                         );
@@ -2136,7 +2138,7 @@ impl Document {
                 );
             }
             DialContext::BlitzResource { id, destination } => {
-                self.deliver_blitz_resource(id, destination, &outcome, redirected);
+                self.deliver_blitz_resource(id, destination, &outcome, &request_url, redirected);
             }
         }
         self.adopt_js_work();
@@ -2150,11 +2152,12 @@ impl Document {
         id: u64,
         destination: Option<crate::csp::Destination>,
         outcome: &DialOutcome,
+        request_url: &str,
         redirected: bool,
     ) {
         let blocked = redirected
             && destination.is_some_and(|destination| {
-                self.response_url_blocked(&outcome.final_url, destination, None)
+                self.response_url_blocked(&outcome.final_url, request_url, destination, None)
             });
         if !blocked && (200..300).contains(&outcome.status) {
             self.subresource_bytes
@@ -2533,10 +2536,14 @@ impl Document {
     pub(in crate::document) fn response_url_blocked(
         &mut self,
         final_url: &str,
+        request_url: &str,
         destination: crate::csp::Destination,
         target: Option<crate::dom::tree::NodeId>,
     ) -> bool {
         let Ok(url) = Url::parse(final_url) else {
+            return false;
+        };
+        let Ok(blocked_url) = Url::parse(request_url) else {
             return false;
         };
         let violations = {
@@ -2545,6 +2552,7 @@ impl Document {
                 &world.origin,
                 &world.document_url,
                 &url,
+                &blocked_url,
                 destination,
             )
         };

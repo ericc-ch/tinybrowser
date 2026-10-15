@@ -118,6 +118,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     };
     if outcome.final_url != name
         && let Ok(final_url) = url::Url::parse(&outcome.final_url)
+        && let Ok(request_url) = url::Url::parse(name)
     {
         let violations = {
             let world = world_rc.borrow();
@@ -125,6 +126,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
                 &world.origin,
                 &world.document_url,
                 &final_url,
+                &request_url,
                 crate::csp::Destination::Script,
             )
         };
