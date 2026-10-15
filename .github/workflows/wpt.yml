@@ -10,6 +10,11 @@
 # run page. CARGO_PROFILE_WPT_DEBUG=false is a CI-only tweak for the 14 GB
 # runner disk: the wpt profile keeps its assertions either way.
 #
+# Defaults: the four test types tinybrowser can run today (testharness,
+# crashtest, reftest, test262) over the whole tree. print-reftest is out (no
+# printing); aamtest and wdspec need pytest plus the platform accessibility
+# stack, so they cannot run yet.
+#
 # Not here yet: results publishing (wpt-results branch + tracker page), PR
 # subsets, wpt.fyi upload.
 name: WPT
@@ -20,11 +25,11 @@ on:
       chunks:
         description: Matrix size; mirrors upstream --total-chunks.
         type: string
-        default: "16"
+        default: "20"
       test-types:
         description: Space-separated wptrunner test types; stays last (nargs).
         type: string
-        default: "testharness"
+        default: "testharness crashtest reftest test262"
       exclude:
         description: Space-separated upstream --exclude values.
         type: string
