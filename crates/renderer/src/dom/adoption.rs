@@ -133,7 +133,7 @@ pub(crate) fn import_snapshot(
             })
         }
         NodeData::CDataSection { .. } => Some(ImportSnapshot::CData(doc.character_data(id.node))),
-        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => {
+        NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
             let children = if deep {
                 snapshot_children(doc, id.document, node.children.iter().copied())
             } else {
@@ -141,7 +141,11 @@ pub(crate) fn import_snapshot(
             };
             Some(ImportSnapshot::Fragment(children))
         }
-        NodeData::Document(_) => None,
+        // A shadow root is not a fragment that clone, import, or adopt may
+        // copy. Callers reject it with the spec exception before snapshotting
+        // (<https://dom.spec.whatwg.org/#dom-node-clonenode>). A document has
+        // no snapshot either.
+        NodeData::ShadowRoot { .. } | NodeData::Document(_) => None,
     }
 }
 

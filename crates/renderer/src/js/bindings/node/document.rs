@@ -6,10 +6,10 @@ use super::super::{
     WebIdlString, attr_wrapper, child_value, deref_weak, document_base_url_string,
     document_is_html, document_is_html_content, document_url_string, element_at_point,
     elements_by_tag, find_element_by_id, fixup_focus_after_removal, host, host_node_id,
-    import_attr, is_main_document, live_collection, make_weak, new_detached_attr, required_node,
-    schedule_mutation_delivery, set_attribute_sync, throw_dom, throw_dom_error,
-    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
-    world, world_for_node, wrap_new_document_in_world, wrap_node,
+    import_attr, is_main_document, live_collection, make_weak, new_detached_attr,
+    node_is_shadow_root, required_node, schedule_mutation_delivery, set_attribute_sync, throw_dom,
+    throw_dom_error, valid_attribute_local_name, valid_element_local_name, validate_and_extract,
+    with_node_data, world, world_for_node, wrap_new_document_in_world, wrap_node,
 };
 use crate::dom::adoption::{ImportSnapshot, import_snapshot, materialize_import};
 use rquickjs::function::Rest;
@@ -891,6 +891,14 @@ impl JsNode {
                 "cannot import a document",
             ));
         }
+        if node_is_shadow_root(&ctx, source_id)? {
+            // https://dom.spec.whatwg.org/#dom-document-importnode
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "cannot import a shadow root",
+            ));
+        }
         let tree = world_rc
             .borrow()
             .store()
@@ -1288,7 +1296,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-shadowroot
-    pub(super) fn shadow_root<'js>(&self, ctx: &Ctx<'js>) -> Value<'js> {
+    pub(super) fn shadow_root<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let id = self.handle.0;
         let found = world(ctx).ok().and_then(|world| {
             let world = world.borrow();
@@ -1309,9 +1317,8 @@ impl JsNode {
                     document: id.document,
                     node: shadow,
                 },
-            )
-            .unwrap_or_else(|_| Value::new_null(ctx.clone())),
-            None => Value::new_null(ctx.clone()),
+            ),
+            None => Ok(Value::new_null(ctx.clone())),
         }
     }
 
@@ -2227,6 +2234,23 @@ fn valid_shadow_host(local: &str) -> bool {
     ) || valid_custom_element_name(local)
 }
 
+/// `PCENChar` (<https://html.spec.whatwg.org/multipage/custom-elements.html#prod-pcenchar>).
+fn is_pcen_char(ch: char) -> bool {
+    matches!(ch, '-' | '.' | '0'..='9' | '_' | 'a'..='z' | '\u{00B7}')
+        || ('\u{00C0}'..='\u{00D6}').contains(&ch)
+        || ('\u{00D8}'..='\u{00F6}').contains(&ch)
+        || ('\u{00F8}'..='\u{037D}').contains(&ch)
+        || ('\u{037F}'..='\u{1FFF}').contains(&ch)
+        || ('\u{200C}'..='\u{200D}').contains(&ch)
+        || ('\u{203F}'..='\u{2040}').contains(&ch)
+        || ('\u{2070}'..='\u{218F}').contains(&ch)
+        || ('\u{2C00}'..='\u{2FEF}').contains(&ch)
+        || ('\u{3001}'..='\u{D7FF}').contains(&ch)
+        || ('\u{F900}'..='\u{FDCF}').contains(&ch)
+        || ('\u{FDF0}'..='\u{FFFD}').contains(&ch)
+        || ('\u{10000}'..='\u{EFFFF}').contains(&ch)
+}
+
 fn valid_custom_element_name(local: &str) -> bool {
     const FORBIDDEN: &[&str] = &[
         "annotation-xml",
@@ -2241,6 +2265,8 @@ fn valid_custom_element_name(local: &str) -> bool {
     if FORBIDDEN.contains(&local) {
         return false;
     }
+    // PotentialCustomElementName is `[a-z] PCENChar* '-' PCENChar*`
+    // (<https://html.spec.whatwg.org/multipage/custom-elements.html#valid-custom-element-name>).
     let mut chars = local.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -2249,15 +2275,43 @@ fn valid_custom_element_name(local: &str) -> bool {
         return false;
     }
     let mut hyphen = false;
-    for ch in local.chars() {
+    for ch in chars {
         if ch == '-' {
             hyphen = true;
-            continue;
         }
-        let ok = ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '.');
-        if !ok {
+        if !is_pcen_char(ch) {
             return false;
         }
     }
     hyphen
+}
+
+/// Fragment context for `innerHTML`: the element itself, or a shadow root's host
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml>).
+pub(super) fn inner_html_fragment_context(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
+    let owner = world_for_node(ctx, id)?;
+    let parsed = owner.borrow();
+    let Some(parsed) = parsed.document(id) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    let Some(node) = parsed.document.base.get_node(id.node) else {
+        return Err(Exception::throw_type(ctx, "stale node"));
+    };
+    let name = match &node.data {
+        NodeData::Element(element) => element.name.clone(),
+        NodeData::ShadowRoot { host, .. } => parsed
+            .document
+            .base
+            .get_node(*host)
+            .and_then(|host| host.data.downcast_element())
+            .map(|element| element.name.clone())
+            .ok_or_else(|| Exception::throw_type(ctx, "shadow root has no host"))?,
+        _ => {
+            return Err(Exception::throw_type(
+                ctx,
+                "innerHTML requires an element or shadow root",
+            ));
+        }
+    };
+    Ok(html_fragment_context(&name))
 }

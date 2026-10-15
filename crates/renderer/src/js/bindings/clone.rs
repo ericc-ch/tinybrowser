@@ -52,6 +52,14 @@ pub(crate) fn adopt_into_document(ctx: &Ctx<'_>, document: NodeId, node: NodeId)
             "cannot adopt a document",
         ));
     }
+    if super::node_is_shadow_root(ctx, node)? {
+        // https://dom.spec.whatwg.org/#dom-document-adoptnode
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "cannot adopt a shadow root",
+        ));
+    }
     if node.document == document.document {
         store
             .borrow_mut()

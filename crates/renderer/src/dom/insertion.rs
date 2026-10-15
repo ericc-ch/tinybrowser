@@ -12,7 +12,7 @@ use crate::documents::JournalEntry;
 use crate::dom::TreeError;
 use crate::dom::tree::{
     BlitzId, NodeId, attr, html_namespace, is_html_element, is_iframe_element, is_real_element,
-    mathml_namespace, root_of, sibling, svg_namespace,
+    mathml_namespace, sibling, svg_namespace,
 };
 
 /// The inserted node's side of ensure pre-insert validity.
@@ -727,10 +727,9 @@ pub(crate) fn ensure_no_cycle(
     node: BlitzId,
 ) -> Result<(), TreeError> {
     // Host-including inclusive ancestry: a template contents fragment counts
-    // as a child of its host, so appending an ancestor of the host into the
-    // fragment is a cycle
+    // as a child of its host, and a shadow root counts as a child of its
+    // host, so appending an ancestor of the host into either is a cycle
     // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
-    // No shadow hosts exist, so the host link is the only non-parent step.
     let mut cursor = Some(parent);
     while let Some(current) = cursor {
         if current == node {
@@ -843,11 +842,16 @@ pub(crate) fn ensure_can_move(
         return Err(TreeError::Hierarchy);
     }
     let base = &doc.base;
-    if root_of(base, parent.node) != root_of(base, node.node) {
+    // `move` compares shadow-including roots, so a node can cross into a
+    // connected shadow tree
+    // (<https://dom.spec.whatwg.org/#move>).
+    if crate::dom::tree::shadow_including_root(base, parent.node)
+        != crate::dom::tree::shadow_including_root(base, node.node)
+    {
         return Err(TreeError::Hierarchy);
     }
-    // Host-including ancestry (template contents via their host) is checked
-    // inside `ensure_no_cycle`; there are no shadow hosts
+    // Host-including ancestry (template contents and shadow roots via their
+    // host) is checked inside `ensure_no_cycle`
     // (<https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor>).
     ensure_no_cycle(base, parent.node, node.node)?;
     match target {

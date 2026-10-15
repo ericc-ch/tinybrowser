@@ -1174,6 +1174,12 @@ pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<Wor
     owner.ok_or_else(|| Exception::throw_type(ctx, "stale node"))
 }
 
+pub(super) fn node_is_shadow_root(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
+    with_node_data(ctx, id, |data| {
+        matches!(data, Some(NodeData::ShadowRoot { .. }))
+    })
+}
+
 pub(super) fn with_node_data<T>(
     ctx: &Ctx<'_>,
     id: NodeId,

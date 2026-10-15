@@ -6,10 +6,10 @@ use super::super::{
     character_data, character_data_offset, child_value, clone_document,
     convert_union_nodes_into_node, copy_nonce_subtree, deref_weak, document_is_html_content,
     dom_string, drain_mutation_journal, element_sibling_value, fixup_focus_after_removal,
-    live_collection, make_weak, replace_character_data, schedule_mutation_delivery, select_error,
-    selector_matching_elements, set_character_data, set_pi_data, sibling_value, string_value,
-    throw_dom, throw_dom_error, valid_attribute_local_name, with_node_data, world, world_for_node,
-    wrap_node,
+    live_collection, make_weak, node_is_shadow_root, replace_character_data,
+    schedule_mutation_delivery, select_error, selector_matching_elements, set_character_data,
+    set_pi_data, sibling_value, string_value, throw_dom, throw_dom_error,
+    valid_attribute_local_name, with_node_data, world, world_for_node, wrap_node,
 };
 use crate::dom::adoption::{clone_within_document, materialize_import};
 
@@ -930,7 +930,8 @@ impl JsNode {
     pub(super) fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
         // https://dom.spec.whatwg.org/#dom-node-nodetype
         // Fragment backings are elements flagged in the document's fragment
-        // set. Shadow roots have no Blitz kind.
+        // set. A shadow root is a fragment node too
+        // (<https://dom.spec.whatwg.org/#interface-shadowroot>).
         let world = world(ctx)?;
         let is_fragment = world
             .borrow()
@@ -1192,9 +1193,9 @@ impl JsNode {
             .base
             .get_node(self.handle.0.node)
             .map(|node| match &node.data {
-                NodeData::Element(_)
-                | NodeData::Fragment { .. }
-                | NodeData::ShadowRoot { .. } => 0u8,
+                NodeData::Element(_) | NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => {
+                    0u8
+                }
                 NodeData::Text(_)
                 | NodeData::Comment { .. }
                 | NodeData::ProcessingInstruction { .. }
@@ -1559,9 +1560,8 @@ impl JsNode {
         ctx: Ctx<'js>,
         options: node_generated::GetRootNodeOptions,
     ) -> Result<Value<'js>> {
-        let _ = options.composed;
-        // Known gap: Blitz has no shadow DOM, so the composed option never
-        // crosses a shadow boundary and the root is the tree root.
+        // `composed: true` returns the shadow-including root
+        // (<https://dom.spec.whatwg.org/#dom-node-getrootnode>).
         let world = world(&ctx)?;
         let mut root = self.handle.0;
         {
@@ -1570,7 +1570,15 @@ impl JsNode {
                 return Ok(Value::new_null(ctx));
             };
             let base = &parsed.document.base;
-            while let Some(parent) = base.get_node(root.node).and_then(|node| node.parent) {
+            loop {
+                let parent = if options.composed {
+                    crate::dom::tree::shadow_including_parent(base, root.node)
+                } else {
+                    base.get_node(root.node).and_then(|node| node.parent)
+                };
+                let Some(parent) = parent else {
+                    break;
+                };
                 root = NodeId {
                     document: root.document,
                     node: parent,
@@ -1602,6 +1610,14 @@ impl JsNode {
         };
         if is_document {
             return clone_document(&ctx, self.handle.0, deep);
+        }
+        if node_is_shadow_root(&ctx, self.handle.0)? {
+            // https://dom.spec.whatwg.org/#dom-node-clonenode
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "cannot clone a shadow root",
+            ));
         }
         // Known gap: form-state cloning (input checkedness/value) has no Blitz
         // equivalent yet; deep clones carry structure only.
@@ -1941,14 +1957,8 @@ pub(super) fn insertion_excluding_children(
         let parsed = owner
             .document(parent)
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
-        ensure_document_content_model(
-            &parsed.document,
-            parent,
-            reference,
-            excluded,
-            &inserted,
-        )
-        .map_err(|error| throw_dom_error(ctx, error))?;
+        ensure_document_content_model(&parsed.document, parent, reference, excluded, &inserted)
+            .map_err(|error| throw_dom_error(ctx, error))?;
     }
     Ok((node, reference))
 }
@@ -2072,7 +2082,11 @@ pub(super) fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> 
 /// Same-document insert returns `node`. A node from another document adopts
 /// into the parent's document, preserving fragment backings as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
-pub(in crate::js::bindings) fn adopt_node(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
+pub(in crate::js::bindings) fn adopt_node(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeId,
+) -> Result<NodeId> {
     if node.document == parent.document {
         return Ok(node);
     }
@@ -2527,7 +2541,11 @@ pub(super) fn doctype_field(
 /// then move node points over and bump the equal parent slot; the truncate
 /// writes without the generic replacement rule, which the split steps have
 /// already accounted for.
-pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, offset: u32) -> Result<Value<'js>> {
+pub(in crate::js::bindings) fn split_text_node<'js>(
+    ctx: &Ctx<'js>,
+    id: NodeId,
+    offset: u32,
+) -> Result<Value<'js>> {
     let units = character_data(ctx, id)?.units().into_owned();
     let offset = character_data_offset(ctx, offset, units.len())?;
     let new_data = DomString::from_utf16(units[offset..].to_vec());
@@ -2548,9 +2566,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
             });
             let index = parent.and_then(|parent| {
                 base.get_node(parent.node)
-                    .and_then(|node| {
-                        node.children.iter().position(|sibling| *sibling == id.node)
-                    })
+                    .and_then(|node| node.children.iter().position(|sibling| *sibling == id.node))
                     .and_then(|index| u32::try_from(index).ok())
             });
             (parent, next, index)
@@ -2592,12 +2608,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
             );
             let mut kept = units.clone();
             kept.drain(offset..);
-            truncate_split_text(
-                &mut parsed,
-                id,
-                &kept,
-                DomString::from_utf16(units),
-            );
+            truncate_split_text(&mut parsed, id, &kept, DomString::from_utf16(units));
         }
         apply_inserted(ctx, parent, &[new_id], true)?;
     } else {
@@ -2622,12 +2633,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
             );
             let mut kept = units.clone();
             kept.drain(offset..);
-            truncate_split_text(
-                &mut parsed,
-                id,
-                &kept,
-                DomString::from_utf16(units),
-            );
+            truncate_split_text(&mut parsed, id, &kept, DomString::from_utf16(units));
         }
         schedule_mutation_delivery(ctx)?;
     }
@@ -2637,18 +2643,19 @@ pub(in crate::js::bindings) fn split_text_node<'js>(ctx: &Ctx<'js>, id: NodeId, 
 /// Truncate `id`'s data to `kept` for `splitText`, recording the change. The
 /// range steps already ran, so this writes without the generic replacement
 /// rule that would corrupt a split. Other node kinds cannot reach a split.
-fn truncate_split_text(
-    parsed: &mut crate::Parsed,
-    id: NodeId,
-    kept: &[u16],
-    old_value: DomString,
-) {
-    let wrote = match parsed.document.base.get_node(id.node).map(|node| &node.data) {
+fn truncate_split_text(parsed: &mut crate::Parsed, id: NodeId, kept: &[u16], old_value: DomString) {
+    let wrote = match parsed
+        .document
+        .base
+        .get_node(id.node)
+        .map(|node| &node.data)
+    {
         Some(NodeData::Text(_)) => {
-            parsed.document.base.mutate().set_node_text(
-                id.node,
-                &String::from_utf16_lossy(kept),
-            );
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_node_text(id.node, &String::from_utf16_lossy(kept));
             true
         }
         Some(NodeData::CDataSection { .. }) => {

@@ -327,8 +327,8 @@
     enumerable: true,
     configurable: true,
   });
-  // Without shadow roots no slot ever has assigned nodes; the fallback
-  // answers the spec result for the shadow-less tree instead of throwing.
+  // Slot assignment is not implemented. `assignedNodes` filters the host's
+  // light-DOM children by the `slot` attribute.
   Object.defineProperties(table.HTMLSlotElement, {
     assignedNodes: {
       value: function() {

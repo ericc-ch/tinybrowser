@@ -244,7 +244,7 @@ impl<'js> element_generated::Element<'js> for JsNode {
 
     // https://dom.spec.whatwg.org/#dom-element-shadowroot
     fn get_shadow_root(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        Ok(self.shadow_root(ctx))
+        self.shadow_root(ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-tagname
@@ -2115,13 +2115,9 @@ impl JsNode {
         let element = super::super::realm_registry(ctx)?
             .borrow_mut()
             .live_node_id(self.handle.0);
-        let context = with_node_data(ctx, element, |data| match data {
-            Some(NodeData::Element(element)) => Some(html_fragment_context(&element.name)),
-            _ => None,
-        })?
-        .ok_or_else(|| {
-            Exception::throw_type(ctx, "innerHTML requires an element or shadow root")
-        })?;
+        // A shadow root's fragment parsing context is its host
+        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml>).
+        let context = super::document::inner_html_fragment_context(ctx, element)?;
 
         let snapshots = {
             let (base_url, font_ctx) = fragment_base_url(ctx, element);
