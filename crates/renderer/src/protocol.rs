@@ -402,6 +402,11 @@ pub struct DialRequest {
     /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     #[serde(default)]
     pub referrer: Option<String>,
+    /// Caller deadline in milliseconds. `0` keeps the carrier timeout.
+    /// A synchronous XHR uses its `timeout` attribute here
+    /// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>).
+    #[serde(default)]
+    pub timeout_ms: u64,
 }
 
 fn default_dial_method() -> String {
@@ -442,6 +447,21 @@ pub trait NetworkHost: Send + Sync + 'static {
     /// Implementations must invoke it exactly once, including when submission
     /// is rejected.
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> DialCancellation;
+
+    /// Performs `request` on the calling thread and returns when the response
+    /// arrives. The browser process answers on the reader thread, so this does
+    /// not wait on the renderer loop. Wasm cannot block inside a host callback,
+    /// so the default is a connect failure.
+    ///
+    /// <https://xhr.spec.whatwg.org/#the-send()-method>
+    ///
+    /// # Errors
+    ///
+    /// [`DialFailure::Connect`] when this host cannot block, and whatever
+    /// [`DialFailure`] the carrier reports for transport, timeout, or limits.
+    fn dial_sync(&self, _request: DialRequest) -> Result<DialOutcome, DialFailure> {
+        Err(DialFailure::Connect)
+    }
 
     /// `document.cookie` getter for `url`.
     fn cookies_for(&self, url: &Url) -> String;
