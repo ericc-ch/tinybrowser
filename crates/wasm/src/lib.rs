@@ -130,8 +130,14 @@ impl GuestTab for Tab {
 
     fn step(&self) -> Option<u64> {
         let mut renderer = self.renderer.borrow_mut();
-        let _yielded = renderer.drain_ready();
-        renderer.time_until_deadline().map(|delay| {
+        // Fired timers sit in the task queue and are not a deadline. A yield
+        // with `time_until_deadline() == None` would idle the host forever.
+        let delay = if renderer.drain_ready() {
+            Some(std::time::Duration::ZERO)
+        } else {
+            renderer.time_until_deadline()
+        };
+        delay.map(|delay| {
             let milliseconds = delay.as_nanos().saturating_add(999_999) / 1_000_000;
             u64::try_from(milliseconds).unwrap_or(u64::MAX)
         })

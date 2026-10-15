@@ -1141,6 +1141,28 @@ pub fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
     Some((url.mime_type().to_string(), body))
 }
 
+/// Decodes a `data:` URL that fits the response body cap.
+///
+/// The raw-length check runs before decode. A `data:` URL is materialized
+/// entirely in this process, and base64 plus the MIME prefix can make the
+/// URL longer than its body, so the raw ceiling is twice
+/// [`MAX_RESPONSE_BODY_BYTES`]. The decoded body is then held to that cap.
+/// `None` means the raw URL is past the ceiling, the URL is not decodable,
+/// or the body is past the cap.
+///
+/// <https://fetch.spec.whatwg.org/#data-url-processor>
+#[must_use]
+pub fn decode_data_url_bounded(raw: &str) -> Option<(String, Vec<u8>)> {
+    if raw.len() > crate::protocol::MAX_RESPONSE_BODY_BYTES.saturating_mul(2) {
+        return None;
+    }
+    let (content_type, body) = decode_data_url(raw)?;
+    if body.len() > crate::protocol::MAX_RESPONSE_BODY_BYTES {
+        return None;
+    }
+    Some((content_type, body))
+}
+
 /// Decodes a URL into its UTF-8 text, percent-escapes included.
 fn percent_decode(source: &str) -> String {
     percent_encoding::percent_decode_str(source)
@@ -1170,5 +1192,43 @@ impl Drop for Engine {
         self.frames.clear();
         self.runtime.registry.borrow_mut().clear();
         self.js_runtime.collect();
+    }
+}
+
+#[cfg(test)]
+mod data_url_tests {
+    use super::decode_data_url_bounded;
+    use crate::protocol::MAX_RESPONSE_BODY_BYTES;
+
+    #[test]
+    fn accepts_a_small_data_url() {
+        let (content_type, body) = decode_data_url_bounded("data:text/plain,hi").expect("decode");
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(body, b"hi");
+    }
+
+    #[test]
+    fn rejects_a_malformed_data_url() {
+        assert!(decode_data_url_bounded("data:text/plain;base64,!!!!").is_none());
+    }
+
+    #[test]
+    fn rejects_a_raw_url_past_twice_the_body_cap() {
+        let raw = format!(
+            "data:text/plain,{}",
+            "x".repeat(MAX_RESPONSE_BODY_BYTES.saturating_mul(2))
+        );
+        assert!(raw.len() > MAX_RESPONSE_BODY_BYTES.saturating_mul(2));
+        assert!(decode_data_url_bounded(&raw).is_none());
+    }
+
+    #[test]
+    fn rejects_a_decoded_body_past_the_cap() {
+        let raw = format!(
+            "data:text/plain,{}",
+            "x".repeat(MAX_RESPONSE_BODY_BYTES.saturating_add(1))
+        );
+        assert!(raw.len() <= MAX_RESPONSE_BODY_BYTES.saturating_mul(2));
+        assert!(decode_data_url_bounded(&raw).is_none());
     }
 }

@@ -109,6 +109,51 @@ test("javascript: iframe src runs from an opaque about:blank parent", async ({ d
   await browser.close();
 });
 
+test("a blob URL iframe is same-origin with its opaque creator", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+
+  const result = await page.evaluate(async () => {
+    const url = URL.createObjectURL(
+      new Blob(["<!doctype html><body>BLOB</body>"], { type: "text/html" }),
+    );
+    const iframe = document.createElement("iframe");
+    const blank = new Promise<void>((resolve) => {
+      iframe.addEventListener("load", () => resolve(), { once: true });
+    });
+    document.body.appendChild(iframe);
+    await blank;
+    const loaded = new Promise<void>((resolve) => {
+      iframe.addEventListener("load", () => resolve(), { once: true });
+    });
+    iframe.src = url;
+    await Promise.race([
+      loaded,
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, 1000);
+      }),
+    ]);
+    const child = iframe.contentDocument;
+    let sameOrigin = false;
+    try {
+      sameOrigin = child !== null && iframe.contentWindow.parent.document === document;
+    } catch {
+      sameOrigin = false;
+    }
+    return {
+      readable: child !== null,
+      sameOrigin,
+      body: child && child.body && child.body.textContent,
+    };
+  });
+
+  expect(result.readable).toBe(true);
+  expect(result.sameOrigin).toBe(true);
+  expect(result.body).toContain("BLOB");
+
+  await browser.close();
+});
+
 test("javascript: iframe src runs from an opaque data: parent", async ({ daemon }) => {
   const browser = await chromium.connectOverCDP(daemon.origin);
   const page = browser.contexts()[0].pages()[0];

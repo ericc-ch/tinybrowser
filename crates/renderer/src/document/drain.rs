@@ -131,16 +131,8 @@ impl Document {
                     completed_data = true;
                     // Same ceiling as a streamed navigation body. Decoding an
                     // unbounded `data:` URL would sit entirely in this process.
-                    let raw = dial.url.as_str();
-                    let over_cap =
-                        raw.len() > crate::protocol::MAX_RESPONSE_BODY_BYTES.saturating_mul(2);
-                    match (!over_cap)
-                        .then(|| crate::engine::decode_data_url(raw))
-                        .flatten()
-                    {
-                        Some((content_type, body))
-                            if body.len() <= crate::protocol::MAX_RESPONSE_BODY_BYTES =>
-                        {
+                    match crate::engine::decode_data_url_bounded(dial.url.as_str()) {
+                        Some((content_type, body)) => {
                             self.finish_dial(super::CompletedDial {
                                 context: dial.context,
                                 outcome: crate::protocol::DialOutcome {
@@ -152,7 +144,7 @@ impl Document {
                                 },
                             });
                         }
-                        _ => self.fail_dial(dial.context),
+                        None => self.fail_dial(dial.context),
                     }
                     continue;
                 }

@@ -2066,12 +2066,49 @@ mod realm_tests {
         let elapsed = started.elapsed();
         assert!(yielded, "ready timers stay queued after the deadline");
         assert!(
+            engine.next_deadline().is_none(),
+            "fired timers are queued tasks, not a deadline"
+        );
+        assert!(
             elapsed < std::time::Duration::from_secs(10),
             "one drain took {elapsed:?}"
         );
         let count = engine
             .eval_in(FrameId::MAIN, "String(globalThis.__n)")
             .expect("counter");
+        assert_eq!(count, "1");
+        let again = engine
+            .drain_ready_until(std::time::Instant::now() + std::time::Duration::from_millis(400));
+        assert!(again, "the queued timer is still ready");
+        let count = engine
+            .eval_in(FrameId::MAIN, "String(globalThis.__n)")
+            .expect("counter");
+        assert_eq!(count, "2");
+    }
+
+    /// An embedded host that only waits on the next timer stalls after a
+    /// yield: the due timers are already queued. The wait is zero so the
+    /// host steps again.
+    #[test]
+    fn embedded_yield_is_an_immediate_step() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let mut renderer = crate::EmbeddedRenderer::new(services);
+        let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
+        renderer
+            .mount_for_test(&crate::protocol::Mount {
+                url: "https://example.test/".into(),
+                content_type: Some("text/html".into()),
+                body: html.as_bytes().to_vec(),
+                history: crate::protocol::HistorySnapshot::default(),
+                viewport: None,
+                init_scripts: Vec::new(),
+            })
+            .expect("mount");
+        let yielded = renderer.drain_for(std::time::Duration::from_millis(400));
+        assert!(yielded, "ready work stays queued");
+        let delay = renderer.time_until_deadline();
+        assert_eq!(delay, Some(std::time::Duration::ZERO));
+        let count = renderer.eval("String(globalThis.__n)").expect("counter");
         assert_eq!(count, "1");
     }
 

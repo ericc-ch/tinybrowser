@@ -13,6 +13,11 @@ use crate::{BrowserServices, FrameId, Mount, RemoteValue, RendererEvent, TabErro
 pub struct EmbeddedRenderer {
     engine: Engine,
     stop: Arc<Stop>,
+    /// Ready tasks left queued by the last budgeted drain.
+    ///
+    /// Those tasks are often timers already marked fired, so
+    /// [`Engine::next_deadline`] is `None` while work remains.
+    ready_queued: bool,
 }
 
 impl EmbeddedRenderer {
@@ -23,17 +28,23 @@ impl EmbeddedRenderer {
         Self {
             engine: Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new())),
             stop,
+            ready_queued: false,
         }
     }
 
-    /// Replaces the main-frame document and runs every immediately ready task.
+    /// Replaces the main-frame document and runs ready tasks until the
+    /// script budget.
+    ///
+    /// A yield leaves tasks queued. [`Self::drain_ready`] reports that so
+    /// the host can step again immediately: timers already marked fired are
+    /// not a future deadline.
     ///
     /// # Errors
     ///
     /// The engine rejected the mount.
     pub fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
         self.engine.mount_frame(FrameId::MAIN, mount)?;
-        let _yielded = self.engine.drain_ready();
+        self.drain_until(std::time::Instant::now() + crate::TURN_SCRIPT_BUDGET);
         Ok(())
     }
 
@@ -60,9 +71,31 @@ impl EmbeddedRenderer {
             .execute_remote_in(FrameId::MAIN, crate::ScriptSource::Page(source), timeout)
     }
 
-    /// Runs every immediately ready page task without blocking.
-    pub fn drain_ready(&mut self) {
-        let _yielded = self.engine.drain_ready();
+    /// Runs ready tasks until the script budget without blocking.
+    ///
+    /// Returns whether ready work stayed queued. The host steps again
+    /// immediately in that case.
+    #[must_use]
+    pub fn drain_ready(&mut self) -> bool {
+        self.drain_until(std::time::Instant::now() + crate::TURN_SCRIPT_BUDGET)
+    }
+
+    /// Drains until `deadline`. Returns whether ready work stayed queued.
+    ///
+    /// `drain_ready_until` already stops at `deadline`. The loop matters
+    /// when that call returns early with work still queued and the budget
+    /// has time left.
+    fn drain_until(&mut self, deadline: std::time::Instant) -> bool {
+        let yielded = loop {
+            if !self.engine.drain_ready_until(deadline) {
+                break false;
+            }
+            if std::time::Instant::now() >= deadline {
+                break true;
+            }
+        };
+        self.ready_queued = yielded;
+        yielded
     }
 
     /// Removes and returns all pending main-frame events.
@@ -75,11 +108,30 @@ impl EmbeddedRenderer {
     }
 
     /// Duration until the next page timer is ready.
+    ///
+    /// `Some(0)` when the last drain left ready work queued. Fired timers
+    /// are not a deadline, and a host that waited on `None` would never
+    /// run them.
     #[must_use]
     pub fn time_until_deadline(&self) -> Option<Duration> {
+        if self.ready_queued {
+            return Some(Duration::ZERO);
+        }
         self.engine
             .next_deadline()
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// Mounts without draining, so a test can bound the following drain.
+    #[cfg(test)]
+    pub(crate) fn mount_for_test(&mut self, mount: &Mount) -> Result<(), TabError> {
+        self.engine.mount_frame(FrameId::MAIN, mount)
+    }
+
+    /// [`Self::drain_ready`] bounded by `budget` from now.
+    #[cfg(test)]
+    pub(crate) fn drain_for(&mut self, budget: Duration) -> bool {
+        self.drain_until(std::time::Instant::now() + budget)
     }
 }
 
