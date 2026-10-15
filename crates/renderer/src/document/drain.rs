@@ -23,6 +23,7 @@ impl Document {
         self.launch_queued_dials();
         self.adopt_dial_completions();
         if let Some(task) = self.tasks.pop_front() {
+            let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
             self.run_task(task);
             return !self.stop.is_set();
         }
