@@ -2,10 +2,11 @@
 """Single entry point for the tinybrowser WPT harness.
 
 Upstream WPT (`third_party/wpt`, pristine submodule) owns serving,
-scheduling, driving, and reporting. This file owns three phases around it:
+scheduling, driving, and reporting. This file owns the phases around it:
 * `run`    — build the binary, ready the shared venv + manifest, exec wpt.
 * `score`  — run a set, then print one row per directory + attention list.
 * `rerun`  — re-run only the attention set from a saved wptreport.
+* `merge`  — fold the chunk reports of a CI run into one score.
 * `overnight` — full-suite run + score (needs explicit approval per AGENTS.md).
 
 `tinybrowser_wpt.py` stays separate: upstream imports it as the
@@ -686,6 +687,38 @@ def parse_rerun_argv(
     return report, include_timeout, dry_run, save_report, [], None
 
 
+def parse_merge_argv(argv: list[str]) -> tuple[list[Path], Path | None, str | None]:
+    reports: list[Path] = []
+    out: Path | None = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--out" or arg.startswith("--out="):
+            if arg == "--out":
+                if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                    return reports, None, "--out needs a file"
+                out = Path(argv[i + 1])
+                i += 1
+            else:
+                value = arg.split("=", 1)[1]
+                if not value:
+                    return reports, None, "--out needs a file"
+                out = Path(value)
+        elif arg.startswith("-"):
+            return (
+                reports,
+                out,
+                f"merge takes report files, not {arg} "
+                "(chunk flags belong to `run`)",
+            )
+        else:
+            reports.append(Path(arg))
+        i += 1
+    if len(reports) < 2:
+        return reports, out, "merge needs at least two report files"
+    return reports, out, None
+
+
 # --- report primitives (score + rerun share these) ---
 
 
@@ -761,6 +794,10 @@ def summarize(report: Path) -> int:
     if not results:
         eprint(f"no results in report {report}")
         return 1
+    return summarize_results(results)
+
+
+def summarize_results(results: list[dict]) -> int:
     rows, attention = classify_results(results)
     width = max(len(name) for name in rows)
     header = (
@@ -822,6 +859,51 @@ def rerun_status(remaining: int, runner_exit: int) -> tuple[int, bool]:
     if remaining:
         return 1, True
     return 0, False
+
+
+# --- `merge` (chunk reports of a CI run -> one report, one score) ---
+
+
+def read_report_results(report: Path) -> tuple[list[dict], str | None]:
+    try:
+        data = json.loads(report.read_text())
+    except OSError as error:
+        return [], f"cannot read report {report}: {error}"
+    except json.JSONDecodeError as error:
+        return [], f"report {report} is not valid JSON ({error})"
+    results = data.get("results") or []
+    if not results:
+        return [], f"no results in report {report}"
+    return results, None
+
+
+def merge_main(argv: list[str]) -> int:
+    reports, out, error = parse_merge_argv(argv)
+    if error:
+        return die("merge", error, 2)
+    results: list[dict] = []
+    seen: set[str] = set()
+    for report in reports:
+        chunk, error = read_report_results(report)
+        if error:
+            return die("merge", error, 2)
+        for result in chunk:
+            test = result.get("test")
+            if not test:
+                return die("merge", f"a result in {report} has no test id", 2)
+            if test in seen:
+                # Upstream dir_hash chunking puts every test in exactly one
+                # chunk, so an overlap means the chunking and the reports
+                # disagree; folding anyway would double-count the test.
+                return die("merge", f"{test} appears in more than one report", 2)
+            seen.add(test)
+            results.append(result)
+    results.sort(key=lambda result: result["test"])
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"results": results}))
+        eprint(f"merged {len(reports)} reports -> {out} ({len(results)} results)")
+    return summarize_results(results)
 
 
 # --- longest-first split (durations from earlier runs) ---
@@ -1754,8 +1836,19 @@ def _selftest() -> None:
     assert r == Path("r.json") and err is None
     assert parse_rerun_argv([])[5] is not None
 
+    reports, out, err = parse_merge_argv(["a.json", "b.json", "--out", "m.json"])
+    assert (
+        reports == [Path("a.json"), Path("b.json")]
+        and out == Path("m.json")
+        and err is None
+    )
+    assert parse_merge_argv(["a.json", "b.json"])[1] is None
+    assert parse_merge_argv(["a.json"])[2] is not None
+    assert parse_merge_argv(["a.json", "b.json", "--out"])[2] is not None
+    assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[2] is not None
 
-TOP_HELP = """tinybrowser WPT harness: run | score | rerun | overnight | selftest
+
+TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | overnight | selftest
 
   run PATH... [--score] [--dry-run] [-- upstream-flags...]
     Run WPT. Upstream flags follow `--` (or start implicitly at the first
@@ -1765,6 +1858,9 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | overnight | selftes
     Summarize an existing report (--report) or run then summarize.
   rerun REPORT [--include-timeout] [--dry-run] [--save-report FILE] [-- runner...]
     Re-run only the attention set from a wptreport.
+  merge REPORT... [--out FILE]
+    Fold the chunk reports of one CI run into a single score. Overlapping
+    reports are refused; --out also writes the merged wptreport.
   overnight [--save-report FILE] [--dry-run] [-- runner...]
     Full-suite run + score. Long; needs explicit approval per AGENTS.md.
   selftest
@@ -1774,6 +1870,7 @@ Examples:
   tools/wpt/run dom/events/ --exclude=worker
   tools/wpt/run --score dom/nodes/ -- --processes 4
   tools/wpt/rerun /tmp/fileapi.json -- --processes 8 --fully-parallel
+  cli.py merge reports/*.json --out merged.json
 """
 
 
@@ -1791,6 +1888,8 @@ def main(argv: list[str] | None = None) -> int:
         return score_main(rest)
     if command in ("rerun", "retest"):
         return rerun_main(rest)
+    if command == "merge":
+        return merge_main(rest)
     if command == "overnight":
         return overnight_main(rest)
     if command == "_inner":
@@ -1801,7 +1900,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     return die(
         "wpt",
-        f"unknown command {command}; expected run | score | rerun | overnight | selftest",
+        f"unknown command {command}; expected run | score | rerun | merge | overnight | selftest",
         2,
     )
 

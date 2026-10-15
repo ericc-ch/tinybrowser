@@ -1,0 +1,169 @@
+# Chunked WPT runs for sets too long for one machine. Local loops stay on
+# tools/wpt/run; this workflow is the full-suite pass. Each run keeps its
+# raw chunk reports as artifacts, so a score can be reproduced without
+# rerunning anything.
+#
+# Shape: one build (stylo makes a cold build long) fans the same wpt-profile
+# binary out to `chunks` jobs. Each job runs one upstream dir_hash chunk of
+# the manifest (wptrunner hashes the test directory, so a directory is never
+# split across jobs); the score job folds the reports into one table on the
+# run page. CARGO_PROFILE_WPT_DEBUG=false is a CI-only tweak for the 14 GB
+# runner disk: the wpt profile keeps its assertions either way.
+#
+# Not here yet: results publishing (wpt-results branch + tracker page), PR
+# subsets, wpt.fyi upload.
+name: WPT
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunks:
+        description: Matrix size; mirrors upstream --total-chunks.
+        type: string
+        default: "16"
+      test-types:
+        description: Space-separated wptrunner test types; stays last (nargs).
+        type: string
+        default: "testharness"
+      exclude:
+        description: Space-separated upstream --exclude values.
+        type: string
+        default: "worker"
+
+permissions:
+  contents: read
+
+concurrency:
+  # One live run per ref; a new dispatch supersedes the old one.
+  group: wpt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_WPT_DEBUG: "false"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+    steps:
+      - id: plan
+        name: Build the chunk list
+        env:
+          CHUNKS: ${{ inputs.chunks }}
+        run: echo "chunks=[$(seq -s, 1 "$CHUNKS")]" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Submodules (build inputs only, shallow)
+        run: >
+          git submodule update --init --recursive --depth 1 --jobs 4
+          third_party/blitz third_party/rquickjs third_party/html5ever
+      - name: Build the wpt profile
+        run: |
+          cargo build --profile wpt --locked
+          cp "$(./tools/binary-path --profile wpt)" tinybrowser-wpt
+          ls -l tinybrowser-wpt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinybrowser-wpt
+          path: tinybrowser-wpt
+          retention-days: 3
+
+  wpt:
+    name: chunk ${{ matrix.chunk }}/${{ inputs.chunks }}
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: WPT checkout (pinned, shallow)
+        run: git submodule update --init --depth 1 third_party/wpt
+      # uv materializes CPython 3.12 and the adapter venv on first use;
+      # the chunk itself never compiles.
+      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: tinybrowser-wpt
+      - name: Run chunk ${{ matrix.chunk }}
+        env:
+          TINYBROWSER_BINARY: ${{ github.workspace }}/tinybrowser-wpt
+          REPORT: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.json
+          EXCLUDES: ${{ inputs.exclude }}
+        run: |
+          chmod +x "$TINYBROWSER_BINARY"
+          excludes=()
+          for value in $EXCLUDES; do excludes+=(--exclude="$value"); done
+          ./tools/wpt/run -- \
+            --log-wptreport "$REPORT" \
+            --no-fail-on-unexpected \
+            --total-chunks "${{ inputs.chunks }}" \
+            --this-chunk "${{ matrix.chunk }}" \
+            "${excludes[@]}" \
+            --test-types ${{ inputs.test-types }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: wpt-report-${{ matrix.chunk }}
+          path: wpt-report-${{ matrix.chunk }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  score:
+    name: score
+    needs: [plan, wpt]
+    if: ${{ !cancelled() && needs.wpt.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wpt-report-*
+          path: reports
+          merge-multiple: true
+      - name: Merge chunk reports
+        env:
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reports=(reports/*.json)
+          echo "downloaded ${#reports[@]}/$CHUNKS chunk reports"
+          if (( ${#reports[@]} == 0 )); then
+            echo "::error::no chunk reports to merge"
+            exit 1
+          fi
+          python3 tools/wpt/cli.py merge "${reports[@]}" --out merged.json | tee summary.txt
+          if (( ${#reports[@]} != CHUNKS )); then
+            echo "::error::incomplete run: ${#reports[@]} of $CHUNKS chunk reports"
+            exit 1
+          fi
+      - name: Run page summary
+        if: ${{ !cancelled() && hashFiles('summary.txt') != '' }}
+        run: |
+          {
+            echo "## WPT — ${{ inputs.test-types }} (${{ inputs.chunks }} chunks, exclude: ${{ inputs.exclude }})"
+            echo
+            echo '```'
+            cat summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: wpt-merged
+          path: |
+            merged.json
+            summary.txt
+          if-no-files-found: warn
+          retention-days: 7
