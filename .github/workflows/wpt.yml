@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: System libraries
         run: >
           sudo apt-get update -qq &&
@@ -85,7 +85,7 @@ jobs:
             echo "::error::missing runtime libraries in the runner image:"$'\n'"$missing"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tinybrowser-wpt
           path: tinybrowser-wpt
@@ -101,13 +101,13 @@ jobs:
       matrix:
         chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: WPT checkout (pinned, shallow)
         run: git submodule update --init --depth 1 third_party/wpt
       # uv materializes CPython 3.12 and the adapter venv on first use;
       # the chunk itself never compiles.
       - uses: astral-sh/setup-uv@v10.3.0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tinybrowser-wpt
       - name: Run chunk ${{ matrix.chunk }}
@@ -126,7 +126,7 @@ jobs:
             --this-chunk "${{ matrix.chunk }}" \
             "${excludes[@]}" \
             --test-types ${{ inputs.test-types }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: wpt-report-${{ matrix.chunk }}
@@ -141,8 +141,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: wpt-report-*
           path: reports
@@ -174,7 +174,7 @@ jobs:
             cat summary.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: wpt-merged
