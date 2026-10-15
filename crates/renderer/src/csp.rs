@@ -116,6 +116,8 @@ pub(crate) enum Destination {
     Img,
     /// Web fonts (`font-src`).
     Font,
+    /// Nested browsing-context navigations (`frame-src`).
+    Frame,
 }
 
 /// The directive that decides a check
@@ -130,6 +132,7 @@ enum Effective {
     ConnectSrc,
     ImgSrc,
     FontSrc,
+    FrameSrc,
 }
 
 impl Effective {
@@ -142,6 +145,7 @@ impl Effective {
             Self::ConnectSrc => "connect-src",
             Self::ImgSrc => "img-src",
             Self::FontSrc => "font-src",
+            Self::FrameSrc => "frame-src",
         }
     }
 
@@ -156,6 +160,8 @@ impl Effective {
             Self::ConnectSrc => &["connect-src", "default-src"],
             Self::ImgSrc => &["img-src", "default-src"],
             Self::FontSrc => &["font-src", "default-src"],
+            // <https://w3c.github.io/webappsec-csp/#directive-fallback-list>
+            Self::FrameSrc => &["frame-src", "child-src", "default-src"],
         }
     }
 }
@@ -169,6 +175,7 @@ impl Destination {
             Self::StyleSheet => Effective::StyleSrcElem,
             Self::Img => Effective::ImgSrc,
             Self::Font => Effective::FontSrc,
+            Self::Frame => Effective::FrameSrc,
         }
     }
 }
@@ -406,6 +413,27 @@ impl RedirectGate {
             redirects,
         ))
     }
+
+    /// Violations for a redirect hop. `blocked_url` is the request's URL
+    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-request>).
+    pub(crate) fn redirected_violations(
+        &self,
+        document_url: &Url,
+        response_url: &Url,
+        blocked_url: &Url,
+    ) -> Vec<Violation> {
+        let origin = self
+            .origin
+            .as_ref()
+            .map_or_else(Origin::new_opaque, TupleOrigin::to_origin);
+        self.list.check_redirected_request(
+            &origin,
+            document_url,
+            response_url,
+            blocked_url,
+            self.destination,
+        )
+    }
 }
 
 /// Whether the fallback directive chain for `destination` violates `policy`
@@ -612,7 +640,8 @@ fn inline_check_blocks(effective: Effective, list: &[String], inline: &InlineScr
         Effective::StyleSrcElem
         | Effective::ConnectSrc
         | Effective::ImgSrc
-        | Effective::FontSrc => false,
+        | Effective::FontSrc
+        | Effective::FrameSrc => false,
     }
 }
 
@@ -1084,21 +1113,46 @@ fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
+/// Splits `host-part [ ":" port-part ]`.
+///
+/// A bracketed address keeps every colon inside the brackets. The port is
+/// only the component after `]`, so `[::1]` is a host with no port and
+/// `[::1]:443` is that host on port 443. An empty port (`example.test:`,
+/// `[::1]:`) is rejected.
+///
+/// CSP3's `host-part` grammar does not include addresses
+/// (<https://w3c.github.io/webappsec-csp/#grammardef-host-part>), so
+/// [`valid_host_part`] still drops the expression. The split itself must not
+/// treat the last hextet as a port.
 fn split_host_port(hostport: &str) -> Option<(&str, Option<PortPart>)> {
+    if hostport.starts_with('[') {
+        let end = hostport.find(']')?;
+        let host = &hostport[..=end];
+        let after = &hostport[end + 1..];
+        if after.is_empty() {
+            return Some((host, None));
+        }
+        let port = after.strip_prefix(':')?;
+        return Some((host, Some(parse_port_part(port)?)));
+    }
     let Some((host, port)) = hostport.rsplit_once(':') else {
         return Some((hostport, None));
     };
+    if port.is_empty() {
+        return None;
+    }
+    Some((host, Some(parse_port_part(port)?)))
+}
+
+fn parse_port_part(port: &str) -> Option<PortPart> {
     if port == "*" {
-        return Some((host, Some(PortPart::Star)));
+        return Some(PortPart::Star);
     }
     if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
         let number = port.parse::<u16>().ok()?;
-        return Some((host, Some(PortPart::Number(number))));
+        return Some(PortPart::Number(number));
     }
-    if hostport.contains(':') {
-        return None;
-    }
-    Some((hostport, None))
+    None
 }
 
 fn valid_host_part(host: &str) -> bool {
@@ -1253,6 +1307,13 @@ mod tests {
             ("example.test:", None),
             ("example.test:abc", None),
             ("example.test:99999", None),
+            ("[::1]", Some(("[::1]", None))),
+            ("[::1]:443", Some(("[::1]", Some(443u16)))),
+            ("[2001:db8::1]:8443", Some(("[2001:db8::1]", Some(8443u16)))),
+            ("[::1]:", None),
+            ("[::1]:abc", None),
+            ("[::1]:99999", None),
+            ("[::1", None),
         ];
         for (input, expect) in cases {
             let parsed = split_host_port(input);
@@ -1275,6 +1336,9 @@ mod tests {
         }
         let (host, port) = split_host_port("example.test:*").expect("star");
         assert_eq!(host, "example.test");
+        assert!(matches!(port, Some(PortPart::Star)));
+        let (host, port) = split_host_port("[::1]:*").expect("ipv6 star");
+        assert_eq!(host, "[::1]");
         assert!(matches!(port, Some(PortPart::Star)));
     }
 

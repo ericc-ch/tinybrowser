@@ -96,6 +96,9 @@ pub(crate) enum DialContext {
     /// a superseded load is dropped when it completes.
     FrameLoad {
         sequence: u64,
+        /// The embedding document, when this navigation is a nested browsing
+        /// context. `None` for the top-level document.
+        embedder: Option<FrameId>,
     },
     /// A Blitz subresource (stylesheet, image, font) fetch. The response
     /// handler waits in [`Document::blitz_handlers`] under this id; delivery
@@ -123,8 +126,8 @@ pub(crate) struct QueuedDial {
     pub(crate) headers: Vec<(String, String)>,
     /// Browser-generated `Referer` URL. `None` omits the header.
     pub(crate) referrer: Option<String>,
-    /// Policy the network re-checks on every redirect. `None` for a document
-    /// navigation, which this check does not cover.
+    /// Policy the network re-checks on every redirect. `None` for a top-level
+    /// document navigation. A nested frame navigation carries `frame-src`.
     pub(crate) csp: Option<crate::RedirectGate>,
 }
 
@@ -152,6 +155,8 @@ pub(crate) struct CompletedDial {
     /// URL the dial asked for, so a response can tell a redirect from the
     /// original hop.
     pub(crate) request_url: String,
+    /// Policy carried with the dial, used when a redirect is reported.
+    pub(crate) csp: Option<crate::RedirectGate>,
 }
 
 /// Who feeds the active parser, and therefore who may end it.
@@ -365,6 +370,9 @@ pub(crate) struct Document {
     classic_fetch_in_flight: bool,
     deferred_modules: Vec<(crate::dom::tree::NodeId, crate::js::ScriptSource)>,
     stop: Arc<crate::js::Stop>,
+    /// `frame-src` redirect violations to fire in the embedding document.
+    /// The navigating frame cannot dispatch into its parent's realm.
+    embedder_csp_reports: Vec<(FrameId, Vec<crate::csp::Violation>)>,
 }
 
 impl Drop for Document {
@@ -453,6 +461,7 @@ impl Document {
             character_set: "UTF-8",
             response_content_type: None,
             response_policy: crate::csp::List::default(),
+            embedder_csp_reports: Vec::new(),
             csp_from_response: false,
             sniff_header: Vec::new(),
             apply_mime_sniff: false,
@@ -725,6 +734,7 @@ impl Document {
         self.queued_dials.push(QueuedDial {
             context: DialContext::FrameLoad {
                 sequence: self.frame_load_sequence,
+                embedder: None,
             },
             url,
             initiator,
@@ -735,6 +745,25 @@ impl Document {
             referrer,
             csp: None,
         });
+    }
+
+    /// Attaches the embedder's `frame-src` gate to the navigation just queued.
+    pub(crate) fn set_pending_frame_policy(
+        &mut self,
+        embedder: FrameId,
+        gate: crate::RedirectGate,
+    ) {
+        let Some(dial) = self.queued_dials.last_mut() else {
+            return;
+        };
+        let DialContext::FrameLoad {
+            embedder: slot, ..
+        } = &mut dial.context
+        else {
+            return;
+        };
+        *slot = Some(embedder);
+        dial.csp = Some(gate);
     }
 
     /// Loads the frame's initial `about:blank`, inheriting `inherited_url` as
@@ -1866,7 +1895,7 @@ impl Document {
 
     /// The main document's root node, the violation target for checks that
     /// are not attributable to an element.
-    pub(in crate::document) fn document_node(&self) -> Option<crate::dom::tree::NodeId> {
+    pub(crate) fn document_node(&self) -> Option<crate::dom::tree::NodeId> {
         self.world
             .borrow()
             .with_main_document(|parsed| crate::dom::tree::NodeId {
@@ -1876,7 +1905,7 @@ impl Document {
     }
 
     /// Dispatches the `securitypolicyviolation` events a check produced.
-    pub(in crate::document) fn fire_csp_violations(
+    pub(crate) fn fire_csp_violations(
         &mut self,
         target: crate::dom::tree::NodeId,
         violations: &[crate::csp::Violation],
@@ -2048,6 +2077,7 @@ impl Document {
             context,
             outcome,
             request_url,
+            csp,
         } = done;
         let redirected = outcome.final_url != request_url;
         match context {
@@ -2101,30 +2131,37 @@ impl Document {
                     self.resume_scripts();
                 }
             }
-            DialContext::FrameLoad { sequence } => {
+            DialContext::FrameLoad { sequence, embedder } => {
                 // The superseded-load early return deliberately skips the
                 // trailing `adopt_js_work()` below.
                 if sequence != self.frame_load_sequence {
                     return;
                 }
                 self.frame_load_in_flight = false;
-                let Ok(url) = Url::parse(&outcome.final_url) else {
-                    return;
-                };
-                // Announce the commit before the new document's load, so the
-                // browser can re-create the top-level execution contexts
-                // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
-                self.record_event(RendererEvent::Navigated {
-                    url: url.to_string(),
-                });
-                let policy = crate::csp::List::from_headers(
-                    crate::csp::combined_header(&outcome.headers, "content-security-policy")
+                // A redirect the embedder's `frame-src` refuses is not loaded.
+                // Report-only still reports and then loads.
+                // <https://w3c.github.io/webappsec-csp/#should-block-response>
+                if redirected
+                    && let Some(embedder) = embedder
+                    && let Some(gate) = csp.as_ref()
+                    && self.note_frame_redirect(embedder, gate, &outcome.final_url, &request_url)
+                {
+                    // Leave the current document in place.
+                } else if let Ok(url) = Url::parse(&outcome.final_url) {
+                    // Announce the commit before the new document's load, so the
+                    // browser can re-create the top-level execution contexts
+                    // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+                    self.record_event(RendererEvent::Navigated {
+                        url: url.to_string(),
+                    });
+                    let policy = crate::csp::List::from_headers(
+                        crate::csp::combined_header(&outcome.headers, "content-security-policy")
+                            .as_deref(),
+                        crate::csp::combined_header(
+                            &outcome.headers,
+                            "content-security-policy-report-only",
+                        )
                         .as_deref(),
-                    crate::csp::combined_header(
-                        &outcome.headers,
-                        "content-security-policy-report-only",
-                    )
-                    .as_deref(),
                 );
                 self.load_frame_response(
                     &url,
@@ -2136,6 +2173,7 @@ impl Document {
                         http: true,
                     },
                 );
+                }
             }
             DialContext::BlitzResource { id, destination } => {
                 self.deliver_blitz_resource(id, destination, &outcome, &request_url, redirected);
@@ -2209,7 +2247,7 @@ impl Document {
                     self.resume_scripts();
                 }
             }
-            DialContext::FrameLoad { sequence } => {
+            DialContext::FrameLoad { sequence, .. } => {
                 if sequence == self.frame_load_sequence {
                     // Keep the frame's current (about:blank) document; the
                     // container's load event still fires because the frame is
@@ -2524,9 +2562,46 @@ impl Document {
         }
     }
 
-    fn redirect_gate(&self, destination: crate::csp::Destination) -> crate::RedirectGate {
+    pub(crate) fn redirect_gate(
+        &self,
+        destination: crate::csp::Destination,
+    ) -> crate::RedirectGate {
         let world = self.world.borrow();
         crate::RedirectGate::new(world.csp.clone(), &world.origin, destination)
+    }
+
+    /// Records `frame-src` violations for a redirect and reports whether the
+    /// enforced policy refuses the response. The embedding document dispatches
+    /// the events; this frame only queues them.
+    fn note_frame_redirect(
+        &mut self,
+        embedder: FrameId,
+        gate: &crate::RedirectGate,
+        final_url: &str,
+        request_url: &str,
+    ) -> bool {
+        let Ok(response_url) = Url::parse(final_url) else {
+            return false;
+        };
+        let Ok(blocked_url) = Url::parse(request_url) else {
+            return false;
+        };
+        let Ok(document_url) = Url::parse(self.document_url()) else {
+            return false;
+        };
+        let violations = gate.redirected_violations(&document_url, &response_url, &blocked_url);
+        let blocked = crate::csp::blocks(&violations);
+        if !violations.is_empty() {
+            self.embedder_csp_reports.push((embedder, violations));
+        }
+        blocked
+    }
+
+    /// `frame-src` redirect violations queued for the embedding document.
+    pub(crate) fn take_embedder_csp_reports(
+        &mut self,
+    ) -> Vec<(FrameId, Vec<crate::csp::Violation>)> {
+        std::mem::take(&mut self.embedder_csp_reports)
     }
 
     /// Whether the response URL of a completed request violates the policy

@@ -136,6 +136,7 @@ impl Document {
                             self.finish_dial(super::CompletedDial {
                                 context: dial.context,
                                 request_url: dial.url.to_string(),
+                                csp: dial.csp.clone(),
                                 outcome: crate::protocol::DialOutcome {
                                     status: 200,
                                     final_url: dial.url.to_string(),

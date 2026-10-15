@@ -125,5 +125,6 @@ pub(in crate::document) fn complete(
         context,
         outcome,
         request_url: dial.url.to_string(),
+        csp: dial.csp.clone(),
     })
 }
