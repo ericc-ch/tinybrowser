@@ -182,6 +182,18 @@ struct Timer {
 ///
 /// The nested realm is deferred: `QuickJS` cannot enter a new context while
 /// the parent script still runs.
+/// Maps a Blitz request kind onto the CSP destination it is checked as.
+fn subresource_destination(
+    kind: blitz_traits::net::RequestKind,
+) -> Option<crate::csp::Destination> {
+    match kind {
+        blitz_traits::net::RequestKind::Stylesheet => Some(crate::csp::Destination::StyleSheet),
+        blitz_traits::net::RequestKind::Image => Some(crate::csp::Destination::Img),
+        blitz_traits::net::RequestKind::Font => Some(crate::csp::Destination::Font),
+        blitz_traits::net::RequestKind::Other => None,
+    }
+}
+
 fn materialize_iframe_document(
     world_rc: &Rc<RefCell<World>>,
     frame: FrameId,
@@ -2043,6 +2055,29 @@ impl Document {
                 if let Some(handler) = self.blitz_handlers.remove(&id) {
                     let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
                     Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
+                    let target = Url::parse(&request_url)
+                        .ok()
+                        .and_then(|url| self.subresource_target(&url));
+                    let is_image = target.is_some_and(|element| {
+                        self.world.borrow().document(element).is_some_and(|parsed| {
+                            crate::dom::tree::is_html_element(
+                                &parsed.document.base,
+                                element.node,
+                                "img",
+                            )
+                        })
+                    });
+                    if let Some(element) = target {
+                        // A failed request must be visible to later scans; a
+                        // waiterless element would otherwise re-register a
+                        // waiter that never settles. Images report their
+                        // `error` through the lifecycle; other elements here.
+                        if is_image {
+                            self.world.borrow_mut().fail_image(element, request_url.clone());
+                        } else {
+                            self.tasks.push_back(Task::NodeError(element));
+                        }
+                    }
                     self.settle_blitz_layout();
                     self.settle_image_waiters(&request_url);
                 }
@@ -2264,6 +2299,40 @@ impl Document {
                 self.settle_image_waiters(&url);
                 continue;
             }
+            // Per-destination policy: a blocked stylesheet, image, or font is
+            // never dialed; the handler receives empty bytes so Blitz
+            // releases the resource as failed
+            // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
+            if let Some(destination) = subresource_destination(fetch.kind) {
+                let violations = self.subresource_violations(&fetch.url, destination);
+                let target = self
+                    .subresource_target(&fetch.url)
+                    .or_else(|| self.document_node());
+                if !violations.is_empty()
+                    && let Some(target) = target
+                {
+                    self.fire_csp_violations(target, &violations);
+                }
+                if crate::csp::blocks(&violations) {
+                    Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
+                    if let Some(element) = target {
+                        if matches!(destination, crate::csp::Destination::Img) {
+                            // The image lifecycle reports the error when the
+                            // DOM walk reaches the element, so scripts that
+                            // precede it have run.
+                            self.world.borrow_mut().fail_image(element, url.clone());
+                        } else {
+                            // A blocked element load fails with an `error`
+                            // event
+                            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fetching-resources>).
+                            self.tasks.push_back(Task::NodeError(element));
+                        }
+                    }
+                    self.settle_blitz_layout();
+                    self.settle_image_waiters(&url);
+                    continue;
+                }
+            }
             self.blitz_request_urls.insert(fetch.id, url);
             self.blitz_handlers.insert(fetch.id, handler);
             // The Fetch initiator is the document, not the fetch target: the
@@ -2277,6 +2346,69 @@ impl Document {
                 initiator,
             ));
         }
+    }
+
+    /// The violations a Blitz subresource fetch produces.
+    fn subresource_violations(
+        &self,
+        url: &Url,
+        destination: crate::csp::Destination,
+    ) -> Vec<crate::csp::Violation> {
+        let world = self.world.borrow();
+        world.csp.check_request(
+            &world.origin,
+            &world.document_url,
+            url,
+            destination,
+            None,
+        )
+    }
+
+    /// The element whose subresource load `url` is: a `<link>` or `<img>`
+    /// whose resolved URL matches, when the fetch came from markup.
+    fn subresource_target(&self, url: &Url) -> Option<crate::dom::tree::NodeId> {
+        let candidates: Vec<(crate::dom::tree::NodeId, String)> = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return None;
+            };
+            let base = &parsed.document.base;
+            let document = parsed.id;
+            let mut candidates = Vec::new();
+            let mut stack = vec![base.root_node().id];
+            while let Some(id) = stack.pop() {
+                let Some(node) = base.get_node(id) else {
+                    continue;
+                };
+                stack.extend(node.children.iter().copied());
+                let Some(element) = node.data.downcast_element() else {
+                    continue;
+                };
+                if element.name.ns != crate::dom::tree::html_namespace() {
+                    continue;
+                }
+                let attribute = match element.name.local.as_str() {
+                    "link" => "href",
+                    "img" => "src",
+                    _ => continue,
+                };
+                if let Some(spec) = crate::dom::tree::attr(base, id, attribute) {
+                    candidates.push((
+                        crate::dom::tree::NodeId { document, node: id },
+                        spec.to_owned(),
+                    ));
+                }
+            }
+            candidates
+        };
+        for (id, spec) in candidates {
+            if let Ok(resolved) = self.resolve_dial_url(&spec)
+                && resolved == *url
+            {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Registers the current `<img>` request as a waiter on Blitz image
@@ -2322,6 +2454,18 @@ impl Document {
             return;
         };
         let selected = url.as_str().to_owned();
+        // A request that already failed (blocked or network error) must not
+        // register a waiter: no delivery will ever settle it, which would
+        // hold the load event forever. The failure reports its `error` event
+        // here, in parser order, instead of when the block decided.
+        if self.world.borrow().image_failed(element, &selected) {
+            self.in_flight_images.remove(&element);
+            self.image_selected_src.remove(&element);
+            if self.world.borrow_mut().report_image_error(element) {
+                self.tasks.push_back(Task::NodeError(element));
+            }
+            return;
+        }
         self.image_selected_src.insert(element, selected.clone());
         self.world
             .borrow_mut()
@@ -2374,7 +2518,9 @@ impl Document {
                 self.fire_js(|js| js.fire_node_load(*element));
             } else {
                 self.world.borrow_mut().fail_image(*element, selected);
-                self.fire_js(|js| js.fire_node_error(*element));
+                if self.world.borrow_mut().report_image_error(*element) {
+                    self.fire_js(|js| js.fire_node_error(*element));
+                }
             }
             self.adopt_js_work();
         }

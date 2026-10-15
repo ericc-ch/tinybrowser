@@ -35,6 +35,12 @@ rejected, customized built-in elements are rejected. Shadow-scoped
 styles, composed-event retargeting, and form-control state are upstream
 gaps (docs/upstream.md).
 
+CSP `eval`/`Function` gating shadows the globals in JS because the
+engine has no compilation hook; direct `eval` therefore evaluates
+indirectly (global scope) even when allowed. Blocking and report
+delivery (`report-uri`/`report-to`), `frame-ancestors`, and per-element
+violation source positions are not implemented yet.
+
 Associated stylesheets expose `cssRules`, per-interface rule objects, and
 declaration accessors. Still open: constructable `insertRule` /
 `deleteRule` throw `NotSupportedError`, and a cross-origin `<link>` is

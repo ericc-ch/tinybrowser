@@ -789,6 +789,9 @@ pub(crate) struct World {
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
     pub(crate) image_broken: HashSet<NodeId>,
+    /// Elements whose current request already dispatched its `error` event,
+    /// so a later scan does not repeat it.
+    pub(crate) image_error_reported: HashSet<NodeId>,
     /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
     /// without touching the content attribute
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
@@ -911,6 +914,7 @@ impl World {
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
             image_broken: HashSet::new(),
+            image_error_reported: HashSet::new(),
             nonce_slots: HashMap::new(),
         }
     }
@@ -1585,6 +1589,7 @@ impl World {
     pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
         self.image_loading.insert(element);
         self.image_broken.remove(&element);
+        self.image_error_reported.remove(&element);
         if !self.images.contains_key(&element) {
             self.image_current_src.insert(element, url);
         }
@@ -1615,10 +1620,27 @@ impl World {
         self.image_broken.insert(element);
     }
 
+    /// Whether `element`'s current request already failed for `url`, so a
+    /// later scan must not register a waiter that no delivery will settle.
+    pub(crate) fn image_failed(&self, element: NodeId, url: &str) -> bool {
+        self.image_broken.contains(&element)
+            && self
+                .image_current_src
+                .get(&element)
+                .is_some_and(|current| current == url)
+    }
+
+    /// Records the first `error` event for `element`'s current request.
+    /// Returns false when it was already reported.
+    pub(crate) fn report_image_error(&mut self, element: NodeId) -> bool {
+        self.image_error_reported.insert(element)
+    }
+
     pub(crate) fn forget_image(&mut self, element: NodeId) {
         self.image_loading.remove(&element);
         self.image_current_src.remove(&element);
         self.image_broken.remove(&element);
+        self.image_error_reported.remove(&element);
         self.images.remove(&element);
     }
 
@@ -1627,6 +1649,7 @@ impl World {
         self.image_loading.clear();
         self.image_current_src.clear();
         self.image_broken.clear();
+        self.image_error_reported.clear();
     }
 
     pub(crate) fn queue_document_stream(

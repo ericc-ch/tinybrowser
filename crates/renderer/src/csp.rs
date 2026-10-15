@@ -108,26 +108,77 @@ pub(crate) enum Destination {
     Connect,
     /// Classic and module script requests (`script-src-elem`).
     Script,
+    /// Stylesheet requests: `<link rel=stylesheet>` and `@import`
+    /// (`style-src-elem`).
+    StyleSheet,
+    /// Images (`img-src`).
+    Img,
+    /// Web fonts (`font-src`).
+    Font,
+}
+
+/// The directive that decides a check
+/// (<https://w3c.github.io/webappsec-csp/#effective-directive>).
+#[derive(Clone, Copy)]
+enum Effective {
+    ScriptSrcElem,
+    ScriptSrcAttr,
+    /// String compilation (`eval`, `Function`).
+    ScriptSrc,
+    StyleSrcElem,
+    ConnectSrc,
+    ImgSrc,
+    FontSrc,
+}
+
+impl Effective {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ScriptSrcElem => "script-src-elem",
+            Self::ScriptSrcAttr => "script-src-attr",
+            Self::ScriptSrc => "script-src",
+            Self::StyleSrcElem => "style-src-elem",
+            Self::ConnectSrc => "connect-src",
+            Self::ImgSrc => "img-src",
+            Self::FontSrc => "font-src",
+        }
+    }
+
+    /// The fallback list from most to least relevant, the directive itself
+    /// included (<https://w3c.github.io/webappsec-csp/#directive-fallback-list>).
+    fn fallback(self) -> &'static [&'static str] {
+        match self {
+            Self::ScriptSrcElem => &["script-src-elem", "script-src", "default-src"],
+            Self::ScriptSrcAttr => &["script-src-attr", "script-src", "default-src"],
+            Self::ScriptSrc => &["script-src", "default-src"],
+            Self::StyleSrcElem => &["style-src-elem", "style-src", "default-src"],
+            Self::ConnectSrc => &["connect-src", "default-src"],
+            Self::ImgSrc => &["img-src", "default-src"],
+            Self::FontSrc => &["font-src", "default-src"],
+        }
+    }
 }
 
 impl Destination {
-    /// The effective directive for this destination
-    /// (<https://w3c.github.io/webappsec-csp/#effective-directive>).
-    fn effective_directive(self) -> &'static str {
+    /// The effective directive for this destination.
+    fn effective(self) -> Effective {
         match self {
-            Self::Connect => "connect-src",
-            Self::Script => "script-src-elem",
+            Self::Connect => Effective::ConnectSrc,
+            Self::Script => Effective::ScriptSrcElem,
+            Self::StyleSheet => Effective::StyleSrcElem,
+            Self::Img => Effective::ImgSrc,
+            Self::Font => Effective::FontSrc,
         }
     }
 }
 
 impl InlineScript<'_> {
     /// The effective directive for this inline check.
-    fn effective_directive(&self) -> &'static str {
+    fn effective(&self) -> Effective {
         match self.kind {
-            InlineKind::Script | InlineKind::Navigation => "script-src-elem",
-            InlineKind::ScriptAttribute => "script-src-attr",
-            InlineKind::Evaluation => "script-src",
+            InlineKind::Script | InlineKind::Navigation => Effective::ScriptSrcElem,
+            InlineKind::ScriptAttribute => Effective::ScriptSrcAttr,
+            InlineKind::Evaluation => Effective::ScriptSrc,
         }
     }
 
@@ -136,7 +187,9 @@ impl InlineScript<'_> {
     fn blocked_uri(&self) -> String {
         match self.kind {
             InlineKind::Evaluation => "eval".to_owned(),
-            _ => "inline".to_owned(),
+            InlineKind::Script | InlineKind::Navigation | InlineKind::ScriptAttribute => {
+                "inline".to_owned()
+            }
         }
     }
 
@@ -203,12 +256,12 @@ impl List {
         destination: Destination,
         script: Option<ScriptRequest<'_>>,
     ) -> Vec<Violation> {
-        let effective = destination.effective_directive();
+        let effective = destination.effective();
         let mut violations = Vec::new();
         for policy in &self.policies {
             if policy_request_violation(policy, origin, document_url, url, destination, script) {
                 violations.push(Violation {
-                    effective_directive: effective.to_owned(),
+                    effective_directive: effective.name().to_owned(),
                     original_policy: policy.serialized.clone(),
                     disposition: policy.disposition,
                     blocked_uri: url.as_str().to_owned(),
@@ -224,12 +277,12 @@ impl List {
     /// (<https://w3c.github.io/webappsec-csp/#should-elements-inline-type-behavior-be-blocked-by-content-security-policy>).
     #[must_use]
     pub(crate) fn check_inline(&self, inline: &InlineScript<'_>) -> Vec<Violation> {
-        let effective = inline.effective_directive();
+        let effective = inline.effective();
         let mut violations = Vec::new();
         for policy in &self.policies {
             if policy_inline_violation(policy, inline) {
                 violations.push(Violation {
-                    effective_directive: effective.to_owned(),
+                    effective_directive: effective.name().to_owned(),
                     original_policy: policy.serialized.clone(),
                     disposition: policy.disposition,
                     blocked_uri: inline.blocked_uri(),
@@ -266,7 +319,7 @@ impl List {
                         && connect_directive_executes(policy)
                 })
                 .map(|policy| Violation {
-                    effective_directive: "connect-src".to_owned(),
+                    effective_directive: Effective::ConnectSrc.name().to_owned(),
                     original_policy: policy.serialized.clone(),
                     disposition: policy.disposition,
                     blocked_uri: url.to_owned(),
@@ -287,45 +340,44 @@ fn policy_request_violation(
     destination: Destination,
     script: Option<ScriptRequest<'_>>,
 ) -> bool {
-    let effective = destination.effective_directive();
-    for &name in fallback_names(effective) {
+    let effective = destination.effective();
+    for &name in effective.fallback() {
         let Some(list) = directive_value(policy, name) else {
             continue;
         };
         // A directive lower in the fallback chain only executes when no
         // higher-priority directive is present; the loop order guarantees
         // that, so the first present directive decides.
-        let check = if name == "default-src" { effective } else { name };
-        return request_check_blocks(check, list, origin, document_url, url, script);
+        return request_check_blocks(effective, list, origin, document_url, url, script);
     }
     false
 }
 
 /// Whether the fallback chain for the inline kind violates `policy`.
 fn policy_inline_violation(policy: &Policy, inline: &InlineScript<'_>) -> bool {
-    let effective = inline.effective_directive();
-    for &name in fallback_names(effective) {
+    let effective = inline.effective();
+    for &name in effective.fallback() {
         let Some(list) = directive_value(policy, name) else {
             continue;
         };
-        let check = if name == "default-src" { effective } else { name };
-        return inline_check_blocks(check, list, inline);
+        return inline_check_blocks(effective, list, inline);
     }
     false
 }
 
 /// The first fallback directive the policy actually defines, i.e. the
-/// directive that would run `should_execute` would pick
+/// directive that `should_execute` would pick
 /// (<https://w3c.github.io/webappsec-csp/#should-directive-execute>).
-fn first_present_directive(policy: &Policy, effective: &str) -> Option<&'static str> {
-    fallback_names(effective)
+fn first_present_directive(policy: &Policy, effective: Effective) -> Option<&'static str> {
+    effective
+        .fallback()
         .iter()
         .copied()
         .find(|name| directive_value(policy, name).is_some())
 }
 
 fn connect_directive_executes(policy: &Policy) -> bool {
-    first_present_directive(policy, "connect-src").is_some()
+    first_present_directive(policy, Effective::ConnectSrc).is_some()
 }
 
 /// Joins every occurrence of `name` with `", "`, the way a list header is
@@ -456,14 +508,14 @@ fn parse_serialized(serialized: &str, _source: Source, disposition: Disposition)
 }
 
 fn request_check_blocks(
-    name: &str,
+    effective: Effective,
     list: &[String],
     origin: &Origin,
     document_url: &Url,
     url: &Url,
     script: Option<ScriptRequest<'_>>,
 ) -> bool {
-    if name == "script-src-elem" || name == "script-src" {
+    if matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc) {
         let script = script.unwrap_or(ScriptRequest {
             nonce: "",
             parser_inserted: true,
@@ -480,14 +532,14 @@ fn request_check_blocks(
 
 /// The inline check for one directive
 /// (<https://w3c.github.io/webappsec-csp/#should-block-inline>).
-fn inline_check_blocks(name: &str, list: &[String], inline: &InlineScript<'_>) -> bool {
-    if matches!(inline.kind, InlineKind::Evaluation) {
-        return name == "script-src" && evaluation_blocks(list, inline.source);
+fn inline_check_blocks(effective: Effective, list: &[String], inline: &InlineScript<'_>) -> bool {
+    match effective {
+        Effective::ScriptSrc => evaluation_blocks(list, inline.source),
+        Effective::ScriptSrcElem | Effective::ScriptSrcAttr => !element_matches(list, inline),
+        Effective::StyleSrcElem | Effective::ConnectSrc | Effective::ImgSrc | Effective::FontSrc => {
+            false
+        }
     }
-    if name == "script-src-elem" || name == "script-src" || name == "script-src-attr" {
-        return !element_matches(list, inline);
-    }
-    false
 }
 
 /// Whether a source list blocks compiling `source`
@@ -498,25 +550,6 @@ fn evaluation_blocks(list: &[String], source: &str) -> bool {
         return false;
     }
     !list.iter().any(|expression| hash_matches(expression, source))
-}
-
-fn fallback_names(effective: &str) -> &'static [&'static str] {
-    match effective {
-        "script-src-elem" => &["script-src-elem", "script-src", "default-src"],
-        "script-src-attr" => &["script-src-attr", "script-src", "default-src"],
-        "script-src" => &["script-src", "default-src"],
-        "style-src-elem" => &["style-src-elem", "style-src", "default-src"],
-        "style-src-attr" => &["style-src-attr", "style-src", "default-src"],
-        "worker-src" => &["worker-src", "child-src", "script-src", "default-src"],
-        "connect-src" => &["connect-src", "default-src"],
-        "manifest-src" => &["manifest-src", "default-src"],
-        "object-src" => &["object-src", "default-src"],
-        "frame-src" => &["frame-src", "child-src", "default-src"],
-        "media-src" => &["media-src", "default-src"],
-        "font-src" => &["font-src", "default-src"],
-        "img-src" => &["img-src", "default-src"],
-        _ => &[],
-    }
 }
 
 fn directive_value<'a>(policy: &'a Policy, name: &str) -> Option<&'a [String]> {

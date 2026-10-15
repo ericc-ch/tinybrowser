@@ -99,3 +99,15 @@ host.__tbMakeStyle = element => {
     }
   });
 };
+
+// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-image
+globalThis.Image = function Image(width, height) {
+  const image = globalThis.document.createElement('img');
+  if (width !== undefined) {
+    image.width = width;
+  }
+  if (height !== undefined) {
+    image.height = height;
+  }
+  return image;
+};
