@@ -726,6 +726,10 @@ def group_of(test: str) -> str:
     parts = [p for p in test.split("/") if p]
     if len(parts) <= 1:
         return "(root)"
+    if "." in parts[1]:
+        # A test directly inside a top-level directory groups under that
+        # directory, not under the file; the table header says "directory".
+        return parts[0]
     return "/".join(parts[:2])
 
 
@@ -1712,6 +1716,10 @@ def _selftest() -> None:
     _, _, err = hoist_paths_after_test_types([], ["--test-types", "testharnes"])
     assert err is not None
 
+    assert group_of("/dom/nodes/Node-childNodes.html") == "dom/nodes"
+    assert group_of("/FileAPI/Blob.html") == "FileAPI"
+    assert group_of("/foo.html") == "(root)"
+
     rows, attention = classify_results(
         [
             {
@@ -1723,7 +1731,7 @@ def _selftest() -> None:
             }
         ]
     )
-    assert rows["html/foo.html"]["unexpected"] == 1 and attention == [
+    assert rows["html"]["unexpected"] == 1 and attention == [
         ("/html/foo.html", "", "PASS")
     ]
     rows, attention = classify_results(
@@ -1739,7 +1747,7 @@ def _selftest() -> None:
             }
         ]
     )
-    assert rows["dom/bar.html"]["unexpected"] == 1 and attention == [
+    assert rows["dom"]["unexpected"] == 1 and attention == [
         ("/dom/bar.html", "b", "PASS")
     ]
     rows, attention = classify_results(
@@ -1752,7 +1760,7 @@ def _selftest() -> None:
             }
         ]
     )
-    assert rows["dom/ok.html"]["pass"] == 1 and attention == []
+    assert rows["dom"]["pass"] == 1 and attention == []
     rows, attention = classify_results(
         [
             {
@@ -1763,7 +1771,7 @@ def _selftest() -> None:
             }
         ]
     )
-    assert rows["dom/fail.html"]["expected_fail"] == 1 and attention == []
+    assert rows["dom"]["expected_fail"] == 1 and attention == []
 
     ok = {"test": "/dom/ok.html", "status": "PASS"}
     skip = {
