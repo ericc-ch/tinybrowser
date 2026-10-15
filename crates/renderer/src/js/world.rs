@@ -700,6 +700,9 @@ pub(crate) struct World {
     /// Connected `<script src>` elements whose fetch prepare steps queued a
     /// load (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
     pending_scripts: Vec<NodeId>,
+    /// Violations produced where dispatching is unsafe (inside the module
+    /// loader), flushed by the drain.
+    pub(crate) pending_csp_violations: Vec<(NodeId, Vec<crate::csp::Violation>)>,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
@@ -881,6 +884,7 @@ impl World {
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
             pending_scripts: Vec::new(),
+            pending_csp_violations: Vec::new(),
             input_files: HashMap::new(),
             decoders: HashMap::new(),
             document_stream: Vec::new(),
@@ -944,6 +948,7 @@ impl World {
         self.frame_navigations.clear();
         self.image_updates.clear();
         self.pending_scripts.clear();
+        self.pending_csp_violations.clear();
         self.clear_images();
         self.remote_ids.clear();
         self.remote_nodes.clear();
@@ -1571,6 +1576,16 @@ impl World {
 
     pub(crate) fn take_pending_scripts(&mut self) -> Vec<NodeId> {
         std::mem::take(&mut self.pending_scripts)
+    }
+
+    /// Queues violations for targets the caller cannot dispatch into (the
+    /// module loader runs inside QuickJS).
+    pub(crate) fn queue_csp_violations(
+        &mut self,
+        target: NodeId,
+        violations: Vec<crate::csp::Violation>,
+    ) {
+        self.pending_csp_violations.push((target, violations));
     }
 
     /// Records the file list a script assigned to a `type=file` input.

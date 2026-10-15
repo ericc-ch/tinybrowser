@@ -286,6 +286,21 @@ impl Document {
                 continue;
             }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
+                // The connect check lives here, the one place every page
+                // request leaves the renderer, instead of in each JS API
+                // (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
+                let violations =
+                    self.subresource_violations(&url, crate::csp::Destination::Connect);
+                if !violations.is_empty()
+                    && let Some(target) = self.document_node()
+                {
+                    self.fire_csp_violations(target, &violations);
+                }
+                if crate::csp::blocks(&violations) {
+                    self.record_event(RendererEvent::FetchFailed);
+                    self.settle_js_fetch(fetch.js_id, None);
+                    continue;
+                }
                 let initiator = self.url.clone();
                 self.queued_dials.push(QueuedDial {
                     context: DialContext::JsFetch {
@@ -355,6 +370,10 @@ impl Document {
                 url,
                 initiator,
             ));
+        }
+        let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
+        for (target, violations) in violations {
+            self.fire_csp_violations(target, &violations);
         }
     }
 

@@ -258,12 +258,6 @@ globalThis.fetch = function(input, init) {
   if (options.headers !== undefined) headers = new globalThis.Headers(options.headers);
   if (options.body !== undefined) body = options.body;
   return new Promise(function(resolve, reject) {
-    // Pre-request check, including blob fetches
-    // (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
-    if (host.__tbCspAllowsConnect(url) === false) {
-      reject(new TypeError('Failed to fetch'));
-      return;
-    }
     if (url.indexOf('blob:') === 0) {
       if (method !== 'GET' || body !== null) {
         reject(new TypeError('Failed to fetch'));

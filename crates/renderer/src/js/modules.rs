@@ -50,11 +50,39 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     // (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-a-single-module-script>).
     // QuickJS's host loader is synchronous, so the renderer waits here while
     // the browser process performs the network operation on its I/O runtime.
-    let world = super::bindings::world(ctx)?;
-    let world = world.borrow();
-    let services = world.runtime.services.clone();
-    let initiator = world.document_url.to_string();
-    drop(world);
+    let world_rc = super::bindings::world(ctx)?;
+    let (services, initiator) = {
+        let world = world_rc.borrow();
+        (
+            world.runtime.services.clone(),
+            world.document_url.to_string(),
+        )
+    };
+    // A module graph fetch is a script request; check it before the renderer
+    // waits on the dial
+    // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
+    if let Ok(url) = url::Url::parse(name) {
+        let violations = {
+            let world = world_rc.borrow();
+            world.csp.check_request(
+                &world.origin,
+                &world.document_url,
+                &url,
+                crate::csp::Destination::Script,
+                None,
+            )
+        };
+        if !violations.is_empty() {
+            let blocked = crate::csp::blocks(&violations);
+            if let Ok(target) = super::bindings::main_document(ctx) {
+                // The module loader runs inside QuickJS; dispatch later.
+                world_rc.borrow_mut().queue_csp_violations(target, violations);
+            }
+            if blocked {
+                return Err(Error::new_loading(name));
+            }
+        }
+    }
 
     let (send, receive) = mpsc::sync_channel(1);
     let cancel = services.start_dial(

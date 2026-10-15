@@ -2093,9 +2093,10 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     let violations = {
         let world = world(ctx)?;
         let world = world.borrow();
+        let slot = world.nonce_slots.get(&id).map(String::as_str);
         let (nonce, nonceable) = world.document(id).map_or_else(
             || (String::new(), false),
-            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
         world.csp.check_inline(&crate::csp::InlineScript {
             source: &source,

@@ -2428,7 +2428,7 @@ pub(super) fn run_html_insertion_steps(
                 }
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
-            InsertionStep::MetaReferrer(id) => {
+            InsertionStep::Meta(id) => {
                 apply_meta_referrer(ctx, id);
                 apply_meta_csp(ctx, id);
             }

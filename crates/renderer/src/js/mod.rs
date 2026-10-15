@@ -909,30 +909,6 @@ impl JsRealm {
                 fetch_referrer(&world, &request_url)
             }),
         )?;
-        let csp_world = world.clone();
-        bridge::object(ctx)?.set(
-            "__tbCspAllowsConnect",
-            Func::from(move |ctx: Ctx<'_>, url: String| -> rquickjs::Result<bool> {
-                let violations = {
-                    let world = csp_world.borrow();
-                    world
-                        .csp
-                        .check_connect(&world.origin, &world.document_url, &url)
-                };
-                if !violations.is_empty() {
-                    let target = csp_world.borrow().with_main_document(|parsed| {
-                        crate::dom::tree::NodeId {
-                            document: parsed.id,
-                            node: parsed.document.base.root_node().id,
-                        }
-                    });
-                    if let Some(target) = target {
-                        bindings::fire_csp_violations(&ctx, target, &violations)?;
-                    }
-                }
-                Ok(!crate::csp::blocks(&violations))
-            }),
-        )?;
         let eval_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbCspAllowsEval",

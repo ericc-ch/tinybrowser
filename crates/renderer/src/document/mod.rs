@@ -213,6 +213,8 @@ fn materialize_iframe_document(
     let mut document = Document::with_shared(frame, &runtime, &init_scripts);
     document.set_viewport_size(viewport);
     document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
+    let inherited = world_rc.borrow().csp.clone();
+    document.world().borrow_mut().csp = inherited;
     if let Some(root) = document.document_root() {
         world_rc
             .borrow()
@@ -337,10 +339,10 @@ pub(crate) struct Document {
     /// select the XML parser; anything else, including a script's
     /// `document.open()`, stays HTML.
     response_content_type: Option<String>,
-    /// `Content-Security-Policy` from the response being parsed.
-    response_csp: Option<String>,
-    /// `Content-Security-Policy-Report-Only` from the response being parsed.
-    response_csp_report: Option<String>,
+    /// `Content-Security-Policy` and `Content-Security-Policy-Report-Only`
+    /// from the response being parsed, parsed once
+    /// (<https://w3c.github.io/webappsec-csp/#parse-response-csp>).
+    response_policy: crate::csp::List,
     /// When set, [`Document::install_parsed`] replaces the world's policy
     /// with the response headers. A script's `document.open()` leaves it
     /// unset so the existing policy survives.
@@ -435,8 +437,7 @@ impl Document {
             decoder: None,
             character_set: "UTF-8",
             response_content_type: None,
-            response_csp: None,
-            response_csp_report: None,
+            response_policy: crate::csp::List::default(),
             csp_from_response: false,
             classic_fetch_in_flight: false,
             deferred_modules: Vec::new(),
@@ -554,6 +555,7 @@ impl Document {
             )
         };
         let mut loaded = Vec::with_capacity(pending.len());
+        let inherited = self.world.borrow().csp.clone();
         for (frame, container) in pending {
             let mut document = Document::with_shared(frame, &runtime, &init_scripts);
             // Frames created from parsed markup share the tab's viewport too.
@@ -562,6 +564,7 @@ impl Document {
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
             document.set_viewport_size(viewport);
             document.load_about_blank(Some(base_url.as_str()), Some(origin.clone()));
+            document.world().borrow_mut().csp = inherited.clone();
             loaded.push((frame, container, document));
         }
         self.new_frames.borrow_mut().extend(loaded);
@@ -766,10 +769,9 @@ impl Document {
         url: &Url,
         content_type: Option<&str>,
         body: &[u8],
-        csp: Option<&str>,
-        csp_report: Option<&str>,
+        policy: crate::csp::List,
     ) {
-        self.load_response_body(url, content_type, body, csp, csp_report);
+        self.load_response_body(url, content_type, body, policy);
         // Nested HTML documents without scripts skip a realm at parse;
         // `fire_ready_frame_loads` creates one when the parent is not in the
         // encoding-label burst
@@ -785,11 +787,16 @@ impl Document {
     /// observes the page's own state, not a fresh blank realm. The result
     /// document keeps the target's URL
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-    pub(crate) fn load_javascript_frame(&mut self, script: &str, source: &str) {
+    pub(crate) fn load_javascript_frame(
+        &mut self,
+        script: &str,
+        source: &str,
+        policy: &crate::csp::List,
+    ) {
         if self.js.is_none() {
             self.ensure_js_ok();
         }
-        self.eval_frame_script(script, source);
+        self.eval_frame_script(script, source, policy);
     }
 
     /// Runs one `javascript:` URL script in this frame's realm. A string
@@ -799,11 +806,16 @@ impl Document {
     /// `source` is the serialized `javascript:` URL, which is what CSP source
     /// matching and hashes use
     /// (<https://w3c.github.io/webappsec-csp/#should-block-navigation-request>).
-    pub(crate) fn eval_frame_script(&mut self, script: &str, source: &str) {
+    pub(crate) fn eval_frame_script(
+        &mut self,
+        script: &str,
+        source: &str,
+        policy: &crate::csp::List,
+    ) {
         if script.is_empty() {
             return;
         }
-        let violations = self.navigation_script_violations(source);
+        let violations = self.navigation_script_violations(policy, source);
         if !violations.is_empty()
             && let Some(target) = self.document_node()
         {
@@ -1087,8 +1099,10 @@ impl Document {
             &url,
             mount.content_type.as_deref(),
             &mount.body,
-            mount.content_security_policy.as_deref(),
-            mount.content_security_policy_report_only.as_deref(),
+            crate::csp::List::from_headers(
+                mount.content_security_policy.as_deref(),
+                mount.content_security_policy_report_only.as_deref(),
+            ),
         );
         Ok(())
     }
@@ -1110,8 +1124,7 @@ impl Document {
         self.decoder = decoder;
         self.parser_owner = owner;
         self.response_content_type = None;
-        self.response_csp = None;
-        self.response_csp_report = None;
+        self.response_policy = crate::csp::List::default();
         self.csp_from_response = false;
         self.active_buffer = Some(input.to_owned());
         // A new parse starts undecided: without this an `about:blank` or
@@ -1130,8 +1143,7 @@ impl Document {
         url: Option<&Url>,
         content_type: Option<&str>,
         viewport: Option<(u32, u32)>,
-        csp: Option<&str>,
-        csp_report: Option<&str>,
+        policy: crate::csp::List,
     ) {
         self.reset_js_realm();
         if let Some((width, height)) = viewport {
@@ -1153,8 +1165,7 @@ impl Document {
             Some(dial::ResponseDecoder::new(content_type.map(str::to_owned))),
         );
         self.response_content_type = content_type.map(str::to_owned);
-        self.response_csp = csp.map(str::to_owned);
-        self.response_csp_report = csp_report.map(str::to_owned);
+        self.response_policy = policy;
         self.csp_from_response = true;
     }
 
@@ -1165,10 +1176,9 @@ impl Document {
         url: &Url,
         content_type: Option<&str>,
         body: &[u8],
-        csp: Option<&str>,
-        csp_report: Option<&str>,
+        policy: crate::csp::List,
     ) {
-        self.load_response_body_with_origin(url, content_type, body, None, csp, csp_report);
+        self.load_response_body_with_origin(url, content_type, body, None, policy);
     }
 
     /// [`Document::load_response_body`] that stores `origin` instead of
@@ -1182,10 +1192,9 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         origin: Option<url::Origin>,
-        csp: Option<&str>,
-        csp_report: Option<&str>,
+        policy: crate::csp::List,
     ) {
-        self.begin_response(Some(url), content_type, None, csp, csp_report);
+        self.begin_response(Some(url), content_type, None, policy);
         if let Some(origin) = origin {
             self.world
                 .borrow_mut()
@@ -1202,10 +1211,9 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         origin: url::Origin,
-        csp: Option<&str>,
-        csp_report: Option<&str>,
+        policy: crate::csp::List,
     ) {
-        self.load_response_body_with_origin(url, content_type, body, Some(origin), csp, csp_report);
+        self.load_response_body_with_origin(url, content_type, body, Some(origin), policy);
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
@@ -1536,11 +1544,7 @@ impl Document {
         if !self.csp_from_response {
             return;
         }
-        let list = crate::csp::List::from_headers(
-            self.response_csp.as_deref(),
-            self.response_csp_report.as_deref(),
-        );
-        self.world.borrow_mut().csp = list;
+        self.world.borrow_mut().csp = self.response_policy.clone();
     }
 
     /// Rebinds the realm's `document` global to the installed document and
@@ -1726,9 +1730,10 @@ impl Document {
         id: crate::dom::tree::NodeId,
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
+        let slot = world.nonce_slots.get(&id).map(String::as_str);
         let (nonce, nonceable) = world.document(id).map_or_else(
             || (String::new(), false),
-            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
         world.csp.check_inline(&crate::csp::InlineScript {
             source,
@@ -1739,9 +1744,12 @@ impl Document {
         })
     }
 
-    fn navigation_script_violations(&self, source: &str) -> Vec<crate::csp::Violation> {
-        let world = self.world.borrow();
-        world.csp.check_inline(&crate::csp::InlineScript {
+    fn navigation_script_violations(
+        &self,
+        policy: &crate::csp::List,
+        source: &str,
+    ) -> Vec<crate::csp::Violation> {
+        policy.check_inline(&crate::csp::InlineScript {
             source,
             nonce: "",
             nonceable: false,
@@ -1756,9 +1764,10 @@ impl Document {
         id: crate::dom::tree::NodeId,
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
+        let slot = world.nonce_slots.get(&id).map(String::as_str);
         let (nonce, _) = world.document(id).map_or_else(
             || (String::new(), false),
-            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node),
+            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
         world.csp.check_request(
             &world.origin,
@@ -1774,7 +1783,7 @@ impl Document {
 
     /// The main document's root node, the violation target for checks that
     /// are not attributable to an element.
-    fn document_node(&self) -> Option<crate::dom::tree::NodeId> {
+    pub(in crate::document) fn document_node(&self) -> Option<crate::dom::tree::NodeId> {
         self.world.borrow().with_main_document(|parsed| {
             crate::dom::tree::NodeId {
                 document: parsed.id,
@@ -1953,7 +1962,18 @@ impl Document {
                     status: outcome.status,
                 });
                 if epoch == self.js_epoch {
-                    self.settle_js_fetch(id, Some(outcome));
+                    // Post-request check: a redirect may have landed on a URL
+                    // the source list does not allow
+                    // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+                    let blocked = self.response_url_blocked(
+                        &outcome.final_url,
+                        crate::csp::Destination::Connect,
+                    );
+                    if blocked {
+                        self.settle_js_fetch(id, None);
+                    } else {
+                        self.settle_js_fetch(id, Some(outcome));
+                    }
                 }
             }
             DialContext::ClassicScript { element, epoch } => {
@@ -1989,17 +2009,20 @@ impl Document {
                 self.record_event(RendererEvent::Navigated {
                     url: url.to_string(),
                 });
-                let csp = crate::csp::combined_header(&outcome.headers, "content-security-policy");
-                let report = crate::csp::combined_header(
-                    &outcome.headers,
-                    "content-security-policy-report-only",
+                let policy = crate::csp::List::from_headers(
+                    crate::csp::combined_header(&outcome.headers, "content-security-policy")
+                        .as_deref(),
+                    crate::csp::combined_header(
+                        &outcome.headers,
+                        "content-security-policy-report-only",
+                    )
+                    .as_deref(),
                 );
                 self.load_frame_response(
                     &url,
                     outcome.content_type.as_deref(),
                     &outcome.body,
-                    csp.as_deref(),
-                    report.as_deref(),
+                    policy,
                 );
             }
             DialContext::BlitzResource { id } => {
@@ -2348,8 +2371,37 @@ impl Document {
         }
     }
 
+    /// Whether the response URL of a completed request violates the policy
+    /// after redirects, firing the violations. Paths are ignored, as the
+    /// post-request check requires
+    /// (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+    pub(in crate::document) fn response_url_blocked(
+        &mut self,
+        final_url: &str,
+        destination: crate::csp::Destination,
+    ) -> bool {
+        let Ok(url) = Url::parse(final_url) else {
+            return false;
+        };
+        let violations = {
+            let world = self.world.borrow();
+            world.csp.check_redirected_request(
+                &world.origin,
+                &world.document_url,
+                &url,
+                destination,
+            )
+        };
+        if !violations.is_empty()
+            && let Some(target) = self.document_node()
+        {
+            self.fire_csp_violations(target, &violations);
+        }
+        crate::csp::blocks(&violations)
+    }
+
     /// The violations a Blitz subresource fetch produces.
-    fn subresource_violations(
+    pub(in crate::document) fn subresource_violations(
         &self,
         url: &Url,
         destination: crate::csp::Destination,

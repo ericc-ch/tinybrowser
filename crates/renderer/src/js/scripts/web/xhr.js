@@ -188,12 +188,6 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     const generation = data.generation;
     this.dispatchEvent(new ProgressEvent('loadstart'));
     if (data.state !== 1 || !data.sent || data.generation !== generation) return;
-    // A blocked connect is a network error, not an exception
-    // (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
-    if (host.__tbCspAllowsConnect(data.url) === false) {
-      __tbXhrError(this, data, 'error');
-      return;
-    }
     data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, (status, bytes, url, type, fields) => {
       if (data.generation !== generation || !data.sent) return;
       data.request = null;

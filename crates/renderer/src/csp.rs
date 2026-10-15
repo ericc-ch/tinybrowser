@@ -259,7 +259,50 @@ impl List {
         let effective = destination.effective();
         let mut violations = Vec::new();
         for policy in &self.policies {
-            if policy_request_violation(policy, origin, document_url, url, destination, script) {
+            if policy_request_violation(
+                policy,
+                origin,
+                document_url,
+                url,
+                destination,
+                script,
+                0,
+            ) {
+                violations.push(Violation {
+                    effective_directive: effective.name().to_owned(),
+                    original_policy: policy.serialized.clone(),
+                    disposition: policy.disposition,
+                    blocked_uri: url.as_str().to_owned(),
+                    sample: None,
+                });
+            }
+        }
+        violations
+    }
+
+    /// The violations a response URL produces after redirects: the
+    /// post-request check re-runs the source lists with paths ignored
+    /// (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+    #[must_use]
+    pub(crate) fn check_redirected_request(
+        &self,
+        origin: &Origin,
+        document_url: &Url,
+        url: &Url,
+        destination: Destination,
+    ) -> Vec<Violation> {
+        let effective = destination.effective();
+        let mut violations = Vec::new();
+        for policy in &self.policies {
+            if policy_request_violation(
+                policy,
+                origin,
+                document_url,
+                url,
+                destination,
+                None,
+                1,
+            ) {
                 violations.push(Violation {
                     effective_directive: effective.name().to_owned(),
                     original_policy: policy.serialized.clone(),
@@ -292,42 +335,6 @@ impl List {
         }
         violations
     }
-
-    /// The violations a `fetch` or `XMLHttpRequest` request produces. An
-    /// unparseable URL is blocked only when an enforced `connect-src` (or
-    /// `default-src`) would actually run.
-    #[must_use]
-    pub(crate) fn check_connect(
-        &self,
-        origin: &Origin,
-        document_url: &Url,
-        url: &str,
-    ) -> Vec<Violation> {
-        match Url::parse(url) {
-            Ok(url) => self.check_request(
-                origin,
-                document_url,
-                &url,
-                Destination::Connect,
-                None,
-            ),
-            Err(_) => self
-                .policies
-                .iter()
-                .filter(|policy| {
-                    policy.disposition == Disposition::Enforce
-                        && connect_directive_executes(policy)
-                })
-                .map(|policy| Violation {
-                    effective_directive: Effective::ConnectSrc.name().to_owned(),
-                    original_policy: policy.serialized.clone(),
-                    disposition: policy.disposition,
-                    blocked_uri: url.to_owned(),
-                    sample: None,
-                })
-                .collect(),
-        }
-    }
 }
 
 /// Whether the fallback directive chain for `destination` violates `policy`
@@ -339,6 +346,7 @@ fn policy_request_violation(
     url: &Url,
     destination: Destination,
     script: Option<ScriptRequest<'_>>,
+    redirects: u32,
 ) -> bool {
     let effective = destination.effective();
     for &name in effective.fallback() {
@@ -348,7 +356,7 @@ fn policy_request_violation(
         // A directive lower in the fallback chain only executes when no
         // higher-priority directive is present; the loop order guarantees
         // that, so the first present directive decides.
-        return request_check_blocks(effective, list, origin, document_url, url, script);
+        return request_check_blocks(effective, list, origin, document_url, url, script, redirects);
     }
     false
 }
@@ -363,21 +371,6 @@ fn policy_inline_violation(policy: &Policy, inline: &InlineScript<'_>) -> bool {
         return inline_check_blocks(effective, list, inline);
     }
     false
-}
-
-/// The first fallback directive the policy actually defines, i.e. the
-/// directive that `should_execute` would pick
-/// (<https://w3c.github.io/webappsec-csp/#should-directive-execute>).
-fn first_present_directive(policy: &Policy, effective: Effective) -> Option<&'static str> {
-    effective
-        .fallback()
-        .iter()
-        .copied()
-        .find(|name| directive_value(policy, name).is_some())
-}
-
-fn connect_directive_executes(policy: &Policy) -> bool {
-    first_present_directive(policy, Effective::ConnectSrc).is_some()
 }
 
 /// Joins every occurrence of `name` with `", "`, the way a list header is
@@ -440,6 +433,7 @@ fn ancestor_is(
 pub(crate) fn element_nonce(
     base: &blitz_dom::BaseDocument,
     id: blitz_traits::node_id::NodeId,
+    slot: Option<&str>,
 ) -> (String, bool) {
     let Some(element) = base
         .get_node(id)
@@ -447,8 +441,11 @@ pub(crate) fn element_nonce(
     else {
         return (String::new(), false);
     };
-    let mut nonce = String::new();
-    let mut nonceable = false;
+    // `clear_nonce_on_connect` blanks the content attribute and moves the
+    // value to the internal slot; checks use the slot when it exists
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+    let mut nonce = slot.unwrap_or_default().to_owned();
+    let mut nonceable = !nonce.is_empty();
     for attribute in element.attrs.iter() {
         let name = attribute.name.local.as_str();
         let value = attribute.value.as_str();
@@ -514,8 +511,15 @@ fn request_check_blocks(
     document_url: &Url,
     url: &Url,
     script: Option<ScriptRequest<'_>>,
+    redirects: u32,
 ) -> bool {
-    if matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc) {
+    // The pre-request check short-circuits on nonces and `'strict-dynamic'`.
+    // The post-request (redirect) check is URL-only, so a policy with
+    // `'strict-dynamic'` does not block every response
+    // (<https://w3c.github.io/webappsec-csp/#script-pre-request>).
+    if redirects == 0
+        && matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc)
+    {
         let script = script.unwrap_or(ScriptRequest {
             nonce: "",
             parser_inserted: true,
@@ -527,7 +531,7 @@ fn request_check_blocks(
             return script.parser_inserted;
         }
     }
-    !url_matches_list(url, list, origin, document_url, 0)
+    !url_matches_list(url, list, origin, document_url, redirects)
 }
 
 /// The inline check for one directive
