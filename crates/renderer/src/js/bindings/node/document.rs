@@ -6,10 +6,10 @@ use super::super::{
     WebIdlString, attr_wrapper, child_value, deref_weak, document_base_url_string,
     document_is_html, document_is_html_content, document_url_string, element_at_point,
     elements_by_tag, find_element_by_id, fixup_focus_after_removal, host, host_node_id,
-    import_attr, is_main_document, live_collection, make_weak, new_detached_attr, required_node,
-    schedule_mutation_delivery, set_attribute_sync, throw_dom, throw_dom_error,
-    valid_attribute_local_name, valid_element_local_name, validate_and_extract, with_node_data,
-    world, world_for_node, wrap_new_document_in_world, wrap_node,
+    import_attr, is_main_document, live_collection, make_weak, new_detached_attr,
+    node_is_shadow_root, required_node, schedule_mutation_delivery, set_attribute_sync, throw_dom,
+    throw_dom_error, valid_attribute_local_name, valid_element_local_name, validate_and_extract,
+    with_node_data, world, world_for_node, wrap_new_document_in_world, wrap_node,
 };
 use crate::dom::adoption::{ImportSnapshot, import_snapshot, materialize_import};
 use rquickjs::function::Rest;
@@ -891,6 +891,14 @@ impl JsNode {
                 "cannot import a document",
             ));
         }
+        if node_is_shadow_root(&ctx, source_id)? {
+            // https://dom.spec.whatwg.org/#dom-document-importnode
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "cannot import a shadow root",
+            ));
+        }
         let tree = world_rc
             .borrow()
             .store()
@@ -1241,32 +1249,109 @@ impl JsNode {
         ctx: Ctx<'js>,
         init: super::element::element_generated::ShadowRootInit,
     ) -> Result<Value<'js>> {
-        let _ = (self, init);
-        // Known gap: Blitz has no shadow DOM, so no element can host a shadow
-        // root. Every call throws instead of handing back a half-built root.
-        Err(throw_dom(
+        let closed = matches!(
+            init.mode,
+            super::element::element_generated::ShadowRootMode::Closed
+        );
+        let id = self.handle.0;
+        let world_rc = world(&ctx)?;
+        let shadow = {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(id) else {
+                return Err(Exception::throw_type(&ctx, "stale node"));
+            };
+            let eligible = parsed
+                .document
+                .base
+                .get_node(id.node)
+                .and_then(|node| node.element_data())
+                .is_some_and(|element| {
+                    element.name.ns == html_namespace()
+                        && valid_shadow_host(element.name.local.as_ref())
+                        && element.shadow_root.is_none()
+                });
+            if !eligible {
+                // A non-HTML element, a name that cannot host a shadow, or an
+                // element that already hosts one
+                // (<https://dom.spec.whatwg.org/#dom-element-attachshadow>).
+                return Err(throw_dom(
+                    &ctx,
+                    "NotSupportedError",
+                    "element cannot host a shadow root",
+                ));
+            }
+            parsed
+                .document
+                .base
+                .mutate()
+                .attach_shadow_root(id.node, closed)
+        };
+        wrap_node(
             &ctx,
-            "NotSupportedError",
-            "shadow DOM is not supported",
-        ))
+            NodeId {
+                document: id.document,
+                node: shadow,
+            },
+        )
     }
 
-    pub(super) fn shadow_root<'js>(&self, ctx: &Ctx<'js>) -> Value<'js> {
-        // Known gap: Blitz has no shadow DOM, so elements never host a shadow
-        // root.
-        Value::new_null(ctx.clone())
+    // https://dom.spec.whatwg.org/#dom-element-shadowroot
+    pub(super) fn shadow_root<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let id = self.handle.0;
+        let found = world(ctx).ok().and_then(|world| {
+            let world = world.borrow();
+            let parsed = world.document(id)?;
+            let node = parsed.document.base.get_node(id.node)?;
+            let element = node.element_data()?;
+            let shadow = element.shadow_root?;
+            let closed = matches!(
+                parsed.document.base.get_node(shadow).map(|node| &node.data),
+                Some(NodeData::ShadowRoot { closed: true, .. })
+            );
+            if closed { None } else { Some(shadow) }
+        });
+        match found {
+            Some(shadow) => wrap_node(
+                ctx,
+                NodeId {
+                    document: id.document,
+                    node: shadow,
+                },
+            ),
+            None => Ok(Value::new_null(ctx.clone())),
+        }
     }
 
+    // https://dom.spec.whatwg.org/#dom-shadowroot-host
     pub(super) fn host<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        // Known gap: Blitz has no shadow DOM, so no node is ever a shadow
-        // root. The brand check rejects every receiver first.
-        Err(Exception::throw_type(ctx, "not a shadow root"))
+        let id = self.handle.0;
+        let host = with_node_data(ctx, id, |data| match data {
+            Some(NodeData::ShadowRoot { host, .. }) => Some(*host),
+            _ => None,
+        })?;
+        let Some(host) = host else {
+            return Err(Exception::throw_type(ctx, "not a shadow root"));
+        };
+        wrap_node(
+            ctx,
+            NodeId {
+                document: id.document,
+                node: host,
+            },
+        )
     }
 
+    // https://dom.spec.whatwg.org/#dom-shadowroot-mode
     pub(super) fn mode(&self, ctx: &Ctx<'_>) -> Result<String> {
-        // Known gap: Blitz has no shadow DOM, so no node is ever a shadow
-        // root. The brand check rejects every receiver first.
-        Err(Exception::throw_type(ctx, "not a shadow root"))
+        let id = self.handle.0;
+        let mode = with_node_data(ctx, id, |data| match data {
+            Some(NodeData::ShadowRoot { closed, .. }) => {
+                Some(if *closed { "closed" } else { "open" })
+            }
+            _ => None,
+        })?;
+        mode.map(str::to_owned)
+            .ok_or_else(|| Exception::throw_type(ctx, "not a shadow root"))
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
@@ -2119,4 +2204,114 @@ impl JsNode {
             NodeReference::Attribute { scope, id } => import_attr(&ctx, self.handle.0, scope, id),
         }
     }
+}
+
+/// Names that may host a shadow root, plus a valid custom element name
+/// (<https://html.spec.whatwg.org/multipage/dom.html#valid-shadow-host-name>,
+/// <https://html.spec.whatwg.org/multipage/custom-elements.html#valid-custom-element-name>).
+fn valid_shadow_host(local: &str) -> bool {
+    matches!(
+        local,
+        "article"
+            | "aside"
+            | "blockquote"
+            | "body"
+            | "div"
+            | "footer"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "main"
+            | "nav"
+            | "p"
+            | "section"
+            | "span"
+            | "search"
+    ) || valid_custom_element_name(local)
+}
+
+/// `PCENChar` (<https://html.spec.whatwg.org/multipage/custom-elements.html#prod-pcenchar>).
+fn is_pcen_char(ch: char) -> bool {
+    matches!(ch, '-' | '.' | '0'..='9' | '_' | 'a'..='z' | '\u{00B7}')
+        || ('\u{00C0}'..='\u{00D6}').contains(&ch)
+        || ('\u{00D8}'..='\u{00F6}').contains(&ch)
+        || ('\u{00F8}'..='\u{037D}').contains(&ch)
+        || ('\u{037F}'..='\u{1FFF}').contains(&ch)
+        || ('\u{200C}'..='\u{200D}').contains(&ch)
+        || ('\u{203F}'..='\u{2040}').contains(&ch)
+        || ('\u{2070}'..='\u{218F}').contains(&ch)
+        || ('\u{2C00}'..='\u{2FEF}').contains(&ch)
+        || ('\u{3001}'..='\u{D7FF}').contains(&ch)
+        || ('\u{F900}'..='\u{FDCF}').contains(&ch)
+        || ('\u{FDF0}'..='\u{FFFD}').contains(&ch)
+        || ('\u{10000}'..='\u{EFFFF}').contains(&ch)
+}
+
+fn valid_custom_element_name(local: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "annotation-xml",
+        "color-profile",
+        "font-face",
+        "font-face-src",
+        "font-face-uri",
+        "font-face-format",
+        "font-face-name",
+        "missing-glyph",
+    ];
+    if FORBIDDEN.contains(&local) {
+        return false;
+    }
+    // PotentialCustomElementName is `[a-z] PCENChar* '-' PCENChar*`
+    // (<https://html.spec.whatwg.org/multipage/custom-elements.html#valid-custom-element-name>).
+    let mut chars = local.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    let mut hyphen = false;
+    for ch in chars {
+        if ch == '-' {
+            hyphen = true;
+        }
+        if !is_pcen_char(ch) {
+            return false;
+        }
+    }
+    hyphen
+}
+
+/// Fragment context for `innerHTML`: the element itself, or a shadow root's host
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml>).
+pub(super) fn inner_html_fragment_context(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
+    let owner = world_for_node(ctx, id)?;
+    let parsed = owner.borrow();
+    let Some(parsed) = parsed.document(id) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    let Some(node) = parsed.document.base.get_node(id.node) else {
+        return Err(Exception::throw_type(ctx, "stale node"));
+    };
+    let name = match &node.data {
+        NodeData::Element(element) => element.name.clone(),
+        NodeData::ShadowRoot { host, .. } => parsed
+            .document
+            .base
+            .get_node(*host)
+            .and_then(|host| host.data.downcast_element())
+            .map(|element| element.name.clone())
+            .ok_or_else(|| Exception::throw_type(ctx, "shadow root has no host"))?,
+        _ => {
+            return Err(Exception::throw_type(
+                ctx,
+                "innerHTML requires an element or shadow root",
+            ));
+        }
+    };
+    Ok(html_fragment_context(&name))
 }

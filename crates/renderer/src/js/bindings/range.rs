@@ -8,15 +8,15 @@ use std::rc::{Rc, Weak};
 use rquickjs::class::{Trace, Tracer};
 use rquickjs::{Class, Ctx, Exception, Result, Value};
 
-use super::{
-    attr_wrapper, character_data, fixup_focus_after_removal, realm_registry,
-    replace_character_data, required_node, schedule_mutation_delivery, set_character_data,
-    throw_dom, throw_dom_error, world, world_for_node, wrap_node,
-};
 use super::host::{NodeReference, instance_proto};
 use super::node::core::{adopt_node, insert_tree_node, insertion_tree_nodes, split_text_node};
 use super::node::document::{
     fragment_base_url, html_fragment_context, parse_html_fragment_snapshots,
+};
+use super::{
+    attr_wrapper, character_data, fixup_focus_after_removal, realm_registry,
+    replace_character_data, required_node, schedule_mutation_delivery, set_character_data,
+    throw_dom, throw_dom_error, world, world_for_node, wrap_node,
 };
 use crate::dom::adoption::{ImportSnapshot, clone_within_document, materialize_children};
 use crate::dom::insertion::{
@@ -108,7 +108,10 @@ impl super::host::SharedClass for JsRange {
 /// Allocate a collapsed range at `(root, 0)` of `root`'s document and wrap
 /// it. Backs `new Range()` through the brands constructor.
 pub(crate) fn new_range<'js>(ctx: &Ctx<'js>, root: NodeId) -> Result<Value<'js>> {
-    let point = BoundaryPoint { node: root, offset: 0 };
+    let point = BoundaryPoint {
+        node: root,
+        offset: 0,
+    };
     let (document, slot) = alloc_range(ctx, root.document, RangeState::collapsed(point))?;
     wrap_range(ctx, document, slot)
 }
@@ -176,8 +179,7 @@ fn html_contextual_fragment<'js>(
     markup: &str,
     name: &markup5ever::QualName,
 ) -> Result<Value<'js>> {
-    let context = if name.local.as_str() == "html"
-        && name.ns == crate::dom::tree::html_namespace()
+    let context = if name.local.as_str() == "html" && name.ns == crate::dom::tree::html_namespace()
     {
         "body".to_owned()
     } else {
@@ -248,7 +250,12 @@ fn xml_scope(
                 if attribute.name.ns.as_str() != XMLNS_NAMESPACE {
                     continue;
                 }
-                match attribute.name.prefix.as_ref().map(markup5ever::Prefix::as_str) {
+                match attribute
+                    .name
+                    .prefix
+                    .as_ref()
+                    .map(markup5ever::Prefix::as_str)
+                {
                     Some("xmlns") => {
                         if attribute.name.local.as_str() != "xmlns" {
                             prefixes
@@ -320,13 +327,12 @@ fn xml_contextual_fragment<'js>(
         let Some(parsed) = world.document(start) else {
             return Err(Exception::throw_type(ctx, "stale range"));
         };
-        let default_override = if name.local.as_str() == "html"
-            && name.ns == crate::dom::tree::html_namespace()
-        {
-            Some("http://www.w3.org/1999/xhtml")
-        } else {
-            None
-        };
+        let default_override =
+            if name.local.as_str() == "html" && name.ns == crate::dom::tree::html_namespace() {
+                Some("http://www.w3.org/1999/xhtml")
+            } else {
+                None
+            };
         let scope = xml_scope(&parsed.document, start, default_override);
         let base_url = parsed.document.base.base_url().as_str().to_owned();
         let font_ctx = world.runtime.font_ctx.clone();
@@ -345,7 +351,11 @@ fn xml_contextual_fragment<'js>(
     }
     let mut scratch = crate::documents::BlitzDocument::from_base(base);
     if !scratch.base.take_parse_errors().is_empty() {
-        return Err(throw_dom(ctx, "SyntaxError", "markup is not well-formed XML"));
+        return Err(throw_dom(
+            ctx,
+            "SyntaxError",
+            "markup is not well-formed XML",
+        ));
     }
     let children = {
         let root = scratch.base.root_node().id;
@@ -355,7 +365,11 @@ fn xml_contextual_fragment<'js>(
             .map(|node| node.children.clone())
             .unwrap_or_default();
         if top.len() != 1 {
-            return Err(throw_dom(ctx, "SyntaxError", "markup is not well-formed XML"));
+            return Err(throw_dom(
+                ctx,
+                "SyntaxError",
+                "markup is not well-formed XML",
+            ));
         }
         let wrapper = NodeId {
             document: start.document,
@@ -376,9 +390,8 @@ fn xml_contextual_fragment<'js>(
     let snapshots = children
         .into_iter()
         .map(|child| {
-            crate::dom::adoption::import_snapshot(&scratch, child, true).ok_or_else(|| {
-                throw_dom(ctx, "SyntaxError", "markup is not well-formed XML")
-            })
+            crate::dom::adoption::import_snapshot(&scratch, child, true)
+                .ok_or_else(|| throw_dom(ctx, "SyntaxError", "markup is not well-formed XML"))
         })
         .collect::<Result<Vec<ImportSnapshot>>>()?;
     materialize_fragment_value(ctx, start, &snapshots)
@@ -392,8 +405,7 @@ fn create_contextual_fragment<'js>(
     from_attribute: bool,
     markup: &str,
 ) -> Result<Value<'js>> {
-    let (context, name, content_type) =
-        contextual_fragment_context(ctx, start, from_attribute)?;
+    let (context, name, content_type) = contextual_fragment_context(ctx, start, from_attribute)?;
     if content_type == "text/html" {
         html_contextual_fragment(ctx, context, markup, &name)
     } else {
@@ -443,12 +455,7 @@ impl JsRange {
         world
             .store()
             .get(self.registration.document.get())
-            .and_then(|parsed| {
-                parsed
-                    .document
-                    .ranges
-                    .get(self.registration.slot.get())
-            })
+            .and_then(|parsed| parsed.document.ranges.get(self.registration.slot.get()))
             .ok_or_else(|| Exception::throw_type(ctx, "stale range"))
     }
 
@@ -542,7 +549,11 @@ fn check_point(ctx: &Ctx<'_>, node: NodeReference, offset: u32) -> Result<PointA
                     ));
                 }
                 if offset > ranges::node_length(base, id) {
-                    return Err(throw_dom(ctx, "IndexSizeError", "offset is outside the node"));
+                    return Err(throw_dom(
+                        ctx,
+                        "IndexSizeError",
+                        "offset is outside the node",
+                    ));
                 }
                 Ok(BoundaryPoint { node: id, offset })
             })?;
@@ -570,9 +581,7 @@ fn same_tree(ctx: &Ctx<'_>, a: NodeId, b: NodeId) -> Result<bool> {
     if a.document != b.document {
         return Ok(false);
     }
-    read_document(ctx, a.document, |base| {
-        Ok(ranges::same_root(base, a, b))
-    })
+    read_document(ctx, a.document, |base| Ok(ranges::same_root(base, a, b)))
 }
 
 /// Set the start, collapsing the end when the roots differ or the new point
@@ -672,7 +681,8 @@ fn insert_node_target(
                 "a range starting in a PI or comment takes no nodes",
             ));
         }
-        if ranges::is_text(base, state.start.node) && parent_of_raw(base, state.start.node).is_none()
+        if ranges::is_text(base, state.start.node)
+            && parent_of_raw(base, state.start.node).is_none()
         {
             return Err(throw_dom(
                 ctx,
@@ -700,7 +710,8 @@ fn insert_node_target(
 }
 
 /// Clamp an IDL offset into UTF-16 units.
-fn bound(offset: u32, length: usize) -> usize {    (offset as usize).min(length)
+fn bound(offset: u32, length: usize) -> usize {
+    (offset as usize).min(length)
 }
 
 /// The single point deleteContents and extractContents collapse to, from the
@@ -818,7 +829,6 @@ fn split_endpoint_data(data: Vec<u16>, offset: u32, at_start: bool) -> (Vec<u16>
         (slice, kept)
     }
 }
-
 
 /// Clone `source` (deep when asked), replace a Text clone's data, and append
 /// it to `fragment`. Returns the clone.
@@ -1054,13 +1064,7 @@ fn produce_contents(
         let data = character_data(ctx, snode)?.units().into_owned();
         let start = bound(soff, data.len());
         let end = bound(eoff, data.len()).max(start);
-        clone_into_fragment(
-            ctx,
-            fragment,
-            snode,
-            false,
-            Some(data[start..end].to_vec()),
-        )?;
+        clone_into_fragment(ctx, fragment, snode, false, Some(data[start..end].to_vec()))?;
         if transfer == ContentsTransfer::Moved {
             // One `replace data` span: the range collapses onto the slice
             // start through the generic rule
@@ -1078,7 +1082,10 @@ fn produce_contents(
     reject_span_doctypes(ctx, &contained, transfer.verb())?;
     if let Some(first) = first {
         let sub = RangeState {
-            start: BoundaryPoint { node: snode, offset: soff },
+            start: BoundaryPoint {
+                node: snode,
+                offset: soff,
+            },
             end: BoundaryPoint {
                 node: first,
                 offset: read_document(ctx, first.document, |base| {
@@ -1092,8 +1099,14 @@ fn produce_contents(
     transfer_middle(ctx, fragment, &contained, transfer)?;
     if let Some(last) = last {
         let sub = RangeState {
-            start: BoundaryPoint { node: last, offset: 0 },
-            end: BoundaryPoint { node: enode, offset: eoff },
+            start: BoundaryPoint {
+                node: last,
+                offset: 0,
+            },
+            end: BoundaryPoint {
+                node: enode,
+                offset: eoff,
+            },
             attr: None,
         };
         transfer_partial_endpoint(ctx, fragment, &sub, last, false, transfer)?;
@@ -1106,7 +1119,6 @@ fn produce_contents(
 fn clone_into(ctx: &Ctx<'_>, fragment: NodeId, state: &RangeState) -> Result<()> {
     produce_contents(ctx, fragment, state, ContentsTransfer::Cloned)
 }
-
 
 fn parent_of_raw(base: &blitz_dom::BaseDocument, id: NodeId) -> Option<NodeId> {
     base.get_node(id.node)
@@ -1224,7 +1236,10 @@ impl<'js> range_generated::Range<'js> for JsRange {
             set_start_point(
                 &mut state,
                 base,
-                BoundaryPoint { node: parent, offset: index },
+                BoundaryPoint {
+                    node: parent,
+                    offset: index,
+                },
             );
             Ok(())
         })?;
@@ -1261,7 +1276,10 @@ impl<'js> range_generated::Range<'js> for JsRange {
             set_end_point(
                 &mut state,
                 base,
-                BoundaryPoint { node: parent, offset: index },
+                BoundaryPoint {
+                    node: parent,
+                    offset: index,
+                },
             );
             Ok(())
         })?;
@@ -1306,7 +1324,10 @@ impl<'js> range_generated::Range<'js> for JsRange {
         read_document(&ctx, id.document, |base| {
             let parent = parent_of(&ctx, base, id)?;
             let index = child_index_of(&ctx, base, parent, id)?;
-            state.start = BoundaryPoint { node: parent, offset: index };
+            state.start = BoundaryPoint {
+                node: parent,
+                offset: index,
+            };
             state.end = BoundaryPoint {
                 node: parent,
                 offset: index.saturating_add(1),
@@ -1329,8 +1350,14 @@ impl<'js> range_generated::Range<'js> for JsRange {
                 let id = start.node;
                 read_document(&ctx, id.document, |base| {
                     let length = ranges::node_length(base, id);
-                    state.start = BoundaryPoint { node: id, offset: 0 };
-                    state.end = BoundaryPoint { node: id, offset: length };
+                    state.start = BoundaryPoint {
+                        node: id,
+                        offset: 0,
+                    };
+                    state.end = BoundaryPoint {
+                        node: id,
+                        offset: length,
+                    };
                     state.attr = None;
                     Ok(())
                 })?;
@@ -1340,12 +1367,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
     }
 
     // https://dom.spec.whatwg.org/#dom-range-compareboundarypoints
-    fn compare_boundary_points(
-        &self,
-        ctx: Ctx<'js>,
-        how: u16,
-        source: Value<'js>,
-    ) -> Result<i16> {
+    fn compare_boundary_points(&self, ctx: Ctx<'js>, how: u16, source: Value<'js>) -> Result<i16> {
         let source = Class::<JsRange>::from_value(&source)?;
         let source = source.borrow();
         // The `how` check precedes the root check
@@ -1387,11 +1409,13 @@ impl<'js> range_generated::Range<'js> for JsRange {
             _ => (state.start, other.end),
         };
         read_document(&ctx, state.start.node.document, |base| {
-            Ok(match ranges::position(base, state.start.node.document, mine, theirs) {
-                Ordering::Less => -1,
-                Ordering::Equal => 0,
-                Ordering::Greater => 1,
-            })
+            Ok(
+                match ranges::position(base, state.start.node.document, mine, theirs) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                },
+            )
         })
     }
 
@@ -1437,12 +1461,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
     }
 
     // https://dom.spec.whatwg.org/#dom-range-ispointinrange
-    fn is_point_in_range(
-        &self,
-        ctx: Ctx<'js>,
-        node: NodeReference,
-        offset: u32,
-    ) -> Result<bool> {
+    fn is_point_in_range(&self, ctx: Ctx<'js>, node: NodeReference, offset: u32) -> Result<bool> {
         let state = self.load(&ctx)?;
         // The root check precedes the doctype and offset checks
         // (<https://dom.spec.whatwg.org/#dom-range-ispointinrange>).
@@ -1463,8 +1482,7 @@ impl<'js> range_generated::Range<'js> for JsRange {
                 let id = point.node;
                 read_document(&ctx, id.document, |base| {
                     Ok(
-                        ranges::position(base, id.document, point, state.start)
-                            != Ordering::Less
+                        ranges::position(base, id.document, point, state.start) != Ordering::Less
                             && ranges::position(base, id.document, point, state.end)
                                 != Ordering::Greater,
                     )
@@ -1535,7 +1553,10 @@ impl<'js> range_generated::Range<'js> for JsRange {
             let before_end = ranges::position(
                 base,
                 id.document,
-                BoundaryPoint { node: parent, offset: index },
+                BoundaryPoint {
+                    node: parent,
+                    offset: index,
+                },
                 state.end,
             ) == Ordering::Less;
             let after_start = ranges::position(
@@ -1698,7 +1719,9 @@ impl<'js> range_generated::Range<'js> for JsRange {
                     None => ranges::node_length(base, parent),
                 })
             })?;
-            self.save(&ctx, RangeState {
+            self.save(
+                &ctx,
+                RangeState {
                     start: state.start,
                     end: BoundaryPoint {
                         node: parent,
@@ -1772,8 +1795,13 @@ impl<'js> range_generated::Range<'js> for JsRange {
             let index = child_index_of(&ctx, base, parent, new_parent)?;
             Ok((parent, index))
         })?;
-        self.save(&ctx, RangeState {
-                start: BoundaryPoint { node: parent, offset: index },
+        self.save(
+            &ctx,
+            RangeState {
+                start: BoundaryPoint {
+                    node: parent,
+                    offset: index,
+                },
                 end: BoundaryPoint {
                     node: parent,
                     offset: index.saturating_add(1),

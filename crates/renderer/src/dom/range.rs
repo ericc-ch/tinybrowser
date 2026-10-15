@@ -157,7 +157,8 @@ pub(crate) fn node_length(base: &blitz_dom::BaseDocument, id: NodeId) -> u32 {
         NodeData::Document(_)
         | NodeData::Element(_)
         | NodeData::AnonymousBlock(_)
-        | NodeData::Fragment { .. } => {
+        | NodeData::Fragment { .. }
+        | NodeData::ShadowRoot { .. } => {
             u32::try_from(node.children.len()).unwrap_or(u32::MAX)
         }
         NodeData::Text(text) => utf16_length(&text.content),

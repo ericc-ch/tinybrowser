@@ -141,7 +141,11 @@ pub(crate) fn import_snapshot(
             };
             Some(ImportSnapshot::Fragment(children))
         }
-        NodeData::Document(_) => None,
+        // A shadow root is not a fragment that clone, import, or adopt may
+        // copy. Callers reject it with the spec exception before snapshotting
+        // (<https://dom.spec.whatwg.org/#dom-node-clonenode>). A document has
+        // no snapshot either.
+        NodeData::ShadowRoot { .. } | NodeData::Document(_) => None,
     }
 }
 

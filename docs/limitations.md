@@ -31,8 +31,9 @@ Lone surrogates survive in JS but read back as U+FFFD from the DOM
 ## Missing surfaces
 
 No workers or service-workers, no canvas or WebGL, sync XHR is
-rejected, customized built-in elements are rejected. Shadow DOM and
-form-control state are upstream gaps (docs/upstream.md).
+rejected, customized built-in elements are rejected. Shadow-scoped
+styles, composed-event retargeting, and form-control state are upstream
+gaps (docs/upstream.md).
 
 Associated stylesheets expose `cssRules`, per-interface rule objects, and
 declaration accessors. Still open: constructable `insertRule` /

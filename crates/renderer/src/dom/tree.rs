@@ -48,17 +48,39 @@ impl Ord for NodeId {
     }
 }
 
-/// Whether `node` is connected: its ancestor chain reaches the document root.
-pub(crate) fn is_connected(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
-    let root = base.root_node().id;
-    let mut current = Some(id);
-    while let Some(node_id) = current {
-        if node_id == root {
-            return true;
-        }
-        current = base.get_node(node_id).and_then(|node| node.parent);
+/// The parent of `id`, or the host when `id` is a shadow root
+/// (<https://dom.spec.whatwg.org/#concept-shadow-including-parent>).
+pub(crate) fn shadow_including_parent(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+) -> Option<BlitzNodeId> {
+    let node = base.get_node(id)?;
+    if let Some(parent) = node.parent {
+        return Some(parent);
     }
-    false
+    match &node.data {
+        blitz_dom::NodeData::ShadowRoot { host, .. } => Some(*host),
+        _ => None,
+    }
+}
+
+/// The shadow-including root of `id`
+/// (<https://dom.spec.whatwg.org/#concept-shadow-including-root>).
+pub(crate) fn shadow_including_root(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+) -> BlitzNodeId {
+    let mut root = id;
+    while let Some(parent) = shadow_including_parent(base, root) {
+        root = parent;
+    }
+    root
+}
+
+/// Whether `node` is connected: its shadow-including root is the document
+/// (<https://dom.spec.whatwg.org/#connected>).
+pub(crate) fn is_connected(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
+    shadow_including_root(base, id) == base.root_node().id
 }
 
 /// Whether `node` is an HTML `iframe` element.

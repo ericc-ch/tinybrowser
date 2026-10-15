@@ -53,7 +53,7 @@ fn equal_view(doc: &BlitzDocument, id: BlitzId) -> Option<EqualView> {
         } else {
             match &node.data {
                 NodeData::Document(_) => EqualKind::Document,
-                NodeData::Fragment { .. } => EqualKind::Fragment,
+                NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => EqualKind::Fragment,
                 NodeData::Element(element) => EqualKind::Element {
                     name: element.name.clone(),
                     attributes: element
