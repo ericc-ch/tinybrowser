@@ -22,10 +22,10 @@
         overlays = [ rust-overlay.overlays.default ];
       };
       rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-      # Nightly carries Miri and the sanitizer flags; builds and clippy still use
+      # Nightly is the check shell for Valgrind; builds and clippy still use
       # the pinned stable toolchain above. Enter with `nix develop .#check`.
       checkToolchain = pkgs.rust-bin.nightly.latest.default.override {
-        extensions = [ "miri" "rust-src" ];
+        extensions = [ "rust-src" ];
       };
       runtimeLibs = pkgs.lib.makeLibraryPath [
         pkgs.openssl
@@ -61,7 +61,7 @@
           inherit shellHook;
         };
 
-        # Nightly checks: Miri, Valgrind. Same build deps as the default shell,
+        # Nightly checks: Valgrind. Same build deps as the default shell,
         # nightly toolchain instead of the pinned stable one.
         check = pkgs.mkShell {
           strictDeps = true;
