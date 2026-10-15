@@ -85,13 +85,6 @@ async function discoverTests() {
   return tests.sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function passingTests() {
-  return readFileSync(join(TOOLS, "passing.txt"), "utf8")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"));
-}
-
 const ABSOLUTE_URL = /(?:https?|wss?):\/\/[^\s'"`\\<>]+/g;
 // Namespace and documentation links that appear in test sources without
 // causing a network request. Everything else is a Chromium test-server
@@ -164,10 +157,10 @@ function globPattern(pattern) {
 
 function selectTests(tests, options) {
   if (options.all && options.patterns.length === 0) return tests;
-  const patterns = options.patterns.length ? options.patterns : passingTests();
-  if (patterns.length === 0) {
-    throw new Error("tools/cdp-tests/passing.txt is empty; use --all or provide a path pattern");
+  if (options.patterns.length === 0) {
+    throw new Error("pass test path patterns or --all");
   }
+  const patterns = options.patterns;
   const matchers = patterns.map(globPattern);
   const selected = tests.filter((test) => matchers.some((matcher) => matcher.test(test.id)));
   if (selected.length === 0) throw new Error(`no CDP tests matched: ${patterns.join(", ")}`);

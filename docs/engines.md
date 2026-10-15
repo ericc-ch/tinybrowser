@@ -1,7 +1,14 @@
 # Engines
 
-| Engine   | Search                        | Single file                                                            |
-| -------- | ----------------------------- | ---------------------------------------------------------------------- |
-| Chromium | source.chromium.org           | `https://raw.githubusercontent.com/chromium/chromium/<rev>/path`       |
-| Firefox  | searchfox.org/mozilla-central | `https://raw.githubusercontent.com/mozilla-firefox/firefox/<rev>/path` |
-| WebKit   | searchfox.org/wubkat          | `https://raw.githubusercontent.com/WebKit/WebKit/<rev>/path`           |
+- Chromium
+  - Search: https://source.chromium.org/chromium/chromium/src
+  - Single file: https://raw.githubusercontent.com/chromium/chromium/<rev>/path
+- Firefox
+  - Search: https://searchfox.org/firefox-main/source/
+  - Single file: https://raw.githubusercontent.com/mozilla-firefox/firefox/<rev>/path
+- WebKit
+  - Search: https://searchfox.org/wubkat/source/
+  - Single file: https://raw.githubusercontent.com/WebKit/WebKit/<rev>/path
+
+rev is a commit hash or branch (e.g. main). Old
+searchfox.org/mozilla-central URLs redirect to firefox-main.

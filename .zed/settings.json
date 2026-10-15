@@ -4,8 +4,13 @@
   // "..." expands to the inherited defaults (.git, .DS_Store, ...) so we don't
   // drop those by overriding this array at the project layer.
   "file_scan_exclusions": [
-    "**/third_party/wpt",
+    "**/third_party/blitz",
     "**/third_party/blink-cdp",
+    "**/third_party/fontconfig-parser",
+    "**/third_party/html5ever",
+    "**/third_party/rquickjs",
+    "**/third_party/weedle4",
+    "**/third_party/wpt",
     "...",
   ],
 }

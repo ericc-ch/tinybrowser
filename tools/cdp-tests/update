@@ -6,12 +6,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VENDOR="$ROOT/third_party/blink-cdp"
 REVISION="$(tr -d '[:space:]' < "$VENDOR/REVISION")"
 
-# Documentation pins the same revision; refuse to download when they disagree.
-if ! grep -qF "$REVISION" "$ROOT/third_party/VENDORED.md"; then
-  echo "third_party/VENDORED.md does not record revision $REVISION" >&2
-  exit 1
-fi
-
 STAGE="$VENDOR/.update-stage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/inspector-protocol" "$STAGE/http-inspector-protocol"
