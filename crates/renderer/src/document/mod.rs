@@ -188,18 +188,19 @@ fn materialize_iframe_document(
     container: crate::dom::tree::NodeId,
     new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
 ) {
-    let (runtime, base_url, init_scripts, viewport) = {
+    let (runtime, base_url, origin, init_scripts, viewport) = {
         let world = world_rc.borrow();
         (
             world.runtime.clone(),
             world.document_url.clone(),
+            world.origin.clone(),
             Rc::clone(&world.init_scripts),
             world.viewport_size.get(),
         )
     };
     let mut document = Document::with_shared(frame, &runtime, &init_scripts);
     document.set_viewport_size(viewport);
-    document.load_about_blank_tree(Some(base_url.as_str()));
+    document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
     if let Some(root) = document.document_root() {
         world_rc
             .borrow()
@@ -476,6 +477,12 @@ impl Document {
         self.world.borrow().object_url_type(url)
     }
 
+    /// The creator origin stored for an object URL this document may use.
+    #[must_use]
+    pub(crate) fn object_url_origin(&self, url: &str) -> Option<url::Origin> {
+        self.world.borrow().object_url_origin(url)
+    }
+
     /// Creates the browsing context of every connected `iframe` that lacks
     /// one, so a script sees it in the same task
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
@@ -513,11 +520,12 @@ impl Document {
         if pending.is_empty() {
             return;
         }
-        let (runtime, base_url, init_scripts, viewport) = {
+        let (runtime, base_url, origin, init_scripts, viewport) = {
             let world = self.world.borrow();
             (
                 world.runtime.clone(),
                 world.document_url.clone(),
+                world.origin.clone(),
                 Rc::clone(&world.init_scripts),
                 world.viewport_size.get(),
             )
@@ -530,7 +538,7 @@ impl Document {
             // `contentWindow` in the following classic script
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
             document.set_viewport_size(viewport);
-            document.load_about_blank(Some(base_url.as_str()));
+            document.load_about_blank(Some(base_url.as_str()), Some(origin.clone()));
             loaded.push((frame, container, document));
         }
         self.new_frames.borrow_mut().extend(loaded);
@@ -685,11 +693,17 @@ impl Document {
     }
 
     /// Loads the frame's initial `about:blank`, inheriting `inherited_url` as
-    /// the document URL when the parent supplies one
-    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
-    pub(crate) fn load_about_blank(&mut self, inherited_url: Option<&str>) {
+    /// the document URL and `inherited_origin` as the captured origin when the
+    /// parent supplies them
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>,
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    pub(crate) fn load_about_blank(
+        &mut self,
+        inherited_url: Option<&str>,
+        inherited_origin: Option<url::Origin>,
+    ) {
         if let Some(url) = inherited_url {
-            self.apply_document_url(url);
+            self.apply_document_url(url, inherited_origin);
         }
         self.load_html("");
         self.initial_blank = true;
@@ -702,9 +716,13 @@ impl Document {
     /// Used when a parent script inserts an `iframe`: the document must exist
     /// for `contentDocument` in the same task, but `QuickJS` cannot enter a new
     /// realm until that script returns.
-    pub(crate) fn load_about_blank_tree(&mut self, inherited_url: Option<&str>) {
+    pub(crate) fn load_about_blank_tree(
+        &mut self,
+        inherited_url: Option<&str>,
+        inherited_origin: Option<url::Origin>,
+    ) {
         if let Some(url) = inherited_url {
-            self.apply_document_url(url);
+            self.apply_document_url(url, inherited_origin);
         }
         self.defer_js = true;
         self.load_html("");
@@ -763,10 +781,14 @@ impl Document {
         }
     }
 
-    fn apply_document_url(&mut self, url: &str) {
+    fn apply_document_url(&mut self, url: &str, origin: Option<url::Origin>) {
         if let Ok(url) = Url::parse(url) {
             self.url = url.clone();
-            self.world.borrow_mut().set_url(url);
+            let mut world = self.world.borrow_mut();
+            match origin {
+                Some(origin) => world.set_url_with_origin(url, origin),
+                None => world.set_url(url),
+            }
         }
     }
 
@@ -1087,9 +1109,40 @@ impl Document {
     /// Starts a document from a complete response: new realm, the response's
     /// URL, and the whole body.
     fn load_response_body(&mut self, url: &Url, content_type: Option<&str>, body: &[u8]) {
+        self.load_response_body_with_origin(url, content_type, body, None);
+    }
+
+    /// [`Document::load_response_body`] that stores `origin` instead of
+    /// `Url::origin()`. A `blob:` document's origin is the store entry's
+    /// creator, which is not what `Url::origin()` returns for the blob URL
+    /// (<https://w3c.github.io/FileAPI/#blob-url-entry>,
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    fn load_response_body_with_origin(
+        &mut self,
+        url: &Url,
+        content_type: Option<&str>,
+        body: &[u8],
+        origin: Option<url::Origin>,
+    ) {
         self.begin_response(Some(url), content_type, None);
+        if let Some(origin) = origin {
+            self.world
+                .borrow_mut()
+                .set_url_with_origin(url.clone(), origin);
+        }
         self.write_body(body);
         self.end_body();
+    }
+
+    /// Loads a complete response whose captured origin is `origin`.
+    pub(crate) fn load_frame_response_with_origin(
+        &mut self,
+        url: &Url,
+        content_type: Option<&str>,
+        body: &[u8],
+        origin: url::Origin,
+    ) {
+        self.load_response_body_with_origin(url, content_type, body, Some(origin));
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is

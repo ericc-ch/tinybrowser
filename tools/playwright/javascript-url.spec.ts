@@ -1,4 +1,4 @@
-import { chromium } from "@playwright/test";
+import { chromium, type Page } from "@playwright/test";
 
 import { expect, test } from "./fixtures";
 
@@ -72,6 +72,52 @@ test("javascript: iframe src still runs in a same-origin child", async ({ daemon
   });
 
   expect(ran).toContain("JS RAN");
+
+  await browser.close();
+});
+
+async function opaqueParentJavascriptChild(page: Page) {
+  return page.evaluate(async () => {
+    const frame = document.createElement("iframe");
+    const loaded = new Promise<void>((resolve) => {
+      frame.addEventListener("load", () => resolve(), { once: true });
+    });
+    document.body.appendChild(frame);
+    await loaded;
+    const readable = frame.contentDocument !== null;
+    const replaced = new Promise<void>((resolve) => {
+      frame.addEventListener("load", () => resolve(), { once: true });
+    });
+    frame.src = "javascript:'<body>JS RAN</body>'";
+    await replaced;
+    return {
+      readable,
+      body: frame.contentDocument && frame.contentDocument.body.textContent,
+    };
+  });
+}
+
+test("javascript: iframe src runs from an opaque about:blank parent", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+
+  const result = await opaqueParentJavascriptChild(page);
+
+  expect(result.readable).toBe(true);
+  expect(result.body).toContain("JS RAN");
+
+  await browser.close();
+});
+
+test("javascript: iframe src runs from an opaque data: parent", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+  await page.goto(`data:text/html,${encodeURIComponent("<!doctype html><body></body>")}`);
+
+  const result = await opaqueParentJavascriptChild(page);
+
+  expect(result.readable).toBe(true);
+  expect(result.body).toContain("JS RAN");
 
   await browser.close();
 });

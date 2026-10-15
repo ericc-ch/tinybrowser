@@ -1806,6 +1806,7 @@ mod realm_tests {
             registry: Rc::clone(registry),
             shared: Rc::new(RefCell::new(Shared::default())),
             pending_storage: Rc::new(RefCell::new(Vec::new())),
+            turn_deadline: Rc::new(std::cell::Cell::new(None)),
             font_ctx: parley::FontContext::default(),
         };
         let mut world = World::new(
@@ -2035,5 +2036,75 @@ mod realm_tests {
                 super::super::eval_classic(&ctx, "__el_from_a === __el").expect("identity");
             assert!(same, "cross-realm property reads return the shared wrapper");
         });
+    }
+
+    /// Four zero-delay runaway timers share one drain deadline, so one
+    /// `drain_ready` returns well under the 60 s renderer request timeout
+    /// and leaves the rest queued.
+    #[test]
+    fn one_drain_stops_four_runaway_timers() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let stop = Arc::new(Stop::new());
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let mut engine = crate::engine::Engine::new(services, stop, wake);
+        let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &crate::protocol::Mount {
+                    url: "https://example.test/".into(),
+                    content_type: Some("text/html".into()),
+                    body: html.as_bytes().to_vec(),
+                    history: crate::protocol::HistorySnapshot::default(),
+                    viewport: None,
+                    init_scripts: Vec::new(),
+                },
+            )
+            .expect("mount");
+        let started = std::time::Instant::now();
+        let yielded = engine.drain_ready_until(started + std::time::Duration::from_millis(400));
+        let elapsed = started.elapsed();
+        assert!(yielded, "ready timers stay queued after the deadline");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "one drain took {elapsed:?}"
+        );
+        let count = engine
+            .eval_in(FrameId::MAIN, "String(globalThis.__n)")
+            .expect("counter");
+        assert_eq!(count, "1");
+    }
+
+    /// A cross-origin world cannot revoke another world's blob URL.
+    #[test]
+    fn revoke_object_url_rejects_a_cross_origin_caller() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let first = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<html></html>",
+        );
+        let second = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://b.test/",
+            "<html></html>",
+        );
+        let url = first
+            .borrow_mut()
+            .create_object_url("x".into(), "text/plain".into())
+            .expect("object url");
+        second.borrow_mut().revoke_object_url(&url);
+        assert!(first.borrow().object_url_contents(&url).is_some());
+        first.borrow_mut().revoke_object_url(&url);
+        assert!(first.borrow().object_url_contents(&url).is_none());
     }
 }

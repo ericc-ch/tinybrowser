@@ -32,8 +32,8 @@ mod storage;
 mod xml;
 
 pub use embedded::EmbeddedRenderer;
-pub use engine::{DEFAULT_VIEWPORT, Engine};
-pub use js::Stop;
+pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url};
+pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
     BrowserServices, BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialKind,
     DialOutcome, DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost,

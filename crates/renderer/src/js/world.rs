@@ -1357,8 +1357,19 @@ impl World {
 
     /// Replaces the document URL and captures a new origin for that document.
     pub(crate) fn set_url(&mut self, url: Url) {
+        let origin = url.origin();
+        self.set_url_with_origin(url, origin);
+    }
+
+    /// Replaces the document URL and stores `origin` as the captured origin.
+    ///
+    /// `about:blank` and `blob:` documents inherit an origin. `Url::origin()`
+    /// would allocate a fresh `Origin::Opaque` for those URLs, so the child
+    /// would not match its parent
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    pub(crate) fn set_url_with_origin(&mut self, url: Url, origin: url::Origin) {
         self.document_url = url;
-        self.origin = self.document_url.origin();
+        self.origin = origin;
     }
 
     /// Whether `url` is same-origin with this document's captured origin.
@@ -1681,6 +1692,15 @@ impl World {
             .map(|entry| Rc::clone(&entry.content_type))
     }
 
+    /// The creator origin stored for `url`, when this document may use it.
+    pub(crate) fn object_url_origin(&self, url: &str) -> Option<url::Origin> {
+        self.runtime
+            .registry
+            .borrow()
+            .object_url(url, &self.origin)
+            .map(|entry| entry.origin.clone())
+    }
+
     fn refund_object_url_bytes(&self, bytes: usize) {
         let mut budget = self.budget.borrow_mut();
         budget.object_url_bytes = budget.object_url_bytes.saturating_sub(bytes);
@@ -1706,6 +1726,18 @@ impl World {
     }
 
     pub(crate) fn revoke_object_url(&mut self, url: &str) {
+        // Same-partition check: a cross-origin caller must not remove the
+        // entry or refund bytes it did not allocate
+        // (<https://w3c.github.io/FileAPI/#dfn-revokeObjectURL>).
+        if self
+            .runtime
+            .registry
+            .borrow()
+            .object_url(url, &self.origin)
+            .is_none()
+        {
+            return;
+        }
         if let Some(entry) = self
             .runtime
             .registry
