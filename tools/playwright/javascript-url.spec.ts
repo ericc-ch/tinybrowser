@@ -50,3 +50,28 @@ test("javascript: iframe src does not run in a cross-origin child", async ({ dae
 
   await browser.close();
 });
+
+test("javascript: iframe src still runs in a same-origin child", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+  await page.goto(daemon.pageUrl);
+
+  const ran = await page.evaluate(async () => {
+    const iframe = document.createElement("iframe");
+    const loaded = new Promise<void>((resolve) => {
+      iframe.addEventListener("load", () => resolve(), { once: true });
+    });
+    document.body.appendChild(iframe);
+    await loaded;
+    const replaced = new Promise<void>((resolve) => {
+      iframe.addEventListener("load", () => resolve(), { once: true });
+    });
+    iframe.src = "javascript:'<body>JS RAN</body>'";
+    await replaced;
+    return iframe.contentDocument && iframe.contentDocument.body.textContent;
+  });
+
+  expect(ran).toContain("JS RAN");
+
+  await browser.close();
+});

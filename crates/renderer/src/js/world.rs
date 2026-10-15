@@ -363,6 +363,22 @@ impl RealmRegistry {
         let entry = self.object_urls.get(object_url_key(url))?;
         (entry.origin == *origin).then_some(entry)
     }
+
+    /// File API unloading-document cleanup: drop matching blob URLs and
+    /// return the bytes they held
+    /// (<https://w3c.github.io/FileAPI/#lifeTime>).
+    fn take_object_urls(&mut self, mut unload: impl FnMut(&ObjectUrlEntry) -> bool) -> usize {
+        let mut released = 0usize;
+        self.object_urls.retain(|_, entry| {
+            if unload(entry) {
+                released = released.saturating_add(entry.contents.len() + entry.content_type.len());
+                false
+            } else {
+                true
+            }
+        });
+        released
+    }
 }
 
 /// A child frame navigation queued from inside a script, applied after it
@@ -550,6 +566,8 @@ pub(crate) struct ObjectUrlEntry {
     pub(crate) contents: Rc<str>,
     pub(crate) content_type: Rc<str>,
     pub(crate) origin: url::Origin,
+    frame: FrameId,
+    document: Option<u32>,
 }
 
 /// The Blob URL Store key: the URL without its fragment
@@ -594,6 +612,11 @@ pub(crate) struct World {
     /// observers through the union drain.
     owned: HashSet<u32>,
     pub document_url: Url,
+    /// Origin captured for this document. `Url::origin()` on `about:blank`,
+    /// `data:`, and `file:` yields a fresh `Origin::Opaque` each call, so
+    /// blob lookups and same-origin checks must reuse this value
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+    pub(crate) origin: url::Origin,
     /// Document referrer policy from a `meta name=referrer` insertion
     /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
     pub(crate) referrer_policy: String,
@@ -739,6 +762,7 @@ impl DecoderSession {
 
 impl Drop for World {
     fn drop(&mut self) {
+        self.unload_object_urls_for_frame();
         let mut budget = self.budget.borrow_mut();
         let stream_bytes = self
             .document_stream
@@ -769,6 +793,7 @@ impl World {
             frame_host: None,
             document: None,
             owned: HashSet::new(),
+            origin: document_url.origin(),
             document_url,
             referrer_policy: String::new(),
             history: crate::protocol::HistorySnapshot::default(),
@@ -875,6 +900,7 @@ impl World {
     fn drop_active_document(&mut self) {
         if let Some(old) = self.document.take() {
             self.owned.remove(&old);
+            self.unload_object_urls_for_document(old);
             self.nonce_slots.retain(|node, _| node.document != old);
             self.runtime.documents.borrow_mut().remove(old);
             self.runtime.registry.borrow_mut().forget_document(old);
@@ -884,7 +910,9 @@ impl World {
     /// Drops realm and wrapper associations for every document this realm
     /// owns; called when the frame goes away.
     pub(crate) fn forget_owned_documents(&mut self) {
-        for id in self.owned.drain() {
+        let ids: Vec<u32> = self.owned.drain().collect();
+        for id in ids {
+            self.unload_object_urls_for_document(id);
             self.runtime.documents.borrow_mut().remove(id);
             self.runtime.registry.borrow_mut().forget_document(id);
             self.nonce_slots.retain(|node, _| node.document != id);
@@ -1259,14 +1287,30 @@ impl World {
     /// The serialized origin of this realm's document
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     pub(crate) fn origin_string(&self) -> String {
-        self.document_url.origin().ascii_serialization()
+        self.origin.ascii_serialization()
+    }
+
+    /// Replaces the document URL and captures a new origin for that document.
+    pub(crate) fn set_url(&mut self, url: Url) {
+        self.document_url = url;
+        self.origin = self.document_url.origin();
+    }
+
+    /// Whether `url` is same-origin with this document's captured origin.
+    /// Tuple origins compare with `Url::origin()`; opaque origins cannot,
+    /// because that call allocates a new `Origin::Opaque` each time.
+    pub(crate) fn url_matches_origin(&self, url: &Url) -> bool {
+        match self.origin {
+            url::Origin::Tuple(..) => url.origin() == self.origin,
+            url::Origin::Opaque(_) => !matches!(url.origin(), url::Origin::Tuple(..)),
+        }
     }
 
     /// The origin scoping this realm's storage areas, or `None` for an opaque
     /// origin, where the storage getters must throw `SecurityError`
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute>).
     pub(crate) fn storage_origin(&self) -> Option<String> {
-        match self.document_url.origin() {
+        match self.origin {
             url::Origin::Tuple(..) => Some(self.origin_string()),
             url::Origin::Opaque(_) => None,
         }
@@ -1527,14 +1571,15 @@ impl World {
             return None;
         }
         let id = object_url_id()?;
-        let origin = self.document_url.origin();
-        let url = format!("blob:{}/{id}", origin.ascii_serialization());
+        let url = format!("blob:{}/{id}", self.origin.ascii_serialization());
         self.runtime.registry.borrow_mut().object_urls.insert(
             url.clone(),
             ObjectUrlEntry {
                 contents: Rc::from(contents),
                 content_type: Rc::from(content_type),
-                origin,
+                origin: self.origin.clone(),
+                frame: self.frame,
+                document: self.document,
             },
         );
         budget.object_url_bytes = total;
@@ -1542,21 +1587,43 @@ impl World {
     }
 
     pub(crate) fn object_url_contents(&self, url: &str) -> Option<Rc<str>> {
-        let origin = self.document_url.origin();
         self.runtime
             .registry
             .borrow()
-            .object_url(url, &origin)
+            .object_url(url, &self.origin)
             .map(|entry| Rc::clone(&entry.contents))
     }
 
     pub(crate) fn object_url_type(&self, url: &str) -> Option<Rc<str>> {
-        let origin = self.document_url.origin();
         self.runtime
             .registry
             .borrow()
-            .object_url(url, &origin)
+            .object_url(url, &self.origin)
             .map(|entry| Rc::clone(&entry.content_type))
+    }
+
+    fn refund_object_url_bytes(&self, bytes: usize) {
+        let mut budget = self.budget.borrow_mut();
+        budget.object_url_bytes = budget.object_url_bytes.saturating_sub(bytes);
+    }
+
+    fn unload_object_urls_for_document(&mut self, document: u32) {
+        let released = self
+            .runtime
+            .registry
+            .borrow_mut()
+            .take_object_urls(|entry| entry.document == Some(document));
+        self.refund_object_url_bytes(released);
+    }
+
+    fn unload_object_urls_for_frame(&mut self) {
+        let frame = self.frame;
+        let released = self
+            .runtime
+            .registry
+            .borrow_mut()
+            .take_object_urls(|entry| entry.frame == frame);
+        self.refund_object_url_bytes(released);
     }
 
     pub(crate) fn revoke_object_url(&mut self, url: &str) {

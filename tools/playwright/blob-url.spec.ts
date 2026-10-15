@@ -59,3 +59,56 @@ test("an iframe blob URL lookup strips the fragment", async ({ daemon }) => {
 
   await browser.close();
 });
+
+test("a removed frame's blob URL is gone", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+  await page.goto(daemon.pageUrl);
+
+  const created = await page.evaluate(async (blobChildUrl: string) => {
+    const url = await new Promise<string>((resolve) => {
+      window.addEventListener(
+        "message",
+        (event) => {
+          resolve(String(event.data));
+        },
+        { once: true },
+      );
+      const iframe = document.createElement("iframe");
+      iframe.id = "blob-frame";
+      iframe.src = blobChildUrl;
+      document.body.appendChild(iframe);
+    });
+    const before = await fetch(url).then((response) => response.text());
+    return { before, url };
+  }, daemon.blobChildUrl);
+
+  expect(created.before).toBe("GONE");
+  await page.goto(`${daemon.pageUrl}?next`);
+
+  const after = await page.evaluate(async (url: string) => {
+    try {
+      return await fetch(url).then((response) => response.text());
+    } catch {
+      return "gone";
+    }
+  }, created.url);
+
+  expect(after).toBe("gone");
+
+  await browser.close();
+});
+
+test("createObjectURL on about:blank is fetchable", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+
+  const text = await page.evaluate(async () => {
+    const url = URL.createObjectURL(new Blob(["OPAQUE"], { type: "text/plain" }));
+    return await fetch(url).then((response) => response.text());
+  });
+
+  expect(text).toBe("OPAQUE");
+
+  await browser.close();
+});

@@ -740,8 +740,7 @@ impl Engine {
                 // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url>).
                 let same_origin = match (self.frames.get(&parent), self.frames.get(&child)) {
                     (Some(source), Some(target)) => {
-                        source.world().borrow().document_url.origin()
-                            == target.world().borrow().document_url.origin()
+                        source.world().borrow().origin == target.world().borrow().origin
                     }
                     _ => false,
                 };

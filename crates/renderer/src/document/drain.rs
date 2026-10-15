@@ -217,7 +217,7 @@ impl Document {
         let history = std::mem::take(&mut self.world.borrow_mut().pending_history);
         for event in history {
             if let RendererEvent::HistoryUpdated { ref url, .. } = event {
-                self.apply_document_url(url);
+                self.apply_document_url_same_origin(url);
             }
             self.record_event(event);
         }

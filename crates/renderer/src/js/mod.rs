@@ -1033,7 +1033,7 @@ fn install_history_host_functions(
                 let next = Url::parse(&url)
                     .map_err(|_| Exception::throw_type(&ctx, "Invalid history URL"))?;
                 let mut world = update_world.borrow_mut();
-                if next.origin() != world.document_url.origin() {
+                if !world.url_matches_origin(&next) {
                     return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
                 }
                 world.document_url = next;

@@ -766,6 +766,13 @@ impl Document {
     fn apply_document_url(&mut self, url: &str) {
         if let Ok(url) = Url::parse(url) {
             self.url = url.clone();
+            self.world.borrow_mut().set_url(url);
+        }
+    }
+
+    fn apply_document_url_same_origin(&mut self, url: &str) {
+        if let Ok(url) = Url::parse(url) {
+            self.url = url.clone();
             self.world.borrow_mut().document_url = url;
         }
     }
@@ -780,12 +787,12 @@ impl Document {
         let url = Url::parse(url).map_err(|_| TabError::InvalidUrl {
             spec: url.to_owned(),
         })?;
-        if url.origin() != self.url.origin() {
+        if !self.world.borrow().url_matches_origin(&url) {
             return Err(TabError::InvalidUrl { spec: url.into() });
         }
         let previous_url = self.url.clone();
         let previous_history = self.world.borrow().history.clone();
-        self.apply_document_url(url.as_str());
+        self.apply_document_url_same_origin(url.as_str());
         self.world.borrow_mut().history = history.clone();
         let restored_state = self
             .js
@@ -796,7 +803,7 @@ impl Document {
             Ok(Some(state)) => self.fire_js(|js| js.fire_popstate(&state)),
             Ok(None) => {}
             Err(error) => {
-                self.apply_document_url(previous_url.as_str());
+                self.apply_document_url_same_origin(previous_url.as_str());
                 self.world.borrow_mut().history = previous_history;
                 return Err(TabError::from(error));
             }
@@ -1064,7 +1071,7 @@ impl Document {
         }
         self.initial_blank = false;
         let mut world = self.world.borrow_mut();
-        world.document_url = self.url.clone();
+        world.set_url(self.url.clone());
         drop(world);
         // The realm is already new when this runs; this opens the parser and
         // the decoder for the response that will feed it.
