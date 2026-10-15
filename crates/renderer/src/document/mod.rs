@@ -463,8 +463,8 @@ impl Document {
             .ok()
     }
 
-    /// An object URL's contents, created by this realm
-    /// (<https://w3c.github.io/FileAPI/#dfn-createObjectURL>).
+    /// An object URL's contents, when this document's origin created it
+    /// (<https://w3c.github.io/FileAPI/#blob-url-store>).
     #[must_use]
     pub(crate) fn object_url_contents(&self, url: &str) -> Option<Rc<str>> {
         self.world.borrow().object_url_contents(url)
@@ -739,12 +739,10 @@ impl Document {
     /// Runs one `javascript:` frame URL's script in the frame's current realm,
     /// replacing the document only when the result is a string. A void
     /// result leaves the document (and its realm) untouched; the script
-    /// observes the page's own state, not a fresh blank realm
+    /// observes the page's own state, not a fresh blank realm. The result
+    /// document keeps the target's URL
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-    pub(crate) fn load_javascript_frame(&mut self, inherited_url: Option<&str>, script: &str) {
-        if let Some(url) = inherited_url {
-            self.apply_document_url(url);
-        }
+    pub(crate) fn load_javascript_frame(&mut self, script: &str) {
         if self.js.is_none() {
             self.ensure_js_ok();
         }
@@ -768,6 +766,13 @@ impl Document {
     fn apply_document_url(&mut self, url: &str) {
         if let Ok(url) = Url::parse(url) {
             self.url = url.clone();
+            self.world.borrow_mut().set_url(url);
+        }
+    }
+
+    fn apply_document_url_same_origin(&mut self, url: &str) {
+        if let Ok(url) = Url::parse(url) {
+            self.url = url.clone();
             self.world.borrow_mut().document_url = url;
         }
     }
@@ -782,12 +787,12 @@ impl Document {
         let url = Url::parse(url).map_err(|_| TabError::InvalidUrl {
             spec: url.to_owned(),
         })?;
-        if url.origin() != self.url.origin() {
+        if !self.world.borrow().url_matches_origin(&url) {
             return Err(TabError::InvalidUrl { spec: url.into() });
         }
         let previous_url = self.url.clone();
         let previous_history = self.world.borrow().history.clone();
-        self.apply_document_url(url.as_str());
+        self.apply_document_url_same_origin(url.as_str());
         self.world.borrow_mut().history = history.clone();
         let restored_state = self
             .js
@@ -798,7 +803,7 @@ impl Document {
             Ok(Some(state)) => self.fire_js(|js| js.fire_popstate(&state)),
             Ok(None) => {}
             Err(error) => {
-                self.apply_document_url(previous_url.as_str());
+                self.apply_document_url_same_origin(previous_url.as_str());
                 self.world.borrow_mut().history = previous_history;
                 return Err(TabError::from(error));
             }
@@ -1066,7 +1071,7 @@ impl Document {
         }
         self.initial_blank = false;
         let mut world = self.world.borrow_mut();
-        world.document_url = self.url.clone();
+        world.set_url(self.url.clone());
         drop(world);
         // The realm is already new when this runs; this opens the parser and
         // the decoder for the response that will feed it.

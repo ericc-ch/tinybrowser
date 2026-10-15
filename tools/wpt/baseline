@@ -13,7 +13,7 @@
 #   tools/wpt/baseline d78b30e dom/nodes/Document-adoptNode.html
 #   tools/wpt/baseline d78b30e html/dom/ -- --processes 4
 #
-# Exit: 0 no new failures, 1 new failures, 2 usage or setup error.
+# Exit: 0 no new failures, 1 new failures, 2 usage, setup, or runner error.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -26,7 +26,7 @@ usage: tools/wpt/baseline REV PATH... [-- upstream wpt flags]
   tools/wpt/baseline d78b30e dom/nodes/Document-adoptNode.html
   tools/wpt/baseline d78b30e html/dom/ -- --processes 4
 
-Exit: 0 no new failures, 1 new failures, 2 usage or setup error.
+Exit: 0 no new failures, 1 new failures, 2 usage, setup, or runner error.
 EOF
 }
 
@@ -113,13 +113,20 @@ echo "baseline: rebuilding the working tree" >&2
 nix develop --command cargo build -q --profile wpt
 
 echo "baseline: running the slice at $rev" >&2
+base_status=0
 TINYBROWSER_BINARY="$baseline_bin" nix develop --command \
   tools/wpt/run --score "${paths[@]}" "${runner_args[@]}" \
-  > "$tmp/baseline.log" 2>&1 || true
+  > "$tmp/baseline.log" 2>&1 || base_status=$?
 echo "baseline: running the slice at the working tree" >&2
-nix develop --command tools/wpt/run --score "${paths[@]}" "${runner_args[@]}" \
-  > "$tmp/current.log" 2>&1 || true
+current_status=0
+env -u TINYBROWSER_BINARY nix develop --command \
+  tools/wpt/run --score "${paths[@]}" "${runner_args[@]}" \
+  > "$tmp/current.log" 2>&1 || current_status=$?
 keep_logs=1
+if (( base_status != 0 || current_status != 0 )); then
+  echo "baseline: runner failed (baseline $base_status, working tree $current_status); logs: $tmp" >&2
+  exit 2
+fi
 
 tools/wpt/failures "$tmp/baseline.log" > "$tmp/baseline.failures"
 tools/wpt/failures "$tmp/current.log" > "$tmp/current.failures"

@@ -72,7 +72,9 @@ A conformance change is a failure-list diff, not a pass count: run the same
 slice at the base revision and compare. `tools/wpt/failures` extracts the
 canonical list from a `--score` log (`STATUS PATH :: SUBTEST`, sorted and
 deduplicated; a top-level result prints as `STATUS PATH :: [top-level]`).
-`tools/wpt/baseline` runs both sides and prints the diff:
+`tools/wpt/baseline` runs both sides and prints the diff. Exit 2 covers usage
+and setup errors and a runner that died or wrote no results; `run --score`
+already passes `--no-fail-on-unexpected`, so failing tests are not that exit:
 
 ```sh
 # exits 1 when the working tree has failures the revision does not
