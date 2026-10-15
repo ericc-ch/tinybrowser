@@ -1,0 +1,448 @@
+//! Host calls that expose a document's parsed stylesheets as CSSOM rule lists.
+//!
+//! The style engine already keeps a `CSSRuleList` per `<style>` and
+//! `<link rel=stylesheet>` owner
+//! (<https://drafts.csswg.org/cssom/#concept-css-rule-list>). These functions
+//! are the only bridge: `cssom.js` builds the live list objects on top.
+//! Each call addresses a CSSOM sheet id, not the owner element, so a sheet
+//! that has been replaced or removed stays readable
+//! (<https://drafts.csswg.org/cssom/#remove-a-css-style-sheet>).
+
+use blitz_dom::{CssRuleInfo, CssomError};
+use rquickjs::{Array, Ctx, Exception, Object, Result, Value};
+
+use super::{host_node_id, throw_dom, world};
+
+pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
+    let bridge = crate::js::bridge::object(ctx)?;
+    bridge.set(
+        "__tb_node_sheet_id",
+        rquickjs::prelude::Func::from(node_sheet_id),
+    )?;
+    bridge.set(
+        "__tb_sheet_origin_state",
+        rquickjs::prelude::Func::from(sheet_origin_state),
+    )?;
+    bridge.set(
+        "__tb_sheet_rule_count",
+        rquickjs::prelude::Func::from(sheet_rule_count),
+    )?;
+    bridge.set(
+        "__tb_sheet_rule_info",
+        rquickjs::prelude::Func::from(sheet_rule_info),
+    )?;
+    bridge.set(
+        "__tb_sheet_style_css_text",
+        rquickjs::prelude::Func::from(sheet_style_css_text),
+    )?;
+    bridge.set(
+        "__tb_sheet_style_get_property",
+        rquickjs::prelude::Func::from(sheet_style_get_property),
+    )?;
+    bridge.set(
+        "__tb_sheet_style_names",
+        rquickjs::prelude::Func::from(sheet_style_names),
+    )?;
+    bridge.set(
+        "__tb_sheet_style_set_property",
+        rquickjs::prelude::Func::from(sheet_style_set_property),
+    )?;
+    bridge.set(
+        "__tb_sheet_insert_rule",
+        rquickjs::prelude::Func::from(sheet_insert_rule),
+    )?;
+    bridge.set(
+        "__tb_sheet_delete_rule",
+        rquickjs::prelude::Func::from(sheet_delete_rule),
+    )?;
+    Ok(())
+}
+
+/// `path` is a comma-separated list of rule-list indexes, empty for the
+/// stylesheet's own list. A segment that is not an index fails the whole path
+/// (<https://drafts.csswg.org/cssom/#concept-css-rule-list>).
+fn rule_path(path: &str) -> Option<Vec<usize>> {
+    if path.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut indexes = Vec::new();
+    for part in path.split(',') {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let index = part.parse::<u32>().ok()?;
+        indexes.push(usize::try_from(index).unwrap_or(usize::MAX));
+    }
+    Some(indexes)
+}
+
+fn sheet_id(id: f64) -> Option<u64> {
+    if !id.is_finite() || id < 1.0 || id.fract() != 0.0 || id > f64::from(u32::MAX) {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "id is a finite integer in 1..=u32::MAX"
+    )]
+    Some(id as u64)
+}
+
+/// Web IDL `unsigned long` already applied on the JS side (`index >>> 0`).
+/// A value that is not that integer is a caller bug, not index 0
+/// (<https://webidl.spec.whatwg.org/#idl-unsigned-long>).
+fn rule_index(ctx: &Ctx<'_>, index: f64) -> Result<usize> {
+    if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > f64::from(u32::MAX) {
+        return Err(Exception::throw_type(ctx, "invalid rule index"));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "index is a finite integer in 0..=u32::MAX"
+    )]
+    Ok(index as usize)
+}
+
+fn cssom_throw(ctx: &Ctx<'_>, err: CssomError) -> rquickjs::Error {
+    throw_dom(ctx, err.dom_exception_name(), "CSSOM operation failed")
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn node_sheet_id<'js>(ctx: Ctx<'js>, element: Value<'js>) -> f64 {
+    let Ok(world) = world(&ctx) else {
+        return -1.0;
+    };
+    let Some(id) = host_node_id(&ctx, &element) else {
+        return -1.0;
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(id) else {
+        return -1.0;
+    };
+    parsed
+        .document
+        .base
+        .node_cssom_sheet_id(id.node)
+        .map_or(-1.0, |sheet| {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "sheet ids stay inside the exact integer range of f64"
+            )]
+            {
+                sheet as f64
+            }
+        })
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_origin_state<'js>(ctx: Ctx<'js>, element: Value<'js>, id: f64) -> f64 {
+    let Ok(world) = world(&ctx) else {
+        return -1.0;
+    };
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return -1.0;
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return -1.0;
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return -1.0;
+    };
+    match parsed.document.base.cssom_sheet_origin_clean(sheet) {
+        Some(true) => 1.0,
+        Some(false) => 0.0,
+        None => -1.0,
+    }
+}
+
+fn with_path(path: &str) -> Option<Vec<usize>> {
+    rule_path(path)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_rule_count<'js>(ctx: Ctx<'js>, element: Value<'js>, id: f64, path: String) -> f64 {
+    let Ok(world) = world(&ctx) else {
+        return -1.0;
+    };
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return -1.0;
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return -1.0;
+    };
+    let Some(path) = with_path(&path) else {
+        return -1.0;
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return -1.0;
+    };
+    parsed
+        .document
+        .base
+        .cssom_rule_count(sheet, &path)
+        .map_or(-1.0, |count| {
+            f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+        })
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_rule_info<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    id: f64,
+    path: String,
+) -> Result<Value<'js>> {
+    let world = world(&ctx)?;
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let Some(path) = with_path(&path) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    let Some(info) = parsed.document.base.cssom_rule_info(sheet, &path) else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    rule_info_object(&ctx, info).map(Value::from)
+}
+
+fn rule_info_object<'js>(ctx: &Ctx<'js>, info: CssRuleInfo) -> Result<Object<'js>> {
+    let object = Object::new(ctx.clone())?;
+    object.set("interface", info.interface)?;
+    object.set("type", info.rule_type)?;
+    object.set("cssText", info.css_text)?;
+    object.set("hasChildRules", info.has_child_rules)?;
+    object.set("hasStyle", info.has_style)?;
+    for (name, value) in info.attributes {
+        object.set(name, value)?;
+    }
+    Ok(object)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_style_css_text<'js>(ctx: Ctx<'js>, element: Value<'js>, id: f64, path: String) -> String {
+    let Ok(world) = world(&ctx) else {
+        return String::new();
+    };
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return String::new();
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return String::new();
+    };
+    let Some(path) = with_path(&path) else {
+        return String::new();
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return String::new();
+    };
+    parsed
+        .document
+        .base
+        .cssom_rule_style_css_text(sheet, &path)
+        .unwrap_or_default()
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_style_get_property<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    id: f64,
+    path: String,
+    name: String,
+) -> Result<Value<'js>> {
+    let world = world(&ctx)?;
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let Some(path) = with_path(&path) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    let Some((value, important)) = parsed
+        .document
+        .base
+        .cssom_rule_style_get_property(sheet, &path, &name)
+    else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    let object = Object::new(ctx.clone())?;
+    object.set("value", value)?;
+    object.set("important", important)?;
+    Ok(Value::from(object))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_style_names<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    id: f64,
+    path: String,
+) -> Result<Value<'js>> {
+    let world = world(&ctx)?;
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let Some(path) = with_path(&path) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    let Some(names) = parsed
+        .document
+        .base
+        .cssom_rule_style_property_names(sheet, &path)
+    else {
+        return Ok(Value::new_null(ctx.clone()));
+    };
+    let array = Array::new(ctx.clone())?;
+    for (index, name) in names.iter().enumerate() {
+        array.set(index, name.as_str())?;
+    }
+    Ok(Value::from(array))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_style_set_property<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    id: f64,
+    path: String,
+    name: String,
+    value: String,
+    important: bool,
+) -> Result<()> {
+    let world = world(&ctx)?;
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Err(Exception::throw_type(&ctx, "not a stylesheet owner"));
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return Err(Exception::throw_type(&ctx, "not a stylesheet"));
+    };
+    let Some(path) = with_path(&path) else {
+        return Err(Exception::throw_type(&ctx, "bad rule path"));
+    };
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Err(Exception::throw_type(&ctx, "no document"));
+    };
+    parsed
+        .document
+        .base
+        .cssom_rule_style_set_property(sheet, &path, &name, &value, important)
+        .map_err(|err| cssom_throw(&ctx, err))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_insert_rule<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    id: f64,
+    path: String,
+    rule: String,
+    index: f64,
+) -> Result<f64> {
+    let world = world(&ctx)?;
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Err(Exception::throw_type(&ctx, "not a stylesheet owner"));
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return Err(Exception::throw_type(&ctx, "not a stylesheet"));
+    };
+    let Some(path) = with_path(&path) else {
+        return Err(Exception::throw_type(&ctx, "bad rule path"));
+    };
+    let index = rule_index(&ctx, index)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Err(Exception::throw_type(&ctx, "no document"));
+    };
+    match parsed
+        .document
+        .base
+        .cssom_insert_rule(sheet, &path, &rule, index)
+    {
+        Ok(inserted) => Ok(f64::from(u32::try_from(inserted).unwrap_or(u32::MAX))),
+        Err(err) => Err(cssom_throw(&ctx, err)),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn sheet_delete_rule<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    id: f64,
+    path: String,
+    index: f64,
+) -> Result<()> {
+    let world = world(&ctx)?;
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Err(Exception::throw_type(&ctx, "not a stylesheet owner"));
+    };
+    let Some(sheet) = sheet_id(id) else {
+        return Err(Exception::throw_type(&ctx, "not a stylesheet"));
+    };
+    let Some(path) = with_path(&path) else {
+        return Err(Exception::throw_type(&ctx, "bad rule path"));
+    };
+    let index = rule_index(&ctx, index)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Err(Exception::throw_type(&ctx, "no document"));
+    };
+    parsed
+        .document
+        .base
+        .cssom_delete_rule(sheet, &path, index)
+        .map_err(|err| cssom_throw(&ctx, err))
+}

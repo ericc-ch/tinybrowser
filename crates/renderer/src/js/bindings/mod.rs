@@ -9,6 +9,7 @@ use rquickjs::function::Constructor;
 mod attributes;
 mod clone;
 mod collections;
+mod cssom_host;
 mod document;
 mod exceptions;
 mod focus;
@@ -530,6 +531,7 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
         "__tb_resolved_style",
         rquickjs::prelude::Func::from(resolved_style),
     )?;
+    cssom_host::install(ctx)?;
     Ok(())
 }
 

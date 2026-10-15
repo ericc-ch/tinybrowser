@@ -25,7 +25,7 @@ const __tbPrivateArray = () => {
   return array;
 };
 const __tbArray = Object.create(null);
-for (const name of ['some', 'sort', 'join', 'indexOf']) {
+for (const name of ['some', 'sort', 'join', 'indexOf', 'concat']) {
   const method = Array.prototype[name];
   __tbArray[name] = (array, ...args) => __tbApply(method, array, args);
 }
