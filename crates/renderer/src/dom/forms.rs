@@ -154,12 +154,20 @@ pub(crate) fn pending_entry(
     is_submitter: bool,
 ) -> Vec<PendingEntry> {
     let id = NodeId { document, node };
-    // Blitz keeps no live control values, so the submission value is the
-    // `value` content attribute (the default value), or empty when absent.
+    // A dirty value wins. Otherwise the submission value is the `value`
+    // content attribute (the default value), or empty when absent.
     let value_attr = || attr(base, node, "value").unwrap_or_default().to_owned();
     match local {
         "textarea" => {
-            let mut value = normalize_newlines(&descendant_text(base, node).to_string_lossy());
+            let raw = base
+                .get_node(node)
+                .and_then(|target| target.data.downcast_element())
+                .filter(|element| element.form_state.dirty_value)
+                .map_or_else(
+                    || descendant_text(base, node).to_string_lossy().into_owned(),
+                    |element| element.form_state.value.clone(),
+                );
+            let mut value = normalize_newlines(&raw);
             if wrap_is_hard(attr(base, node, "wrap")) {
                 let cols = parse_positive(attr(base, node, "cols")).unwrap_or(20);
                 value = hard_wrap(&value, cols);
@@ -189,11 +197,14 @@ pub(crate) fn pending_entry(
                 return vec![PendingEntry::Text(control_name.to_owned(), value_attr())];
             }
             if typ == "checkbox" || typ == "radio" {
-                // A checkbox or radio contributes only when checked, and its
-                // value defaults to "on". Blitz keeps no dirty checkedness
-                // flag, so checkedness is the `checked` attribute's presence
+                // A checkbox or radio contributes only when checked. Its
+                // value defaults to "on"
                 // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
-                if attr(base, node, "checked").is_none() {
+                let checked = base
+                    .get_node(node)
+                    .and_then(|target| target.data.downcast_element())
+                    .is_some_and(blitz_dom::ElementData::checkedness);
+                if !checked {
                     return Vec::new();
                 }
                 let value = attr(base, node, "value").unwrap_or("on").to_owned();
@@ -201,7 +212,11 @@ pub(crate) fn pending_entry(
             } else if typ == "file" {
                 vec![PendingEntry::Files(control_name.to_owned(), id)]
             } else {
-                vec![PendingEntry::Text(control_name.to_owned(), value_attr())]
+                let value = base
+                    .get_node(node)
+                    .and_then(|target| target.data.downcast_element())
+                    .map_or_else(value_attr, |element| element.control_value().to_owned());
+                vec![PendingEntry::Text(control_name.to_owned(), value)]
             }
         }
         "select" => {
@@ -272,12 +287,12 @@ pub(crate) fn option_select_owner(base: &BaseDocument, node: BlitzId) -> Option<
     None
 }
 
-/// An `option`'s selectedness: whether its `selected` attribute is present.
-/// The dirty selectedness flag is a known gap; Blitz stores no per-option
-/// state
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
+/// An `option`'s selectedness
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
 pub(crate) fn option_selected(base: &BaseDocument, option: BlitzId) -> bool {
-    attr(base, option, "selected").is_some()
+    base.get_node(option)
+        .and_then(|node| node.data.downcast_element())
+        .is_some_and(blitz_dom::ElementData::selectedness)
 }
 
 /// An `option`'s value: its `value` attribute, else its text
@@ -494,6 +509,14 @@ pub(crate) fn control_value_len(base: &blitz_dom::BaseDocument, node: BlitzId) -
     else {
         return 0;
     };
+    if element.form_state.dirty_value {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "control values stay far below u32::MAX"
+        )]
+        let len = element.form_state.value.encode_utf16().count() as u32;
+        return len;
+    }
     if element.name.ns == html_namespace() && element.name.local.as_str() == "textarea" {
         #[expect(
             clippy::cast_possible_truncation,

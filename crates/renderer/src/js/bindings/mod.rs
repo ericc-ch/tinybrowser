@@ -1366,12 +1366,14 @@ fn replace_character_data_inner(
     let replacement = data.units().into_owned();
     let mut units = old_units;
     units.splice(offset..offset + count, replacement.iter().copied());
-    let utf8 = crate::dom_string::DomString::from_utf16(units)
-        .to_string_lossy()
-        .into_owned();
+    let exact = crate::dom_string::DomString::from_utf16(units);
+    let utf8 = exact.to_string_lossy().into_owned();
     if !write_character_data(&mut parsed.document.base, id, &utf8) {
         return Ok(());
     }
+    // The tree stores lossy UTF-8. DOM reads return the exact units
+    // (<https://infra.spec.whatwg.org/#javascript-string-convert>).
+    parsed.document.remember_character_data(id.node, &exact);
     crate::dom::range::adjust_for_replace_data(
         &mut parsed.document.ranges,
         id,

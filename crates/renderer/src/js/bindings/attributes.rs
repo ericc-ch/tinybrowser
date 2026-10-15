@@ -1816,6 +1816,11 @@ pub(crate) fn remove_attribute_sync(
                     .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
             });
         if let Some((name, value)) = removed.as_ref() {
+            parsed.document.remember_attribute(
+                element.node,
+                local,
+                crate::dom_string::DomString::default(),
+            );
             parsed
                 .document
                 .base
@@ -1953,6 +1958,13 @@ pub(crate) fn set_attribute_sync(
         .base
         .mutate()
         .set_attribute(element.node, name.clone(), value);
+    // A plain write has no unpaired surrogate. A caller that still holds the
+    // original units remembers them after this returns.
+    parsed.document.remember_attribute(
+        element.node,
+        local,
+        crate::dom_string::DomString::from(value),
+    );
     parsed.document.record(JournalEntry::Attributes {
         target: element,
         // attributeName is the attribute's local name.

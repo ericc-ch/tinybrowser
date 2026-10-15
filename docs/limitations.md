@@ -25,15 +25,16 @@ tools/intl/generate-data); every other locale silently falls back.
 
 ## Strings
 
-Lone surrogates survive in JS but read back as U+FFFD from the DOM
-(blitz stores UTF-8; see docs/upstream.md).
+Lone surrogates round-trip through character data, titles, and
+attributes. The layout tree still stores UTF-8 (docs/upstream.md).
 
 ## Missing surfaces
 
-No workers or service-workers, no canvas or WebGL, sync XHR is
-rejected, customized built-in elements are rejected. Shadow-scoped
-styles, composed-event retargeting, and form-control state are upstream
-gaps (docs/upstream.md).
+No workers or service-workers. Canvas `getContext` returns a same-object
+2d or bitmaprenderer object limited to `fillRect` and `getImageData`;
+WebGL returns null. Sync XHR is rejected, customized built-in elements
+are rejected. Shadow-scoped styles and composed-event retargeting are
+upstream gaps (docs/upstream.md).
 
 `Request` exposes `blob()` only of the body-consumption methods; `text`,
 `json`, `arrayBuffer`, and `bytes` are missing. A `text/plain` document
