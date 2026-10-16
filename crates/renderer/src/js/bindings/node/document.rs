@@ -99,6 +99,16 @@ impl<'js> document_generated::Document<'js> for JsNode {
         self.url(ctx)
     }
 
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-referrer
+    // No navigation passes a referrer into the document yet, so this is
+    // always the empty string. Tracking the navigation referrer per
+    // document would make this (and the violation event's `referrer`)
+    // report the real value.
+    fn get_referrer(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
+        let _ = ctx;
+        Ok(crate::dom_string::DomString::default())
+    }
+
     // https://dom.spec.whatwg.org/#dom-document-compatmode
     fn get_compat_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let mode = self.compat_mode(ctx)?;

@@ -813,15 +813,13 @@ pub(crate) fn fire_security_policy_violation(
     {
         set_exposed_event_prototype(ctx, &event, "SecurityPolicyViolationEvent")?;
     }
-    let document_url = bindings::world(ctx)?
-        .borrow()
-        .document_url
-        .as_str()
-        .to_owned();
     // Own data properties, because the shim's prototype accessors are
     // readonly and an assigning set would throw
     // (<https://webidl.spec.whatwg.org/#idl-read-only-attributes>).
-    event.prop("documentURI", document_url)?;
+    // `documentURI` is the stripped document URL from the violation, not
+    // the live document URL: fragment and credentials never report
+    // (<https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>).
+    event.prop("documentURI", violation.document_uri.clone())?;
     event.prop("referrer", String::new())?;
     event.prop("blockedURI", violation.blocked_uri.clone())?;
     event.prop("violatedDirective", violation.effective_directive.clone())?;
