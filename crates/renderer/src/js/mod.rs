@@ -219,6 +219,27 @@ impl SharedJsRuntime {
                     bindings::note_rejection(&ctx, promise, reason, handled);
                 },
             )));
+            // String compilation from JS is a CSP surface the engine must own.
+            // A JS wrapper over `eval` or `Function` is observable and turns
+            // every direct eval into an indirect one
+            // (<https://tc39.es/ecma262/#sec-evaluatecall>), so the gate sits
+            // below the JS surface, where the intrinsics keep their identity
+            // (<https://w3c.github.io/webappsec-csp/#can-compile-strings>).
+            runtime.set_can_compile_strings(Some(Box::new(|ctx, source| {
+                let Some(world) = bindings::try_world(&ctx) else {
+                    // No realm behind this context: no policy to enforce.
+                    return true;
+                };
+                match csp_eval_violations(&ctx, &world, source) {
+                    Ok(violations) if !crate::csp::blocks(&violations) => true,
+                    Ok(violations) => {
+                        throw_eval_error(&ctx, &eval_denied_message(&violations));
+                        false
+                    }
+                    // Reporting raised; that exception is already pending.
+                    Err(_) => false,
+                }
+            })));
             Ok(runtime)
         });
         slot.as_ref()
@@ -966,7 +987,8 @@ impl JsRealm {
     }
 
     /// The CSP checks the shim calls where the Rust choke points cannot run:
-    /// evaluation, and a synchronous XHR that cannot reach the dial queue.
+    /// string resources for timers, and a synchronous XHR that cannot reach
+    /// the dial queue.
     fn install_csp_host_functions(
         ctx: &Ctx<'_>,
         world: &Rc<RefCell<World>>,
@@ -975,44 +997,12 @@ impl JsRealm {
         let csp_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbCspAllowsEval",
-            Func::from(move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
-                // The violation's source is the calling script: capture its
-                // top frame now, while the `eval()` call is on the stack
-                // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-                let caller = error_stack_top(&ctx);
-                let mut violations = {
-                    let world = eval_world.borrow();
-                    world.csp.check_inline(
-                        &world.document_url,
-                        &crate::csp::InlineScript {
-                            source: &source,
-                            nonce: "",
-                            nonceable: false,
-                            parser_inserted: false,
-                            kind: crate::csp::InlineKind::Evaluation,
-                        },
-                    )
-                };
-                if let Some((url, line, column)) = caller {
-                    for violation in &mut violations {
-                        violation.source_file = Some(url.clone());
-                        violation.line_number = line;
-                        violation.column_number = column;
-                    }
-                }
-                if !violations.is_empty() {
-                    let target = eval_world.borrow().with_main_document(|parsed| {
-                        crate::dom::tree::NodeId {
-                            document: parsed.id,
-                            node: parsed.document.base.root_node().id,
-                        }
-                    });
-                    if let Some(target) = target {
-                        bindings::fire_csp_violations(&ctx, target, &violations)?;
-                    }
-                }
-                Ok(!crate::csp::blocks(&violations))
-            }),
+            Func::from(
+                move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
+                    let violations = csp_eval_violations(&ctx, &eval_world, &source)?;
+                    Ok(!crate::csp::blocks(&violations))
+                },
+            ),
         )?;
         // A synchronous XHR cannot reach the dial queue's connect check, so
         // the shim asks this hook instead and the drain dispatches the
@@ -1611,6 +1601,82 @@ fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
     referrer_for_policy(&world.referrer_policy, &world.document_url, request_url)
 }
 
+/// The violations compiling `source` produces against the document's policies,
+/// with the calling script's location captured while the compile call is on
+/// the stack and the `securitypolicyviolation` events fired
+/// (<https://w3c.github.io/webappsec-csp/#can-compile-strings>,
+/// <https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+///
+/// Shared by the engine's string-compilation hook and the `setTimeout(string)`
+/// host surface.
+fn csp_eval_violations(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+    source: &str,
+) -> rquickjs::Result<Vec<crate::csp::Violation>> {
+    let caller = error_stack_top(ctx);
+    let mut violations = {
+        let world = world.borrow();
+        world.csp.check_inline(
+            &world.document_url,
+            &crate::csp::InlineScript {
+                source,
+                nonce: "",
+                nonceable: false,
+                parser_inserted: false,
+                kind: crate::csp::InlineKind::Evaluation,
+            },
+        )
+    };
+    if let Some((url, line, column)) = caller {
+        for violation in &mut violations {
+            violation.source_file = Some(url.clone());
+            violation.line_number = line;
+            violation.column_number = column;
+        }
+    }
+    if !violations.is_empty() {
+        let target = world
+            .borrow()
+            .with_main_document(|parsed| crate::dom::tree::NodeId {
+                document: parsed.id,
+                node: parsed.document.base.root_node().id,
+            });
+        if let Some(target) = target {
+            bindings::fire_csp_violations(ctx, target, &violations)?;
+        }
+    }
+    Ok(violations)
+}
+
+/// The message the engine ends a refused string compilation with, naming the
+/// directive that blocked it rather than a fixed policy.
+fn eval_denied_message(violations: &[crate::csp::Violation]) -> String {
+    let directive = violations
+        .iter()
+        .find(|violation| violation.blocks())
+        .map_or("script-src", |violation| {
+            violation.effective_directive.as_str()
+        });
+    format!(
+        "Refused to evaluate a string as JavaScript because 'unsafe-eval' is not an allowed \
+         source of script in the following Content Security Policy directive: \"{directive}\""
+    )
+}
+
+/// Raises the `EvalError` the engine propagates instead of compiling a refused
+/// string (<https://tc39.es/ecma262/#sec-eval-x>).
+fn throw_eval_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
+    match ctx
+        .globals()
+        .get::<_, Function>("EvalError")
+        .and_then(|constructor| constructor.call::<_, Object>((message,)))
+    {
+        Ok(error) => ctx.throw(error.into_value()),
+        Err(error) => error,
+    }
+}
+
 /// The executing script's URL, line, and column: the top frame of a freshly
 /// constructed `Error`'s stack trace. Subresource triggers (an element
 /// insertion, a `src` set) capture this so a later CSP violation for the load
@@ -1938,7 +2004,7 @@ mod tests {
         assert_eq!(paren_url.column, 17);
         // Page script evaluated without a URL is still page code.
         let eval_code = CreatorInfo::user_frame(
-            "    at <eval> (eval_script:1:5)\n    at cspEval (tinybrowser-shim:7471:46)\n    at <eval> (<input>:2:8)",
+            "    at <eval> (eval_script:1:5)\n    at run (tinybrowser-shim:7471:46)\n    at <eval> (<input>:2:8)",
         )
         .expect("eval frame");
         assert_eq!(eval_code.url, "<input>");

@@ -35,6 +35,7 @@ Exotic hooks for WebIDL legacy platform objects (dcd8edd, 9bcc543, 42688aa, 31e1
 - d73fbda safe realm-aware native callbacks with copyable dispatch state. Callbacks keep argument counts, receive new.target, and run in their creation realm; Copy/Send/Sync-only state fits GC (no Rust destructors mid-collection).
 - 8842327 UTF-16 string conversion preserving lone surrogates. WebIDL DOMString conversion keeps every code unit; pairs with the blitz UTF-8 open issue below (JS side preserves, DOM side does not).
 - 103de1e survive caught panics and regenerated binding types. A panic caught across FFI poisoned the mutex and broke every later call; plus an MSVC atom-type build fix and per-target test gating.
+- ad2fb33 expose the string compilation host hook. `Runtime::set_can_compile_strings` binds `JS_SetCanCompileStringsHandler` with the callback's `Ctx` and source, mirroring the interrupt and rejection handlers; bundle the new symbol for every target.
 - Tracking (11c770e, 7ca6024, 38c4d87, a86ed40, 3587d7e, 50b403e, c161d25): pull quickjs engine fixes and regenerate bindings; wasm OOM/atom-table/inline mirrors.
 
 ### quickjs (third_party/rquickjs/sys/quickjs, fork branch)
@@ -43,6 +44,7 @@ Exotic fallthrough machinery the stock engine lacks (2afa33b, 88a9be3, 2339e92, 
 
 - 712757e native closures retain and enter their home realm. C closures lacked the context ownership and GC edge C functions had; also adds length-zero stack checks and fallible init before opaque adoption.
 - ac85002 keep the callback's exotic key order. The engine re-sorted host keys; now it copies the host order and appends only unreported ordinary keys.
+- 12c216c consult the host before compiling strings from JS. `JS_SetCanCompileStringsHandler` runs at `JS_EvalObject`, the one choke point under `eval` (direct and indirect) and the `Function` constructor; host evaluation (`JS_Eval`) is untouched. An `eval`/`Function` JS wrapper cannot substitute: it is observable and makes every direct eval indirect.
 
 ### Vendored crates (no commits, recorded deltas)
 
