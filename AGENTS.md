@@ -16,6 +16,6 @@ Maximize web spec conformance per byte.
 - **Web API bindings & IDL**: Read `docs/bindings.md` for JS/Rust ownership, WebIDL contracts, and platform objects.
 - **Engine behavior**: Read `docs/engines.md` to search and fetch Chromium/Firefox sources without cloning.
 - **Engine forks & submodules**: Read `third_party/README.md` for submodule maintenance, fork branches, and update workflows.
-- **WPT & conformance harness**: Read `tools/wpt/README.md` for test runners, scoring, and failure diffing.
+- **WPT & conformance harness**: Read `tools/wpt/README.md` for test runners, scoring, and failure diffing. Check `.github/workflows/wpt.yml` runs (`gh run list --workflow=wpt.yml`) against `docs/progress.md` for regressions.
 - **Upstream gaps, priorities, snapshot**: See `docs/upstream.md`, `docs/priorities.md`, `docs/progress.md`.
 - **Project notes**: `~/Documents/obsidian/everything/projects/tinybrowser/`
