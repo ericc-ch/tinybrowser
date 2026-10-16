@@ -5,6 +5,7 @@
 //! for `ws`/`wss`.
 
 mod client;
+pub mod cors;
 mod error;
 mod protocol;
 mod resolve;

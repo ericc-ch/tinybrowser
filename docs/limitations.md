@@ -41,6 +41,20 @@ upstream gaps (docs/upstream.md).
 is still parsed as HTML, so markup served as plain text renders instead
 of showing as text (WPT `mimesniff/sniffing/`).
 
+Cross-origin `fetch`/XHR run the CORS protocol in the browser process
+(`crates/net/src/cors.rs`): the CORS check, preflight, credentials mode,
+response-header filtering, opaque `no-cors`, redirect-tainted origins,
+and redirect mode. Still open: the CORS-preflight cache (every non-simple
+request preflights again), `requestInit.referrerPolicy`/`referrer` on a
+request, `keepalive`, request origins for sandboxed and `data:` frames
+(sent as the URL origin, not `null`), and cookies on a credentialed
+cross-origin redirect. `fetch` also ignores request `integrity` metadata
+(SRI is enforced for scripts only, `crates/renderer/src/csp.rs`); the old
+cross-origin block hid both that and the sandbox-origin gap, so
+`fetch/api/basic/integrity.sub.any.html` and
+`xhr/access-control-sandboxed-iframe-*.htm` now fail honestly. WPT
+`fetch/api/cors/` covers the surface.
+
 CSP `eval`/`Function` gating shadows the globals in JS because the
 engine has no compilation hook; direct `eval` therefore evaluates
 indirectly (global scope) even when allowed. Blocking and report

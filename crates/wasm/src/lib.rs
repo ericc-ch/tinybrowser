@@ -402,13 +402,7 @@ fn next_hop(chain: &Chain, response: &FetchResponse) -> Result<Option<Url>, Dial
 /// A redirect the policy refused. Status 0 is not a response the page can
 /// use; `final_url` is the blocked hop so the renderer can report it.
 fn csp_blocked(url: &Url) -> DialOutcome {
-    DialOutcome {
-        status: 0,
-        final_url: url.to_string(),
-        content_type: None,
-        headers: Vec::new(),
-        body: Vec::new(),
-    }
+    DialOutcome::basic(0, url.to_string(), None, Vec::new(), Vec::new())
 }
 
 fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOutcome, DialFailure> {
@@ -421,13 +415,13 @@ fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOut
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https"))
         .unwrap_or_else(|| hop_url.clone());
-    Ok(DialOutcome {
-        status: response.status,
-        final_url: final_url.into(),
-        content_type: response.content_type,
-        headers: Vec::new(),
-        body: response.body,
-    })
+    Ok(DialOutcome::basic(
+        response.status,
+        final_url.into(),
+        response.content_type,
+        Vec::new(),
+        response.body,
+    ))
 }
 
 fn decode_fetch_error(error: FetchError) -> DialFailure {
@@ -470,13 +464,13 @@ impl NetworkHost for WasmServices {
         // dropped here instead of sent as a bogus GET. The native carrier
         // sends the real POST; the renderer already fired the event.
         if request.kind == DialKind::CspReport {
-            completion(Ok(DialOutcome {
-                status: 204,
-                final_url: request.url,
-                content_type: None,
-                headers: Vec::new(),
-                body: Vec::new(),
-            }));
+            completion(Ok(DialOutcome::basic(
+                204,
+                request.url,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )));
             return Box::new(|| {});
         }
         let shaped = Url::parse(&request.url)

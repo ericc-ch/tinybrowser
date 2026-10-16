@@ -326,7 +326,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       __tbXhrFinish(this, data, generation, result[0], result[1], result[2], result[3], true);
       return;
     }
-    data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, (status, bytes, url, _type, fields) => {
+    data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, {
+      mode: 'cors',
+      credentials: data.withCredentials ? 'include' : 'same-origin',
+      redirect: 'follow',
+    }, (status, bytes, url, _type, fields) => {
       __tbXhrFinish(this, data, generation, status, bytes, url, fields, false);
     });
     __tbXhrTimeout(this, data);

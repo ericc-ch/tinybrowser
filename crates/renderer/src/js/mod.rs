@@ -168,6 +168,7 @@ pub(crate) struct PendingJsFetch {
     pub content_type: Option<String>,
     pub headers: Vec<(String, String)>,
     pub referrer: Option<String>,
+    pub cors: Option<crate::protocol::CorsRequest>,
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -436,7 +437,7 @@ impl JsRealm {
                 // document parser, it never adds a field to a `fetch`
                 // Response, and `blob().type` reads the header list
                 // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-                let (status, body, url, content_type, headers) = match outcome {
+                let (status, body, url, content_type, headers, response_type) = match outcome {
                     Some(outcome) => (
                         i32::from(outcome.status),
                         outcome.body,
@@ -447,11 +448,23 @@ impl JsRealm {
                             .into_iter()
                             .map(|(name, value)| vec![name, value])
                             .collect::<Vec<_>>(),
+                        outcome.response_type.as_str().to_owned(),
                     ),
-                    None => (0, Vec::new(), String::new(), String::new(), Vec::new()),
+                    // A failed dial is a network error: the renderer rejects
+                    // and `Response.type` never becomes observable
+                    // (<https://fetch.spec.whatwg.org/#concept-network-error>).
+                    None => (
+                        0,
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        Vec::new(),
+                        "error".to_owned(),
+                    ),
                 };
                 let bytes = TypedArray::new(ctx.clone(), body)?;
-                if let Err(error) = func.call::<_, ()>((status, bytes, url, content_type, headers))
+                if let Err(error) =
+                    func.call::<_, ()>((status, bytes, url, content_type, headers, response_type))
                 {
                     bindings::host::report_callback_error(&ctx, &error);
                 }
@@ -947,8 +960,33 @@ impl JsRealm {
                       body: Vec<u8>,
                       content_type: Option<String>,
                       headers: Vec<Vec<String>>,
-                      referrer: Option<String>| {
+                      options: Vec<String>| {
                     let headers = header_pairs(headers)?;
+                    // `options` is [referrer, mode, credentials, redirect];
+                    // an empty referrer means "omit the header", and a missing
+                    // mode means the caller is not a CORS-enabled `fetch`.
+                    let mut parts = options.into_iter();
+                    let referrer = parts.next().filter(|value| !value.is_empty());
+                    let mode = parts.next().map(|mode| match mode.as_str() {
+                        "same-origin" => net::cors::RequestMode::SameOrigin,
+                        "no-cors" => net::cors::RequestMode::NoCors,
+                        _ => net::cors::RequestMode::Cors,
+                    });
+                    let credentials = match parts.next().as_deref() {
+                        Some("omit") => net::cors::CredentialsMode::Omit,
+                        Some("include") => net::cors::CredentialsMode::Include,
+                        _ => net::cors::CredentialsMode::SameOrigin,
+                    };
+                    let redirect = match parts.next().as_deref() {
+                        Some("error") => net::cors::RedirectMode::Error,
+                        Some("manual") => net::cors::RedirectMode::Manual,
+                        _ => net::cors::RedirectMode::Follow,
+                    };
+                    let cors = mode.map(|mode| crate::protocol::CorsRequest {
+                        mode,
+                        credentials,
+                        redirect,
+                    });
                     fetches.borrow_mut().push(PendingJsFetch {
                         url,
                         js_id,
@@ -957,6 +995,7 @@ impl JsRealm {
                         content_type,
                         headers,
                         referrer,
+                        cors,
                     });
                     Ok::<(), rquickjs::Error>(())
                 },
@@ -1573,6 +1612,11 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         referrer: request.referrer,
         timeout_ms: u64::from(millis(request.timeout)),
         csp: None,
+        cors: Some(crate::protocol::CorsRequest {
+            mode: net::cors::RequestMode::Cors,
+            credentials: net::cors::CredentialsMode::SameOrigin,
+            redirect: net::cors::RedirectMode::Follow,
+        }),
     });
     match outcome {
         // The header list stays as served; nothing is sniffed into it

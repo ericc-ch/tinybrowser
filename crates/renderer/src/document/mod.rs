@@ -133,6 +133,9 @@ pub(crate) struct QueuedDial {
     /// Policy the network re-checks on every redirect. `None` for a top-level
     /// document navigation. A nested frame navigation carries `frame-src`.
     pub(crate) csp: Option<crate::RedirectGate>,
+    /// CORS protocol parameters for a page `fetch`/XHR. `None` for
+    /// navigation and subresource dials, which are not CORS-enabled.
+    pub(crate) cors: Option<crate::protocol::CorsRequest>,
     /// Ancestor document URLs nearest-first, snapshotted when a nested frame
     /// navigation starts. The child's `frame-ancestors` policy is checked
     /// against these at commit
@@ -155,6 +158,7 @@ impl QueuedDial {
             content_type: None,
             headers: Vec::new(),
             referrer: None,
+            cors: None,
             csp: None,
             ancestors: Vec::new(),
             integrity: None,
@@ -781,6 +785,7 @@ impl Document {
             content_type,
             headers: Vec::new(),
             referrer,
+            cors: None,
             csp: None,
             ancestors: Vec::new(),
             integrity: None,
@@ -2129,6 +2134,7 @@ impl Document {
             content_type: Some(content_type.to_owned()),
             headers: Vec::new(),
             referrer: None,
+            cors: None,
             csp: None,
             ancestors: Vec::new(),
             integrity: None,
