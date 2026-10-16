@@ -327,11 +327,26 @@ impl<'js> element_generated::Element<'js> for JsNode {
         arg_0: rquickjs::String<'js>,
         arg_1: rquickjs::String<'js>,
     ) -> Result<()> {
+        let units = crate::dom_string::DomString::from_utf16(arg_1.to_utf16()?);
+        let name = arg_0.to_string()?;
         self.set_attribute(
-            ctx,
-            WebIdlString(arg_0.to_string()?),
+            ctx.clone(),
+            WebIdlString(name.clone()),
             WebIdlString(js_string_to_utf8(&arg_1)?),
-        )
+        )?;
+        // The tree attribute drops unpaired surrogates so CSS `id` matching
+        // stays distinct from U+FFFD. The getter returns the original units
+        // (<https://infra.spec.whatwg.org/#javascript-string-convert>).
+        if units.has_unpaired_surrogate() {
+            let local = attribute_local_name(&ctx, self.handle.0, &name);
+            let world = world(&ctx)?;
+            if let Some(mut parsed) = world.borrow().document_mut(self.handle.0) {
+                parsed
+                    .document
+                    .remember_attribute(self.handle.0.node, &local, units);
+            }
+        }
+        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-element-hasattribute
@@ -1535,16 +1550,24 @@ impl JsNode {
         // (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
         let local = attribute_local_name(&ctx, self.handle.0, &name.0);
         let world = world(&ctx)?;
-        let found = world.borrow().document(self.handle.0).and_then(|parsed| {
-            crate::dom::tree::attr_by_qualified_name(
-                &parsed.document.base,
-                self.handle.0.node,
-                &local,
-            )
-            .map(ToOwned::to_owned)
-        });
+        let found = {
+            let borrowed = world.borrow();
+            let Some(parsed) = borrowed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx));
+            };
+            if let Some(exact) = parsed.document.attribute_units(self.handle.0.node, &local) {
+                Some(exact.units().into_owned())
+            } else {
+                crate::dom::tree::attr_by_qualified_name(
+                    &parsed.document.base,
+                    self.handle.0.node,
+                    &local,
+                )
+                .map(|value| value.encode_utf16().collect::<Vec<_>>())
+            }
+        };
         match found {
-            Some(value) => string_value(&ctx, &value),
+            Some(units) => Ok(rquickjs::String::from_utf16(ctx, &units)?.into_value()),
             None => Ok(Value::new_null(ctx)),
         }
     }
@@ -2040,70 +2063,101 @@ impl JsNode {
     pub(super) fn inner_html<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let container = self.handle.0;
         let owner = world_for_node(ctx, container)?;
-        let parsed = owner.borrow();
-        let Some(parsed) = parsed.document(container) else {
-            return Err(Exception::throw_type(ctx, "no document"));
+        let (container, html) = {
+            let world = owner.borrow();
+            let Some(parsed) = world.document(container) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            let base = &parsed.document.base;
+            let Some(node) = base.get_node(container.node) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            if !parsed.document.is_fragment(container.node)
+                && node.data.downcast_element().is_none()
+            {
+                return Err(Exception::throw_type(ctx, "innerHTML requires an element"));
+            }
+            // innerHTML on a template reads its template contents, not its
+            // (empty) children. After `content` is read, those nodes live in
+            // the inert template-contents document
+            // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>,
+            // <https://html.spec.whatwg.org/multipage/scripting.html#template-contents>).
+            (
+                template_contents_target(&parsed.document, container),
+                parsed.content_type == "text/html",
+            )
         };
-        let base = &parsed.document.base;
-        let Some(node) = base.get_node(container.node) else {
-            return Err(Exception::throw_type(ctx, "stale node"));
-        };
-        if !parsed.document.is_fragment(container.node) && node.data.downcast_element().is_none() {
-            return Err(Exception::throw_type(ctx, "innerHTML requires an element"));
-        }
-        // innerHTML on a template reads its template contents, not its
-        // (empty) children
-        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
-        let container = crate::dom::tree::template_contents(&parsed.document.base, container.node)
-            .map_or(container, |fragment| NodeId {
-                document: container.document,
-                node: fragment,
-            });
-        let html = world(ctx)?
+        drop(owner);
+        let markup = world(ctx)?
             .borrow()
-            .document(self.handle.0)
-            .is_some_and(|source| source.content_type == "text/html");
-        let markup = if html {
-            serialization::serialize_html_children(&parsed.document, container.node)
-        } else {
-            serialization::serialize_xml_children(&parsed.document, container.node)
-        };
+            .with_document(container, |parsed| {
+                if html {
+                    serialization::serialize_html_children(&parsed.document, container.node)
+                } else {
+                    serialization::serialize_xml_children(&parsed.document, container.node)
+                }
+            })
+            .unwrap_or_default();
         dom_string(ctx, &markup)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
     pub(super) fn outer_html<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let world = world(ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
-            return Err(Exception::throw_type(ctx, "no document"));
+        let (contents, html, markup) = {
+            let borrowed = world.borrow();
+            let Some(parsed) = borrowed.document(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            let base = &parsed.document.base;
+            let Some(element) = base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.data.downcast_element())
+            else {
+                return Err(Exception::throw_type(ctx, "outerHTML requires an element"));
+            };
+            let name = element.name.clone();
+            let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
+            let contents = parsed.document.template_owner(self.handle.0.node);
+            let html = parsed.content_type == "text/html";
+            let markup = if html {
+                serialization::serialize_html_outer(
+                    &parsed.document,
+                    self.handle.0.node,
+                    &name,
+                    &attributes,
+                )
+            } else {
+                let mut output = serialization::HtmlOutput::default();
+                serialization::serialize_xml_element(
+                    &parsed.document,
+                    self.handle.0.node,
+                    &name,
+                    &attributes,
+                    &mut output,
+                );
+                output.finish()
+            };
+            (contents, html, markup)
         };
-        let base = &parsed.document.base;
-        let Some(element) = base
-            .get_node(self.handle.0.node)
-            .and_then(|node| node.data.downcast_element())
-        else {
-            return Err(Exception::throw_type(ctx, "outerHTML requires an element"));
-        };
-        let name = element.name.clone();
-        let attributes = element.attrs.iter().cloned().collect::<Vec<_>>();
-        let markup = if parsed.content_type == "text/html" {
-            serialization::serialize_html_outer(
-                &parsed.document,
-                self.handle.0.node,
-                &name,
-                &attributes,
-            )
+        let markup = if let Some((document, fragment)) = contents {
+            let contents_id = NodeId {
+                document,
+                node: fragment,
+            };
+            let children = world
+                .borrow()
+                .with_document(contents_id, |parsed| {
+                    if html {
+                        serialization::serialize_html_children(&parsed.document, fragment)
+                    } else {
+                        serialization::serialize_xml_children(&parsed.document, fragment)
+                    }
+                })
+                .unwrap_or_default();
+            splice_before_close_tag(markup, &children)
         } else {
-            let mut output = serialization::HtmlOutput::default();
-            serialization::serialize_xml_element(
-                &parsed.document,
-                self.handle.0.node,
-                &name,
-                &attributes,
-                &mut output,
-            );
-            output.finish()
+            markup
         };
         dom_string(ctx, &markup)
     }
@@ -2131,12 +2185,8 @@ impl JsNode {
         let container = world_for_node(ctx, container)?
             .borrow()
             .document(container)
-            .and_then(|parsed| {
-                crate::dom::tree::template_contents(&parsed.document.base, container.node)
-            })
-            .map_or(container, |fragment| NodeId {
-                document: container.document,
-                node: fragment,
+            .map_or(container, |parsed| {
+                template_contents_target(&parsed.document, container)
             });
         let owner = world_for_node(ctx, container)?;
         let world = owner.borrow();
@@ -2887,6 +2937,37 @@ pub(super) fn viewport_offset(ctx: &Ctx<'_>, id: NodeId) -> Result<(f64, f64)> {
     };
     let scroll = parsed.document.base.viewport_scroll();
     Ok((scroll.x, scroll.y))
+}
+
+/// Inserts `children` before the final start of a closing tag. A migrated
+/// template's outer markup is the host element's tags plus the inert
+/// contents
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
+fn splice_before_close_tag(
+    shell: crate::dom_string::DomString,
+    children: &crate::dom_string::DomString,
+) -> crate::dom_string::DomString {
+    let units = shell.units();
+    let Some(end) = units.iter().rposition(|unit| *unit == u16::from(b'<')) else {
+        return shell;
+    };
+    let mut merged = units[..end].to_vec();
+    merged.extend(children.units().iter().copied());
+    merged.extend_from_slice(&units[end..]);
+    crate::dom_string::DomString::from_utf16(merged)
+}
+
+/// The node whose children are a template's contents: the inert fragment
+/// after `content` is first read, otherwise the same-document fragment
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#template-contents>).
+fn template_contents_target(doc: &crate::documents::BlitzDocument, id: NodeId) -> NodeId {
+    if let Some((document, node)) = doc.template_owner(id.node) {
+        return NodeId { document, node };
+    }
+    crate::dom::tree::template_contents(&doc.base, id.node).map_or(id, |node| NodeId {
+        document: id.document,
+        node,
+    })
 }
 
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {

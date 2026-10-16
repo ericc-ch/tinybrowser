@@ -118,11 +118,15 @@ impl Parsed {
 ///
 /// Broken markup recovery is html5ever's job (through `blitz-html`).
 /// Script interleaving runs in tree order in `document`.
-/// Blitz parses with scripting disabled, so `noscript` parses as markup;
-/// `document.write` paths handle scripting-enabled insertion separately.
+/// Scripting is enabled, so `noscript` parses as text. The sniffed quirks
+/// mode is locked into the style engine before parsing, because html5ever
+/// treats an empty system identifier differently from
+/// [`sniff_quirks_mode`], and `document.compatMode` follows the sniff
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode>).
 #[must_use]
-pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Parsed {
+pub(crate) fn parse_html(input: &str, mut config: blitz_dom::DocumentConfig) -> Parsed {
     let quirks_mode = sniff_quirks_mode(input);
+    config.quirks_mode = Some(style_quirks(quirks_mode));
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_html(input, config).into();
     let document = BlitzDocument::from_base(base);
     // The sink appends the doctype as a real document child now. HTML never
@@ -137,6 +141,14 @@ pub(crate) fn parse_html(input: &str, config: blitz_dom::DocumentConfig) -> Pars
         ready_state: ReadyState::Loading,
         url: None,
         character_set: "UTF-8",
+    }
+}
+
+fn style_quirks(mode: QuirksMode) -> blitz_dom::StyleQuirksMode {
+    match mode {
+        QuirksMode::Quirks => blitz_dom::StyleQuirksMode::Quirks,
+        QuirksMode::LimitedQuirks => blitz_dom::StyleQuirksMode::LimitedQuirks,
+        QuirksMode::NoQuirks => blitz_dom::StyleQuirksMode::NoQuirks,
     }
 }
 

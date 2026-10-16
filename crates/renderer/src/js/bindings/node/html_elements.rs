@@ -530,16 +530,14 @@ impl JsNode {
         };
         let title = document_first(&parsed, "title");
         match title {
-            Some(title) => dom_string(
-                ctx,
-                &crate::dom::text::descendant_text(&parsed.document.base, title.node),
-            ),
+            Some(title) => dom_string(ctx, &parsed.document.descendant_dom_text(title.node)),
             None => rquickjs::String::from_str(ctx.clone(), ""),
         }
     }
 
     pub(super) fn set_title(&self, ctx: &Ctx<'_>, value: WebIdlCodeUnits) -> Result<()> {
-        let text = value.0.to_string_lossy().into_owned();
+        let exact = value.0;
+        let text = exact.to_string_lossy().into_owned();
         let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -590,7 +588,7 @@ impl JsNode {
         let added = if text.is_empty() {
             Vec::new()
         } else {
-            let text = parsed.document.base.mutate().create_text_node(&text);
+            let text = parsed.document.create_text(&exact);
             vec![NodeId {
                 document: parsed.id,
                 node: text,

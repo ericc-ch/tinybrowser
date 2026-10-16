@@ -528,29 +528,78 @@ impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/scripting.html#dom-template-contents
     fn get_content(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let owner = world_for_node(ctx, self.handle.0)?;
-        let fragment = {
-            let owner = owner.borrow();
-            let Some(mut parsed) = owner.document_mut(self.handle.0) else {
+        if let Some((document, fragment)) = owner
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.document.template_owner(self.handle.0.node))
+        {
+            let fragment = NodeId {
+                document,
+                node: fragment,
+            };
+            let fragment = owner
+                .borrow()
+                .registry()
+                .borrow_mut()
+                .live_node_id(fragment);
+            return wrap_node(ctx, fragment);
+        }
+        let (snapshots, host_children) = {
+            let borrowed = owner.borrow();
+            let Some(mut parsed) = borrowed.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
-            parsed
+            let fragment = parsed
                 .document
                 .base
                 .mutate()
-                .template_contents(self.handle.0.node)
+                .template_contents(self.handle.0.node);
+            let children = parsed
+                .document
+                .base
+                .get_node(fragment)
+                .map(|node| node.children.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let snapshots = crate::dom::adoption::snapshot_children(
+                &parsed.document,
+                self.handle.0.document,
+                children.iter().copied(),
+            );
+            (snapshots, children)
         };
-        // The contents may have been adopted into another document since:
-        // follow the live id so a previously fetched `content` wrapper and
-        // this getter agree on the adopted fragment.
-        let fragment = NodeId {
-            document: self.handle.0.document,
-            node: fragment,
-        };
-        let fragment = owner
+        let font = owner.borrow().runtime.font_ctx.clone();
+        let mut inert = crate::Parsed::script("text/html", font);
+        let fragment =
+            crate::dom::adoption::materialize_children(&mut inert.document, 0, &snapshots)
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        let root = owner.borrow_mut().add_document(inert);
+        // Register the owner so a wrapper can resolve it later; a document
+        // added without a registry entry reads back as a stale node
+        // (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+        owner
             .borrow()
             .registry()
             .borrow_mut()
-            .live_node_id(fragment);
+            .insert_document(root.document_id(), &owner);
+        let fragment = NodeId {
+            document: root.document,
+            node: fragment.node,
+        };
+        {
+            let borrowed = owner.borrow();
+            let Some(mut parsed) = borrowed.document_mut(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            parsed.document.set_template_owner(
+                self.handle.0.node,
+                fragment.document,
+                fragment.node,
+            );
+            let mut mutator = parsed.document.base.mutate();
+            for child in host_children {
+                mutator.remove_node(child);
+            }
+        }
         wrap_node(ctx, fragment)
     }
 }

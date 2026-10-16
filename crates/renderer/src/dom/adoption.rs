@@ -20,6 +20,10 @@ pub(crate) enum ImportSnapshot {
     Element {
         name: QualName,
         attributes: Vec<blitz_dom::Attribute>,
+        /// Live control state (dirty value, checkedness, selectedness,
+        /// indeterminate). A clone keeps it apart from the content
+        /// attributes (<https://html.spec.whatwg.org/multipage/input.html#input-element-cloning-steps>).
+        form_state: blitz_dom::FormControlState,
         children: Vec<ImportSnapshot>,
     },
     Text(crate::dom_string::DomString),
@@ -112,6 +116,7 @@ pub(crate) fn import_snapshot(
             Some(ImportSnapshot::Element {
                 name,
                 attributes,
+                form_state: element.form_state.clone(),
                 children,
             })
         }
@@ -161,12 +166,20 @@ pub(crate) fn materialize_import(
         ImportSnapshot::Element {
             name,
             attributes,
+            form_state,
             children,
         } => {
             let blitz_id = doc
                 .base
                 .mutate()
                 .create_element(name.clone(), attributes.clone());
+            if let Some(element) = doc
+                .base
+                .get_node_mut(blitz_id)
+                .and_then(|node| node.element_data_mut())
+            {
+                element.adopt_cloned_state(form_state.clone());
+            }
             // Template children materialize into the fresh element's
             // contents fragment, which creation already established.
             let parent = if crate::dom::tree::is_template_tag(name) {

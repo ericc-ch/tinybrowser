@@ -1206,8 +1206,7 @@ impl JsNode {
             });
         match kind {
             Some(0) => {
-                let text =
-                    crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node);
+                let text = parsed.document.descendant_dom_text(self.handle.0.node);
                 dom_string(ctx, &text).map(Some)
             }
             Some(1) => {

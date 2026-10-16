@@ -42,6 +42,17 @@ pub(crate) struct BlitzDocument {
     /// Live ranges by slot, adjusted by every structural mutation. Slots
     /// free with the document; see `dom::range::RangeTable`.
     pub ranges: crate::dom::range::RangeTable,
+    /// Character data that contains an unpaired surrogate. The UTF-8 tree
+    /// stores the lossy form for layout; this map is what DOM reads return
+    /// (<https://infra.spec.whatwg.org/#javascript-string-convert>).
+    exact_text: HashMap<blitz_traits::node_id::NodeId, DomString>,
+    /// Attribute values that contain an unpaired surrogate. The tree attribute
+    /// drops those units so a CSS `id` selector stays distinct from U+FFFD.
+    exact_attrs: HashMap<(blitz_traits::node_id::NodeId, String), DomString>,
+    /// Template element -> `(inert document id, contents fragment)`.
+    /// The fragment's node document is not the host
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#template-contents>).
+    template_owners: HashMap<blitz_traits::node_id::NodeId, (u32, blitz_traits::node_id::NodeId)>,
 }
 
 impl BlitzDocument {
@@ -56,6 +67,9 @@ impl BlitzDocument {
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
             ranges: crate::dom::range::RangeTable::default(),
+            exact_text: HashMap::new(),
+            exact_attrs: HashMap::new(),
+            template_owners: HashMap::new(),
         }
     }
 
@@ -70,6 +84,9 @@ impl BlitzDocument {
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
             ranges: crate::dom::range::RangeTable::default(),
+            exact_text: HashMap::new(),
+            exact_attrs: HashMap::new(),
+            template_owners: HashMap::new(),
         }
     }
 
@@ -236,24 +253,88 @@ impl BlitzDocument {
     /// Creates a text node whose data is `data`
     /// (<https://dom.spec.whatwg.org/#create-a-text-node>).
     pub(crate) fn create_text(&mut self, data: &DomString) -> blitz_traits::node_id::NodeId {
-        self.base.mutate().create_text_node(&data.to_string_lossy())
+        let id = self.base.mutate().create_text_node(&data.to_string_lossy());
+        self.remember_character_data(id, data);
+        id
     }
 
     /// Creates a comment whose data is `data`
     /// (<https://dom.spec.whatwg.org/#create-a-comment-node>).
     pub(crate) fn create_comment(&mut self, data: &DomString) -> blitz_traits::node_id::NodeId {
-        self.base
+        let id = self
+            .base
             .mutate()
-            .create_comment_node(&data.to_string_lossy())
+            .create_comment_node(&data.to_string_lossy());
+        self.remember_character_data(id, data);
+        id
+    }
+
+    /// Keeps `data` when it contains an unpaired surrogate. The tree itself
+    /// stores the lossy UTF-8 form.
+    pub(crate) fn remember_character_data(
+        &mut self,
+        id: blitz_traits::node_id::NodeId,
+        data: &DomString,
+    ) {
+        if data.has_unpaired_surrogate() {
+            self.exact_text.insert(id, data.clone());
+        } else {
+            self.exact_text.remove(&id);
+        }
+    }
+
+    /// Keeps an attribute value that contains an unpaired surrogate. The tree
+    /// attribute is the form with those units dropped.
+    pub(crate) fn remember_attribute(
+        &mut self,
+        id: blitz_traits::node_id::NodeId,
+        name: &str,
+        value: DomString,
+    ) {
+        let key = (id, name.to_owned());
+        if value.has_unpaired_surrogate() {
+            self.exact_attrs.insert(key, value);
+        } else {
+            self.exact_attrs.remove(&key);
+        }
+    }
+
+    /// The exact attribute value when it contains an unpaired surrogate.
+    pub(crate) fn attribute_units(
+        &self,
+        id: blitz_traits::node_id::NodeId,
+        name: &str,
+    ) -> Option<&DomString> {
+        self.exact_attrs.get(&(id, name.to_owned()))
+    }
+
+    /// Records the inert document that owns a template's contents.
+    pub(crate) fn set_template_owner(
+        &mut self,
+        template: blitz_traits::node_id::NodeId,
+        document: u32,
+        fragment: blitz_traits::node_id::NodeId,
+    ) {
+        self.template_owners.insert(template, (document, fragment));
+    }
+
+    /// The inert document and fragment for a template, when migrated.
+    pub(crate) fn template_owner(
+        &self,
+        template: blitz_traits::node_id::NodeId,
+    ) -> Option<(u32, blitz_traits::node_id::NodeId)> {
+        self.template_owners.get(&template).copied()
     }
 
     /// The `CharacterData` of `id` as UTF-16 code units
     /// (<https://dom.spec.whatwg.org/#characterdata>).
     ///
-    /// Unpaired surrogates do not survive the UTF-8 tree: they read back as
-    /// the replacement character. Preserving them is an upstream gap (see
-    /// `docs/progress.md`), not something this map reconstructs.
+    /// Unpaired surrogates live in `exact_text`. The UTF-8 tree holds the
+    /// lossy form for layout.
     pub(crate) fn character_data(&self, id: blitz_traits::node_id::NodeId) -> DomString {
+        if let Some(exact) = self.exact_text.get(&id) {
+            return exact.clone();
+        }
         match self.base.get_node(id).map(|node| &node.data) {
             Some(NodeData::Text(text)) => DomString::from(text.content.clone()),
             Some(
@@ -263,6 +344,32 @@ impl BlitzDocument {
             ) => DomString::from(contents.clone()),
             _ => DomString::default(),
         }
+    }
+
+    /// Descendant text content, keeping unpaired surrogates
+    /// (<https://dom.spec.whatwg.org/#concept-descendant-text-content>).
+    pub(crate) fn descendant_dom_text(&self, id: blitz_traits::node_id::NodeId) -> DomString {
+        let mut text = DomString::default();
+        let mut stack = self
+            .base
+            .get_node(id)
+            .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        while let Some(current) = stack.pop() {
+            let Some(node) = self.base.get_node(current) else {
+                continue;
+            };
+            match &node.data {
+                NodeData::Text(_) | NodeData::CDataSection { .. } => {
+                    text.push_dom(&self.character_data(current));
+                }
+                NodeData::Element(_) => {
+                    stack.extend(node.children.iter().rev().copied());
+                }
+                _ => {}
+            }
+        }
+        text
     }
 
     /// Whether `id` has already started as a script

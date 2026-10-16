@@ -64,6 +64,8 @@ pub(crate) struct RealmRegistry {
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
+    /// Canvas pixel buffers, keyed by the canvas element.
+    canvas_bitmaps: HashMap<NodeId, CanvasBitmap>,
     /// `TextDecoder` session ids, allocated across every world and frame so
     /// a freed id can never alias a live session, even if a finalizer runs
     /// under another realm.
@@ -141,21 +143,166 @@ pub(crate) enum SameObject {
     ChildNodes,
     /// `Document.scripts`.
     Scripts,
+    /// `HTMLCanvasElement.getContext("2d")`.
+    Canvas2d,
+    /// `HTMLCanvasElement.getContext("bitmaprenderer")`.
+    CanvasBitmap,
 }
 
 impl SameObject {
     /// Every member, for rekeying the cache on adoption.
-    pub(crate) const ALL: [SameObject; 6] = [
+    pub(crate) const ALL: [SameObject; 8] = [
         SameObject::ClassList,
         SameObject::Attributes,
         SameObject::Style,
         SameObject::Dataset,
         SameObject::ChildNodes,
         SameObject::Scripts,
+        SameObject::Canvas2d,
+        SameObject::CanvasBitmap,
     ];
 }
 
+/// Pixel buffer for one canvas context.
+pub(crate) struct CanvasBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub fill: [u8; 4],
+    pub pixels: Vec<u8>,
+}
+
+/// A canvas rectangle in CSS pixels.
+#[derive(Clone, Copy)]
+pub(crate) struct CanvasRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Non-finite and negative canvas lengths become zero. Larger values saturate
+/// at `u32::MAX` so a bitmap index stays in range.
+pub(crate) fn canvas_u32(value: f64) -> u32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    let value = value.min(f64::from(u32::MAX));
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is finite, non-negative, and at most u32::MAX"
+    )]
+    {
+        value as u32
+    }
+}
+
+/// Finite canvas origins clamp into `i32` so a source coordinate can sit left
+/// of the bitmap.
+fn canvas_i32(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let value = value.clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "value is finite and clamped to the i32 range"
+    )]
+    {
+        value as i32
+    }
+}
+
 impl RealmRegistry {
+    /// Fills a rectangle of the canvas bitmap. The buffer is the canvas size
+    /// in CSS pixels, transparent black until painted
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-bitmap>).
+    pub(crate) fn fill_canvas(
+        &mut self,
+        id: NodeId,
+        width: u32,
+        height: u32,
+        rect: CanvasRect,
+        color: [u8; 4],
+    ) {
+        let bitmap = self.canvas_bitmap(id, width, height);
+        bitmap.fill = color;
+        let x0 = canvas_u32(rect.x.floor());
+        let y0 = canvas_u32(rect.y.floor());
+        let x1 = canvas_u32((rect.x + rect.width).ceil());
+        let y1 = canvas_u32((rect.y + rect.height).ceil());
+        let x0 = x0.min(bitmap.width);
+        let y0 = y0.min(bitmap.height);
+        let x1 = x1.min(bitmap.width);
+        let y1 = y1.min(bitmap.height);
+        for row in y0..y1 {
+            for column in x0..x1 {
+                let offset = ((row * bitmap.width + column) * 4) as usize;
+                if let Some(pixel) = bitmap.pixels.get_mut(offset..offset + 4) {
+                    pixel.copy_from_slice(&color);
+                }
+            }
+        }
+    }
+
+    /// Copies a rectangle out of the canvas bitmap.
+    pub(crate) fn canvas_pixels(
+        &mut self,
+        id: NodeId,
+        width: u32,
+        height: u32,
+        rect: CanvasRect,
+    ) -> Vec<u8> {
+        let bitmap = self.canvas_bitmap(id, width, height);
+        let sw = canvas_u32(rect.width.max(0.0).ceil());
+        let sh = canvas_u32(rect.height.max(0.0).ceil());
+        let mut out = vec![0; (sw as usize) * (sh as usize) * 4];
+        let x0 = canvas_i32(rect.x.floor());
+        let y0 = canvas_i32(rect.y.floor());
+        for row in 0..sh {
+            for column in 0..sw {
+                let source_x = x0 + column.cast_signed();
+                let source_y = y0 + row.cast_signed();
+                if source_x < 0
+                    || source_y < 0
+                    || source_x.cast_unsigned() >= bitmap.width
+                    || source_y.cast_unsigned() >= bitmap.height
+                {
+                    continue;
+                }
+                let from = ((source_y.cast_unsigned() * bitmap.width + source_x.cast_unsigned())
+                    * 4) as usize;
+                let to = ((row * sw + column) * 4) as usize;
+                if let (Some(src), Some(dst)) =
+                    (bitmap.pixels.get(from..from + 4), out.get_mut(to..to + 4))
+                {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        out
+    }
+
+    fn canvas_bitmap(&mut self, id: NodeId, width: u32, height: u32) -> &mut CanvasBitmap {
+        let width = width.max(1);
+        let height = height.max(1);
+        let stale = self
+            .canvas_bitmaps
+            .get(&id)
+            .is_some_and(|bitmap| bitmap.width != width || bitmap.height != height);
+        if stale {
+            self.canvas_bitmaps.remove(&id);
+        }
+        self.canvas_bitmaps
+            .entry(id)
+            .or_insert_with(|| CanvasBitmap {
+                width,
+                height,
+                fill: [0, 0, 0, 255],
+                pixels: vec![0; (width as usize) * (height as usize) * 4],
+            })
+    }
+
     /// The next process-unique `WebDriver` element id.
     pub(crate) fn allocate_remote(&mut self) -> u64 {
         self.next_remote = self.next_remote.saturating_add(1);
@@ -231,6 +378,8 @@ impl RealmRegistry {
         self.wrappers.retain(|node| node.document_id() != id);
         self.same_object
             .retain(|(node, _)| node.document_id() != id);
+        self.canvas_bitmaps
+            .retain(|node, _| node.document_id() != id);
         self.frame_documents
             .retain(|_, document| document.document_id() != id);
         self.creation_realms
