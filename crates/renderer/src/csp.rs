@@ -237,6 +237,8 @@ impl InlineScript<'_> {
 pub(crate) struct ScriptRequest<'a> {
     pub nonce: &'a str,
     pub parser_inserted: bool,
+    /// Raw `integrity` attribute value, empty when there is none.
+    pub integrity: &'a str,
 }
 
 /// `blockedURI` for a request violation: a non-HTTP(S) scheme reports
@@ -782,16 +784,21 @@ fn request_check_blocks(
     script: Option<ScriptRequest<'_>>,
     redirects: u32,
 ) -> bool {
-    // The pre-request check short-circuits on nonces and `'strict-dynamic'`.
-    // The post-request (redirect) check is URL-only, so a policy with
-    // `'strict-dynamic'` does not block every response
+    // The pre-request check short-circuits on nonces, integrity metadata,
+    // and `'strict-dynamic'`, in that order. The post-request (redirect)
+    // check is URL-only, so a policy with `'strict-dynamic'` does not block
+    // every response
     // (<https://w3c.github.io/webappsec-csp/#script-pre-request>).
     if redirects == 0 && matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc) {
         let script = script.unwrap_or(ScriptRequest {
             nonce: "",
             parser_inserted: true,
+            integrity: "",
         });
         if nonce_matches(script.nonce, list) {
+            return false;
+        }
+        if integrity_matches(list, script.integrity) {
             return false;
         }
         if has_keyword(list, "'strict-dynamic'") {
@@ -799,6 +806,83 @@ fn request_check_blocks(
         }
     }
     !url_matches_list(url, list, origin, document_url, redirects)
+}
+
+/// Whether the request's SRI integrity metadata matches the source list: the
+/// parsed metadata must be non-empty and every entry must equal a hash-source
+/// in the list. Entries with unrecognized algorithms never parse, so they
+/// cannot satisfy the subset but also do not break it
+/// (<https://w3c.github.io/webappsec-csp/#does-integrity-metadata-match-source-list>).
+fn integrity_matches(list: &[String], integrity: &str) -> bool {
+    let expressions: Vec<(&str, &str)> =
+        list.iter().filter_map(|expression| hash_source(expression)).collect();
+    if expressions.is_empty() {
+        return false;
+    }
+    let sources = parse_integrity_metadata(integrity);
+    if sources.is_empty() {
+        return false;
+    }
+    sources.iter().all(|(algorithm, value)| {
+        expressions.iter().any(|(expected_algorithm, expected_value)| {
+            expected_algorithm.eq_ignore_ascii_case(algorithm) && *expected_value == *value
+        })
+    })
+}
+
+/// Parses SRI integrity metadata into `(algorithm, base64-value)` pairs.
+/// Entries with unsupported algorithms or invalid values are dropped, and
+/// the algorithm is lowercased
+/// (<https://www.w3.org/TR/SRI/#parse-metadata>).
+fn parse_integrity_metadata(metadata: &str) -> Vec<(String, String)> {
+    metadata
+        .split_ascii_whitespace()
+        .filter_map(|entry| {
+            let (algorithm, value) = entry.split_once('-')?;
+            let algorithm = if algorithm.eq_ignore_ascii_case("sha256") {
+                "sha256"
+            } else if algorithm.eq_ignore_ascii_case("sha384") {
+                "sha384"
+            } else if algorithm.eq_ignore_ascii_case("sha512") {
+                "sha512"
+            } else {
+                return None;
+            };
+            is_base64_value(value).then(|| (algorithm.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// Whether `bytes` satisfy SRI `integrity` metadata: the strongest supported
+/// algorithm present must have at least one entry matching the content.
+/// Empty metadata enforces nothing; unparseable metadata fails closed
+/// (<https://www.w3.org/TR/SRI/#verify-integrity>).
+#[must_use]
+pub(crate) fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
+    let integrity = integrity.trim();
+    if integrity.is_empty() {
+        return true;
+    }
+    let sources = parse_integrity_metadata(integrity);
+    let Some(strongest) = sources.iter().map(|(algorithm, _)| algorithm.as_str()).max_by_key(
+        |algorithm| match *algorithm {
+            "sha512" => 2,
+            "sha384" => 1,
+            _ => 0,
+        },
+    ) else {
+        return false;
+    };
+    sources.iter().any(|(algorithm, expected)| {
+        algorithm == strongest && {
+            let digest = match strongest {
+                "sha512" => base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes)),
+                "sha384" => base64::engine::general_purpose::STANDARD.encode(Sha384::digest(bytes)),
+                _ => base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)),
+            };
+            digest.as_str() == *expected
+        }
+    })
 }
 
 /// The inline check for one directive
@@ -1558,6 +1642,52 @@ mod tests {
         let expression = "'sha256-wmuLCpoj8EMqfQlPnt5NIMgKkCK62CxAkAiewI0zZps='";
         assert!(hash_matches(expression, "t1.done();"));
         assert!(!hash_matches(expression, "t2.done();"));
+    }
+
+    #[test]
+    fn integrity_metadata_must_subset_policy_hashes() {
+        let list = vec![
+            "'sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c='".to_owned(),
+            "'sha512-rYCVMxWV5nq8IsMo+UZNObWtEiWGok/vDN8BMoEQi41s0znSes6E1Q2aag3Lw3u2J1w2rqH7uF2ws6FpQhfSOA=='".to_owned(),
+        ];
+        assert!(integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c="
+        ));
+        assert!(integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha512-rYCVMxWV5nq8IsMo+UZNObWtEiWGok/vDN8BMoEQi41s0znSes6E1Q2aag3Lw3u2J1w2rqH7uF2ws6FpQhfSOA=="
+        ));
+        // An entry outside the policy breaks the subset, even beside a match.
+        assert!(!integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha256-xyz"
+        ));
+        // Entries with unrecognized algorithms never parse: dropped, not fatal.
+        assert!(integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha999-xyz"
+        ));
+        assert!(!integrity_matches(&list, "sha256-xyz"));
+        assert!(!integrity_matches(&list, ""));
+        assert!(!integrity_matches(&["'self'".to_owned()], "sha256-xyz"));
+    }
+
+    #[test]
+    fn integrity_verifies_strongest_algorithm() {
+        // Exact bytes of the WPT simpleSourcedScript.js fixture.
+        let body = b"window.postMessage(document.currentScript.id, \"*\");\n";
+        let sha256 = "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c=";
+        assert!(integrity_verifies(sha256, body));
+        assert!(integrity_verifies("", body));
+        assert!(!integrity_verifies("sha256-xyz", body));
+        assert!(!integrity_verifies("sha999-xyz", body));
+        // A matching sha256 beside a mismatch still verifies: sha512 is
+        // absent, so sha256 is strongest and one entry matches.
+        assert!(integrity_verifies(
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha256-xyz",
+            body
+        ));
     }
 
     #[test]

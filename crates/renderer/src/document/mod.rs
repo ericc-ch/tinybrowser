@@ -138,6 +138,9 @@ pub(crate) struct QueuedDial {
     /// against these at commit
     /// (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
     pub(crate) ancestors: Vec<Url>,
+    /// Raw `integrity` attribute for a classic script dial, verified against
+    /// the response bytes. `None` enforces nothing.
+    pub(crate) integrity: Option<String>,
 }
 
 impl QueuedDial {
@@ -154,6 +157,7 @@ impl QueuedDial {
             referrer: None,
             csp: None,
             ancestors: Vec::new(),
+            integrity: None,
         }
     }
 }
@@ -170,6 +174,9 @@ pub(crate) struct CompletedDial {
     /// Ancestor document URLs for a nested frame navigation, checked against
     /// the response's `frame-ancestors` at commit.
     pub(crate) ancestors: Vec<Url>,
+    /// Raw `integrity` attribute for a classic script response, verified
+    /// against the response bytes before execution.
+    pub(crate) integrity: Option<String>,
 }
 
 /// Who feeds the active parser, and therefore who may end it.
@@ -764,6 +771,7 @@ impl Document {
             referrer,
             csp: None,
             ancestors: Vec::new(),
+            integrity: None,
         });
     }
 
@@ -1913,9 +1921,19 @@ impl Document {
         let world = self.world.borrow();
         let slot = world.nonce_slots.get(&id).map(String::as_str);
         let parser_inserted = world.is_parser_inserted(id);
-        let (nonce, _) = world.document(id).map_or_else(
-            || (String::new(), false),
-            |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
+        let (nonce, integrity) = world.document(id).map_or_else(
+            || (String::new(), String::new()),
+            |parsed| {
+                let (nonce, _) = crate::csp::element_nonce(
+                    &parsed.document.base,
+                    id.node,
+                    slot,
+                );
+                let integrity = crate::dom::tree::attr(&parsed.document.base, id.node, "integrity")
+                    .unwrap_or_default()
+                    .to_owned();
+                (nonce, integrity)
+            },
         );
         world.csp.check_request(
             &world.origin,
@@ -1925,6 +1943,7 @@ impl Document {
             Some(crate::csp::ScriptRequest {
                 nonce: &nonce,
                 parser_inserted,
+                integrity: &integrity,
             }),
         )
     }
@@ -2060,6 +2079,7 @@ impl Document {
             referrer: None,
             csp: None,
             ancestors: Vec::new(),
+            integrity: None,
         });
     }
 
@@ -2241,8 +2261,20 @@ impl Document {
             initiator,
         );
         dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
+        dial.integrity = self.script_integrity(id);
         self.queued_dials.push(dial);
         true
+    }
+
+    /// Raw `integrity` attribute of a classic script element, for SRI
+    /// verification and the CSP integrity-metadata allowance
+    /// (<https://www.w3.org/TR/SRI/#parse-metadata>).
+    fn script_integrity(&self, id: crate::dom::tree::NodeId) -> Option<String> {
+        let world = self.world.borrow();
+        world.document(id).and_then(|parsed| {
+            crate::dom::tree::attr(&parsed.document.base, id.node, "integrity")
+                .map(str::to_owned)
+        })
     }
 
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
@@ -2280,6 +2312,7 @@ impl Document {
             request_url,
             csp,
             ancestors,
+            integrity,
         } = done;
         let redirected = outcome.final_url != request_url;
         match context {
@@ -2322,7 +2355,13 @@ impl Document {
                             crate::csp::Destination::Script,
                             Some(element),
                         );
-                    if !blocked && (200..300).contains(&outcome.status) {
+                    // SRI verification fails the load like a network error:
+                    // no execution, no `load` event, and no CSP violation
+                    // (<https://www.w3.org/TR/SRI/#verify-integrity>).
+                    let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
+                        crate::csp::integrity_verifies(metadata, &outcome.body)
+                    });
+                    if !blocked && integrity_ok && (200..300).contains(&outcome.status) {
                         let source = String::from_utf8_lossy(&outcome.body);
                         let filename = outcome.final_url.clone();
                         self.eval_classic(&source, Some(element), 1, &filename);

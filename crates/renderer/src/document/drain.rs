@@ -141,6 +141,7 @@ impl Document {
                                 request_url: dial.url.to_string(),
                                 csp: dial.csp.clone(),
                                 ancestors: dial.ancestors.clone(),
+                                integrity: dial.integrity.clone(),
                                 outcome: crate::protocol::DialOutcome {
                                     status: 200,
                                     final_url: dial.url.to_string(),
@@ -370,6 +371,7 @@ impl Document {
                 initiator,
             );
             dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
+            dial.integrity = self.script_integrity(element);
             self.queued_dials.push(dial);
         }
     }
@@ -425,6 +427,7 @@ impl Document {
                     referrer: fetch.referrer,
                     csp: Some(self.redirect_gate(crate::csp::Destination::Connect)),
                     ancestors: Vec::new(),
+                    integrity: None,
                 });
             } else {
                 self.record_event(RendererEvent::FetchFailed);
