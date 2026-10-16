@@ -2113,6 +2113,7 @@ impl Document {
             if !self.executed_scripts.insert(id) {
                 continue;
             }
+            let launched = self.dynamic_script_launched(id);
             // Mirror the run into the tree's already-started flag: the
             // binding layer's prepare step checks that flag, so without
             // this every move, clone, or adopt of a parser-run script
@@ -2146,26 +2147,7 @@ impl Document {
                     self.eval_classic(&source, Some(id), line, &filename);
                 }
                 Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
-                    if let Ok(url) = self.resolve_dial_url(&src) {
-                        let violations = self.script_url_violations(&url, id);
-                        if !violations.is_empty() {
-                            self.fire_csp_violations(id, &violations);
-                        }
-                        if crate::csp::blocks(&violations) {
-                            continue;
-                        }
-                        self.classic_fetch_in_flight = true;
-                        let initiator = self.url.clone();
-                        let mut dial = QueuedDial::get(
-                            DialContext::ClassicScript {
-                                element: id,
-                                epoch: self.js_epoch,
-                            },
-                            url,
-                            initiator,
-                        );
-                        dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
-                        self.queued_dials.push(dial);
+                    if self.start_src_script(id, &src, launched) {
                         return true;
                     }
                 }
@@ -2187,6 +2169,56 @@ impl Document {
         // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
         self.adopt_pending_frames();
         false
+    }
+
+    /// Whether a script-inserted fetch `adopt_js_work` already launched
+    /// for `id`. A later tree walk must not start it again. Callers read
+    /// this before marking the step started; after the mark every script
+    /// looks launched
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    fn dynamic_script_launched(&self, id: crate::dom::tree::NodeId) -> bool {
+        self.world
+            .borrow()
+            .document(id)
+            .is_some_and(|parsed| parsed.document.script_already_started(id.node))
+    }
+
+    /// Starts the fetch for a tree-walked `src` script, unless a
+    /// script-inserted fetch already launched for `id`. Returns whether the
+    /// walk blocks on the fetch
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    fn start_src_script(
+        &mut self,
+        id: crate::dom::tree::NodeId,
+        src: &str,
+        launched: bool,
+    ) -> bool {
+        if launched {
+            return false;
+        }
+        let Ok(url) = self.resolve_dial_url(src) else {
+            return false;
+        };
+        let violations = self.script_url_violations(&url, id);
+        if !violations.is_empty() {
+            self.fire_csp_violations(id, &violations);
+        }
+        if crate::csp::blocks(&violations) {
+            return false;
+        }
+        self.classic_fetch_in_flight = true;
+        let initiator = self.url.clone();
+        let mut dial = QueuedDial::get(
+            DialContext::ClassicScript {
+                element: id,
+                epoch: self.js_epoch,
+            },
+            url,
+            initiator,
+        );
+        dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
+        self.queued_dials.push(dial);
+        true
     }
 
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {

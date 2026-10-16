@@ -341,6 +341,12 @@ impl Document {
             if started {
                 continue;
             }
+            // Mark at launch: prepare deliberately leaves the flag clear
+            // so this queue is the single owner of the fetch. A second
+            // prepare sees the flag and schedules nothing.
+            if let Some(mut parsed) = self.world.borrow().document_mut(element) {
+                parsed.document.mark_script_started(element.node);
+            }
             let Ok(url) = self.resolve_dial_url(&src) else {
                 self.fire_js(|js| js.fire_node_error(element));
                 continue;

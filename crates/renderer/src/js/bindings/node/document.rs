@@ -2050,16 +2050,13 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     let (source, base_line) = match kind {
         Kind::Inline(source, line) => (source, line),
         Kind::External => {
-            // The fetch starts in `Document::adopt_js_work`; an already
-            // started element must not schedule a second load
+            // Parser-inserted scripts never reach this path; the parser
+            // runs them from `Document::run_scripts`. The fetch for a
+            // script-inserted element starts in `Document::adopt_js_work`,
+            // which marks already-started at launch so a second prepare
+            // schedules nothing
             // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
             let world = world(ctx)?;
-            {
-                let world = world.borrow();
-                if let Some(mut parsed) = world.document_mut(id) {
-                    parsed.document.mark_script_started(id.node);
-                }
-            }
             world.borrow_mut().queue_script(id);
             return Ok(());
         }
