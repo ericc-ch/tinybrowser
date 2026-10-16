@@ -28,7 +28,7 @@ mod protocol;
 mod pseudo_attributes;
 mod remote;
 mod render;
-mod sniff;
+pub mod sniff;
 mod storage;
 mod xml;
 

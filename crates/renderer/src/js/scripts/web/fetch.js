@@ -119,7 +119,7 @@ globalThis.Response = class Response {
     const header = data.headers.get('content-type');
     // The Blob type is the MIME type extracted from the header list
     // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-    const type = header === null ? '' : host.__tbParseMimeType(header);
+    const type = header === null ? '' : host.__tbExtractMimeType(header);
     return __tbConsumeResponse(this).then(bytes => __tbMakeBlob(bytes, type));
   }
   clone() {
@@ -216,7 +216,7 @@ globalThis.Request = class Request {
     const header = data.headers.get('content-type');
     // The Blob type is the MIME type extracted from the header list
     // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-    const type = header === null ? '' : host.__tbParseMimeType(header);
+    const type = header === null ? '' : host.__tbExtractMimeType(header);
     const bytes = data.body === null ? Promise.resolve(new Uint8Array(0)) : __tbResponseBytes(data.body);
     return bytes.then(value => __tbMakeBlob(value, type));
   }

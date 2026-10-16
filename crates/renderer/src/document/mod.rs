@@ -1180,8 +1180,17 @@ impl Document {
             "",
             false,
             ParserOwner::Carrier,
-            Some(dial::ResponseDecoder::new(content_type.map(str::to_owned))),
+            // The decoder resolves the charset from the extracted MIME type,
+            // not from the header value as served: a `charset` in
+            // `a;charset=x, b` does not decode `b`
+            // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+            Some(dial::ResponseDecoder::new(
+                content_type.and_then(crate::sniff::extract_mime_type),
+            )),
         );
+        // Kept raw until `finish_parse`: the Apache `text/plain` check needs
+        // the exact bytes the server sent before the extraction runs
+        // (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
         self.response_content_type = content_type.map(str::to_owned);
         self.response_policy = policy;
         self.csp_from_response = true;
@@ -1700,12 +1709,21 @@ impl Document {
         // Writes queued while the parser was active join this parse; later
         // writes have no incremental parser to feed (see `write_text`).
         if self.apply_mime_sniff {
-            let supplied = self.response_content_type.as_deref();
+            // The stored value is the raw header list. The Apache check needs
+            // it exactly as sent; the sniff needs the extracted MIME type.
+            // mimesniff names "the value of the last Content-Type header" as
+            // the supplied type, but browsers extract — last value that
+            // parses, `*/*` skipped — and the WPT `fetch/content-type`
+            // expectations follow the browsers
+            // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>,
+            // <https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
+            let raw = self.response_content_type.as_deref();
+            let supplied = raw.and_then(crate::sniff::extract_mime_type);
             let apache =
-                self.mime_guard.http && supplied.is_some_and(crate::sniff::apache_bug_content_type);
+                self.mime_guard.http && raw.is_some_and(crate::sniff::apache_bug_content_type);
             self.response_content_type = Some(crate::sniff::sniff_mime(
                 &self.sniff_header,
-                supplied,
+                supplied.as_deref(),
                 self.mime_guard.no_sniff,
                 apache,
             ));

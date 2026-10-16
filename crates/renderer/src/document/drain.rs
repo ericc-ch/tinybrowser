@@ -138,8 +138,14 @@ impl Document {
                                 outcome: crate::protocol::DialOutcome {
                                     status: 200,
                                     final_url: dial.url.to_string(),
-                                    content_type: Some(content_type),
-                                    headers: Vec::new(),
+                                    content_type: Some(content_type.clone()),
+                                    // Scheme fetch serves the data: MIME type
+                                    // as the response's `Content-Type` header
+                                    // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
+                                    headers: vec![(
+                                        "content-type".to_owned(),
+                                        content_type,
+                                    )],
                                     body,
                                 },
                             });

@@ -239,7 +239,9 @@ impl StorageKind {
 pub struct Mount {
     /// Absolute document URL.
     pub url: String,
-    /// HTTP `Content-Type`, when the document came from the network.
+    /// Every `Content-Type` response header value joined with `", "`
+    /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>),
+    /// when the document came from the network.
     pub content_type: Option<String>,
     /// Combined `Content-Security-Policy` header, when the response sent one.
     #[serde(default)]
@@ -276,7 +278,9 @@ pub struct Mount {
 pub struct ResponseHead {
     /// Absolute document URL.
     pub url: String,
-    /// HTTP `Content-Type`, when the document came from the network.
+    /// Every `Content-Type` response header value joined with `", "`
+    /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>),
+    /// when the document came from the network.
     pub content_type: Option<String>,
     /// Combined `Content-Security-Policy` header, when the response sent one.
     pub content_security_policy: Option<String>,
@@ -411,7 +415,9 @@ pub struct DialOutcome {
     pub status: u16,
     /// Final URL after redirects.
     pub final_url: String,
-    /// `Content-Type` header, when present and UTF-8.
+    /// Every `Content-Type` response header value joined with `", "`, when
+    /// the response sent any
+    /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
     pub content_type: Option<String>,
     /// Response headers visible to page scripts, in wire order.
     #[serde(default)]

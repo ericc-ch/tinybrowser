@@ -445,18 +445,29 @@ fn isomorphic_decode(bytes: &[u8]) -> String {
     bytes.iter().map(|&byte| char::from(byte)).collect()
 }
 
-/// Whether any `X-Content-Type-Options` value is `nosniff`.
+/// Whether `X-Content-Type-Options` on the response is `nosniff`
+/// (<https://fetch.spec.whatwg.org/#determine-nosniff>). The renderer owns
+/// the algorithm because the renderer-side dials share it.
 fn header_nosniff(headers: &net::HeaderMap) -> bool {
-    headers.get_all("x-content-type-options").any(|value| {
-        std::str::from_utf8(value).is_ok_and(|text| text.trim().eq_ignore_ascii_case("nosniff"))
-    })
+    let values: Vec<String> = headers
+        .get_all("x-content-type-options")
+        .map(isomorphic_decode)
+        .collect();
+    renderer::sniff::nosniff(&values.join(", "))
 }
 
-/// `Content-Type` from response `headers`, exposed the way the page sees it:
-/// each byte is the same code point
-/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
+/// Every `Content-Type` value from the response as one string: the values
+/// joined with `", "`, each byte the same code point
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>,
+/// <https://infra.spec.whatwg.org/#isomorphic-decode>). The renderer extracts
+/// the MIME type from it
+/// (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
 fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
-    headers.get("content-type").map(isomorphic_decode)
+    let values: Vec<String> = headers
+        .get_all("content-type")
+        .map(isomorphic_decode)
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
 }
 
 /// Network-boundary `Referer` check: rejects only a true downgrade (https

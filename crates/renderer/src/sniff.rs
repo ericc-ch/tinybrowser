@@ -278,13 +278,136 @@ pub(crate) fn apache_bug_content_type(value: &str) -> bool {
     )
 }
 
+/// Whether an `X-Content-Type-Options` value is `nosniff`
+/// (<https://fetch.spec.whatwg.org/#determine-nosniff>).
+///
+/// `value` is the combined header value: every occurrence joined with
+/// `", "`, the way the fetch "getting" step exposes a header
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
+/// Only the first comma-separated item counts, and only HTTP tab or space is
+/// stripped, so `nosniff, nosniff` is nosniff while `foo, nosniff` is not.
+#[must_use]
+pub fn nosniff(value: &str) -> bool {
+    split_header_value(value)
+        .first()
+        .is_some_and(|first| first.eq_ignore_ascii_case("nosniff"))
+}
+
 /// `X-Content-Type-Options: nosniff` on a header list.
 #[must_use]
 pub(crate) fn headers_nosniff(headers: &[(String, String)]) -> bool {
-    headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("x-content-type-options")
-            && value.trim().eq_ignore_ascii_case("nosniff")
-    })
+    let values: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-content-type-options"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    nosniff(&values.join(", "))
+}
+
+/// "extract a MIME type" from one combined `Content-Type` value, serialized,
+/// or `None` when extraction fails
+/// (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+///
+/// The last item that parses wins, `*/*` never wins, and a `charset`
+/// parameter carries over from an earlier item with the same essence. The
+/// mimesniff supplied MIME type detection algorithm instead names "the value
+/// of the last `Content-Type` header"
+/// (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>);
+/// browsers and the WPT `fetch/content-type` expectations follow this
+/// algorithm, so the document path does too.
+#[must_use]
+pub(crate) fn extract_mime_type(value: &str) -> Option<String> {
+    let mut mime_type: Option<MimeType> = None;
+    let mut essence: Option<String> = None;
+    let mut charset: Option<String> = None;
+    for item in split_header_value(value) {
+        let Some(mut parsed) = parse_mime_type(&item) else {
+            continue;
+        };
+        if parsed.essence == "*/*" {
+            continue;
+        }
+        if essence.as_deref() == Some(parsed.essence.as_str()) {
+            if !parsed.parameters.iter().any(|(name, _)| name == "charset")
+                && let Some(propagated) = charset.clone()
+            {
+                parsed.parameters.push(("charset".to_owned(), propagated));
+            }
+        } else {
+            charset = parsed
+                .parameters
+                .iter()
+                .find(|(name, _)| name == "charset")
+                .map(|(_, value)| value.clone());
+            essence = Some(parsed.essence.clone());
+        }
+        mime_type = Some(parsed);
+    }
+    mime_type.map(|mime| mime.serialize())
+}
+
+/// "get, decode, and split" for one header value
+/// (<https://fetch.spec.whatwg.org/#concept-header-value-get-decode-and-split>).
+/// A quoted string keeps commas inside it, and each item is stripped of HTTP
+/// tab or space only — not of the rest of HTTP whitespace, which the
+/// algorithm deliberately leaves in place.
+fn split_header_value(value: &str) -> Vec<String> {
+    let characters: Vec<char> = value.chars().collect();
+    let mut position = 0;
+    let mut values = Vec::new();
+    let mut temporary = String::new();
+    loop {
+        while position < characters.len()
+            && characters[position] != '"'
+            && characters[position] != ','
+        {
+            temporary.push(characters[position]);
+            position += 1;
+        }
+        if position < characters.len() && characters[position] == '"' {
+            collect_http_quoted_string_raw(&characters, &mut position, &mut temporary);
+            if position < characters.len() {
+                continue;
+            }
+        }
+        // An HTTP tab or space byte is 0x09 (HT) or 0x20 (SP)
+        // (<https://fetch.spec.whatwg.org/#http-tab-or-space>).
+        values.push(
+            temporary
+                .trim_matches(|character| character == '\t' || character == ' ')
+                .to_owned(),
+        );
+        temporary = String::new();
+        if position == characters.len() {
+            return values;
+        }
+        position += 1; // Skip the comma.
+    }
+}
+
+/// "collect an HTTP quoted string" without `extract-value`: the raw code
+/// points from the opening quote through the closing quote, or to the end of
+/// input when the quote never closes
+/// (<https://fetch.spec.whatwg.org/#collect-an-http-quoted-string>). The
+/// position points at the opening `"`.
+fn collect_http_quoted_string_raw(
+    characters: &[char],
+    position: &mut usize,
+    value: &mut String,
+) {
+    let start = *position;
+    *position += 1;
+    while *position < characters.len() {
+        match characters[*position] {
+            '\\' if *position + 1 < characters.len() => *position += 2,
+            '"' => {
+                *position += 1;
+                break;
+            }
+            _ => *position += 1,
+        }
+    }
+    value.extend(&characters[start..*position]);
 }
 
 /// A MIME type record
@@ -434,8 +557,8 @@ fn parse_mime_type(input: &str) -> Option<MimeType> {
 }
 
 /// Parse then serialize `input`, or the empty string when it is not a MIME
-/// type. The Blob `type` and response-derived strings use this
-/// (<https://w3c.github.io/FileAPI/#dfn-type>).
+/// type. `XMLHttpRequest.overrideMimeType` stores the result
+/// (<https://xhr.spec.whatwg.org/#the-overridemimetype()-method>).
 #[must_use]
 pub(crate) fn parse_serialized_mime_type(input: &str) -> String {
     parse_mime_type(input).map_or_else(String::new, |mime| mime.serialize())
@@ -646,10 +769,11 @@ fn webm_signature(sequence: &[u8]) -> bool {
 
 /// `parse a vint` starting at `start`.
 ///
-/// The published steps set `index` to 0 and then never read the start
-/// parameter (<https://mimesniff.spec.whatwg.org/#parse-a-vint>). That
-/// ignores the offset. Chromium's `ParseVint` starts at the given index,
-/// which is the reading that matches "starting at index iter".
+/// The published steps set `index` to 0 and never read the `start` parameter
+/// (<https://mimesniff.spec.whatwg.org/#parse-a-vint>), so taken literally
+/// they always read the first byte of the sequence. The `WebM` signature
+/// caller walks elements from an offset, and the algorithm takes the
+/// starting index, so the parameter is honoured here.
 fn parse_vint(sequence: &[u8], start: usize) -> Option<usize> {
     let mut mask = 0x80_u16;
     let mut number_size = 1;
@@ -1126,5 +1250,70 @@ mod tests {
     #[test]
     fn a_parameter_value_outside_the_quoted_string_set_is_dropped() {
         assert_eq!(parsed("text/html;charset=a\u{0100}"), "text/html");
+    }
+
+    fn extracted(input: &str) -> Option<String> {
+        extract_mime_type(input)
+    }
+
+    #[test]
+    fn extract_keeps_the_last_item_that_parses() {
+        assert_eq!(
+            extracted("text/html, text/plain").as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            extracted("text/plain, cannot-parse").as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(extracted("text/plain,").as_deref(), Some("text/plain"));
+        assert_eq!(extracted("text/html, */*").as_deref(), Some("text/html"));
+        assert_eq!(extracted("*/*, text/plain").as_deref(), Some("text/plain"));
+        assert_eq!(extracted("*/*").as_deref(), None);
+        assert_eq!(extracted("").as_deref(), None);
+    }
+
+    #[test]
+    fn extract_carries_a_charset_across_a_matching_essence() {
+        assert_eq!(
+            extracted("text/plain;charset=gbk, text/plain").as_deref(),
+            Some("text/plain;charset=gbk")
+        );
+        assert_eq!(
+            extracted("text/plain;charset=gbk;x=foo, text/plain").as_deref(),
+            Some("text/plain;charset=gbk")
+        );
+        assert_eq!(
+            extracted("text/plain;charset=gbk, text/html").as_deref(),
+            Some("text/html")
+        );
+        assert_eq!(
+            extracted("text/plain;charset=gbk, text/plain;charset=windows-1252").as_deref(),
+            Some("text/plain;charset=windows-1252")
+        );
+        assert_eq!(
+            extracted("text/html;charset=gbk, text/html;x=\",text/plain\"").as_deref(),
+            Some("text/html;x=\",text/plain\";charset=gbk")
+        );
+    }
+
+    #[test]
+    fn split_keeps_commas_inside_quotes_together() {
+        assert_eq!(split_header_value("a, \"b,c\", d"), ["a", "\"b,c\"", "d"]);
+        assert_eq!(split_header_value("nosniff,"), ["nosniff", ""]);
+        assert_eq!(split_header_value(""), [""]);
+    }
+
+    #[test]
+    fn nosniff_reads_only_the_first_item() {
+        assert!(nosniff("nosniff"));
+        assert!(nosniff(" nosniff\t"));
+        assert!(nosniff("NOSNIFF, nosniff"));
+        assert!(nosniff("nosniff, nosniff"));
+        assert!(!nosniff("foo, nosniff"));
+        assert!(!nosniff(""));
+        assert!(!nosniff("nosniff-foo"));
+        // A non-breaking space is not an HTTP tab or space.
+        assert!(!nosniff("\u{a0}nosniff"));
     }
 }

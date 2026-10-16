@@ -913,13 +913,23 @@ impl JsRealm {
                 fetch_referrer(&world, &request_url)
             }),
         )?;
-        // Parse a MIME type and serialize it back, the Blob `type` and
-        // `Content-Type` reads use the result
+        // Parse a MIME type and serialize it back; `XMLHttpRequest`'s
+        // `overrideMimeType` stores the result, `""` on failure
         // (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>).
         bridge::object(ctx)?.set(
             "__tbParseMimeType",
             Func::from(|value: String| -> String {
                 crate::sniff::parse_serialized_mime_type(&value)
+            }),
+        )?;
+        // "extract a MIME type" over one combined `Content-Type` value,
+        // serialized, `""` on failure. The `blob()` methods and the XHR blob
+        // response read it
+        // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+        bridge::object(ctx)?.set(
+            "__tbExtractMimeType",
+            Func::from(|value: String| -> String {
+                crate::sniff::extract_mime_type(&value).unwrap_or_default()
             }),
         )?;
         Self::install_csp_host_functions(ctx, world)?;
