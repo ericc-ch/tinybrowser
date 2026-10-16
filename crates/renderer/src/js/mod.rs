@@ -1466,26 +1466,9 @@ impl Drop for ClearInterrupt<'_> {
     }
 }
 
-/// Content type the page shim may use when the response omitted `Content-Type`.
-fn fetch_content_type(header: Option<&str>, body: &[u8], headers: &[(String, String)]) -> String {
-    header
-        .filter(|value| !value.is_empty())
-        .map_or_else(
-            || {
-                let end = body.len().min(crate::sniff::RESOURCE_HEADER_LEN);
-                crate::sniff::sniff_mime(
-                    &body[..end],
-                    None,
-                    crate::sniff::headers_nosniff(headers),
-                    false,
-                )
-            },
-            str::to_owned,
-        )
-}
-
-/// Array `__tbSyncFetch` returns to the XHR shim.
-type SyncFetchList = rquickjs::prelude::List<(i32, Vec<u8>, String, String, Vec<Vec<String>>)>;
+/// Array `__tbSyncFetch` returns to the XHR shim: status, body, final URL,
+/// and the response header list.
+type SyncFetchList = rquickjs::prelude::List<(i32, Vec<u8>, String, Vec<Vec<String>>)>;
 
 struct SyncPageFetch {
     url: String,
@@ -1539,24 +1522,20 @@ fn header_pairs(headers: Vec<Vec<String>>) -> rquickjs::Result<Vec<(String, Stri
         .collect()
 }
 
-/// One synchronous page request. `None` is a network error. A negative status
-/// is the XHR timeout event. `data:` is decoded here, the same way an async
-/// dial short-circuits before the carrier.
+/// One synchronous page request. `None` is a network error, which includes
+/// the carrier deadline: a synchronous request has no `timeout` attribute to
+/// report a timeout event for
+/// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>). `data:` is
+/// decoded here, the same way an async dial short-circuits before the
+/// carrier.
 fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchList> {
     if request.url.starts_with("data:") {
         let (content_type, body) = crate::engine::decode_data_url_bounded(&request.url)?;
-        let headers = vec![("content-type".to_owned(), content_type.clone())];
-        let sniffed = fetch_content_type(Some(&content_type), &body, &headers);
-        return Some(sync_fetch_value(
-            200,
-            body,
-            request.url,
-            sniffed,
-            headers
-                .into_iter()
-                .map(|(name, value)| vec![name, value])
-                .collect(),
-        ));
+        // The data: URL processor yields a MIME type for every URL, and the
+        // response header list carries it
+        // (<https://fetch.spec.whatwg.org/#data-url-processor>).
+        let headers = vec![vec!["content-type".to_owned(), content_type]];
+        return Some(sync_fetch_value(200, body, request.url, headers));
     }
     let Ok(parsed) = url::Url::parse(&request.url) else {
         return None;
@@ -1577,27 +1556,18 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         timeout_ms: u64::from(millis(request.timeout)),
     });
     match outcome {
-        Ok(outcome) => {
-            let content_type = fetch_content_type(
-                outcome.content_type.as_deref(),
-                &outcome.body,
-                &outcome.headers,
-            );
-            Some(sync_fetch_value(
-                i32::from(outcome.status),
-                outcome.body,
-                outcome.final_url,
-                content_type,
-                outcome
-                    .headers
-                    .into_iter()
-                    .map(|(name, value)| vec![name, value])
-                    .collect(),
-            ))
-        }
-        Err(crate::protocol::DialFailure::Timeout) => {
-            Some(sync_fetch_value(-1, Vec::new(), String::new(), String::new(), Vec::new()))
-        }
+        // The header list stays as served; nothing is sniffed into it
+        // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
+        Ok(outcome) => Some(sync_fetch_value(
+            i32::from(outcome.status),
+            outcome.body,
+            outcome.final_url,
+            outcome
+                .headers
+                .into_iter()
+                .map(|(name, value)| vec![name, value])
+                .collect(),
+        )),
         Err(_) => None,
     }
 }
@@ -1607,10 +1577,9 @@ fn sync_fetch_value(
     status: i32,
     body: Vec<u8>,
     url: String,
-    content_type: String,
     headers: Vec<Vec<String>>,
 ) -> SyncFetchList {
-    rquickjs::prelude::List((status, body, url, content_type, headers))
+    rquickjs::prelude::List((status, body, url, headers))
 }
 
 /// The `Referer` header for a page `fetch()` to `request_url`, decided at

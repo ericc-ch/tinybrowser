@@ -539,6 +539,7 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
         "__tb_resolved_style",
         rquickjs::prelude::Func::from(resolved_style),
     )?;
+    parsing::install_xhr_parse(ctx)?;
     cssom_host::install(ctx)?;
     Ok(())
 }

@@ -12,7 +12,7 @@ use crate::js::world::Handle;
 
 use markup5ever::{LocalName, QualName};
 
-use rquickjs::{Ctx, Result, Value, class::Trace};
+use rquickjs::{Ctx, Exception, Result, Value, class::Trace, prelude::Func};
 
 /// `DOMImplementation` as a platform object
 /// (<https://dom.spec.whatwg.org/#interface-domimplementation>).
@@ -271,43 +271,95 @@ impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
         source: rquickjs::String<'js>,
         type_: dom_parser_generated::DOMParserSupportedType,
     ) -> Result<Value<'js>> {
-        // A lone surrogate in the source is replaced with U+FFFD rather than
-        // failing conversion: XML parsing observes the replacement, so the
-        // document reports it in text
-        // (<https://crbug.com/40814739>).
-        let source = String::from_utf16_lossy(&source.to_utf16()?);
-        let content_type = type_.as_str();
-        // `DOMParser` parses with scripting disabled
-        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
-        // DOMParser documents never render: share fonts, skip UA sheets.
-        let font_ctx = world(&ctx)?.borrow().runtime.font_ctx.clone();
-        let base = self.url.parse::<url::Url>().map_or_else(
-            |_| crate::render::INVALID_BASE_URL.to_owned(),
-            |url| crate::render::blitz_base_url(&url),
-        );
-        let mut parsed = if content_type == "text/html" {
-            let mut parsed = crate::parse_html(
-                &source,
-                blitz_dom::DocumentConfig {
-                    base_url: Some(base),
-                    font_ctx: Some(font_ctx),
-                    ua_stylesheets: Vec::new(),
-                    ..blitz_dom::DocumentConfig::default()
-                },
-            );
-            parsed.content_type = content_type;
-            parsed.ready_state = crate::ReadyState::Complete;
-            parsed
-        } else {
-            crate::xml::parse_document(&source, content_type, base, font_ctx)
-        };
         // The instance's constructing realm decides the URL, never the
-        // caller and never a forged argument: cross-realm method calls parse
-        // with the parser's environment, and the reachable native takes no
-        // URL from script at all.
-        parsed.url = Some(self.url.clone());
-        wrap_new_document(&ctx, parsed)
+        // caller: cross-realm method calls parse with the parser's
+        // environment.
+        parse_string_document(&ctx, &source, type_.as_str(), &self.url)
     }
+}
+
+/// Parses `source` as `content_type` with scripting disabled and stamps the
+/// document with `url`. Shared by `DOMParser.parseFromString`, whose URL is
+/// the constructing realm's, and the XHR document response, whose URL is the
+/// response's
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>,
+/// <https://xhr.spec.whatwg.org/#document-response>).
+fn parse_string_document<'js>(
+    ctx: &Ctx<'js>,
+    source: &rquickjs::String<'js>,
+    content_type: &'static str,
+    url: &str,
+) -> Result<Value<'js>> {
+    // A lone surrogate in the source is replaced with U+FFFD rather than
+    // failing conversion: XML parsing observes the replacement, so the
+    // document reports it in text
+    // (<https://crbug.com/40814739>).
+    let source = String::from_utf16_lossy(&source.to_utf16()?);
+    // Parsed documents never render: share fonts, skip UA sheets.
+    let font_ctx = world(ctx)?.borrow().runtime.font_ctx.clone();
+    let base = url.parse::<url::Url>().map_or_else(
+        |_| crate::render::INVALID_BASE_URL.to_owned(),
+        |url| crate::render::blitz_base_url(&url),
+    );
+    let mut parsed = if content_type == "text/html" {
+        let mut parsed = crate::parse_html(
+            &source,
+            blitz_dom::DocumentConfig {
+                base_url: Some(base),
+                font_ctx: Some(font_ctx),
+                ua_stylesheets: Vec::new(),
+                ..blitz_dom::DocumentConfig::default()
+            },
+        );
+        parsed.content_type = content_type;
+        parsed.ready_state = crate::ReadyState::Complete;
+        parsed
+    } else {
+        crate::xml::parse_document(&source, content_type, base, font_ctx)
+    };
+    parsed.url = Some(url.to_owned());
+    wrap_new_document(ctx, parsed)
+}
+
+/// Installs the XHR document-response parser. The `DOMParser` native takes
+/// no URL from script; this one takes the response URL, which the host
+/// supplied with the response, so a page cannot forge a document URL it did
+/// not fetch
+/// (<https://xhr.spec.whatwg.org/#document-response>).
+pub(super) fn install_xhr_parse(ctx: &Ctx<'_>) -> Result<()> {
+    crate::js::bridge::object(ctx)?.set("__tbXhrParseDocument", Func::from(xhr_parse_document))?;
+    Ok(())
+}
+
+/// Parses an XHR response body as `content_type` and stamps the document
+/// with the response URL. The shim only passes the five response-XML types;
+/// anything else is a host-contract violation, reported the way a failed
+/// parse is: the shim treats a throw as no document.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn xhr_parse_document<'js>(
+    ctx: Ctx<'js>,
+    source: rquickjs::String<'js>,
+    content_type: String,
+    url: String,
+) -> Result<Value<'js>> {
+    // `parse_document` stores the type, so it must be a static known type.
+    let content_type: &'static str = match content_type.as_str() {
+        "text/html" => "text/html",
+        "text/xml" => "text/xml",
+        "application/xml" => "application/xml",
+        "application/xhtml+xml" => "application/xhtml+xml",
+        "image/svg+xml" => "image/svg+xml",
+        _ => {
+            return Err(Exception::throw_type(
+                &ctx,
+                "Unknown XML response content type.",
+            ));
+        }
+    };
+    parse_string_document(&ctx, &source, content_type, &url)
 }
 
 /// Wraps the native `DOMParser` so every instance remembers the URL of the
