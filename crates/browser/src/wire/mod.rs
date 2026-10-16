@@ -576,6 +576,7 @@ mod tests {
                         content_type: None,
                         headers: Vec::new(),
                         referrer: None,
+                        timeout_ms: 0,
                     })),
                 },
             },

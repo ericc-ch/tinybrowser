@@ -932,6 +932,7 @@ impl JsRealm {
                 crate::sniff::extract_mime_type(&value).unwrap_or_default()
             }),
         )?;
+        install_sync_fetch(ctx, world)?;
         Self::install_csp_host_functions(ctx, world)?;
         bridge::object(ctx)?.set(
             "__queueFetch",
@@ -943,13 +944,7 @@ impl JsRealm {
                       content_type: Option<String>,
                       headers: Vec<Vec<String>>,
                       referrer: Option<String>| {
-                    let headers = headers
-                        .into_iter()
-                        .map(|field| match field.as_slice() {
-                            [name, value] => Ok((name.clone(), value.clone())),
-                            _ => Err(rquickjs::Error::new_from_js("array", "header pair")),
-                        })
-                        .collect::<rquickjs::Result<Vec<_>>>()?;
+                    let headers = header_pairs(headers)?;
                     fetches.borrow_mut().push(PendingJsFetch {
                         url,
                         js_id,
@@ -967,13 +962,13 @@ impl JsRealm {
     }
 
     /// The CSP checks the shim calls where the Rust choke points cannot run:
-    /// evaluation reads the initiating document's policy
-    /// (<https://w3c.github.io/webappsec-csp/#should-block-inline>).
+    /// evaluation, and a synchronous XHR that cannot reach the dial queue.
     fn install_csp_host_functions(
         ctx: &Ctx<'_>,
         world: &Rc<RefCell<World>>,
     ) -> Result<(), JsError> {
         let eval_world = world.clone();
+        let csp_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbCspAllowsEval",
             Func::from(move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
@@ -999,6 +994,37 @@ impl JsRealm {
                     }
                 }
                 Ok(!crate::csp::blocks(&violations))
+            }),
+        )?;
+        // A synchronous XHR cannot reach the dial queue's connect check, so
+        // the shim asks this hook instead and the drain dispatches the
+        // queued violations
+        // (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
+        bridge::object(ctx)?.set(
+            "__tbCspAllowsConnect",
+            Func::from(move |url: String| {
+                let Ok(url) = url::Url::parse(&url) else {
+                    return false;
+                };
+                let mut world = csp_world.borrow_mut();
+                let violations = world.csp.check_request(
+                    &world.origin,
+                    &world.document_url,
+                    &url,
+                    crate::csp::Destination::Connect,
+                    None,
+                );
+                let blocked = crate::csp::blocks(&violations);
+                if blocked {
+                    let target = world.with_main_document(|parsed| crate::dom::tree::NodeId {
+                        document: parsed.id,
+                        node: parsed.document.base.root_node().id,
+                    });
+                    if let Some(target) = target {
+                        world.pending_csp_violations.push((target, violations));
+                    }
+                }
+                !blocked
             }),
         )?;
         Ok(())
@@ -1438,6 +1464,122 @@ impl Drop for ClearInterrupt<'_> {
     fn drop(&mut self) {
         self.runtime.set_interrupt_handler(None);
     }
+}
+
+/// Array `__tbSyncFetch` returns to the XHR shim: status, body, final URL,
+/// and the response header list.
+type SyncFetchList = rquickjs::prelude::List<(i32, Vec<u8>, String, Vec<Vec<String>>)>;
+
+struct SyncPageFetch {
+    url: String,
+    method: String,
+    body: Vec<u8>,
+    content_type: Option<String>,
+    headers: Vec<(String, String)>,
+    referrer: Option<String>,
+    timeout: f64,
+}
+
+/// `__tbSyncFetch`: one page request that finishes before `send` returns.
+fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    let sync_world = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbSyncFetch",
+        Func::from(
+            move |url: String,
+                  method: String,
+                  body: Vec<u8>,
+                  content_type: Option<String>,
+                  headers: Vec<Vec<String>>,
+                  referrer: Option<String>,
+                  timeout_ms: f64| {
+                let headers = header_pairs(headers)?;
+                Ok::<_, rquickjs::Error>(sync_page_fetch(
+                    &sync_world.borrow(),
+                    SyncPageFetch {
+                        url,
+                        method,
+                        body,
+                        content_type,
+                        headers,
+                        referrer,
+                        timeout: timeout_ms,
+                    },
+                ))
+            },
+        ),
+    )?;
+    Ok(())
+}
+
+fn header_pairs(headers: Vec<Vec<String>>) -> rquickjs::Result<Vec<(String, String)>> {
+    headers
+        .into_iter()
+        .map(|field| match field.as_slice() {
+            [name, value] => Ok((name.clone(), value.clone())),
+            _ => Err(rquickjs::Error::new_from_js("array", "header pair")),
+        })
+        .collect()
+}
+
+/// One synchronous page request. `None` is a network error, which includes
+/// the carrier deadline: a synchronous request has no `timeout` attribute to
+/// report a timeout event for
+/// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>). `data:` is
+/// decoded here, the same way an async dial short-circuits before the
+/// carrier.
+fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchList> {
+    if request.url.starts_with("data:") {
+        let (content_type, body) = crate::engine::decode_data_url_bounded(&request.url)?;
+        // The data: URL processor yields a MIME type for every URL, and the
+        // response header list carries it
+        // (<https://fetch.spec.whatwg.org/#data-url-processor>).
+        let headers = vec![vec!["content-type".to_owned(), content_type]];
+        return Some(sync_fetch_value(200, body, request.url, headers));
+    }
+    let Ok(parsed) = url::Url::parse(&request.url) else {
+        return None;
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    let outcome = world.runtime.services.dial_sync(crate::protocol::DialRequest {
+        kind: crate::protocol::DialKind::JsFetch,
+        url: request.url,
+        initiator: world.document_url.to_string(),
+        read_body: true,
+        method: request.method,
+        body: request.body,
+        content_type: request.content_type,
+        headers: request.headers,
+        referrer: request.referrer,
+        timeout_ms: u64::from(millis(request.timeout)),
+    });
+    match outcome {
+        // The header list stays as served; nothing is sniffed into it
+        // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
+        Ok(outcome) => Some(sync_fetch_value(
+            i32::from(outcome.status),
+            outcome.body,
+            outcome.final_url,
+            outcome
+                .headers
+                .into_iter()
+                .map(|(name, value)| vec![name, value])
+                .collect(),
+        )),
+        Err(_) => None,
+    }
+}
+
+/// One synchronous fetch result as the array `__tbSyncFetch` returns.
+fn sync_fetch_value(
+    status: i32,
+    body: Vec<u8>,
+    url: String,
+    headers: Vec<Vec<String>>,
+) -> SyncFetchList {
+    rquickjs::prelude::List((status, body, url, headers))
 }
 
 /// The `Referer` header for a page `fetch()` to `request_url`, decided at
