@@ -109,7 +109,7 @@ impl Document {
             DialContext::BlitzResource { .. }
             | DialContext::JsFetch { .. }
             | DialContext::CspReport => false,
-        }) || self.classic_fetch_in_flight
+        }) || self.parser_blocked_script.is_some()
             || self.frame_load_in_flight
             || self.active_buffer.is_some()
             || self.world.borrow().main_ready_state() != crate::ReadyState::Complete

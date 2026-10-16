@@ -392,7 +392,11 @@ pub(crate) struct Document {
     apply_mime_sniff: bool,
     /// `nosniff` and whether this body came from HTTP.
     mime_guard: crate::sniff::MimeGuard,
-    classic_fetch_in_flight: bool,
+    /// The parser-inserted script the parser waits for, if any. A dynamic
+    /// script that finishes first must not resume the walk: the synchronous
+    /// scripts after a parser-inserted `src` run only once it executes
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    parser_blocked_script: Option<crate::dom::tree::NodeId>,
     deferred_modules: Vec<(crate::dom::tree::NodeId, crate::js::ScriptSource)>,
     stop: Arc<crate::js::Stop>,
     /// `frame-src` redirect violations to fire in the embedding document.
@@ -492,7 +496,7 @@ impl Document {
             sniff_header: Vec::new(),
             apply_mime_sniff: false,
             mime_guard: crate::sniff::MimeGuard::default(),
-            classic_fetch_in_flight: false,
+            parser_blocked_script: None,
             deferred_modules: Vec::new(),
             stop: Arc::clone(&runtime.stop),
         }
@@ -1537,7 +1541,7 @@ impl Document {
             .sum::<usize>();
         world.pending_html_writes.clear();
         world.release_stream_bytes(bytes);
-        self.classic_fetch_in_flight = false;
+        self.parser_blocked_script = None;
         self.deferred_modules.clear();
     }
 
@@ -2250,7 +2254,7 @@ impl Document {
         if crate::csp::blocks(&violations) {
             return false;
         }
-        self.classic_fetch_in_flight = true;
+        self.parser_blocked_script = Some(id);
         let initiator = self.url.clone();
         let mut dial = QueuedDial::get(
             DialContext::ClassicScript {
@@ -2343,7 +2347,14 @@ impl Document {
                     status: outcome.status,
                 });
                 if epoch == self.js_epoch {
-                    self.classic_fetch_in_flight = false;
+                    // Only the script the parser waits for resumes the walk.
+                    // Any other completion still runs its load steps, but the
+                    // walk stays paused until the blocking fetch settles.
+                    let unblocks_parser =
+                        self.parser_blocked_script.is_none_or(|waiting| waiting == element);
+                    if unblocks_parser {
+                        self.parser_blocked_script = None;
+                    }
                     // A redirect may have landed outside `script-src`. The
                     // network refuses that hop; this is the report, and the
                     // check for a host that already followed.
@@ -2369,7 +2380,9 @@ impl Document {
                     } else {
                         self.fire_js(|js| js.fire_node_error(element));
                     }
-                    self.resume_scripts();
+                    if unblocks_parser {
+                        self.resume_scripts();
+                    }
                 }
             }
             DialContext::FrameLoad { sequence, embedder } => {
@@ -2505,9 +2518,15 @@ impl Document {
             }
             DialContext::ClassicScript { element, epoch } => {
                 if epoch == self.js_epoch {
-                    self.classic_fetch_in_flight = false;
+                    let unblocks_parser =
+                        self.parser_blocked_script.is_none_or(|waiting| waiting == element);
+                    if unblocks_parser {
+                        self.parser_blocked_script = None;
+                    }
                     self.fire_js(|js| js.fire_node_error(element));
-                    self.resume_scripts();
+                    if unblocks_parser {
+                        self.resume_scripts();
+                    }
                 }
             }
             DialContext::FrameLoad { sequence, .. } => {
