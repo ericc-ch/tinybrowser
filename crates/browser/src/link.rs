@@ -292,6 +292,7 @@ impl RendererHandle {
             content_type: mount.content_type.clone(),
             content_security_policy: mount.content_security_policy.clone(),
             content_security_policy_report_only: mount.content_security_policy_report_only.clone(),
+            reporting_endpoints: mount.reporting_endpoints.clone(),
             no_sniff: mount.no_sniff,
             http_response: mount.http_response,
             history: mount.history.clone(),

@@ -59,7 +59,7 @@ pub(super) async fn run(
                 Polled::Empty => {}
                 Polled::Received(received) => {
                     if !handle_host(
-                        received,
+                        *received,
                         &mut engines,
                         &mut responses,
                         outbox,
@@ -337,15 +337,17 @@ enum Drained {
 enum Polled {
     /// No frame is waiting.
     Empty,
-    /// A frame, or `None` when the inbox is closed.
-    Received(Option<ToRenderer>),
+    /// A frame, or `None` when the inbox is closed. Boxed: a response start
+    /// carries headers and history, and the unboxed form trips
+    /// `large_enum_variant` next to the empty arm.
+    Received(Box<Option<ToRenderer>>),
 }
 
 /// Reads a host frame if one is already queued.
 async fn poll_inbox(inbox: &mut exchange::Receiver<ToRenderer>) -> Polled {
     tokio::select! {
         biased;
-        received = inbox.recv() => Polled::Received(received),
+        received = inbox.recv() => Polled::Received(Box::new(received)),
         () = ready(()) => Polled::Empty,
     }
 }
@@ -431,6 +433,7 @@ impl ResponseStreams {
                 content_security_policy_report_only: response
                     .content_security_policy_report_only
                     .clone(),
+                reporting_endpoints: response.reporting_endpoints.clone(),
                 no_sniff: response.no_sniff,
                 http_response: response.http_response,
                 history: response.history.clone(),

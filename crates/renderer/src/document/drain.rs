@@ -105,7 +105,10 @@ impl Document {
             DialContext::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
             DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
             // Blitz tracks its own critical resources; ours never gate load.
-            DialContext::BlitzResource { .. } | DialContext::JsFetch { .. } => false,
+            // Reports are fire-and-forget and never gate load either.
+            DialContext::BlitzResource { .. }
+            | DialContext::JsFetch { .. }
+            | DialContext::CspReport => false,
         }) || self.classic_fetch_in_flight
             || self.frame_load_in_flight
             || self.active_buffer.is_some()

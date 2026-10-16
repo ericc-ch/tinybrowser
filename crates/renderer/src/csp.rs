@@ -27,6 +27,18 @@ pub(crate) enum Disposition {
     Report,
 }
 
+impl Disposition {
+    /// `"enforce"` or `"report"`, as the legacy report body spells it
+    /// (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Report => "report",
+        }
+    }
+}
+
 /// One parsed policy: directive names in source order, first occurrence wins.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Policy {
@@ -51,6 +63,18 @@ pub(crate) struct Violation {
     pub blocked_uri: String,
     /// First 40 characters of an inline script or style, when applicable.
     pub sample: Option<String>,
+    /// Stripped URL of the protected resource, reported as `document-uri`
+    /// (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
+    pub document_uri: String,
+    /// `report-uri` endpoints of the violated policy, resolved against the
+    /// document URL when the report is sent
+    /// (<https://w3c.github.io/webappsec-csp/#directive-report-uri>).
+    pub report_uris: Vec<String>,
+    /// `report-to` endpoint names of the violated policy. A name the
+    /// document's `Reporting-Endpoints` header defines takes the report as a
+    /// Reporting API `csp-violation` POST and suppresses `report-uri`
+    /// (<https://w3c.github.io/webappsec-csp/#directive-report-to>).
+    pub report_to: Vec<String>,
 }
 
 impl Violation {
@@ -122,7 +146,7 @@ pub(crate) enum Destination {
 
 /// The directive that decides a check
 /// (<https://w3c.github.io/webappsec-csp/#effective-directive>).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Effective {
     ScriptSrcElem,
     ScriptSrcAttr,
@@ -215,6 +239,103 @@ pub(crate) struct ScriptRequest<'a> {
     pub parser_inserted: bool,
 }
 
+/// `blockedURI` for a request violation: a non-HTTP(S) scheme reports
+/// just the scheme; a cross-origin `frame-src` violation reports the
+/// origin, so the page never learns the framed path; otherwise the URL
+/// without fragment or credentials
+/// (<https://w3c.github.io/webappsec-csp/#violation-blocked-uri>,
+/// <https://crbug.com/633306>).
+fn blocked_uri(origin: &Origin, effective: Effective, url: &Url) -> String {
+    if effective == Effective::FrameSrc && url.origin() != *origin {
+        let port = url
+            .port_or_known_default()
+            .map_or_else(String::new, |port| format!(":{port}"));
+        return format!(
+            "{}://{}{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            port
+        );
+    }
+    strip_url(url)
+}
+
+/// A URL for use in violation reports: a non-HTTP(S) scheme reports just
+/// the scheme, otherwise the URL without fragment or credentials
+/// (<https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>).
+fn strip_url(url: &Url) -> String {
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return url.scheme().to_owned();
+    }
+    let mut clean = url.clone();
+    clean.set_fragment(None);
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean.as_str().to_owned()
+}
+
+/// `report-uri` endpoints of `policy`, in order. The report goes to every
+/// endpoint; meta-delivered policies never carry one.
+fn report_uris(policy: &Policy) -> Vec<String> {
+    policy
+        .directives
+        .iter()
+        .find(|(name, _)| name == "report-uri")
+        .map_or_else(Vec::new, |(_, values)| values.clone())
+}
+
+/// `report-to` endpoint names of `policy`, in order. The report goes to the
+/// first name the document's `Reporting-Endpoints` header defines, and that
+/// delivery suppresses `report-uri`; meta-delivered policies never carry one.
+fn report_to(policy: &Policy) -> Vec<String> {
+    policy
+        .directives
+        .iter()
+        .find(|(name, _)| name == "report-to")
+        .map_or_else(Vec::new, |(_, values)| values.clone())
+}
+
+/// Endpoint names and URLs from the response's `Reporting-Endpoints`
+/// headers, in order (<https://w3c.github.io/reporting/#header>).
+#[must_use]
+pub(crate) fn reporting_endpoints(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let Some(combined) = combined_header(headers, "reporting-endpoints") else {
+        return Vec::new();
+    };
+    parse_reporting_endpoints_value(&combined)
+}
+
+/// Endpoint names and URLs from one combined `Reporting-Endpoints` value.
+#[must_use]
+pub(crate) fn parse_reporting_endpoints_value(combined: &str) -> Vec<(String, String)> {
+    let mut endpoints = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut items = Vec::new();
+    for c in combined.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                current.push(c);
+            }
+            ',' if !quoted => {
+                items.push(std::mem::take(&mut current));
+            }
+            c => current.push(c),
+        }
+    }
+    items.push(current);
+    for item in items {
+        let (name, url) = item.split_once('=').unwrap_or((item.as_str(), ""));
+        let name = name.trim().to_owned();
+        let url = url.trim().trim_matches('"').to_owned();
+        if !name.is_empty() && !url.is_empty() {
+            endpoints.push((name, url));
+        }
+    }
+    endpoints
+}
+
 impl List {
     /// Header policies from a navigation response. Absent headers yield an
     /// empty list, which allows every request.
@@ -239,12 +360,15 @@ impl List {
     }
 
     /// Appends one `meta` policy. Report-only is not delivered by `meta`.
-    /// `report-uri`, `frame-ancestors`, and `sandbox` are dropped
+    /// `report-uri`, `report-to`, `frame-ancestors`, and `sandbox` are dropped
     /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
     pub(crate) fn push_meta(&mut self, content: &str) {
         let mut policy = parse_serialized(content, Source::Meta, Disposition::Enforce);
         policy.directives.retain(|(name, _)| {
-            !matches!(name.as_str(), "report-uri" | "frame-ancestors" | "sandbox")
+            !matches!(
+                name.as_str(),
+                "report-uri" | "report-to" | "frame-ancestors" | "sandbox"
+            )
         });
         if !policy.directives.is_empty() {
             self.policies.push(policy);
@@ -285,7 +409,7 @@ impl List {
     ) -> Vec<Violation> {
         let mut violations =
             self.violations(origin, document_url, response_url, destination, None, 1);
-        let blocked = blocked_url.as_str().to_owned();
+        let blocked = blocked_uri(origin, destination.effective(), blocked_url);
         for violation in &mut violations {
             violation.blocked_uri.clone_from(&blocked);
         }
@@ -317,8 +441,11 @@ impl List {
                     effective_directive: effective.name().to_owned(),
                     original_policy: policy.serialized.clone(),
                     disposition: policy.disposition,
-                    blocked_uri: url.as_str().to_owned(),
+                    blocked_uri: blocked_uri(origin, effective, url),
                     sample: None,
+                    document_uri: strip_url(document_url),
+                    report_uris: report_uris(policy),
+                    report_to: report_to(policy),
                 });
             }
         }
@@ -329,7 +456,11 @@ impl List {
     /// produces
     /// (<https://w3c.github.io/webappsec-csp/#should-elements-inline-type-behavior-be-blocked-by-content-security-policy>).
     #[must_use]
-    pub(crate) fn check_inline(&self, inline: &InlineScript<'_>) -> Vec<Violation> {
+    pub(crate) fn check_inline(
+        &self,
+        document_url: &Url,
+        inline: &InlineScript<'_>,
+    ) -> Vec<Violation> {
         let effective = inline.effective();
         let mut violations = Vec::new();
         for policy in &self.policies {
@@ -340,6 +471,9 @@ impl List {
                     disposition: policy.disposition,
                     blocked_uri: inline.blocked_uri(),
                     sample: Some(inline.sample()),
+                    document_uri: strip_url(document_url),
+                    report_uris: report_uris(policy),
+                    report_to: report_to(policy),
                 });
             }
         }

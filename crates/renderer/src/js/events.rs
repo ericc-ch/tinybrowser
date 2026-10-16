@@ -1649,13 +1649,16 @@ fn handler_attribute_allowed<'js>(
     let violations = {
         let world = bindings::world(ctx)?;
         let world = world.borrow();
-        world.csp.check_inline(&crate::csp::InlineScript {
-            source,
-            nonce: "",
-            nonceable: false,
-            parser_inserted: false,
-            kind: crate::csp::InlineKind::ScriptAttribute,
-        })
+        world.csp.check_inline(
+            &world.document_url,
+            &crate::csp::InlineScript {
+                source,
+                nonce: "",
+                nonceable: false,
+                parser_inserted: false,
+                kind: crate::csp::InlineKind::ScriptAttribute,
+            },
+        )
     };
     if !violations.is_empty() {
         bindings::fire_csp_violations(ctx, id, &violations)?;

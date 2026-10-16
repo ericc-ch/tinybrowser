@@ -178,6 +178,11 @@ impl Engine {
                 http: head.http_response,
             },
         );
+        document.reporting_endpoints = head
+            .reporting_endpoints
+            .as_deref()
+            .map(crate::csp::parse_reporting_endpoints_value)
+            .unwrap_or_default();
         Ok(())
     }
 

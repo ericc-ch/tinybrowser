@@ -109,6 +109,10 @@ pub(crate) enum DialContext {
         /// `style-src-elem`, `img-src`, or `font-src` for this fetch.
         destination: Option<crate::csp::Destination>,
     },
+    /// A `report-uri` violation report. The response is dropped; reports
+    /// never gate load and are never CSP-checked themselves
+    /// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+    CspReport,
 }
 
 /// One dial waiting to start, with the URL and initiator it runs under.
@@ -361,6 +365,11 @@ pub(crate) struct Document {
     /// with the response headers. A script's `document.open()` leaves it
     /// unset so the existing policy survives.
     csp_from_response: bool,
+    /// Endpoint names and URLs from the navigation response's
+    /// `Reporting-Endpoints` headers. A violated policy's `report-to`
+    /// directive resolves its first known name here
+    /// (<https://w3c.github.io/reporting/#header>).
+    pub(crate) reporting_endpoints: Vec<(String, String)>,
     /// First 1445 raw response bytes, the MIME sniff resource header.
     sniff_header: Vec<u8>,
     /// Whether [`Document::finish_parse`] runs the MIME sniffing algorithm.
@@ -463,6 +472,7 @@ impl Document {
             response_policy: crate::csp::List::default(),
             embedder_csp_reports: Vec::new(),
             csp_from_response: false,
+            reporting_endpoints: Vec::new(),
             sniff_header: Vec::new(),
             apply_mime_sniff: false,
             mime_guard: crate::sniff::MimeGuard::default(),
@@ -864,7 +874,7 @@ impl Document {
         if script.is_empty() {
             return;
         }
-        let violations = Self::navigation_script_violations(policy, source);
+        let violations = Self::navigation_script_violations(policy, &self.url, source);
         if !violations.is_empty()
             && let Some(target) = self.document_node()
         {
@@ -1144,6 +1154,11 @@ impl Document {
             self.viewport_size = (width, height);
         }
         self.world.borrow_mut().history = mount.history.clone();
+        self.reporting_endpoints = mount
+            .reporting_endpoints
+            .as_deref()
+            .map(crate::csp::parse_reporting_endpoints_value)
+            .unwrap_or_default();
         self.load_response_body(
             &url,
             mount.content_type.as_deref(),
@@ -1847,26 +1862,33 @@ impl Document {
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
-        world.csp.check_inline(&crate::csp::InlineScript {
-            source,
-            nonce: &nonce,
-            nonceable,
-            parser_inserted,
-            kind: crate::csp::InlineKind::Script,
-        })
+        world.csp.check_inline(
+            &self.url,
+            &crate::csp::InlineScript {
+                source,
+                nonce: &nonce,
+                nonceable,
+                parser_inserted,
+                kind: crate::csp::InlineKind::Script,
+            },
+        )
     }
 
     fn navigation_script_violations(
         policy: &crate::csp::List,
+        document_url: &Url,
         source: &str,
     ) -> Vec<crate::csp::Violation> {
-        policy.check_inline(&crate::csp::InlineScript {
-            source,
-            nonce: "",
-            nonceable: false,
-            parser_inserted: false,
-            kind: crate::csp::InlineKind::Navigation,
-        })
+        policy.check_inline(
+            document_url,
+            &crate::csp::InlineScript {
+                source,
+                nonce: "",
+                nonceable: false,
+                parser_inserted: false,
+                kind: crate::csp::InlineKind::Navigation,
+            },
+        )
     }
 
     pub(in crate::document) fn script_url_violations(
@@ -1904,7 +1926,36 @@ impl Document {
             })
     }
 
-    /// Dispatches the `securitypolicyviolation` events a check produced.
+    /// A JSON string literal: `"` and `\` plus the control escapes a report
+    /// body needs. The report fields are URLs and policy text, so full
+    /// Unicode passes through unescaped.
+    fn json_string(value: &str) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for c in value.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// Dispatches the `securitypolicyviolation` events a check produced,
+    /// and queues the legacy `report-uri` POSTs. Reports are fire-and-forget
+    /// dials: the response is dropped, they never gate load, and they carry
+    /// no CSP gate of their own, so a restrictive policy cannot silence its
+    /// own reports
+    /// (<https://w3c.github.io/webappsec-csp/#report-violation>).
     pub(crate) fn fire_csp_violations(
         &mut self,
         target: crate::dom::tree::NodeId,
@@ -1914,6 +1965,100 @@ impl Document {
             return;
         }
         self.fire_js(|js| js.fire_csp_violations(target, violations));
+        for violation in violations {
+            // A `report-to` name the response's `Reporting-Endpoints`
+            // defined takes the report as a Reporting API `csp-violation`
+            // POST and suppresses `report-uri`
+            // (<https://w3c.github.io/webappsec-csp/#directive-report-to>).
+            if let Some(url) = self.reporting_url(&violation.report_to) {
+                let body = Self::reporting_api_body(violation);
+                self.queue_report(url, body, "application/reports+json");
+                continue;
+            }
+            if violation.report_uris.is_empty() {
+                continue;
+            }
+            // The legacy `report-uri` serialization, built without a JSON
+            // dependency: every field is a string except `status-code`
+            // (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
+            let body = format!(
+                "{{\"csp-report\":{{\"document-uri\":{},\"referrer\":\"\",\"blocked-uri\":{},\"effective-directive\":{},\"violated-directive\":{},\"original-policy\":{},\"disposition\":{},\"status-code\":0,\"script-sample\":{}}}}}",
+                Self::json_string(&violation.document_uri),
+                Self::json_string(&violation.blocked_uri),
+                Self::json_string(&violation.effective_directive),
+                Self::json_string(&violation.effective_directive),
+                Self::json_string(&violation.original_policy),
+                Self::json_string(violation.disposition.as_str()),
+                Self::json_string(violation.sample.as_deref().unwrap_or_default()),
+            )
+            .into_bytes();
+            for endpoint in &violation.report_uris {
+                let Ok(url) = self.url.join(endpoint) else {
+                    continue;
+                };
+                if !matches!(url.scheme(), "http" | "https") {
+                    continue;
+                }
+                self.queue_report(url, body.clone(), "application/csp-report");
+            }
+        }
+    }
+
+    /// First `Reporting-Endpoints` URL named by `report-to`, resolved
+    /// against the document URL. `None` falls back to `report-uri`.
+    fn reporting_url(&self, names: &[String]) -> Option<Url> {
+        for name in names {
+            let url = self
+                .reporting_endpoints
+                .iter()
+                .find(|(endpoint, _)| endpoint == name)
+                .map(|(_, url)| url)?;
+            let Ok(url) = self.url.join(url) else {
+                continue;
+            };
+            if matches!(url.scheme(), "http" | "https") {
+                return Some(url);
+            }
+        }
+        None
+    }
+
+    /// Queues one violation report POST. The response is dropped and the
+    /// dial never gates load.
+    fn queue_report(&mut self, url: Url, body: Vec<u8>, content_type: &str) {
+        self.queued_dials.push(QueuedDial {
+            context: DialContext::CspReport,
+            url,
+            initiator: self.url.clone(),
+            method: "POST".to_owned(),
+            body,
+            content_type: Some(content_type.to_owned()),
+            headers: Vec::new(),
+            referrer: None,
+            csp: None,
+        });
+    }
+
+    /// The Reporting API envelope for a violation, with the
+    /// `CSPViolationReportBody` camelCase fields
+    /// (<https://w3c.github.io/webappsec-csp/#cspviolationreportbody>,
+    /// <https://w3c.github.io/reporting/#send-reports>).
+    fn reporting_api_body(violation: &crate::csp::Violation) -> Vec<u8> {
+        let sample = violation.sample.as_deref().map_or_else(
+            || "null".to_owned(),
+            Self::json_string,
+        );
+        format!(
+            "{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":\"tinybrowser\",\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":null,\"sample\":{},\"disposition\":{},\"statusCode\":0}}}}",
+            Self::json_string(&violation.document_uri),
+            Self::json_string(&violation.document_uri),
+            Self::json_string(&violation.blocked_uri),
+            Self::json_string(&violation.effective_directive),
+            Self::json_string(&violation.original_policy),
+            sample,
+            Self::json_string(violation.disposition.as_str()),
+        )
+        .into_bytes()
     }
 
     /// Runs every not-yet-executed script in tree order, stopping (returning
@@ -2163,6 +2308,8 @@ impl Document {
                         )
                         .as_deref(),
                 );
+                self.reporting_endpoints =
+                    crate::csp::reporting_endpoints(&outcome.headers);
                 self.load_frame_response(
                     &url,
                     outcome.content_type.as_deref(),
@@ -2178,6 +2325,9 @@ impl Document {
             DialContext::BlitzResource { id, destination } => {
                 self.deliver_blitz_resource(id, destination, &outcome, &request_url, redirected);
             }
+            // Fire-and-forget: the endpoint already stored the report, if it
+            // cares. A failure is invisible by design.
+            DialContext::CspReport => {}
         }
         self.adopt_js_work();
     }
@@ -2290,6 +2440,8 @@ impl Document {
                     self.settle_image_waiters(&request_url);
                 }
             }
+            // Fire-and-forget: a lost report is invisible by design.
+            DialContext::CspReport => {}
         }
         self.adopt_js_work();
     }

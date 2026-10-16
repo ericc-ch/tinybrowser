@@ -249,6 +249,11 @@ pub struct Mount {
     /// Combined `Content-Security-Policy-Report-Only` header.
     #[serde(default)]
     pub content_security_policy_report_only: Option<String>,
+    /// Combined `Reporting-Endpoints` header, when the response sent one.
+    /// A violated policy's `report-to` directive resolves its endpoint names
+    /// against it (<https://w3c.github.io/reporting/#header>).
+    #[serde(default)]
+    pub reporting_endpoints: Option<String>,
     /// `X-Content-Type-Options: nosniff` on the response.
     #[serde(default)]
     pub no_sniff: bool,
@@ -286,6 +291,10 @@ pub struct ResponseHead {
     pub content_security_policy: Option<String>,
     /// Combined `Content-Security-Policy-Report-Only` header.
     pub content_security_policy_report_only: Option<String>,
+    /// Combined `Reporting-Endpoints` header, when the response sent one.
+    /// A violated policy's `report-to` directive resolves its endpoint names
+    /// against it (<https://w3c.github.io/reporting/#header>).
+    pub reporting_endpoints: Option<String>,
     /// `X-Content-Type-Options: nosniff` on the response.
     pub no_sniff: bool,
     /// The body came from HTTP, so the Apache `text/plain` check applies.
@@ -346,6 +355,11 @@ pub enum DialKind {
     Image,
     /// A child frame's navigation.
     FrameLoad,
+    /// A legacy `report-uri` violation report POST. Fire-and-forget: the
+    /// response is dropped and the dial is never CSP-gated, so a policy
+    /// cannot silence its own reports
+    /// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+    CspReport,
 }
 
 /// One screenshot request: viewport size plus an optional crop window.

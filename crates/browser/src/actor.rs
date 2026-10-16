@@ -725,6 +725,7 @@ impl Tab {
             content_type: Some("text/html; charset=utf-8".to_owned()),
             content_security_policy: None,
             content_security_policy_report_only: None,
+            reporting_endpoints: None,
             no_sniff: false,
             http_response: false,
             body: html.as_bytes().to_vec(),
@@ -983,6 +984,7 @@ impl Tab {
             init_scripts: self.init_scripts.clone(),
             content_security_policy: None,
             content_security_policy_report_only: None,
+            reporting_endpoints: None,
             no_sniff: false,
             http_response: false,
         };
@@ -1085,6 +1087,7 @@ impl Tab {
             content_security_policy_report_only: outcome
                 .content_security_policy_report_only
                 .clone(),
+            reporting_endpoints: outcome.reporting_endpoints.clone(),
             no_sniff: outcome.no_sniff,
             http_response: true,
             body: Vec::new(),
@@ -1214,6 +1217,7 @@ fn blank_mount() -> Mount {
         content_type: Some("text/html; charset=utf-8".into()),
         content_security_policy: None,
         content_security_policy_report_only: None,
+        reporting_endpoints: None,
         no_sniff: false,
         http_response: false,
         body: b"<!doctype html><title></title>".to_vec(),
@@ -1231,7 +1235,9 @@ impl Drop for Tab {
 
 enum Wake {
     Command(Option<ServerInput<Command, Infallible>>),
-    Navigation(Option<(u64, Result<NavOutcome, DialFailure>)>),
+    // Boxed: a navigation outcome carries response bodies and headers, and
+    // the unboxed form trips `large_enum_variant` next to the small arms.
+    Navigation(Box<Option<(u64, Result<NavOutcome, DialFailure>)>>),
     Renderer(Option<(FrameId, RendererEvent)>),
     Delivery(Option<String>),
     WaiterDeadline,
@@ -1264,7 +1270,7 @@ async fn coordinator_loop(
             let events_rx = &mut tab.events_rx;
             tokio::select! {
                 command = server.recv() => Wake::Command(command),
-                navigation = dial_rx.recv() => Wake::Navigation(navigation),
+                navigation = dial_rx.recv() => Wake::Navigation(Box::new(navigation)),
                 event = next_renderer_event(events_rx) => Wake::Renderer(event),
                 delivery = next_delivery(&mut delivery_rx) => Wake::Delivery(delivery),
                 () = wait_for_deadline(deadline) => Wake::WaiterDeadline,
@@ -1292,10 +1298,12 @@ async fn coordinator_loop(
                 cancelled.remove(&id);
             }
             Wake::Command(Some(ServerInput::Notify(_)) | None) => break,
-            Wake::Navigation(Some((epoch, result))) => {
-                tab.handle_navigation(epoch, result).await;
+            Wake::Navigation(boxed) => {
+                if let Some((epoch, result)) = *boxed {
+                    tab.handle_navigation(epoch, result).await;
+                }
             }
-            Wake::Navigation(None) | Wake::WaiterDeadline => {}
+            Wake::WaiterDeadline => {}
             Wake::Renderer(Some((frame, event))) => {
                 let navigated = matches!(event, RendererEvent::Navigated { .. });
                 tab.handle_renderer_event(frame, &event).await;

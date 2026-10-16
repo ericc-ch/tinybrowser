@@ -29,6 +29,7 @@ pub(crate) struct NavOutcome {
     pub content_type: Option<String>,
     pub content_security_policy: Option<String>,
     pub content_security_policy_report_only: Option<String>,
+    pub reporting_endpoints: Option<String>,
     pub no_sniff: bool,
     pub body: net::Body,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -177,6 +178,7 @@ impl TabNetworkHandle {
         let content_security_policy = list_header(headers, "content-security-policy");
         let content_security_policy_report_only =
             list_header(headers, "content-security-policy-report-only");
+        let reporting_endpoints = list_header(headers, "reporting-endpoints");
         let no_sniff = header_nosniff(headers);
         let body = response.into_body();
         Ok(NavOutcome {
@@ -185,6 +187,7 @@ impl TabNetworkHandle {
             content_type,
             content_security_policy,
             content_security_policy_report_only,
+            reporting_endpoints,
             no_sniff,
             body,
             _permit: permits,

@@ -2082,13 +2082,16 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
-        world.csp.check_inline(&crate::csp::InlineScript {
-            source: &source,
-            nonce: &nonce,
-            nonceable,
-            parser_inserted: false,
-            kind: crate::csp::InlineKind::Script,
-        })
+        world.csp.check_inline(
+            &world.document_url,
+            &crate::csp::InlineScript {
+                source: &source,
+                nonce: &nonce,
+                nonceable,
+                parser_inserted: false,
+                kind: crate::csp::InlineKind::Script,
+            },
+        )
     };
     if !violations.is_empty() {
         super::super::fire_csp_violations(ctx, id, &violations)?;

@@ -99,6 +99,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         // Plain page subresources; no carrier policy keys off the kind
         // except for script-initiated fetches.
         DialContext::BlitzResource { .. } => DialKind::Image,
+        DialContext::CspReport => DialKind::CspReport,
     };
     DialRequest {
         kind,

@@ -119,6 +119,7 @@ impl GuestTab for Tab {
             content_type: Some("text/html; charset=utf-8".into()),
             content_security_policy: None,
             content_security_policy_report_only: None,
+            reporting_endpoints: None,
             no_sniff: false,
             http_response: false,
             body: html.into_bytes(),
@@ -292,6 +293,8 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
             DialKind::Stylesheet => FetchKind::Stylesheet,
             DialKind::Image => FetchKind::Image,
             DialKind::FrameLoad => FetchKind::FrameLoad,
+            // Unreachable: `start_dial` completes reports without a hop.
+            DialKind::CspReport => unreachable!("report-uri has no transport hop"),
         },
         url: chain.url.to_string(),
         initiator: chain
@@ -462,6 +465,20 @@ impl NetworkHost for WasmServices {
     ) -> renderer::DialCancellation {
         // A dial the component cannot shape is not a transport question, so it
         // never reaches the host.
+        // `report-uri` POSTs have no body or method on this GET-only
+        // transport (`fetch-request` carries neither), so the report is
+        // dropped here instead of sent as a bogus GET. The native carrier
+        // sends the real POST; the renderer already fired the event.
+        if request.kind == DialKind::CspReport {
+            completion(Ok(DialOutcome {
+                status: 204,
+                final_url: request.url,
+                content_type: None,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }));
+            return Box::new(|| {});
+        }
         let shaped = Url::parse(&request.url)
             .ok()
             .filter(|url| matches!(url.scheme(), "http" | "https"));

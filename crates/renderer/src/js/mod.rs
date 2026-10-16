@@ -974,13 +974,16 @@ impl JsRealm {
             Func::from(move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
                 let violations = {
                     let world = eval_world.borrow();
-                    world.csp.check_inline(&crate::csp::InlineScript {
-                        source: &source,
-                        nonce: "",
-                        nonceable: false,
-                        parser_inserted: false,
-                        kind: crate::csp::InlineKind::Evaluation,
-                    })
+                    world.csp.check_inline(
+                        &world.document_url,
+                        &crate::csp::InlineScript {
+                            source: &source,
+                            nonce: "",
+                            nonceable: false,
+                            parser_inserted: false,
+                            kind: crate::csp::InlineKind::Evaluation,
+                        },
+                    )
                 };
                 if !violations.is_empty() {
                     let target = eval_world.borrow().with_main_document(|parsed| {
