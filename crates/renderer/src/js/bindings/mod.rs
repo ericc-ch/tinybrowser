@@ -602,6 +602,7 @@ fn capture_host_primitives<'js>(
     let number: Function = globals.get("Number")?;
     let boolean: Function = globals.get("Boolean")?;
     let error: Constructor = globals.get("Error")?;
+    let eval_error: Function = globals.get("EvalError")?;
     let reflect: Object = globals.get("Reflect")?;
     let reflect_set: Function = reflect.get("set")?;
     let deliver: Function = crate::js::bridge::object(ctx)?.get("__tb_deliver_mutations")?;
@@ -616,6 +617,7 @@ fn capture_host_primitives<'js>(
     world.pristine_number = Some(Persistent::save(ctx, number));
     world.pristine_boolean = Some(Persistent::save(ctx, boolean));
     world.pristine_error = Some(Persistent::save(ctx, error));
+    world.pristine_eval_error = Some(Persistent::save(ctx, eval_error));
     world.pristine_reflect_set = Some(Persistent::save(ctx, reflect_set));
     world.pristine_queue_microtask = globals
         .get::<_, Function>("queueMicrotask")
@@ -1934,6 +1936,24 @@ mod realm_tests {
             )
             .expect("eval");
         assert_eq!(denied, "EvalError,EvalError");
+
+        // A page that swaps the `EvalError` global must not run code inside the
+        // bindings nor substitute the thrown value: the refusal uses the
+        // pristine constructor captured at install.
+        let spoofed = realm
+            .eval(
+                r#"
+                var spoof_ran = false;
+                globalThis.EvalError = function () { spoof_ran = true; return {}; };
+                var outcome = [];
+                try { eval("1"); outcome.push("ran"); }
+                catch (error) { outcome.push(error.name); }
+                outcome.push(spoof_ran);
+                outcome.join(",");
+                "#,
+            )
+            .expect("eval");
+        assert_eq!(spoofed, "EvalError,false");
 
         policy.borrow_mut().csp =
             crate::csp::List::from_headers(Some("script-src 'self' 'unsafe-eval'"), None);

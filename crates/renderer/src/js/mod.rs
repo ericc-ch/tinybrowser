@@ -1666,12 +1666,19 @@ fn eval_denied_message(violations: &[crate::csp::Violation]) -> String {
 
 /// Raises the `EvalError` the engine propagates instead of compiling a refused
 /// string (<https://tc39.es/ecma262/#sec-eval-x>).
+///
+/// The constructor is the pristine one captured at install: a page that
+/// replaces the `EvalError` global must neither run code inside the bindings
+/// nor substitute another thrown value. With no captured constructor (outside
+/// a realm), fall back to an internal error carrying the same message.
 fn throw_eval_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
-    match ctx
-        .globals()
-        .get::<_, Function>("EvalError")
-        .and_then(|constructor| constructor.call::<_, Object>((message,)))
-    {
+    let constructor = bindings::try_world(ctx)
+        .and_then(|world| world.borrow().pristine_eval_error.clone())
+        .and_then(|saved| saved.restore(ctx).ok());
+    let Some(constructor) = constructor else {
+        return Exception::throw_internal(ctx, message);
+    };
+    match constructor.call::<_, Object>((message,)) {
         Ok(error) => ctx.throw(error.into_value()),
         Err(error) => error,
     }
