@@ -428,36 +428,22 @@ impl JsRealm {
                 let Some(func) = cbs.get::<_, Option<Function>>(js_id)? else {
                     return Ok(());
                 };
+                // The header list stays as served: sniffing picks the
+                // document parser, it never adds a field to a `fetch`
+                // Response, and `blob().type` reads the header list
+                // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
                 let (status, body, url, content_type, headers) = match outcome {
-                    Some(outcome) => {
-                        let header_type = outcome
-                            .content_type
-                            .as_deref()
-                            .filter(|value| !value.is_empty());
-                        let content_type = header_type.map_or_else(
-                            || {
-                                let end = outcome.body.len().min(crate::sniff::RESOURCE_HEADER_LEN);
-                                crate::sniff::sniff_mime(
-                                    &outcome.body[..end],
-                                    None,
-                                    crate::sniff::headers_nosniff(&outcome.headers),
-                                    false,
-                                )
-                            },
-                            str::to_owned,
-                        );
-                        (
-                            i32::from(outcome.status),
-                            outcome.body,
-                            outcome.final_url,
-                            content_type,
-                            outcome
-                                .headers
-                                .into_iter()
-                                .map(|(name, value)| vec![name, value])
-                                .collect::<Vec<_>>(),
-                        )
-                    }
+                    Some(outcome) => (
+                        i32::from(outcome.status),
+                        outcome.body,
+                        outcome.final_url,
+                        outcome.content_type.unwrap_or_default(),
+                        outcome
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| vec![name, value])
+                            .collect::<Vec<_>>(),
+                    ),
                     None => (0, Vec::new(), String::new(), String::new(), Vec::new()),
                 };
                 let bytes = TypedArray::new(ctx.clone(), body)?;

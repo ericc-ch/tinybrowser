@@ -69,7 +69,12 @@ const __tbEndings = value => {
 const __tbBlobType = value => {
   if (value === undefined) return '';
   // https://w3c.github.io/FileAPI/#dfn-type
-  return host.__tbParseMimeType(String(value));
+  value = String(value);
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code > 0x7E) return '';
+  }
+  return value.toLowerCase();
 };
 const __tbBlobBytes = (converted, endings) => {
   const chunks = __tbArray.map(converted, part => typeof part === 'string'
@@ -161,6 +166,16 @@ globalThis.Blob = class Blob {
   }
 };
 Object.defineProperty(globalThis.Blob.prototype, Symbol.toStringTag, { value: 'Blob', writable: false, enumerable: false, configurable: true });
+// A Blob whose type is set directly, without the constructor's ASCII filter
+// and lowercase: `body.blob()` stores the MIME type extracted from the
+// header list (<https://fetch.spec.whatwg.org/#dom-body-blob>). Captured at
+// realm init so a page replacing `Blob` cannot reroute it.
+const __tbBlobPrototype = globalThis.Blob.prototype;
+const __tbMakeBlob = (bytes, type) => {
+  const blob = Object.create(__tbBlobPrototype);
+  __tbBlobData.set(blob, { bytes, type });
+  return blob;
+};
 // Web IDL constructor objects: `length` is the number of required arguments
 // (<https://webidl.spec.whatwg.org/#es-interface>).
 Object.defineProperty(globalThis.Blob, 'length', { value: 0, writable: false, enumerable: false, configurable: true });

@@ -1,6 +1,5 @@
 // https://xhr.spec.whatwg.org/#the-xmlhttprequest-interface
 const __tbXhrData = host.slots('tinybrowser.xhr');
-const __tbXhrBlobConstructor = globalThis.Blob;
 // Captured at realm init: the native `DOMParser` class and its prototype
 // method are installed by `bindings::install` before the web bundle
 // evaluates (`bindings/mod.rs` runs before `js/mod.rs`), and pages may
@@ -90,7 +89,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     if (data.responseType === '' || data.responseType === 'text') return this.responseText;
     if (data.state !== 4) return null;
     if (data.responseType === 'arraybuffer') return __tbBytesCopy(data.responseBytes).buffer;
-    if (data.responseType === 'blob') return new __tbXhrBlobConstructor([__tbBytesCopy(data.responseBytes)], { type: __tbApply(__tbHeadersGet, data.responseHeaders, ['content-type']) || '' });
+    if (data.responseType === 'blob') {
+      // The Blob type is the MIME type extracted from the response header
+      // list (<https://xhr.spec.whatwg.org/#the-response-attribute>).
+      const header = __tbApply(__tbHeadersGet, data.responseHeaders, ['content-type']);
+      return __tbMakeBlob(__tbBytesCopy(data.responseBytes), header === null ? '' : host.__tbParseMimeType(header));
+    }
     if (data.responseType === 'json') {
       try { return JSON.parse(__tbDecodeBytes(data.responseBytes, 'utf-8', false, false)); }
       catch (_) { return null; }

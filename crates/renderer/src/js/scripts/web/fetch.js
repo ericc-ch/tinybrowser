@@ -86,14 +86,21 @@ const __tbHeadersAppend = __tbHeadersConstructor.prototype.append;
 globalThis.Response = class Response {
   constructor(body, init) {
     const options = init === undefined ? {} : Object(init);
-    const storedBody = body === undefined || body === null ? '' : body;
+    const storedBody = body === undefined || body === null ? null : body;
+    const headers = new globalThis.Headers(options.headers);
+    // The body's type becomes the Content-Type when the header list holds
+    // none (<https://fetch.spec.whatwg.org/#dom-response>).
+    if (storedBody !== null && !headers.has('content-type')) {
+      const type = __tbBodyType(storedBody);
+      if (type !== null) headers.set('content-type', type);
+    }
     __tbResponseData.set(this, {
         body: storedBody,
         bodyUsed: false,
         status: options.status === undefined ? 200 : Number(options.status),
         statusText: options.statusText === undefined ? '' : String(options.statusText),
         url: options.url === undefined ? '' : String(options.url),
-        headers: options.headers instanceof globalThis.Headers ? options.headers : new globalThis.Headers(options.headers),
+        headers,
     });
   }
   get status() { return __tbBrand(this, __tbResponseData).status; }
@@ -109,13 +116,18 @@ globalThis.Response = class Response {
   arrayBuffer() { return __tbConsumeResponse(this).then(bytes => bytes.buffer); }
   blob() {
     const data = __tbBrand(this, __tbResponseData);
-    const type = data.headers.get('content-type');
-    return __tbConsumeResponse(this).then(bytes => new Blob([bytes], { type: type === null ? '' : type }));
+    const header = data.headers.get('content-type');
+    // The Blob type is the MIME type extracted from the header list
+    // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+    const type = header === null ? '' : host.__tbParseMimeType(header);
+    return __tbConsumeResponse(this).then(bytes => __tbMakeBlob(bytes, type));
   }
   clone() {
     const data = __tbBrand(this, __tbResponseData);
     if (data.bodyUsed) throw new TypeError('body already used');
-    return new Response(data.body, { status: data.status, statusText: data.statusText, url: data.url, headers: data.headers });
+    const copy = Object.create(globalThis.Response.prototype);
+    __tbResponseData.set(copy, { body: data.body, bodyUsed: false, status: data.status, statusText: data.statusText, url: data.url, headers: new globalThis.Headers(data.headers) });
+    return copy;
   }
 };
 const __tbConsumeResponse = response => {
@@ -125,6 +137,7 @@ const __tbConsumeResponse = response => {
   return __tbResponseBytes(data.body);
 };
 const __tbResponseBytes = async body => {
+  if (body === null) return new Uint8Array(0);
   if (body instanceof ReadableStream) {
     const chunks = [];
     let length = 0;
@@ -180,6 +193,12 @@ globalThis.Request = class Request {
     if (options.method !== undefined) method = __tbRequestMethod(options.method);
     if (options.headers !== undefined) headers = new globalThis.Headers(options.headers);
     if (options.body !== undefined) body = options.body;
+    // The init body's type becomes the Content-Type when the header list
+    // holds none (<https://fetch.spec.whatwg.org/#dom-request>).
+    if (options.body !== undefined && options.body !== null && !headers.has('content-type')) {
+      const type = __tbBodyType(options.body);
+      if (type !== null) headers.set('content-type', type);
+    }
     // A Request keeps a blob URL's data alive, so fetching it still works
     // after revokeObjectURL (<https://w3c.github.io/FileAPI/#lifeTime>).
     if (blob === null && url.indexOf('blob:') === 0) blob = __tbLookupObjectUrl(url);
@@ -194,9 +213,12 @@ globalThis.Request = class Request {
     const data = __tbBrand(this, __tbRequestData);
     if (data.bodyUsed) return Promise.reject(new TypeError('body already used'));
     data.bodyUsed = true;
-    const type = data.headers.get('content-type');
+    const header = data.headers.get('content-type');
+    // The Blob type is the MIME type extracted from the header list
+    // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+    const type = header === null ? '' : host.__tbParseMimeType(header);
     const bytes = data.body === null ? Promise.resolve(new Uint8Array(0)) : __tbResponseBytes(data.body);
-    return bytes.then(value => new Blob([value], { type: type === null ? '' : type }));
+    return bytes.then(value => __tbMakeBlob(value, type));
   }
   clone() {
     const data = __tbBrand(this, __tbRequestData);
@@ -211,16 +233,22 @@ const __tbMakeResponse = (body, status, url, type, fields) => {
   if (type && !headers.has('content-type')) headers.set('content-type', type);
   return new globalThis.Response(body, { status, url, headers });
 };
+// The type a body of a given kind contributes, or null when it has none
+// (<https://fetch.spec.whatwg.org/#concept-bodyinit-extract>).
+const __tbBodyType = body => {
+  if (body instanceof Blob) return body.type === '' ? null : body.type;
+  if (body instanceof URLSearchParams) return 'application/x-www-form-urlencoded;charset=UTF-8';
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof ReadableStream) return null;
+  return 'text/plain;charset=UTF-8';
+};
 // <https://fetch.spec.whatwg.org/#bodyinit-safely-extract>
 const __tbPageRequestBody = async body => {
   if (body === null || body === undefined) return { bytes: [], type: null };
-  if (body instanceof Blob) return { bytes: Array.from(new Uint8Array(await body.arrayBuffer())), type: body.type || null };
-  if (body instanceof ArrayBuffer) return { bytes: Array.from(new Uint8Array(body)), type: null };
-  if (ArrayBuffer.isView(body)) return { bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)), type: null };
-  if (body instanceof URLSearchParams) {
-    return { bytes: Array.from(__tbUtf8Encode(String(body))), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
-  }
-  return { bytes: Array.from(__tbUtf8Encode(String(body))), type: 'text/plain;charset=UTF-8' };
+  const type = __tbBodyType(body);
+  if (body instanceof Blob) return { bytes: Array.from(new Uint8Array(await body.arrayBuffer())), type };
+  if (body instanceof ArrayBuffer) return { bytes: Array.from(new Uint8Array(body)), type };
+  if (ArrayBuffer.isView(body)) return { bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)), type };
+  return { bytes: Array.from(__tbUtf8Encode(String(body))), type };
 };
 const __tbQueuePageRequest = (url, method, body, headers, callback) => {
   const id = ++host.__tb_fetchSeq;
