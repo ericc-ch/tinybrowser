@@ -317,6 +317,19 @@ impl NetworkHost for AssignmentServices {
             .start_dial(self.assignment, request, completion)
     }
 
+    fn dial_sync(
+        &self,
+        request: renderer::DialRequest,
+    ) -> Result<renderer::DialOutcome, renderer::DialFailure> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::Network(NetworkCall::Dial(request)),
+        ) {
+            Some(ServiceReply::Dial(outcome)) => outcome,
+            _ => Err(renderer::DialFailure::Connect),
+        }
+    }
+
     fn cookies_for(&self, url: &Url) -> String {
         match self.channel.call(
             self.assignment,

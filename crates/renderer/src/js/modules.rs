@@ -96,6 +96,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             content_type: None,
             headers: Vec::new(),
             referrer: None,
+            timeout_ms: 0,
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);

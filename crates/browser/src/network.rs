@@ -200,7 +200,12 @@ impl TabNetworkHandle {
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<DialOutcome, DialFailure> {
         let call = async {
-            let deadline = Instant::now() + PAGE_FETCH_TIMEOUT;
+            let budget = if request.timeout_ms == 0 {
+                PAGE_FETCH_TIMEOUT
+            } else {
+                PAGE_FETCH_TIMEOUT.min(Duration::from_millis(request.timeout_ms))
+            };
+            let deadline = Instant::now() + budget;
             let _global = Self::acquire(&self.permits.global, deadline).await?;
             let _tab = Self::acquire(&self.tab, deadline).await?;
             let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
