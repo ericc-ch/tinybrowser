@@ -127,5 +127,6 @@ pub(in crate::document) fn complete(
         outcome,
         request_url: dial.url.to_string(),
         csp: dial.csp.clone(),
+        ancestors: dial.ancestors.clone(),
     })
 }

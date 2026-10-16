@@ -803,11 +803,29 @@ impl Engine {
         current != next
     }
 
+    /// Ancestor document URLs nearest-first for a nested frame's `frame-ancestors`
+    /// check at commit. Empty for a top-level navigation, which skips it
+    /// (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+    fn ancestor_urls(&self, embedder: Option<FrameId>) -> Vec<Url> {
+        let mut ancestors = Vec::new();
+        let mut cursor = embedder;
+        while let Some(frame) = cursor {
+            let Some(document) = self.frames.get(&frame) else {
+                break;
+            };
+            let Ok(url) = Url::parse(document.document_url()) else {
+                break;
+            };
+            ancestors.push(url);
+            cursor = self.runtime.shared.borrow().tree.parent(frame);
+        }
+        ancestors
+    }
+
     /// Reports the embedder's `frame-src` violations and returns whether the
     /// enforced policy refuses `url`
     /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
-    fn frame_src_blocked(&mut self, embedder: FrameId, child: FrameId, url: &Url) -> bool {
-        let violations = {
+    fn frame_src_blocked(&mut self, embedder: FrameId, child: FrameId, url: &Url) -> bool {        let violations = {
             let Some(document) = self.frames.get(&embedder) else {
                 return false;
             };
@@ -952,6 +970,14 @@ impl Engine {
                         url.as_str(),
                     )
                 });
+                // Ancestor document URLs nearest-first for the child's
+                // `frame-ancestors` check at commit
+                // (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+                let ancestors = if embedder.is_some() && frame_gate.is_some() {
+                    self.ancestor_urls(embedder)
+                } else {
+                    Vec::new()
+                };
                 if let Some(document) = self.frames.get_mut(&child) {
                     document.navigate_to(
                         url,
@@ -962,7 +988,7 @@ impl Engine {
                         referrer,
                     );
                     if let (Some(embedder), Some(gate)) = (embedder, frame_gate) {
-                        document.set_pending_frame_policy(embedder, gate);
+                        document.set_pending_frame_policy(embedder, gate, ancestors);
                     }
                 }
             }

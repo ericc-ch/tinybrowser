@@ -140,6 +140,7 @@ impl Document {
                                 context: dial.context,
                                 request_url: dial.url.to_string(),
                                 csp: dial.csp.clone(),
+                                ancestors: dial.ancestors.clone(),
                                 outcome: crate::protocol::DialOutcome {
                                     status: 200,
                                     final_url: dial.url.to_string(),
@@ -423,6 +424,7 @@ impl Document {
                     headers: fetch.headers,
                     referrer: fetch.referrer,
                     csp: Some(self.redirect_gate(crate::csp::Destination::Connect)),
+                    ancestors: Vec::new(),
                 });
             } else {
                 self.record_event(RendererEvent::FetchFailed);

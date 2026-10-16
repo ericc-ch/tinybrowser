@@ -133,6 +133,11 @@ pub(crate) struct QueuedDial {
     /// Policy the network re-checks on every redirect. `None` for a top-level
     /// document navigation. A nested frame navigation carries `frame-src`.
     pub(crate) csp: Option<crate::RedirectGate>,
+    /// Ancestor document URLs nearest-first, snapshotted when a nested frame
+    /// navigation starts. The child's `frame-ancestors` policy is checked
+    /// against these at commit
+    /// (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+    pub(crate) ancestors: Vec<Url>,
 }
 
 impl QueuedDial {
@@ -148,6 +153,7 @@ impl QueuedDial {
             headers: Vec::new(),
             referrer: None,
             csp: None,
+            ancestors: Vec::new(),
         }
     }
 }
@@ -161,6 +167,9 @@ pub(crate) struct CompletedDial {
     pub(crate) request_url: String,
     /// Policy carried with the dial, used when a redirect is reported.
     pub(crate) csp: Option<crate::RedirectGate>,
+    /// Ancestor document URLs for a nested frame navigation, checked against
+    /// the response's `frame-ancestors` at commit.
+    pub(crate) ancestors: Vec<Url>,
 }
 
 /// Who feeds the active parser, and therefore who may end it.
@@ -754,14 +763,18 @@ impl Document {
             headers: Vec::new(),
             referrer,
             csp: None,
+            ancestors: Vec::new(),
         });
     }
 
-    /// Attaches the embedder's `frame-src` gate to the navigation just queued.
+    /// Attaches the embedder's `frame-src` gate to the navigation just queued,
+    /// plus the ancestor URLs the child's `frame-ancestors` policy is checked
+    /// against at commit.
     pub(crate) fn set_pending_frame_policy(
         &mut self,
         embedder: FrameId,
         gate: crate::RedirectGate,
+        ancestors: Vec<Url>,
     ) {
         let Some(dial) = self.queued_dials.last_mut() else {
             return;
@@ -774,6 +787,7 @@ impl Document {
         };
         *slot = Some(embedder);
         dial.csp = Some(gate);
+        dial.ancestors = ancestors;
     }
 
     /// Loads the frame's initial `about:blank`, inheriting `inherited_url` as
@@ -1965,6 +1979,15 @@ impl Document {
             return;
         }
         self.fire_js(|js| js.fire_csp_violations(target, violations));
+        self.queue_csp_reports(violations);
+    }
+
+    /// Queues the `report-uri` / `report-to` POSTs for violations without
+    /// firing DOM events. `frame-ancestors` response violations report this
+    /// way: they are created with a null global, so no event target exists
+    /// (<https://w3c.github.io/webappsec-csp/#should-navigation-response-to-navigation-request-of-type-in-target-be-blocked-by-content-security-policy>,
+    /// <https://w3c.github.io/webappsec-csp/#report-violation>).
+    pub(crate) fn queue_csp_reports(&mut self, violations: &[crate::csp::Violation]) {
         for violation in violations {
             // A `report-to` name the response's `Reporting-Endpoints`
             // defined takes the report as a Reporting API `csp-violation`
@@ -2036,6 +2059,7 @@ impl Document {
             headers: Vec::new(),
             referrer: None,
             csp: None,
+            ancestors: Vec::new(),
         });
     }
 
@@ -2255,6 +2279,7 @@ impl Document {
             outcome,
             request_url,
             csp,
+            ancestors,
         } = done;
         let redirected = outcome.final_url != request_url;
         match context {
@@ -2325,33 +2350,7 @@ impl Document {
                 {
                     // Leave the current document in place.
                 } else if let Ok(url) = Url::parse(&outcome.final_url) {
-                    // Announce the commit before the new document's load, so the
-                    // browser can re-create the top-level execution contexts
-                    // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
-                    self.record_event(RendererEvent::Navigated {
-                        url: url.to_string(),
-                    });
-                    let policy = crate::csp::List::from_headers(
-                        crate::csp::combined_header(&outcome.headers, "content-security-policy")
-                            .as_deref(),
-                        crate::csp::combined_header(
-                            &outcome.headers,
-                            "content-security-policy-report-only",
-                        )
-                        .as_deref(),
-                );
-                self.reporting_endpoints =
-                    crate::csp::reporting_endpoints(&outcome.headers);
-                self.load_frame_response(
-                    &url,
-                    outcome.content_type.as_deref(),
-                    &outcome.body,
-                    policy,
-                    crate::sniff::MimeGuard {
-                        no_sniff: crate::sniff::headers_nosniff(&outcome.headers),
-                        http: true,
-                    },
-                );
+                    self.commit_frame_response(&outcome, &url, embedder, &ancestors);
                 }
             }
             DialContext::BlitzResource { id, destination } => {
@@ -2362,6 +2361,49 @@ impl Document {
             DialContext::CspReport => {}
         }
         self.adopt_js_work();
+    }
+
+    /// Commits a child frame's HTTP response, unless its `frame-ancestors`
+    /// refuses the ancestors. A refused response falls back to an opaque
+    /// `about:blank` the embedder can no longer read; the embedder dispatches
+    /// the violations
+    /// (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+    fn commit_frame_response(
+        &mut self,
+        outcome: &DialOutcome,
+        url: &Url,
+        embedder: Option<FrameId>,
+        ancestors: &[Url],
+    ) {
+        let policy = crate::csp::List::from_headers(
+            crate::csp::combined_header(&outcome.headers, "content-security-policy").as_deref(),
+            crate::csp::combined_header(&outcome.headers, "content-security-policy-report-only")
+                .as_deref(),
+        );
+        self.reporting_endpoints = crate::csp::reporting_endpoints(&outcome.headers);
+        if embedder.is_some()
+            && !ancestors.is_empty()
+            && self.note_frame_ancestors_block(embedder, url, &policy, ancestors)
+        {
+            // The blank completes and fires the container's load.
+            return;
+        }
+        // Announce the commit before the new document's load, so the
+        // browser can re-create the top-level execution contexts
+        // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+        self.record_event(RendererEvent::Navigated {
+            url: url.to_string(),
+        });
+        self.load_frame_response(
+            url,
+            outcome.content_type.as_deref(),
+            &outcome.body,
+            policy,
+            crate::sniff::MimeGuard {
+                no_sniff: crate::sniff::headers_nosniff(&outcome.headers),
+                http: true,
+            },
+        );
     }
 
     /// Hands one Blitz subresource response to its handler. A redirect the
@@ -2777,6 +2819,35 @@ impl Document {
         let blocked = crate::csp::blocks(&violations);
         if !violations.is_empty() {
             self.embedder_csp_reports.push((embedder, violations));
+        }
+        blocked
+    }
+
+    /// Records `frame-ancestors` violations for a child response and reports
+    /// whether the enforced policy refuses the embed. A refused response is
+    /// replaced with an opaque `about:blank` the embedder can no longer read.
+    /// No DOM event fires: the response-policy violation is created with a
+    /// null global, so only the network reports are sent
+    /// (<https://w3c.github.io/webappsec-csp/#should-navigation-response-to-navigation-request-of-type-in-target-be-blocked-by-content-security-policy>).
+    fn note_frame_ancestors_block(
+        &mut self,
+        embedder: Option<FrameId>,
+        child_url: &Url,
+        policy: &crate::csp::List,
+        ancestors: &[Url],
+    ) -> bool {
+        if embedder.is_none() {
+            return false;
+        }
+        let violations = policy.check_frame_ancestors(child_url, ancestors);
+        let blocked = crate::csp::blocks(&violations);
+        if !violations.is_empty() {
+            self.queue_csp_reports(&violations);
+        }
+        if blocked {
+            let opaque = Url::parse("about:blank")
+                .map_or_else(|_| child_url.origin(), |blank| blank.origin());
+            self.load_about_blank(Some("about:blank"), Some(opaque));
         }
         blocked
     }

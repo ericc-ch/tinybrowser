@@ -479,6 +479,42 @@ impl List {
         }
         violations
     }
+
+    /// Violations when the `frame-ancestors` directives of these policies
+    /// refuse to embed `child_url` in `ancestors`. Every ancestor must
+    /// match; a source expression with a path matches no origin, so a
+    /// path-bearing policy blocks everything
+    /// (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+    #[must_use]
+    pub(crate) fn check_frame_ancestors(
+        &self,
+        child_url: &Url,
+        ancestors: &[Url],
+    ) -> Vec<Violation> {
+        let origin = child_url.origin();
+        let mut violations = Vec::new();
+        for policy in &self.policies {
+            let Some(list) = directive_value(policy, "frame-ancestors") else {
+                continue;
+            };
+            let allowed = ancestors
+                .iter()
+                .all(|ancestor| url_matches_list(ancestor, list, &origin, child_url, 0));
+            if !allowed {
+                violations.push(Violation {
+                    effective_directive: "frame-ancestors".to_owned(),
+                    original_policy: policy.serialized.clone(),
+                    disposition: policy.disposition,
+                    blocked_uri: strip_url(child_url),
+                    sample: None,
+                    document_uri: strip_url(child_url),
+                    report_uris: report_uris(policy),
+                    report_to: report_to(policy),
+                });
+            }
+        }
+        violations
+    }
 }
 
 /// Tuple origin carried with a dial. An opaque document origin is `None`,
