@@ -9,6 +9,7 @@
 //! <https://w3c.github.io/webappsec-csp/#should-elements-inline-type-behavior-be-blocked-by-content-security-policy>
 
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use url::{Host, Origin, Url};
 
@@ -20,14 +21,26 @@ enum Source {
 }
 
 /// Whether a policy blocks or is only monitored.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Disposition {
     Enforce,
     Report,
 }
 
+impl Disposition {
+    /// `"enforce"` or `"report"`, as the legacy report body spells it
+    /// (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Report => "report",
+        }
+    }
+}
+
 /// One parsed policy: directive names in source order, first occurrence wins.
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Policy {
     directives: Vec<(String, Vec<String>)>,
     disposition: Disposition,
@@ -39,6 +52,7 @@ struct Policy {
 /// A decision to block (or, for report-only policies, to report) one check.
 /// Callers dispatch one `securitypolicyviolation` event per violation
 /// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+#[derive(Clone)]
 pub(crate) struct Violation {
     /// The directive that blocked, after fallback: `script-src-elem` from a
     /// `script-src` policy reports `script-src`
@@ -50,6 +64,29 @@ pub(crate) struct Violation {
     pub blocked_uri: String,
     /// First 40 characters of an inline script or style, when applicable.
     pub sample: Option<String>,
+    /// Stripped URL of the protected resource, reported as `document-uri`
+    /// (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
+    pub document_uri: String,
+    /// The script that triggered the violation, if one was executing. The
+    /// event and the reports carry the stripped URL; a non-HTTP(S) script
+    /// URL reports just its scheme
+    /// (<https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>).
+    pub source_file: Option<String>,
+    /// Line and column of the triggering call in `source_file`. Zero when
+    /// unknown or inapplicable.
+    pub line_number: u32,
+    pub column_number: u32,
+    /// HTTP status of the protected resource. Zero when unknown.
+    pub status_code: u16,
+    /// `report-uri` endpoints of the violated policy, resolved against the
+    /// document URL when the report is sent
+    /// (<https://w3c.github.io/webappsec-csp/#directive-report-uri>).
+    pub report_uris: Vec<String>,
+    /// `report-to` endpoint names of the violated policy. A name the
+    /// document's `Reporting-Endpoints` header defines takes the report as a
+    /// Reporting API `csp-violation` POST and suppresses `report-uri`
+    /// (<https://w3c.github.io/webappsec-csp/#directive-report-to>).
+    pub report_to: Vec<String>,
 }
 
 impl Violation {
@@ -68,7 +105,7 @@ pub(crate) fn blocks(violations: &[Violation]) -> bool {
 }
 
 /// The document's CSP list and the origin `'self'` is resolved against.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct List {
     policies: Vec<Policy>,
 }
@@ -102,7 +139,7 @@ pub(crate) enum InlineKind {
 }
 
 /// Destination used by the pre-request check this browser enforces.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Destination {
     /// `fetch` and `XMLHttpRequest` (`connect-src`).
     Connect,
@@ -115,11 +152,13 @@ pub(crate) enum Destination {
     Img,
     /// Web fonts (`font-src`).
     Font,
+    /// Nested browsing-context navigations (`frame-src`).
+    Frame,
 }
 
 /// The directive that decides a check
 /// (<https://w3c.github.io/webappsec-csp/#effective-directive>).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Effective {
     ScriptSrcElem,
     ScriptSrcAttr,
@@ -129,6 +168,7 @@ enum Effective {
     ConnectSrc,
     ImgSrc,
     FontSrc,
+    FrameSrc,
 }
 
 impl Effective {
@@ -141,6 +181,7 @@ impl Effective {
             Self::ConnectSrc => "connect-src",
             Self::ImgSrc => "img-src",
             Self::FontSrc => "font-src",
+            Self::FrameSrc => "frame-src",
         }
     }
 
@@ -155,6 +196,8 @@ impl Effective {
             Self::ConnectSrc => &["connect-src", "default-src"],
             Self::ImgSrc => &["img-src", "default-src"],
             Self::FontSrc => &["font-src", "default-src"],
+            // <https://w3c.github.io/webappsec-csp/#directive-fallback-list>
+            Self::FrameSrc => &["frame-src", "child-src", "default-src"],
         }
     }
 }
@@ -168,6 +211,7 @@ impl Destination {
             Self::StyleSheet => Effective::StyleSrcElem,
             Self::Img => Effective::ImgSrc,
             Self::Font => Effective::FontSrc,
+            Self::Frame => Effective::FrameSrc,
         }
     }
 }
@@ -205,6 +249,112 @@ impl InlineScript<'_> {
 pub(crate) struct ScriptRequest<'a> {
     pub nonce: &'a str,
     pub parser_inserted: bool,
+    /// Raw `integrity` attribute value, empty when there is none.
+    pub integrity: &'a str,
+}
+
+/// `blockedURI` for a request violation: a non-HTTP(S) scheme reports
+/// just the scheme; a cross-origin `frame-src` violation reports the
+/// origin, so the page never learns the framed path; otherwise the URL
+/// without fragment or credentials
+/// (<https://w3c.github.io/webappsec-csp/#violation-blocked-uri>,
+/// <https://crbug.com/633306>).
+fn blocked_uri(origin: &Origin, effective: Effective, url: &Url) -> String {
+    if effective == Effective::FrameSrc && url.origin() != *origin {
+        let port = url
+            .port_or_known_default()
+            .map_or_else(String::new, |port| format!(":{port}"));
+        return format!(
+            "{}://{}{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            port
+        );
+    }
+    strip_url(url)
+}
+
+/// A URL for use in violation reports: a non-HTTP(S) scheme reports just
+/// the scheme, otherwise the URL without fragment or credentials
+/// (<https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>).
+fn strip_url(url: &Url) -> String {
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return url.scheme().to_owned();
+    }
+    let mut clean = url.clone();
+    clean.set_fragment(None);
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean.as_str().to_owned()
+}
+
+/// Parses `raw` and strips it for use in violation reports. Unparseable
+/// input reports as the empty string.
+#[must_use]
+pub(crate) fn strip_url_for_reports(raw: &str) -> String {
+    Url::parse(raw).map_or_else(|_| String::new(), |url| strip_url(&url))
+}
+
+/// `report-uri` endpoints of `policy`, in order. The report goes to every
+/// endpoint; meta-delivered policies never carry one.
+fn report_uris(policy: &Policy) -> Vec<String> {
+    policy
+        .directives
+        .iter()
+        .find(|(name, _)| name == "report-uri")
+        .map_or_else(Vec::new, |(_, values)| values.clone())
+}
+
+/// `report-to` endpoint names of `policy`, in order. The report goes to the
+/// first name the document's `Reporting-Endpoints` header defines, and that
+/// delivery suppresses `report-uri`; meta-delivered policies never carry one.
+fn report_to(policy: &Policy) -> Vec<String> {
+    policy
+        .directives
+        .iter()
+        .find(|(name, _)| name == "report-to")
+        .map_or_else(Vec::new, |(_, values)| values.clone())
+}
+
+/// Endpoint names and URLs from the response's `Reporting-Endpoints`
+/// headers, in order (<https://w3c.github.io/reporting/#header>).
+#[must_use]
+pub(crate) fn reporting_endpoints(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let Some(combined) = combined_header(headers, "reporting-endpoints") else {
+        return Vec::new();
+    };
+    parse_reporting_endpoints_value(&combined)
+}
+
+/// Endpoint names and URLs from one combined `Reporting-Endpoints` value.
+#[must_use]
+pub(crate) fn parse_reporting_endpoints_value(combined: &str) -> Vec<(String, String)> {
+    let mut endpoints = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut items = Vec::new();
+    for c in combined.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                current.push(c);
+            }
+            ',' if !quoted => {
+                items.push(std::mem::take(&mut current));
+            }
+            c => current.push(c),
+        }
+    }
+    items.push(current);
+    for item in items {
+        let (name, url) = item.split_once('=').unwrap_or((item.as_str(), ""));
+        let name = name.trim().to_owned();
+        let url = url.trim().trim_matches('"').to_owned();
+        if !name.is_empty() && !url.is_empty() {
+            endpoints.push((name, url));
+        }
+    }
+    endpoints
 }
 
 impl List {
@@ -231,12 +381,15 @@ impl List {
     }
 
     /// Appends one `meta` policy. Report-only is not delivered by `meta`.
-    /// `report-uri`, `frame-ancestors`, and `sandbox` are dropped
+    /// `report-uri`, `report-to`, `frame-ancestors`, and `sandbox` are dropped
     /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
     pub(crate) fn push_meta(&mut self, content: &str) {
         let mut policy = parse_serialized(content, Source::Meta, Disposition::Enforce);
         policy.directives.retain(|(name, _)| {
-            !matches!(name.as_str(), "report-uri" | "frame-ancestors" | "sandbox")
+            !matches!(
+                name.as_str(),
+                "report-uri" | "report-to" | "frame-ancestors" | "sandbox"
+            )
         });
         if !policy.directives.is_empty() {
             self.policies.push(policy);
@@ -256,40 +409,42 @@ impl List {
         destination: Destination,
         script: Option<ScriptRequest<'_>>,
     ) -> Vec<Violation> {
-        let effective = destination.effective();
-        let mut violations = Vec::new();
-        for policy in &self.policies {
-            if policy_request_violation(
-                policy,
-                origin,
-                document_url,
-                url,
-                destination,
-                script,
-                0,
-            ) {
-                violations.push(Violation {
-                    effective_directive: effective.name().to_owned(),
-                    original_policy: policy.serialized.clone(),
-                    disposition: policy.disposition,
-                    blocked_uri: url.as_str().to_owned(),
-                    sample: None,
-                });
-            }
-        }
-        violations
+        self.violations(origin, document_url, url, destination, script, 0)
     }
 
     /// The violations a response URL produces after redirects: the
     /// post-request check re-runs the source lists with paths ignored
     /// (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+    ///
+    /// `blocked_url` is the request's URL, not the redirect target. The
+    /// violation reports that URL so the page never learns where the hop
+    /// went (<https://w3c.github.io/webappsec-csp/#create-violation-for-request>).
     #[must_use]
     pub(crate) fn check_redirected_request(
         &self,
         origin: &Origin,
         document_url: &Url,
+        response_url: &Url,
+        blocked_url: &Url,
+        destination: Destination,
+    ) -> Vec<Violation> {
+        let mut violations =
+            self.violations(origin, document_url, response_url, destination, None, 1);
+        let blocked = blocked_uri(origin, destination.effective(), blocked_url);
+        for violation in &mut violations {
+            violation.blocked_uri.clone_from(&blocked);
+        }
+        violations
+    }
+
+    fn violations(
+        &self,
+        origin: &Origin,
+        document_url: &Url,
         url: &Url,
         destination: Destination,
+        script: Option<ScriptRequest<'_>>,
+        redirects: u32,
     ) -> Vec<Violation> {
         let effective = destination.effective();
         let mut violations = Vec::new();
@@ -300,15 +455,22 @@ impl List {
                 document_url,
                 url,
                 destination,
-                None,
-                1,
+                script,
+                redirects,
             ) {
                 violations.push(Violation {
                     effective_directive: effective.name().to_owned(),
                     original_policy: policy.serialized.clone(),
                     disposition: policy.disposition,
-                    blocked_uri: url.as_str().to_owned(),
+                    blocked_uri: blocked_uri(origin, effective, url),
                     sample: None,
+                    document_uri: strip_url(document_url),
+                    source_file: None,
+                    line_number: 0,
+                    column_number: 0,
+                    status_code: 0,
+                    report_uris: report_uris(policy),
+                    report_to: report_to(policy),
                 });
             }
         }
@@ -319,7 +481,11 @@ impl List {
     /// produces
     /// (<https://w3c.github.io/webappsec-csp/#should-elements-inline-type-behavior-be-blocked-by-content-security-policy>).
     #[must_use]
-    pub(crate) fn check_inline(&self, inline: &InlineScript<'_>) -> Vec<Violation> {
+    pub(crate) fn check_inline(
+        &self,
+        document_url: &Url,
+        inline: &InlineScript<'_>,
+    ) -> Vec<Violation> {
         let effective = inline.effective();
         let mut violations = Vec::new();
         for policy in &self.policies {
@@ -330,10 +496,146 @@ impl List {
                     disposition: policy.disposition,
                     blocked_uri: inline.blocked_uri(),
                     sample: Some(inline.sample()),
+                    document_uri: strip_url(document_url),
+                    source_file: None,
+                    line_number: 0,
+                    column_number: 0,
+                    status_code: 0,
+                    report_uris: report_uris(policy),
+                    report_to: report_to(policy),
                 });
             }
         }
         violations
+    }
+
+    /// Violations when the `frame-ancestors` directives of these policies
+    /// refuse to embed `child_url` in `ancestors`. Every ancestor must
+    /// match; a source expression with a path matches no origin, so a
+    /// path-bearing policy blocks everything
+    /// (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+    #[must_use]
+    pub(crate) fn check_frame_ancestors(
+        &self,
+        child_url: &Url,
+        ancestors: &[Url],
+    ) -> Vec<Violation> {
+        let origin = child_url.origin();
+        let mut violations = Vec::new();
+        for policy in &self.policies {
+            let Some(list) = directive_value(policy, "frame-ancestors") else {
+                continue;
+            };
+            let allowed = ancestors
+                .iter()
+                .all(|ancestor| url_matches_list(ancestor, list, &origin, child_url, 0));
+            if !allowed {
+                violations.push(Violation {
+                    effective_directive: "frame-ancestors".to_owned(),
+                    original_policy: policy.serialized.clone(),
+                    disposition: policy.disposition,
+                    blocked_uri: strip_url(child_url),
+                    sample: None,
+                    document_uri: strip_url(child_url),
+                    source_file: None,
+                    line_number: 0,
+                    column_number: 0,
+                    status_code: 0,
+                    report_uris: report_uris(policy),
+                    report_to: report_to(policy),
+                });
+            }
+        }
+        violations
+    }
+}
+
+/// Tuple origin carried with a dial. An opaque document origin is `None`,
+/// and `'self'` then matches only the document URL.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TupleOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl TupleOrigin {
+    fn from_origin(origin: &Origin) -> Option<Self> {
+        match origin {
+            Origin::Tuple(scheme, host, port) => Some(Self {
+                scheme: scheme.clone(),
+                host: host.to_string(),
+                port: *port,
+            }),
+            Origin::Opaque(_) => None,
+        }
+    }
+
+    fn to_origin(&self) -> Origin {
+        let host = Host::parse(&self.host).unwrap_or(Host::Domain(self.host.clone()));
+        Origin::Tuple(self.scheme.clone(), host, self.port)
+    }
+}
+
+/// The policy a subresource dial carries so every redirect hop is checked
+/// before it is followed. `None` on a dial skips the check, which is how a
+/// document navigation is sent.
+///
+/// <https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RedirectGate {
+    list: List,
+    origin: Option<TupleOrigin>,
+    destination: Destination,
+}
+
+impl RedirectGate {
+    pub(crate) fn new(list: List, origin: &Origin, destination: Destination) -> Self {
+        Self {
+            list,
+            origin: TupleOrigin::from_origin(origin),
+            destination,
+        }
+    }
+
+    /// Whether `url` may be fetched. `redirects` is `0` for the original URL
+    /// and at least `1` after a redirect, which skips path matching.
+    /// Report-only policies do not refuse the hop.
+    #[must_use]
+    pub fn allows(&self, document_url: &Url, url: &Url, redirects: u32) -> bool {
+        let origin = self
+            .origin
+            .as_ref()
+            .map_or_else(Origin::new_opaque, TupleOrigin::to_origin);
+        !blocks(&self.list.violations(
+            &origin,
+            document_url,
+            url,
+            self.destination,
+            None,
+            redirects,
+        ))
+    }
+
+    /// Violations for a redirect hop. `blocked_url` is the request's URL
+    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-request>).
+    pub(crate) fn redirected_violations(
+        &self,
+        document_url: &Url,
+        response_url: &Url,
+        blocked_url: &Url,
+    ) -> Vec<Violation> {
+        let origin = self
+            .origin
+            .as_ref()
+            .map_or_else(Origin::new_opaque, TupleOrigin::to_origin);
+        self.list.check_redirected_request(
+            &origin,
+            document_url,
+            response_url,
+            blocked_url,
+            self.destination,
+        )
     }
 }
 
@@ -356,7 +658,15 @@ fn policy_request_violation(
         // A directive lower in the fallback chain only executes when no
         // higher-priority directive is present; the loop order guarantees
         // that, so the first present directive decides.
-        return request_check_blocks(effective, list, origin, document_url, url, script, redirects);
+        return request_check_blocks(
+            effective,
+            list,
+            origin,
+            document_url,
+            url,
+            script,
+            redirects,
+        );
     }
     false
 }
@@ -505,18 +815,21 @@ fn request_check_blocks(
     script: Option<ScriptRequest<'_>>,
     redirects: u32,
 ) -> bool {
-    // The pre-request check short-circuits on nonces and `'strict-dynamic'`.
-    // The post-request (redirect) check is URL-only, so a policy with
-    // `'strict-dynamic'` does not block every response
+    // The pre-request check short-circuits on nonces, integrity metadata,
+    // and `'strict-dynamic'`, in that order. The post-request (redirect)
+    // check is URL-only, so a policy with `'strict-dynamic'` does not block
+    // every response
     // (<https://w3c.github.io/webappsec-csp/#script-pre-request>).
-    if redirects == 0
-        && matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc)
-    {
+    if redirects == 0 && matches!(effective, Effective::ScriptSrcElem | Effective::ScriptSrc) {
         let script = script.unwrap_or(ScriptRequest {
             nonce: "",
             parser_inserted: true,
+            integrity: "",
         });
         if nonce_matches(script.nonce, list) {
+            return false;
+        }
+        if integrity_matches(list, script.integrity) {
             return false;
         }
         if has_keyword(list, "'strict-dynamic'") {
@@ -526,15 +839,99 @@ fn request_check_blocks(
     !url_matches_list(url, list, origin, document_url, redirects)
 }
 
+/// Whether the request's SRI integrity metadata matches the source list: the
+/// parsed metadata must be non-empty and every entry must equal a hash-source
+/// in the list. Entries with unrecognized algorithms never parse, so they
+/// cannot satisfy the subset but also do not break it
+/// (<https://w3c.github.io/webappsec-csp/#does-integrity-metadata-match-source-list>).
+fn integrity_matches(list: &[String], integrity: &str) -> bool {
+    let expressions: Vec<(&str, &str)> =
+        list.iter().filter_map(|expression| hash_source(expression)).collect();
+    if expressions.is_empty() {
+        return false;
+    }
+    let sources = parse_integrity_metadata(integrity);
+    if sources.is_empty() {
+        return false;
+    }
+    sources.iter().all(|(algorithm, value)| {
+        expressions.iter().any(|(expected_algorithm, expected_value)| {
+            expected_algorithm.eq_ignore_ascii_case(algorithm) && *expected_value == *value
+        })
+    })
+}
+
+/// Parses SRI integrity metadata into `(algorithm, base64-value)` pairs.
+/// Entries with unsupported algorithms or invalid values are dropped, the
+/// algorithm is lowercased, and any `?`-suffixed options ride along with
+/// neither the digest nor the parse: unknown options degrade gracefully
+/// (<https://www.w3.org/TR/SRI/#parse-metadata>).
+fn parse_integrity_metadata(metadata: &str) -> Vec<(String, String)> {
+    metadata
+        .split_ascii_whitespace()
+        .filter_map(|entry| {
+            let (algorithm, rest) = entry.split_once('-')?;
+            let value = rest.split_once('?').map_or(rest, |(value, _)| value);
+            let algorithm = if algorithm.eq_ignore_ascii_case("sha256") {
+                "sha256"
+            } else if algorithm.eq_ignore_ascii_case("sha384") {
+                "sha384"
+            } else if algorithm.eq_ignore_ascii_case("sha512") {
+                "sha512"
+            } else {
+                return None;
+            };
+            is_base64_value(value).then(|| (algorithm.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// Whether `bytes` satisfy SRI `integrity` metadata: the strongest supported
+/// algorithm present must have at least one entry matching the content.
+/// Empty metadata enforces nothing, and so does metadata with no supported
+/// algorithm: unknown hashes degrade gracefully, and only a supported
+/// algorithm's mismatch fails the load
+/// (<https://www.w3.org/TR/SRI/#does-response-match-metadatalist>).
+#[must_use]
+pub(crate) fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
+    let integrity = integrity.trim();
+    if integrity.is_empty() {
+        return true;
+    }
+    let sources = parse_integrity_metadata(integrity);
+    let Some(strongest) = sources.iter().map(|(algorithm, _)| algorithm.as_str()).max_by_key(
+        |algorithm| match *algorithm {
+            "sha512" => 2,
+            "sha384" => 1,
+            _ => 0,
+        },
+    ) else {
+        // No supported metadata: nothing to enforce.
+        return true;
+    };
+    sources.iter().any(|(algorithm, expected)| {
+        algorithm == strongest && {
+            let digest = match strongest {
+                "sha512" => base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes)),
+                "sha384" => base64::engine::general_purpose::STANDARD.encode(Sha384::digest(bytes)),
+                _ => base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)),
+            };
+            digest.as_str() == *expected
+        }
+    })
+}
+
 /// The inline check for one directive
 /// (<https://w3c.github.io/webappsec-csp/#should-block-inline>).
 fn inline_check_blocks(effective: Effective, list: &[String], inline: &InlineScript<'_>) -> bool {
     match effective {
         Effective::ScriptSrc => evaluation_blocks(list, inline.source),
         Effective::ScriptSrcElem | Effective::ScriptSrcAttr => !element_matches(list, inline),
-        Effective::StyleSrcElem | Effective::ConnectSrc | Effective::ImgSrc | Effective::FontSrc => {
-            false
-        }
+        Effective::StyleSrcElem
+        | Effective::ConnectSrc
+        | Effective::ImgSrc
+        | Effective::FontSrc
+        | Effective::FrameSrc => false,
     }
 }
 
@@ -545,7 +942,9 @@ fn evaluation_blocks(list: &[String], source: &str) -> bool {
     if has_keyword(list, "'unsafe-eval'") {
         return false;
     }
-    !list.iter().any(|expression| hash_matches(expression, source))
+    !list
+        .iter()
+        .any(|expression| hash_matches(expression, source))
 }
 
 fn directive_value<'a>(policy: &'a Policy, name: &str) -> Option<&'a [String]> {
@@ -1004,21 +1403,46 @@ fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
+/// Splits `host-part [ ":" port-part ]`.
+///
+/// A bracketed address keeps every colon inside the brackets. The port is
+/// only the component after `]`, so `[::1]` is a host with no port and
+/// `[::1]:443` is that host on port 443. An empty port (`example.test:`,
+/// `[::1]:`) is rejected.
+///
+/// CSP3's `host-part` grammar does not include addresses
+/// (<https://w3c.github.io/webappsec-csp/#grammardef-host-part>), so
+/// [`valid_host_part`] still drops the expression. The split itself must not
+/// treat the last hextet as a port.
 fn split_host_port(hostport: &str) -> Option<(&str, Option<PortPart>)> {
+    if hostport.starts_with('[') {
+        let end = hostport.find(']')?;
+        let host = &hostport[..=end];
+        let after = &hostport[end + 1..];
+        if after.is_empty() {
+            return Some((host, None));
+        }
+        let port = after.strip_prefix(':')?;
+        return Some((host, Some(parse_port_part(port)?)));
+    }
     let Some((host, port)) = hostport.rsplit_once(':') else {
         return Some((hostport, None));
     };
+    if port.is_empty() {
+        return None;
+    }
+    Some((host, Some(parse_port_part(port)?)))
+}
+
+fn parse_port_part(port: &str) -> Option<PortPart> {
     if port == "*" {
-        return Some((host, Some(PortPart::Star)));
+        return Some(PortPart::Star);
     }
     if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
         let number = port.parse::<u16>().ok()?;
-        return Some((host, Some(PortPart::Number(number))));
+        return Some(PortPart::Number(number));
     }
-    if hostport.contains(':') {
-        return None;
-    }
-    Some((hostport, None))
+    None
 }
 
 fn valid_host_part(host: &str) -> bool {
@@ -1098,15 +1522,16 @@ mod tests {
         let origin = url("https://example.test/").origin();
         let document_url = url("https://example.test/page");
         // The duplicate `'none'` must not override the first `'self'`.
-        assert!(list
-            .check_request(
+        assert!(
+            list.check_request(
                 &origin,
                 &document_url,
                 &url("https://example.test/a.js"),
                 Destination::Script,
                 None,
             )
-            .is_empty());
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1115,15 +1540,16 @@ mod tests {
         let origin = url("https://example.test/").origin();
         let document_url = url("https://example.test/page");
         // The only token is not ASCII, so the policy parses empty and allows.
-        assert!(list
-            .check_request(
+        assert!(
+            list.check_request(
                 &origin,
                 &document_url,
                 &url("https://other.test/a.js"),
                 Destination::Script,
                 None,
             )
-            .is_empty());
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1164,6 +1590,49 @@ mod tests {
     }
 
     #[test]
+    fn split_host_port_table() {
+        let cases = [
+            ("example.test", Some(("example.test", None))),
+            ("example.test:443", Some(("example.test", Some(443u16)))),
+            ("example.test:", None),
+            ("example.test:abc", None),
+            ("example.test:99999", None),
+            ("[::1]", Some(("[::1]", None))),
+            ("[::1]:443", Some(("[::1]", Some(443u16)))),
+            ("[2001:db8::1]:8443", Some(("[2001:db8::1]", Some(8443u16)))),
+            ("[::1]:", None),
+            ("[::1]:abc", None),
+            ("[::1]:99999", None),
+            ("[::1", None),
+        ];
+        for (input, expect) in cases {
+            let parsed = split_host_port(input);
+            match expect {
+                None => assert!(parsed.is_none(), "{input}"),
+                Some((host, None)) => {
+                    let (got, port) = parsed.expect(input);
+                    assert_eq!(got, host, "{input}");
+                    assert!(port.is_none(), "{input}");
+                }
+                Some((host, Some(number))) => {
+                    let (got, port) = parsed.expect(input);
+                    assert_eq!(got, host, "{input}");
+                    assert!(
+                        matches!(port, Some(PortPart::Number(value)) if value == number),
+                        "{input}"
+                    );
+                }
+            }
+        }
+        let (host, port) = split_host_port("example.test:*").expect("star");
+        assert_eq!(host, "example.test");
+        assert!(matches!(port, Some(PortPart::Star)));
+        let (host, port) = split_host_port("[::1]:*").expect("ipv6 star");
+        assert_eq!(host, "[::1]");
+        assert!(matches!(port, Some(PortPart::Star)));
+    }
+
+    #[test]
     fn percent_encoded_paths_decode_before_comparing() {
         assert!(path_part_matches("/%61/b", "/a/b"));
         assert!(path_part_matches("/a%2Fb", "/a%2Fb"));
@@ -1173,14 +1642,26 @@ mod tests {
     fn self_matches_secure_variants() {
         let origin = url("http://example.test/").origin();
         let document_url = url("http://example.test/page");
-        assert!(self_matches(&url("http://example.test/a"), &origin, &document_url));
+        assert!(self_matches(
+            &url("http://example.test/a"),
+            &origin,
+            &document_url
+        ));
         assert!(self_matches(
             &url("https://example.test/a"),
             &origin,
             &document_url
         ));
-        assert!(self_matches(&url("ws://example.test/a"), &origin, &document_url));
-        assert!(!self_matches(&url("http://other.test/a"), &origin, &document_url));
+        assert!(self_matches(
+            &url("ws://example.test/a"),
+            &origin,
+            &document_url
+        ));
+        assert!(!self_matches(
+            &url("http://other.test/a"),
+            &origin,
+            &document_url
+        ));
     }
 
     #[test]
@@ -1197,6 +1678,67 @@ mod tests {
         let expression = "'sha256-wmuLCpoj8EMqfQlPnt5NIMgKkCK62CxAkAiewI0zZps='";
         assert!(hash_matches(expression, "t1.done();"));
         assert!(!hash_matches(expression, "t2.done();"));
+    }
+
+    #[test]
+    fn report_urls_strip() {
+        assert_eq!(
+            strip_url_for_reports("http://user:pass@example.test/a?b=1#frag"),
+            "http://example.test/a?b=1"
+        );
+        assert_eq!(strip_url_for_reports("data:text/javascript,alert(1)"), "data");
+        assert_eq!(strip_url_for_reports("blob:https://example.test/uuid"), "blob");
+        assert_eq!(strip_url_for_reports("not a url ["), "");
+    }
+
+    #[test]
+    fn integrity_metadata_must_subset_policy_hashes() {
+        let list = vec![
+            "'sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c='".to_owned(),
+            "'sha512-rYCVMxWV5nq8IsMo+UZNObWtEiWGok/vDN8BMoEQi41s0znSes6E1Q2aag3Lw3u2J1w2rqH7uF2ws6FpQhfSOA=='".to_owned(),
+        ];
+        assert!(integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c="
+        ));
+        assert!(integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha512-rYCVMxWV5nq8IsMo+UZNObWtEiWGok/vDN8BMoEQi41s0znSes6E1Q2aag3Lw3u2J1w2rqH7uF2ws6FpQhfSOA=="
+        ));
+        // An entry outside the policy breaks the subset, even beside a match.
+        assert!(!integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha256-xyz"
+        ));
+        // Entries with unrecognized algorithms never parse: dropped, not fatal.
+        assert!(integrity_matches(
+            &list,
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha999-xyz"
+        ));
+        assert!(!integrity_matches(&list, "sha256-xyz"));
+        assert!(!integrity_matches(&list, ""));
+        assert!(!integrity_matches(&["'self'".to_owned()], "sha256-xyz"));
+    }
+
+    #[test]
+    fn integrity_verifies_strongest_algorithm() {
+        // Exact bytes of the WPT simpleSourcedScript.js fixture.
+        let body = b"window.postMessage(document.currentScript.id, \"*\");\n";
+        let sha256 = "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c=";
+        assert!(integrity_verifies(sha256, body));
+        assert!(integrity_verifies("", body));
+        assert!(!integrity_verifies("sha256-xyz", body));
+        // Unknown algorithms degrade gracefully: no supported metadata means
+        // nothing to enforce
+        // (<https://www.w3.org/TR/SRI/#does-response-match-metadatalist>).
+        assert!(integrity_verifies("sha999-xyz", body));
+        assert!(integrity_verifies("sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c=?opt", body));
+        // A matching sha256 beside a mismatch still verifies: sha512 is
+        // absent, so sha256 is strongest and one entry matches.
+        assert!(integrity_verifies(
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c= sha256-xyz",
+            body
+        ));
     }
 
     #[test]

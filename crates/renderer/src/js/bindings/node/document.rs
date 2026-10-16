@@ -99,6 +99,16 @@ impl<'js> document_generated::Document<'js> for JsNode {
         self.url(ctx)
     }
 
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-referrer
+    // No navigation passes a referrer into the document yet, so this is
+    // always the empty string. Tracking the navigation referrer per
+    // document would make this (and the violation event's `referrer`)
+    // report the real value.
+    fn get_referrer(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
+        let _ = ctx;
+        Ok(crate::dom_string::DomString::default())
+    }
+
     // https://dom.spec.whatwg.org/#dom-document-compatmode
     fn get_compat_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let mode = self.compat_mode(ctx)?;
@@ -2050,16 +2060,13 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     let (source, base_line) = match kind {
         Kind::Inline(source, line) => (source, line),
         Kind::External => {
-            // The fetch starts in `Document::adopt_js_work`; an already
-            // started element must not schedule a second load
+            // Parser-inserted scripts never reach this path; the parser
+            // runs them from `Document::run_scripts`. The fetch for a
+            // script-inserted element starts in `Document::adopt_js_work`,
+            // which marks already-started at launch so a second prepare
+            // schedules nothing
             // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
             let world = world(ctx)?;
-            {
-                let world = world.borrow();
-                if let Some(mut parsed) = world.document_mut(id) {
-                    parsed.document.mark_script_started(id.node);
-                }
-            }
             world.borrow_mut().queue_script(id);
             return Ok(());
         }
@@ -2082,13 +2089,16 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
-        world.csp.check_inline(&crate::csp::InlineScript {
-            source: &source,
-            nonce: &nonce,
-            nonceable,
-            parser_inserted: false,
-            kind: crate::csp::InlineKind::Script,
-        })
+        world.csp.check_inline(
+            &world.document_url,
+            &crate::csp::InlineScript {
+                source: &source,
+                nonce: &nonce,
+                nonceable,
+                parser_inserted: false,
+                kind: crate::csp::InlineKind::Script,
+            },
+        )
     };
     if !violations.is_empty() {
         super::super::fire_csp_violations(ctx, id, &violations)?;
@@ -2100,16 +2110,19 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     world(ctx)?.borrow_mut().current_script = Some(id);
     let mut options = EvalOptions::default();
     options.strict = false;
+    // Text-set scripts run under the document URL so their stacks attribute
+    // to page script, matching parser-inserted scripts.
+    let filename = world_for_node(ctx, id)?
+        .borrow()
+        .document_url
+        .as_str()
+        .to_owned();
+    options.filename = Some(filename.clone());
     if let Err(error) = ctx.eval_with_options::<Value, _>(source, options) {
         // A script inserted from script reports through the same pipeline as
         // a parser script: the exception reaches `window.onerror` and the
         // `error` event instead of staying pending
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script>).
-        let filename = world_for_node(ctx, id)?
-            .borrow()
-            .document_url
-            .as_str()
-            .to_owned();
         crate::js::report_script_error(ctx, &error, base_line, &filename);
     }
     world(ctx)?.borrow_mut().current_script = previous;

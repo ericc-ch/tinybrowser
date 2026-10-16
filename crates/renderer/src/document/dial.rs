@@ -99,6 +99,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         // Plain page subresources; no carrier policy keys off the kind
         // except for script-initiated fetches.
         DialContext::BlitzResource { .. } => DialKind::Image,
+        DialContext::CspReport => DialKind::CspReport,
     };
     DialRequest {
         kind,
@@ -111,6 +112,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         headers: dial.headers.clone(),
         referrer: dial.referrer.clone(),
         timeout_ms: 0,
+        csp: dial.csp.clone().map(Box::new),
     }
 }
 
@@ -120,5 +122,12 @@ pub(in crate::document) fn complete(
 ) -> Result<CompletedDial, DialContext> {
     let context = dial.context;
     let outcome = outcome.map_err(|_| context)?;
-    Ok(CompletedDial { context, outcome })
+    Ok(CompletedDial {
+        context,
+        outcome,
+        request_url: dial.url.to_string(),
+        csp: dial.csp.clone(),
+        ancestors: dial.ancestors.clone(),
+        integrity: dial.integrity.clone(),
+    })
 }

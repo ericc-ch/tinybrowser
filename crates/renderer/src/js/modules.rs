@@ -51,11 +51,16 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     // QuickJS's host loader is synchronous, so the renderer waits here while
     // the browser process performs the network operation on its I/O runtime.
     let world_rc = super::bindings::world(ctx)?;
-    let (services, initiator) = {
+    let (services, initiator, gate) = {
         let world = world_rc.borrow();
         (
             world.runtime.services.clone(),
             world.document_url.to_string(),
+            crate::RedirectGate::new(
+                world.csp.clone(),
+                &world.origin,
+                crate::csp::Destination::Script,
+            ),
         )
     };
     // A module graph fetch is a script request; check it before the renderer
@@ -76,7 +81,9 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             let blocked = crate::csp::blocks(&violations);
             if let Ok(target) = super::bindings::main_document(ctx) {
                 // The module loader runs inside QuickJS; dispatch later.
-                world_rc.borrow_mut().queue_csp_violations(target, violations);
+                world_rc
+                    .borrow_mut()
+                    .queue_csp_violations(target, violations);
             }
             if blocked {
                 return Err(Error::new_loading(name));
@@ -97,6 +104,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             headers: Vec::new(),
             referrer: None,
             timeout_ms: 0,
+            csp: Some(Box::new(gate)),
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);
@@ -108,6 +116,32 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         cancel();
         return Err(Error::new_loading(name));
     };
+    if outcome.final_url != name
+        && let Ok(final_url) = url::Url::parse(&outcome.final_url)
+        && let Ok(request_url) = url::Url::parse(name)
+    {
+        let violations = {
+            let world = world_rc.borrow();
+            world.csp.check_redirected_request(
+                &world.origin,
+                &world.document_url,
+                &final_url,
+                &request_url,
+                crate::csp::Destination::Script,
+            )
+        };
+        if !violations.is_empty() {
+            let blocked = crate::csp::blocks(&violations);
+            if let Ok(target) = super::bindings::main_document(ctx) {
+                world_rc
+                    .borrow_mut()
+                    .queue_csp_violations(target, violations);
+            }
+            if blocked {
+                return Err(Error::new_loading(name));
+            }
+        }
+    }
     if !(200..300).contains(&outcome.status)
         || !super::javascript_module_mime(outcome.content_type.as_deref())
     {

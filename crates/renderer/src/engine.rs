@@ -178,6 +178,15 @@ impl Engine {
                 http: head.http_response,
             },
         );
+        // The document's own HTTP status, after the fresh response reset it:
+        // violation `status-code` reports it
+        // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+        document.http_status = head.status;
+        document.reporting_endpoints = head
+            .reporting_endpoints
+            .as_deref()
+            .map(crate::csp::parse_reporting_endpoints_value)
+            .unwrap_or_default();
         Ok(())
     }
 
@@ -601,6 +610,7 @@ impl Engine {
             self.apply_navigations(navigations);
             self.apply_streams(streams);
             self.apply_deliveries(deliveries);
+            self.flush_embedder_csp();
             let fired_load = self.fire_ready_frame_loads();
             if !had_work && !fired_load {
                 break;
@@ -776,6 +786,96 @@ impl Engine {
         self.inherit_policy(child, parent);
     }
 
+    /// Whether `url` is a nested cross-document navigation that `frame-src`
+    /// governs. Same-document navigations and `about:` are not.
+    fn frame_src_applies(&self, child: FrameId, url: &Url) -> bool {
+        if self.runtime.shared.borrow().tree.parent(child).is_none() {
+            return false;
+        }
+        if !matches!(url.scheme(), "http" | "https" | "data" | "blob") {
+            return false;
+        }
+        let Some(document) = self.frames.get(&child) else {
+            return false;
+        };
+        let Ok(mut current) = Url::parse(document.document_url()) else {
+            return true;
+        };
+        let mut next = url.clone();
+        current.set_fragment(None);
+        next.set_fragment(None);
+        current != next
+    }
+
+    /// Ancestor document URLs nearest-first for a nested frame's `frame-ancestors`
+    /// check at commit. Empty for a top-level navigation, which skips it
+    /// (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+    fn ancestor_urls(&self, embedder: Option<FrameId>) -> Vec<Url> {
+        let mut ancestors = Vec::new();
+        let mut cursor = embedder;
+        while let Some(frame) = cursor {
+            let Some(document) = self.frames.get(&frame) else {
+                break;
+            };
+            let Ok(url) = Url::parse(document.document_url()) else {
+                break;
+            };
+            ancestors.push(url);
+            cursor = self.runtime.shared.borrow().tree.parent(frame);
+        }
+        ancestors
+    }
+
+    /// Reports the embedder's `frame-src` violations and returns whether the
+    /// enforced policy refuses `url`
+    /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
+    fn frame_src_blocked(&mut self, embedder: FrameId, child: FrameId, url: &Url) -> bool {        let violations = {
+            let Some(document) = self.frames.get(&embedder) else {
+                return false;
+            };
+            let world = document.world();
+            let world = world.borrow();
+            world.csp.check_request(
+                &world.origin,
+                &world.document_url,
+                url,
+                crate::csp::Destination::Frame,
+                None,
+            )
+        };
+        if violations.is_empty() {
+            return false;
+        }
+        let container = self.runtime.shared.borrow().tree.container(child);
+        if let Some(document) = self.frames.get_mut(&embedder) {
+            let target = container.or_else(|| document.document_node());
+            if let Some(target) = target {
+                document.fire_csp_violations(target, &violations);
+            }
+        }
+        crate::csp::blocks(&violations)
+    }
+
+    /// Dispatches `frame-src` redirect violations into the embedding document.
+    fn flush_embedder_csp(&mut self) {
+        let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+        let mut reports = Vec::new();
+        for frame in frames {
+            if let Some(document) = self.frames.get_mut(&frame) {
+                reports.extend(document.take_embedder_csp_reports());
+            }
+        }
+        for (embedder, violations) in reports {
+            let Some(document) = self.frames.get_mut(&embedder) else {
+                continue;
+            };
+            let Some(target) = document.document_node() else {
+                continue;
+            };
+            document.fire_csp_violations(target, &violations);
+        }
+    }
+
     /// Starts the load one resolved frame URL names, dispatching on its scheme
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
     fn load_frame_url(
@@ -787,6 +887,27 @@ impl Engine {
         body: &[u8],
         content_type: Option<&str>,
     ) {
+        // Nested navigations are `frame-src` on the embedder. A same-document
+        // navigation is not, and `about:` stays allowed: blocking it would
+        // only show `about:blank` again
+        // (<https://w3c.github.io/webappsec-csp/#effective-directive-for-a-request>).
+        let embedder = self.runtime.shared.borrow().tree.parent(child);
+        let check_frame_src = self.frame_src_applies(child, &url);
+        if check_frame_src
+            && let Some(embedder) = embedder
+            && self.frame_src_blocked(embedder, child, &url)
+        {
+            return;
+        }
+        let frame_gate = (check_frame_src && matches!(url.scheme(), "http" | "https"))
+            .then(|| {
+                embedder.and_then(|embedder| {
+                    self.frames
+                        .get(&embedder)
+                        .map(|document| document.redirect_gate(crate::csp::Destination::Frame))
+                })
+            })
+            .flatten();
         match url.scheme() {
             "about" => self.keep_initial_blank(child, parent),
             "data" => self.load_data_frame(child, parent, &url),
@@ -853,6 +974,14 @@ impl Engine {
                         url.as_str(),
                     )
                 });
+                // Ancestor document URLs nearest-first for the child's
+                // `frame-ancestors` check at commit
+                // (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
+                let ancestors = if embedder.is_some() && frame_gate.is_some() {
+                    self.ancestor_urls(embedder)
+                } else {
+                    Vec::new()
+                };
                 if let Some(document) = self.frames.get_mut(&child) {
                     document.navigate_to(
                         url,
@@ -862,6 +991,9 @@ impl Engine {
                         content_type.map(str::to_owned),
                         referrer,
                     );
+                    if let (Some(embedder), Some(gate)) = (embedder, frame_gate) {
+                        document.set_pending_frame_policy(embedder, gate, ancestors);
+                    }
                 }
             }
             _ => {

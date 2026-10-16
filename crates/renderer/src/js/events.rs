@@ -744,11 +744,10 @@ pub(crate) fn install_custom_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     super::blob::decompress(ctx, INSTALL_CUSTOM_EVENT_DEFLATE, &CACHE)
 }
 
-pub(crate) const INSTALL_SECURITY_POLICY_VIOLATION_EVENT_DEFLATE: &[u8] =
-    include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/js_blobs/security_policy_violation_event.deflate"
-    ));
+pub(crate) const INSTALL_SECURITY_POLICY_VIOLATION_EVENT_DEFLATE: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/js_blobs/security_policy_violation_event.deflate"
+));
 
 /// The `SecurityPolicyViolationEvent` shim, inflated once per process.
 pub(crate) fn install_security_policy_violation_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
@@ -814,25 +813,39 @@ pub(crate) fn fire_security_policy_violation(
     {
         set_exposed_event_prototype(ctx, &event, "SecurityPolicyViolationEvent")?;
     }
-    let document_url = bindings::world(ctx)?.borrow().document_url.as_str().to_owned();
     // Own data properties, because the shim's prototype accessors are
     // readonly and an assigning set would throw
     // (<https://webidl.spec.whatwg.org/#idl-read-only-attributes>).
-    event.prop("documentURI", document_url)?;
+    // `documentURI` is the stripped document URL from the violation, not
+    // the live document URL: fragment and credentials never report
+    // (<https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>).
+    event.prop("documentURI", violation.document_uri.clone())?;
     event.prop("referrer", String::new())?;
     event.prop("blockedURI", violation.blocked_uri.clone())?;
     event.prop("violatedDirective", violation.effective_directive.clone())?;
     event.prop("effectiveDirective", violation.effective_directive.clone())?;
     event.prop("originalPolicy", violation.original_policy.clone())?;
-    event.prop("sourceFile", String::new())?;
+    // `sourceFile` strips like the reports: a `data:` or `blob:` trigger
+    // reports just its scheme. Line and column are zero when unknown.
+    event.prop(
+        "sourceFile",
+        violation
+            .source_file
+            .as_deref()
+            .map_or_else(String::new, crate::csp::strip_url_for_reports),
+    )?;
     event.prop("sample", violation.sample.clone().unwrap_or_default())?;
     event.prop(
         "disposition",
-        if violation.blocks() { "enforce" } else { "report" },
+        if violation.blocks() {
+            "enforce"
+        } else {
+            "report"
+        },
     )?;
-    event.prop("statusCode", 0u16)?;
-    event.prop("lineNumber", 0u32)?;
-    event.prop("columnNumber", 0u32)?;
+    event.prop("statusCode", violation.status_code)?;
+    event.prop("lineNumber", violation.line_number)?;
+    event.prop("columnNumber", violation.column_number)?;
     dispatch(ctx, target, &event, None)?;
     Ok(())
 }
@@ -1642,13 +1655,16 @@ fn handler_attribute_allowed<'js>(
     let violations = {
         let world = bindings::world(ctx)?;
         let world = world.borrow();
-        world.csp.check_inline(&crate::csp::InlineScript {
-            source,
-            nonce: "",
-            nonceable: false,
-            parser_inserted: false,
-            kind: crate::csp::InlineKind::ScriptAttribute,
-        })
+        world.csp.check_inline(
+            &world.document_url,
+            &crate::csp::InlineScript {
+                source,
+                nonce: "",
+                nonceable: false,
+                parser_inserted: false,
+                kind: crate::csp::InlineKind::ScriptAttribute,
+            },
+        )
     };
     if !violations.is_empty() {
         bindings::fire_csp_violations(ctx, id, &violations)?;
@@ -1666,7 +1682,8 @@ fn call_handler_attribute<'js>(
     target: Option<&Value<'js>>,
     typ: &str,
     event: &Value<'js>,
-) -> Result<()> {    let Some(object) = target.and_then(|target| target.as_object()) else {
+) -> Result<()> {
+    let Some(object) = target.and_then(|target| target.as_object()) else {
         return Ok(());
     };
     let name = format!("on{typ}");

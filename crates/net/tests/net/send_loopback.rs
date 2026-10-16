@@ -320,6 +320,37 @@ async fn max_redirects_cap_returns_limit_exceeded() {
     server.assert_clean();
 }
 
+/// The redirect gate sees the next URL and the hop count before that hop is
+/// sent. A false answer is a protocol rejection, not a followed request.
+#[tokio::test]
+async fn redirect_gate_can_refuse_the_next_hop() {
+    let server = scripted([canned_redirect(302, "/landed"), canned_ok(&[], b"landed")]);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut request = Request::new(Method::GET, server.url("/start"));
+    let seen_gate = Arc::clone(&seen);
+    request.on_redirect = Some(Arc::new(move |next, redirects| {
+        seen_gate
+            .lock()
+            .expect("gate log")
+            .push((next.path().to_owned(), redirects));
+        false
+    }));
+    let error = default_agent()
+        .send(request)
+        .await
+        .expect_err("refused hop");
+    assert!(matches!(
+        error,
+        NetError::Protocol(ProtocolError::RejectedRequest)
+    ));
+    assert_eq!(
+        seen.lock().expect("gate log").as_slice(),
+        &[("/landed".to_owned(), 1)]
+    );
+    assert_eq!(server.requests().len(), 1);
+    server.assert_clean();
+}
+
 /// On origin change the redirect loop drops caller-set forbidden headers
 /// (`Host`, `Content-Length`). JS cannot set forbidden header names
 /// (<https://fetch.spec.whatwg.org/#forbidden-header-name>), so WPT cannot

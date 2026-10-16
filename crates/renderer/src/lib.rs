@@ -15,6 +15,7 @@ use markup5ever::interface::QuirksMode;
 use crate::documents::BlitzDocument;
 
 mod csp;
+pub use csp::RedirectGate;
 mod document;
 mod documents;
 mod dom;

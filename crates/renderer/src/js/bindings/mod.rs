@@ -601,6 +601,7 @@ fn capture_host_primitives<'js>(
 ) -> Result<()> {
     let number: Function = globals.get("Number")?;
     let boolean: Function = globals.get("Boolean")?;
+    let error: Constructor = globals.get("Error")?;
     let reflect: Object = globals.get("Reflect")?;
     let reflect_set: Function = reflect.get("set")?;
     let deliver: Function = crate::js::bridge::object(ctx)?.get("__tb_deliver_mutations")?;
@@ -614,6 +615,7 @@ fn capture_host_primitives<'js>(
     });
     world.pristine_number = Some(Persistent::save(ctx, number));
     world.pristine_boolean = Some(Persistent::save(ctx, boolean));
+    world.pristine_error = Some(Persistent::save(ctx, error));
     world.pristine_reflect_set = Some(Persistent::save(ctx, reflect_set));
     world.pristine_queue_microtask = globals
         .get::<_, Function>("queueMicrotask")
@@ -2074,6 +2076,7 @@ mod realm_tests {
                     init_scripts: Vec::new(),
                     content_security_policy: None,
                     content_security_policy_report_only: None,
+                    reporting_endpoints: None,
                     no_sniff: false,
                     http_response: false,
                 },
@@ -2118,6 +2121,7 @@ mod realm_tests {
                 content_type: Some("text/html".into()),
                 content_security_policy: None,
                 content_security_policy_report_only: None,
+                reporting_endpoints: None,
                 no_sniff: false,
                 http_response: false,
                 body: html.as_bytes().to_vec(),

@@ -205,6 +205,9 @@ pub struct ResponseStart {
     /// Combined `Content-Security-Policy-Report-Only` header.
     #[serde(default)]
     pub content_security_policy_report_only: Option<String>,
+    /// Combined `Reporting-Endpoints` header, when the response sent one.
+    #[serde(default)]
+    pub reporting_endpoints: Option<String>,
     /// `X-Content-Type-Options: nosniff` on the response.
     #[serde(default)]
     pub no_sniff: bool,
@@ -502,6 +505,7 @@ mod tests {
                         content_type: Some("text/html".into()),
                         content_security_policy: None,
                         content_security_policy_report_only: None,
+                        reporting_endpoints: None,
                         no_sniff: false,
                         http_response: true,
                         history: renderer::HistorySnapshot::default(),
@@ -577,6 +581,7 @@ mod tests {
                         headers: Vec::new(),
                         referrer: None,
                         timeout_ms: 0,
+                        csp: None,
                     })),
                 },
             },
@@ -675,6 +680,7 @@ mod tests {
                     content_type: Some("text/html".into()),
                     content_security_policy: None,
                     content_security_policy_report_only: None,
+                    reporting_endpoints: None,
                     no_sniff: false,
                     http_response: true,
                     history: renderer::HistorySnapshot::default(),

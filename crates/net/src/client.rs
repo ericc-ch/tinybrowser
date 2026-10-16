@@ -396,6 +396,13 @@ impl Agent {
             }
 
             let next = resolve_location(&url, location)?;
+            // `followed + 1` is the redirect count the next hop will carry.
+            // A false gate refuses the hop before any bytes are sent.
+            if let Some(gate) = &request.on_redirect
+                && !gate(&next, followed + 1)
+            {
+                return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+            }
             cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
             apply_redirect_policy(
                 response.status(),
@@ -446,11 +453,13 @@ impl Agent {
     }
 }
 
+/// Decides whether a redirect hop may be followed.
+pub type RedirectGate = Arc<dyn Fn(&Url, u32) -> bool + Send + Sync>;
+
 /// One outbound request as plain data. Set fields directly, then hand it to
 /// [`Agent::send`] (`http`/`https`) or [`Agent::upgrade`] (`ws`/`wss`).
 ///
 /// Default [`InitiatorKind`] is [`InitiatorKind::Navigation`].
-#[derive(Debug)]
 pub struct Request {
     /// Request method.
     pub method: Method,
@@ -472,6 +481,27 @@ pub struct Request {
     /// When set, reject any initial or redirected hop outside this origin
     /// before sending headers or body. Navigation and subresources leave it unset.
     pub same_origin: Option<url::Origin>,
+    /// Called with the next URL and the redirect count that hop will carry
+    /// (`1` for the first redirect) before the hop is followed. `false`
+    /// rejects the dial. Unset follows every redirect the cap allows.
+    pub on_redirect: Option<RedirectGate>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Request")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &self.headers)
+            .field("initiator_kind", &self.initiator_kind)
+            .field("initiator", &self.initiator)
+            .field("body", &self.body)
+            .field("deadline", &self.deadline)
+            .field("same_origin", &self.same_origin)
+            .field("on_redirect", &self.on_redirect.is_some())
+            .finish()
+    }
 }
 
 impl Request {
@@ -488,6 +518,7 @@ impl Request {
             body: None,
             deadline: None,
             same_origin: None,
+            on_redirect: None,
         }
     }
 }

@@ -773,6 +773,10 @@ pub(crate) struct World {
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_reflect_set: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
+    /// The pristine `Error` constructor, so violation source capture never
+    /// resolves the page-replaceable global: a page that swaps `Error` must
+    /// neither spoof `sourceFile` nor run code inside the bindings.
+    pub(crate) pristine_error: Option<Persistent<rquickjs::function::Constructor<'static>>>,
     /// The realm's own event-interface constructors, captured after the web
     /// bundle installs them and before page script runs. `createEvent` uses
     /// these, never `globals[interface]`: a page that replaces the global
@@ -811,6 +815,76 @@ pub(crate) struct World {
     /// write, closed by clearing on removal. Clones copy the slot, adopts
     /// retarget it, and `forget_document` drops a dead document's entries.
     pub(crate) nonce_slots: HashMap<NodeId, String>,
+    /// The executing script's URL, line, and column captured when a
+    /// subresource URL entered an element: a `src` set, or an insertion when
+    /// no set chose the URL. A later CSP violation for that element's load
+    /// reports these as `sourceFile`, `lineNumber`, and `columnNumber`
+    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+    pub(crate) creator_stacks: HashMap<NodeId, CreatorInfo>,
+}
+
+/// The top JS frame that triggered a subresource fetch: the script URL as
+/// written (fragments and credentials stripped at report time), with 1-based
+/// line and column. Zero line or column means unknown.
+#[derive(Clone, Debug)]
+pub(crate) struct CreatorInfo {
+    pub url: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl CreatorInfo {
+    /// Parses one `at`-prefixed stack line into its `(url, line, column)`.
+    /// The trailing `:line:col` is stripped first, so URLs carrying their
+    /// own parentheses (a `data:` script's encoded source) do not confuse
+    /// the frame wrapper split. `(native)` dispatch lines and malformed
+    /// frames parse to `None`.
+    fn parse_frame(line: &str) -> Option<(&str, u32, u32)> {
+        let frame = line.trim().strip_prefix("at ")?.trim();
+        let frame = frame.strip_suffix(')').unwrap_or(frame);
+        // Line and column are the last two colon segments, both numeric.
+        let (rest, column) = frame.rsplit_once(':')?;
+        let (rest, line) = rest.rsplit_once(':')?;
+        let (Some(line), Some(column)) =
+            (line.parse::<u32>().ok(), column.parse::<u32>().ok())
+        else {
+            return None;
+        };
+        // `name (url)` or a bare `url`: the name never holds a paren, so
+        // the first `(` opens the location even when the URL has its own.
+        // A URL may itself end in `)`; the wrapper close is already gone.
+        let url = rest.split_once('(').map_or(rest, |(_, url)| url);
+        if url.is_empty() {
+            return None;
+        }
+        Some((url, line, column))
+    }
+
+    /// The first engine-external frame of a stack trace captured inside a
+    /// binding: frame zero is the capture `eval` itself, `(native)` lines
+    /// are dispatch with no page location, and `tinybrowser-shim` frames are
+    /// the engine bundle between page script and the binding. What remains
+    /// is the executing page script, whose URL names the violation source.
+    /// Page script evaluated without a URL (direct `eval`, `WebDriver`
+    /// `execute`) still counts: it is genuinely page code, only oddly
+    /// labeled. Returns `None` when no page frame is on the stack (parser
+    /// insertions run with no script executing).
+    pub(crate) fn user_frame(stack: &str) -> Option<Self> {
+        let mut frames = stack.lines().filter_map(Self::parse_frame).peekable();
+        // The capture `eval` is always innermost.
+        frames.next()?;
+        for (url, line, column) in frames {
+            if url == crate::js::bridge::ENGINE_FILENAME {
+                continue;
+            }
+            return Some(Self {
+                url: url.to_owned(),
+                line,
+                column,
+            });
+        }
+        None
+    }
 }
 
 /// One streaming `TextDecoder` session: the decoder plus what recreates it.
@@ -915,6 +989,7 @@ impl World {
             pristine_boolean: None,
             pristine_reflect_set: None,
             pristine_queue_microtask: None,
+            pristine_error: None,
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
@@ -924,6 +999,7 @@ impl World {
             image_broken: HashSet::new(),
             image_error_reported: HashSet::new(),
             nonce_slots: HashMap::new(),
+            creator_stacks: HashMap::new(),
         }
     }
 
@@ -993,6 +1069,7 @@ impl World {
             self.owned.remove(&old);
             self.unload_object_urls_for_document(old);
             self.nonce_slots.retain(|node, _| node.document != old);
+            self.creator_stacks.retain(|node, _| node.document != old);
             self.runtime.documents.borrow_mut().remove(old);
             self.runtime.registry.borrow_mut().forget_document(old);
         }
@@ -1007,6 +1084,7 @@ impl World {
             self.runtime.documents.borrow_mut().remove(id);
             self.runtime.registry.borrow_mut().forget_document(id);
             self.nonce_slots.retain(|node, _| node.document != id);
+            self.creator_stacks.retain(|node, _| node.document != id);
             self.handler_attributes
                 .retain(|(node, _), _| node.is_some_and(|node| node.document_id() != id));
             self.cleared_handlers
@@ -1995,6 +2073,7 @@ impl World {
         self.pristine_boolean = None;
         self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
+        self.pristine_error = None;
         self.event_ctors.clear();
         self.weak_references = None;
         self.deliver_mutations_fn = None;
