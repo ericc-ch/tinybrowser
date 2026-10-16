@@ -2136,7 +2136,8 @@ impl Document {
     }
 
     /// The Reporting API envelope for a violation, with the
-    /// `CSPViolationReportBody` camelCase fields
+    /// `CSPViolationReportBody` camelCase fields. The endpoint receives a
+    /// list of reports, even when only one fired
     /// (<https://w3c.github.io/webappsec-csp/#cspviolationreportbody>,
     /// <https://w3c.github.io/reporting/#send-reports>).
     fn reporting_api_body(violation: &crate::csp::Violation) -> Vec<u8> {
@@ -2153,7 +2154,7 @@ impl Document {
             |_| (violation.line_number.to_string(), violation.column_number.to_string()),
         );
         format!(
-            "{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":\"tinybrowser\",\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":{},\"lineNumber\":{},\"columnNumber\":{},\"sample\":{},\"disposition\":{},\"statusCode\":{}}}}}",
+            "[{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":\"tinybrowser\",\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":{},\"lineNumber\":{},\"columnNumber\":{},\"sample\":{},\"disposition\":{},\"statusCode\":{}}}}}]",
             Self::json_string(&violation.document_uri),
             Self::json_string(&violation.document_uri),
             Self::json_string(&violation.blocked_uri),

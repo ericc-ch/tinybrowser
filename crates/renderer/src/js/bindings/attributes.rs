@@ -1665,10 +1665,12 @@ fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
     let Some((url, line, column)) = crate::js::error_stack_top(ctx) else {
         return;
     };
-    let Ok(world) = crate::js::bindings::world(ctx) else {
+    // The entry lives in the element owner's world, where a later violation
+    // for its load looks it up.
+    let Ok(owner) = world_for_node(ctx, element) else {
         return;
     };
-    world.borrow_mut().creator_stacks.insert(
+    owner.borrow_mut().creator_stacks.insert(
         element,
         crate::js::CreatorInfo { url, line, column },
     );

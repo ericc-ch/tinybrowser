@@ -862,14 +862,16 @@ fn integrity_matches(list: &[String], integrity: &str) -> bool {
 }
 
 /// Parses SRI integrity metadata into `(algorithm, base64-value)` pairs.
-/// Entries with unsupported algorithms or invalid values are dropped, and
-/// the algorithm is lowercased
+/// Entries with unsupported algorithms or invalid values are dropped, the
+/// algorithm is lowercased, and any `?`-suffixed options ride along with
+/// neither the digest nor the parse: unknown options degrade gracefully
 /// (<https://www.w3.org/TR/SRI/#parse-metadata>).
 fn parse_integrity_metadata(metadata: &str) -> Vec<(String, String)> {
     metadata
         .split_ascii_whitespace()
         .filter_map(|entry| {
-            let (algorithm, value) = entry.split_once('-')?;
+            let (algorithm, rest) = entry.split_once('-')?;
+            let value = rest.split_once('?').map_or(rest, |(value, _)| value);
             let algorithm = if algorithm.eq_ignore_ascii_case("sha256") {
                 "sha256"
             } else if algorithm.eq_ignore_ascii_case("sha384") {
@@ -886,8 +888,10 @@ fn parse_integrity_metadata(metadata: &str) -> Vec<(String, String)> {
 
 /// Whether `bytes` satisfy SRI `integrity` metadata: the strongest supported
 /// algorithm present must have at least one entry matching the content.
-/// Empty metadata enforces nothing; unparseable metadata fails closed
-/// (<https://www.w3.org/TR/SRI/#verify-integrity>).
+/// Empty metadata enforces nothing, and so does metadata with no supported
+/// algorithm: unknown hashes degrade gracefully, and only a supported
+/// algorithm's mismatch fails the load
+/// (<https://www.w3.org/TR/SRI/#does-response-match-metadatalist>).
 #[must_use]
 pub(crate) fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
     let integrity = integrity.trim();
@@ -902,7 +906,8 @@ pub(crate) fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
             _ => 0,
         },
     ) else {
-        return false;
+        // No supported metadata: nothing to enforce.
+        return true;
     };
     sources.iter().any(|(algorithm, expected)| {
         algorithm == strongest && {
@@ -1723,7 +1728,11 @@ mod tests {
         assert!(integrity_verifies(sha256, body));
         assert!(integrity_verifies("", body));
         assert!(!integrity_verifies("sha256-xyz", body));
-        assert!(!integrity_verifies("sha999-xyz", body));
+        // Unknown algorithms degrade gracefully: no supported metadata means
+        // nothing to enforce
+        // (<https://www.w3.org/TR/SRI/#does-response-match-metadatalist>).
+        assert!(integrity_verifies("sha999-xyz", body));
+        assert!(integrity_verifies("sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c=?opt", body));
         // A matching sha256 beside a mismatch still verifies: sha512 is
         // absent, so sha256 is strongest and one entry matches.
         assert!(integrity_verifies(

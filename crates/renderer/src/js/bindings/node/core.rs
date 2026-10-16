@@ -2386,9 +2386,6 @@ pub(super) fn insert_tree_node_inner(
 /// here, so it reports no source
 /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
 fn note_inserted_creators(ctx: &Ctx<'_>, inserted: &[NodeId]) {
-    let Some(creator) = crate::js::error_stack_top(ctx) else {
-        return;
-    };
     let Ok(world_rc) = world(ctx) else {
         return;
     };
@@ -2420,16 +2417,27 @@ fn note_inserted_creators(ctx: &Ctx<'_>, inserted: &[NodeId]) {
         }
         targets
     };
+    // Only capture a stack when an attribution target exists: most insertions
+    // are text and plain elements, and building an `Error` for each is pure
+    // overhead.
     if targets.is_empty() {
         return;
     }
-    let mut world = world_rc.borrow_mut();
+    let Some(creator) = crate::js::error_stack_top(ctx) else {
+        return;
+    };
     for target in targets {
+        // The entry lives in the element owner's world, where a later
+        // violation for its load looks it up: a script mutating another
+        // frame's DOM must not attribute to its own realm.
+        let Ok(owner_rc) = world_for_node(ctx, target) else {
+            continue;
+        };
         // The earliest trigger wins: a `src` set already recorded the
         // mutation that chose the URL, and insertion only starts this load
         // when nothing did. A disconnect clears the entry, so a moved
         // element attributes its new load to the move.
-        world.creator_stacks.entry(target).or_insert_with(|| {
+        owner_rc.borrow_mut().creator_stacks.entry(target).or_insert_with(|| {
             let (url, line, column) = creator.clone();
             crate::js::CreatorInfo { url, line, column }
         });

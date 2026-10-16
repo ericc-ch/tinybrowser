@@ -773,6 +773,10 @@ pub(crate) struct World {
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_reflect_set: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
+    /// The pristine `Error` constructor, so violation source capture never
+    /// resolves the page-replaceable global: a page that swaps `Error` must
+    /// neither spoof `sourceFile` nor run code inside the bindings.
+    pub(crate) pristine_error: Option<Persistent<rquickjs::function::Constructor<'static>>>,
     /// The realm's own event-interface constructors, captured after the web
     /// bundle installs them and before page script runs. `createEvent` uses
     /// these, never `globals[interface]`: a page that replaces the global
@@ -985,6 +989,7 @@ impl World {
             pristine_boolean: None,
             pristine_reflect_set: None,
             pristine_queue_microtask: None,
+            pristine_error: None,
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
@@ -2068,6 +2073,7 @@ impl World {
         self.pristine_boolean = None;
         self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
+        self.pristine_error = None;
         self.event_ctors.clear();
         self.weak_references = None;
         self.deliver_mutations_fn = None;

@@ -1616,10 +1616,17 @@ fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
 /// insertion, a `src` set) capture this so a later CSP violation for the load
 /// can report `sourceFile`, `lineNumber`, and `columnNumber`
 /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-/// Returns `None` outside script execution or when no frame parses.
+/// The constructor is the pristine one captured at install, passed as an
+/// argument: a page that replaces the `Error` global neither spoofs the
+/// capture nor runs code inside the bindings. Returns `None` outside script
+/// execution or when no frame parses.
 pub(crate) fn error_stack_top(ctx: &Ctx<'_>) -> Option<(String, u32, u32)> {
-    let error: Value<'_> = ctx.eval("new Error()").ok()?;
-    let stack: String = error.as_object()?.get("stack").ok()?;
+    let factory: Function = ctx.eval("(function(E){ return new E(); })").ok()?;
+    let error_ctor = bindings::world(ctx).ok()?.borrow().pristine_error.clone()?;
+    let error: Object = factory
+        .call((error_ctor.restore(ctx).ok()?,))
+        .ok()?;
+    let stack: String = error.get("stack").ok()?;
     // The capture runs inside a binding, so engine dispatch frames sit
     // between the capture and the executing page script; `user_frame` skips
     // them to the script the violation attributes to.
