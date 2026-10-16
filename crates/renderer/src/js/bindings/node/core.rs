@@ -2378,6 +2378,64 @@ pub(super) fn insert_tree_node_inner(
     apply_inserted(ctx, parent, &moved, deliver)
 }
 
+/// Records the executing script for inserted `<img>` and `<script>` elements,
+/// so a later CSP violation for their loads can report `sourceFile`,
+/// `lineNumber`, and `columnNumber`. Insertions that trigger no fetch
+/// (disconnected parents, non-URL elements) still record; the entry is only
+/// read when a violation fires. Parser-inserted content never passes through
+/// here, so it reports no source
+/// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+fn note_inserted_creators(ctx: &Ctx<'_>, inserted: &[NodeId]) {
+    let Some(creator) = crate::js::error_stack_top(ctx) else {
+        return;
+    };
+    let Ok(world_rc) = world(ctx) else {
+        return;
+    };
+    let targets: Vec<NodeId> = {
+        let world = world_rc.borrow();
+        let mut targets = Vec::new();
+        for root in inserted {
+            let Some(parsed) = world.document(*root) else {
+                continue;
+            };
+            let base = &parsed.document.base;
+            let mut stack = vec![root.node];
+            while let Some(id) = stack.pop() {
+                let Some(node) = base.get_node(id) else {
+                    continue;
+                };
+                stack.extend(node.children.iter().copied());
+                let is_url_element = node.data.downcast_element().is_some_and(|element| {
+                    element.name.ns == crate::dom::tree::html_namespace()
+                        && matches!(element.name.local.as_str(), "img" | "script")
+                });
+                if is_url_element {
+                    targets.push(NodeId {
+                        document: parsed.id,
+                        node: id,
+                    });
+                }
+            }
+        }
+        targets
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let mut world = world_rc.borrow_mut();
+    for target in targets {
+        // The earliest trigger wins: a `src` set already recorded the
+        // mutation that chose the URL, and insertion only starts this load
+        // when nothing did. A disconnect clears the entry, so a moved
+        // element attributes its new load to the move.
+        world.creator_stacks.entry(target).or_insert_with(|| {
+            let (url, line, column) = creator.clone();
+            crate::js::CreatorInfo { url, line, column }
+        });
+    }
+}
+
 /// HTML insertion and script children-changed steps after a tree insert, in
 /// tree order: an earlier script must not observe a later iframe's browsing
 /// context, and an earlier iframe must already have one
@@ -2396,6 +2454,7 @@ pub(super) fn run_html_insertion_steps(
     if !connected.unwrap_or(false) {
         return Ok(());
     }
+    note_inserted_creators(ctx, inserted);
     drain_mutation_journal(ctx)?;
     let mut steps = Vec::new();
     {

@@ -283,6 +283,10 @@ pub struct Mount {
 pub struct ResponseHead {
     /// Absolute document URL.
     pub url: String,
+    /// Final HTTP status. Violation `status-code` reports it; documents
+    /// without an HTTP response (blank, data) carry zero
+    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+    pub status: u16,
     /// Every `Content-Type` response header value joined with `", "`
     /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>),
     /// when the document came from the network.

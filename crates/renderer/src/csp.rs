@@ -52,6 +52,7 @@ struct Policy {
 /// A decision to block (or, for report-only policies, to report) one check.
 /// Callers dispatch one `securitypolicyviolation` event per violation
 /// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+#[derive(Clone)]
 pub(crate) struct Violation {
     /// The directive that blocked, after fallback: `script-src-elem` from a
     /// `script-src` policy reports `script-src`
@@ -66,6 +67,17 @@ pub(crate) struct Violation {
     /// Stripped URL of the protected resource, reported as `document-uri`
     /// (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
     pub document_uri: String,
+    /// The script that triggered the violation, if one was executing. The
+    /// event and the reports carry the stripped URL; a non-HTTP(S) script
+    /// URL reports just its scheme
+    /// (<https://w3c.github.io/webappsec-csp/#strip-url-for-use-in-reports>).
+    pub source_file: Option<String>,
+    /// Line and column of the triggering call in `source_file`. Zero when
+    /// unknown or inapplicable.
+    pub line_number: u32,
+    pub column_number: u32,
+    /// HTTP status of the protected resource. Zero when unknown.
+    pub status_code: u16,
     /// `report-uri` endpoints of the violated policy, resolved against the
     /// document URL when the report is sent
     /// (<https://w3c.github.io/webappsec-csp/#directive-report-uri>).
@@ -276,6 +288,13 @@ fn strip_url(url: &Url) -> String {
     clean.as_str().to_owned()
 }
 
+/// Parses `raw` and strips it for use in violation reports. Unparseable
+/// input reports as the empty string.
+#[must_use]
+pub(crate) fn strip_url_for_reports(raw: &str) -> String {
+    Url::parse(raw).map_or_else(|_| String::new(), |url| strip_url(&url))
+}
+
 /// `report-uri` endpoints of `policy`, in order. The report goes to every
 /// endpoint; meta-delivered policies never carry one.
 fn report_uris(policy: &Policy) -> Vec<String> {
@@ -446,6 +465,10 @@ impl List {
                     blocked_uri: blocked_uri(origin, effective, url),
                     sample: None,
                     document_uri: strip_url(document_url),
+                    source_file: None,
+                    line_number: 0,
+                    column_number: 0,
+                    status_code: 0,
                     report_uris: report_uris(policy),
                     report_to: report_to(policy),
                 });
@@ -474,6 +497,10 @@ impl List {
                     blocked_uri: inline.blocked_uri(),
                     sample: Some(inline.sample()),
                     document_uri: strip_url(document_url),
+                    source_file: None,
+                    line_number: 0,
+                    column_number: 0,
+                    status_code: 0,
                     report_uris: report_uris(policy),
                     report_to: report_to(policy),
                 });
@@ -510,6 +537,10 @@ impl List {
                     blocked_uri: strip_url(child_url),
                     sample: None,
                     document_uri: strip_url(child_url),
+                    source_file: None,
+                    line_number: 0,
+                    column_number: 0,
+                    status_code: 0,
                     report_uris: report_uris(policy),
                     report_to: report_to(policy),
                 });
@@ -1642,6 +1673,17 @@ mod tests {
         let expression = "'sha256-wmuLCpoj8EMqfQlPnt5NIMgKkCK62CxAkAiewI0zZps='";
         assert!(hash_matches(expression, "t1.done();"));
         assert!(!hash_matches(expression, "t2.done();"));
+    }
+
+    #[test]
+    fn report_urls_strip() {
+        assert_eq!(
+            strip_url_for_reports("http://user:pass@example.test/a?b=1#frag"),
+            "http://example.test/a?b=1"
+        );
+        assert_eq!(strip_url_for_reports("data:text/javascript,alert(1)"), "data");
+        assert_eq!(strip_url_for_reports("blob:https://example.test/uuid"), "blob");
+        assert_eq!(strip_url_for_reports("not a url ["), "");
     }
 
     #[test]

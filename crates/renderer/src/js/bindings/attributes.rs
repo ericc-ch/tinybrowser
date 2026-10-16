@@ -1658,6 +1658,22 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     Ok(())
 }
 
+/// Records the executing script for an element whose `src` set chose its URL,
+/// for later CSP `sourceFile` reporting
+/// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
+    let Some((url, line, column)) = crate::js::error_stack_top(ctx) else {
+        return;
+    };
+    let Ok(world) = crate::js::bindings::world(ctx) else {
+        return;
+    };
+    world.borrow_mut().creator_stacks.insert(
+        element,
+        crate::js::CreatorInfo { url, line, column },
+    );
+}
+
 /// After an attribute change, runs the element's attribute-change hooks: an
 /// `iframe`'s `src` drives its browsing context's navigation
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>),
@@ -1702,6 +1718,17 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_default();
+    // The fetch a set triggers attributes to the executing script: a later
+    // CSP violation for the load reports it as `sourceFile`, `lineNumber`,
+    // and `columnNumber`
+    // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+    // Record even when detached: the URL enters the element here, and the
+    // insertion hook keeps the earliest trigger, so a script that sets
+    // `src` then inserts reports the set, matching the line browsers
+    // attribute the mutation to.
+    if is_img || is_script {
+        note_src_creator(ctx, element);
+    }
     // A detached `iframe` has no browsing context yet; insertion reads the
     // current attribute, so queueing here would navigate it twice. The same
     // is true of `<img>`: connection starts the fetch.

@@ -825,7 +825,15 @@ pub(crate) fn fire_security_policy_violation(
     event.prop("violatedDirective", violation.effective_directive.clone())?;
     event.prop("effectiveDirective", violation.effective_directive.clone())?;
     event.prop("originalPolicy", violation.original_policy.clone())?;
-    event.prop("sourceFile", String::new())?;
+    // `sourceFile` strips like the reports: a `data:` or `blob:` trigger
+    // reports just its scheme. Line and column are zero when unknown.
+    event.prop(
+        "sourceFile",
+        violation
+            .source_file
+            .as_deref()
+            .map_or_else(String::new, crate::csp::strip_url_for_reports),
+    )?;
     event.prop("sample", violation.sample.clone().unwrap_or_default())?;
     event.prop(
         "disposition",
@@ -835,9 +843,9 @@ pub(crate) fn fire_security_policy_violation(
             "report"
         },
     )?;
-    event.prop("statusCode", 0u16)?;
-    event.prop("lineNumber", 0u32)?;
-    event.prop("columnNumber", 0u32)?;
+    event.prop("statusCode", violation.status_code)?;
+    event.prop("lineNumber", violation.line_number)?;
+    event.prop("columnNumber", violation.column_number)?;
     dispatch(ctx, target, &event, None)?;
     Ok(())
 }

@@ -34,7 +34,7 @@ use rquickjs::{
 };
 use url::Url;
 
-pub(crate) use world::World;
+pub(crate) use world::{CreatorInfo, World};
 
 /// Shared `QuickJS` heap cap. Forty live subframe realms need more than
 /// 32MB (measured: `Document-createElement-namespace.html`, 40 parallel
@@ -303,6 +303,10 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let mut options = EvalOptions::default();
                 options.strict = false;
+                // The URL names classic-script stacks: CSP `sourceFile` and
+                // `window.onerror` lines attribute to the script that ran,
+                // not to the engine's anonymous eval label.
+                options.filename = Some(filename.into());
                 match ctx.eval_with_options::<Value, _>(source, options) {
                     Ok(_) => Ok(()),
                     Err(error) => {
@@ -972,7 +976,11 @@ impl JsRealm {
         bridge::object(ctx)?.set(
             "__tbCspAllowsEval",
             Func::from(move |ctx: Ctx<'_>, source: String| -> rquickjs::Result<bool> {
-                let violations = {
+                // The violation's source is the calling script: capture its
+                // top frame now, while the `eval()` call is on the stack
+                // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+                let caller = error_stack_top(&ctx);
+                let mut violations = {
                     let world = eval_world.borrow();
                     world.csp.check_inline(
                         &world.document_url,
@@ -985,6 +993,13 @@ impl JsRealm {
                         },
                     )
                 };
+                if let Some((url, line, column)) = caller {
+                    for violation in &mut violations {
+                        violation.source_file = Some(url.clone());
+                        violation.line_number = line;
+                        violation.column_number = column;
+                    }
+                }
                 if !violations.is_empty() {
                     let target = eval_world.borrow().with_main_document(|parsed| {
                         crate::dom::tree::NodeId {
@@ -1596,6 +1611,21 @@ fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
     referrer_for_policy(&world.referrer_policy, &world.document_url, request_url)
 }
 
+/// The executing script's URL, line, and column: the top frame of a freshly
+/// constructed `Error`'s stack trace. Subresource triggers (an element
+/// insertion, a `src` set) capture this so a later CSP violation for the load
+/// can report `sourceFile`, `lineNumber`, and `columnNumber`
+/// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+/// Returns `None` outside script execution or when no frame parses.
+pub(crate) fn error_stack_top(ctx: &Ctx<'_>) -> Option<(String, u32, u32)> {
+    let error: Value<'_> = ctx.eval("new Error()").ok()?;
+    let stack: String = error.as_object()?.get("stack").ok()?;
+    // The capture runs inside a binding, so engine dispatch frames sit
+    // between the capture and the executing page script; `user_frame` skips
+    // them to the script the violation attributes to.
+    CreatorInfo::user_frame(&stack).map(|creator| (creator.url, creator.line, creator.column))
+}
+
 /// The pure policy decision behind [`fetch_referrer`], split out so unit
 /// tests need no `World`: credentials and fragments never leave,
 /// local-scheme documents send nothing, unknown tokens fail closed to the
@@ -1788,6 +1818,7 @@ pub(crate) fn js_number(id: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::referrer_for_policy;
+    use super::CreatorInfo;
     use url::Url;
 
     /// The referrer for one policy/document/request triple, without a
@@ -1848,5 +1879,63 @@ mod tests {
         );
         // Unparseable request URLs send nothing rather than leaking.
         assert_eq!(referrer("", doc, "http://["), None);
+    }
+
+    #[test]
+    fn stack_top_frame_parses() {
+        // Direct page-script frame past the capture `eval`.
+        let frame = CreatorInfo::user_frame(
+            "    at <eval> (eval_script:1:5)\n    at appendChild (http://example.test/page.html:3:15)\n    at <eval> (http://example.test/page.html:1:1)",
+        )
+        .expect("frame");
+        assert_eq!(frame.url, "http://example.test/page.html");
+        assert_eq!(frame.line, 3);
+        assert_eq!(frame.column, 15);
+        // Bare `url:line:col` frames parse too.
+        let anonymous = CreatorInfo::user_frame(
+            "    at <eval> (eval_script:1:5)\n    at http://example.test/a.js:2:1",
+        )
+        .expect("anonymous");
+        assert_eq!(anonymous.url, "http://example.test/a.js");
+        assert_eq!(anonymous.line, 2);
+        assert_eq!(anonymous.column, 1);
+        assert!(CreatorInfo::user_frame("no frames here").is_none());
+        assert!(
+            CreatorInfo::user_frame("    at <eval> (eval_script:1:5)\n    at broken (http://example.test/a.js)")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn user_frame_skips_engine_frames() {
+        // A binding capture: frame zero is the capture `eval`, then native
+        // dispatch and the shim bundle, then the executing page script.
+        let stack = "    at <eval> (eval_script:1:5)\n    at appendChild (native)\n    at apply (native)\n    at insertion (tinybrowser-shim:3346:48)\n    at <eval> (http://example.test/inject.js:3:15)";
+        let user = CreatorInfo::user_frame(stack).expect("user frame");
+        assert_eq!(user.url, "http://example.test/inject.js");
+        assert_eq!(user.line, 3);
+        assert_eq!(user.column, 15);
+        // No page script on the stack (parser insertion): no attribution.
+        assert!(
+            CreatorInfo::user_frame("    at <eval> (eval_script:1:5)\n    at insertion (tinybrowser-shim:10:2)")
+                .is_none()
+        );
+        // A `data:` script URL carries its own parentheses; the location
+        // still splits at the frame wrapper, not inside the URL.
+        let paren_url = CreatorInfo::user_frame(
+            "    at <eval> (eval_script:1:5)\n    at <eval> (data:text/javascript,eval(%22x('y')%22):3:17)",
+        )
+        .expect("paren url");
+        assert_eq!(paren_url.url, "data:text/javascript,eval(%22x('y')%22)");
+        assert_eq!(paren_url.line, 3);
+        assert_eq!(paren_url.column, 17);
+        // Page script evaluated without a URL is still page code.
+        let eval_code = CreatorInfo::user_frame(
+            "    at <eval> (eval_script:1:5)\n    at cspEval (tinybrowser-shim:7471:46)\n    at <eval> (<input>:2:8)",
+        )
+        .expect("eval frame");
+        assert_eq!(eval_code.url, "<input>");
+        assert_eq!(eval_code.line, 2);
+        assert_eq!(eval_code.column, 8);
     }
 }

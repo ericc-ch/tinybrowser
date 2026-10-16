@@ -386,6 +386,10 @@ pub(crate) struct Document {
     /// directive resolves its first known name here
     /// (<https://w3c.github.io/reporting/#header>).
     pub(crate) reporting_endpoints: Vec<(String, String)>,
+    /// HTTP status of the committed navigation response, reported as the
+    /// violation `status-code`. Zero when unknown
+    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+    pub(crate) http_status: u16,
     /// First 1445 raw response bytes, the MIME sniff resource header.
     sniff_header: Vec<u8>,
     /// Whether [`Document::finish_parse`] runs the MIME sniffing algorithm.
@@ -493,6 +497,7 @@ impl Document {
             embedder_csp_reports: Vec::new(),
             csp_from_response: false,
             reporting_endpoints: Vec::new(),
+            http_status: 0,
             sniff_header: Vec::new(),
             apply_mime_sniff: false,
             mime_guard: crate::sniff::MimeGuard::default(),
@@ -744,6 +749,9 @@ impl Document {
     pub(crate) fn disconnect_image(&mut self, element: crate::dom::tree::NodeId) {
         self.in_flight_images.remove(&element);
         self.image_selected_src.remove(&element);
+        // A re-insertion starts a new load: drop the old trigger so the
+        // move attributes to itself rather than to a stale `src` set.
+        self.world.borrow_mut().creator_stacks.remove(&element);
         self.world.borrow_mut().forget_image(element);
     }
 
@@ -815,6 +823,8 @@ impl Document {
         if let Some(url) = inherited_url {
             self.apply_document_url(url, inherited_origin);
         }
+        // No HTTP response stands behind a blank document.
+        self.http_status = 0;
         self.load_html("");
         self.initial_blank = true;
         self.ensure_js_ok();
@@ -1244,6 +1254,10 @@ impl Document {
         mime: crate::sniff::MimeGuard,
     ) {
         self.reset_js_realm();
+        // A new response brings its own HTTP status: the HTTP entries set it
+        // after this runs, so documents without one (blank, data) report
+        // zero rather than a previous page's status.
+        self.http_status = 0;
         if let Some((width, height)) = viewport {
             self.viewport_size = (width, height);
         }
@@ -2001,8 +2015,30 @@ impl Document {
         if violations.is_empty() {
             return;
         }
-        self.fire_js(|js| js.fire_csp_violations(target, violations));
-        self.queue_csp_reports(violations);
+        let mut enriched: Vec<crate::csp::Violation> = violations.to_vec();
+        {
+            let world = self.world.borrow();
+            for violation in &mut enriched {
+                // A fetch violation attributes to the element whose trigger
+                // (insertion or connected `src` set) the executing script ran.
+                // Inline and `eval` violations carry their own source (sample
+                // or the eval hook's capture), so the creator map stays out.
+                if violation.source_file.is_none()
+                    && violation.blocked_uri != "inline"
+                    && violation.blocked_uri != "eval"
+                    && let Some(creator) = world.creator_stacks.get(&target)
+                {
+                    violation.source_file = Some(creator.url.clone());
+                    violation.line_number = creator.line;
+                    violation.column_number = creator.column;
+                }
+                if violation.status_code == 0 {
+                    violation.status_code = self.http_status;
+                }
+            }
+        }
+        self.fire_js(|js| js.fire_csp_violations(target, &enriched));
+        self.queue_csp_reports(&enriched);
     }
 
     /// Queues the `report-uri` / `report-to` POSTs for violations without
@@ -2025,17 +2061,29 @@ impl Document {
                 continue;
             }
             // The legacy `report-uri` serialization, built without a JSON
-            // dependency: every field is a string except `status-code`
+            // dependency: every field is a string except `status-code`,
+            // `line-number`, and `column-number`. `source-file` and its line
+            // and column only appear when a source file exists
             // (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
+            let source_fields = violation.source_file.as_deref().map_or_else(String::new, |source| {
+                format!(
+                    ",\"source-file\":{},\"line-number\":{},\"column-number\":{}",
+                    Self::json_string(&crate::csp::strip_url_for_reports(source)),
+                    violation.line_number,
+                    violation.column_number,
+                )
+            });
             let body = format!(
-                "{{\"csp-report\":{{\"document-uri\":{},\"referrer\":\"\",\"blocked-uri\":{},\"effective-directive\":{},\"violated-directive\":{},\"original-policy\":{},\"disposition\":{},\"status-code\":0,\"script-sample\":{}}}}}",
+                "{{\"csp-report\":{{\"document-uri\":{},\"referrer\":\"\",\"blocked-uri\":{},\"effective-directive\":{},\"violated-directive\":{},\"original-policy\":{},\"disposition\":{},\"status-code\":{},\"script-sample\":{}{}}}}}",
                 Self::json_string(&violation.document_uri),
                 Self::json_string(&violation.blocked_uri),
                 Self::json_string(&violation.effective_directive),
                 Self::json_string(&violation.effective_directive),
                 Self::json_string(&violation.original_policy),
                 Self::json_string(violation.disposition.as_str()),
+                violation.status_code,
                 Self::json_string(violation.sample.as_deref().unwrap_or_default()),
+                source_fields,
             )
             .into_bytes();
             for endpoint in &violation.report_uris {
@@ -2096,15 +2144,27 @@ impl Document {
             || "null".to_owned(),
             Self::json_string,
         );
+        let source_file = violation.source_file.as_deref().map_or_else(
+            || "null".to_owned(),
+            |source| Self::json_string(&crate::csp::strip_url_for_reports(source)),
+        );
+        let (line_number, column_number) = violation.source_file.as_deref().map_or_else(
+            || ("null".to_owned(), "null".to_owned()),
+            |_| (violation.line_number.to_string(), violation.column_number.to_string()),
+        );
         format!(
-            "{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":\"tinybrowser\",\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":null,\"sample\":{},\"disposition\":{},\"statusCode\":0}}}}",
+            "{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":\"tinybrowser\",\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":{},\"lineNumber\":{},\"columnNumber\":{},\"sample\":{},\"disposition\":{},\"statusCode\":{}}}}}",
             Self::json_string(&violation.document_uri),
             Self::json_string(&violation.document_uri),
             Self::json_string(&violation.blocked_uri),
             Self::json_string(&violation.effective_directive),
             Self::json_string(&violation.original_policy),
+            source_file,
+            line_number,
+            column_number,
             sample,
             Self::json_string(violation.disposition.as_str()),
+            violation.status_code,
         )
         .into_bytes()
     }
@@ -2456,6 +2516,10 @@ impl Document {
                 http: true,
             },
         );
+        // The document's own HTTP status, after the fresh response reset it:
+        // violation `status-code` reports it
+        // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+        self.http_status = outcome.status;
     }
 
     /// Hands one Blitz subresource response to its handler. A redirect the

@@ -178,6 +178,10 @@ impl Engine {
                 http: head.http_response,
             },
         );
+        // The document's own HTTP status, after the fresh response reset it:
+        // violation `status-code` reports it
+        // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+        document.http_status = head.status;
         document.reporting_endpoints = head
             .reporting_endpoints
             .as_deref()

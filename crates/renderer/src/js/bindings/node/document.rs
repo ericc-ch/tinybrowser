@@ -2110,16 +2110,19 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     world(ctx)?.borrow_mut().current_script = Some(id);
     let mut options = EvalOptions::default();
     options.strict = false;
+    // Text-set scripts run under the document URL so their stacks attribute
+    // to page script, matching parser-inserted scripts.
+    let filename = world_for_node(ctx, id)?
+        .borrow()
+        .document_url
+        .as_str()
+        .to_owned();
+    options.filename = Some(filename.clone());
     if let Err(error) = ctx.eval_with_options::<Value, _>(source, options) {
         // A script inserted from script reports through the same pipeline as
         // a parser script: the exception reaches `window.onerror` and the
         // `error` event instead of staying pending
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script>).
-        let filename = world_for_node(ctx, id)?
-            .borrow()
-            .document_url
-            .as_str()
-            .to_owned();
         crate::js::report_script_error(ctx, &error, base_line, &filename);
     }
     world(ctx)?.borrow_mut().current_script = previous;

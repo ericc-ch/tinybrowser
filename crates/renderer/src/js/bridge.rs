@@ -85,11 +85,23 @@ pub(crate) fn object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
 pub(crate) fn evaluate(ctx: &Ctx<'_>, source: &str) -> Result<()> {
     let primordials = include_str!("scripts/primordials.js");
     let bindings = include_str!("scripts/bindings.js");
-    let initializer: Function = ctx.eval(format!(
-        "(function(host) {{ 'use strict';\n{primordials}\n{bindings}\n{source}\n}})"
-    ))?;
+    // Engine code carries its own filename so violation source attribution
+    // can tell the shim bundle apart from page script: the bundle's frames
+    // never name a page location
+    // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+    let mut options = EvalOptions::default();
+    options.filename = Some(ENGINE_FILENAME.into());
+    let initializer: Function = ctx.eval_with_options(
+        format!("(function(host) {{ 'use strict';\n{primordials}\n{bindings}\n{source}\n}})"),
+        options,
+    )?;
     initializer.call((object(ctx)?,))
 }
+
+/// Filename for engine shim evaluations, so stacks distinguish engine frames
+/// from page script. It parses as no URL scheme, so a leaked frame strips to
+/// the empty string rather than a fake location.
+pub(crate) const ENGINE_FILENAME: &str = "tinybrowser-shim";
 
 #[expect(
     clippy::needless_pass_by_value,

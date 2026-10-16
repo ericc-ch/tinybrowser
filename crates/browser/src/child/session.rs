@@ -428,6 +428,7 @@ impl ResponseStreams {
             response.frame,
             &ResponseHead {
                 url: response.final_url.clone(),
+                status: response.status,
                 content_type: response.content_type.clone(),
                 content_security_policy: response.content_security_policy.clone(),
                 content_security_policy_report_only: response
