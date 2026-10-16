@@ -29,6 +29,7 @@ pub(crate) struct NavOutcome {
     pub content_type: Option<String>,
     pub content_security_policy: Option<String>,
     pub content_security_policy_report_only: Option<String>,
+    pub no_sniff: bool,
     pub body: net::Body,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -176,6 +177,7 @@ impl TabNetworkHandle {
         let content_security_policy = list_header(headers, "content-security-policy");
         let content_security_policy_report_only =
             list_header(headers, "content-security-policy-report-only");
+        let no_sniff = header_nosniff(headers);
         let body = response.into_body();
         Ok(NavOutcome {
             status,
@@ -183,6 +185,7 @@ impl TabNetworkHandle {
             content_type,
             content_security_policy,
             content_security_policy_report_only,
+            no_sniff,
             body,
             _permit: permits,
         })
@@ -269,7 +272,7 @@ impl TabNetworkHandle {
                         || (!name.eq_ignore_ascii_case("set-cookie")
                             && !name.eq_ignore_ascii_case("set-cookie2"))
                 })
-                .map(|(name, value)| (name.to_owned(), String::from_utf8_lossy(value).into_owned()))
+                .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
                 .collect();
             let body = if request.read_body {
                 response
@@ -435,12 +438,36 @@ fn list_header(headers: &net::HeaderMap, name: &str) -> Option<String> {
     )
 }
 
-/// `Content-Type` from response `headers`, when it is UTF-8.
+/// Header values are byte sequences; each byte is exposed as the same code
+/// point so the page never sees a replacement character
+/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
+fn isomorphic_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
+/// Whether `X-Content-Type-Options` on the response is `nosniff`
+/// (<https://fetch.spec.whatwg.org/#determine-nosniff>). The renderer owns
+/// the algorithm because the renderer-side dials share it.
+fn header_nosniff(headers: &net::HeaderMap) -> bool {
+    let values: Vec<String> = headers
+        .get_all("x-content-type-options")
+        .map(isomorphic_decode)
+        .collect();
+    renderer::sniff::nosniff(&values.join(", "))
+}
+
+/// Every `Content-Type` value from the response as one string: the values
+/// joined with `", "`, each byte the same code point
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>,
+/// <https://infra.spec.whatwg.org/#isomorphic-decode>). The renderer extracts
+/// the MIME type from it
+/// (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
 fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
-    headers
-        .get("content-type")
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .map(str::to_owned)
+    let values: Vec<String> = headers
+        .get_all("content-type")
+        .map(isomorphic_decode)
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
 }
 
 /// Network-boundary `Referer` check: rejects only a true downgrade (https

@@ -2073,6 +2073,8 @@ mod realm_tests {
                     init_scripts: Vec::new(),
                     content_security_policy: None,
                     content_security_policy_report_only: None,
+                    no_sniff: false,
+                    http_response: false,
                 },
             )
             .expect("mount");
@@ -2115,6 +2117,8 @@ mod realm_tests {
                 content_type: Some("text/html".into()),
                 content_security_policy: None,
                 content_security_policy_report_only: None,
+                no_sniff: false,
+                http_response: false,
                 body: html.as_bytes().to_vec(),
                 history: crate::protocol::HistorySnapshot::default(),
                 viewport: None,

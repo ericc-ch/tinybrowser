@@ -2632,7 +2632,6 @@ dependencies = [
  "icu_provider_adapters",
  "icu_provider_blob",
  "markup5ever",
- "mime",
  "net",
  "parley",
  "percent-encoding",

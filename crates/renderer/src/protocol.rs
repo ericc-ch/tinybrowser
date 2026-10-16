@@ -239,7 +239,9 @@ impl StorageKind {
 pub struct Mount {
     /// Absolute document URL.
     pub url: String,
-    /// HTTP `Content-Type`, when the document came from the network.
+    /// Every `Content-Type` response header value joined with `", "`
+    /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>),
+    /// when the document came from the network.
     pub content_type: Option<String>,
     /// Combined `Content-Security-Policy` header, when the response sent one.
     #[serde(default)]
@@ -247,6 +249,12 @@ pub struct Mount {
     /// Combined `Content-Security-Policy-Report-Only` header.
     #[serde(default)]
     pub content_security_policy_report_only: Option<String>,
+    /// `X-Content-Type-Options: nosniff` on the response.
+    #[serde(default)]
+    pub no_sniff: bool,
+    /// The body came from HTTP, so the Apache `text/plain` check applies.
+    #[serde(default)]
+    pub http_response: bool,
     /// Raw document bytes; the renderer decodes them.
     #[serde(skip, default)]
     pub body: Vec<u8>,
@@ -270,12 +278,18 @@ pub struct Mount {
 pub struct ResponseHead {
     /// Absolute document URL.
     pub url: String,
-    /// HTTP `Content-Type`, when the document came from the network.
+    /// Every `Content-Type` response header value joined with `", "`
+    /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>),
+    /// when the document came from the network.
     pub content_type: Option<String>,
     /// Combined `Content-Security-Policy` header, when the response sent one.
     pub content_security_policy: Option<String>,
     /// Combined `Content-Security-Policy-Report-Only` header.
     pub content_security_policy_report_only: Option<String>,
+    /// `X-Content-Type-Options: nosniff` on the response.
+    pub no_sniff: bool,
+    /// The body came from HTTP, so the Apache `text/plain` check applies.
+    pub http_response: bool,
     /// Session history visible in the newly opened document.
     pub history: HistorySnapshot,
     /// Emulated viewport size to apply before the document lays out, when the
@@ -401,7 +415,9 @@ pub struct DialOutcome {
     pub status: u16,
     /// Final URL after redirects.
     pub final_url: String,
-    /// `Content-Type` header, when present and UTF-8.
+    /// Every `Content-Type` response header value joined with `", "`, when
+    /// the response sent any
+    /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
     pub content_type: Option<String>,
     /// Response headers visible to page scripts, in wire order.
     #[serde(default)]

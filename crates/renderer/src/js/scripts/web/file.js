@@ -68,8 +68,13 @@ const __tbEndings = value => {
 };
 const __tbBlobType = value => {
   if (value === undefined) return '';
+  // https://w3c.github.io/FileAPI/#dfn-type
   value = String(value);
-  return [...value].some(character => character < ' ' || character > '~') ? '' : value;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code > 0x7E) return '';
+  }
+  return value.toLowerCase();
 };
 const __tbBlobBytes = (converted, endings) => {
   const chunks = __tbArray.map(converted, part => typeof part === 'string'
@@ -99,7 +104,7 @@ globalThis.Blob = class Blob {
       type = __tbBlobType(options.type);
     }
     const bytes = __tbBlobBytes(converted, endings);
-    __tbBlobData.set(this, { bytes, type: type.toLowerCase() });
+    __tbBlobData.set(this, { bytes, type });
   }
   get size() { return __tbBrand(this, __tbBlobData).bytes.length; }
   get type() { return __tbBrand(this, __tbBlobData).type; }
@@ -136,11 +141,7 @@ globalThis.Blob = class Blob {
       relativeEnd = relativeEnd < 0 ? Math.max(size + relativeEnd, 0) : Math.min(relativeEnd, size);
     }
     const span = Math.max(relativeEnd - relativeStart, 0);
-    let type = '';
-    if (hasContentType) {
-      type = String(contentType);
-      if ([...type].some(character => character < ' ' || character > '~')) type = '';
-    }
+    const type = hasContentType ? __tbBlobType(contentType) : '';
     return new Blob([__tbBytesCopy(data.bytes, relativeStart, relativeStart + span)], { type });
   }
   // https://w3c.github.io/FileAPI/#dom-blob-stream
@@ -165,6 +166,16 @@ globalThis.Blob = class Blob {
   }
 };
 Object.defineProperty(globalThis.Blob.prototype, Symbol.toStringTag, { value: 'Blob', writable: false, enumerable: false, configurable: true });
+// A Blob whose type is set directly, without the constructor's ASCII filter
+// and lowercase: `body.blob()` stores the MIME type extracted from the
+// header list (<https://fetch.spec.whatwg.org/#dom-body-blob>). Captured at
+// realm init so a page replacing `Blob` cannot reroute it.
+const __tbBlobPrototype = globalThis.Blob.prototype;
+const __tbMakeBlob = (bytes, type) => {
+  const blob = Object.create(__tbBlobPrototype);
+  __tbBlobData.set(blob, { bytes, type });
+  return blob;
+};
 // Web IDL constructor objects: `length` is the number of required arguments
 // (<https://webidl.spec.whatwg.org/#es-interface>).
 Object.defineProperty(globalThis.Blob, 'length', { value: 0, writable: false, enumerable: false, configurable: true });

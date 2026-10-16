@@ -431,6 +431,8 @@ impl ResponseStreams {
                 content_security_policy_report_only: response
                     .content_security_policy_report_only
                     .clone(),
+                no_sniff: response.no_sniff,
+                http_response: response.http_response,
                 history: response.history.clone(),
                 viewport: response.viewport,
                 init_scripts: response.init_scripts.clone(),

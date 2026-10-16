@@ -350,9 +350,7 @@ impl HttpEngine {
         };
         let mut mapped = HeaderMap::new();
         for (name, value) in response.headers() {
-            mapped
-                .insert(name.as_str(), value.as_bytes())
-                .map_err(|_| NetError::Protocol(ProtocolError::UnrepresentableHeader))?;
+            mapped.insert_wire(name.as_str(), value.as_bytes().to_vec());
         }
         Ok((response.status().as_u16(), mapped, response.into_body()))
     }

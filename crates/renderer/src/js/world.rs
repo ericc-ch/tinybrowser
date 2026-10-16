@@ -1584,7 +1584,7 @@ impl World {
     }
 
     /// Queues violations for targets the caller cannot dispatch into (the
-    /// module loader runs inside QuickJS).
+    /// module loader runs inside `QuickJS`).
     pub(crate) fn queue_csp_violations(
         &mut self,
         target: NodeId,

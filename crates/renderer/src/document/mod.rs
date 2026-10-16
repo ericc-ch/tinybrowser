@@ -347,6 +347,12 @@ pub(crate) struct Document {
     /// with the response headers. A script's `document.open()` leaves it
     /// unset so the existing policy survives.
     csp_from_response: bool,
+    /// First 1445 raw response bytes, the MIME sniff resource header.
+    sniff_header: Vec<u8>,
+    /// Whether [`Document::finish_parse`] runs the MIME sniffing algorithm.
+    apply_mime_sniff: bool,
+    /// `nosniff` and whether this body came from HTTP.
+    mime_guard: crate::sniff::MimeGuard,
     classic_fetch_in_flight: bool,
     deferred_modules: Vec<(crate::dom::tree::NodeId, crate::js::ScriptSource)>,
     stop: Arc<crate::js::Stop>,
@@ -439,6 +445,9 @@ impl Document {
             response_content_type: None,
             response_policy: crate::csp::List::default(),
             csp_from_response: false,
+            sniff_header: Vec::new(),
+            apply_mime_sniff: false,
+            mime_guard: crate::sniff::MimeGuard::default(),
             classic_fetch_in_flight: false,
             deferred_modules: Vec::new(),
             stop: Arc::clone(&runtime.stop),
@@ -770,8 +779,9 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         policy: crate::csp::List,
+        mime: crate::sniff::MimeGuard,
     ) {
-        self.load_response_body(url, content_type, body, policy);
+        self.load_response_body(url, content_type, body, policy, mime);
         // Nested HTML documents without scripts skip a realm at parse;
         // `fire_ready_frame_loads` creates one when the parent is not in the
         // encoding-label burst
@@ -815,7 +825,7 @@ impl Document {
         if script.is_empty() {
             return;
         }
-        let violations = self.navigation_script_violations(policy, source);
+        let violations = Self::navigation_script_violations(policy, source);
         if !violations.is_empty()
             && let Some(target) = self.document_node()
         {
@@ -1103,6 +1113,10 @@ impl Document {
                 mount.content_security_policy.as_deref(),
                 mount.content_security_policy_report_only.as_deref(),
             ),
+            crate::sniff::MimeGuard {
+                no_sniff: mount.no_sniff,
+                http: mount.http_response,
+            },
         );
         Ok(())
     }
@@ -1126,6 +1140,9 @@ impl Document {
         self.response_content_type = None;
         self.response_policy = crate::csp::List::default();
         self.csp_from_response = false;
+        self.sniff_header.clear();
+        self.apply_mime_sniff = false;
+        self.mime_guard = crate::sniff::MimeGuard::default();
         self.active_buffer = Some(input.to_owned());
         // A new parse starts undecided: without this an `about:blank` or
         // `document.open()` document inherits the previous response's
@@ -1144,6 +1161,7 @@ impl Document {
         content_type: Option<&str>,
         viewport: Option<(u32, u32)>,
         policy: crate::csp::List,
+        mime: crate::sniff::MimeGuard,
     ) {
         self.reset_js_realm();
         if let Some((width, height)) = viewport {
@@ -1162,11 +1180,22 @@ impl Document {
             "",
             false,
             ParserOwner::Carrier,
-            Some(dial::ResponseDecoder::new(content_type.map(str::to_owned))),
+            // The decoder resolves the charset from the extracted MIME type,
+            // not from the header value as served: a `charset` in
+            // `a;charset=x, b` does not decode `b`
+            // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+            Some(dial::ResponseDecoder::new(
+                content_type.and_then(crate::sniff::extract_mime_type),
+            )),
         );
+        // Kept raw until `finish_parse`: the Apache `text/plain` check needs
+        // the exact bytes the server sent before the extraction runs
+        // (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
         self.response_content_type = content_type.map(str::to_owned);
         self.response_policy = policy;
         self.csp_from_response = true;
+        self.apply_mime_sniff = true;
+        self.mime_guard = mime;
     }
 
     /// Starts a document from a complete response: new realm, the response's
@@ -1177,8 +1206,9 @@ impl Document {
         content_type: Option<&str>,
         body: &[u8],
         policy: crate::csp::List,
+        mime: crate::sniff::MimeGuard,
     ) {
-        self.load_response_body_with_origin(url, content_type, body, None, policy);
+        self.load_response_body_with_origin(url, content_type, body, None, policy, mime);
     }
 
     /// [`Document::load_response_body`] that stores `origin` instead of
@@ -1193,8 +1223,9 @@ impl Document {
         body: &[u8],
         origin: Option<url::Origin>,
         policy: crate::csp::List,
+        mime: crate::sniff::MimeGuard,
     ) {
-        self.begin_response(Some(url), content_type, None, policy);
+        self.begin_response(Some(url), content_type, None, policy, mime);
         if let Some(origin) = origin {
             self.world
                 .borrow_mut()
@@ -1212,13 +1243,18 @@ impl Document {
         body: &[u8],
         origin: url::Origin,
         policy: crate::csp::List,
+        mime: crate::sniff::MimeGuard,
     ) {
-        self.load_response_body_with_origin(url, content_type, body, Some(origin), policy);
+        self.load_response_body_with_origin(url, content_type, body, Some(origin), policy, mime);
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
     /// known, then the parser sees the markup.
     pub(crate) fn write_body(&mut self, bytes: &[u8]) {
+        if self.sniff_header.len() < crate::sniff::RESOURCE_HEADER_LEN {
+            let room = crate::sniff::RESOURCE_HEADER_LEN - self.sniff_header.len();
+            self.sniff_header.extend(bytes.iter().copied().take(room));
+        }
         let Some(decoder) = self.decoder.as_mut() else {
             return;
         };
@@ -1672,6 +1708,26 @@ impl Document {
         };
         // Writes queued while the parser was active join this parse; later
         // writes have no incremental parser to feed (see `write_text`).
+        if self.apply_mime_sniff {
+            // The stored value is the raw header list. The Apache check needs
+            // it exactly as sent; the sniff needs the extracted MIME type.
+            // mimesniff names "the value of the last Content-Type header" as
+            // the supplied type, but browsers extract — last value that
+            // parses, `*/*` skipped — and the WPT `fetch/content-type`
+            // expectations follow the browsers
+            // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>,
+            // <https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
+            let raw = self.response_content_type.as_deref();
+            let supplied = raw.and_then(crate::sniff::extract_mime_type);
+            let apache =
+                self.mime_guard.http && raw.is_some_and(crate::sniff::apache_bug_content_type);
+            self.response_content_type = Some(crate::sniff::sniff_mime(
+                &self.sniff_header,
+                supplied.as_deref(),
+                self.mime_guard.no_sniff,
+                apache,
+            ));
+        }
         let pending = std::mem::take(&mut self.world.borrow_mut().pending_html_writes);
         let pending_bytes = pending.iter().map(String::len).sum::<usize>();
         self.world.borrow().release_stream_bytes(pending_bytes);
@@ -1762,7 +1818,6 @@ impl Document {
     }
 
     fn navigation_script_violations(
-        &self,
         policy: &crate::csp::List,
         source: &str,
     ) -> Vec<crate::csp::Violation> {
@@ -2041,6 +2096,10 @@ impl Document {
                     outcome.content_type.as_deref(),
                     &outcome.body,
                     policy,
+                    crate::sniff::MimeGuard {
+                        no_sniff: crate::sniff::headers_nosniff(&outcome.headers),
+                        http: true,
+                    },
                 );
             }
             DialContext::BlitzResource { id } => {
@@ -2439,9 +2498,7 @@ impl Document {
     fn subresource_target(&self, url: &Url) -> Option<crate::dom::tree::NodeId> {
         let candidates: Vec<(crate::dom::tree::NodeId, String)> = {
             let world = self.world.borrow();
-            let Some(parsed) = world.main_document() else {
-                return None;
-            };
+            let parsed = world.main_document()?;
             let base = &parsed.document.base;
             let document = parsed.id;
             let mut candidates = Vec::new();
