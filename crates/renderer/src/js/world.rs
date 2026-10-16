@@ -926,6 +926,10 @@ pub(crate) struct World {
     /// resolves the page-replaceable global: a page that swaps `Error` must
     /// neither spoof `sourceFile` nor run code inside the bindings.
     pub(crate) pristine_error: Option<Persistent<rquickjs::function::Constructor<'static>>>,
+    /// The pristine `EvalError` constructor, so a refused string compilation
+    /// raises the realm's own exception: a page that swaps `EvalError` must
+    /// neither run code inside the bindings nor substitute another value.
+    pub(crate) pristine_eval_error: Option<Persistent<Function<'static>>>,
     /// The realm's own event-interface constructors, captured after the web
     /// bundle installs them and before page script runs. `createEvent` uses
     /// these, never `globals[interface]`: a page that replaces the global
@@ -1139,6 +1143,7 @@ impl World {
             pristine_reflect_set: None,
             pristine_queue_microtask: None,
             pristine_error: None,
+            pristine_eval_error: None,
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
@@ -2223,6 +2228,7 @@ impl World {
         self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
         self.pristine_error = None;
+        self.pristine_eval_error = None;
         self.event_ctors.clear();
         self.weak_references = None;
         self.deliver_mutations_fn = None;

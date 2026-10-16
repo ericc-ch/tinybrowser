@@ -602,6 +602,7 @@ fn capture_host_primitives<'js>(
     let number: Function = globals.get("Number")?;
     let boolean: Function = globals.get("Boolean")?;
     let error: Constructor = globals.get("Error")?;
+    let eval_error: Function = globals.get("EvalError")?;
     let reflect: Object = globals.get("Reflect")?;
     let reflect_set: Function = reflect.get("set")?;
     let deliver: Function = crate::js::bridge::object(ctx)?.get("__tb_deliver_mutations")?;
@@ -616,6 +617,7 @@ fn capture_host_primitives<'js>(
     world.pristine_number = Some(Persistent::save(ctx, number));
     world.pristine_boolean = Some(Persistent::save(ctx, boolean));
     world.pristine_error = Some(Persistent::save(ctx, error));
+    world.pristine_eval_error = Some(Persistent::save(ctx, eval_error));
     world.pristine_reflect_set = Some(Persistent::save(ctx, reflect_set));
     world.pristine_queue_microtask = globals
         .get::<_, Function>("queueMicrotask")
@@ -1168,15 +1170,22 @@ pub(super) fn install_collections_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     super::blob::decompress(ctx, INSTALL_COLLECTIONS_DEFLATE, &CACHE)
 }
 
+/// The realm's world, or `None` when `ctx` has no registered realm.
+///
+/// Unlike [`world`], this never raises: hosts that run before or outside a
+/// realm's install (an engine callback, for instance) must be able to observe
+/// the absence without leaving an exception pending.
+pub(crate) fn try_world(ctx: &Ctx<'_>) -> Option<Rc<RefCell<World>>> {
+    REALM_WORLDS.with(|worlds| {
+        worlds
+            .borrow()
+            .get(&(ctx.as_raw().as_ptr() as usize))
+            .and_then(Weak::upgrade)
+    })
+}
+
 pub(crate) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
-    REALM_WORLDS
-        .with(|worlds| {
-            worlds
-                .borrow()
-                .get(&(ctx.as_raw().as_ptr() as usize))
-                .and_then(Weak::upgrade)
-        })
-        .ok_or_else(|| Exception::throw_internal(ctx, "missing JS world"))
+    try_world(ctx).ok_or_else(|| Exception::throw_internal(ctx, "missing JS world"))
 }
 
 pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
@@ -1841,6 +1850,117 @@ mod realm_tests {
         registry.borrow_mut().insert_document(id, &world);
         registry.borrow_mut().insert_frame(FrameId::MAIN, &world);
         world
+    }
+
+    /// A call is a direct eval only when the callee is `%eval%` itself
+    /// (<https://tc39.es/ecma262/#sec-evaluatecall>), and `%eval%` /
+    /// `%Function%` expose intrinsic property attributes
+    /// (<https://tc39.es/ecma262/#sec-eval-x>). A wrapper over either global is
+    /// observable and turns every direct eval into an indirect one, so the
+    /// engine must gate string compilation below the JS surface.
+    #[test]
+    fn evaluation_intrinsics_keep_spec_identity() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p></p>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        realm
+            .eval(
+                r#"
+                if (eval.name !== "eval") throw new Error("eval.name=" + eval.name);
+                if (eval.length !== 1) throw new Error("eval.length=" + eval.length);
+                if ("prototype" in eval) throw new Error("eval has a prototype");
+                var constructible = true;
+                try {
+                    new eval();
+                } catch (error) {
+                    if (error instanceof TypeError) constructible = false;
+                    else throw error;
+                }
+                if (constructible) throw new Error("eval is a constructor");
+                if (Function.prototype.constructor !== Function)
+                    throw new Error("Function.prototype.constructor is not Function");
+                var scope_probe = (function () {
+                    var local = 1;
+                    return eval("local");
+                })();
+                if (scope_probe !== 1) throw new Error("direct eval lost the local scope");
+                "#,
+            )
+            .expect("evaluation intrinsics");
+    }
+
+    /// A policy without `'unsafe-eval'` refuses `eval` and the `Function`
+    /// constructor in the engine, not through a JS wrapper; adding the keyword
+    /// allows both.
+    /// (<https://w3c.github.io/webappsec-csp/#can-compile-strings>)
+    #[test]
+    fn evaluation_respects_content_security_policy() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p></p>",
+        );
+        let policy = Rc::clone(&world);
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+
+        policy.borrow_mut().csp = crate::csp::List::from_headers(Some("script-src 'self'"), None);
+        let denied = realm
+            .eval(
+                r#"
+                var outcome = [];
+                try { eval("1"); outcome.push("eval ran"); }
+                catch (error) { outcome.push(error.name); }
+                try { Function("return 1")(); outcome.push("Function ran"); }
+                catch (error) { outcome.push(error.name); }
+                outcome.join(",");
+                "#,
+            )
+            .expect("eval");
+        assert_eq!(denied, "EvalError,EvalError");
+
+        // A page that swaps the `EvalError` global must not run code inside the
+        // bindings nor substitute the thrown value: the refusal uses the
+        // pristine constructor captured at install.
+        let spoofed = realm
+            .eval(
+                r#"
+                var spoof_ran = false;
+                globalThis.EvalError = function () { spoof_ran = true; return {}; };
+                var outcome = [];
+                try { eval("1"); outcome.push("ran"); }
+                catch (error) { outcome.push(error.name); }
+                outcome.push(spoof_ran);
+                outcome.join(",");
+                "#,
+            )
+            .expect("eval");
+        assert_eq!(spoofed, "EvalError,false");
+
+        policy.borrow_mut().csp =
+            crate::csp::List::from_headers(Some("script-src 'self' 'unsafe-eval'"), None);
+        let allowed = realm
+            .eval(r#"[eval("1 + 1"), Function("return 2")()].join(",");"#)
+            .expect("eval");
+        assert_eq!(allowed, "2,2");
     }
 
     /// A JS-reachable event must not pin its `QuickJS` context past realm
