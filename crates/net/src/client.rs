@@ -286,9 +286,12 @@ impl Agent {
     /// Runs the preflight for a non-safelisted cross-origin `cors` request
     /// (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>). The preflight
     /// carries the same `Referer` and `User-Agent` as the request it gates.
+    /// `origin` is the request's byte-serialized origin: the document origin,
+    /// or `null` once a redirect has tainted it.
     async fn cors_preflight(
         &self,
         settings: &crate::cors::CorsSettings,
+        origin: &str,
         method: &Method,
         headers: &HeaderMap,
         wire: &Url,
@@ -298,7 +301,7 @@ impl Agent {
         if !crate::cors::needs_preflight(method, &unsafe_names) {
             return Ok(());
         }
-        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, &settings.origin);
+        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin);
         if let Some(referrer) = headers.get("referer") {
             let _ = preflight.insert("Referer", referrer);
         }
@@ -313,12 +316,65 @@ impl Agent {
         if !crate::cors::preflight_ok(
             status,
             &preflight_headers,
-            &settings.origin,
+            origin,
             settings.credentials.includes(),
             method,
             &unsafe_names,
         ) {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
+        Ok(())
+    }
+
+    /// Applies the request-side CORS rules for one hop: the preflight a
+    /// `cors`-tainted hop needs, and the `Origin` header
+    /// (<https://fetch.spec.whatwg.org/#http-fetch>,
+    /// <https://fetch.spec.whatwg.org/#append-a-request-origin-header>).
+    async fn apply_cors_request(
+        &self,
+        settings: Option<&crate::cors::CorsSettings>,
+        hop: &Hop,
+        wire: &Url,
+        headers: &mut HeaderMap,
+        budget: CallBudget,
+    ) -> Result<(), NetError> {
+        let Some(settings) = settings else {
+            return Ok(());
+        };
+        // A redirect-tainted request serializes its origin as `null` for the
+        // rest of the chain, and both the request `Origin` header and the
+        // response CORS check compare that serialization
+        // (<https://fetch.spec.whatwg.org/#serializing-a-request-origin>).
+        let serialized_origin = if hop.origin_tainted {
+            "null"
+        } else {
+            settings.origin.as_str()
+        };
+        // Case 2 of main fetch sends same-origin, still-`basic` requests
+        // straight to scheme fetch, so only a `cors`-tainted hop can need a
+        // preflight (<https://fetch.spec.whatwg.org/#main-fetch>).
+        if hop.response_type == crate::cors::ResponseType::Cors {
+            self.cors_preflight(
+                settings,
+                serialized_origin,
+                &hop.method,
+                headers,
+                wire,
+                budget,
+            )
+            .await?;
+        }
+        // `Origin` rides on every hop whose response tainting is `cors`, and
+        // on every other request whose method is neither GET nor HEAD
+        // (<https://fetch.spec.whatwg.org/#append-a-request-origin-header>).
+        // A same-origin `cors` POST that survives a 307/308 redirect sends
+        // `Origin` here, which `fetch/api/redirect/redirect-origin.any.js`
+        // expects to be absent; step 3 of the algorithm does not exempt that
+        // case, and Chrome and Firefox fail the same two subtests.
+        if hop.response_type == crate::cors::ResponseType::Cors
+            || !matches!(hop.method.as_str(), "GET" | "HEAD")
+        {
+            append_origin(headers, serialized_origin);
         }
         Ok(())
     }
@@ -402,8 +458,15 @@ impl Agent {
                 .await?;
             let hop_status = response.status();
             let response_type = hop.response_type;
+            let origin_tainted = hop.origin_tainted;
             if self.max_redirects == 0 {
-                return filtered(response, dial.cors, response_type, dial.credentials_include);
+                return filtered(
+                    response,
+                    dial.cors,
+                    response_type,
+                    dial.credentials_include,
+                    origin_tainted,
+                );
             }
             let next = match classify_response(
                 response,
@@ -411,6 +474,7 @@ impl Agent {
                 dial.cors,
                 response_type,
                 dial.credentials_include,
+                origin_tainted,
             )? {
                 HopOutcome::Final(response) => return Ok(response),
                 HopOutcome::Redirect { next } => next,
@@ -476,33 +540,8 @@ impl Agent {
             .cors
             .is_some_and(|settings| settings.origin != wire.origin().ascii_serialization());
         let mut hop_headers = hop.headers.clone();
-        if let Some(settings) = dial.cors {
-            // Case 2 of main fetch sends same-origin, still-`basic` requests
-            // straight to scheme fetch, so only a `cors`-tainted hop can need
-            // a preflight (<https://fetch.spec.whatwg.org/#main-fetch>).
-            if hop.response_type == crate::cors::ResponseType::Cors {
-                self.cors_preflight(settings, &hop.method, &hop_headers, &wire, budget)
-                    .await?;
-            }
-            // `Origin` rides on every hop whose response tainting is `cors`,
-            // and on `no-cors` requests with a method other than GET/HEAD
-            // (<https://fetch.spec.whatwg.org/#append-a-request-origin-header>).
-            let send_origin = match settings.mode {
-                crate::cors::RequestMode::Cors => {
-                    hop.response_type == crate::cors::ResponseType::Cors
-                }
-                crate::cors::RequestMode::NoCors => !matches!(hop.method.as_str(), "GET" | "HEAD"),
-                crate::cors::RequestMode::SameOrigin => false,
-            };
-            if send_origin {
-                let origin = if hop.origin_tainted {
-                    "null"
-                } else {
-                    settings.origin.as_str()
-                };
-                append_origin(&mut hop_headers, origin);
-            }
-        }
+        self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget)
+            .await?;
         self.prepare_outbound(
             &mut hop_headers,
             url,
@@ -511,13 +550,16 @@ impl Agent {
             dial.initiator,
             cross_site_redirect,
         )?;
-        apply_url_credentials(&mut hop_headers, url);
-        // Credentials mode gates the `Cookie` header
-        // (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
+        // Credentials mode gates both the `Cookie` header and the
+        // URL-credentials `Authorization` header
+        // (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>,
+        // <https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>).
         let send_credentials = dial
             .cors
             .is_none_or(|settings| credentials_admitted(settings.credentials, cross_origin));
-        if !send_credentials {
+        if send_credentials {
+            apply_url_credentials(&mut hop_headers, url);
+        } else {
             hop_headers.remove("cookie");
         }
         let (status, response_headers, reader) = self
@@ -787,7 +829,16 @@ fn hop_taint(
             Err(NetError::Protocol(ProtocolError::RejectedRequest))
         }
         crate::cors::RequestMode::Cors => Ok(crate::cors::ResponseType::Cors),
-        crate::cors::RequestMode::NoCors => Ok(crate::cors::ResponseType::Opaque),
+        // A cross-origin `no-cors` request must follow redirects; any other
+        // redirect mode is a network error
+        // (<https://fetch.spec.whatwg.org/#main-fetch>).
+        crate::cors::RequestMode::NoCors => {
+            if settings.redirect == crate::cors::RedirectMode::Follow {
+                Ok(crate::cors::ResponseType::Opaque)
+            } else {
+                Err(NetError::Protocol(ProtocolError::RejectedRequest))
+            }
+        }
     }
 }
 
@@ -810,6 +861,7 @@ fn cors_gate(
     cors: Option<&crate::cors::CorsSettings>,
     response_type: crate::cors::ResponseType,
     credentials_include: bool,
+    origin_tainted: bool,
 ) -> Result<(), NetError> {
     if response_type != crate::cors::ResponseType::Cors {
         return Ok(());
@@ -817,7 +869,15 @@ fn cors_gate(
     let Some(settings) = cors else {
         return Err(NetError::Protocol(ProtocolError::RejectedRequest));
     };
-    if !crate::cors::cors_check(response.headers(), &settings.origin, credentials_include) {
+    // The CORS check compares against the byte-serialized origin, which is
+    // `null` once a redirect has tainted the request
+    // (<https://fetch.spec.whatwg.org/#concept-cors-check>).
+    let origin = if origin_tainted {
+        "null"
+    } else {
+        settings.origin.as_str()
+    };
+    if !crate::cors::cors_check(response.headers(), origin, credentials_include) {
         return Err(NetError::Protocol(ProtocolError::RejectedRequest));
     }
     Ok(())
@@ -830,8 +890,15 @@ fn filtered(
     cors: Option<&crate::cors::CorsSettings>,
     response_type: crate::cors::ResponseType,
     credentials_include: bool,
+    origin_tainted: bool,
 ) -> Result<Response, NetError> {
-    cors_gate(&response, cors, response_type, credentials_include)?;
+    cors_gate(
+        &response,
+        cors,
+        response_type,
+        credentials_include,
+        origin_tainted,
+    )?;
     Ok(finalize(response, response_type, credentials_include))
 }
 
@@ -846,8 +913,15 @@ fn classify_response(
     cors: Option<&crate::cors::CorsSettings>,
     response_type: crate::cors::ResponseType,
     credentials_include: bool,
+    origin_tainted: bool,
 ) -> Result<HopOutcome, NetError> {
-    cors_gate(&response, cors, response_type, credentials_include)?;
+    cors_gate(
+        &response,
+        cors,
+        response_type,
+        credentials_include,
+        origin_tainted,
+    )?;
     let Some(location) =
         followable_location(response.status(), response.headers())?.map(str::to_owned)
     else {

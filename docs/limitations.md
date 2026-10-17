@@ -44,16 +44,30 @@ of showing as text (WPT `mimesniff/sniffing/`).
 Cross-origin `fetch`/XHR run the CORS protocol in the browser process
 (`crates/net/src/cors.rs`): the CORS check, preflight, credentials mode,
 response-header filtering, opaque `no-cors`, redirect-tainted origins,
-and redirect mode. Still open: the CORS-preflight cache (every non-simple
-request preflights again), `requestInit.referrerPolicy`/`referrer` on a
-request, `keepalive`, request origins for sandboxed and `data:` frames
-(sent as the URL origin, not `null`), and cookies on a credentialed
-cross-origin redirect. `fetch` also ignores request `integrity` metadata
+and redirect mode. A `no-cors` request is held to CORS-safelisted methods
+and headers at the network boundary, but the JS-visible `Request.headers`
+and `Headers.set` do not yet apply the `request-no-cors` guard, so a page
+sees headers in its own object that the wire drops. Still open: the
+CORS-preflight cache (every non-simple request preflights again),
+`requestInit.referrerPolicy`/`referrer` on a request, `keepalive`, request
+origins for sandboxed and `data:` frames (sent as the URL origin, not
+`null`), cookies on a credentialed cross-origin redirect, and deriving the
+request origin from a per-frame browser record rather than the
+site-authorized initiator (a renderer may name any origin within its own
+site, which shares its process). A header value holding a control byte
+other than TAB (Fetch permits e.g. `0x01`) is refused by the HTTP layer,
+so WPT `fetch/api/cors/cors-preflight-not-cors-safelisted.any.js` still
+fails on the `accept-language`/`content-language` `0x01` rows. `fetch`
+also ignores request `integrity` metadata
 (SRI is enforced for scripts only, `crates/renderer/src/csp.rs`); the old
 cross-origin block hid both that and the sandbox-origin gap, so
 `fetch/api/basic/integrity.sub.any.html` and
-`xhr/access-control-sandboxed-iframe-*.htm` now fail honestly. WPT
-`fetch/api/cors/` covers the surface.
+`xhr/access-control-sandboxed-iframe-*.htm` now fail honestly. A
+same-origin `cors` POST that survives a 307/308 redirect sends `Origin`,
+which `fetch/api/redirect/redirect-origin.any.js` expects to be absent;
+step 3 of the append algorithm does not exempt that case, and Chrome and
+Firefox fail the same two subtests. WPT `fetch/api/cors/` covers the
+surface.
 
 CSP `eval`/`Function` gating shadows the globals in JS because the
 engine has no compilation hook; direct `eval` therefore evaluates

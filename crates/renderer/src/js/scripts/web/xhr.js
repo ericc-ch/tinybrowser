@@ -319,7 +319,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       const type = __tbApply(__tbHeadersGet, data.headers, ['content-type']) === null ? payload.type : null;
       const fields = __tbArray.map(__tbBrand(data.headers, __tbHeadersData), entry => [entry[0], entry[1]]);
       const referrer = host.__tbReferrer(data.url);
-      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, referrer, data.timeout);
+      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, [referrer === null || referrer === undefined ? '' : String(referrer), data.withCredentials ? '1' : '0'], data.timeout);
       if (result === null || result === undefined) {
         __tbXhrSyncError(data, 'The request failed due to a network error.');
       }

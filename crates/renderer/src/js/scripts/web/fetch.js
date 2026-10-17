@@ -39,6 +39,10 @@ const __tbRedirectMode = value => {
   if (mode === 'follow' || mode === 'error' || mode === 'manual') return mode;
   throw new TypeError('Invalid redirect mode');
 };
+// A `no-cors` request may use only a CORS-safelisted method
+// (<https://fetch.spec.whatwg.org/#cors-safelisted-method>).
+const __tbCorsSafelistedMethod = method =>
+  method === 'GET' || method === 'HEAD' || method === 'POST';
 const __tbBrand = (value, slots, message) => {
   const data = slots.get(value);
   if (data === undefined) throw new TypeError(message === undefined ? 'Illegal invocation' : message);
@@ -231,6 +235,11 @@ globalThis.Request = class Request {
       const type = __tbBodyType(options.body);
       if (type !== null) headers.set('content-type', type);
     }
+    // A `no-cors` Request rejects a method that is not CORS-safelisted
+    // (<https://fetch.spec.whatwg.org/#dom-request>).
+    if (mode === 'no-cors' && !__tbCorsSafelistedMethod(method)) {
+      throw new TypeError('Invalid request method for no-cors mode');
+    }
     // A Request keeps a blob URL's data alive, so fetching it still works
     // after revokeObjectURL (<https://w3c.github.io/FileAPI/#lifeTime>).
     if (blob === null && url.indexOf('blob:') === 0) blob = __tbLookupObjectUrl(url);
@@ -351,6 +360,9 @@ globalThis.fetch = function(input, init) {
     if (options.mode !== undefined) mode = __tbRequestMode(options.mode);
     if (options.credentials !== undefined) credentials = __tbCredentialsMode(options.credentials);
     if (options.redirect !== undefined) redirect = __tbRedirectMode(options.redirect);
+    if (mode === 'no-cors' && !__tbCorsSafelistedMethod(method)) {
+      throw new TypeError('Invalid request method for no-cors mode');
+    }
   } catch (error) {
     return Promise.reject(error);
   }

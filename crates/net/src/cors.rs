@@ -183,6 +183,20 @@ pub fn is_cors_safelisted_request_header(name: &str, value: &[u8]) -> bool {
     }
 }
 
+/// A no-CORS-safelisted request-header: one of the four names a `no-cors`
+/// request may carry, and safelisted by value
+/// (<https://fetch.spec.whatwg.org/#no-cors-safelisted-request-header>). The
+/// `request-no-cors` guard drops every other name, so a `no-cors` request can
+/// only send what a form or `<img>` could
+/// (<https://fetch.spec.whatwg.org/#concept-headers-guard>).
+#[must_use]
+pub fn is_no_cors_safelisted_request_header(name: &str, value: &[u8]) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "accept" | "accept-language" | "content-language" | "content-type"
+    ) && is_cors_safelisted_request_header(name, value)
+}
+
 /// A single range header value the spec is willing to safelist
 /// (<https://fetch.spec.whatwg.org/#simple-range-header-value>): `bytes=N-...`
 /// with a numeric start.
@@ -529,6 +543,26 @@ mod tests {
             "content-language",
             b"a@b"
         ));
+    }
+
+    #[test]
+    fn no_cors_safelist_is_names_and_values() {
+        assert!(is_no_cors_safelisted_request_header(
+            "Accept",
+            b"text/plain"
+        ));
+        assert!(is_no_cors_safelisted_request_header(
+            "content-type",
+            b"application/x-www-form-urlencoded"
+        ));
+        // The value safelist still applies within the four names.
+        assert!(!is_no_cors_safelisted_request_header(
+            "content-type",
+            b"application/json"
+        ));
+        // Every other name is refused, safelisted or not.
+        assert!(!is_no_cors_safelisted_request_header("X-Custom", b"1"));
+        assert!(!is_no_cors_safelisted_request_header("range", b"bytes 0-"));
     }
 
     #[test]

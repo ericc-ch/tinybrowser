@@ -246,7 +246,14 @@ impl TabNetworkHandle {
             };
             Ok(DialOutcome {
                 status: if response_type.is_opaque() { 0 } else { status },
-                final_url,
+                // An opaque filtered response has an empty URL list, so
+                // `Response.url` must not reveal where the request landed
+                // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+                final_url: if response_type == net::cors::ResponseType::Opaque {
+                    String::new()
+                } else {
+                    final_url
+                },
                 content_type,
                 headers,
                 body,
@@ -366,6 +373,19 @@ fn outbound_request(
     {
         return Err(DialFailure::Connect);
     }
+    // A `no-cors` request may only use CORS-safelisted methods and headers:
+    // the page-side `request-no-cors` guard is advisory, so the network
+    // boundary enforces it here. Otherwise a page could send an unpreflighted,
+    // state-changing cross-origin request with an arbitrary method and headers
+    // (<https://fetch.spec.whatwg.org/#concept-headers-guard>).
+    let no_cors = request.kind == DialKind::JsFetch
+        && request
+            .cors
+            .as_ref()
+            .is_some_and(|cors| cors.mode == net::cors::RequestMode::NoCors);
+    if no_cors && !net::cors::is_cors_safelisted_method(&method) {
+        return Err(DialFailure::Connect);
+    }
     let mut outbound = Request::new(method, url);
     apply_cors(request, initiator, &mut outbound);
     if let Some(content_type) = &request.content_type {
@@ -375,6 +395,9 @@ fn outbound_request(
     }
     for (name, value) in &request.headers {
         if request.kind == DialKind::JsFetch && forbidden_page_header(name, value) {
+            continue;
+        }
+        if no_cors && !net::cors::is_no_cors_safelisted_request_header(name, value.as_bytes()) {
             continue;
         }
         outbound
@@ -402,11 +425,14 @@ fn outbound_request(
     Ok(outbound)
 }
 
-/// Copies a page dial's CORS parameters onto the `net` request. The browser
-/// owns the origin and fills it from the document URL, so a compromised
-/// renderer cannot claim a different origin to widen the CORS check
-/// (<https://fetch.spec.whatwg.org/#concept-request-origin>). A dial with no
-/// CORS parameters keeps the same-origin-only enforcement.
+/// Copies a page dial's CORS parameters onto the `net` request. The origin
+/// comes from the site-authorized initiator, so a compromised renderer cannot
+/// claim an origin outside its renderer's site lock
+/// (<https://fetch.spec.whatwg.org/#concept-request-origin>). It can still
+/// name a different origin *within* that site, which shares the renderer
+/// process; deriving the origin from a per-frame record the browser owns is a
+/// known gap. A dial with no CORS parameters keeps the same-origin-only
+/// enforcement.
 fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
     if request.kind != DialKind::JsFetch {
         return;

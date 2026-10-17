@@ -1534,6 +1534,7 @@ struct SyncPageFetch {
     content_type: Option<String>,
     headers: Vec<(String, String)>,
     referrer: Option<String>,
+    with_credentials: bool,
     timeout: f64,
 }
 
@@ -1548,9 +1549,16 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                   body: Vec<u8>,
                   content_type: Option<String>,
                   headers: Vec<Vec<String>>,
-                  referrer: Option<String>,
+                  options: Vec<String>,
                   timeout_ms: f64| {
                 let headers = header_pairs(headers)?;
+                // `[referrer, withCredentials]`, positionally, like
+                // `__queueFetch`'s options
+                // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
+                // <https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
+                let mut options = options.into_iter();
+                let referrer = options.next().filter(|value| !value.is_empty());
+                let with_credentials = options.next().is_some_and(|value| value == "1");
                 Ok::<_, rquickjs::Error>(sync_page_fetch(
                     &sync_world.borrow(),
                     SyncPageFetch {
@@ -1560,6 +1568,7 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                         content_type,
                         headers,
                         referrer,
+                        with_credentials,
                         timeout: timeout_ms,
                     },
                 ))
@@ -1614,7 +1623,13 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         csp: None,
         cors: Some(crate::protocol::CorsRequest {
             mode: net::cors::RequestMode::Cors,
-            credentials: net::cors::CredentialsMode::SameOrigin,
+            // `withCredentials` selects `include`, else `same-origin`
+            // (<https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
+            credentials: if request.with_credentials {
+                net::cors::CredentialsMode::Include
+            } else {
+                net::cors::CredentialsMode::SameOrigin
+            },
             redirect: net::cors::RedirectMode::Follow,
         }),
     });
