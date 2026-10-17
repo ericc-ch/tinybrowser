@@ -149,6 +149,61 @@ impl FrameTree {
     pub(crate) fn frame_for_container(&self, container: NodeId) -> Option<FrameId> {
         self.owners.get(&container).copied()
     }
+
+    /// The navigable a `target` value chooses from `current`, per the rules for
+    /// choosing a navigable
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
+    ///
+    /// `None` is the spec's "will not find a navigable" option: the rules asked
+    /// for a new top-level traversable, and a tab is one top-level traversable
+    /// with no popups, so the caller navigates nothing.
+    pub(crate) fn choose_navigable(&self, target: &str, current: FrameId) -> Option<FrameId> {
+        if target.is_empty() || target.eq_ignore_ascii_case("_self") {
+            return Some(current);
+        }
+        if target.eq_ignore_ascii_case("_parent") {
+            return Some(self.parent(current).unwrap_or(current));
+        }
+        if target.eq_ignore_ascii_case("_top") {
+            return Some(self.top_level(current));
+        }
+        if target.eq_ignore_ascii_case("_blank") {
+            return None;
+        }
+        [current, self.top_level(current)]
+            .into_iter()
+            .find_map(|subtree| self.find_by_target_name(subtree, target))
+    }
+
+    /// The top-level traversable of `frame`
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#nav-top>).
+    fn top_level(&self, frame: FrameId) -> FrameId {
+        let mut top = frame;
+        while let Some(parent) = self.parent(top) {
+            top = parent;
+        }
+        top
+    }
+
+    /// "Find a navigable by target name"
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#find-a-navigable-by-target-name>).
+    ///
+    /// The searched subtrees are implementation-defined, and the spec's first
+    /// option is «traversable, current», searched in reverse: `choose_navigable`
+    /// therefore passes this frame first, then the traversable. The browsing
+    /// context group search that follows the subtrees is unreachable here: a
+    /// renderer hosts one top-level traversable and creates no other.
+    fn find_by_target_name(&self, subtree: FrameId, target: &str) -> Option<FrameId> {
+        // The inclusive descendant navigables of a document put the document's
+        // own navigable first, then each container's subtree in container tree
+        // order, which is the order `children` keeps.
+        if self.name(subtree) == target {
+            return Some(subtree);
+        }
+        self.children(subtree)
+            .iter()
+            .find_map(|child| self.find_by_target_name(*child, target))
+    }
 }
 
 /// One endpoint of a channel. Two endpoints entangled to each other form the
@@ -598,5 +653,73 @@ impl Shared {
     /// Takes the frames whose documents the engine must drop.
     pub(crate) fn take_removed_frames(&mut self) -> Vec<(FrameId, Option<NodeId>)> {
         std::mem::take(&mut self.removed_frames)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameTree;
+    use crate::protocol::FrameId;
+
+    /// The tree every case reads, as `(parent, child)` edges and the names the
+    /// frames carry. Frames are `1` (top) with children `2` and `3`, `2` with
+    /// child `4`, `3` with child `5`; `2` and `4` share the name `alpha`, so
+    /// the search order is visible in the result.
+    ///
+    /// Containers are omitted: only the shape and the names matter to choosing
+    /// a navigable, and nothing here navigates.
+    fn tree() -> FrameTree {
+        let mut tree = FrameTree::default();
+        for (parent, child) in [(1, 2), (1, 3), (2, 4), (3, 5)] {
+            let (parent, child) = (FrameId::new(parent), FrameId::new(child));
+            tree.parents.insert(child, parent);
+            tree.children.entry(parent).or_default().push(child);
+        }
+        for (frame, name) in [(2, "alpha"), (3, "beta"), (4, "alpha"), (5, "gamma")] {
+            tree.names.insert(FrameId::new(frame), name.to_owned());
+        }
+        tree
+    }
+
+    /// The chosen frame, or `0` for "nothing is navigable", so a failure reads
+    /// as one number.
+    fn chosen(target: &str, current: u64) -> u64 {
+        tree()
+            .choose_navigable(target, FrameId::new(current))
+            .map_or(0, FrameId::get)
+    }
+
+    #[test]
+    fn keywords_choose_the_current_relative_and_top_level_frame() {
+        // The empty string and `_self` are the current navigable, ASCII
+        // case-insensitively.
+        assert_eq!(chosen("", 4), 4);
+        assert_eq!(chosen("_self", 2), 2);
+        assert_eq!(chosen("_SELF", 2), 2);
+        // `_parent` is the parent, and the current navigable when there is
+        // none.
+        assert_eq!(chosen("_parent", 4), 2);
+        assert_eq!(chosen("_parent", 1), 1);
+        // `_top` is the top-level traversable.
+        assert_eq!(chosen("_top", 4), 1);
+        assert_eq!(chosen("_top", 1), 1);
+        // `_blank` asks for a top-level traversable this engine cannot create,
+        // so nothing is chosen.
+        assert_eq!(chosen("_blank", 1), 0);
+        assert_eq!(chosen("_BLANK", 4), 0);
+    }
+
+    #[test]
+    fn a_name_is_searched_in_this_frames_subtree_before_the_whole_tree() {
+        // `alpha` names both `2` and `4`. A frame inside `4`'s subtree finds
+        // itself first, and the top-level search finds `2` first in tree order.
+        assert_eq!(chosen("alpha", 4), 4);
+        assert_eq!(chosen("alpha", 1), 2);
+        assert_eq!(chosen("alpha", 5), 2);
+        // A name outside the current subtree is found through the traversable.
+        assert_eq!(chosen("beta", 4), 3);
+        assert_eq!(chosen("gamma", 1), 5);
+        // A name nothing holds asks for a new top-level traversable.
+        assert_eq!(chosen("missing", 1), 0);
     }
 }

@@ -997,7 +997,7 @@
       const withoutFragment = hash === -1 ? action : action.slice(0, hash);
       const query = withoutFragment.indexOf('?');
       const base = query === -1 ? withoutFragment : withoutFragment.slice(0, query);
-      host.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', '', null);
+      host.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', '', null, form);
       return;
     }
     // POST: the entries become the request body, encoded per `enctype`
@@ -1013,7 +1013,7 @@
       body = urlEncode(formData, label);
       contentType = 'application/x-www-form-urlencoded';
     }
-    host.__tbFormNavigate(action, target, 'POST', body, contentType);
+    host.__tbFormNavigate(action, target, 'POST', body, contentType, form);
   };
 
   // The submission algorithm's entry-list step: the FormData constructor

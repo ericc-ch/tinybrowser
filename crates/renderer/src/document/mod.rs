@@ -722,12 +722,12 @@ impl Document {
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
         let mut navigations = self.world.borrow_mut().take_frame_navigations();
-        // Blitz link clicks land here without a container: they target this
-        // frame itself. Container attribution (which iframe was clicked)
-        // arrives when subdocument click routing wires up.
+        // A click Blitz routes through its navigation provider names no target
+        // (`NavigationOptions` carries the URL alone), so the empty target
+        // leaves it navigating the frame it was clicked in.
         navigations.extend(self.blitz_nav.drain().into_iter().map(|url| {
             FrameNavigation::get(
-                crate::js::NavigationTarget::SelfFrame,
+                crate::js::NavigationTarget::Target(String::new()),
                 url.as_str().to_owned(),
             )
         }));

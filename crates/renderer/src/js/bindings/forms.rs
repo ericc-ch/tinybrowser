@@ -14,7 +14,7 @@
 //! `value` IDL setter are a known cutover gap until the control state moves
 //! into the tree.
 
-use super::{host_node_id, world, world_for_node};
+use super::{focus, host_node_id, owning_world, world, world_for_node};
 use crate::documents::JournalEntry;
 use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
 use crate::dom::tree::{NodeId, attr, is_html_element};
@@ -259,35 +259,40 @@ pub(super) fn set_input_files<'js>(
     Ok(())
 }
 
-/// Queues a form-submission navigation to `url`. A `target` naming an `iframe`
-/// lands in that frame; `_self`, `_top`, `_parent`, `_blank`, and the empty
-/// target all land in the submitting frame (a new tab for `_blank` is not
-/// modelled yet)
+/// Queues a form-submission navigation to `url`, to the navigable the form's
+/// `target` chooses
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm>).
+///
+/// Submission returns without navigating when the form cannot navigate
+/// (<https://html.spec.whatwg.org/multipage/links.html#cannot-navigate>), which
+/// is why the form itself crosses the boundary.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-pub(super) fn form_navigate(
-    ctx: Ctx<'_>,
+pub(super) fn form_navigate<'js>(
+    ctx: Ctx<'js>,
     url: String,
     target: String,
     method: String,
     body: String,
     content_type: Option<String>,
+    form: Value<'js>,
 ) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &form) else {
+        return Ok(());
+    };
+    // A form whose document is gone cannot navigate either, and must not throw
+    // on the way to that conclusion.
+    let Some(owner) = owning_world(&ctx, node) else {
+        return Ok(());
+    };
+    if focus::cannot_navigate(&owner.borrow(), node) {
+        return Ok(());
+    }
     let world_rc = world(&ctx)?;
-    let container = if target.is_empty() || target.starts_with('_') {
-        None
-    } else {
-        find_named_frame(&world_rc, &target)
-    };
-    let navigation_target = match container {
-        Some(container) => crate::js::NavigationTarget::Container(container),
-        None => crate::js::NavigationTarget::SelfFrame,
-    };
     let navigation = FrameNavigation {
-        target: navigation_target,
+        target: crate::js::NavigationTarget::Target(target),
         spec: url,
         method,
         // The body arrives as a Latin-1 string, one char per byte, so file
@@ -305,32 +310,10 @@ pub(super) fn form_navigate(
             })
             .collect(),
         content_type,
+        // A form submission carries no policy of its own yet, so the initiator
+        // document's referrer policy decides.
+        referrer_policy: String::new(),
     };
     world_rc.borrow_mut().queue_frame_navigation(navigation);
     Ok(())
-}
-
-/// The first `iframe` in the main document whose `name` matches, for a form
-/// `target` that is a browsing-context name.
-fn find_named_frame(world: &Rc<RefCell<World>>, name: &str) -> Option<NodeId> {
-    let world = world.borrow();
-    let parsed = world.main_document()?;
-    let base = &parsed.document.base;
-    let document = parsed.id;
-    let mut stack = vec![base.root_node().id];
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        if is_html_element(base, current, "iframe")
-            && attr(base, current, "name").is_some_and(|value| value == name)
-        {
-            return Some(NodeId {
-                document,
-                node: current,
-            });
-        }
-        stack.extend(node.children.iter().rev().copied());
-    }
-    None
 }
