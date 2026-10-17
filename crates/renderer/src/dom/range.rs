@@ -158,9 +158,7 @@ pub(crate) fn node_length(base: &blitz_dom::BaseDocument, id: NodeId) -> u32 {
         | NodeData::Element(_)
         | NodeData::AnonymousBlock(_)
         | NodeData::Fragment { .. }
-        | NodeData::ShadowRoot { .. } => {
-            u32::try_from(node.children.len()).unwrap_or(u32::MAX)
-        }
+        | NodeData::ShadowRoot { .. } => u32::try_from(node.children.len()).unwrap_or(u32::MAX),
         NodeData::Text(text) => utf16_length(&text.content),
         NodeData::Comment { contents }
         | NodeData::ProcessingInstruction { contents, .. }
@@ -254,10 +252,12 @@ pub(crate) fn is_doctype(base: &blitz_dom::BaseDocument, id: NodeId) -> bool {
 }
 
 fn parent_of(base: &blitz_dom::BaseDocument, id: NodeId) -> Option<NodeId> {
-    base.get_node(id.node).and_then(|node| node.parent).map(|parent| NodeId {
-        document: id.document,
-        node: parent,
-    })
+    base.get_node(id.node)
+        .and_then(|node| node.parent)
+        .map(|parent| NodeId {
+            document: id.document,
+            node: parent,
+        })
 }
 
 /// Whether `possible` is `node` or an ancestor of it, staying in one arena.
@@ -283,11 +283,7 @@ pub(crate) fn is_inclusive_ancestor(
 }
 
 /// Whether `possible` is an inclusive descendant of `node`.
-fn is_inclusive_descendant(
-    base: &blitz_dom::BaseDocument,
-    possible: NodeId,
-    node: NodeId,
-) -> bool {
+fn is_inclusive_descendant(base: &blitz_dom::BaseDocument, possible: NodeId, node: NodeId) -> bool {
     is_inclusive_ancestor(base, node, possible)
 }
 
@@ -367,11 +363,19 @@ pub(crate) fn is_contained(
         return false;
     }
     let length = node_length(base, node);
-    position(base, document, BoundaryPoint { node, offset: 0 }, state.start) == Ordering::Greater
+    position(
+        base,
+        document,
+        BoundaryPoint { node, offset: 0 },
+        state.start,
+    ) == Ordering::Greater
         && position(
             base,
             document,
-            BoundaryPoint { node, offset: length },
+            BoundaryPoint {
+                node,
+                offset: length,
+            },
             state.end,
         ) == Ordering::Less
 }
@@ -425,12 +429,7 @@ pub(crate) fn ancestor_span(
 
 /// Shift boundary points in `parent` past an insertion of `count` children
 /// at `index` (<https://dom.spec.whatwg.org/#concept-node-insert>).
-pub(crate) fn adjust_for_insert(
-    ranges: &mut RangeTable,
-    parent: NodeId,
-    index: u32,
-    count: u32,
-) {
+pub(crate) fn adjust_for_insert(ranges: &mut RangeTable, parent: NodeId, index: u32, count: u32) {
     for range in ranges.iter_mut() {
         for point in [&mut range.start, &mut range.end] {
             if point.node == parent && point.offset > index {
@@ -453,7 +452,10 @@ pub(crate) fn adjust_for_remove(
     for range in ranges.iter_mut() {
         for point in [&mut range.start, &mut range.end] {
             if is_inclusive_descendant(base, point.node, removed) {
-                *point = BoundaryPoint { node: parent, offset: index };
+                *point = BoundaryPoint {
+                    node: parent,
+                    offset: index,
+                };
             } else if point.node == parent && point.offset > index {
                 point.offset = point.offset.saturating_sub(1);
             }
@@ -552,9 +554,7 @@ pub(crate) fn adjust_for_replace_all(
                 if point.offset > 0 {
                     point.offset = 0;
                 }
-            } else if point.node != parent
-                && is_inclusive_descendant(base, point.node, parent)
-            {
+            } else if point.node != parent && is_inclusive_descendant(base, point.node, parent) {
                 *point = BoundaryPoint {
                     node: parent,
                     offset: 0,

@@ -845,8 +845,10 @@ fn request_check_blocks(
 /// cannot satisfy the subset but also do not break it
 /// (<https://w3c.github.io/webappsec-csp/#does-integrity-metadata-match-source-list>).
 fn integrity_matches(list: &[String], integrity: &str) -> bool {
-    let expressions: Vec<(&str, &str)> =
-        list.iter().filter_map(|expression| hash_source(expression)).collect();
+    let expressions: Vec<(&str, &str)> = list
+        .iter()
+        .filter_map(|expression| hash_source(expression))
+        .collect();
     if expressions.is_empty() {
         return false;
     }
@@ -855,9 +857,11 @@ fn integrity_matches(list: &[String], integrity: &str) -> bool {
         return false;
     }
     sources.iter().all(|(algorithm, value)| {
-        expressions.iter().any(|(expected_algorithm, expected_value)| {
-            expected_algorithm.eq_ignore_ascii_case(algorithm) && *expected_value == *value
-        })
+        expressions
+            .iter()
+            .any(|(expected_algorithm, expected_value)| {
+                expected_algorithm.eq_ignore_ascii_case(algorithm) && *expected_value == *value
+            })
     })
 }
 
@@ -899,13 +903,15 @@ pub(crate) fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
         return true;
     }
     let sources = parse_integrity_metadata(integrity);
-    let Some(strongest) = sources.iter().map(|(algorithm, _)| algorithm.as_str()).max_by_key(
-        |algorithm| match *algorithm {
+    let Some(strongest) = sources
+        .iter()
+        .map(|(algorithm, _)| algorithm.as_str())
+        .max_by_key(|algorithm| match *algorithm {
             "sha512" => 2,
             "sha384" => 1,
             _ => 0,
-        },
-    ) else {
+        })
+    else {
         // No supported metadata: nothing to enforce.
         return true;
     };
@@ -1686,8 +1692,14 @@ mod tests {
             strip_url_for_reports("http://user:pass@example.test/a?b=1#frag"),
             "http://example.test/a?b=1"
         );
-        assert_eq!(strip_url_for_reports("data:text/javascript,alert(1)"), "data");
-        assert_eq!(strip_url_for_reports("blob:https://example.test/uuid"), "blob");
+        assert_eq!(
+            strip_url_for_reports("data:text/javascript,alert(1)"),
+            "data"
+        );
+        assert_eq!(
+            strip_url_for_reports("blob:https://example.test/uuid"),
+            "blob"
+        );
         assert_eq!(strip_url_for_reports("not a url ["), "");
     }
 
@@ -1732,7 +1744,10 @@ mod tests {
         // nothing to enforce
         // (<https://www.w3.org/TR/SRI/#does-response-match-metadatalist>).
         assert!(integrity_verifies("sha999-xyz", body));
-        assert!(integrity_verifies("sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c=?opt", body));
+        assert!(integrity_verifies(
+            "sha256-L7/UQ9VWpyG7C9RDEC4ctS5hI3Zcw+ta+haPGlByG9c=?opt",
+            body
+        ));
         // A matching sha256 beside a mismatch still verifies: sha512 is
         // absent, so sha256 is strongest and one entry matches.
         assert!(integrity_verifies(

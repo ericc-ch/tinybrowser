@@ -915,7 +915,11 @@ mod tests {
     #[test]
     fn clip_layer_masks_content() {
         let mut painter = TinySkiaScenePainter::new(40, 40);
-        painter.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &Rect::new(0.0, 0.0, 10.0, 40.0));
+        painter.push_clip_layer(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &Rect::new(0.0, 0.0, 10.0, 40.0),
+        );
         painter.fill(
             Fill::NonZero,
             Affine::IDENTITY,

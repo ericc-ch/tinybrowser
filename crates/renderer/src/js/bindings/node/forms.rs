@@ -1370,7 +1370,10 @@ fn value_is_content_attribute(
 /// An input's current type state: a trimmed, ASCII-lowercased `type`
 /// attribute; missing or empty is the text state
 /// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
-fn element_input_type(base: &blitz_dom::BaseDocument, node: blitz_traits::node_id::NodeId) -> String {
+fn element_input_type(
+    base: &blitz_dom::BaseDocument,
+    node: blitz_traits::node_id::NodeId,
+) -> String {
     into_element_input_type(attr(base, node, "type"))
 }
 

@@ -829,7 +829,8 @@ impl Engine {
     /// Reports the embedder's `frame-src` violations and returns whether the
     /// enforced policy refuses `url`
     /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
-    fn frame_src_blocked(&mut self, embedder: FrameId, child: FrameId, url: &Url) -> bool {        let violations = {
+    fn frame_src_blocked(&mut self, embedder: FrameId, child: FrameId, url: &Url) -> bool {
+        let violations = {
             let Some(document) = self.frames.get(&embedder) else {
                 return false;
             };

@@ -804,10 +804,7 @@ impl Document {
         let Some(dial) = self.queued_dials.last_mut() else {
             return;
         };
-        let DialContext::FrameLoad {
-            embedder: slot, ..
-        } = &mut dial.context
-        else {
+        let DialContext::FrameLoad { embedder: slot, .. } = &mut dial.context else {
             return;
         };
         *slot = Some(embedder);
@@ -1947,11 +1944,7 @@ impl Document {
         let (nonce, integrity) = world.document(id).map_or_else(
             || (String::new(), String::new()),
             |parsed| {
-                let (nonce, _) = crate::csp::element_nonce(
-                    &parsed.document.base,
-                    id.node,
-                    slot,
-                );
+                let (nonce, _) = crate::csp::element_nonce(&parsed.document.base, id.node, slot);
                 let integrity = crate::dom::tree::attr(&parsed.document.base, id.node, "integrity")
                     .unwrap_or_default()
                     .to_owned();
@@ -2070,14 +2063,18 @@ impl Document {
             // `line-number`, and `column-number`. `source-file` and its line
             // and column only appear when a source file exists
             // (<https://w3c.github.io/webappsec-csp/#deprecated-serialize-violation>).
-            let source_fields = violation.source_file.as_deref().map_or_else(String::new, |source| {
-                format!(
-                    ",\"source-file\":{},\"line-number\":{},\"column-number\":{}",
-                    Self::json_string(&crate::csp::strip_url_for_reports(source)),
-                    violation.line_number,
-                    violation.column_number,
-                )
-            });
+            let source_fields =
+                violation
+                    .source_file
+                    .as_deref()
+                    .map_or_else(String::new, |source| {
+                        format!(
+                            ",\"source-file\":{},\"line-number\":{},\"column-number\":{}",
+                            Self::json_string(&crate::csp::strip_url_for_reports(source)),
+                            violation.line_number,
+                            violation.column_number,
+                        )
+                    });
             let body = format!(
                 "{{\"csp-report\":{{\"document-uri\":{},\"referrer\":\"\",\"blocked-uri\":{},\"effective-directive\":{},\"violated-directive\":{},\"original-policy\":{},\"disposition\":{},\"status-code\":{},\"script-sample\":{}{}}}}}",
                 Self::json_string(&violation.document_uri),
@@ -2147,17 +2144,22 @@ impl Document {
     /// (<https://w3c.github.io/webappsec-csp/#cspviolationreportbody>,
     /// <https://w3c.github.io/reporting/#send-reports>).
     fn reporting_api_body(violation: &crate::csp::Violation) -> Vec<u8> {
-        let sample = violation.sample.as_deref().map_or_else(
-            || "null".to_owned(),
-            Self::json_string,
-        );
+        let sample = violation
+            .sample
+            .as_deref()
+            .map_or_else(|| "null".to_owned(), Self::json_string);
         let source_file = violation.source_file.as_deref().map_or_else(
             || "null".to_owned(),
             |source| Self::json_string(&crate::csp::strip_url_for_reports(source)),
         );
         let (line_number, column_number) = violation.source_file.as_deref().map_or_else(
             || ("null".to_owned(), "null".to_owned()),
-            |_| (violation.line_number.to_string(), violation.column_number.to_string()),
+            |_| {
+                (
+                    violation.line_number.to_string(),
+                    violation.column_number.to_string(),
+                )
+            },
         );
         format!(
             "[{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":\"tinybrowser\",\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":{},\"lineNumber\":{},\"columnNumber\":{},\"sample\":{},\"disposition\":{},\"statusCode\":{}}}}}]",
@@ -2343,8 +2345,7 @@ impl Document {
     fn script_integrity(&self, id: crate::dom::tree::NodeId) -> Option<String> {
         let world = self.world.borrow();
         world.document(id).and_then(|parsed| {
-            crate::dom::tree::attr(&parsed.document.base, id.node, "integrity")
-                .map(str::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, id.node, "integrity").map(str::to_owned)
         })
     }
 
@@ -2417,8 +2418,9 @@ impl Document {
                     // Only the script the parser waits for resumes the walk.
                     // Any other completion still runs its load steps, but the
                     // walk stays paused until the blocking fetch settles.
-                    let unblocks_parser =
-                        self.parser_blocked_script.is_none_or(|waiting| waiting == element);
+                    let unblocks_parser = self
+                        .parser_blocked_script
+                        .is_none_or(|waiting| waiting == element);
                     if unblocks_parser {
                         self.parser_blocked_script = None;
                     }
@@ -2589,8 +2591,9 @@ impl Document {
             }
             DialContext::ClassicScript { element, epoch } => {
                 if epoch == self.js_epoch {
-                    let unblocks_parser =
-                        self.parser_blocked_script.is_none_or(|waiting| waiting == element);
+                    let unblocks_parser = self
+                        .parser_blocked_script
+                        .is_none_or(|waiting| waiting == element);
                     if unblocks_parser {
                         self.parser_blocked_script = None;
                     }

@@ -230,7 +230,10 @@ pub(crate) fn sniff_mime(
     apache_bug: bool,
 ) -> String {
     let parsed = supplied.and_then(parse_mime_type);
-    if parsed.as_ref().is_some_and(|mime| mime.html() || mime.xml()) {
+    if parsed
+        .as_ref()
+        .is_some_and(|mime| mime.html() || mime.xml())
+    {
         return supplied.unwrap_or("text/html").to_owned();
     }
     let unknown = parsed.is_none()
@@ -390,11 +393,7 @@ fn split_header_value(value: &str) -> Vec<String> {
 /// input when the quote never closes
 /// (<https://fetch.spec.whatwg.org/#collect-an-http-quoted-string>). The
 /// position points at the opening `"`.
-fn collect_http_quoted_string_raw(
-    characters: &[char],
-    position: &mut usize,
-    value: &mut String,
-) {
+fn collect_http_quoted_string_raw(characters: &[char], position: &mut usize, value: &mut String) {
     let start = *position;
     *position += 1;
     while *position < characters.len() {
@@ -426,7 +425,10 @@ impl MimeType {
     }
 
     fn xml(&self) -> bool {
-        let subtype = self.essence.split_once('/').map_or("", |(_, subtype)| subtype);
+        let subtype = self
+            .essence
+            .split_once('/')
+            .map_or("", |(_, subtype)| subtype);
         subtype == "xml" || subtype.ends_with("+xml")
     }
 
@@ -501,7 +503,9 @@ fn parse_mime_type(input: &str) -> Option<MimeType> {
             position += 1;
         }
         let mut name = String::new();
-        while position < characters.len() && characters[position] != ';' && characters[position] != '='
+        while position < characters.len()
+            && characters[position] != ';'
+            && characters[position] != '='
         {
             name.push(characters[position]);
             position += 1;
@@ -1189,13 +1193,22 @@ mod tests {
 
     #[test]
     fn values_that_are_not_tokens_are_quoted_on_write() {
-        assert_eq!(parsed("text/html;charset=gbk("), "text/html;charset=\"gbk(\"");
-        assert_eq!(parsed("text/html;charset= gbk"), "text/html;charset=\" gbk\"");
+        assert_eq!(
+            parsed("text/html;charset=gbk("),
+            "text/html;charset=\"gbk(\""
+        );
+        assert_eq!(
+            parsed("text/html;charset= gbk"),
+            "text/html;charset=\" gbk\""
+        );
         assert_eq!(
             parsed("text/html;charset= \"gbk\""),
             "text/html;charset=\" \\\"gbk\\\"\""
         );
-        assert_eq!(parsed("text/html;x=(;charset=gbk"), "text/html;x=\"(\";charset=gbk");
+        assert_eq!(
+            parsed("text/html;x=(;charset=gbk"),
+            "text/html;x=\"(\";charset=gbk"
+        );
         assert_eq!(
             parsed("text/html;charset=();charset=GBK"),
             "text/html;charset=\"()\""
@@ -1241,7 +1254,15 @@ mod tests {
 
     #[test]
     fn invalid_types_serialize_to_nothing() {
-        for input in ["", "/", "text/", "/html", "text /html", "text/ html", "text/html\u{000c}"] {
+        for input in [
+            "",
+            "/",
+            "text/",
+            "/html",
+            "text /html",
+            "text/ html",
+            "text/html\u{000c}",
+        ] {
             assert_eq!(parsed(input), "", "{input:?}");
         }
         assert_eq!(parsed("*/*"), "*/*");

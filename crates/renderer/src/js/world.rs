@@ -998,8 +998,7 @@ impl CreatorInfo {
         // Line and column are the last two colon segments, both numeric.
         let (rest, column) = frame.rsplit_once(':')?;
         let (rest, line) = rest.rsplit_once(':')?;
-        let (Some(line), Some(column)) =
-            (line.parse::<u32>().ok(), column.parse::<u32>().ok())
+        let (Some(line), Some(column)) = (line.parse::<u32>().ok(), column.parse::<u32>().ok())
         else {
             return None;
         };

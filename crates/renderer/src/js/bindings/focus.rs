@@ -532,10 +532,9 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             {
                 return Ok(());
             }
-            world.borrow_mut().queue_frame_navigation(FrameNavigation::get(
-                NavigationTarget::SelfFrame,
-                spec,
-            ));
+            world
+                .borrow_mut()
+                .queue_frame_navigation(FrameNavigation::get(NavigationTarget::SelfFrame, spec));
             Ok(())
         }
         Activation::Submit | Activation::Reset => {

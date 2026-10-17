@@ -1599,30 +1599,33 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return None;
     }
-    let outcome = world.runtime.services.dial_sync(crate::protocol::DialRequest {
-        kind: crate::protocol::DialKind::JsFetch,
-        url: request.url,
-        initiator: world.document_url.to_string(),
-        read_body: true,
-        method: request.method,
-        body: request.body,
-        content_type: request.content_type,
-        headers: request.headers,
-        referrer: request.referrer,
-        timeout_ms: u64::from(millis(request.timeout)),
-        csp: None,
-        cors: Some(crate::protocol::CorsRequest {
-            mode: net::cors::RequestMode::Cors,
-            // `withCredentials` selects `include`, else `same-origin`
-            // (<https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
-            credentials: if request.with_credentials {
-                net::cors::CredentialsMode::Include
-            } else {
-                net::cors::CredentialsMode::SameOrigin
-            },
-            redirect: net::cors::RedirectMode::Follow,
-        }),
-    });
+    let outcome = world
+        .runtime
+        .services
+        .dial_sync(crate::protocol::DialRequest {
+            kind: crate::protocol::DialKind::JsFetch,
+            url: request.url,
+            initiator: world.document_url.to_string(),
+            read_body: true,
+            method: request.method,
+            body: request.body,
+            content_type: request.content_type,
+            headers: request.headers,
+            referrer: request.referrer,
+            timeout_ms: u64::from(millis(request.timeout)),
+            csp: None,
+            cors: Some(crate::protocol::CorsRequest {
+                mode: net::cors::RequestMode::Cors,
+                // `withCredentials` selects `include`, else `same-origin`
+                // (<https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
+                credentials: if request.with_credentials {
+                    net::cors::CredentialsMode::Include
+                } else {
+                    net::cors::CredentialsMode::SameOrigin
+                },
+                redirect: net::cors::RedirectMode::Follow,
+            }),
+        });
     match outcome {
         // The header list stays as served; nothing is sniffed into it
         // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
@@ -1755,9 +1758,7 @@ fn throw_eval_error(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
 pub(crate) fn error_stack_top(ctx: &Ctx<'_>) -> Option<(String, u32, u32)> {
     let factory: Function = ctx.eval("(function(E){ return new E(); })").ok()?;
     let error_ctor = bindings::world(ctx).ok()?.borrow().pristine_error.clone()?;
-    let error: Object = factory
-        .call((error_ctor.restore(ctx).ok()?,))
-        .ok()?;
+    let error: Object = factory.call((error_ctor.restore(ctx).ok()?,)).ok()?;
     let stack: String = error.get("stack").ok()?;
     // The capture runs inside a binding, so engine dispatch frames sit
     // between the capture and the executing page script; `user_frame` skips
@@ -1956,8 +1957,8 @@ pub(crate) fn js_number(id: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::referrer_for_policy;
     use super::CreatorInfo;
+    use super::referrer_for_policy;
     use url::Url;
 
     /// The referrer for one policy/document/request triple, without a
@@ -2040,8 +2041,10 @@ mod tests {
         assert_eq!(anonymous.column, 1);
         assert!(CreatorInfo::user_frame("no frames here").is_none());
         assert!(
-            CreatorInfo::user_frame("    at <eval> (eval_script:1:5)\n    at broken (http://example.test/a.js)")
-                .is_none()
+            CreatorInfo::user_frame(
+                "    at <eval> (eval_script:1:5)\n    at broken (http://example.test/a.js)"
+            )
+            .is_none()
         );
     }
 
@@ -2056,8 +2059,10 @@ mod tests {
         assert_eq!(user.column, 15);
         // No page script on the stack (parser insertion): no attribution.
         assert!(
-            CreatorInfo::user_frame("    at <eval> (eval_script:1:5)\n    at insertion (tinybrowser-shim:10:2)")
-                .is_none()
+            CreatorInfo::user_frame(
+                "    at <eval> (eval_script:1:5)\n    at insertion (tinybrowser-shim:10:2)"
+            )
+            .is_none()
         );
         // A `data:` script URL carries its own parentheses; the location
         // still splits at the frame wrapper, not inside the URL.

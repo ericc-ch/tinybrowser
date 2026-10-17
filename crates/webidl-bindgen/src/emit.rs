@@ -1376,13 +1376,9 @@ fn operation_argument_at(
             }
         }
         ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
-        ReturnType::UnsignedShort => {
-            numeric_argument(&fetch, variable, &ushort_from_value())
-        }
+        ReturnType::UnsignedShort => numeric_argument(&fetch, variable, &ushort_from_value()),
         ReturnType::Short => numeric_argument(&fetch, variable, &short_from_value()),
-        ReturnType::UnsignedLong => {
-            numeric_argument(&fetch, variable, &ulong_from_value())
-        }
+        ReturnType::UnsignedLong => numeric_argument(&fetch, variable, &ulong_from_value()),
         ReturnType::Long => numeric_argument(&fetch, variable, &long_from_value()),
         ReturnType::Double => numeric_argument(&fetch, variable, &double_from_value()),
         ReturnType::RestrictedDouble => {

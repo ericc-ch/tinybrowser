@@ -149,10 +149,7 @@ impl Document {
                                     // Scheme fetch serves the data: MIME type
                                     // as the response's `Content-Type` header
                                     // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
-                                    headers: vec![(
-                                        "content-type".to_owned(),
-                                        content_type,
-                                    )],
+                                    headers: vec![("content-type".to_owned(), content_type)],
                                     body,
                                     response_type: net::cors::ResponseType::Basic,
                                 },

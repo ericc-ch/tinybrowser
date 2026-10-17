@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Workspace checks: clippy, embedded JS syntax, rustdoc, Python, Valgrind.
 #
-#   clippy    stable shell. Workspace lints, then `node --check` on JavaScript
+#   clippy    stable shell. `cargo fmt --all --check`, then workspace lints,
+#            then `node --check` on JavaScript
 #            `include_str!`'d into the renderer, then the realm-free layer
 #            check (dom/ and documents.rs never name Ctx/Value/Persistent/
 #            JsNode), then `cargo doc --no-deps --document-private-items`
@@ -44,7 +45,8 @@ crate_args() {
   printf '%s\n' "${args[@]}"
 }
 
-run_clippy() {
+run_rust() {
+  nix develop --command cargo fmt --all --check
   nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 }
 
@@ -126,7 +128,7 @@ valgrind_test() {
 case "${1:-clippy}" in
   clippy)
     tools/webidl/import --check
-    run_clippy
+    run_rust
     run_js
     run_layers
     run_docs

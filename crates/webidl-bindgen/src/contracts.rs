@@ -2391,9 +2391,7 @@ pub(crate) fn native_type(
     visited: &mut BTreeSet<String>,
 ) -> Result<ReturnType, Error> {
     match type_ {
-        Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(item)))
-            if item.q_mark.is_none() =>
-        {
+        Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(item))) if item.q_mark.is_none() => {
             Ok(ReturnType::Uint8Array)
         }
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) => {

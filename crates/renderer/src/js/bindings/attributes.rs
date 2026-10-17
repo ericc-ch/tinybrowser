@@ -1670,10 +1670,10 @@ fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
     let Ok(owner) = world_for_node(ctx, element) else {
         return;
     };
-    owner.borrow_mut().creator_stacks.insert(
-        element,
-        crate::js::CreatorInfo { url, line, column },
-    );
+    owner
+        .borrow_mut()
+        .creator_stacks
+        .insert(element, crate::js::CreatorInfo { url, line, column });
 }
 
 /// After an attribute change, runs the element's attribute-change hooks: an

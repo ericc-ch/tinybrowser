@@ -403,12 +403,8 @@ fn input(type_: &ReturnType, value: &str, allow_shared: bool) -> Result<String, 
 fn output(database: &Database<'_>, type_: &ReturnType, value: &str) -> Result<String, Error> {
     // https://webidl.spec.whatwg.org/#es-to-js-dictionary
     match type_ {
-        ReturnType::String => {
-            Ok(format!("__tbIDLResult({value}, 'string')"))
-        }
-        ReturnType::Uint8Array => {
-            Ok(format!("__tbIDLRealmUint8Array({value}, false, realm)"))
-        }
+        ReturnType::String => Ok(format!("__tbIDLResult({value}, 'string')")),
+        ReturnType::Uint8Array => Ok(format!("__tbIDLRealmUint8Array({value}, false, realm)")),
         ReturnType::Dictionary(name) => {
             let dictionary = database.dictionary(name)?;
             attributes(dictionary.attributes.as_ref(), &[])?;
@@ -421,8 +417,7 @@ fn output(database: &Database<'_>, type_: &ReturnType, value: &str) -> Result<St
             for member in dictionary.members.body {
                 attributes(member.attributes.as_ref(), &[])?;
                 attributes(member.type_.attributes.as_ref(), &[])?;
-                let lowered =
-                    native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
+                let lowered = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
                 if member.required.is_some()
                     || member.default.is_some()
                     || !matches!(lowered, ReturnType::UnsignedLongLong)

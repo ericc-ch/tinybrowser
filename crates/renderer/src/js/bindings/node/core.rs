@@ -2436,10 +2436,14 @@ fn note_inserted_creators(ctx: &Ctx<'_>, inserted: &[NodeId]) {
         // mutation that chose the URL, and insertion only starts this load
         // when nothing did. A disconnect clears the entry, so a moved
         // element attributes its new load to the move.
-        owner_rc.borrow_mut().creator_stacks.entry(target).or_insert_with(|| {
-            let (url, line, column) = creator.clone();
-            crate::js::CreatorInfo { url, line, column }
-        });
+        owner_rc
+            .borrow_mut()
+            .creator_stacks
+            .entry(target)
+            .or_insert_with(|| {
+                let (url, line, column) = creator.clone();
+                crate::js::CreatorInfo { url, line, column }
+            });
     }
 }
 
