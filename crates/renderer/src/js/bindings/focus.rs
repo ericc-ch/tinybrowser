@@ -1,5 +1,6 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
+use super::node::element;
 use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for_node, wrap_node};
 
 use markup5ever::{LocalName, Namespace, QualName};
@@ -487,7 +488,8 @@ pub(super) fn cannot_navigate(world: &World, node: NodeId) -> bool {
 /// The referrer policy a followed hyperlink navigates with
 /// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>):
 /// the `noreferrer` link type wins, otherwise the `referrerpolicy` content
-/// attribute's current state. An empty policy leaves the initiator document's
+/// attribute, whose keywords are the referrer policies and whose invalid value
+/// default is the empty string. An empty policy leaves the initiator document's
 /// policy in force.
 fn hyperlink_referrer_policy(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
     if attr(base, node, "rel")
@@ -497,9 +499,12 @@ fn hyperlink_referrer_policy(base: &blitz_dom::BaseDocument, node: BlitzId) -> S
     {
         return "no-referrer".to_owned();
     }
-    attr(base, node, "referrerpolicy")
-        .unwrap_or_default()
-        .to_owned()
+    element::reflect_enum(
+        attr(base, node, "referrerpolicy"),
+        element::REFERRER_POLICY_KEYWORDS,
+        "",
+        "",
+    )
 }
 
 /// The activation behavior of a clicked control: a submit button submits its

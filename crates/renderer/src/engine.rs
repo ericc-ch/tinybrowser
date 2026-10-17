@@ -714,7 +714,15 @@ impl Engine {
             let shared = self.runtime.shared.borrow();
             (shared.tree.parent(child), shared.tree.container(child))
         };
-        let resolved = (!navigation.spec.is_empty())
+        // An empty `src` is a container with no URL to load; it keeps its
+        // `about:blank`. Every other navigation resolves an empty string
+        // against the initiator document, which is that document's own URL
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#parse-a-url>),
+        // so a link or form that names no URL reloads its document instead of
+        // blanking it.
+        let blank = navigation.spec.is_empty()
+            && matches!(navigation.target, NavigationTarget::Container(_));
+        let resolved = (!blank)
             .then(|| {
                 self.frames
                     .get(&initiator)
@@ -722,13 +730,15 @@ impl Engine {
             })
             .flatten();
         let Some(url) = resolved else {
-            // About:blank, the initial document of every frame without a
-            // usable `src`, inherits the initiator's captured origin
-            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
-            // A frame the engine just created is already on that document;
-            // reloading it would throw away its realm and anything a script
-            // has already set on it.
-            self.keep_initial_blank(child, initiator);
+            if blank {
+                // About:blank, the initial document of every frame without a
+                // usable `src`, inherits the initiator's captured origin
+                // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+                // A frame the engine just created is already on that document;
+                // reloading it would throw away its realm and anything a script
+                // has already set on it.
+                self.keep_initial_blank(child, initiator);
+            }
             if let (Some(embedder), Some(container)) = (embedder, container) {
                 self.mark_frame_load_pending(container, embedder);
             }
