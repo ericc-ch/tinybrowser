@@ -211,59 +211,7 @@ impl TabNetworkHandle {
             let deadline = Instant::now() + budget;
             let _global = Self::acquire(&self.permits.global, deadline).await?;
             let _tab = Self::acquire(&self.tab, deadline).await?;
-            let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
-            // Until the Fetch CORS protocol is implemented, do not issue a
-            // cross-origin script request (including requests with side
-            // effects) or expose a redirected response to the caller.
-            // <https://fetch.spec.whatwg.org/#http-fetch>
-            if request.kind == DialKind::JsFetch && url.origin() != initiator.origin() {
-                return Err(DialFailure::Connect);
-            }
-            let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
-            // https://fetch.spec.whatwg.org/#forbidden-method
-            if request.kind == DialKind::JsFetch
-                && matches!(
-                    method.as_str().to_ascii_uppercase().as_str(),
-                    "CONNECT" | "TRACE" | "TRACK"
-                )
-            {
-                return Err(DialFailure::Connect);
-            }
-            let mut outbound = Request::new(method, url);
-            if request.kind == DialKind::JsFetch {
-                outbound.same_origin = Some(initiator.origin());
-            }
-            if let Some(content_type) = &request.content_type {
-                let _ = outbound
-                    .headers
-                    .insert("Content-Type", content_type.as_bytes());
-            }
-            for (name, value) in &request.headers {
-                if request.kind == DialKind::JsFetch && forbidden_page_header(name, value) {
-                    continue;
-                }
-                outbound
-                    .headers
-                    .insert(name, value.as_bytes())
-                    .map_err(|_| DialFailure::Connect)?;
-            }
-            if let Some(referrer) = &request.referrer {
-                // Defense in depth: the renderer computes this per
-                // `referrer_for_policy`, but the network boundary re-validates
-                // so a compromised renderer cannot leak a cross-origin `Referer`.
-                if is_safe_referrer(referrer, &request.url) {
-                    outbound
-                        .headers
-                        .insert("Referer", referrer.as_bytes())
-                        .map_err(|_| DialFailure::Connect)?;
-                }
-            }
-            if !request.body.is_empty() {
-                outbound.body = Some(request.body.clone());
-            }
-            outbound.initiator_kind = InitiatorKind::Fetch;
-            outbound.initiator = Some(initiator.clone());
-            outbound.deadline = Some(deadline);
+            let mut outbound = outbound_request(request, initiator, deadline)?;
             let blocked_redirect = watch_redirects(request, initiator, &mut outbound);
             let response = match self.agent.send(outbound).await {
                 Ok(response) => response,
@@ -271,6 +219,7 @@ impl TabNetworkHandle {
                     return refused_redirect(&blocked_redirect).ok_or_else(|| dial_failure(&error));
                 }
             };
+            let response_type = response.response_type();
             let status = response.status();
             let final_url = response.final_url().to_string();
             let content_type = content_type_header(response.headers());
@@ -284,7 +233,9 @@ impl TabNetworkHandle {
                 })
                 .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
                 .collect();
-            let body = if request.read_body {
+            // An opaque response hides its body as well as its status and
+            // headers (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+            let body = if request.read_body && !response_type.is_opaque() {
                 response
                     .into_body()
                     .bytes(CONTROL_BODY_LIMIT)
@@ -294,11 +245,19 @@ impl TabNetworkHandle {
                 Vec::new()
             };
             Ok(DialOutcome {
-                status,
-                final_url,
+                status: if response_type.is_opaque() { 0 } else { status },
+                // An opaque filtered response has an empty URL list, so
+                // `Response.url` must not reveal where the request landed
+                // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+                final_url: if response_type == net::cors::ResponseType::Opaque {
+                    String::new()
+                } else {
+                    final_url
+                },
                 content_type,
                 headers,
                 body,
+                response_type,
             })
         };
         tokio::select! {
@@ -396,6 +355,101 @@ fn watch_redirects(
     blocked
 }
 
+/// Builds the `net` request for one page dial: URL, method, CORS parameters,
+/// headers, body, and initiator.
+fn outbound_request(
+    request: &DialRequest,
+    initiator: &Url,
+    deadline: Instant,
+) -> Result<Request, DialFailure> {
+    let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
+    let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
+    // https://fetch.spec.whatwg.org/#forbidden-method
+    if request.kind == DialKind::JsFetch
+        && matches!(
+            method.as_str().to_ascii_uppercase().as_str(),
+            "CONNECT" | "TRACE" | "TRACK"
+        )
+    {
+        return Err(DialFailure::Connect);
+    }
+    // A `no-cors` request may only use CORS-safelisted methods and headers:
+    // the page-side `request-no-cors` guard is advisory, so the network
+    // boundary enforces it here. Otherwise a page could send an unpreflighted,
+    // state-changing cross-origin request with an arbitrary method and headers
+    // (<https://fetch.spec.whatwg.org/#concept-headers-guard>).
+    let no_cors = request.kind == DialKind::JsFetch
+        && request
+            .cors
+            .as_ref()
+            .is_some_and(|cors| cors.mode == net::cors::RequestMode::NoCors);
+    if no_cors && !net::cors::is_cors_safelisted_method(&method) {
+        return Err(DialFailure::Connect);
+    }
+    let mut outbound = Request::new(method, url);
+    apply_cors(request, initiator, &mut outbound);
+    if let Some(content_type) = &request.content_type {
+        let _ = outbound
+            .headers
+            .insert("Content-Type", content_type.as_bytes());
+    }
+    for (name, value) in &request.headers {
+        if request.kind == DialKind::JsFetch && forbidden_page_header(name, value) {
+            continue;
+        }
+        if no_cors && !net::cors::is_no_cors_safelisted_request_header(name, value.as_bytes()) {
+            continue;
+        }
+        outbound
+            .headers
+            .insert(name, value.as_bytes())
+            .map_err(|_| DialFailure::Connect)?;
+    }
+    if let Some(referrer) = &request.referrer
+        // Defense in depth: the renderer computes this per `referrer_for_policy`,
+        // but the network boundary re-validates so a compromised renderer cannot
+        // leak a cross-origin `Referer`.
+        && is_safe_referrer(referrer, &request.url)
+    {
+        outbound
+            .headers
+            .insert("Referer", referrer.as_bytes())
+            .map_err(|_| DialFailure::Connect)?;
+    }
+    if !request.body.is_empty() {
+        outbound.body = Some(request.body.clone());
+    }
+    outbound.initiator_kind = InitiatorKind::Fetch;
+    outbound.initiator = Some(initiator.clone());
+    outbound.deadline = Some(deadline);
+    Ok(outbound)
+}
+
+/// Copies a page dial's CORS parameters onto the `net` request. The origin
+/// comes from the site-authorized initiator, so a compromised renderer cannot
+/// claim an origin outside its renderer's site lock
+/// (<https://fetch.spec.whatwg.org/#concept-request-origin>). It can still
+/// name a different origin *within* that site, which shares the renderer
+/// process; deriving the origin from a per-frame record the browser owns is a
+/// known gap. A dial with no CORS parameters keeps the same-origin-only
+/// enforcement.
+fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
+    if request.kind != DialKind::JsFetch {
+        return;
+    }
+    match request.cors {
+        Some(cors) => {
+            outbound.cors = Some(net::cors::CorsSettings {
+                mode: cors.mode,
+                credentials: cors.credentials,
+                redirect: cors.redirect,
+                origin: initiator.origin().ascii_serialization(),
+            });
+        }
+        None => outbound.same_origin = Some(initiator.origin()),
+    }
+}
+
 fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutcome> {
     let url = blocked
         .lock()
@@ -407,6 +461,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         content_type: None,
         headers: Vec::new(),
         body: Vec::new(),
+        response_type: net::cors::ResponseType::Basic,
     })
 }
 

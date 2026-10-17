@@ -154,6 +154,7 @@ impl Document {
                                         content_type,
                                     )],
                                     body,
+                                    response_type: net::cors::ResponseType::Basic,
                                 },
                             });
                         }
@@ -425,6 +426,7 @@ impl Document {
                     content_type: fetch.content_type,
                     headers: fetch.headers,
                     referrer: fetch.referrer,
+                    cors: fetch.cors,
                     csp: Some(self.redirect_gate(crate::csp::Destination::Connect)),
                     ancestors: Vec::new(),
                     integrity: None,

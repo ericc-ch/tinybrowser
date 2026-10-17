@@ -319,14 +319,18 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       const type = __tbApply(__tbHeadersGet, data.headers, ['content-type']) === null ? payload.type : null;
       const fields = __tbArray.map(__tbBrand(data.headers, __tbHeadersData), entry => [entry[0], entry[1]]);
       const referrer = host.__tbReferrer(data.url);
-      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, referrer, data.timeout);
+      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, [referrer === null || referrer === undefined ? '' : String(referrer), data.withCredentials ? '1' : '0'], data.timeout);
       if (result === null || result === undefined) {
         __tbXhrSyncError(data, 'The request failed due to a network error.');
       }
       __tbXhrFinish(this, data, generation, result[0], result[1], result[2], result[3], true);
       return;
     }
-    data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, (status, bytes, url, _type, fields) => {
+    data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, {
+      mode: 'cors',
+      credentials: data.withCredentials ? 'include' : 'same-origin',
+      redirect: 'follow',
+    }, (status, bytes, url, _type, fields) => {
       __tbXhrFinish(this, data, generation, status, bytes, url, fields, false);
     });
     __tbXhrTimeout(this, data);

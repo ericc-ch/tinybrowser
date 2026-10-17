@@ -105,6 +105,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             referrer: None,
             timeout_ms: 0,
             csp: Some(Box::new(gate)),
+            cors: None,
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);

@@ -22,6 +22,27 @@ const __tbRequestMethod = value => {
   }
   return /^(DELETE|GET|HEAD|OPTIONS|POST|PUT)$/i.test(method) ? method.toUpperCase() : method;
 };
+// Request mode, credentials mode, and redirect mode
+// (<https://fetch.spec.whatwg.org/#request-class>).
+const __tbRequestMode = value => {
+  const mode = String(value);
+  if (mode === 'same-origin' || mode === 'cors' || mode === 'no-cors') return mode;
+  throw new TypeError('Invalid request mode');
+};
+const __tbCredentialsMode = value => {
+  const mode = String(value);
+  if (mode === 'omit' || mode === 'same-origin' || mode === 'include') return mode;
+  throw new TypeError('Invalid credentials mode');
+};
+const __tbRedirectMode = value => {
+  const mode = String(value);
+  if (mode === 'follow' || mode === 'error' || mode === 'manual') return mode;
+  throw new TypeError('Invalid redirect mode');
+};
+// A `no-cors` request may use only a CORS-safelisted method
+// (<https://fetch.spec.whatwg.org/#cors-safelisted-method>).
+const __tbCorsSafelistedMethod = method =>
+  method === 'GET' || method === 'HEAD' || method === 'POST';
 const __tbBrand = (value, slots, message) => {
   const data = slots.get(value);
   if (data === undefined) throw new TypeError(message === undefined ? 'Illegal invocation' : message);
@@ -100,12 +121,18 @@ globalThis.Response = class Response {
         status: options.status === undefined ? 200 : Number(options.status),
         statusText: options.statusText === undefined ? '' : String(options.statusText),
         url: options.url === undefined ? '' : String(options.url),
+        // `ResponseInit` has no `type` member; the constructor always yields
+        // "default". Only the network path sets another type, through
+        // `__tbMakeResponse`
+        // (<https://fetch.spec.whatwg.org/#responseinit>).
+        type: 'default',
         headers,
     });
   }
   get status() { return __tbBrand(this, __tbResponseData).status; }
   get statusText() { return __tbBrand(this, __tbResponseData).statusText; }
   get url() { return __tbBrand(this, __tbResponseData).url; }
+  get type() { return __tbBrand(this, __tbResponseData).type; }
   get headers() { return __tbBrand(this, __tbResponseData).headers; }
   get ok() { const status = __tbBrand(this, __tbResponseData).status; return status >= 200 && status <= 299; }
   get bodyUsed() { return __tbBrand(this, __tbResponseData).bodyUsed; }
@@ -126,7 +153,7 @@ globalThis.Response = class Response {
     const data = __tbBrand(this, __tbResponseData);
     if (data.bodyUsed) throw new TypeError('body already used');
     const copy = Object.create(globalThis.Response.prototype);
-    __tbResponseData.set(copy, { body: data.body, bodyUsed: false, status: data.status, statusText: data.statusText, url: data.url, headers: new globalThis.Headers(data.headers) });
+    __tbResponseData.set(copy, { body: data.body, bodyUsed: false, status: data.status, statusText: data.statusText, url: data.url, type: data.type, headers: new globalThis.Headers(data.headers) });
     return copy;
   }
 };
@@ -179,6 +206,9 @@ globalThis.Request = class Request {
     let blob = null;
     let headers = new globalThis.Headers();
     let body = null;
+    let mode = 'cors';
+    let credentials = 'same-origin';
+    let redirect = 'follow';
     if (input instanceof globalThis.Request) {
       const source = __tbBrand(input, __tbRequestData);
       url = source.url;
@@ -186,6 +216,9 @@ globalThis.Request = class Request {
       blob = source.blob;
       headers = new globalThis.Headers(source.headers);
       body = source.body;
+      mode = source.mode;
+      credentials = source.credentials;
+      redirect = source.redirect;
     } else {
       const resolved = host.__tbResolveUrl(String(input), undefined);
       url = resolved === null ? String(input) : resolved;
@@ -193,21 +226,32 @@ globalThis.Request = class Request {
     if (options.method !== undefined) method = __tbRequestMethod(options.method);
     if (options.headers !== undefined) headers = new globalThis.Headers(options.headers);
     if (options.body !== undefined) body = options.body;
+    if (options.mode !== undefined) mode = __tbRequestMode(options.mode);
+    if (options.credentials !== undefined) credentials = __tbCredentialsMode(options.credentials);
+    if (options.redirect !== undefined) redirect = __tbRedirectMode(options.redirect);
     // The init body's type becomes the Content-Type when the header list
     // holds none (<https://fetch.spec.whatwg.org/#dom-request>).
     if (options.body !== undefined && options.body !== null && !headers.has('content-type')) {
       const type = __tbBodyType(options.body);
       if (type !== null) headers.set('content-type', type);
     }
+    // A `no-cors` Request rejects a method that is not CORS-safelisted
+    // (<https://fetch.spec.whatwg.org/#dom-request>).
+    if (mode === 'no-cors' && !__tbCorsSafelistedMethod(method)) {
+      throw new TypeError('Invalid request method for no-cors mode');
+    }
     // A Request keeps a blob URL's data alive, so fetching it still works
     // after revokeObjectURL (<https://w3c.github.io/FileAPI/#lifeTime>).
     if (blob === null && url.indexOf('blob:') === 0) blob = __tbLookupObjectUrl(url);
-    __tbRequestData.set(this, { url, method, blob, headers, body, bodyUsed: false });
+    __tbRequestData.set(this, { url, method, blob, headers, body, bodyUsed: false, mode, credentials, redirect });
   }
   get url() { return __tbBrand(this, __tbRequestData).url; }
   get method() { return __tbBrand(this, __tbRequestData).method; }
   get headers() { return __tbBrand(this, __tbRequestData).headers; }
   get bodyUsed() { return __tbBrand(this, __tbRequestData).bodyUsed; }
+  get mode() { return __tbBrand(this, __tbRequestData).mode; }
+  get credentials() { return __tbBrand(this, __tbRequestData).credentials; }
+  get redirect() { return __tbBrand(this, __tbRequestData).redirect; }
   // https://fetch.spec.whatwg.org/#dom-body-blob
   blob() {
     const data = __tbBrand(this, __tbRequestData);
@@ -223,15 +267,18 @@ globalThis.Request = class Request {
   clone() {
     const data = __tbBrand(this, __tbRequestData);
     const copy = Object.create(globalThis.Request.prototype);
-    __tbRequestData.set(copy, { url: data.url, method: data.method, blob: data.blob, headers: new globalThis.Headers(data.headers), body: data.body, bodyUsed: false });
+    __tbRequestData.set(copy, { url: data.url, method: data.method, blob: data.blob, headers: new globalThis.Headers(data.headers), body: data.body, bodyUsed: false, mode: data.mode, credentials: data.credentials, redirect: data.redirect });
     return copy;
   }
 };
 Object.defineProperty(globalThis.Request.prototype, Symbol.toStringTag, { value: 'Request', writable: false, enumerable: false, configurable: true });
-const __tbMakeResponse = (body, status, url, type, fields) => {
+const __tbMakeResponse = (body, status, url, type, fields, responseType) => {
   const headers = new globalThis.Headers(fields);
   if (type && !headers.has('content-type')) headers.set('content-type', type);
-  return new globalThis.Response(body, { status, url, headers });
+  const response = new globalThis.Response(body, { status, url, headers });
+  // The network path is the only source of a non-"default" type.
+  __tbBrand(response, __tbResponseData).type = responseType;
+  return response;
 };
 // The type a body of a given kind contributes, or null when it has none
 // (<https://fetch.spec.whatwg.org/#concept-bodyinit-extract>).
@@ -250,7 +297,7 @@ const __tbPageRequestBody = async body => {
   if (ArrayBuffer.isView(body)) return { bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)), type };
   return { bytes: Array.from(__tbUtf8Encode(String(body))), type };
 };
-const __tbQueuePageRequest = (url, method, body, headers, callback) => {
+const __tbQueuePageRequest = (url, method, body, headers, cors, callback) => {
   const id = ++host.__tb_fetchSeq;
   // Snapshot the document referrer at `fetch()` time. Body extraction is
   // async, so a later `meta name=referrer` insertion would otherwise apply
@@ -261,18 +308,18 @@ const __tbQueuePageRequest = (url, method, body, headers, callback) => {
   // fetch-time (not construction-time) policy; construction-time state is a
   // known gap.
   const referrer = host.__tbReferrer(url);
-  host.__tb_fetchCbs[id] = function(status, bytes, finalUrl, contentType, responseHeaders) {
+  host.__tb_fetchCbs[id] = function(status, bytes, finalUrl, contentType, responseHeaders, responseType) {
     delete host.__tb_fetchCbs[id];
-    callback(status, bytes, finalUrl, contentType, responseHeaders);
+    callback(status, bytes, finalUrl, contentType, responseHeaders, responseType);
   };
   __tbPageRequestBody(body).then(payload => {
     if (!host.__tb_fetchCbs[id]) return;
     const type = __tbApply(__tbHeadersGet, headers, ['content-type']) === null ? payload.type : null;
     const fields = __tbArray.map(__tbBrand(headers, __tbHeadersData), entry => [entry[0], entry[1]]);
-    host.__queueFetch(url, id, method, payload.bytes, type, fields, referrer);
+    host.__queueFetch(url, id, method, payload.bytes, type, fields, [referrer === null || referrer === undefined ? '' : String(referrer), cors.mode, cors.credentials, cors.redirect]);
   }, () => {
     const done = host.__tb_fetchCbs[id];
-    if (done) done(0, new Uint8Array(), '', '', []);
+    if (done) done(0, new Uint8Array(), '', '', [], 'error');
   });
   return id;
 };
@@ -289,6 +336,9 @@ globalThis.fetch = function(input, init) {
   let blob = null;
   let headers = new globalThis.Headers();
   let body = null;
+  let mode = 'cors';
+  let credentials = 'same-origin';
+  let redirect = 'follow';
   if (input instanceof globalThis.Request) {
     const source = __tbBrand(input, __tbRequestData);
     url = source.url;
@@ -296,16 +346,26 @@ globalThis.fetch = function(input, init) {
     blob = source.blob;
     headers = new globalThis.Headers(source.headers);
     body = source.body;
+    mode = source.mode;
+    credentials = source.credentials;
+    redirect = source.redirect;
   } else {
     const resolved = host.__tbResolveUrl(String(input), undefined);
     url = resolved === null ? String(input) : resolved;
   }
-  if (options.method !== undefined) {
-    try { method = __tbRequestMethod(options.method); }
-    catch (error) { return Promise.reject(error); }
+  try {
+    if (options.method !== undefined) method = __tbRequestMethod(options.method);
+    if (options.headers !== undefined) headers = new globalThis.Headers(options.headers);
+    if (options.body !== undefined) body = options.body;
+    if (options.mode !== undefined) mode = __tbRequestMode(options.mode);
+    if (options.credentials !== undefined) credentials = __tbCredentialsMode(options.credentials);
+    if (options.redirect !== undefined) redirect = __tbRedirectMode(options.redirect);
+    if (mode === 'no-cors' && !__tbCorsSafelistedMethod(method)) {
+      throw new TypeError('Invalid request method for no-cors mode');
+    }
+  } catch (error) {
+    return Promise.reject(error);
   }
-  if (options.headers !== undefined) headers = new globalThis.Headers(options.headers);
-  if (options.body !== undefined) body = options.body;
   return new Promise(function(resolve, reject) {
     if (url.indexOf('blob:') === 0) {
       if (method !== 'GET' || body !== null) {
@@ -317,11 +377,11 @@ globalThis.fetch = function(input, init) {
         reject(new TypeError('Failed to fetch'));
         return;
       }
-      resolve(__tbMakeResponse(entry.contents, 200, url, entry.type, []));
+      resolve(__tbMakeResponse(entry.contents, 200, url, entry.type, [], 'basic'));
       return;
     }
-    __tbQueuePageRequest(url, method, body, headers, (status, bytes, finalUrl, type, fields) => {
-      if (status !== 0) resolve(__tbMakeResponse(bytes, status, finalUrl, type, fields));
+    __tbQueuePageRequest(url, method, body, headers, { mode, credentials, redirect }, (status, bytes, finalUrl, type, fields, responseType) => {
+      if (responseType !== 'error') resolve(__tbMakeResponse(bytes, status, finalUrl, type, fields, responseType));
       else reject(new TypeError('Failed to fetch'));
     });
   });

@@ -1859,6 +1859,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "native-tls",
+ "serde",
  "thiserror",
  "tokio",
  "tokio-native-tls",

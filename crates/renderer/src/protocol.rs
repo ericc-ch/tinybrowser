@@ -430,6 +430,25 @@ pub struct DialRequest {
     /// redirect hop with it.
     #[serde(default)]
     pub csp: Option<Box<crate::RedirectGate>>,
+    /// CORS protocol parameters for a page `fetch`/XHR. `None` for navigation
+    /// and subresource dials.
+    #[serde(default)]
+    pub cors: Option<CorsRequest>,
+}
+
+/// The CORS parameters a page `fetch`/XHR sends over the wire. The browser
+/// fills in the origin from the document URL, so the renderer cannot claim
+/// one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorsRequest {
+    /// CORS mode (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+    pub mode: net::cors::RequestMode,
+    /// Credentials mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
+    pub credentials: net::cors::CredentialsMode,
+    /// Redirect mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-redirect-mode>).
+    pub redirect: net::cors::RedirectMode,
 }
 
 fn default_dial_method() -> String {
@@ -452,6 +471,33 @@ pub struct DialOutcome {
     pub headers: Vec<(String, String)>,
     /// Response body, when [`DialRequest::read_body`].
     pub body: Vec<u8>,
+    /// How the response was filtered
+    /// (<https://fetch.spec.whatwg.org/#concept-response-type>); `basic` for
+    /// same-origin and subresource responses.
+    #[serde(default)]
+    pub response_type: net::cors::ResponseType,
+}
+
+impl DialOutcome {
+    /// An unfiltered (`basic`) response, for carriers that do not run the CORS
+    /// protocol.
+    #[must_use]
+    pub fn basic(
+        status: u16,
+        final_url: String,
+        content_type: Option<String>,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            status,
+            final_url,
+            content_type,
+            headers,
+            body,
+            response_type: net::cors::ResponseType::Basic,
+        }
+    }
 }
 
 /// Completion for a dial submitted to the browser process.

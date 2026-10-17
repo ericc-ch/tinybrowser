@@ -582,6 +582,7 @@ mod tests {
                         referrer: None,
                         timeout_ms: 0,
                         csp: None,
+                        cors: None,
                     })),
                 },
             },

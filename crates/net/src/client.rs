@@ -283,6 +283,102 @@ impl Agent {
         Ok(())
     }
 
+    /// Runs the preflight for a non-safelisted cross-origin `cors` request
+    /// (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>). The preflight
+    /// carries the same `Referer` and `User-Agent` as the request it gates.
+    /// `origin` is the request's byte-serialized origin: the document origin,
+    /// or `null` once a redirect has tainted it.
+    async fn cors_preflight(
+        &self,
+        settings: &crate::cors::CorsSettings,
+        origin: &str,
+        method: &Method,
+        headers: &HeaderMap,
+        wire: &Url,
+        budget: CallBudget,
+    ) -> Result<(), NetError> {
+        let unsafe_names = crate::cors::unsafe_request_header_names(headers);
+        if !crate::cors::needs_preflight(method, &unsafe_names) {
+            return Ok(());
+        }
+        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin);
+        if let Some(referrer) = headers.get("referer") {
+            let _ = preflight.insert("Referer", referrer);
+        }
+        if let Some(ua) = &self.ua {
+            let _ = preflight.insert("User-Agent", ua.as_bytes());
+        }
+        let (status, preflight_headers, body) = self
+            .engine
+            .send(&Method::OPTIONS, wire, &preflight, None, budget)
+            .await?;
+        drop(body);
+        if !crate::cors::preflight_ok(
+            status,
+            &preflight_headers,
+            origin,
+            settings.credentials.includes(),
+            method,
+            &unsafe_names,
+        ) {
+            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
+        Ok(())
+    }
+
+    /// Applies the request-side CORS rules for one hop: the preflight a
+    /// `cors`-tainted hop needs, and the `Origin` header
+    /// (<https://fetch.spec.whatwg.org/#http-fetch>,
+    /// <https://fetch.spec.whatwg.org/#append-a-request-origin-header>).
+    async fn apply_cors_request(
+        &self,
+        settings: Option<&crate::cors::CorsSettings>,
+        hop: &Hop,
+        wire: &Url,
+        headers: &mut HeaderMap,
+        budget: CallBudget,
+    ) -> Result<(), NetError> {
+        let Some(settings) = settings else {
+            return Ok(());
+        };
+        // A redirect-tainted request serializes its origin as `null` for the
+        // rest of the chain, and both the request `Origin` header and the
+        // response CORS check compare that serialization
+        // (<https://fetch.spec.whatwg.org/#serializing-a-request-origin>).
+        let serialized_origin = if hop.origin_tainted {
+            "null"
+        } else {
+            settings.origin.as_str()
+        };
+        // Case 2 of main fetch sends same-origin, still-`basic` requests
+        // straight to scheme fetch, so only a `cors`-tainted hop can need a
+        // preflight (<https://fetch.spec.whatwg.org/#main-fetch>).
+        if hop.response_type == crate::cors::ResponseType::Cors {
+            self.cors_preflight(
+                settings,
+                serialized_origin,
+                &hop.method,
+                headers,
+                wire,
+                budget,
+            )
+            .await?;
+        }
+        // `Origin` rides on every hop whose response tainting is `cors`, and
+        // on every other request whose method is neither GET nor HEAD
+        // (<https://fetch.spec.whatwg.org/#append-a-request-origin-header>).
+        // A same-origin `cors` POST that survives a 307/308 redirect sends
+        // `Origin` here, which `fetch/api/redirect/redirect-origin.any.js`
+        // expects to be absent; step 3 of the algorithm does not exempt that
+        // case, and Chrome and Firefox fail the same two subtests.
+        if hop.response_type == crate::cors::ResponseType::Cors
+            || !matches!(hop.method.as_str(), "GET" | "HEAD")
+        {
+            append_origin(headers, serialized_origin);
+        }
+        Ok(())
+    }
+
     pub(crate) fn store_set_cookie_lines(
         &self,
         url: &Url,
@@ -318,104 +414,188 @@ impl Agent {
     /// # Errors
     ///
     /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request
-    /// (including a merged `Cookie` header that is not a valid field value), or
-    /// an unusable `Location`. [`NetError::Limit`] when the redirect cap is exceeded.
-    /// [`NetError::Transport`] when a hop fails.
+    /// (a failed CORS check or preflight, a redirect the CORS rules refuse, or
+    /// a merged `Cookie` header that is not a valid field value), or an
+    /// unusable `Location`. [`NetError::Limit`] when the redirect cap is
+    /// exceeded. [`NetError::Transport`] when a hop fails.
     pub async fn send(&self, request: Request) -> Result<Response, NetError> {
         if !matches!(request.url.scheme(), "http" | "https") {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
-        let mut method = request.method;
+        let dial = Dial {
+            cors: request.cors.as_ref(),
+            initiator_kind: request.initiator_kind,
+            initiator: request.initiator.as_ref(),
+            same_origin: request.same_origin.as_ref(),
+            on_redirect: request.on_redirect.as_ref(),
+            credentials_include: request
+                .cors
+                .as_ref()
+                .is_some_and(|settings| settings.credentials.includes()),
+        };
+        let mut hop = Hop {
+            method: request.method,
+            headers: request.headers,
+            body: request.body,
+            // Once any hop is cross-origin under `cors` (or `no-cors`), every
+            // later hop keeps that tainting
+            // (<https://fetch.spec.whatwg.org/#main-fetch>).
+            response_type: crate::cors::ResponseType::Basic,
+            previous_url: None,
+            origin_tainted: false,
+        };
         let mut url = request.url;
-        let mut headers = request.headers;
-        let mut body = request.body;
         let mut followed = 0u32;
-        let initiator_kind = request.initiator_kind;
-        let initiator = request.initiator;
         let mut cross_site_redirect = false;
-        let started = Instant::now();
-        let mut budget = self.engine.budget_at(started);
+        let mut budget = self.engine.budget_at(Instant::now());
         if let Some(deadline) = request.deadline {
             budget.global = Some(deadline);
         }
 
         loop {
-            // https://fetch.spec.whatwg.org/#http-fetch
-            if request
-                .same_origin
-                .as_ref()
-                .is_some_and(|origin| url.origin() != *origin)
+            let response = self
+                .exchange(&dial, &url, &mut hop, cross_site_redirect, budget)
+                .await?;
+            let hop_status = response.status();
+            let response_type = hop.response_type;
+            let origin_tainted = hop.origin_tainted;
+            if self.max_redirects == 0 {
+                return filtered(
+                    response,
+                    dial.cors,
+                    response_type,
+                    dial.credentials_include,
+                    origin_tainted,
+                );
+            }
+            let next = match classify_response(
+                response,
+                &url,
+                dial.cors,
+                response_type,
+                dial.credentials_include,
+                origin_tainted,
+            )? {
+                HopOutcome::Final(response) => return Ok(response),
+                HopOutcome::Redirect { next } => next,
+            };
+            if followed == self.max_redirects {
+                return Err(NetError::Limit(LimitExceeded::Redirect));
+            }
+            // `followed + 1` is the redirect count the next hop will carry.
+            // A false gate refuses the hop before any bytes are sent.
+            if let Some(gate) = dial.on_redirect
+                && !gate(&next, followed + 1)
             {
                 return Err(NetError::Protocol(ProtocolError::RejectedRequest));
             }
-            if budget.is_expired() {
-                return Err(NetError::Transport(TransportError::Timeout(
-                    budget.timeout_kind(TimeoutKind::Global),
-                )));
-            }
-            budget = budget.with_hop_start(self.engine.timeout_per_call, Instant::now());
-            let mut wire = url.clone();
-            wire.set_fragment(None);
-            let mut hop_headers = headers.clone();
-            self.prepare_outbound(
-                &mut hop_headers,
-                &url,
-                initiator_kind,
-                &method,
-                initiator.as_ref(),
-                cross_site_redirect,
-            )?;
-            apply_url_credentials(&mut hop_headers, &url);
-            let (status, response_headers, reader) = self
-                .engine
-                .send(&method, &wire, &hop_headers, body.as_deref(), budget)
-                .await?;
-            let response =
-                Response::from_parts(status, response_headers, reader, url.clone(), budget);
+            cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
+            apply_redirect_policy(hop_status, &url, &next, &mut hop);
+            url = next;
+            followed += 1;
+        }
+    }
+
+    /// One HTTP hop: the same-origin gate, the CORS request rules, the send,
+    /// and the cookie store. Mutates `hop` only to acquire its CORS tainting
+    /// (<https://fetch.spec.whatwg.org/#http-fetch>).
+    async fn exchange(
+        &self,
+        dial: &Dial<'_>,
+        url: &Url,
+        hop: &mut Hop,
+        cross_site_redirect: bool,
+        budget: CallBudget,
+    ) -> Result<Response, NetError> {
+        if dial
+            .same_origin
+            .is_some_and(|origin| url.origin() != *origin)
+        {
+            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
+        let taint = hop_taint(dial.cors, url)?;
+        if taint != crate::cors::ResponseType::Basic {
+            hop.response_type = taint;
+        }
+        // The redirect-taint: once a hop crosses an origin that is neither
+        // the previous URL's nor the request's own, the serialized origin
+        // becomes `null` for this and every later hop
+        // (<https://fetch.spec.whatwg.org/#concept-request-tainted-origin>).
+        if let (Some(settings), Some(previous)) = (dial.cors, hop.previous_url.as_ref())
+            && previous.origin() != url.origin()
+            && settings.origin != previous.origin().ascii_serialization()
+        {
+            hop.origin_tainted = true;
+        }
+        hop.previous_url = Some(url.clone());
+        if budget.is_expired() {
+            return Err(NetError::Transport(TransportError::Timeout(
+                budget.timeout_kind(TimeoutKind::Global),
+            )));
+        }
+        let budget = budget.with_hop_start(self.engine.timeout_per_call, Instant::now());
+        let mut wire = url.clone();
+        wire.set_fragment(None);
+        let cross_origin = dial
+            .cors
+            .is_some_and(|settings| settings.origin != wire.origin().ascii_serialization());
+        let mut hop_headers = hop.headers.clone();
+        self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget)
+            .await?;
+        self.prepare_outbound(
+            &mut hop_headers,
+            url,
+            dial.initiator_kind,
+            &hop.method,
+            dial.initiator,
+            cross_site_redirect,
+        )?;
+        // Credentials mode gates both the `Cookie` header and the
+        // URL-credentials `Authorization` header
+        // (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>,
+        // <https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>).
+        let send_credentials = dial
+            .cors
+            .is_none_or(|settings| credentials_admitted(settings.credentials, cross_origin));
+        if send_credentials {
+            apply_url_credentials(&mut hop_headers, url);
+        } else {
+            hop_headers.remove("cookie");
+        }
+        let (status, response_headers, reader) = self
+            .engine
+            .send(
+                &hop.method,
+                &wire,
+                &hop_headers,
+                hop.body.as_deref(),
+                budget,
+            )
+            .await?;
+        let response = Response::from_parts(
+            status,
+            response_headers,
+            reader,
+            url.clone(),
+            budget,
+            hop.response_type,
+        );
+        // Set-Cookie must be read before CORS filtering removes it, and only
+        // when credentials mode admits them for this origin.
+        if send_credentials {
             self.store_set_cookie_lines(
-                &url,
-                initiator_kind,
-                &method,
-                initiator.as_ref(),
+                url,
+                dial.initiator_kind,
+                &hop.method,
+                dial.initiator,
                 cross_site_redirect,
                 response
                     .headers()
                     .get_all("set-cookie")
                     .filter_map(|v| std::str::from_utf8(v).ok()),
             );
-
-            let Some(location) = followable_location(response.status(), response.headers())? else {
-                return Ok(response);
-            };
-
-            if self.max_redirects == 0 {
-                return Ok(response);
-            }
-            if followed == self.max_redirects {
-                return Err(NetError::Limit(LimitExceeded::Redirect));
-            }
-
-            let next = resolve_location(&url, location)?;
-            // `followed + 1` is the redirect count the next hop will carry.
-            // A false gate refuses the hop before any bytes are sent.
-            if let Some(gate) = &request.on_redirect
-                && !gate(&next, followed + 1)
-            {
-                return Err(NetError::Protocol(ProtocolError::RejectedRequest));
-            }
-            cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
-            apply_redirect_policy(
-                response.status(),
-                &url,
-                &next,
-                &mut method,
-                &mut headers,
-                &mut body,
-            );
-            url = next;
-            followed += 1;
-            drop(response);
         }
+        Ok(response)
     }
 
     /// WebSocket handshake for `request`. The URL must be `ws` or `wss`.
@@ -481,6 +661,11 @@ pub struct Request {
     /// When set, reject any initial or redirected hop outside this origin
     /// before sending headers or body. Navigation and subresources leave it unset.
     pub same_origin: Option<url::Origin>,
+    /// CORS protocol parameters for a cross-origin `fetch`. The caller fills
+    /// `origin` from the document it is fetching for, so a compromised
+    /// renderer cannot claim another origin. `None` keeps the legacy behaviour
+    /// where `same_origin` alone gates the request.
+    pub cors: Option<crate::cors::CorsSettings>,
     /// Called with the next URL and the redirect count that hop will carry
     /// (`1` for the first redirect) before the hop is followed. `false`
     /// rejects the dial. Unset follows every redirect the cap allows.
@@ -499,6 +684,7 @@ impl std::fmt::Debug for Request {
             .field("body", &self.body)
             .field("deadline", &self.deadline)
             .field("same_origin", &self.same_origin)
+            .field("has_cors", &self.cors.is_some())
             .field("on_redirect", &self.on_redirect.is_some())
             .finish()
     }
@@ -518,6 +704,7 @@ impl Request {
             body: None,
             deadline: None,
             same_origin: None,
+            cors: None,
             on_redirect: None,
         }
     }
@@ -552,36 +739,29 @@ fn resolve_location(current: &Url, location: &str) -> Result<Url, NetError> {
 }
 
 // https://fetch.spec.whatwg.org/#http-redirect-fetch
-fn apply_redirect_policy(
-    status: u16,
-    current: &Url,
-    next: &Url,
-    method: &mut Method,
-    headers: &mut HeaderMap,
-    body: &mut Option<Vec<u8>>,
-) {
-    let post_to_get = matches!(status, 301 | 302) && *method == Method::POST;
-    let see_other = status == 303 && *method != Method::GET && *method != Method::HEAD;
+fn apply_redirect_policy(status: u16, current: &Url, next: &Url, hop: &mut Hop) {
+    let post_to_get = matches!(status, 301 | 302) && hop.method == Method::POST;
+    let see_other = status == 303 && hop.method != Method::GET && hop.method != Method::HEAD;
     if post_to_get || see_other {
-        *method = Method::GET;
-        *body = None;
-        headers.remove("content-encoding");
-        headers.remove("content-language");
-        headers.remove("content-location");
-        headers.remove("content-type");
-        headers.remove("content-length");
-        headers.remove("transfer-encoding");
+        hop.method = Method::GET;
+        hop.body = None;
+        hop.headers.remove("content-encoding");
+        hop.headers.remove("content-language");
+        hop.headers.remove("content-location");
+        hop.headers.remove("content-type");
+        hop.headers.remove("content-length");
+        hop.headers.remove("transfer-encoding");
     }
     if current.origin() != next.origin() {
-        headers.remove("authorization");
-        headers.remove("cookie");
-        headers.remove("host");
+        hop.headers.remove("authorization");
+        hop.headers.remove("cookie");
+        hop.headers.remove("host");
     }
     if next.scheme() != "https" && !loopback_http(next) {
-        headers.remove("sec-ch-ua");
-        headers.remove("sec-ch-ua-mobile");
-        headers.remove("sec-ch-ua-platform");
-        headers.remove("sec-ch-prefers-color-scheme");
+        hop.headers.remove("sec-ch-ua");
+        hop.headers.remove("sec-ch-ua-mobile");
+        hop.headers.remove("sec-ch-ua-platform");
+        hop.headers.remove("sec-ch-prefers-color-scheme");
     }
 }
 
@@ -595,6 +775,218 @@ fn loopback_http(url: &Url) -> bool {
         }
         None => false,
     }
+}
+
+/// What the caller does after one hop.
+enum HopOutcome {
+    /// The response is the final result.
+    Final(Response),
+    /// The response redirects; fetch `next`.
+    Redirect { next: Url },
+}
+
+/// Request-scoped values shared by every hop of one `send` call.
+struct Dial<'a> {
+    cors: Option<&'a crate::cors::CorsSettings>,
+    initiator_kind: InitiatorKind,
+    initiator: Option<&'a Url>,
+    same_origin: Option<&'a url::Origin>,
+    on_redirect: Option<&'a RedirectGate>,
+    credentials_include: bool,
+}
+
+/// The request state a redirect may rewrite, plus the sticky CORS tainting.
+struct Hop {
+    method: Method,
+    headers: HeaderMap,
+    body: Option<Vec<u8>>,
+    response_type: crate::cors::ResponseType,
+    /// The previous hop's URL, for the redirect-taint computation
+    /// (<https://fetch.spec.whatwg.org/#concept-request-tainted-origin>).
+    previous_url: Option<Url>,
+    /// Whether the serialized request origin has collapsed to `null` because a
+    /// hop crossed an origin that is neither the previous URL's nor the
+    /// request's own
+    /// (<https://fetch.spec.whatwg.org/#serializing-a-request-origin>).
+    origin_tainted: bool,
+}
+
+/// The response tainting a hop acquires
+/// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>). A
+/// `same-origin` request across an origin boundary is a network error.
+fn hop_taint(
+    cors: Option<&crate::cors::CorsSettings>,
+    url: &Url,
+) -> Result<crate::cors::ResponseType, NetError> {
+    let Some(settings) = cors else {
+        return Ok(crate::cors::ResponseType::Basic);
+    };
+    if settings.origin == url.origin().ascii_serialization() {
+        return Ok(crate::cors::ResponseType::Basic);
+    }
+    match settings.mode {
+        crate::cors::RequestMode::SameOrigin => {
+            Err(NetError::Protocol(ProtocolError::RejectedRequest))
+        }
+        crate::cors::RequestMode::Cors => Ok(crate::cors::ResponseType::Cors),
+        // A cross-origin `no-cors` request must follow redirects; any other
+        // redirect mode is a network error
+        // (<https://fetch.spec.whatwg.org/#main-fetch>).
+        crate::cors::RequestMode::NoCors => {
+            if settings.redirect == crate::cors::RedirectMode::Follow {
+                Ok(crate::cors::ResponseType::Opaque)
+            } else {
+                Err(NetError::Protocol(ProtocolError::RejectedRequest))
+            }
+        }
+    }
+}
+
+/// Whether a credentials mode admits credentials for a hop that is (or is
+/// not) cross-origin
+/// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
+fn credentials_admitted(mode: crate::cors::CredentialsMode, cross_origin: bool) -> bool {
+    match mode {
+        crate::cors::CredentialsMode::Omit => false,
+        crate::cors::CredentialsMode::SameOrigin => !cross_origin,
+        crate::cors::CredentialsMode::Include => true,
+    }
+}
+
+/// The CORS check for a `cors`-tainted response
+/// (<https://fetch.spec.whatwg.org/#cors-check>). Every hop, redirect or
+/// final, must pass it.
+fn cors_gate(
+    response: &Response,
+    cors: Option<&crate::cors::CorsSettings>,
+    response_type: crate::cors::ResponseType,
+    credentials_include: bool,
+    origin_tainted: bool,
+) -> Result<(), NetError> {
+    if response_type != crate::cors::ResponseType::Cors {
+        return Ok(());
+    }
+    let Some(settings) = cors else {
+        return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+    };
+    // The CORS check compares against the byte-serialized origin, which is
+    // `null` once a redirect has tainted the request
+    // (<https://fetch.spec.whatwg.org/#concept-cors-check>).
+    let origin = if origin_tainted {
+        "null"
+    } else {
+        settings.origin.as_str()
+    };
+    if !crate::cors::cors_check(response.headers(), origin, credentials_include) {
+        return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+    }
+    Ok(())
+}
+
+/// Applies the CORS check and the response filtering for one hop
+/// (<https://fetch.spec.whatwg.org/#http-fetch>).
+fn filtered(
+    response: Response,
+    cors: Option<&crate::cors::CorsSettings>,
+    response_type: crate::cors::ResponseType,
+    credentials_include: bool,
+    origin_tainted: bool,
+) -> Result<Response, NetError> {
+    cors_gate(
+        &response,
+        cors,
+        response_type,
+        credentials_include,
+        origin_tainted,
+    )?;
+    Ok(finalize(response, response_type, credentials_include))
+}
+
+/// Applies the response-side CORS rules for one hop, in spec order: the CORS
+/// check, then the redirect handling (the credentials rule, the redirect
+/// mode, and the final filtering)
+/// (<https://fetch.spec.whatwg.org/#http-fetch>,
+/// <https://fetch.spec.whatwg.org/#http-redirect-fetch>).
+fn classify_response(
+    response: Response,
+    current_url: &Url,
+    cors: Option<&crate::cors::CorsSettings>,
+    response_type: crate::cors::ResponseType,
+    credentials_include: bool,
+    origin_tainted: bool,
+) -> Result<HopOutcome, NetError> {
+    cors_gate(
+        &response,
+        cors,
+        response_type,
+        credentials_include,
+        origin_tainted,
+    )?;
+    let Some(location) =
+        followable_location(response.status(), response.headers())?.map(str::to_owned)
+    else {
+        return Ok(HopOutcome::Final(finalize(
+            response,
+            response_type,
+            credentials_include,
+        )));
+    };
+    let next = resolve_location(current_url, &location)?;
+    if let Some(settings) = cors {
+        // A redirect to a URL that includes credentials is a network error
+        // once the request is `cors`-tainted or would cross an origin
+        // (<https://fetch.spec.whatwg.org/#http-redirect-fetch>, steps 9-10).
+        let redirects_with_credentials = !next.username().is_empty() || next.password().is_some();
+        if redirects_with_credentials
+            && (response_type == crate::cors::ResponseType::Cors
+                || (settings.mode == crate::cors::RequestMode::Cors
+                    && settings.origin != next.origin().ascii_serialization()))
+        {
+            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
+        match settings.redirect {
+            crate::cors::RedirectMode::Error => {
+                return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+            }
+            crate::cors::RedirectMode::Manual => {
+                return Ok(HopOutcome::Final(finalize(
+                    response,
+                    crate::cors::ResponseType::OpaqueRedirect,
+                    credentials_include,
+                )));
+            }
+            crate::cors::RedirectMode::Follow => {}
+        }
+    }
+    Ok(HopOutcome::Redirect { next })
+}
+
+/// Applies a response's CORS filtering: `cors` exposes only safelisted and
+/// explicitly exposed headers, and the opaque types expose none
+/// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
+fn finalize(
+    mut response: Response,
+    response_type: crate::cors::ResponseType,
+    credentials_include: bool,
+) -> Response {
+    response.filtering = response_type;
+    match response_type {
+        crate::cors::ResponseType::Cors => {
+            response.headers =
+                crate::cors::exposed_response_headers(&response.headers, credentials_include);
+        }
+        crate::cors::ResponseType::Opaque | crate::cors::ResponseType::OpaqueRedirect => {
+            response.headers = crate::cors::opaque_response_headers();
+        }
+        crate::cors::ResponseType::Basic => {}
+    }
+    response
+}
+
+/// Appends the request `Origin` header, replacing any page-supplied one.
+fn append_origin(headers: &mut HeaderMap, origin: &str) {
+    headers.remove("origin");
+    let _ = headers.insert("Origin", origin.as_bytes());
 }
 
 fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) {
@@ -674,6 +1066,7 @@ pub struct Response {
     headers: HeaderMap,
     final_url: Url,
     body: Body,
+    filtering: crate::cors::ResponseType,
 }
 
 impl Response {
@@ -683,12 +1076,14 @@ impl Response {
         body: hyper::body::Incoming,
         final_url: Url,
         budget: CallBudget,
+        response_type: crate::cors::ResponseType,
     ) -> Self {
         Self {
             status,
             headers,
             final_url,
             body: Body::from_incoming(body, budget),
+            filtering: response_type,
         }
     }
 
@@ -696,6 +1091,13 @@ impl Response {
     #[must_use]
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    /// How the response was filtered: basic, CORS, or opaque
+    /// (<https://fetch.spec.whatwg.org/#concept-response-type>).
+    #[must_use]
+    pub fn response_type(&self) -> crate::cors::ResponseType {
+        self.filtering
     }
 
     /// Response fields, including each `Set-Cookie`.
