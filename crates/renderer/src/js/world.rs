@@ -536,9 +536,10 @@ impl RealmRegistry {
 pub(crate) enum NavigationTarget {
     /// The child frame whose container is this node.
     Container(NodeId),
-    /// The frame that queued the navigation; used by form submission to the
-    /// form's own frame (`_self`, `_top`, `_parent`).
-    SelfFrame,
+    /// The `target` of a link or form: the empty string, a keyword (`_self`,
+    /// `_parent`, `_top`, `_blank`), or a browsing context name. The engine
+    /// applies the rules for choosing a navigable once the script stops.
+    Target(String),
 }
 
 pub(crate) struct FrameNavigation {
@@ -553,6 +554,10 @@ pub(crate) struct FrameNavigation {
     pub(crate) body: Vec<u8>,
     /// `Content-Type` for `body`, when there is one.
     pub(crate) content_type: Option<String>,
+    /// The navigating element's `hyperlink referrer policy`, empty when the
+    /// element has none and the initiator document's policy stays in force
+    /// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
+    pub(crate) referrer_policy: String,
 }
 
 impl FrameNavigation {
@@ -564,7 +569,15 @@ impl FrameNavigation {
             method: "GET".to_owned(),
             body: Vec::new(),
             content_type: None,
+            referrer_policy: String::new(),
         }
+    }
+
+    /// The policy this navigation's referrer is determined under, overriding
+    /// the initiator document's for this navigation alone.
+    pub(crate) fn with_referrer_policy(mut self, policy: String) -> Self {
+        self.referrer_policy = policy;
+        self
     }
 }
 

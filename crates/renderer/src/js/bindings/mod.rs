@@ -1189,9 +1189,14 @@ pub(crate) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
 }
 
 pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
-    let registry = realm_registry(ctx)?;
-    let owner = registry.borrow().owner_world(id);
-    owner.ok_or_else(|| Exception::throw_type(ctx, "stale node"))
+    owning_world(ctx, id).ok_or_else(|| Exception::throw_type(ctx, "stale node"))
+}
+
+/// The world that owns `id`, or `None` when its document is gone. Callers that
+/// must not throw for a node from a dead document use this instead of
+/// [`world_for_node`].
+pub(crate) fn owning_world(ctx: &Ctx<'_>, id: NodeId) -> Option<Rc<RefCell<World>>> {
+    realm_registry(ctx).ok()?.borrow().owner_world(id)
 }
 
 pub(super) fn node_is_shadow_root(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {

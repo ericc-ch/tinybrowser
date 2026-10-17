@@ -1,5 +1,6 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
+use super::node::element;
 use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for_node, wrap_node};
 
 use markup5ever::{LocalName, Namespace, QualName};
@@ -8,7 +9,7 @@ use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 use crate::documents::JournalEntry;
 use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected};
 use crate::js::world::EventTargetKey;
-use crate::js::{FrameNavigation, NavigationTarget};
+use crate::js::{FrameNavigation, NavigationTarget, World};
 
 /// The node-removal focus fixup: when the document's focused area is inside
 /// a removed subtree, clear it without firing events
@@ -463,6 +464,49 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     Ok(())
 }
 
+/// Whether an element cannot navigate
+/// (<https://html.spec.whatwg.org/multipage/links.html#cannot-navigate>): its
+/// node document is not fully active, or — for anything but an `a` element,
+/// which keeps the web-compatible exception — it is not connected. Following a
+/// hyperlink and form submission both start by returning for such an element.
+///
+/// "Fully active" is "the node document is this realm's active document": a
+/// document built by `createDocument()` has no browsing context at all, and a
+/// document its frame has navigated away from is no longer active.
+pub(super) fn cannot_navigate(world: &World, node: NodeId) -> bool {
+    if !world.is_main_document(node) {
+        return true;
+    }
+    let Some(parsed) = world.document(node) else {
+        return true;
+    };
+    let base = &parsed.document.base;
+    let anchor = node_local_name(base, node.node).as_deref() == Some("a");
+    !anchor && !is_connected(base, node.node)
+}
+
+/// The referrer policy a followed hyperlink navigates with
+/// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>):
+/// the `noreferrer` link type wins, otherwise the `referrerpolicy` content
+/// attribute, whose keywords are the referrer policies and whose invalid value
+/// default is the empty string. An empty policy leaves the initiator document's
+/// policy in force.
+fn hyperlink_referrer_policy(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
+    if attr(base, node, "rel")
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("noreferrer"))
+    {
+        return "no-referrer".to_owned();
+    }
+    element::reflect_enum(
+        attr(base, node, "referrerpolicy"),
+        element::REFERRER_POLICY_KEYWORDS,
+        "",
+        "",
+    )
+}
+
 /// The activation behavior of a clicked control: a submit button submits its
 /// form owner with itself as submitter, a reset button resets it, and a
 /// checkbox or radio updates its checkedness
@@ -511,7 +555,10 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         Activation::None => Ok(()),
         Activation::ToggleCheckedness => toggle_checkedness(ctx, node),
         Activation::Link => {
-            let (spec, target) = {
+            if cannot_navigate(&world.borrow(), node) {
+                return Ok(());
+            }
+            let (spec, target, referrer_policy) = {
                 let world = world.borrow();
                 let Some(parsed) = world.document(node) else {
                     return Ok(());
@@ -520,21 +567,20 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 (
                     crate::dom::tree::attr(base, node.node, "href").map(str::to_owned),
                     crate::dom::tree::attr(base, node.node, "target").map(str::to_owned),
+                    hyperlink_referrer_policy(base, node.node),
                 )
             };
             let Some(spec) = spec else {
                 return Ok(());
             };
-            // A named or `_blank` target needs a browsing context this engine
-            // does not create; only the default and `_self` navigate in place.
-            if target
-                .is_some_and(|target| !target.is_empty() && !target.eq_ignore_ascii_case("_self"))
-            {
-                return Ok(());
-            }
-            world
-                .borrow_mut()
-                .queue_frame_navigation(FrameNavigation::get(NavigationTarget::SelfFrame, spec));
+            // Following the hyperlink queues the navigation; the target picks
+            // the navigable at navigation time, so a frame inserted between
+            // the click and the drain is still eligible
+            // (<https://html.spec.whatwg.org/multipage/links.html#following-hyperlinks-2>).
+            let navigation =
+                FrameNavigation::get(NavigationTarget::Target(target.unwrap_or_default()), spec)
+                    .with_referrer_policy(referrer_policy);
+            world.borrow_mut().queue_frame_navigation(navigation);
             Ok(())
         }
         Activation::Submit | Activation::Reset => {

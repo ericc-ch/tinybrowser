@@ -2597,7 +2597,7 @@ pub(super) fn is_element_data(data: &NodeData) -> bool {
 /// the canonical keyword, absence yields the missing default, and anything
 /// else yields the invalid default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-pub(super) fn reflect_enum(
+pub(crate) fn reflect_enum(
     raw: Option<&str>,
     keywords: &[&str],
     missing: &str,
@@ -2987,7 +2987,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
 pub(super) const DIR_KEYWORDS: &[&str] = &["ltr", "rtl", "auto"];
 
 // Shared enumerated keyword tables for content-attribute reflection.
-pub(super) const REFERRER_POLICY_KEYWORDS: &[&str] = &[
+pub(crate) const REFERRER_POLICY_KEYWORDS: &[&str] = &[
     "",
     "no-referrer",
     "no-referrer-when-downgrade",

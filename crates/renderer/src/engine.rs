@@ -108,7 +108,9 @@ impl Engine {
                     .get(&parent)
                     .and_then(|document| document.frame_src(container));
                 if let Some(src) = src {
-                    self.navigate_frame(child, container, &src, "GET", &[], None);
+                    let navigation =
+                        FrameNavigation::get(NavigationTarget::Container(container), src);
+                    self.navigate_frame(child, parent, &navigation);
                 }
                 if let Some(document) = self.frames.get_mut(&parent) {
                     document.mark_frame_load_pending(container);
@@ -700,45 +702,69 @@ impl Engine {
         }
     }
 
-    /// Navigates a child frame to one URL, resolving it against the parent
-    /// document and dispatching on its scheme
+    /// Navigates `child` to one URL, resolving a relative URL against the
+    /// document that queued the navigation and dispatching on its scheme
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
-    fn navigate_frame(
-        &mut self,
-        child: FrameId,
-        container: crate::dom::tree::NodeId,
-        spec: &str,
-        method: &str,
-        body: &[u8],
-        content_type: Option<&str>,
-    ) {
-        let parent = self
-            .runtime
-            .shared
-            .borrow()
-            .tree
-            .parent(child)
-            .unwrap_or(child);
-        let resolved = (!spec.is_empty())
+    ///
+    /// The embedder is read from the tree: it is the initiator for every
+    /// navigation a fresh `iframe` starts, and only a link that targets another
+    /// navigable splits the two.
+    fn navigate_frame(&mut self, child: FrameId, initiator: FrameId, navigation: &FrameNavigation) {
+        let (embedder, container) = {
+            let shared = self.runtime.shared.borrow();
+            (shared.tree.parent(child), shared.tree.container(child))
+        };
+        // An empty `src` is a container with no URL to load; it keeps its
+        // `about:blank`. Every other navigation resolves an empty string
+        // against the initiator document, which is that document's own URL
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#parse-a-url>),
+        // so a link or form that names no URL reloads its document instead of
+        // blanking it.
+        let blank = navigation.spec.is_empty()
+            && matches!(navigation.target, NavigationTarget::Container(_));
+        let resolved = (!blank)
             .then(|| {
                 self.frames
-                    .get(&parent)
-                    .and_then(|document| document.resolve_frame_url(spec))
+                    .get(&initiator)
+                    .and_then(|document| document.resolve_frame_url(&navigation.spec))
             })
             .flatten();
         let Some(url) = resolved else {
-            // About:blank, the initial document of every frame without a
-            // usable `src`, inherits the parent's captured origin
-            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
-            // A frame the engine just created is already on that document;
-            // reloading it would throw away its realm and anything a script
-            // has already set on it.
-            self.keep_initial_blank(child, parent);
-            self.mark_frame_load_pending(container, parent);
+            if blank {
+                // About:blank, the initial document of every frame without a
+                // usable `src`, inherits the initiator's captured origin
+                // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+                // A frame the engine just created is already on that document;
+                // reloading it would throw away its realm and anything a script
+                // has already set on it.
+                self.keep_initial_blank(child, initiator);
+            }
+            if let (Some(embedder), Some(container)) = (embedder, container) {
+                self.mark_frame_load_pending(container, embedder);
+            }
             return;
         };
-        self.load_frame_url(child, url, parent, method, body, content_type);
-        self.mark_frame_load_pending(container, parent);
+        self.load_frame_url(child, url, initiator, navigation);
+        if let (Some(embedder), Some(container)) = (embedder, container) {
+            self.mark_frame_load_pending(container, embedder);
+        }
+    }
+
+    /// The referrer a navigation sends: the navigating element's policy when it
+    /// names one, the initiator document's otherwise
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>,
+    /// <https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
+    fn navigation_referrer(&self, initiator: FrameId, policy: &str, url: &Url) -> Option<String> {
+        self.frames.get(&initiator).and_then(|document| {
+            let world = document.world();
+            let world = world.borrow();
+            let policy = if policy.is_empty() {
+                world.referrer_policy.as_str()
+            } else {
+                policy
+            };
+            crate::js::referrer_for_policy(policy, &world.document_url, url.as_str())
+        })
     }
 
     /// The policy a local-scheme document inherits from its initiator
@@ -883,10 +909,8 @@ impl Engine {
         &mut self,
         child: FrameId,
         url: Url,
-        parent: FrameId,
-        method: &str,
-        body: &[u8],
-        content_type: Option<&str>,
+        initiator: FrameId,
+        navigation: &FrameNavigation,
     ) {
         // Nested navigations are `frame-src` on the embedder. A same-document
         // navigation is not, and `about:` stays allowed: blocking it would
@@ -910,14 +934,14 @@ impl Engine {
             })
             .flatten();
         match url.scheme() {
-            "about" => self.keep_initial_blank(child, parent),
-            "data" => self.load_data_frame(child, parent, &url),
+            "about" => self.keep_initial_blank(child, initiator),
+            "data" => self.load_data_frame(child, initiator, &url),
             "javascript" => {
                 // Navigate to a javascript: URL returns when the initiator
                 // is not same origin-domain with the target's active
                 // document
                 // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url>).
-                let same_origin = match (self.frames.get(&parent), self.frames.get(&child)) {
+                let same_origin = match (self.frames.get(&initiator), self.frames.get(&child)) {
                     (Some(source), Some(target)) => {
                         source.world().borrow().origin == target.world().borrow().origin
                     }
@@ -941,7 +965,7 @@ impl Engine {
                 // (<https://w3c.github.io/webappsec-csp/#should-block-navigation-request>).
                 let policy = self
                     .frames
-                    .get(&parent)
+                    .get(&initiator)
                     .map(|document| document.world().borrow().csp.clone())
                     .unwrap_or_default();
                 if let Some(document) = self.frames.get_mut(&child) {
@@ -954,11 +978,13 @@ impl Engine {
                     }
                 }
             }
-            "blob" => self.load_blob_frame(child, parent, &url),
+            "blob" => self.load_blob_frame(child, initiator, &url),
             "http" | "https" => {
-                let initiator = self
+                // The document the navigation started from, which supplies the
+                // request's initiator.
+                let source = self
                     .frames
-                    .get(&parent)
+                    .get(&initiator)
                     .and_then(|document| Url::parse(document.document_url()).ok())
                     .unwrap_or_else(|| url.clone());
                 // Top-level navigations send the source document's referrer
@@ -966,15 +992,8 @@ impl Engine {
                 // navigation is a no-referrer navigation regardless of
                 // policy
                 // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-                let referrer = self.frames.get(&parent).and_then(|document| {
-                    let world = document.world();
-                    let world = world.borrow();
-                    crate::js::referrer_for_policy(
-                        &world.referrer_policy,
-                        &world.document_url,
-                        url.as_str(),
-                    )
-                });
+                let referrer =
+                    self.navigation_referrer(initiator, &navigation.referrer_policy, &url);
                 // Ancestor document URLs nearest-first for the child's
                 // `frame-ancestors` check at commit
                 // (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
@@ -986,10 +1005,10 @@ impl Engine {
                 if let Some(document) = self.frames.get_mut(&child) {
                     document.navigate_to(
                         url,
-                        initiator,
-                        method.to_owned(),
-                        body.to_vec(),
-                        content_type.map(str::to_owned),
+                        source,
+                        navigation.method.clone(),
+                        navigation.body.clone(),
+                        navigation.content_type.clone(),
                         referrer,
                     );
                     if let (Some(embedder), Some(gate)) = (embedder, frame_gate) {
@@ -1001,7 +1020,7 @@ impl Engine {
                 if let Some(document) = self.frames.get_mut(&child) {
                     document.load_about_blank(None, None);
                 }
-                self.inherit_policy(child, parent);
+                self.inherit_policy(child, initiator);
             }
         }
     }
@@ -1075,44 +1094,25 @@ impl Engine {
     }
 
     fn apply_navigations(&mut self, navigations: Vec<(FrameId, FrameNavigation)>) {
-        for (
-            frame,
-            FrameNavigation {
-                target,
-                spec,
-                method,
-                body,
-                content_type,
-            },
-        ) in navigations
-        {
-            match target {
-                NavigationTarget::Container(container) => {
-                    let Some(child) = self
-                        .runtime
-                        .shared
-                        .borrow()
-                        .tree
-                        .frame_for_container(container)
-                    else {
-                        continue;
-                    };
-                    self.navigate_frame(
-                        child,
-                        container,
-                        &spec,
-                        &method,
-                        &body,
-                        content_type.as_deref(),
-                    );
-                    self.publish_frame_document(container, child);
+        for (initiator, navigation) in navigations {
+            let chosen = {
+                let shared = self.runtime.shared.borrow();
+                let tree = &shared.tree;
+                match &navigation.target {
+                    NavigationTarget::Container(container) => tree
+                        .frame_for_container(*container)
+                        .map(|frame| (frame, Some(*container))),
+                    NavigationTarget::Target(target) => tree
+                        .choose_navigable(target, initiator)
+                        .map(|frame| (frame, tree.container(frame))),
                 }
-                NavigationTarget::SelfFrame => {
-                    let Ok(url) = Url::parse(&spec) else {
-                        continue;
-                    };
-                    self.load_frame_url(frame, url, frame, &method, &body, content_type.as_deref());
-                }
+            };
+            let Some((chosen, container)) = chosen else {
+                continue;
+            };
+            self.navigate_frame(chosen, initiator, &navigation);
+            if let Some(container) = container {
+                self.publish_frame_document(container, chosen);
             }
         }
     }
