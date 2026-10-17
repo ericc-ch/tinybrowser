@@ -13,9 +13,11 @@ Paths and our flags first; literal -- starts upstream flags.
 
 Tight loop: --score prints per-directory buckets; --save-report keeps
 the wptreport; rerun feeds attention-tests back (TIMEOUTs excluded
-unless --include-timeout); --dry-run lists the selection. profile ranks
-tests by wall time with --report, or runs a path and prints the
-browser's navigation/request timeline.
+unless --include-timeout); --dry-run lists the selection. tools/wpt/profile
+ranks tests by wall time with --report, or runs a path and prints the
+browser's navigation/request timeline. Each shim only finds a Python
+before the venv exists; run and profile are separate entry points because
+`run` owns its own grammar.
 
 A conformance change is a failure-list diff: failures extracts the
 canonical list, baseline runs both sides in a detached worktree (exit 1
