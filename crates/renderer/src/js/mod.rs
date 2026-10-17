@@ -54,7 +54,7 @@ const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(20);
 /// Wall-clock cap for one renderer turn: a parser script walk, a batch of
 /// init scripts, or one drain of ready tasks from the session's inbox wait
-/// back to the next wait. Each JS entry still uses [`DEFAULT_SCRIPT_BUDGET`],
+/// back to the next wait. Each JS entry still uses `DEFAULT_SCRIPT_BUDGET`,
 /// then clamps to this deadline so N serial runaways stay well under the 60 s
 /// request timeout in `crates/browser/src/link.rs`.
 pub const TURN_SCRIPT_BUDGET: Duration = Duration::from_secs(45);

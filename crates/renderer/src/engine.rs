@@ -1331,7 +1331,7 @@ pub fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
 /// Room for `data:` plus a MIME type before the comma.
 ///
 /// A percent-encoded payload uses three characters per body byte (`%XX`).
-/// The raw ceiling is three times [`MAX_RESPONSE_BODY_BYTES`] plus this
+/// The raw ceiling is three times [`crate::MAX_RESPONSE_BODY_BYTES`] plus this
 /// allowance, so a body that fits the cap is not rejected for its encoding.
 const DATA_URL_PREFIX_ALLOWANCE: usize = 1024;
 
@@ -1340,7 +1340,7 @@ const DATA_URL_PREFIX_ALLOWANCE: usize = 1024;
 /// The raw-length check runs before decode. A `data:` URL is materialized
 /// entirely in this process. Percent-encoding is the long form: one body
 /// byte is `%XX`. Base64 is shorter (~4/3). The raw ceiling is three times
-/// [`MAX_RESPONSE_BODY_BYTES`] plus [`DATA_URL_PREFIX_ALLOWANCE`]. The
+/// [`crate::MAX_RESPONSE_BODY_BYTES`] plus `DATA_URL_PREFIX_ALLOWANCE`. The
 /// decoded body is then held to the cap. `None` means the raw URL is past
 /// the ceiling, the URL is not decodable, or the body is past the cap.
 ///
