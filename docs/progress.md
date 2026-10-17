@@ -4,22 +4,22 @@
 
 ## WPT
 
-CI 2026-10-15 run 38732775601 (wpt.yml, 20 chunks), --exclude=worker
+CI 2026-10-17 run 39014390263 (wpt.yml, 20 chunks), --exclude=worker
 testharness+crashtest+reftest+test262
 
-pass 63197
+pass 64073
 expfail 31
-unexp 45799
-timeout 5914
-crash 2
-error 3981
+unexp 45324
+timeout 5518
+crash 0
+error 3978
 skip 78
 tests 119002
 
 per type (pass / tests)
-testharness 5144 / 34819 = 14.8%
+testharness 5698 / 34819 = 16.4%
 crashtest 1879 / 2031 = 92.5%
-reftest 13378 / 28492 = 47.0%
-test262 42796 / 53660 = 79.8%
+reftest 13371 / 28492 = 46.9%
+test262 43125 / 53660 = 80.4%
 
-Total 53.1% = pass / (tests - skip)
+Total 53.9% = pass / (tests - skip)
