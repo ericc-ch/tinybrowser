@@ -183,12 +183,12 @@ jobs:
         # streaming raw log already holds everything the chunk finished.
         timeout-minutes: 135
         env:
-          TINYBROWSER_BINARY: ${{ github.workspace }}/tinybrowser-wpt
+          BINARY: ${{ github.workspace }}/tinybrowser-wpt
           REPORT: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.json
           RAW: ${{ github.workspace }}/wpt-report-${{ matrix.chunk }}.raw.log
         run: |
           set -euo pipefail
-          chmod +x "$TINYBROWSER_BINARY"
+          chmod +x "$BINARY"
           excludes=()
           for value in $WPT_EXCLUDE; do excludes+=("--exclude=$value"); done
           types=()
@@ -197,7 +197,7 @@ jobs:
             echo "::error::test-types is empty; nothing would run"
             exit 1
           fi
-          ./tools/wpt/run -- \
+          ./tools/wpt/run --binary "$BINARY" -- \
             --log-wptreport "$REPORT" \
             --log-raw "$RAW" \
             --no-fail-on-unexpected \

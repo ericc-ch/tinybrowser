@@ -175,6 +175,11 @@ class TinyBrowser(WebDriverBrowser):
         self.env["XDG_DATA_HOME"] = data
 
     def _remove_profile(self):
+        """Drops the throwaway profile.
+
+        The run's log is wherever `--log-file` put it, which the harness picks,
+        so nothing here has to survive teardown.
+        """
         root = self._profile_root
         self._profile_root = None
         if root is not None:

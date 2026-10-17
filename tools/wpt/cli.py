@@ -7,6 +7,7 @@ scheduling, driving, and reporting. This file owns the phases around it:
 * `score`  — run a set, then print one row per directory + attention list.
 * `rerun`  — re-run only the attention set from a saved wptreport.
 * `merge`  — fold the chunk reports of a CI run into one score.
+* `profile` — run tests (or read one report) and rank them by wall time.
 * `manifest` — one manifest walk for a chunked CI run (build job).
 * `overnight` — full-suite run + score (needs explicit approval per AGENTS.md).
 
@@ -20,7 +21,10 @@ Grammar (all subcommands): test paths and our flags come first; a literal
 `--` starts verbatim upstream flags. For convenience an upstream flag before
 `--` implicitly starts the verbatim region, so
 `run dom/nodes/ --exclude=worker` works as well as
-`run dom/nodes/ -- --exclude=worker`.
+`run dom/nodes/ -- --exclude=worker`. The harness flags listed by `--help`
+are recognized in any subcommand before `--`, and a command re-passes them
+to whatever process it spawns, so a run has one configuration and no state
+in the environment.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ import tempfile
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -166,11 +171,125 @@ def opt_value(args: list[str], option: str) -> str | None:
     return None
 
 
+# --- harness options (every knob is a flag; no harness setting comes from the environment) ---
+
+
+@dataclass(frozen=True)
+class Options:
+    """Harness configuration, resolved from argv once at the entry point.
+
+    A subcommand and any process it spawns agree by construction: the parent
+    re-creates the configuration as flags on the child's argv, so no value has
+    to travel through the environment.
+    """
+
+    binary: str | None = None
+    wpt_root: str | None = None
+    venv: str | None = None
+    durations: str | None = None
+    log_level: str | None = None
+    log_file: str | None = None
+    allow_pin_mismatch: bool = False
+    no_lock: bool = False
+    lock_timeout: int | None = None
+
+    def flags(self) -> list[str]:
+        """This configuration as the flags that reproduce it."""
+        out: list[str] = []
+        for name, value in (
+            ("--binary", self.binary),
+            ("--wpt-root", self.wpt_root),
+            ("--venv", self.venv),
+            ("--log-level", self.log_level),
+            ("--log-file", self.log_file),
+        ):
+            if value is not None:
+                out += [name, value]
+        if self.durations is not None:
+            out.append(f"--durations={self.durations}")
+        if self.allow_pin_mismatch:
+            out.append("--allow-pin-mismatch")
+        if self.no_lock:
+            out.append("--no-lock")
+        if self.lock_timeout is not None:
+            out += ["--lock-timeout", str(self.lock_timeout)]
+        return out
+
+
+# flag -> (Options field, kind). `value` takes the next argv item and rejects an
+# empty one, `value_or_empty` also accepts the bare `--flag=` form (the empty
+# `--durations=` disables the longest-first split), `int` a non-negative whole
+# number, `switch` is bare.
+HARNESS_FLAGS: dict[str, tuple[str, str]] = {
+    "--binary": ("binary", "value"),
+    "--wpt-root": ("wpt_root", "value"),
+    "--venv": ("venv", "value"),
+    "--durations": ("durations", "value_or_empty"),
+    "--log-level": ("log_level", "value"),
+    "--log-file": ("log_file", "value"),
+    "--lock-timeout": ("lock_timeout", "int"),
+    "--allow-pin-mismatch": ("allow_pin_mismatch", "switch"),
+    "--no-lock": ("no_lock", "switch"),
+}
+
+
+def extract_options(argv: list[str]) -> tuple[Options, list[str], str | None]:
+    """Splits the harness flags out of argv, leaving the subcommand grammar.
+
+    Stops at a literal `--` so upstream flags (`run -- --binary x`) are never
+    mistaken for ours.
+    """
+    values: dict[str, Any] = {}
+    rest: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            rest.extend(argv[index:])
+            break
+        name = arg.split("=", 1)[0]
+        entry = HARNESS_FLAGS.get(name)
+        if entry is None:
+            rest.append(arg)
+            index += 1
+            continue
+        field, kind = entry
+        if "=" in arg:
+            value = arg.split("=", 1)[1]
+        elif kind == "switch":
+            value = ""
+        else:
+            # A harness value never starts with `-`, so refusing one keeps
+            # `--binary --log-level=trace` from eating the next flag.
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                return Options(), [], f"{name} needs a value"
+            value = argv[index + 1]
+            index += 1
+        if kind == "switch":
+            if value:
+                return Options(), [], f"{name} takes no value"
+            values[field] = True
+        elif kind == "int":
+            try:
+                number = int(value)
+            except ValueError:
+                return Options(), [], f"{name} needs a whole number"
+            if number < 0:
+                return Options(), [], f"{name} needs a non-negative number"
+            values[field] = number
+        elif kind == "value" and not value:
+            return Options(), [], f"{name} needs a value"
+        else:
+            values[field] = value
+        index += 1
+    return Options(**values), rest, None
+
+
 # --- WPT checkout ---
 
 
-def resolve_wpt_root() -> Path:
-    override = os.environ.get("TINYBROWSER_WPT_ROOT")
+def resolve_wpt_root(options: Options) -> Path:
+    override = options.wpt_root
     if override:
         return Path(override)
     local = ROOT / "third_party" / "wpt"
@@ -186,18 +305,18 @@ def resolve_wpt_root() -> Path:
     return base / "third_party" / "wpt"
 
 
-def check_pin(wpt: Path) -> int:
+def check_pin(wpt: Path, options: Options) -> int:
     pinned = git(["rev-parse", "HEAD:third_party/wpt"])
     actual = git(["rev-parse", "HEAD"], cwd=wpt)
-    allow = os.environ.get("TINYBROWSER_WPT_ALLOW_PIN_MISMATCH", "0") == "1"
+    allow = options.allow_pin_mismatch
     if pinned and not allow:
         if not actual:
             eprint(f"cannot read the WPT revision at {wpt}; it is not a git checkout")
-            eprint("Set TINYBROWSER_WPT_ALLOW_PIN_MISMATCH=1 to run it anyway.")
+            eprint("Pass --allow-pin-mismatch to run it anyway.")
             return 1
         if pinned != actual:
             eprint(f"WPT checkout at {wpt} is {actual}; this worktree pins {pinned}")
-            eprint("Update the checkout, or set TINYBROWSER_WPT_ALLOW_PIN_MISMATCH=1.")
+            eprint("Update the checkout, or pass --allow-pin-mismatch.")
             return 1
     elif pinned and pinned != (actual or ""):
         eprint(
@@ -208,9 +327,12 @@ def check_pin(wpt: Path) -> int:
 
 # --- locks (shared venv + shared manifest) ---
 
+# Seconds to wait for a shared venv/manifest lock when `--lock-timeout` is absent.
+LOCK_TIMEOUT_S = 1800
 
-def acquire_lock(name: str, what: str | None = None, timeout_s: int = 1800):
-    if os.environ.get("TINYBROWSER_WPT_NO_LOCK", "0") == "1":
+
+def acquire_lock(name: str, options: Options, what: str | None = None):
+    if options.no_lock:
         return None
     path = cache_dir() / name
     handle = open(path, "a+b")
@@ -219,13 +341,9 @@ def acquire_lock(name: str, what: str | None = None, timeout_s: int = 1800):
         return handle
     except BlockingIOError:
         pass
-    raw = os.environ.get("TINYBROWSER_WPT_LOCK_TIMEOUT", "")
-    try:
-        timeout_s = int(raw) if raw else timeout_s
-    except ValueError:
-        timeout_s = 1800
-    if timeout_s < 0:
-        timeout_s = 1800
+    timeout_s = options.lock_timeout
+    if timeout_s is None:
+        timeout_s = LOCK_TIMEOUT_S
     eprint(f"another WPT run holds {path}; waiting")
     deadline = time.monotonic() + timeout_s
     while True:
@@ -289,16 +407,14 @@ def venv_is_current(wpt: Path, venv: Path) -> bool:
         return False
 
 
-def install_venv(wpt: Path, venv: Path) -> None:
+def install_venv(wpt: Path, venv: Path, options: Options) -> None:
     if shutil.which("uv") is None:
         eprint("uv is required to bootstrap the WPT virtualenv")
         raise SystemExit(1)
     exe = venv_python(venv)
     if not (exe.is_file() and os.access(exe, os.X_OK)):
-        if os.environ.get("TINYBROWSER_WPT_VENV"):
-            eprint(
-                f"WPT virtualenv not found at {venv}; TINYBROWSER_WPT_VENV must name one"
-            )
+        if options.venv:
+            eprint(f"WPT virtualenv not found at {venv}; --venv must name one")
             raise SystemExit(1)
         subprocess.run(
             ["uv", "venv", "--seed", str(venv), "--python", "3.12"], check=True
@@ -328,17 +444,17 @@ def install_venv(wpt: Path, venv: Path) -> None:
     (venv / ".tinybrowser-wpt-stamp").write_text(venv_stamp_payload(wpt, venv) + "\n")
 
 
-def ensure_venv(wpt: Path, venv: Path) -> None:
+def ensure_venv(wpt: Path, venv: Path, options: Options) -> None:
     if venv_is_current(wpt, venv):
         eprint("wpt: venv is current, skipping install")
         return
-    lock = acquire_lock(f"wpt-{sha16(str(venv.resolve()))}.lock")
+    lock = acquire_lock(f"wpt-{sha16(str(venv.resolve()))}.lock", options)
     try:
         if venv_is_current(wpt, venv):
             eprint("wpt: venv is current, skipping install")
         else:
             eprint("wpt: installing WPT virtualenv")
-            install_venv(wpt, venv)
+            install_venv(wpt, venv, options)
     finally:
         release_lock(lock)
 
@@ -1020,17 +1136,176 @@ def merge_main(argv: list[str]) -> int:
     return code
 
 
+# --- `profile` (wall-time census over a report or a live run) ---
+
+
+# A passing test above this many ms is close to the normal budget's cliff.
+NEAR_BUDGET_MS = 2500
+
+# Browser-timeline records shown per profiled run.
+TIMELINE_LINES = 40
+
+
+def profile_report(report: Path, top: int) -> int:
+    """Ranks one wptreport by wall time: killed tests first, then the near."""
+    try:
+        data = json.loads(report.read_text())
+    except OSError as error:
+        eprint(f"cannot read report {report}: {error}")
+        return 1
+    except json.JSONDecodeError as error:
+        eprint(
+            f"report {report} is not valid JSON ({error}); the runner probably failed before writing results"
+        )
+        return 1
+    results = [r for r in data.get("results", []) if r.get("test")]
+    if not results:
+        eprint(f"no results in report {report}")
+        return 1
+    ranked = sorted(results, key=lambda r: -(r.get("duration") or 0))
+    killed = [r for r in results if r.get("status") in HARD_STATUSES]
+    near = [
+        r
+        for r in results
+        if r.get("status") not in HARD_STATUSES
+        and (r.get("duration") or 0) >= NEAR_BUDGET_MS
+    ]
+    total_s = sum(r.get("duration") or 0 for r in results) / 1000
+    print(
+        f"{len(results)} results, {total_s:.1f}s total, {len(killed)} killed, "
+        f"{len(near)} passing within {NEAR_BUDGET_MS}ms of the budget"
+    )
+    print()
+    test_width = max((len(r["test"]) for r in ranked[:top]), default=0)
+    print(f"{'wall'.rjust(9)}  {'status'.ljust(8)}  test")
+    print("-" * (11 + 8 + test_width))
+    for result in ranked[:top]:
+        duration = result.get("duration") or 0
+        status = str(result.get("status", "?"))
+        print(f"{duration:7.0f}ms  {status[:8].ljust(8)}  {result['test']}")
+    return 0
+
+
+def print_timeline(log: Path) -> None:
+    """Prints the browser's navigation and request records from one kept log."""
+    try:
+        lines = log.read_text(errors="replace").splitlines()
+    except OSError as error:
+        eprint(f"cannot read browser log {log}: {error}")
+        return
+    records = [line for line in lines if "browser::net" in line]
+    print()
+    print(f"timeline ({log}), last {TIMELINE_LINES} records:")
+    for line in records[-TIMELINE_LINES:]:
+        print(f"  {line}")
+
+
+def profile_run(options: Options, paths: list[str], extra: list[str], top: int) -> int:
+    """Runs tests at trace with the browser log at a path it picks, then ranks them.
+
+    A run's own profile is thrown away at teardown, so `profile` gives the
+    browser its own temp log instead; the caller just asks for a profile.
+    """
+    handle, name = tempfile.mkstemp(prefix="wpt-profile-", suffix=".json")
+    os.close(handle)
+    report = Path(name)
+    handle, name = tempfile.mkstemp(prefix="wpt-profile-", suffix=".log")
+    os.close(handle)
+    log = Path(name)
+    profiled = replace(options, log_level="trace", log_file=str(log))
+    command = [
+        sys.executable,
+        str(CLI),
+        "run",
+        *paths,
+        *profiled.flags(),
+        "--log-wptreport",
+        str(report),
+        "--no-fail-on-unexpected",
+        *extra,
+    ]
+    eprint(f"$ {shlex.join(command)}")
+    proc = subprocess.run(
+        command,
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    out = proc.stdout.decode(errors="replace")
+    stderr = proc.stderr.decode(errors="replace")
+    sys.stderr.write(out)
+    sys.stderr.write(stderr)
+    if proc.returncode != 0:
+        eprint(f"runner exited {proc.returncode}")
+    eprint(f"profile: browser log {log}")
+    if log.is_file():
+        print_timeline(log)
+    code = profile_report(report, top)
+    try:
+        os.unlink(report)
+    except OSError:
+        pass
+    return code
+
+
+def profile_main(options: Options, argv: list[str]) -> int:
+    usage = "profile PATH... [--top N] | profile --report FILE [--top N]"
+    paths: list[str] = []
+    extra: list[str] = []
+    report: Path | None = None
+    top = MAX_LISTED
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            extra = argv[index + 1 :]
+            break
+        if arg.startswith("--report=") or arg.startswith("--top="):
+            flag, value = arg.split("=", 1)
+        elif arg in ("--report", "--top"):
+            if index + 1 >= len(argv):
+                return die("profile", f"{arg} needs a value", 2)
+            flag, value = arg, argv[index + 1]
+            index += 1
+        elif arg.startswith("-"):
+            # A flag that is not ours opens the runner's verbatim region,
+            # matching the `run` grammar.
+            extra = argv[index:]
+            break
+        else:
+            paths.append(arg)
+            index += 1
+            continue
+        if flag == "--top":
+            try:
+                top = int(value)
+            except ValueError:
+                return die("profile", f"--top needs an integer, got {value!r}", 2)
+            if top < 1:
+                return die("profile", f"--top needs a positive integer, got {top}", 2)
+        else:
+            report = Path(value)
+        index += 1
+    if report is not None and paths:
+        return die("profile", f"give paths or --report, not both; usage: {usage}", 2)
+    if report is not None:
+        return profile_report(report, top)
+    if not paths:
+        return die("profile", usage, 2)
+    return profile_run(options, paths, extra, top)
+
+
 # --- longest-first split (durations from earlier runs) ---
 
 
-def durations_source() -> Path | None:
+def durations_source(options: Options) -> Path | None:
     """The wptreport-shaped file whose per-test durations drive the split.
 
-    `TINYBROWSER_WPT_DURATIONS` names one (any `--log-wptreport` output);
-    set to empty it disables the split. Unset, it is the cache every run
-    refreshes, so the second run of a slice is already balanced.
+    `--durations` names one (any `--log-wptreport` output); `--durations=`
+    (empty) disables the split. Absent, it is the cache every run refreshes,
+    so the second run of a slice is already balanced.
     """
-    override = os.environ.get("TINYBROWSER_WPT_DURATIONS")
+    override = options.durations
     if override is not None:
         return Path(override) if override else None
     return cache_dir() / "wpt-durations.json"
@@ -1249,12 +1524,12 @@ def patch_wpt(
     testloader.SingleTestSource: type[testloader.SingleTestSource] = LongestFirstSource
 
 
-def inner_main(argv: list[str]) -> int:
+def inner_main(options: Options, argv: list[str]) -> int:
     """Runs under the venv python: patch upstream, then `wpt run`."""
-    wpt_root = Path(
-        os.environ.get("TINYBROWSER_WPT_ROOT") or ROOT / "third_party" / "wpt"
-    )
-    source = durations_source()
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    wpt_root = resolve_wpt_root(options)
+    source = durations_source(options)
     recorder = DurationRecorder()
     patch_wpt(wpt_root, read_durations(source) if source else {}, recorder)
     from tools.wpt import wpt
@@ -1270,11 +1545,11 @@ def inner_main(argv: list[str]) -> int:
 # --- `run` (setup, then exec or spawn the venv python) ---
 
 
-def build_binary() -> Path:
-    override = os.environ.get("TINYBROWSER_BINARY")
+def build_binary(options: Options) -> Path:
+    override = options.binary
     if override:
         eprint(
-            f"wpt: using prebuilt TINYBROWSER_BINARY without a freshness check: {override}"
+            f"wpt: using the --binary override without a freshness check: {override}"
         )
         return Path(override)
     out = subprocess.run(
@@ -1360,6 +1635,19 @@ def check_type_drift(exe: Path) -> None:
         )
 
 
+def inner_flags(wpt: Path, options: Options) -> list[str]:
+    """Flags for the `_inner` child: only what it cannot derive itself.
+
+    The child re-resolves the default durations cache identically, so only a
+    caller-supplied value has to travel. The checkout is always passed: the
+    parent did the worktree lookup, and the child must see the same tree.
+    """
+    out = ["--wpt-root", str(wpt)]
+    if options.durations is not None:
+        out.append(f"--durations={options.durations}")
+    return out
+
+
 def run_wpt(
     wpt: Path,
     venv: Path,
@@ -1368,12 +1656,31 @@ def run_wpt(
     final_args: list[str],
     manifest: Path,
     record: int,
+    options: Options,
 ) -> int:
-    inner_argv = ["--binary", str(binary), "tinybrowser", *final_args]
+    # wpt's `--binary-arg` is the only channel that carries an argument into
+    # the product's command line, and the browser owns both of these.
+    wpt_args = list(final_args)
+    for flag, value in (
+        ("log-level", options.log_level),
+        ("log-file", options.log_file),
+    ):
+        if value:
+            wpt_args.append(f"--binary-arg=--{flag}={value}")
+    # Everything for the harness goes before `--`; wpt's own `--binary` and the
+    # user's upstream flags stay after it, untouched.
+    inner_argv = [
+        *inner_flags(wpt, options),
+        "--",
+        "--binary",
+        str(binary),
+        "tinybrowser",
+        *wpt_args,
+    ]
     manifest_lock = None
     if not has_option_exact("--no-manifest-update", final_args):
         lock_name = f"wpt-manifest-{sha16(str(manifest.resolve()))}.lock"
-        manifest_lock = acquire_lock(lock_name, what=f"manifest {manifest}")
+        manifest_lock = acquire_lock(lock_name, options, what=f"manifest {manifest}")
     manifest_locked = manifest_lock is not None
     venv_lock = None
     if (
@@ -1383,7 +1690,9 @@ def run_wpt(
         or has_option("--install-fonts", final_args)
     ):
         venv_lock = acquire_lock(
-            f"wpt-{sha16(str(venv.resolve()))}.lock", what=f"venv {venv}"
+            f"wpt-{sha16(str(venv.resolve()))}.lock",
+            options,
+            what=f"venv {venv}",
         )
 
     for i, arg in enumerate(final_args):
@@ -1461,16 +1770,16 @@ def run_wpt(
     return status
 
 
-def run_main(argv: list[str]) -> int:
+def run_main(options: Options, argv: list[str]) -> int:
     paths, score, dry_run, extras, error = split_run_argv(argv)
     if error:
         return die("run", error, 2)
     if score:
         if dry_run:
             extras = ["--dry-run", *extras]
-        return score_main([*paths, *extras])
+        return score_main(options, [*paths, *extras])
     if dry_run:
-        wpt = resolve_wpt_root()
+        wpt = resolve_wpt_root(options)
         final = finalize_run_args(wpt, extras)
         paths, final, error = hoist_paths_after_test_types(paths, final)
         if error:
@@ -1480,29 +1789,28 @@ def run_main(argv: list[str]) -> int:
         )
         return 0
 
-    wpt = resolve_wpt_root()
+    wpt = resolve_wpt_root(options)
     if not (wpt / "wpt").is_file():
         eprint(f"WPT checkout not found at {wpt}")
         eprint("Initialize it with: git submodule update --init third_party/wpt")
-        eprint("or point TINYBROWSER_WPT_ROOT at an initialized checkout.")
+        eprint("or pass --wpt-root with an initialized checkout.")
         return 1
     wpt = Path(os.path.realpath(wpt))
-    os.environ["TINYBROWSER_WPT_ROOT"] = str(wpt)
-    if check_pin(wpt) != 0:
+    if check_pin(wpt, options) != 0:
         return 1
 
     os.chdir(ROOT)
-    binary = build_binary()
+    binary = build_binary(options)
     if not (binary.is_file() and os.access(binary, os.X_OK)):
         return die("run", f"tinybrowser binary not found at {binary}")
     binary = Path(os.path.realpath(binary))
     os.chdir(wpt)
 
-    venv = Path(os.environ.get("TINYBROWSER_WPT_VENV") or wpt / "_venv3")
+    venv = Path(options.venv) if options.venv else wpt / "_venv3"
     eprint(f"wpt: {wpt}")
     eprint(f"venv: {venv}")
     eprint(f"binary: {binary}")
-    ensure_venv(wpt, venv)
+    ensure_venv(wpt, venv, options)
     exe = venv_python(venv)
 
     final = finalize_run_args(wpt, extras)
@@ -1522,13 +1830,13 @@ def run_main(argv: list[str]) -> int:
     paths, final, error = hoist_paths_after_test_types(paths, final)
     if error:
         return die("run", error, 2)
-    return run_wpt(wpt, venv, exe, binary, [*paths, *final], manifest, record)
+    return run_wpt(wpt, venv, exe, binary, [*paths, *final], manifest, record, options)
 
 
 # --- `manifest` (one walk for a whole chunked CI run) ---
 
 
-def manifest_main(argv: list[str]) -> int:
+def manifest_main(options: Options, argv: list[str]) -> int:
     """`manifest` — build MANIFEST.json and its stamp once per CI run.
 
     A chunked CI run has one build job and N chunk jobs; without this,
@@ -1541,36 +1849,38 @@ def manifest_main(argv: list[str]) -> int:
     """
     if argv:
         return die("manifest", "manifest takes no arguments", 2)
-    wpt = resolve_wpt_root()
+    wpt = resolve_wpt_root(options)
     if not (wpt / "wpt").is_file():
         eprint(f"WPT checkout not found at {wpt}")
         eprint("Initialize it with: git submodule update --init third_party/wpt")
-        eprint("or point TINYBROWSER_WPT_ROOT at an initialized checkout.")
+        eprint("or pass --wpt-root with an initialized checkout.")
         return 1
     wpt = Path(os.path.realpath(wpt))
-    os.environ["TINYBROWSER_WPT_ROOT"] = str(wpt)
-    if check_pin(wpt) != 0:
+    if check_pin(wpt, options) != 0:
         return 1
-    venv = Path(os.environ.get("TINYBROWSER_WPT_VENV") or wpt / "_venv3")
+    venv = Path(options.venv) if options.venv else wpt / "_venv3"
     eprint(f"wpt: {wpt}")
     eprint(f"venv: {venv}")
-    ensure_venv(wpt, venv)
+    ensure_venv(wpt, venv, options)
     exe = venv_python(venv)
     os.chdir(wpt)
+    child = [*inner_flags(wpt, options), "--"]
     try:
-        os.execv(str(exe), [str(exe), str(CLI), "_manifest"])
+        os.execv(str(exe), [str(exe), str(CLI), "_manifest", *child])
     except OSError as error:
         return die("manifest", f"cannot exec {exe}: {error}")
     raise AssertionError("unreachable")
 
 
-def manifest_inner_main(argv: list[str]) -> int:
+def manifest_inner_main(options: Options, argv: list[str]) -> int:
     """The `manifest` body, under the venv python (manifest has its own
     requirements). The tree snapshot is taken before the walk: the stamp
     must describe the tree the walk saw, not what the run left behind."""
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
     if argv:
         return die("manifest", "manifest takes no arguments", 2)
-    wpt = Path(os.environ["TINYBROWSER_WPT_ROOT"])
+    wpt = resolve_wpt_root(options)
     manifest = wpt / "MANIFEST.json"
     tree_before = tree_state(wpt)
     try:
@@ -1594,7 +1904,7 @@ def manifest_inner_main(argv: list[str]) -> int:
 
 
 def score_run(
-    paths: list[str], extra: list[str], save_report: Path | None
+    paths: list[str], extra: list[str], save_report: Path | None, options: Options
 ) -> tuple[Path, int]:
     if save_report is not None:
         report = save_report
@@ -1608,6 +1918,7 @@ def score_run(
         str(CLI),
         "run",
         *paths,
+        *options.flags(),
         "--log-wptreport",
         str(report),
         "--no-fail-on-unexpected",
@@ -1644,7 +1955,7 @@ def finish_scored_run(
         eprint(f"wall time: {time.monotonic() - started:.1f}s")
 
 
-def score_main(argv: list[str]) -> int:
+def score_main(options: Options, argv: list[str]) -> int:
     report, save_report, paths, extra, dry_run, error = split_score_argv(argv)
     if error:
         return die("run --score", error, 2)
@@ -1677,7 +1988,7 @@ def score_main(argv: list[str]) -> int:
         return die("run --score", "give test paths or --report FILE", 2)
     started = time.monotonic()
     try:
-        report_path, runner_exit = score_run(paths, extra, save_report)
+        report_path, runner_exit = score_run(paths, extra, save_report, options)
     except OSError as error:
         return die("run --score", f"could not start the runner: {error}")
     return finish_scored_run(report_path, runner_exit, save_report, started)
@@ -1687,7 +1998,7 @@ def score_main(argv: list[str]) -> int:
 
 
 def rerun_spawn(
-    tests: list[str], extra: list[str], save_report: Path | None
+    tests: list[str], extra: list[str], save_report: Path | None, options: Options
 ) -> tuple[Path, int]:
     handle, name = tempfile.mkstemp(prefix="wpt-rerun-", suffix=".txt")
     os.close(handle)
@@ -1706,6 +2017,7 @@ def rerun_spawn(
         "run",
         "--include-file",
         str(include_file),
+        *options.flags(),
         "--log-wptreport",
         str(report),
         "--no-fail-on-unexpected",
@@ -1724,7 +2036,7 @@ def rerun_spawn(
     return report, exit_code
 
 
-def rerun_main(argv: list[str]) -> int:
+def rerun_main(options: Options, argv: list[str]) -> int:
     report, include_timeout, dry_run, save_report, extra, error = parse_rerun_argv(argv)
     if error:
         return die("rerun", error, 2)
@@ -1745,7 +2057,7 @@ def rerun_main(argv: list[str]) -> int:
         return 0
     started = time.monotonic()
     try:
-        report_path, runner_exit = rerun_spawn(tests, extra, save_report)
+        report_path, runner_exit = rerun_spawn(tests, extra, save_report, options)
     except OSError as error:
         return die("rerun", f"could not start the runner: {error}", 2)
     summarize(report_path)
@@ -1778,7 +2090,7 @@ def rerun_main(argv: list[str]) -> int:
 # --- `overnight` (full-suite run + score; needs approval per AGENTS.md) ---
 
 
-def overnight_main(argv: list[str]) -> int:
+def overnight_main(options: Options, argv: list[str]) -> int:
     save_report: Path | None = None
     extra: list[str] = []
     dry_run = False
@@ -1820,7 +2132,7 @@ def overnight_main(argv: list[str]) -> int:
         return 0
     started = time.monotonic()
     try:
-        report_path, runner_exit = score_run([], extra, save_report)
+        report_path, runner_exit = score_run([], extra, save_report, options)
     except OSError as error:
         return die("overnight", f"could not start the runner: {error}")
     return finish_scored_run(report_path, runner_exit, save_report, started)
@@ -1850,6 +2162,46 @@ def _selftest() -> None:
     assert not has_option("--processes", ["--pause-after-test"])
     assert has_option_exact("--manifest", ["--manifest", "x"])
     assert not has_option_exact("--manifest", ["--manif", "x"])
+
+    # Harness flags are ours before `--`, upstream's after it.
+    opts, rest, err = extract_options(
+        [
+            "run",
+            "dom/",
+            "--binary",
+            "/x",
+            "--durations=",
+            "--no-lock",
+            "--",
+            "--binary",
+            "wpt-value",
+        ]
+    )
+    assert err is None, err
+    assert rest == ["run", "dom/", "--", "--binary", "wpt-value"]
+    assert opts.binary == "/x" and opts.durations == "" and opts.no_lock
+    assert extract_options(["--binary"])[2] is not None
+    assert extract_options(["--binary="])[2] is not None
+    # A value never starts with `-`, so a missing one cannot swallow a flag.
+    assert extract_options(["--binary", "--log-level=trace"])[2] is not None
+    assert extract_options(["--log-level="])[2] is not None
+    assert extract_options(["--no-lock=1"])[2] is not None
+    assert extract_options(["--lock-timeout", "soon"])[2] is not None
+    assert extract_options(["--lock-timeout", "-1"])[2] is not None
+    assert extract_options([])[0] == Options()
+    # Round trip: the flags a parent hands its child rebuild the same options.
+    chosen = Options(
+        binary="/x",
+        wpt_root="/w",
+        venv="/v",
+        durations="/d",
+        log_level="trace",
+        log_file="/log",
+        allow_pin_mismatch=True,
+        no_lock=True,
+        lock_timeout=7,
+    )
+    assert extract_options(chosen.flags())[0] == chosen
 
     paths, score, dry, extras, err = split_run_argv(["dom/nodes/", "--exclude=worker"])
     assert (
@@ -2034,7 +2386,61 @@ def _selftest() -> None:
     assert parse_merge_argv(["a.json", "b.json", "--out"])[3] is not None
     assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[3] is not None
 
+    _selftest_profile()
     _selftest_merge()
+
+
+def _selftest_profile() -> None:
+    """profile: ranks a report by wall time, and reads the browser log it asked for."""
+    with tempfile.TemporaryDirectory() as tmp:
+        report = Path(tmp) / "r.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "results": [
+                        {"test": "/a.html", "status": "PASS", "duration": 100},
+                        {"test": "/b.html", "status": "TIMEOUT", "duration": 7192},
+                        {"test": "/c.html", "status": "PASS", "duration": 2600},
+                    ]
+                }
+            )
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert profile_main(Options(), ["--report", str(report), "--top=2"]) == 0
+        text = stdout.getvalue()
+        assert text.index("/b.html") < text.index("/c.html")  # longest first
+        assert "/a.html" not in text  # --top=2 drops it
+        assert "1 killed" in text and "1 passing within 2500ms" in text
+
+        # A kept log prints only its browser::net records.
+        log = Path(tmp) / "default.log"
+        log.write_text(
+            "2026-10-17T08:36:48.751Z TRACE browser::net nav start http://x/\n"
+            "2026-10-17T08:36:48.752Z INFO renderer ready\n"
+            "2026-10-17T08:36:48.772Z TRACE browser::net nav head http://x/ -> 200\n"
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            print_timeline(log)
+        text = stdout.getvalue()
+        assert "nav start" in text and "nav head" in text
+        assert "renderer ready" not in text
+
+        # Malformed invocations fail; paths and --report are exclusive.
+        for bad in (
+            ["--top", "x", "--report", str(report)],
+            ["--top=0", "--report", str(report)],
+            ["--report"],
+            [],
+            ["--report", str(report), "dom/"],
+            ["--bogus"],
+        ):
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                assert profile_main(Options(), bad) == 2, bad
 
 
 def _selftest_merge() -> None:
@@ -2137,7 +2543,7 @@ def _selftest_merge() -> None:
             assert merge_main([str(empty)]) == 1
 
 
-TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | manifest | overnight | selftest
+TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | manifest | overnight | selftest
 
   run PATH... [--score] [--dry-run] [-- upstream-flags...]
     Run WPT. Upstream flags follow `--` (or start implicitly at the first
@@ -2153,6 +2559,15 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | manifest | 
     tests are refused. --out writes the merged wptreport, keeping run_info,
     subsuites, and the time bounds. --strict-skips exits 2 after printing
     the table when any report was unusable, so a dead chunk still fails CI.
+  profile PATH... [--top N]
+  profile --report FILE [--top N]
+    Rank tests by wall time. With paths it runs them at trace with the
+    browser log at a path it picks, then prints the navigation/request
+    timeline. With --report it ranks one existing wptreport instead.
+    The timeline separates wait-bound from compute-bound: requests that all
+    end in milliseconds while the test still times out mean the renderer is
+    spinning, not the network. Records sit at the browser's seams, never in
+    the renderer crate (that crate is shared with wasm and carries no logger).
   manifest
     Build MANIFEST.json plus its stamp once per chunked CI run, so chunk
     jobs can skip the tree walk. The stamp only ever makes runs faster.
@@ -2161,11 +2576,24 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | manifest | 
   selftest
     Pure-function checks (worker filter, classify, arg grammars).
 
+Harness flags (any subcommand, before `--`):
+  --binary PATH          use a prebuilt browser binary as-is
+  --wpt-root PATH        WPT checkout to use
+  --venv PATH            WPT virtualenv to use
+  --durations FILE       per-test durations for the longest-first split;
+                         `--durations=` disables the split
+  --log-level LEVEL      browser log level (e.g. trace)
+  --log-file PATH        write the browser log here, not under the data home
+  --allow-pin-mismatch   run even when the checkout drifts from the pin
+  --no-lock              skip the shared venv/manifest locks
+  --lock-timeout SECONDS how long to wait for a held lock
+
 Examples:
   tools/wpt/run dom/events/ --exclude=worker
   tools/wpt/run --score dom/nodes/ -- --processes 4
   tools/wpt/rerun /tmp/fileapi.json -- --processes 8 --fully-parallel
   cli.py merge reports/*.json --out merged.json
+  cli.py profile referrer-policy/gen/req.rel-noref/no-referrer/a-tag.http.html
 """
 
 
@@ -2176,30 +2604,38 @@ def main(argv: list[str] | None = None) -> int:
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(TOP_HELP)
         return 0
-    command, rest = argv[0], argv[1:]
+    options, rest, error = extract_options(argv)
+    if error:
+        return die("wpt", error, 2)
+    if not rest or rest[0] in ("-h", "--help", "help"):
+        print(TOP_HELP)
+        return 0
+    command, args = rest[0], rest[1:]
     if command == "run":
-        return run_main(rest)
+        return run_main(options, args)
     if command == "score":
-        return score_main(rest)
+        return score_main(options, args)
     if command in ("rerun", "retest"):
-        return rerun_main(rest)
+        return rerun_main(options, args)
     if command == "merge":
-        return merge_main(rest)
+        return merge_main(args)
+    if command == "profile":
+        return profile_main(options, args)
     if command == "manifest":
-        return manifest_main(rest)
+        return manifest_main(options, args)
     if command == "overnight":
-        return overnight_main(rest)
+        return overnight_main(options, args)
     if command == "_inner":
-        return inner_main(rest)
+        return inner_main(options, args)
     if command == "_manifest":
-        return manifest_inner_main(rest)
+        return manifest_inner_main(options, args)
     if command == "selftest":
         _selftest()
         eprint("selftest: ok")
         return 0
     return die(
         "wpt",
-        f"unknown command {command}; expected run | score | rerun | merge | overnight | selftest",
+        f"unknown command {command}; expected run | score | rerun | merge | manifest | profile | overnight | selftest",
         2,
     )
 

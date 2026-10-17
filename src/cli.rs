@@ -1,4 +1,4 @@
-//! Command-line boundary: four global flags, three subcommands, hand-scanned.
+//! Command-line boundary: five global flags, three subcommands, hand-scanned.
 //!
 //! Tokens scan once, left to right, so `--version` and `--help` short-circuit
 //! where they appear and value errors surface in order. Behavior parity with
@@ -16,6 +16,8 @@ use logging::Level;
 pub(crate) struct Cli {
     /// Minimum log level override.
     pub(crate) log_level: Option<Level>,
+    /// Log file override, in place of the profile's log under the data home.
+    pub(crate) log_file: Option<PathBuf>,
     /// Shorthand for debug logging.
     pub(crate) verbose: bool,
     /// Selected process mode, if any.
@@ -70,6 +72,8 @@ Options:
           Minimum log level: error, warn, info, debug, or trace [default: info]
 
           A running daemon keeps its start-up level; `--verbose` is shorthand for `--log-level=debug`.
+      --log-file <PATH>
+          Write the log file here; without it, a daemon or webdriver logs under the data home
       --verbose
           Shorthand for --log-level=debug
   -v, --version
@@ -92,6 +96,7 @@ struct Scanner<I: Iterator<Item = OsString>> {
     args: Peekable<I>,
     end_of_flags: bool,
     log_level: Option<Level>,
+    log_file: Option<PathBuf>,
     verbose: bool,
     command: Option<Partial>,
 }
@@ -116,6 +121,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             args: args.peekable(),
             end_of_flags: false,
             log_level: None,
+            log_file: None,
             verbose: false,
             command: None,
         }
@@ -173,6 +179,16 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 );
                 Ok(None)
             }
+            "log-file" => {
+                let raw = self.value("log-file", "<PATH>", inline)?;
+                if self.log_file.is_some() {
+                    return Err(
+                        "the argument '--log-file <PATH>' was provided more than once".into(),
+                    );
+                }
+                self.log_file = Some(PathBuf::from(raw));
+                Ok(None)
+            }
             "verbose" => {
                 if inline.is_some() {
                     return Err("unexpected value for '--verbose'".into());
@@ -195,6 +211,17 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 }
                 Ok(Some(Outcome::Help))
             }
+            _ => self.subcommand_flag(name, inline),
+        }
+    }
+
+    /// Long flags that only one subcommand understands; `long` holds the rest.
+    fn subcommand_flag(
+        &mut self,
+        name: &str,
+        inline: Option<&str>,
+    ) -> Result<Option<Outcome>, String> {
+        match name {
             "profile" => {
                 let raw = self.value("profile", "<NAME>", inline)?;
                 let profile = Profile::parse(&raw).map_err(|error| error.to_string())?;
@@ -308,6 +335,13 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
         inline: Option<&str>,
     ) -> Result<String, String> {
         if let Some(raw) = inline {
+            if raw.is_empty() {
+                // `--flag=` is never meaningful here, and every value-taking
+                // flag wants the same message for it.
+                return Err(format!(
+                    "a value is required for '--{flag} {placeholder}' but none was supplied"
+                ));
+            }
             return Ok(raw.to_owned());
         }
         let missing =
@@ -359,6 +393,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
         };
         Ok(Outcome::Run(Cli {
             log_level: self.log_level,
+            log_file: self.log_file,
             verbose: self.verbose,
             command,
         }))

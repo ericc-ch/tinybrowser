@@ -159,20 +159,36 @@ impl TabNetworkHandle {
     }
 
     async fn navigate(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, DialFailure> {
-        let deadline = Instant::now() + PAGE_FETCH_TIMEOUT;
+        // Browser-seam timeline for `profile` in tools/wpt: a stalled test is
+        // read from these records. The macro tests the level before it formats
+        // anything, so an off level costs one check and the clock read below.
+        let started = Instant::now();
+        logging::trace!(target: "browser::net", "nav start {url}");
+        let deadline = started + PAGE_FETCH_TIMEOUT;
         let permits = Self::acquire(&self.permits.navigation, deadline).await?;
         let mut request = Request::new(Method::GET, url.clone());
         chrome_navigation_request(&mut request, url);
         request.initiator_kind = InitiatorKind::Navigation;
         request.initiator = Some(initiator.clone());
         request.deadline = Some(deadline);
-        let response = self
-            .agent
-            .send(request)
-            .await
-            .map_err(|error| dial_failure(&error))?;
+        let response = match self.agent.send(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                logging::trace!(
+                    target: "browser::net",
+                    "nav failed {url} in {:?}: {error:?}",
+                    started.elapsed()
+                );
+                return Err(dial_failure(&error));
+            }
+        };
         let status = response.status();
         let final_url = response.final_url().clone();
+        logging::trace!(
+            target: "browser::net",
+            "nav head {url} -> {status} {final_url} in {:?}",
+            started.elapsed()
+        );
         let headers = response.headers();
         let content_type = content_type_header(headers);
         let content_security_policy = list_header(headers, "content-security-policy");
@@ -202,6 +218,13 @@ impl TabNetworkHandle {
         initiator: &Url,
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<DialOutcome, DialFailure> {
+        let started = Instant::now();
+        logging::trace!(
+            target: "browser::net",
+            "request start {:?} {}",
+            request.kind,
+            request.url
+        );
         let call = async {
             let budget = if request.timeout_ms == 0 {
                 PAGE_FETCH_TIMEOUT
@@ -260,11 +283,29 @@ impl TabNetworkHandle {
                 response_type,
             })
         };
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = cancel.changed() => Err(DialFailure::Cancelled),
             result = call => result,
+        };
+        match &result {
+            Ok(outcome) => logging::trace!(
+                target: "browser::net",
+                "request done {:?} {} -> {} in {:?}",
+                request.kind,
+                request.url,
+                outcome.status,
+                started.elapsed()
+            ),
+            Err(failure) => logging::trace!(
+                target: "browser::net",
+                "request failed {:?} {} in {:?}: {failure:?}",
+                request.kind,
+                request.url,
+                started.elapsed()
+            ),
         }
+        result
     }
 
     async fn acquire(

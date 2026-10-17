@@ -8,6 +8,7 @@ Maximize web spec conformance per byte.
 - Handwritten `unsafe` is prohibited unless runtime safety is proven (`// SAFETY:` invariant, Miri/valgrind checks via `tools/check`) and no safe alternative is as simple, clear, or fast.
 - Let upstream bugs fail honestly. Never build tinybrowser workarounds for upstream engine bugs; record gaps in `docs/upstream.md`.
 - Keep feedback loop fast. Cargo tests cover tinybrowser internals only (`cargo test --workspace`); never test web-platform spec conformance in cargo tests. Run the smallest slice that answers the question (single files or directories, never full suites). Never run long or whole-suite test runs without explicit approval.
+- A WPT timeout is a failure. The harness budget (`DEFAULT_TIMEOUT = 3s`, `LONG_TIMEOUT = 5s`, `EXTRA_TIMEOUT = 2s` in `tools/wpt/tinybrowser_wpt.py`) is the speed standard, so a test that cannot finish inside it is too slow and is a work item. Profile and fix the slow path; never raise a budget to hide one.
 - Commit messages should also record decisions.
 - Throwaway experiments belong in `/tmp/`.
 

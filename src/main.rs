@@ -87,12 +87,12 @@ fn install_logger(cli: &Cli) {
         None
     });
     let level = requested.or_else(env_level).unwrap_or(Level::Info);
-    let file = match &cli.command {
+    let file = cli.log_file.clone().or_else(|| match &cli.command {
         Some(Command::Daemon { profile } | Command::Webdriver { profile, .. }) => {
             profile_log_file(profile)
         }
         Some(Command::Renderer) | None => None,
-    };
+    });
     logging::install(level, file);
 }
 

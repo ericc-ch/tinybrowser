@@ -6,7 +6,7 @@
 # manifest; only the browser binary differs. The baseline binary is built in a
 # detached worktree whose build submodules are copied from this checkout, then
 # copied out; this checkout's binary is rebuilt before the runs, so
-# `TINYBROWSER_BINARY` serves each side. The worktree is removed on exit.
+# `--binary` serves each side. The worktree is removed on exit.
 #
 # usage: tools/wpt/baseline REV PATH... [-- upstream wpt flags]
 #
@@ -114,12 +114,12 @@ nix develop --command cargo build -q --profile wpt
 
 echo "baseline: running the slice at $rev" >&2
 base_status=0
-TINYBROWSER_BINARY="$baseline_bin" nix develop --command \
-  tools/wpt/run --score "${paths[@]}" "${runner_args[@]}" \
+nix develop --command \
+  tools/wpt/run --binary "$baseline_bin" --score "${paths[@]}" "${runner_args[@]}" \
   > "$tmp/baseline.log" 2>&1 || base_status=$?
 echo "baseline: running the slice at the working tree" >&2
 current_status=0
-env -u TINYBROWSER_BINARY nix develop --command \
+nix develop --command \
   tools/wpt/run --score "${paths[@]}" "${runner_args[@]}" \
   > "$tmp/current.log" 2>&1 || current_status=$?
 keep_logs=1
