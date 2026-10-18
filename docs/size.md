@@ -27,7 +27,12 @@ alone was 19.5 KiB). Postcard encodes the same derives as varint tags and
 positional fields, so `.text` fell 126 KiB (8,556,052 → 8,427,016 B) and every
 command and renderer event stopped paying a JSON parse. The frame header, body-chunk lane, and
 control-size cap are unchanged; `RemoteValue::Number` lost its JSON-only
-`serde(with)` shim with it, since postcard carries `f64` natively.
+`serde(with)` shim with it, since postcard carries `f64` natively. One
+validation had to be rebuilt rather than inherited: `postcard::from_bytes`
+discards whatever follows the message, where `serde_json::from_slice` rejected
+trailing characters, and a frame's length is the payload's exact extent, so
+`decode_control` now decodes through `take_from_bytes` and rejects a remainder
+(1.4 KiB of `.text` for the check and its message).
 
 `panic = "abort"` costs 0.82 MiB over `immediate-abort` (10.61 vs 9.79 MiB
 measured): the panic formatting machinery from every dependency. It buys the

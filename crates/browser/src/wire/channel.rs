@@ -285,12 +285,21 @@ pub fn read_body(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<Opt
 
 /// Decodes one control-frame payload after its frame header has been read.
 ///
+/// The frame length is the payload's exact extent, so anything left over after
+/// the message is a framing bug, not slack. `postcard::from_bytes` would drop
+/// the remainder silently.
+///
 /// # Errors
 ///
-/// Invalid postcard bytes or a payload that does not match `T`.
+/// Invalid postcard bytes, a payload that does not match `T`, or trailing bytes.
 pub fn decode_control<T: DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
-    postcard::from_bytes(payload)
-        .map_err(|error| invalid(format!("invalid renderer IPC payload: {error}")))
+    let (message, trailing) = postcard::take_from_bytes(payload)
+        .map_err(|error| invalid(format!("invalid renderer IPC payload: {error}")))?;
+    if trailing.is_empty() {
+        Ok(message)
+    } else {
+        Err(invalid("renderer IPC payload has trailing bytes"))
+    }
 }
 
 fn read_exact(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<()> {
@@ -464,13 +473,23 @@ mod tests {
         assert!(read_frame(&mut Cursor::new(header(KIND_CONTROL, 1, 0, 0)), &mut buffer).is_err());
 
         assert!(
-            read_control::<crate::wire::HostNotice>(
+            read_control::<crate::wire::ToRenderer>(
                 &mut Cursor::new(header(KIND_RESPONSE_CHUNK, 0, 1, 0)),
                 &mut buffer
             )
             .is_err()
         );
         assert!(read_body(&mut Cursor::new(header(KIND_CONTROL, 0, 0, 0)), &mut buffer).is_err());
+    }
+
+    #[test]
+    fn control_payloads_reject_trailing_bytes() {
+        let message: crate::wire::ToRenderer =
+            crate::exchange::Frame::Notify(crate::wire::HostNotice::Shutdown);
+        let mut payload = postcard::to_allocvec(&message).expect("encode");
+        assert!(decode_control::<crate::wire::ToRenderer>(&payload).is_ok());
+        payload.push(0);
+        assert!(decode_control::<crate::wire::ToRenderer>(&payload).is_err());
     }
 
     #[test]
