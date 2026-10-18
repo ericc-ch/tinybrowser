@@ -1,17 +1,13 @@
 //! Link-time size knobs for the shipping binary.
 //!
 //! These lived in `.cargo/config.toml` as global `rustflags`. They are scoped
-//! to the release binary instead: they only shrink the shipping artifact, and
-//! applying them to every debug/test link forces LLD onto objects whose DWARF
-//! rustc 1.98.1 does not always compile to something LLD accepts (`unknown
-//! relocation (1875)` on `icu_experimental` and `browser`); dev/test links use
-//! bfd, selected in `.cargo/config.toml` because this toolchain otherwise
-//! defaults to rust-lld. Nothing unwinds in release (`panic =
+//! to the release binary instead: they only shrink the shipping artifact.
+//! Every link uses the toolchain's default rust-lld (the rustc 1.98.1
+//! `unknown relocation (1875)` DWARF bug that forced bfd onto dev/test links
+//! is gone on the pinned nightly). Nothing unwinds in release (`panic =
 //! "immediate-abort"` via build-std; QuickJS-ng uses setjmp/longjmp), so the
-//! shipping binary needs neither the
-//! unwind index (dropped here) nor the `.eh_frame` body (`tools/release` removes
-//! it). The panic strategy is `immediate-abort` (nightly, via build-std): no
-//! formatting machinery and no unwinding at all.
+//! shipping binary needs neither the unwind index (dropped here) nor the
+//! `.eh_frame` body (`tools/release` removes it).
 //!
 //! Sizes and method: `docs/size.md`.
 

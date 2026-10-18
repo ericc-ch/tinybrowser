@@ -282,7 +282,8 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
     let mut request = Request::new(Method::GET, server.url("/invalid"));
     let result = request.headers.insert("X-Bad", "line\r\nInjected: yes");
     assert!(matches!(result, Err(net::HeaderError::InvalidValue(_))));
-    assert!(server.requests().is_empty());
+    // `RecordedRequest` has no `PartialEq`, so compare the count.
+    assert_eq!(server.requests().len(), 0);
     server.assert_clean();
 }
 

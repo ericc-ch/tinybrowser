@@ -1364,7 +1364,7 @@ mod tests {
             "a=1; Expires=Thu, 29 Feb 1900 00:00:00 GMT",
             http(&page, at(NOW))
         ));
-        assert!(jar.snapshot().is_empty());
+        assert_eq!(jar.snapshot(), [] as [CookieRecord; 0]);
         assert_eq!(jar.cookie_string(http(&page, at(NOW))), "a=1");
     }
 
@@ -1388,7 +1388,7 @@ mod tests {
             "a=1; Expires=Fri, 31 Dec 1600 23:59:59 GMT",
             http(&page, at(NOW))
         ));
-        assert!(jar.snapshot().is_empty());
+        assert_eq!(jar.snapshot(), [] as [CookieRecord; 0]);
         assert_eq!(jar.cookie_string(http(&page, at(NOW))), "a=1");
     }
 
@@ -1477,7 +1477,7 @@ mod tests {
             }],
             at(NOW),
         );
-        assert!(jar.snapshot().is_empty());
+        assert_eq!(jar.snapshot(), [] as [CookieRecord; 0]);
     }
 
     #[test]
@@ -1669,7 +1669,7 @@ mod tests {
             "a=1; Expires=Tue 29 üFeb 2000 00:00:00",
             http(&page, at(946_598_400))
         ));
-        assert!(jar.snapshot().is_empty());
+        assert_eq!(jar.snapshot(), [] as [CookieRecord; 0]);
     }
 
     fn fill(jar: &mut CookieJar, page: &Url, names: impl IntoIterator<Item = String>, from: u64) {

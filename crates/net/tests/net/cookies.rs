@@ -16,7 +16,7 @@ fn cookie_quota_evicts_the_oldest_entries_globally() {
             agent.set_cookie(&format!("c{cookie}={cookie}; Path=/"), &domain);
         }
     }
-    assert!(agent.cookies_for(&oldest).is_empty());
+    assert_eq!(agent.cookies_for(&oldest), "");
 }
 
 /// The per-domain quota: the newest cookie evicts the oldest on that one
@@ -44,19 +44,18 @@ fn public_suffix_domains_are_rejected() {
 
     let https = url::Url::parse("https://www.example.com/app").expect("https");
     agent.set_cookie("public=1; Path=/; Domain=com", &https);
-    assert!(agent.cookies_for(&https).is_empty());
+    assert_eq!(agent.cookies_for(&https), "");
 
     let s3 = url::Url::parse("https://evil.s3.amazonaws.com/obj").expect("s3");
     agent.set_cookie("bucket=1; Path=/; Domain=s3.amazonaws.com", &s3);
-    assert!(agent.cookies_for(&s3).is_empty());
+    assert_eq!(agent.cookies_for(&s3), "");
 
     let pages = url::Url::parse("https://github.io/").expect("pages");
     agent.set_cookie("id=1; Path=/; Domain=github.io", &pages);
     assert_eq!(agent.cookies_for(&pages), "id=1");
-    assert!(
-        agent
-            .cookies_for(&url::Url::parse("https://foo.github.io/").expect("sub"))
-            .is_empty()
+    assert_eq!(
+        agent.cookies_for(&url::Url::parse("https://foo.github.io/").expect("sub")),
+        ""
     );
 }
 

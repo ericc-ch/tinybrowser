@@ -1081,7 +1081,7 @@ pub(crate) fn ret_nullable<'js, T: rquickjs::IntoJs<'js>>(
 /// (<https://webidl.spec.whatwg.org/#idl-USVString>).
 #[inline(never)]
 pub(crate) fn ret_usv<'js>(
-    result: crate::dom_string::DomString,
+    result: &crate::dom_string::DomString,
     ctx: &Ctx<'js>,
 ) -> Result<Value<'js>> {
     let lossy = result.to_string_lossy();
@@ -1090,28 +1090,24 @@ pub(crate) fn ret_usv<'js>(
 
 /// An enumeration return value: the IDL string for the enum value.
 #[inline(never)]
-pub(crate) fn ret_enum<'js>(
-    result: impl AsRef<str>,
-    ctx: &Ctx<'js>,
-) -> Result<Value<'js>> {
+pub(crate) fn ret_enum<'js>(result: impl AsRef<str>, ctx: &Ctx<'js>) -> Result<Value<'js>> {
     let result = rquickjs::String::from_str(ctx.clone(), result.as_ref())?;
     rquickjs::IntoJs::into_js(result, ctx)
 }
 
 #[inline(never)]
-pub(crate) fn ret_undefined<'js>(ctx: &Ctx<'js>) -> Result<Value<'js>> {
-    Ok(Value::new_undefined(ctx.clone()))
+pub(crate) fn ret_undefined<'js>(ctx: &Ctx<'js>) -> Value<'js> {
+    Value::new_undefined(ctx.clone())
 }
 
 /// A `sequence<DOMString>` return value.
 #[inline(never)]
-pub(crate) fn ret_string_sequence<'js>(
-    result: Vec<String>,
-    ctx: &Ctx<'js>,
-) -> Result<Value<'js>> {
+pub(crate) fn ret_string_sequence<'js>(result: Vec<String>, ctx: &Ctx<'js>) -> Result<Value<'js>> {
     let values = result
         .into_iter()
-        .map(|item| rquickjs::String::from_str(ctx.clone(), &item).map(rquickjs::String::into_value))
+        .map(|item| {
+            rquickjs::String::from_str(ctx.clone(), &item).map(rquickjs::String::into_value)
+        })
         .collect::<Result<Vec<Value>>>()?;
     sequence(ctx, values)
 }

@@ -735,29 +735,28 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             quote! {
                 let result: crate::dom_string::DomString =
                     host::reflect_url_string(&ctx, receiver.node_id(), #content)?;
-                host::ret_usv(result, &ctx)
+                host::ret_usv(&result, &ctx)
             }
         }
         GetterMapping::Method => match getter.return_type {
-            ReturnType::String => {
+            ReturnType::String
+            | ReturnType::Boolean
+            | ReturnType::UnsignedShort
+            | ReturnType::UnsignedLong
+            | ReturnType::Long
+            | ReturnType::Double
+            | ReturnType::RestrictedDouble => {
                 quote! { host::ret(#call?, &ctx) }
             }
             ReturnType::UsvString => {
-                quote! { host::ret_usv(#call?, &ctx) }
-            }
-            ReturnType::Boolean | ReturnType::UnsignedShort | ReturnType::UnsignedLong => {
-                quote! { host::ret(#call?, &ctx) }
-            }
-            ReturnType::Long => {
-                quote! { host::ret(#call?, &ctx) }
+                quote! {
+                    let result = #call?;
+                    host::ret_usv(&result, &ctx)
+                }
             }
             ReturnType::NullableString | ReturnType::NullableUnsignedLong => {
                 quote! { host::ret_nullable(#call?, &ctx) }
             }
-            ReturnType::Double | ReturnType::RestrictedDouble => quote! {
-                // https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp
-                host::ret(#call?, &ctx)
-            },
             ReturnType::NullableNode | ReturnType::PlatformObject => {
                 quote! { #call }
             }
@@ -968,15 +967,20 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
     let call = method_call(interface, method, &arguments_call);
     let body = match operation.result {
         OperationResult::Object => quote! { #call },
-        OperationResult::Union => quote! {
+        OperationResult::Union
+        | OperationResult::String
+        | OperationResult::Boolean
+        | OperationResult::UnsignedShort
+        | OperationResult::Short
+        | OperationResult::Long => quote! {
             host::ret(#call?, &ctx)
         },
-        OperationResult::NullableUnion => quote! {
+        OperationResult::NullableUnion | OperationResult::NullableString => quote! {
             host::ret_nullable(#call?, &ctx)
         },
         OperationResult::Undefined => quote! {
             #call?;
-            host::ret_undefined(&ctx)
+            Ok(host::ret_undefined(&ctx))
         },
         OperationResult::PromiseUndefined => quote! {
             #call?;
@@ -988,18 +992,6 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
         },
         OperationResult::StringSequence => quote! {
             host::ret_string_sequence(#call?, &ctx)
-        },
-        OperationResult::String => quote! {
-            host::ret(#call?, &ctx)
-        },
-        OperationResult::NullableString => quote! {
-            host::ret_nullable(#call?, &ctx)
-        },
-        OperationResult::Boolean | OperationResult::UnsignedShort | OperationResult::Short => {
-            quote! { host::ret(#call?, &ctx) }
-        }
-        OperationResult::Long => quote! {
-            host::ret(#call?, &ctx)
         },
     };
     let body = if operation.reactions {
@@ -1142,6 +1134,30 @@ fn operation_argument_at(
         | ReturnType::Enumeration(_)
         | ReturnType::Union(..)
         | ReturnType::NullableUnion(..) => converted_argument(argument, variable, &fetch),
+        ReturnType::String
+        | ReturnType::UsvString
+        | ReturnType::NullableString
+        | ReturnType::NullableDocumentType
+        | ReturnType::Boolean
+        | ReturnType::UnsignedShort
+        | ReturnType::Short
+        | ReturnType::UnsignedLong
+        | ReturnType::Long
+        | ReturnType::Double
+        | ReturnType::RestrictedDouble => operation_scalar_argument(argument, index, variable),
+        _ => unreachable!("validated operation argument"),
+    }
+}
+
+/// The scalar argument conversions: strings, numerics, booleans, and the
+/// nullable/legacy variants around them. Split out of `operation_argument_at`
+/// for size; every arm here is one or two shared-funnel calls.
+fn operation_scalar_argument(
+    argument: &OperationArgument,
+    index: &TokenStream,
+    variable: &proc_macro2::Ident,
+) -> TokenStream {
+    match &argument.type_ {
         ReturnType::String => {
             // https://webidl.spec.whatwg.org/#es-DOMString
             let conversion = match (argument.arity, argument.legacy_null_to_empty) {
@@ -1189,15 +1205,17 @@ fn operation_argument_at(
             let #variable = host::nullable_string_argument(params, #index)?;
         },
         ReturnType::NullableDocumentType => {
+            // An omitted optional argument takes its default before
+            // conversion, so `= null` supplies `null`, not `undefined`
+            // (<https://webidl.spec.whatwg.org/#es-any>).
             let fetch = if argument.null_default {
-                // An omitted optional argument takes its default before
-                // conversion, so `= null` supplies `null`, not `undefined`
-                // (<https://webidl.spec.whatwg.org/#es-any>).
                 quote! {
                     let value = params.arg(#index).unwrap_or_else(|| Value::new_null(ctx.clone()));
                 }
             } else {
-                fetch
+                quote! {
+                    let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                }
             };
             quote! {
                 #fetch
@@ -1207,25 +1225,18 @@ fn operation_argument_at(
         ReturnType::Boolean => {
             // https://webidl.spec.whatwg.org/#es-boolean
             let conversion = match (argument.arity, argument.boolean_default) {
-                (ArgumentArity::Required, None) => {
-                    quote! { host::boolean_argument(params, #index)? }
-                }
-                (ArgumentArity::Required, Some(default)) => {
+                // A defaulted boolean (any arity) takes the default before
+                // conversion.
+                (_, Some(default)) => {
                     quote! { host::boolean_argument_with_default(params, #index, #default)? }
                 }
                 (ArgumentArity::Optional, None) => {
                     quote! { host::optional_boolean_argument(params, #index)? }
                 }
-                (ArgumentArity::Optional, Some(default)) => quote! {
-                    host::boolean_argument_with_default(params, #index, #default)?
-                },
-                // Variadic booleans are rejected at contract time.
-                (ArgumentArity::Variadic, None) => {
-                    quote! { host::boolean_argument(params, #index)? }
-                }
-                (ArgumentArity::Variadic, Some(default)) => quote! {
-                    host::boolean_argument_with_default(params, #index, #default)?
-                },
+                // Required and variadic booleans without a default convert
+                // nothing first; variadic presence is checked at contract
+                // time.
+                (_, None) => quote! { host::boolean_argument(params, #index)? },
             };
             quote! { let #variable = #conversion; }
         }

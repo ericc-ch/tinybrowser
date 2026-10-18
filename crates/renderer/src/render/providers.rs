@@ -202,6 +202,6 @@ mod tests {
         ));
         let pending = nav.drain();
         assert_eq!(pending.len(), 1);
-        assert!(nav.drain().is_empty());
+        assert_eq!(nav.drain(), Vec::new());
     }
 }

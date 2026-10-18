@@ -7,14 +7,6 @@ RUST_TEST_THREADS = "1"
 # them (about 53 KB). Plain [env], no force, so an ambient CFLAGS still wins.
 CFLAGS = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
 
-# Dev and test links use GNU bfd. The pinned toolchain defaults to rust-lld,
-# which rejects a DWARF relocation rustc itself emits in some code shapes
-# (`unknown relocation (1875)`, see build.rs); bfd ignores it. The release
-# binary's size flags in build.rs select lld later on the command line, and
-# the later `-fuse-ld` wins.
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
-
 # Build-std for every target build (dev, test, release). The pinned toolchain
 # is nightly specifically for this: `panic = "immediate-abort"` and the
 # per-content panic strategy both need in-tree core/std. Shipping path stays

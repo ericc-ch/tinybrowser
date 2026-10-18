@@ -438,10 +438,7 @@ pub fn preflight_ok(
         return false;
     }
     let wildcard = wildcard_ok && listed("*");
-    if !wildcard && unsafe_names.iter().any(|name| !listed(name)) {
-        return false;
-    }
-    true
+    wildcard || unsafe_names.iter().all(|name| listed(name))
 }
 
 /// The outbound headers of a preflight request
@@ -769,7 +766,7 @@ mod tests {
         // from the header list the decision sees
         // (<https://fetch.spec.whatwg.org/#forbidden-request-header>).
         let request = headers(&[("Referer", "https://a.test/"), ("Sec-Fetch-Mode", "cors")]);
-        assert!(unsafe_request_header_names(&request).is_empty());
+        assert_eq!(unsafe_request_header_names(&request), [] as [String; 0]);
         let request = headers(&[("X-Custom", "1")]);
         assert_eq!(
             unsafe_request_header_names(&request),
