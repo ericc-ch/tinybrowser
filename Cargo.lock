@@ -266,9 +266,9 @@ version = "0.1.0"
 dependencies = [
  "logging",
  "net",
+ "postcard",
  "renderer",
  "serde",
- "serde_json",
  "tokio",
  "url",
  "webstorage",
@@ -2639,7 +2639,6 @@ dependencies = [
  "png",
  "rquickjs",
  "serde",
- "serde_json",
  "sha2",
  "stylo",
  "stylo_traits",

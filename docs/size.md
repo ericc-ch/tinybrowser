@@ -16,7 +16,18 @@ pass/unexp/timeout/crash counts, and a release smoke via
 | nightly + `[unstable] build-std` (std at `opt-level = "z"`) | 11.86 MiB |
 | `panic = "immediate-abort"` (interim) | 10.94 MiB |
 | `force-unwind-tables=no`, `tools/release` deleted (interim, immediate-abort) | 9.79 MiB |
-| current: `panic = "abort"` + synchronous panic hook for diagnostics | **10.61 MiB** |
+| panic = "abort" + synchronous panic hook for diagnostics | 10.61 MiB |
+| current: postcard renderer IPC control payloads | **10.47 MiB** |
+
+The renderer channel is the only wire we own, and both ends are the same
+binary, so JSON's field names and string escaping bought nothing: the derived
+`serde_json` impls for `Frame`, `ServiceCall`, `Command`, `StorageCall`,
+`ServiceReply`, and friends were 100 KiB of `.text` (one enum's deserializer
+alone was 19.5 KiB). Postcard encodes the same derives as varint tags and
+positional fields, so `.text` fell 126 KiB (8,556,052 → 8,427,016 B) and every
+command and renderer event stopped paying a JSON parse. The frame header, body-chunk lane, and
+control-size cap are unchanged; `RemoteValue::Number` lost its JSON-only
+`serde(with)` shim with it, since postcard carries `f64` natively.
 
 `panic = "abort"` costs 0.82 MiB over `immediate-abort` (10.61 vs 9.79 MiB
 measured): the panic formatting machinery from every dependency. It buys the
