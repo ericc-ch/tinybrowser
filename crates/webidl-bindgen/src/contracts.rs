@@ -1276,7 +1276,7 @@ fn lower_operation(
         )));
     };
     let this_parameter = if takes_this {
-        quote! { this: Object<'js>, }
+        quote! { this: rquickjs::Object<'js>, }
     } else {
         quote! {}
     };

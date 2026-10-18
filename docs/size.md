@@ -17,7 +17,18 @@ pass/unexp/timeout/crash counts, and a release smoke via
 | `panic = "immediate-abort"` (interim) | 10.94 MiB |
 | `force-unwind-tables=no`, `tools/release` deleted (interim, immediate-abort) | 9.79 MiB |
 | panic = "abort" + synchronous panic hook for diagnostics | 10.61 MiB |
-| current: postcard renderer IPC control payloads | **10.47 MiB** |
+| postcard renderer IPC control payloads | 10.47 MiB |
+| current: shared interface installer funnel | **10.43 MiB** |
+
+The generated bindings emitted the same six-line installer for all 90
+interfaces — look up the constructor the web shims created, take its prototype,
+add members, add constants to the interface object as well as the prototype,
+mark the unscopables — inlined into every caller at roughly 590 B apiece. One
+`#[inline(never)]` funnel (`host::install_interface`) holds that body now: the
+install family fell from 183 KiB to 136 KiB and `.text` by 47 KiB. Generated
+modules also stopped importing `Object`: the three places that name it spell
+`rquickjs::Object`, so the import list is fixed rather than conditional on which
+pieces a given interface emits.
 
 The renderer channel is the only wire we own, and both ends are the same
 binary, so JSON's field names and string escaping bought nothing: the derived

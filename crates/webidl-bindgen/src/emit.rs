@@ -60,7 +60,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
         pub(crate) mod #module {
             use super::#rust;
             use crate::js::bindings::host;
-            use rquickjs::{Ctx, Object, Result, Value};
+            use rquickjs::{Ctx, Result, Value};
             use rquickjs::function::Params;
 
             #tables
@@ -285,7 +285,7 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
     };
     let constructor_parent = match &interface.parent {
         Some(PrototypeParent::Interface(parent)) => quote! {
-            let parent: Object = ctx.globals().get(#parent)?;
+            let parent: rquickjs::Object = ctx.globals().get(#parent)?;
             constructor.set_prototype(Some(&parent))?;
         },
         Some(PrototypeParent::Intrinsic(_)) | None => quote! {},
@@ -299,7 +299,7 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
                 type Mutable = Readable;
                 #property_hooks
 
-                fn prototype(ctx: &Ctx<'js>) -> Result<Option<Object<'js>>> {
+                fn prototype(ctx: &Ctx<'js>) -> Result<Option<rquickjs::Object<'js>>> {
                     let prototype = host::prototype(ctx, #name, #parent, MEMBERS, CONSTANTS, dispatch)?;
                     host::install_unscopables(&prototype, UNSCOPABLES)?;
                     Ok(Some(prototype))
@@ -329,13 +329,14 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
             quote! {
                 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
                     #(
-                        let constructor: Object = ctx.globals().get(#targets)?;
-                        let prototype: Object = constructor.get("prototype")?;
-                        host::install_members(&prototype, MEMBERS, CONSTANTS, dispatch)?;
-                        // Constants are visible on the interface object as well
-                        // as the prototype (<https://webidl.spec.whatwg.org/#es-constants>).
-                        host::install_constants(&constructor, CONSTANTS)?;
-                        host::install_unscopables(&prototype, UNSCOPABLES)?;
+                        host::install_interface(
+                            ctx,
+                            #targets,
+                            MEMBERS,
+                            CONSTANTS,
+                            UNSCOPABLES,
+                            dispatch,
+                        )?;
                     )*
                     Ok(())
                 }
@@ -1381,7 +1382,7 @@ fn dictionary(dictionary: &Dictionary) -> TokenStream {
                 if value.is_null() || value.is_undefined() {
                     #null_branch
                 }
-                let object: Object = value.clone().into_object().ok_or_else(|| {
+                let object: rquickjs::Object = value.clone().into_object().ok_or_else(|| {
                     rquickjs::Exception::throw_type(ctx, "dictionary must be an object")
                 })?;
                 Ok(Self {
@@ -1433,7 +1434,7 @@ fn dictionary_field(field: &DictionaryField) -> TokenStream {
             quote! { pub(crate) #rust: Option<String> }
         }
         DictionaryFieldType::Interface { .. } => {
-            quote! { pub(crate) #rust: Option<rquickjs::Persistent<Object<'static>>> }
+            quote! { pub(crate) #rust: Option<rquickjs::Persistent<rquickjs::Object<'static>>> }
         }
     }
 }

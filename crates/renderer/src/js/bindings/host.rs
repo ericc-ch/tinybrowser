@@ -107,6 +107,34 @@ pub(crate) fn prototype<'js>(
     Ok(prototype)
 }
 
+/// Adds one interface's members to the prototype its constructor already has.
+///
+/// Every generated interface installs the same way: look up the constructor the
+/// web shims created, take its prototype, add members, then add constants to the
+/// interface object as well as the prototype
+/// (<https://webidl.spec.whatwg.org/#es-constants>) and mark the unscopables.
+/// Emitting that body per interface inlined ~590 B of identical code into each
+/// caller, so it lives here once.
+///
+/// # Errors
+///
+/// The constructor or its prototype is missing, or member installation fails.
+#[inline(never)]
+pub(crate) fn install_interface(
+    ctx: &Ctx<'_>,
+    name: &str,
+    members: &[Member],
+    constants: &[Constant],
+    unscopables: &[&str],
+    dispatch: Dispatch,
+) -> Result<()> {
+    let constructor: Object = ctx.globals().get(name)?;
+    let prototype: Object = constructor.get("prototype")?;
+    install_members(&prototype, members, constants, dispatch)?;
+    install_constants(&constructor, constants)?;
+    install_unscopables(&prototype, unscopables)
+}
+
 pub(crate) fn install_members(
     prototype: &Object<'_>,
     members: &[Member],
