@@ -1,30 +1,29 @@
 # WPT harness
 
-tools/wpt/run runs wpt run against tinybrowser. All logic in
-tools/wpt/cli.py (run | score | rerun | merge | profile | manifest | overnight |
-selftest). Builds the wpt-profile binary via cargo each run;
---binary PATH uses a prebuilt binary as-is.
+tools/wpt/cli.py is the whole harness (run | score | rerun | merge | profile |
+failures | baseline | manifest | overnight | selftest). It needs a dev-shell
+Python, so call it through `nix develop --command`. Builds the wpt-profile
+binary via cargo each run; --binary PATH uses a prebuilt binary as-is.
 
-    nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
-    nix develop --command ./tools/wpt/run --score dom/nodes/ -- --processes 4
+    nix develop --command python3 tools/wpt/cli.py run dom/events/ --exclude=worker
+    nix develop --command python3 tools/wpt/cli.py run --score dom/nodes/ -- --processes 4
 
 Paths and our flags first; literal -- starts upstream flags.
---exclude=worker skips Worker variants too. Prove with cli.py selftest.
+--exclude=worker skips Worker variants too. Prove with `... selftest`.
 
 Tight loop: --score prints per-directory buckets; --save-report keeps
 the wptreport; rerun feeds attention-tests back (TIMEOUTs excluded
-unless --include-timeout); --dry-run lists the selection. tools/wpt/profile
+unless --include-timeout); --dry-run lists the selection. profile
 ranks tests by wall time with --report, or runs a path and prints the
-browser's navigation/request timeline. Each shim only finds a Python
-before the venv exists; run and profile are separate entry points because
-`run` owns its own grammar.
+browser's navigation/request timeline.
 
-A conformance change is a failure-list diff: failures extracts the
-canonical list, baseline runs both sides in a detached worktree (exit 1
-on new failures). Metadata-expected TIMEOUTs: --skip-timeout in dev
-only; score/overnight refuse it. overnight needs explicit approval.
-Update the docs/progress.md total after scoring. Timeout policy
-(DEFAULT/LONG/EXTRA seconds) lives at the top of tinybrowser_wpt.py.
+A conformance change is a failure-list diff: failures prints the
+canonical list of a --score log, baseline runs both sides in a detached
+worktree (exit 1 on new failures). Metadata-expected TIMEOUTs:
+--skip-timeout in dev only; score/overnight refuse it. overnight needs
+explicit approval. Update the docs/progress.md total after scoring.
+Timeout policy (DEFAULT/LONG/EXTRA seconds) lives at the top of
+tinybrowser_wpt.py.
 
 Enabled: testharness (multi-window, same-site frames), crashtest,
 reftest (screenshot compare, 800x600), test262 (generated wrappers),
