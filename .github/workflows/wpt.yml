@@ -3,14 +3,13 @@
 # raw chunk reports as artifacts, so a score can be reproduced without
 # rerunning anything.
 #
-# Shape: one build (stylo makes a cold build long) fans the same wpt-profile
-# binary out to `chunks` jobs, and walks the test tree once (cli.py
-# manifest) so chunk jobs can skip that walk. Each job runs one upstream
-# dir_hash chunk of the shared manifest (wptrunner hashes the test
+# Shape: a plan job walks the test tree once (cli.py manifest) and a build job
+# compiles the wpt profile; both fan out to `chunks` jobs. Each job runs one
+# upstream dir_hash chunk of the shared manifest (wptrunner hashes the test
 # directory, so a directory is never split across jobs); the score job folds
-# the reports into one table on the run page. A chunk that died before
-# writing its report is skipped there with a warning, turns the run red, and
-# its raw log still says how far it got.
+# the reports into one table on the run page. A chunk that died before writing
+# its report is skipped there with a warning, turns the run red, and its raw
+# log still says how far it got.
 #
 # Defaults: the four test types tinybrowser can run today (testharness,
 # crashtest, reftest, test262) over the whole tree. print-reftest is out (no
@@ -70,7 +69,7 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 20
     outputs:
       chunks: ${{ steps.plan.outputs.chunks }}
     steps:
@@ -82,6 +81,25 @@ jobs:
             exit 1
           fi
           echo "chunks=[$(seq -s, 1 "$WPT_CHUNKS")]" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - name: WPT checkout (pinned, shallow)
+        run: git submodule update --init --depth 1 third_party/wpt
+      - uses: astral-sh/setup-uv@v10.3.0
+      - name: WPT manifest (built once for every chunk)
+        run: |
+          python3 tools/wpt/cli.py manifest
+          mkdir -p wpt-manifest
+          cp third_party/wpt/MANIFEST.json wpt-manifest/
+          if compgen -G "$HOME/.cache/tinybrowser/wpt-manifest-*.stamp" > /dev/null; then
+            cp "$HOME"/.cache/tinybrowser/wpt-manifest-*.stamp wpt-manifest/
+          else
+            echo "::warning::no manifest stamp; every chunk will walk the tree itself"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wpt-manifest
+          path: wpt-manifest/
+          retention-days: 3
 
   build:
     runs-on: ubuntu-24.04
@@ -108,7 +126,14 @@ jobs:
             ~/.cargo/git
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.18.0"
       - name: Build the wpt profile
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           cargo build --profile wpt --locked
           cp "$(./tools/binary-path --profile wpt)" tinybrowser-wpt
@@ -120,27 +145,10 @@ jobs:
             echo "::error::missing runtime libraries in the runner image:"$'\n'"$missing"
             exit 1
           fi
-      - uses: astral-sh/setup-uv@v10.3.0
-      - name: WPT manifest (built once for every chunk)
-        run: |
-          git submodule update --init --depth 1 third_party/wpt
-          python3 tools/wpt/cli.py manifest
-          mkdir -p wpt-manifest
-          cp third_party/wpt/MANIFEST.json wpt-manifest/
-          if compgen -G "$HOME/.cache/tinybrowser/wpt-manifest-*.stamp" > /dev/null; then
-            cp "$HOME"/.cache/tinybrowser/wpt-manifest-*.stamp wpt-manifest/
-          else
-            echo "::warning::no manifest stamp; every chunk will walk the tree itself"
-          fi
       - uses: actions/upload-artifact@v7
         with:
           name: tinybrowser-wpt
           path: tinybrowser-wpt
-          retention-days: 3
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wpt-manifest
-          path: wpt-manifest/
           retention-days: 3
 
   wpt:
