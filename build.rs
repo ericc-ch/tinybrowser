@@ -5,7 +5,7 @@
 //! Every link uses the toolchain's default rust-lld (the rustc 1.98.1
 //! `unknown relocation (1875)` DWARF bug that forced bfd onto dev/test links
 //! is gone on the pinned nightly). Nothing unwinds in release (`panic =
-//! "immediate-abort"` via build-std; QuickJS-ng uses setjmp/longjmp), so
+//! "abort"` from the profile; QuickJS-ng uses setjmp/longjmp), so
 //! `[profile.release] rustflags` disables unwind-table emission outright
 //! (`force-unwind-tables=no`): the shipping binary carries no `.eh_frame`
 //! bodies beyond the CRT startup objects' 48-byte CIE. No post-link step is

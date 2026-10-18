@@ -14,14 +14,16 @@
 //! ```
 //!
 //! The file sink is best-effort and never blocks a logging thread. A full
-//! queue drops lines, and release builds abort on panic (`panic = "abort"`),
-//! so whatever is still queued at that point is lost.
+//! queue drops lines. Release builds abort on panic (`panic = "abort"`), so
+//! within the panic path the queue is bypassed: [`install`] also sets a panic
+//! hook that appends the panic record straight to the log file and stderr.
 //!
 //! ```
 //! logging::install(logging::Level::Debug, None);
 //! logging::info!(target: "example", "ready");
 //! ```
 
+mod crash;
 mod file;
 mod format;
 
@@ -98,11 +100,14 @@ impl fmt::Display for ParseLevelError {
 impl std::error::Error for ParseLevelError {}
 
 /// Installs the process logger: records at or above `level` go to stderr and,
-/// when `file` is given, to that file from one background writer thread.
+/// when `file` is given, to that file from one background writer thread. Also
+/// installs the panic hook, which writes its record synchronously instead of
+/// through the queue.
 ///
 /// A file that cannot be opened is reported on stderr and skipped; logging
 /// never takes the process down. A second install is ignored.
 pub fn install(level: Level, file: Option<PathBuf>) {
+    crash::install(file.clone());
     let _ = LOGGER.set(Logger::new(level, file));
 }
 

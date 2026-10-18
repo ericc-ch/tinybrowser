@@ -2,15 +2,15 @@
 RUST_TEST_THREADS = "1"
 
 # QuickJS-ng is the only C compiled in the graph (rquickjs-sys via cc). C
-# unwind tables serve backtraces only: nothing unwinds (release panics with
-# `immediate-abort`; QuickJS-ng uses setjmp instead of exceptions), so drop
-# them (about 53 KB). Plain [env], no force, so an ambient CFLAGS still wins.
+# unwind tables serve backtraces only: nothing unwinds (release panics abort;
+# QuickJS-ng uses setjmp instead of exceptions), so drop them (about 53 KB).
+# Plain [env], no force, so an ambient CFLAGS still wins.
 CFLAGS = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
 
 # Build-std for every target build (dev, test, release). The pinned toolchain
-# is nightly specifically for this: `panic = "immediate-abort"` and the
-# per-content panic strategy both need in-tree core/std. Shipping path stays
-# exactly `cargo build --release` (see docs/size.md reproduction note).
+# is nightly specifically for `[profile.release] rustflags` (see Cargo.toml)
+# and for rebuilding core/std in-tree. Shipping path stays exactly
+# `cargo build --release`.
 [unstable]
 build-std = ["std", "core", "alloc", "panic_abort"]
 

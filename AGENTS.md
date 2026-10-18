@@ -12,6 +12,24 @@ Maximize web spec conformance per byte.
 - Commit messages should also record decisions.
 - Throwaway experiments belong in `/tmp/`.
 
+## Size and release
+
+- Size is a headline constraint, but never pay with a used feature. `display: grid`, for example, stays: real pages use it, so grid layout code stays. Cut code nothing calls, not conformance.
+- No binary packing. No compressor, stub, or self-extractor step (nothing UPX-like). Shrink real code, then strip what no consumer reads.
+- The shipped artifact is `cargo build --release`. There is no post-link step (`tools/release` was deleted once the compiler could emit no unwind tables). Any future post-link step must work on a copy, smoke-test it, then replace atomically.
+- The toolchain is pinned nightly (`rust-toolchain.toml`) for `[profile.release] rustflags` and in-tree std. Release invariants live in `Cargo.toml`/`build.rs` with their size reason: `panic = "abort"`, `force-unwind-tables=no`, `[unstable] build-std`. Changing one means re-measuring; see `docs/size.md`.
+- Release never unwinds. Design for it: no cleanup may depend on `Drop` after a panic, never use `catch_unwind` on a production path, and a child process must not outlive its parent (`crates/browser/src/child/mod.rs` exits on channel EOF).
+- A panic must leave a record. The panic hook writes synchronously to the log file before the abort (`crates/logging/src/crash.rs`); the async log queue is lost on abort. Keep crash-path code panic-free.
+
+## Method
+
+- Measure the ceiling before designing. Prove what a change can win (stub the code out, read `.text`, count call sites) before writing it.
+- Record flat experiments. Negative results are results, so nobody retries them: outlining generated groups, `#[inline(never)]` on conversion helpers, link-time ICF, and dictionary dedup all measured flat or negligible.
+- Data over code. Generated glue becomes tables plus shared funnels: monomorphize per IDL type, never per member.
+- Parity gates every refactor. WPT before/after must match exactly (same pass/unexp/timeout/crash counts), and any release-binary change gets a WPT smoke run via `--binary`.
+- Delete stale config when its reason expires. Workarounds (bfd linker flags, an extra nightly dev shell, the post-link script, an unused wasm target) are removed with the reason recorded in the commit, not left to rot.
+- Forks are for correctness, not micro-wins. A fork change needs a spec or crash reason recorded in `docs/upstream.md`; compile or size tricks stay upstream.
+
 ## Pointers
 
 - **Web API bindings & IDL**: Read `docs/bindings.md` for JS/Rust ownership, WebIDL contracts, and platform objects.

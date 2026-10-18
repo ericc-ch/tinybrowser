@@ -1,7 +1,6 @@
 cargo-features = [
-    "panic-immediate-abort",
-    # `[profile.release] rustflags` keeps the release-only codegen shapes out
-    # of dev/test links.
+    # `[profile.release] rustflags` keeps release-only codegen shapes out of
+    # dev/test links.
     "profile-rustflags",
 ]
 
@@ -134,10 +133,10 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "immediate-abort"
-# No unwinder can run (`immediate-abort` panics, QuickJS uses setjmp), so no
-# function needs unwind tables. Emitting none at codegen beats deleting them
-# post-link: the bytes are never produced.
+panic = "abort"
+# No unwinder runs (abort panics, QuickJS uses setjmp), so no function needs
+# unwind tables. Emitting none at codegen beats deleting them post-link: the
+# bytes are never produced. The panic hook still runs (see logging).
 rustflags = ["-C", "force-unwind-tables=no"]
 
 # ─── WPT profile ──────────────────────────────────────────────────────────────
