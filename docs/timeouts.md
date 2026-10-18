@@ -23,7 +23,7 @@ A timeout also hides work: the runner kills the browser, so the report says
 
 ## How to diagnose one
 
-    nix develop --command ./tools/wpt/profile <test-path> [-- --test-types reftest]
+    nix develop --command python3 tools/wpt/cli.py profile <test-path> [-- --test-types reftest]
 
 `profile` reruns the file at trace and prints the browser's navigation/request
 timeline plus wall time. Read it as: the last record before the silence is what
