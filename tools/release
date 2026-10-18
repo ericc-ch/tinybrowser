@@ -2,10 +2,11 @@
 # Build the release binary and drop `.eh_frame`.
 #
 # `cargo build --release` already links with lld + ICF, RELR relative
-# relocations, and no `.eh_frame_hdr` (see `build.rs`). This step removes the
-# `.eh_frame` body, which nothing reads once the header is gone: the release
-# profile is `panic = "abort"` and QuickJS-ng uses setjmp/longjmp, so no
-# unwinder ever runs. Debug and test binaries are untouched.
+# relocations, and no `.eh_frame_hdr` (see `build.rs`), and the release profile
+# is `panic = "immediate-abort"` (no panic formatting, no unwinding; QuickJS-ng
+# uses setjmp/longjmp), so no unwinder ever runs. This step removes the
+# `.eh_frame` body, which nothing reads once the header is gone. Debug and
+# test binaries are untouched.
 #
 # The replacement is atomic: objcopy and the `--version` smoke test run on a
 # copy, and only a copy that both succeeds and runs replaces the artifact.

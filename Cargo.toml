@@ -1,3 +1,5 @@
+cargo-features = ["panic-immediate-abort"]
+
 [workspace]
 exclude = ["third_party/rquickjs", "third_party/weedle4", "third_party/fontconfig-parser", "third_party/blitz", "third_party/html5ever"]
 members = [
@@ -127,7 +129,7 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
+panic = "immediate-abort"
 
 # ─── WPT profile ──────────────────────────────────────────────────────────────
 # Conformance runs measure the engine against testharness file timeouts. A

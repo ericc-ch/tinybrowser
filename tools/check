@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Workspace checks: clippy, embedded JS syntax, rustdoc, Python, Valgrind.
 #
-#   clippy    stable shell. `cargo fmt --all --check`, then workspace lints,
-#            then `node --check` on JavaScript
-#            `include_str!`'d into the renderer, then the realm-free layer
-#            check (dom/ and documents.rs never name Ctx/Value/Persistent/
-#            JsNode), then `cargo doc --no-deps --document-private-items`
-#            (intra-doc link lints are denied workspace-wide, so a bare or
-#            stale path fails here instead of shipping, private items
-#            included), then the Astral Python stack on tools/wpt
-#            (`ruff check`, `ruff format --check`, `ty check`, all via uvx
-#            with versions pinned below). Always run this.
-#   valgrind nightly shell. Runs test binaries under Valgrind's memcheck,
-#            including the C QuickJS build. It sees heap misuse and
-#            uninitialized reads across the FFI boundary but does not model
-#            Rust aliasing rules, and it is slow.
+#   clippy    `cargo fmt --all --check`, then workspace lints,
+#             then `node --check` on JavaScript
+#             `include_str!`'d into the renderer, then the realm-free layer
+#             check (dom/ and documents.rs never name Ctx/Value/Persistent/
+#             JsNode), then `cargo doc --no-deps --document-private-items`
+#             (intra-doc link lints are denied workspace-wide, so a bare or
+#             stale path fails here instead of shipping, private items
+#             included), then the Astral Python stack on tools/wpt
+#             (`ruff check`, `ruff format --check`, `ty check`, all via uvx
+#             with versions pinned below). Always run this.
+#   valgrind  Runs test binaries under Valgrind's memcheck (the default
+#             shell includes it), including the C QuickJS build. It sees
+#             heap misuse and uninitialized reads across the FFI boundary
+#             but does not model Rust aliasing rules, and it is slow.
 #
 # With no subcommand, clippy (including embedded JS). AddressSanitizer is not wired:
 # `-Zsanitizer=address` makes rustc reject the sanitizer-built rquickjs-macro
@@ -120,7 +120,7 @@ run_py() {
 }
 
 valgrind_test() {
-  nix develop .#check --command env \
+  nix develop --command env \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
     cargo test --target x86_64-unknown-linux-gnu "$@"
 }

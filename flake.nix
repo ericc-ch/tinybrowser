@@ -22,11 +22,10 @@
         overlays = [ rust-overlay.overlays.default ];
       };
       rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-      # Nightly is the check shell for Valgrind; builds and clippy still use
-      # the pinned stable toolchain above. Enter with `nix develop .#check`.
-      checkToolchain = pkgs.rust-bin.nightly.latest.default.override {
-        extensions = [ "rust-src" ];
-      };
+      # Pinned nightly (rust-toolchain.toml): the release profile uses
+      # `panic = "immediate-abort"` and `.cargo/config.toml` builds std
+      # in-tree (`[unstable] build-std`), both of which need a nightly
+      # toolchain with `rust-src`.
       runtimeLibs = pkgs.lib.makeLibraryPath [
         pkgs.openssl
         pkgs.fontconfig
@@ -47,26 +46,6 @@
           strictDeps = true;
           nativeBuildInputs = [
             rustToolchain
-            pkgs.pkg-config
-            pkgs.nodejs_24
-            (pkgs.python3.withPackages (ps: [ ps.mako ]))
-          ];
-          buildInputs = [
-            pkgs.openssl
-            pkgs.fontconfig
-          ];
-          env = {
-            OPENSSL_NO_VENDOR = "1";
-          };
-          inherit shellHook;
-        };
-
-        # Nightly checks: Valgrind. Same build deps as the default shell,
-        # nightly toolchain instead of the pinned stable one.
-        check = pkgs.mkShell {
-          strictDeps = true;
-          nativeBuildInputs = [
-            checkToolchain
             pkgs.pkg-config
             pkgs.nodejs_24
             pkgs.valgrind
