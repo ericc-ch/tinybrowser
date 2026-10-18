@@ -177,6 +177,7 @@ pub(crate) fn install_unscopables(prototype: &Object<'_>, names: &[&str]) -> Res
 /// Read a reflected `DOMString` attribute: the content attribute value,
 /// or the empty string when missing
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflect>).
+#[inline(never)]
 pub(crate) fn reflect_string<'js>(
     ctx: &Ctx<'js>,
     element: NodeId,
@@ -418,6 +419,7 @@ pub(crate) fn require_constructor(params: &Params<'_, '_>) -> Result<()> {
     }
 }
 
+#[inline(never)]
 pub(crate) fn require_arguments(params: &Params<'_, '_>, minimum: usize) -> Result<()> {
     // https://webidl.spec.whatwg.org/#dfn-overload-resolution-algorithm
     if params.len() >= minimum {
@@ -436,6 +438,7 @@ pub(crate) fn receiver<'js, T: JsClass<'js>>(params: &Params<'_, 'js>) -> Result
         .map_err(|_| Exception::throw_type(params.ctx(), "incompatible receiver"))
 }
 
+#[inline(never)]
 pub(crate) fn node_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<NodeReference> {
     // https://webidl.spec.whatwg.org/#js-interface
     // https://dom.spec.whatwg.org/#interface-attr
@@ -452,6 +455,7 @@ pub(crate) fn node_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<N
     Err(Exception::throw_type(ctx, "argument is not a Node"))
 }
 
+#[inline(never)]
 pub(crate) fn nullable_node_argument<'js>(
     ctx: &Ctx<'js>,
     value: &Value<'js>,
@@ -468,6 +472,7 @@ pub(crate) fn nullable_node_argument<'js>(
 /// serializes, falling back to the raw value when parsing fails. A present
 /// but empty attribute still resolves (to the base URL itself)
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
+#[inline(never)]
 pub(crate) fn reflect_url_string(
     ctx: &Ctx<'_>,
     id: NodeId,
@@ -755,6 +760,7 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
 /// The receiver JS object for hand methods that keep it (observer identity
 /// for callback delivery). The receiver check already passed, so a missing
 /// object is an internal error, never a user throw.
+#[inline(never)]
 pub(crate) fn this_object<'js>(params: &Params<'_, 'js>) -> Result<Object<'js>> {
     params
         .this()
@@ -762,6 +768,7 @@ pub(crate) fn this_object<'js>(params: &Params<'_, 'js>) -> Result<Object<'js>> 
         .ok_or_else(|| Exception::throw_internal(params.ctx(), "native receiver has no object"))
 }
 
+#[inline(never)]
 pub(crate) fn put_forwards<'js>(
     params: &Params<'_, 'js>,
     name: &str,
@@ -797,6 +804,7 @@ pub(crate) fn put_forwards<'js>(
 /// A `USVString` argument: `ToString`, then lone surrogates become U+FFFD
 /// (unlike `DOMString`, this conversion never throws for them)
 /// (<https://webidl.spec.whatwg.org/#es-USVString>).
+#[inline(never)]
 pub(crate) fn usv_string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
@@ -811,6 +819,7 @@ pub(crate) fn usv_string_argument<'js>(
     rquickjs::String::from_str(params.ctx().clone(), &lossy)
 }
 
+#[inline(never)]
 pub(crate) fn string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
@@ -833,6 +842,7 @@ pub(crate) fn string_argument<'js>(
 
 /// A `boolean` argument, converted with the pristine `ToBoolean`
 /// (<https://webidl.spec.whatwg.org/#es-boolean>).
+#[inline(never)]
 pub(crate) fn boolean_argument(params: &Params<'_, '_>, index: usize) -> Result<bool> {
     let ctx = params.ctx();
     let value = params
@@ -841,6 +851,7 @@ pub(crate) fn boolean_argument(params: &Params<'_, '_>, index: usize) -> Result<
     super::to_boolean(ctx, &value)
 }
 
+#[inline(never)]
 pub(crate) fn callback_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Function<'js>> {
     // https://webidl.spec.whatwg.org/#js-callback-function
     value
@@ -851,6 +862,7 @@ pub(crate) fn callback_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Resu
 
 /// A `[LegacyNullToEmptyString]` `DOMString` argument: null becomes empty.
 /// (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
+#[inline(never)]
 pub(crate) fn legacy_null_string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
@@ -862,6 +874,7 @@ pub(crate) fn legacy_null_string_argument<'js>(
     }
 }
 
+#[inline(never)]
 pub(crate) fn document_type_argument<'js>(
     ctx: &Ctx<'js>,
     value: &Value<'js>,
@@ -888,6 +901,7 @@ pub(crate) fn document_type_argument<'js>(
     }
 }
 
+#[inline(never)]
 pub(crate) fn nullable_string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
@@ -920,6 +934,7 @@ pub(crate) fn dict_flag<'js>(
 /// A promise already resolved with `undefined`, for synchronous operations
 /// whose IDL result is `Promise<undefined>`
 /// (<https://webidl.spec.whatwg.org/#es-promise>).
+#[inline(never)]
 pub(crate) fn resolved_promise<'js>(ctx: &Ctx<'js>) -> Result<Value<'js>> {
     let (promise, resolve, _) = ctx.promise()?;
     resolve.call::<_, ()>((Value::new_undefined(ctx.clone()),))?;
@@ -1016,6 +1031,7 @@ pub(crate) fn dict_string_sequence<'js>(
 
 /// A record sequence result as a fresh JS array
 /// (<https://webidl.spec.whatwg.org/#es-sequence>).
+#[inline(never)]
 pub(crate) fn sequence<'js>(ctx: &Ctx<'js>, values: Vec<Value<'js>>) -> Result<Value<'js>> {
     let array = rquickjs::Array::new(ctx.clone())?;
     for (index, value) in values.into_iter().enumerate() {
@@ -1037,4 +1053,184 @@ pub(crate) fn report_callback_error(ctx: &Ctx<'_>, error: &rquickjs::Error) {
         let caught = ctx.catch();
         super::report_exception_value(ctx, caught, 0, "");
     }
+}
+
+// ─── Conversion funnels ───────────────────────────────────────────────────────
+// Generated dispatch arms call these instead of inlining conversion logic.
+// Each is `#[inline(never)]` so the whole graph shares one copy per funnel
+// (one per IDL type for the generic ones), not one copy per member arm.
+
+#[inline(never)]
+pub(crate) fn ret<'js, T: rquickjs::IntoJs<'js>>(result: T, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    rquickjs::IntoJs::into_js(result, ctx)
+}
+
+#[inline(never)]
+pub(crate) fn ret_nullable<'js, T: rquickjs::IntoJs<'js>>(
+    result: Option<T>,
+    ctx: &Ctx<'js>,
+) -> Result<Value<'js>> {
+    // https://webidl.spec.whatwg.org/#es-nullable-type
+    match result {
+        Some(result) => rquickjs::IntoJs::into_js(result, ctx),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
+/// A `USVString` return value: lone surrogates become U+FFFD on the way out
+/// (<https://webidl.spec.whatwg.org/#idl-USVString>).
+#[inline(never)]
+pub(crate) fn ret_usv<'js>(
+    result: crate::dom_string::DomString,
+    ctx: &Ctx<'js>,
+) -> Result<Value<'js>> {
+    let lossy = result.to_string_lossy();
+    rquickjs::IntoJs::into_js(lossy.as_ref(), ctx)
+}
+
+/// An enumeration return value: the IDL string for the enum value.
+#[inline(never)]
+pub(crate) fn ret_enum<'js>(
+    result: impl AsRef<str>,
+    ctx: &Ctx<'js>,
+) -> Result<Value<'js>> {
+    let result = rquickjs::String::from_str(ctx.clone(), result.as_ref())?;
+    rquickjs::IntoJs::into_js(result, ctx)
+}
+
+#[inline(never)]
+pub(crate) fn ret_undefined<'js>(ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    Ok(Value::new_undefined(ctx.clone()))
+}
+
+/// A `sequence<DOMString>` return value.
+#[inline(never)]
+pub(crate) fn ret_string_sequence<'js>(
+    result: Vec<String>,
+    ctx: &Ctx<'js>,
+) -> Result<Value<'js>> {
+    let values = result
+        .into_iter()
+        .map(|item| rquickjs::String::from_str(ctx.clone(), &item).map(rquickjs::String::into_value))
+        .collect::<Result<Vec<Value>>>()?;
+    sequence(ctx, values)
+}
+
+/// Fetches one argument value, standing in `undefined` for an omitted one.
+/// Shared so arms carry a call, not the fetch-and-default logic.
+#[inline(never)]
+pub(crate) fn fetch<'js>(params: &Params<'_, 'js>, index: usize) -> Value<'js> {
+    // https://webidl.spec.whatwg.org/#dfn-overload-resolution-algorithm
+    params
+        .arg(index)
+        .unwrap_or_else(|| Value::new_undefined(params.ctx().clone()))
+}
+
+/// A required `long` argument (<https://webidl.spec.whatwg.org/#es-long>).
+#[inline(never)]
+pub(crate) fn long_argument(params: &Params<'_, '_>, index: usize) -> Result<i32> {
+    let value = fetch(params, index);
+    let converted: Coerced<i32> = Coerced::from_js(params.ctx(), value)?;
+    Ok(converted.0)
+}
+
+/// A required `unsigned long` argument (<https://webidl.spec.whatwg.org/#es-unsigned-long>).
+#[inline(never)]
+pub(crate) fn ulong_argument(params: &Params<'_, '_>, index: usize) -> Result<u32> {
+    let value = fetch(params, index);
+    let converted: Coerced<i32> = Coerced::from_js(params.ctx(), value)?;
+    Ok(converted.0.cast_unsigned())
+}
+
+/// A required `unsigned short` argument
+/// (<https://webidl.spec.whatwg.org/#es-unsigned-short>).
+#[inline(never)]
+pub(crate) fn ushort_argument(params: &Params<'_, '_>, index: usize) -> Result<u16> {
+    let value = fetch(params, index);
+    let converted: Coerced<i32> = Coerced::from_js(params.ctx(), value)?;
+    // Wrapping arithmetic, like the `cast_unsigned` conversions above: the
+    // remainder always fits, so the fallback is dead.
+    Ok(u16::try_from(converted.0.rem_euclid(65536)).unwrap_or(u16::MAX))
+}
+
+/// A required `double` argument (<https://webidl.spec.whatwg.org/#es-double>).
+#[inline(never)]
+pub(crate) fn double_argument(params: &Params<'_, '_>, index: usize) -> Result<f64> {
+    let value = fetch(params, index);
+    let converted: Coerced<f64> = Coerced::from_js(params.ctx(), value)?;
+    Ok(converted.0)
+}
+
+/// A restricted `double` argument, rejecting NaN and infinities.
+#[inline(never)]
+pub(crate) fn restricted_double_argument(params: &Params<'_, '_>, index: usize) -> Result<f64> {
+    let value = fetch(params, index);
+    let converted: Coerced<f64> = Coerced::from_js(params.ctx(), value)?;
+    if !converted.0.is_finite() {
+        return Err(rquickjs::Exception::throw_type(
+            params.ctx(),
+            "finite double required",
+        ));
+    }
+    Ok(converted.0)
+}
+
+/// An optional `DOMString` argument: omitted (`undefined`) is `None`.
+#[inline(never)]
+pub(crate) fn optional_string_argument<'js>(
+    params: &Params<'_, 'js>,
+    index: usize,
+) -> Result<Option<rquickjs::String<'js>>> {
+    let value = fetch(params, index);
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    // https://webidl.spec.whatwg.org/#es-DOMString
+    Coerced::<rquickjs::String>::from_js(params.ctx(), value)
+        .map(|string| string.0)
+        .map(Some)
+}
+
+/// A `nullable unsigned long` argument: `null` and `undefined` are `None`.
+#[inline(never)]
+pub(crate) fn nullable_ulong_argument(
+    params: &Params<'_, '_>,
+    index: usize,
+) -> Result<Option<u32>> {
+    let value = fetch(params, index);
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    // https://webidl.spec.whatwg.org/#es-unsigned-long
+    let converted: Coerced<i32> = Coerced::from_js(params.ctx(), value)?;
+    Ok(Some(converted.0.cast_unsigned()))
+}
+
+/// An optional `boolean` argument with no default: `undefined` is `None`.
+#[inline(never)]
+pub(crate) fn optional_boolean_argument(
+    params: &Params<'_, '_>,
+    index: usize,
+) -> Result<Option<bool>> {
+    let value = fetch(params, index);
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    // https://webidl.spec.whatwg.org/#es-boolean
+    super::to_boolean(params.ctx(), &value).map(Some)
+}
+
+/// A `boolean` argument with an IDL default: `undefined` takes the default
+/// (<https://webidl.spec.whatwg.org/#es-boolean>).
+#[inline(never)]
+pub(crate) fn boolean_argument_with_default(
+    params: &Params<'_, '_>,
+    index: usize,
+    default: bool,
+) -> Result<bool> {
+    let value = fetch(params, index);
+    if value.is_undefined() {
+        return Ok(default);
+    }
+    super::to_boolean(params.ctx(), &value)
 }

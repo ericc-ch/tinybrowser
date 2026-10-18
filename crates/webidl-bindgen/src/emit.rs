@@ -29,29 +29,6 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
     let (alternate_dispatch, alternate_groups) = alternate_dispatch(interface);
     let legacy_code = legacy_codes(interface);
     let definition = definition(interface, &payload, required);
-    let conversion_import = if interface.attributes.iter().any(|attribute| {
-        matches!(
-            attribute.mapping,
-            GetterMapping::Reflect { .. } | GetterMapping::ReflectUrl { .. }
-        ) || matches!(
-            attribute.return_type,
-            ReturnType::String
-                | ReturnType::UsvString
-                | ReturnType::NullableString
-                | ReturnType::Boolean
-                | ReturnType::UnsignedShort
-                | ReturnType::UnsignedLong
-                | ReturnType::NullableUnsignedLong
-                | ReturnType::Long
-                | ReturnType::Double
-                | ReturnType::RestrictedDouble
-                | ReturnType::Enumeration(_)
-        )
-    }) {
-        quote! { use rquickjs::IntoJs; }
-    } else {
-        quote! {}
-    };
     let constructor_dispatch = match interface.kind {
         InterfaceKind::Complete => quote! {
             if operation.index() == 0 {
@@ -85,7 +62,6 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
             use crate::js::bindings::host;
             use rquickjs::{Ctx, Object, Result, Value};
             use rquickjs::function::Params;
-            #conversion_import
 
             #tables
             #contract
@@ -745,10 +721,13 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             // attribute exactly like `DOMString` (stored content is
             // already scalar values); only the setter argument converts.
             ReturnType::String | ReturnType::UsvString => quote! {
-                host::reflect_string(&ctx, receiver.node_id(), #content)?.into_js(&ctx)
+                host::ret(
+                    host::reflect_string(&ctx, receiver.node_id(), #content)?,
+                    &ctx,
+                )
             },
             ReturnType::Boolean => quote! {
-                host::reflect_bool(&ctx, receiver.node_id(), #content)?.into_js(&ctx)
+                host::ret(host::reflect_bool(&ctx, receiver.node_id(), #content)?, &ctx)
             },
             _ => unreachable!("validated reflect mapping"),
         },
@@ -756,50 +735,28 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             quote! {
                 let result: crate::dom_string::DomString =
                     host::reflect_url_string(&ctx, receiver.node_id(), #content)?;
-                result.to_string_lossy().into_js(&ctx)
+                host::ret_usv(result, &ctx)
             }
         }
         GetterMapping::Method => match getter.return_type {
             ReturnType::String => {
-                quote! { let result = #call?; result.into_js(&ctx) }
+                quote! { host::ret(#call?, &ctx) }
             }
-            ReturnType::UsvString => quote! {
-                let result = #call?;
-                let result = result.to_string_lossy();
-                result.into_js(&ctx)
-            },
-            ReturnType::Boolean => quote! {
-                let result: bool = #call?;
-                result.into_js(&ctx)
-            },
-            ReturnType::UnsignedShort => {
-                quote! { let result: u16 = #call?; result.into_js(&ctx) }
+            ReturnType::UsvString => {
+                quote! { host::ret_usv(#call?, &ctx) }
+            }
+            ReturnType::Boolean | ReturnType::UnsignedShort | ReturnType::UnsignedLong => {
+                quote! { host::ret(#call?, &ctx) }
             }
             ReturnType::Long => {
-                quote! { let result: i32 = #call?; result.into_js(&ctx) }
+                quote! { host::ret(#call?, &ctx) }
             }
-            ReturnType::UnsignedLong => quote! {
-                let result = #call?;
-                result.into_js(&ctx)
-            },
-            ReturnType::NullableString => quote! {
-                let result: Option<rquickjs::String> = #call?;
-                match result {
-                    Some(result) => result.into_js(&ctx),
-                    None => Ok(Value::new_null(ctx)),
-                }
-            },
-            ReturnType::NullableUnsignedLong => quote! {
-                let result: Option<u32> = #call?;
-                match result {
-                    Some(result) => result.into_js(&ctx),
-                    None => Ok(Value::new_null(ctx)),
-                }
-            },
+            ReturnType::NullableString | ReturnType::NullableUnsignedLong => {
+                quote! { host::ret_nullable(#call?, &ctx) }
+            }
             ReturnType::Double | ReturnType::RestrictedDouble => quote! {
                 // https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp
-                let result: f64 = #call?;
-                result.into_js(&ctx)
+                host::ret(#call?, &ctx)
             },
             ReturnType::NullableNode | ReturnType::PlatformObject => {
                 quote! { #call }
@@ -812,8 +769,7 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             }
             ReturnType::Enumeration(_) => quote! {
                 let result = #call?;
-                let result = rquickjs::String::from_str(ctx.clone(), result.as_str())?;
-                rquickjs::IntoJs::into_js(result, &ctx)
+                host::ret_enum(result.as_str(), &ctx)
             },
             ReturnType::Node
             | ReturnType::Callback
@@ -833,92 +789,6 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
     quote! { #id => { #body } }
 }
 
-/// Fetches the first argument into `value`, standing in `undefined` for an
-/// omitted one.
-fn fetch_first_argument() -> TokenStream {
-    quote! {
-        let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-    }
-}
-
-/// Yields the `WebIDL` `long` conversion of the fetched `value`.
-fn long_from_value() -> TokenStream {
-    quote! {
-        {
-            // https://webidl.spec.whatwg.org/#es-long
-            let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-            converted.0
-        }
-    }
-}
-
-/// Yields the `WebIDL` `unsigned short` conversion of the fetched `value`.
-fn ushort_from_value() -> TokenStream {
-    quote! {
-        {
-            // https://webidl.spec.whatwg.org/#es-unsigned-short
-            // Wrapping arithmetic, like the `cast_unsigned` conversions
-            // above: the remainder always fits, so the fallback is dead.
-            let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-            u16::try_from(converted.0.rem_euclid(65536)).unwrap_or(u16::MAX)
-        }
-    }
-}
-
-/// Yields the `WebIDL` `short` conversion of the fetched `value`.
-fn short_from_value() -> TokenStream {
-    quote! {
-        {
-            // https://webidl.spec.whatwg.org/#es-short
-            // Wrapping arithmetic, like the `cast_unsigned` conversions
-            // above: the remainder always fits, so the fallback is dead.
-            let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-            u16::try_from(converted.0.rem_euclid(65536))
-                .map(u16::cast_signed)
-                .unwrap_or(0)
-        }
-    }
-}
-
-/// Yields the `WebIDL` `unsigned long` conversion of the fetched `value`.
-fn ulong_from_value() -> TokenStream {
-    quote! {
-        {
-            // https://webidl.spec.whatwg.org/#es-unsigned-long
-            let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-            converted.0.cast_unsigned()
-        }
-    }
-}
-
-/// Yields the `WebIDL` `double` conversion of the fetched `value`.
-fn double_from_value() -> TokenStream {
-    quote! {
-        {
-            // https://webidl.spec.whatwg.org/#es-double
-            let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
-            converted.0
-        }
-    }
-}
-
-/// Yields the `WebIDL` restricted `double` conversion of the fetched `value`,
-/// rejecting NaN and infinities.
-fn restricted_double_from_value() -> TokenStream {
-    quote! {
-        {
-            let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
-            if !converted.0.is_finite() {
-                return Err(rquickjs::Exception::throw_type(
-                    &ctx,
-                    "finite double required",
-                ));
-            }
-            converted.0
-        }
-    }
-}
-
 /// One attribute setter's value conversion from the first argument.
 fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool) -> TokenStream {
     match return_type {
@@ -930,54 +800,27 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
         ReturnType::UsvString => quote! { host::usv_string_argument(params, 0)? },
         ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
         ReturnType::NullableUnsignedLong => {
-            let fetch = fetch_first_argument();
-            let convert = ulong_from_value();
-            quote! {
-                {
-                    #fetch
-                    if value.is_null() || value.is_undefined() {
-                        None
-                    } else {
-                        Some(#convert)
-                    }
-                }
-            }
+            quote! { host::nullable_ulong_argument(params, 0)? }
         }
         // https://webidl.spec.whatwg.org/#es-boolean
         ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
         // https://webidl.spec.whatwg.org/#es-unsigned-long
-        ReturnType::UnsignedLong => {
-            let fetch = fetch_first_argument();
-            let convert = ulong_from_value();
-            quote! { { #fetch #convert } }
-        }
+        ReturnType::UnsignedLong => quote! { host::ulong_argument(params, 0)? },
         // https://webidl.spec.whatwg.org/#es-long
-        ReturnType::Long => {
-            let fetch = fetch_first_argument();
-            let convert = long_from_value();
-            quote! { { #fetch #convert } }
-        }
+        ReturnType::Long => quote! { host::long_argument(params, 0)? },
         // https://webidl.spec.whatwg.org/#es-double
-        ReturnType::Double => {
-            let fetch = fetch_first_argument();
-            let convert = double_from_value();
-            quote! { { #fetch #convert } }
-        }
+        ReturnType::Double => quote! { host::double_argument(params, 0)? },
         // Restricted `double` rejects NaN and infinities.
         ReturnType::RestrictedDouble => {
-            let fetch = fetch_first_argument();
-            let convert = restricted_double_from_value();
-            quote! { { #fetch #convert } }
+            quote! { host::restricted_double_argument(params, 0)? }
         }
         // A platform-object setter takes the value as-is.
-        ReturnType::PlatformObject => quote! {
-            params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()))
-        },
+        ReturnType::PlatformObject => quote! { host::fetch(params, 0) },
         ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             quote! {
                 {
-                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                    let value = host::fetch(params, 0);
                     #name::from_value(&ctx, value)?
                 }
             }
@@ -1051,28 +894,14 @@ fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenSt
         // https://webidl.spec.whatwg.org/#es-boolean
         ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
         // https://webidl.spec.whatwg.org/#es-long
-        ReturnType::Long => {
-            let fetch = fetch_first_argument();
-            let convert = long_from_value();
-            quote! { { #fetch #convert } }
-        }
+        ReturnType::Long => quote! { host::long_argument(params, 0)? },
         // https://webidl.spec.whatwg.org/#es-unsigned-long
-        ReturnType::UnsignedLong => {
-            let fetch = fetch_first_argument();
-            let convert = ulong_from_value();
-            quote! { { #fetch #convert } }
-        }
+        ReturnType::UnsignedLong => quote! { host::ulong_argument(params, 0)? },
         // https://webidl.spec.whatwg.org/#es-double
-        ReturnType::Double => {
-            let fetch = fetch_first_argument();
-            let convert = double_from_value();
-            quote! { { #fetch #convert } }
-        }
+        ReturnType::Double => quote! { host::double_argument(params, 0)? },
         // Restricted `double` rejects NaN and infinities.
         ReturnType::RestrictedDouble => {
-            let fetch = fetch_first_argument();
-            let convert = restricted_double_from_value();
-            quote! { { #fetch #convert } }
+            quote! { host::restricted_double_argument(params, 0)? }
         }
         _ => unreachable!("validated reflect mapping"),
     };
@@ -1140,18 +969,14 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
     let body = match operation.result {
         OperationResult::Object => quote! { #call },
         OperationResult::Union => quote! {
-            let result = #call?;
-            rquickjs::IntoJs::into_js(result, &ctx)
+            host::ret(#call?, &ctx)
         },
         OperationResult::NullableUnion => quote! {
-            match #call? {
-                Some(result) => rquickjs::IntoJs::into_js(result, &ctx),
-                None => Ok(Value::new_null(ctx.clone())),
-            }
+            host::ret_nullable(#call?, &ctx)
         },
         OperationResult::Undefined => quote! {
             #call?;
-            Ok(Value::new_undefined(ctx.clone()))
+            host::ret_undefined(&ctx)
         },
         OperationResult::PromiseUndefined => quote! {
             #call?;
@@ -1162,34 +987,19 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
             host::sequence(&ctx, result)
         },
         OperationResult::StringSequence => quote! {
-            let result: Vec<String> = #call?;
-            let values = result
-                .into_iter()
-                .map(|item| rquickjs::String::from_str(ctx.clone(), &item).map(rquickjs::String::into_value))
-                .collect::<Result<Vec<Value>>>()?;
-            host::sequence(&ctx, values)
+            host::ret_string_sequence(#call?, &ctx)
         },
         OperationResult::String => quote! {
-            #call.map(rquickjs::String::into_value)
+            host::ret(#call?, &ctx)
         },
         OperationResult::NullableString => quote! {
-            #call.map(|value| value.map_or_else(|| Value::new_null(ctx.clone()), rquickjs::String::into_value))
+            host::ret_nullable(#call?, &ctx)
         },
-        OperationResult::Boolean => quote! {
-            let result: bool = #call?;
-            rquickjs::IntoJs::into_js(result, &ctx)
-        },
-        OperationResult::UnsignedShort => quote! {
-            let result: u16 = #call?;
-            rquickjs::IntoJs::into_js(result, &ctx)
-        },
-        OperationResult::Short => quote! {
-            let result: i16 = #call?;
-            rquickjs::IntoJs::into_js(result, &ctx)
-        },
+        OperationResult::Boolean | OperationResult::UnsignedShort | OperationResult::Short => {
+            quote! { host::ret(#call?, &ctx) }
+        }
         OperationResult::Long => quote! {
-            let result: i32 = #call?;
-            rquickjs::IntoJs::into_js(result, &ctx)
+            host::ret(#call?, &ctx)
         },
     };
     let body = if operation.reactions {
@@ -1333,24 +1143,56 @@ fn operation_argument_at(
         | ReturnType::Union(..)
         | ReturnType::NullableUnion(..) => converted_argument(argument, variable, &fetch),
         ReturnType::String => {
-            let conversion = if argument.legacy_null_to_empty {
-                quote! { host::legacy_null_string_argument(params, #index)? }
-            } else {
-                quote! { host::string_argument(params, #index, None)? }
+            // https://webidl.spec.whatwg.org/#es-DOMString
+            let conversion = match (argument.arity, argument.legacy_null_to_empty) {
+                (ArgumentArity::Optional, false) => {
+                    quote! { host::optional_string_argument(params, #index)? }
+                }
+                (ArgumentArity::Optional, true) => quote! {
+                    {
+                        // (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>)
+                        let value = host::fetch(params, #index);
+                        if value.is_undefined() {
+                            None
+                        } else if value.is_null() {
+                            Some(rquickjs::String::from_str(ctx.clone(), "")?)
+                        } else {
+                            Some(host::string_argument(params, #index, None)?)
+                        }
+                    }
+                },
+                (_, true) => quote! { host::legacy_null_string_argument(params, #index)? },
+                (_, false) => quote! { host::string_argument(params, #index, None)? },
             };
-            optional_argument(&fetch, variable, &conversion, argument.arity)
+            quote! { let #variable = #conversion; }
         }
         ReturnType::UsvString => {
             // Handled like `DOMString` except for lone surrogates; legacy
             // null is rejected at contract time.
-            let conversion = quote! { host::usv_string_argument(params, #index)? };
-            optional_argument(&fetch, variable, &conversion, argument.arity)
+            let conversion = if argument.arity == ArgumentArity::Optional {
+                quote! {
+                    {
+                        let value = host::fetch(params, #index);
+                        if value.is_undefined() {
+                            None
+                        } else {
+                            Some(host::usv_string_argument(params, #index)?)
+                        }
+                    }
+                }
+            } else {
+                quote! { host::usv_string_argument(params, #index)? }
+            };
+            quote! { let #variable = #conversion; }
         }
         ReturnType::NullableString => quote! {
             let #variable = host::nullable_string_argument(params, #index)?;
         },
         ReturnType::NullableDocumentType => {
             let fetch = if argument.null_default {
+                // An omitted optional argument takes its default before
+                // conversion, so `= null` supplies `null`, not `undefined`
+                // (<https://webidl.spec.whatwg.org/#es-any>).
                 quote! {
                     let value = params.arg(#index).unwrap_or_else(|| Value::new_null(ctx.clone()));
                 }
@@ -1362,88 +1204,61 @@ fn operation_argument_at(
                 let #variable = host::document_type_argument(&ctx, &value)?;
             }
         }
-        ReturnType::Boolean
-            if argument.arity == ArgumentArity::Optional && argument.boolean_default.is_none() =>
-        {
-            quote! {
-                #fetch
-                // https://webidl.spec.whatwg.org/#es-boolean
-                let #variable = if value.is_undefined() {
-                    None
-                } else {
-                    Some(host::boolean_argument(params, #index)?)
-                };
-            }
-        }
-        ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
-        ReturnType::UnsignedShort => numeric_argument(&fetch, variable, &ushort_from_value()),
-        ReturnType::Short => numeric_argument(&fetch, variable, &short_from_value()),
-        ReturnType::UnsignedLong => numeric_argument(&fetch, variable, &ulong_from_value()),
-        ReturnType::Long => numeric_argument(&fetch, variable, &long_from_value()),
-        ReturnType::Double => numeric_argument(&fetch, variable, &double_from_value()),
-        ReturnType::RestrictedDouble => {
-            numeric_argument(&fetch, variable, &restricted_double_from_value())
-        }
-        _ => unreachable!("validated operation argument"),
-    }
-}
-
-/// Fetches one value and converts it with a numeric `*_from_value` helper.
-fn numeric_argument(
-    fetch: &TokenStream,
-    variable: &proc_macro2::Ident,
-    convert: &TokenStream,
-) -> TokenStream {
-    quote! {
-        #fetch
-        let #variable = #convert;
-    }
-}
-
-/// Wraps a value conversion for an optional operation argument: `undefined`
-/// stays `None`, otherwise the conversion runs for `Some`.
-fn optional_argument(
-    fetch: &TokenStream,
-    variable: &proc_macro2::Ident,
-    conversion: &TokenStream,
-    arity: ArgumentArity,
-) -> TokenStream {
-    if arity == ArgumentArity::Optional {
-        quote! {
-            #fetch
-            let #variable = if value.is_undefined() {
-                None
-            } else {
-                Some(#conversion)
+        ReturnType::Boolean => {
+            // https://webidl.spec.whatwg.org/#es-boolean
+            let conversion = match (argument.arity, argument.boolean_default) {
+                (ArgumentArity::Required, None) => {
+                    quote! { host::boolean_argument(params, #index)? }
+                }
+                (ArgumentArity::Required, Some(default)) => {
+                    quote! { host::boolean_argument_with_default(params, #index, #default)? }
+                }
+                (ArgumentArity::Optional, None) => {
+                    quote! { host::optional_boolean_argument(params, #index)? }
+                }
+                (ArgumentArity::Optional, Some(default)) => quote! {
+                    host::boolean_argument_with_default(params, #index, #default)?
+                },
+                // Variadic booleans are rejected at contract time.
+                (ArgumentArity::Variadic, None) => {
+                    quote! { host::boolean_argument(params, #index)? }
+                }
+                (ArgumentArity::Variadic, Some(default)) => quote! {
+                    host::boolean_argument_with_default(params, #index, #default)?
+                },
             };
+            quote! { let #variable = #conversion; }
         }
-    } else {
-        quote! { let #variable = #conversion; }
-    }
-}
-
-/// `boolean` argument conversion with its optional default
-/// (<https://webidl.spec.whatwg.org/#es-boolean>).
-fn boolean_argument(
-    argument: &OperationArgument,
-    variable: &proc_macro2::Ident,
-    fetch: &TokenStream,
-) -> TokenStream {
-    let default = argument.boolean_default.map_or_else(
-        || quote! {},
-        |default| {
-            quote! {
-                let value = if value.is_undefined() {
-                    Value::new_bool(ctx.clone(), #default)
-                } else { value };
-            }
+        ReturnType::UnsignedShort => quote! {
+            // https://webidl.spec.whatwg.org/#es-unsigned-short
+            let #variable = host::ushort_argument(params, #index)?;
         },
-    );
-    quote! {
-        #fetch
-        #default
-        let converted: rquickjs::Coerced<bool> = rquickjs::FromJs::from_js(&ctx, value)?;
-        let #variable = converted.0;
+        ReturnType::Short => quote! {
+            // https://webidl.spec.whatwg.org/#es-short
+            // Wrapping arithmetic, like the `cast_unsigned` conversions
+            // above: the remainder always fits, so the fallback is dead.
+            let value = host::fetch(params, #index);
+            let converted: rquickjs::Coerced<i32> = rquickjs::Coerced::from_js(&ctx, value)?;
+            let #variable = u16::try_from(converted.0.rem_euclid(65536))
+                .map(u16::cast_signed)
+                .unwrap_or(0);
+        },
+        ReturnType::UnsignedLong => quote! {
+            // https://webidl.spec.whatwg.org/#es-unsigned-long
+            let #variable = host::ulong_argument(params, #index)?;
+        },
+        ReturnType::Long => quote! {
+            // https://webidl.spec.whatwg.org/#es-long
+            let #variable = host::long_argument(params, #index)?;
+        },
+        ReturnType::Double => quote! {
+            // https://webidl.spec.whatwg.org/#es-double
+            let #variable = host::double_argument(params, #index)?;
+        },
+        ReturnType::RestrictedDouble => quote! {
+            let #variable = host::restricted_double_argument(params, #index)?;
+        },
+        _ => unreachable!("validated operation argument"),
     }
 }
 

@@ -52,9 +52,27 @@ impl CustomElementReactions {
 // https://html.spec.whatwg.org/multipage/custom-elements.html#cereactions
 // Chromium's CEReactionsScope also preserves the original exception while
 // invoking reactions on exceptional exits.
+//
+// The typed shell lets generated setters keep their `(value)` closure while
+// the scaffolding lives in one shared copy, reached through a `dyn FnMut`
+// call instead of a per-closure LLVM clone of this whole body.
+#[inline(never)]
 pub(crate) fn with_reactions<'js>(
     ctx: &Ctx<'js>,
     operation: impl FnOnce() -> Result<Value<'js>>,
+) -> Result<Value<'js>> {
+    let mut operation = Some(operation);
+    with_reactions_core(ctx, &mut || {
+        // Never `None`: the core calls the closure exactly once.
+        let operation = operation.take().expect("reactions closure reused");
+        operation()
+    })
+}
+
+#[inline(never)]
+fn with_reactions_core<'js>(
+    ctx: &Ctx<'js>,
+    operation: &mut dyn FnMut() -> Result<Value<'js>>,
 ) -> Result<Value<'js>> {
     push(ctx)?;
     let result = operation();
