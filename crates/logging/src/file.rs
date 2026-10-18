@@ -134,7 +134,10 @@ fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(backup)
 }
 
-fn open(path: &Path) -> io::Result<File> {
+/// Opens `path` for appending with the same permissions policy as the sink
+/// (0600 file, 0700 parent). Shared with the panic hook so a hook-created log
+/// cannot be world-readable.
+pub(crate) fn open(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         let _ = restrict_dir(parent);

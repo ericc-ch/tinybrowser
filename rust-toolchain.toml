@@ -1,4 +1,7 @@
 [toolchain]
 channel = "nightly-2026-09-17"
 components = ["rustfmt", "clippy", "rust-src"]
+# tinybrowser-wasm (crates/wasm) is the cdylib component built for this target;
+# it is the only consumer, and wasm is a P2 area in docs/priorities.md.
+targets = ["wasm32-wasip2"]
 profile = "minimal"

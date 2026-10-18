@@ -432,6 +432,7 @@ pub(crate) fn require_arguments(params: &Params<'_, '_>, minimum: usize) -> Resu
     }
 }
 
+#[inline(never)]
 pub(crate) fn receiver<'js, T: JsClass<'js>>(params: &Params<'_, 'js>) -> Result<Class<'js, T>> {
     // https://webidl.spec.whatwg.org/#es-attributes
     Class::from_value(&params.this())
@@ -1177,14 +1178,11 @@ pub(crate) fn optional_string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
 ) -> Result<Option<rquickjs::String<'js>>> {
-    let value = fetch(params, index);
-    if value.is_undefined() {
+    if fetch(params, index).is_undefined() {
         return Ok(None);
     }
     // https://webidl.spec.whatwg.org/#es-DOMString
-    Coerced::<rquickjs::String>::from_js(params.ctx(), value)
-        .map(|string| string.0)
-        .map(Some)
+    string_argument(params, index, None).map(Some)
 }
 
 /// A `nullable unsigned long` argument: `null` and `undefined` are `None`.
@@ -1198,8 +1196,7 @@ pub(crate) fn nullable_ulong_argument(
         return Ok(None);
     }
     // https://webidl.spec.whatwg.org/#es-unsigned-long
-    let converted: Coerced<i32> = Coerced::from_js(params.ctx(), value)?;
-    Ok(Some(converted.0.cast_unsigned()))
+    ulong_argument(params, index).map(Some)
 }
 
 /// An optional `boolean` argument with no default: `undefined` is `None`.
@@ -1208,12 +1205,11 @@ pub(crate) fn optional_boolean_argument(
     params: &Params<'_, '_>,
     index: usize,
 ) -> Result<Option<bool>> {
-    let value = fetch(params, index);
-    if value.is_undefined() {
+    if fetch(params, index).is_undefined() {
         return Ok(None);
     }
     // https://webidl.spec.whatwg.org/#es-boolean
-    super::to_boolean(params.ctx(), &value).map(Some)
+    boolean_argument(params, index).map(Some)
 }
 
 /// A `boolean` argument with an IDL default: `undefined` takes the default

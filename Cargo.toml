@@ -139,6 +139,20 @@ panic = "abort"
 # bytes are never produced. The panic hook still runs (see logging).
 rustflags = ["-C", "force-unwind-tables=no"]
 
+# `[unstable] build-std` applies to every profile. In dev/test that means std
+# is built at `opt-level = 0` instead of the toolchain's release-optimized
+# prebuilt std, which measurably slowed the suite: `cargo test -p renderer`
+# went from 13.85s to 24.9s. Optimize the four crates std owns; our crates and
+# dependencies keep the dev profile's settings so compiles stay fast.
+[profile.dev.package.std]
+opt-level = 2
+[profile.dev.package.core]
+opt-level = 2
+[profile.dev.package.alloc]
+opt-level = 2
+[profile.dev.package.panic_abort]
+opt-level = 2
+
 # ─── WPT profile ──────────────────────────────────────────────────────────────
 # Conformance runs measure the engine against testharness file timeouts. A
 # debug build spends that budget inside a `-O0` QuickJS interpreter, so slow

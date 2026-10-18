@@ -111,6 +111,14 @@ jobs:
           sudo apt-get update -qq &&
           sudo apt-get install -y -qq --no-install-recommends
           libfontconfig1-dev libssl-dev pkg-config
+      - name: Toolchain
+        # `rust-toolchain.toml` pins a nightly and `.cargo/config.toml` builds
+        # std in-tree, so the runner needs that toolchain plus `rust-src`.
+        # Install it here: an implicit rustup auto-install during `cargo build`
+        # would be the failure point with no name.
+        run: |
+          rustup toolchain install --profile minimal --component rust-src
+          cargo --version
       - name: Submodules (build inputs only, shallow)
         run: |
           git submodule update --init --depth 1 --jobs 4 \

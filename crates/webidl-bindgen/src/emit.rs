@@ -1246,8 +1246,8 @@ fn operation_scalar_argument(
         },
         ReturnType::Short => quote! {
             // https://webidl.spec.whatwg.org/#es-short
-            // Wrapping arithmetic, like the `cast_unsigned` conversions
-            // above: the remainder always fits, so the fallback is dead.
+            // Inline rather than funnelled: no interface in the corpus takes a
+            // `short` argument, so the conversion stays where it is used.
             let value = host::fetch(params, #index);
             let converted: rquickjs::Coerced<i32> = rquickjs::Coerced::from_js(&ctx, value)?;
             let #variable = u16::try_from(converted.0.rem_euclid(65536))

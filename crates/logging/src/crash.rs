@@ -8,7 +8,6 @@
 //!
 //! The hook must not panic: every step is best-effort.
 
-use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -62,8 +61,10 @@ fn format_line(location: &str, message: &str) -> String {
 
 /// Appends one record through a fresh handle: the writer thread rotates the
 /// file to `<file>.1`, so a cached handle could point at the rotated inode.
+/// Opens through the sink's own `open`, so a hook-created log gets the same
+/// 0600 file and 0700 parent as the sink's.
 fn append(path: &std::path::Path, line: &str) {
-    if let Ok(mut file) = OpenOptions::new().append(true).create(true).open(path) {
+    if let Ok(mut file) = crate::file::open(path) {
         let _ = file.write_all(line.as_bytes());
         let _ = file.flush();
     }
@@ -75,6 +76,9 @@ mod tests {
 
     #[test]
     fn installed_hook_records_a_panic_in_the_log_file() {
+        // Process-global state (logger + panic hook) is safe here because the
+        // workspace pins RUST_TEST_THREADS=1 and this is the only test that
+        // installs the logger.
         let dir = std::env::temp_dir().join(format!(
             "tinybrowser-panic-{}-{}",
             std::process::id(),

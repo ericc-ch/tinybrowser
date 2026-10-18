@@ -13,5 +13,3 @@ CFLAGS = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
 # `cargo build --release`.
 [unstable]
 build-std = ["std", "core", "alloc", "panic_abort"]
-
-

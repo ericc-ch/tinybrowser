@@ -22,10 +22,9 @@
         overlays = [ rust-overlay.overlays.default ];
       };
       rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-      # Pinned nightly (rust-toolchain.toml): the release profile uses
-      # `panic = "immediate-abort"` and `.cargo/config.toml` builds std
-      # in-tree (`[unstable] build-std`), both of which need a nightly
-      # toolchain with `rust-src`.
+      # Pinned nightly (rust-toolchain.toml): `[profile.release] rustflags`
+      # (unwind tables off) and `.cargo/config.toml`'s in-tree std both need a
+      # nightly toolchain with `rust-src`.
       runtimeLibs = pkgs.lib.makeLibraryPath [
         pkgs.openssl
         pkgs.fontconfig
