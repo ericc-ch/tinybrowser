@@ -1,5 +1,5 @@
 # Chunked WPT runs for sets too long for one machine. Local loops stay on
-# tools/wpt/run; this workflow is the full-suite pass. Each run keeps its
+# tools/wpt/cli.py; this workflow is the full-suite pass. Each run keeps its
 # raw chunk reports as artifacts, so a score can be reproduced without
 # rerunning anything.
 #
@@ -197,7 +197,7 @@ jobs:
             echo "::error::test-types is empty; nothing would run"
             exit 1
           fi
-          ./tools/wpt/run --binary "$BINARY" -- \
+          python3 tools/wpt/cli.py run --binary "$BINARY" -- \
             --log-wptreport "$REPORT" \
             --log-raw "$RAW" \
             --no-fail-on-unexpected \

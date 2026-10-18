@@ -34,7 +34,7 @@ ship in the binary.
 - WPT submodule at third_party/wpt. IDL extracts snapshotted to
   crates/webidl-bindgen/idl/ via tools/webidl/import (manifest pins
   revision + sha256; tools/check enforces). Never edit extracts to
-  match code. Runner: tools/wpt/run; parser gate:
+  match code. Runner: tools/wpt/cli.py; parser gate:
   html/syntax/parsing/html5lib_*.html.
 - Blink inspector-protocol snapshot at third_party/blink-cdp.
   Revision in REVISION file. Update: set REVISION, run

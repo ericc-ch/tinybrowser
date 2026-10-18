@@ -8,6 +8,8 @@ scheduling, driving, and reporting. This file owns the phases around it:
 * `rerun`  — re-run only the attention set from a saved wptreport.
 * `merge`  — fold the chunk reports of a CI run into one score.
 * `profile` — run tests (or read one report) and rank them by wall time.
+* `failures` — print the canonical failure list from a `--score` log.
+* `baseline` — run a slice at two revisions, diff the failure lists.
 * `manifest` — one manifest walk for a chunked CI run (build job).
 * `overnight` — full-suite run + score (needs explicit approval per AGENTS.md).
 
@@ -2138,6 +2140,263 @@ def overnight_main(options: Options, argv: list[str]) -> int:
     return finish_scored_run(report_path, runner_exit, save_report, started)
 
 
+# --- `failures` / `baseline` (canonical lists, two-revision diff) ---
+
+# The `▶` blocks the runner prints are the canonical record: the score table
+# truncates its attention list, but every failing result keeps a full block.
+# The runner's formatter prints two block headers and their detail lines:
+#   "  ▶ STATUS [expected ...] PATH"             a top-level result
+#   "  ▶ Unexpected (subtest )?result in PATH:"  a subtest grouping header
+#   "  │|└ STATUS [expected ...] SUBTEST"        a subtest
+# Continuation lines ("│   → message", "└ url") do not start with a status.
+_FAILURE_BLOCK = "  ▶ "
+_FAILURE_UNEXPECTED = re.compile(r"^Unexpected (subtest )?result in ")
+_FAILURE_EXPECTED = re.compile(r"^[A-Z][A-Z_-]* \[expected[^\]]*\] ")
+_FAILURE_STATUS = re.compile(r"^[A-Z][A-Z_-]* ")
+_FAILURE_FIRST_FIELD = re.compile(r" .*")
+_FAILURE_SUBTEST = re.compile(r"^  [│└] [A-Z][A-Z_-]*( |$)")
+_FAILURE_SUBTEST_LEAD = re.compile(r"^  [│└] +")
+_FAILURE_TRAILING_COLON = re.compile(r":$")
+
+FAILURES_USAGE = "failures [LOG...]   (or pipe one log on stdin)"
+
+BASELINE_USAGE = """baseline REV PATH... [-- upstream-flags...]
+
+Run the same WPT slice against REV and the working tree, then diff the two
+canonical failure lists. Both runs use this checkout's WPT, venv, and
+manifest; only the browser binary differs, so a fresh failure is the working
+tree's. REV must pin the same third_party build submodules as this checkout.
+The baseline binary is built in a detached worktree with its own target dir,
+and that worktree is removed on exit; run logs stay in the temp dir printed.
+
+Exit: 0 no new failures, 1 new failures, 2 usage, setup, or runner error."""
+
+
+def failure_lines(lines: Iterable[str]) -> list[str]:
+    """One canonical line per failing result: `STATUS PATH :: SUBTEST`.
+
+    Top-level results (an ERROR or TIMEOUT with no failing subtests) print as
+    `STATUS PATH :: [top-level]`; subtests print their own line. Sorted and
+    deduplicated, so two such lists compare with set operations.
+    """
+    out: list[str] = []
+    path = ""
+    for line in lines:
+        if line.startswith(_FAILURE_BLOCK):
+            header = line[len(_FAILURE_BLOCK) :]
+            if _FAILURE_UNEXPECTED.match(header):
+                path = _FAILURE_UNEXPECTED.sub("", header)
+            else:
+                top = _FAILURE_FIRST_FIELD.sub("", header)
+                path = header
+                if _FAILURE_EXPECTED.match(path):
+                    path = _FAILURE_EXPECTED.sub("", path)
+                else:
+                    path = _FAILURE_STATUS.sub("", path)
+                out.append(f"{top} {path} :: [top-level]")
+            path = _FAILURE_TRAILING_COLON.sub("", path)
+        elif _FAILURE_SUBTEST.match(line):
+            body = _FAILURE_SUBTEST_LEAD.sub("", line)
+            status = _FAILURE_FIRST_FIELD.sub("", body)
+            if _FAILURE_EXPECTED.match(body):
+                body = _FAILURE_EXPECTED.sub("", body)
+            else:
+                body = _FAILURE_STATUS.sub("", body)
+            if path and body:
+                out.append(f"{status} {path} :: {body}")
+    return sorted(set(out))
+
+
+def read_log(path: Path) -> str | None:
+    try:
+        return path.read_text(errors="replace")
+    except OSError as error:
+        eprint(f"cannot read {path}: {error}")
+        return None
+
+
+def failures_main(argv: list[str]) -> int:
+    if argv and argv[0] in ("-h", "--help"):
+        print(FAILURES_USAGE)
+        return 0
+    if not argv:
+        text = sys.stdin.read()
+    else:
+        parts: list[str] = []
+        for name in argv:
+            part = read_log(Path(name))
+            if part is None:
+                return 1
+            parts.append(part)
+        text = "\n".join(parts)
+    for line in failure_lines(text.splitlines()):
+        print(line)
+    return 0
+
+
+def _remove_worktree(worktree: Path) -> None:
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree)],
+        cwd=str(ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if worktree.exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+
+
+def build_baseline_binary(worktree: Path, tmp: Path) -> Path | None:
+    """Builds REV's browser in its worktree, returning the copied binary.
+
+    The worktree build gets its own target dir: the machine shares one target
+    dir across checkouts (~/.cargo/config.toml), and same-version path
+    dependencies from another revision would otherwise poison this checkout's
+    fingerprints (e.g. an old webidl-bindgen reused by the new build script).
+    """
+    env = {**os.environ, "CARGO_TARGET_DIR": str(tmp / "target")}
+    cargo_toml = (worktree / "Cargo.toml").read_text(errors="replace")
+    if any(line.startswith("[profile.wpt]") for line in cargo_toml.splitlines()):
+        profile = ["--profile", "wpt"]
+        build = ["cargo", "build", "-q", "--profile", "wpt"]
+    else:
+        # The `wpt` profile arrives with ec99fb4c; older revisions take the
+        # same settings through cargo's dev-profile override, so both sides of
+        # a diff build with the same optimization level.
+        profile = []
+        env["CARGO_PROFILE_DEV_OPT_LEVEL"] = "2"
+        build = ["cargo", "build", "-q"]
+    if subprocess.run(build, cwd=str(worktree), env=env).returncode != 0:
+        return None
+    located = subprocess.run(
+        [str(ROOT / "tools" / "binary-path"), *profile],
+        cwd=str(worktree),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    source = Path(located.stdout.decode(errors="replace").strip())
+    if located.returncode != 0 or not source.is_file():
+        return None
+    out = tmp / "tinybrowser-baseline"
+    shutil.copy2(source, out)
+    return out
+
+
+def baseline_score(
+    paths: list[str],
+    runner: list[str],
+    flags: list[str],
+    binary: Path | None,
+    log: Path,
+) -> int:
+    """Runs one side of the diff, streaming everything it prints into `log`."""
+    command = [sys.executable, str(CLI), "run", *paths, *flags, "--score"]
+    if binary is not None:
+        command += ["--binary", str(binary)]
+    command += runner
+    eprint(f"$ {shlex.join(command)} > {log}")
+    with open(log, "w") as handle:
+        return subprocess.run(
+            command, cwd=str(ROOT), stdout=handle, stderr=subprocess.STDOUT
+        ).returncode
+
+
+def baseline_main(options: Options, argv: list[str]) -> int:
+    if argv and argv[0] in ("-h", "--help"):
+        print(BASELINE_USAGE)
+        return 0
+    if len(argv) < 2:
+        return die("baseline", BASELINE_USAGE, 2)
+    rev, rest = argv[0], argv[1:]
+    cut = rest.index("--") if "--" in rest else len(rest)
+    paths, runner = rest[:cut], rest[cut:]
+    if not paths:
+        return die("baseline", "no test paths given", 2)
+    if git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"]) is None:
+        return die("baseline", f"{rev} is not a commit", 2)
+
+    tmp = Path(
+        tempfile.mkdtemp(
+            prefix="tinybrowser-baseline.", dir=os.environ.get("TMPDIR") or "/tmp"
+        )
+    )
+    worktree = tmp / "tree"
+    keep_logs = False
+    try:
+        if git(["worktree", "add", "--detach", str(worktree), rev]) is None:
+            return die("baseline", f"cannot create a worktree at {worktree}", 2)
+        eprint(f"baseline: {rev} -> {worktree}")
+        # A linked worktree cannot reuse the cached submodule clones, and the
+        # network may not be available, so copy this checkout's build
+        # submodules in. The WPT submodule stays empty: the runner falls back
+        # to this checkout's WPT (and its venv).
+        for sub in (
+            "third_party/rquickjs",
+            "third_party/blitz",
+            "third_party/html5ever",
+        ):
+            pinned = git(["rev-parse", f"{rev}:{sub}"])
+            actual = git(["rev-parse", "HEAD"], cwd=ROOT / sub)
+            if pinned is None or pinned != actual:
+                eprint(
+                    f"baseline: {rev} pins {sub} at {(pinned or 'nothing')[:12]}, "
+                    f"this checkout has {(actual or 'nothing')[:12]}"
+                )
+                eprint("baseline: update that submodule to the pinned commit and retry")
+                return 2
+            dest = worktree / sub
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(ROOT / sub, dest, symlinks=True)
+        eprint(f"baseline: building {rev}")
+        baseline_bin = build_baseline_binary(worktree, tmp)
+        if baseline_bin is None:
+            return die("baseline", f"could not build {rev}", 2)
+
+        flags = replace(options, binary=None).flags()
+        baseline_log = tmp / "baseline.log"
+        current_log = tmp / "current.log"
+        eprint(f"baseline: running the slice at {rev}")
+        base_status = baseline_score(paths, runner, flags, baseline_bin, baseline_log)
+        eprint("baseline: running the slice at the working tree")
+        current_status = baseline_score(paths, runner, flags, None, current_log)
+        keep_logs = True
+        if base_status != 0 or current_status != 0:
+            eprint(
+                f"baseline: runner failed (baseline {base_status}, "
+                f"working tree {current_status}); logs: {tmp}"
+            )
+            return 2
+
+        base_failures = failure_lines((read_log(baseline_log) or "").splitlines())
+        current_failures = failure_lines((read_log(current_log) or "").splitlines())
+        new = sorted(set(current_failures) - set(base_failures))
+        fixed = sorted(set(base_failures) - set(current_failures))
+        print(f"baseline {rev}: {len(base_failures)} failing results")
+        print(f"working tree:   {len(current_failures)} failing results")
+        if fixed:
+            print()
+            print("only in baseline (fixed):")
+            for line in fixed:
+                print(f"  {line}")
+        if new:
+            print()
+            print("only in the working tree (new failures):")
+            for line in new:
+                print(f"  {line}")
+            print()
+            print(f"logs: {tmp}")
+            return 1
+        print()
+        print(f"no new failures; logs: {tmp}")
+        return 0
+    finally:
+        _remove_worktree(worktree)
+        if not keep_logs:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --- selftest ---
 
 
@@ -2387,6 +2646,8 @@ def _selftest() -> None:
     assert parse_merge_argv(["a.json", "b.json", "--total-chunks", "2"])[3] is not None
 
     _selftest_profile()
+    _selftest_failures()
+    _selftest_baseline()
     _selftest_merge()
 
 
@@ -2441,6 +2702,62 @@ def _selftest_profile() -> None:
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 assert profile_main(Options(), bad) == 2, bad
+
+
+def _selftest_failures() -> None:
+    """failures: the canonical list is a pure fold over the runner's blocks."""
+    log = (
+        "  ▶ ERROR [expected OK] /a/top.html\n"
+        "  ▶ TIMEOUT [expected OK] /b/timeout.html\n"
+        "  ▶ NOTRUN /c/notrun.html\n"
+        "  ▶ Unexpected subtest result in /d/sub.html:\n"
+        "  │ FAIL [expected PASS] first subtest\n"
+        "  │   → assert_equals: expected 1 but got 2\n"
+        "  │ \n"
+        "  │     at foo (eval:1:1)\n"
+        "  └     at bar (eval:2:2)\n"
+        "  ▶ Unexpected subtest result in /e/multi.html:\n"
+        "  │ TIMEOUT subtest with status only\n"
+        "  ▶ Unexpected subtest result in /d/sub.html:\n"
+        "  │ FAIL [expected PASS] first subtest\n"
+    )
+    assert failure_lines(log.splitlines()) == [
+        "ERROR /a/top.html :: [top-level]",
+        "FAIL /d/sub.html :: first subtest",
+        "NOTRUN /c/notrun.html :: [top-level]",
+        "TIMEOUT /b/timeout.html :: [top-level]",
+        "TIMEOUT /e/multi.html :: subtest with status only",
+    ]
+    # No block header yet: a stray subtest has no path to belong to.
+    assert failure_lines(["noise", "  │ FAIL [expected PASS] x"]) == []
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "score.log"
+        path.write_text(log)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            assert failures_main([str(path)]) == 0
+        assert "ERROR /a/top.html :: [top-level]" in stdout.getvalue()
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert failures_main(["--help"]) == 0
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            assert failures_main([str(Path(tmp) / "missing.log")]) == 1
+
+
+def _selftest_baseline() -> None:
+    """baseline: the argument grammar rejects before it touches the tree."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert baseline_main(Options(), ["--help"]) == 0
+    with (
+        contextlib.redirect_stderr(io.StringIO()),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        assert baseline_main(Options(), []) == 2
+        assert baseline_main(Options(), ["d78b30e"]) == 2
+        assert baseline_main(Options(), ["d78b30e", "--"]) == 2
+        assert baseline_main(Options(), ["not-a-commit", "dom/"]) == 2
 
 
 def _selftest_merge() -> None:
@@ -2543,7 +2860,7 @@ def _selftest_merge() -> None:
             assert merge_main([str(empty)]) == 1
 
 
-TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | manifest | overnight | selftest
+TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest
 
   run PATH... [--score] [--dry-run] [-- upstream-flags...]
     Run WPT. Upstream flags follow `--` (or start implicitly at the first
@@ -2568,6 +2885,14 @@ TOP_HELP = """tinybrowser WPT harness: run | score | rerun | merge | profile | m
     end in milliseconds while the test still times out mean the renderer is
     spinning, not the network. Records sit at the browser's seams, never in
     the renderer crate (that crate is shared with wasm and carries no logger).
+  failures [LOG...]
+    Print the canonical failure list of a `--score` log, one
+    `STATUS PATH :: SUBTEST` line per failing result, sorted and deduplicated.
+    Reads stdin when given no logs.
+  baseline REV PATH... [-- upstream-flags...]
+    Run the slice at REV and in the working tree and diff the failure lists;
+    exit 1 on a failure the working tree adds. The baseline browser is built
+    in a detached worktree that is removed on exit.
   manifest
     Build MANIFEST.json plus its stamp once per chunked CI run, so chunk
     jobs can skip the tree walk. The stamp only ever makes runs faster.
@@ -2589,11 +2914,12 @@ Harness flags (any subcommand, before `--`):
   --lock-timeout SECONDS how long to wait for a held lock
 
 Examples:
-  tools/wpt/run dom/events/ --exclude=worker
-  tools/wpt/run --score dom/nodes/ -- --processes 4
-  tools/wpt/rerun /tmp/fileapi.json -- --processes 8 --fully-parallel
+  cli.py run dom/events/ --exclude=worker
+  cli.py run --score dom/nodes/ -- --processes 4
+  cli.py rerun /tmp/fileapi.json -- --processes 8 --fully-parallel
   cli.py merge reports/*.json --out merged.json
   cli.py profile referrer-policy/gen/req.rel-noref/no-referrer/a-tag.http.html
+  cli.py baseline d78b30e dom/nodes/Document-adoptNode.html
 """
 
 
@@ -2621,6 +2947,10 @@ def main(argv: list[str] | None = None) -> int:
         return merge_main(args)
     if command == "profile":
         return profile_main(options, args)
+    if command == "failures":
+        return failures_main(args)
+    if command == "baseline":
+        return baseline_main(options, args)
     if command == "manifest":
         return manifest_main(options, args)
     if command == "overnight":
@@ -2635,7 +2965,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     return die(
         "wpt",
-        f"unknown command {command}; expected run | score | rerun | merge | manifest | profile | overnight | selftest",
+        f"unknown command {command}; expected run | score | rerun | merge | profile | failures | baseline | manifest | overnight | selftest",
         2,
     )
 
