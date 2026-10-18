@@ -49,6 +49,18 @@ in a JS callback (see `docs/upstream.md`).
 
 ## Experiments measured flat (do not retry)
 
+- Replacing `serde_json` in the protocol layer (`cdp`, `webdriver`, `server`).
+  Measured in a standalone probe with the same flags (`opt-level = "z"`, fat
+  LTO, `codegen-units = 1`, `panic = "abort"`), same workload, byte-identical
+  output: `serde_json` costs 29.5 KiB over a no-JSON baseline, a hand-rolled
+  DOM 37.3 KiB, a direct writer (no response tree) 35.7 KiB, and `miniserde`
+  23.4 KiB. miniserde is the only winner, at ~6 KiB of library plus ~100 B per
+  `json!` site, so ~15-25 KiB (0.2%) for rewriting 259 `Value` references and
+  149 `json!` sites across the three crates — not worth it. The hand-rolled
+  variants lose on float tables (`core`'s `POWER_OF_FIVE_128` 10.4 KiB plus
+  `ryu`'s `DOUBLE_POW5_*` 10.7 KiB) that `serde_json` avoids with its own 2.5
+  KiB `POW10` table and `zmij`. The per-type codegen that JSON used to cost is
+  already gone: the binary holds 13.8 KiB of derived `serde` impls in total.
 - `#[inline(never)]` on generated dispatch groups: flat (outlining relocates code).
 - `#[inline(never)]` on conversion helpers alone: flat (arms still inlined their own copies).
 - Link-time `--icf=all`: flat (no identical function bodies to fold).
