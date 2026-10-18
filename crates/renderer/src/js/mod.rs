@@ -1153,14 +1153,11 @@ impl JsRealm {
         bridge::object(ctx)?.set(
             "__tbResolveUrl",
             Func::from(move |input: String, base: Option<String>| {
-                let fallback = url_resolve.borrow().document_url.clone();
                 let resolved = match base {
                     Some(base) => url::Url::parse(&base)
                         .ok()
                         .and_then(|base| base.join(&input).ok()),
-                    None => url::Url::parse(&input)
-                        .ok()
-                        .or_else(|| fallback.join(&input).ok()),
+                    None => url_resolve.borrow().resolve_relative(&input),
                 };
                 resolved.map(|url| url.to_string())
             }),
@@ -1660,7 +1657,12 @@ fn sync_fetch_value(
 /// `data:`) documents send nothing; an empty policy means
 /// `strict-origin-when-cross-origin`.
 fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
-    referrer_for_policy(&world.referrer_policy, &world.document_url, request_url)
+    // An `about:srcdoc` document's requests carry the creator's URL as the
+    // referrer source — `about:srcdoc` itself is a local scheme, and the
+    // local-scheme rule below would send nothing where browsers send the
+    // embedding document's URL.
+    let source = world.base_url.as_ref().unwrap_or(&world.document_url);
+    referrer_for_policy(&world.referrer_policy, source, request_url)
 }
 
 /// The violations compiling `source` produces against the document's policies,

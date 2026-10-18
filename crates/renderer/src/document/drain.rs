@@ -101,7 +101,7 @@ impl Document {
     }
 
     pub(crate) fn waiting_for_load(&self) -> bool {
-        self.queued_dials.iter().any(|dial| match &dial.context {
+        let dial_waiting = self.queued_dials.iter().any(|dial| match &dial.context {
             DialContext::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
             DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
             // Blitz tracks its own critical resources; ours never gate load.
@@ -109,7 +109,9 @@ impl Document {
             DialContext::BlitzResource { .. }
             | DialContext::JsFetch { .. }
             | DialContext::CspReport => false,
-        }) || self.parser_blocked_script.is_some()
+        });
+        dial_waiting
+            || self.parser_blocked_script.is_some()
             || self.frame_load_in_flight
             || self.active_buffer.is_some()
             || self.world.borrow().main_ready_state() != crate::ReadyState::Complete

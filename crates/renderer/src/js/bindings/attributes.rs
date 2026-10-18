@@ -1692,7 +1692,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     {
         compile_handler_attribute(ctx, element, typ)?;
     }
-    if local != "src" {
+    if local != "src" && local != "srcdoc" {
         return Ok(());
     }
     let (is_iframe, is_img, is_script) = world_for_node(ctx, element)
@@ -1712,6 +1712,28 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         return Ok(());
     }
     let world = world(ctx)?;
+    // A `srcdoc` set, changed, or removed reprocesses the iframe attributes;
+    // so does a `src` change, but only while no `srcdoc` is specified
+    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+    let srcdoc = if is_iframe && matches!(local, "srcdoc" | "src") {
+        let has_srcdoc = world.borrow().document(element).is_some_and(|parsed| {
+            crate::dom::tree::attr(&parsed.document.base, element.node, "srcdoc").is_some()
+        });
+        if local == "srcdoc" && has_srcdoc {
+            world.borrow().document(element).and_then(|parsed| {
+                crate::dom::tree::attr(&parsed.document.base, element.node, "srcdoc")
+                    .map(ToOwned::to_owned)
+            })
+        } else if local == "src" && has_srcdoc {
+            // `src` changes while `srcdoc` is present change nothing
+            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+            return Ok(());
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let spec = world
         .borrow()
         .document(element)
@@ -1742,12 +1764,20 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         return Ok(());
     }
     if is_iframe {
-        world
-            .borrow_mut()
-            .queue_frame_navigation(FrameNavigation::get(
-                NavigationTarget::Container(element),
-                spec,
-            ));
+        match srcdoc {
+            Some(markup) => world
+                .borrow_mut()
+                .queue_frame_navigation(FrameNavigation::srcdoc(
+                    NavigationTarget::Container(element),
+                    markup,
+                )),
+            None => world
+                .borrow_mut()
+                .queue_frame_navigation(FrameNavigation::get(
+                    NavigationTarget::Container(element),
+                    spec,
+                )),
+        }
     } else if is_img {
         world.borrow_mut().queue_image_update(element);
     } else {

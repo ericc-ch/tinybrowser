@@ -49,7 +49,7 @@ pub(crate) fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
 }
 
 /// The document's base URL: the first `base` element's `href` resolved
-/// against the document URL, or the document URL itself
+/// against the fallback base URL, or the fallback itself
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
 pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     let fallback = document_url_string(ctx, id);
@@ -79,6 +79,14 @@ pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
         }
         stack.extend(node.children.iter().rev().copied());
     }
+    // An `about:srcdoc` document's fallback base URL is the creator's base
+    // URL; its own URL cannot be a base
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    let fallback = world
+        .base_url
+        .as_ref()
+        .map(std::string::ToString::to_string)
+        .unwrap_or(fallback);
     let Some(href) = href else {
         return fallback;
     };
@@ -87,7 +95,6 @@ pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
         .and_then(|url| url.join(&href).ok())
         .map_or(fallback, |url| url.to_string())
 }
-
 /// Whether the document that owns `id` is an HTML document
 /// (`text/html` or `application/xhtml+xml`).
 pub(crate) fn document_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {

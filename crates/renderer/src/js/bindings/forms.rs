@@ -294,6 +294,7 @@ pub(super) fn form_navigate<'js>(
     let navigation = FrameNavigation {
         target: crate::js::NavigationTarget::Target(target),
         spec: url,
+        srcdoc: None,
         method,
         // The body arrives as a Latin-1 string, one char per byte, so file
         // bytes survive the JS boundary unchanged

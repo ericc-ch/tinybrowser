@@ -103,14 +103,26 @@ impl Engine {
             adopted = true;
             for (parent, child, container, document) in batch.drain(..) {
                 self.frames.insert(child, document);
-                let src = self
+                // `srcdoc` takes priority over `src`
+                // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
+                let srcdoc = self
                     .frames
                     .get(&parent)
-                    .and_then(|document| document.frame_src(container));
-                if let Some(src) = src {
+                    .and_then(|document| document.frame_srcdoc(container));
+                if let Some(markup) = srcdoc {
                     let navigation =
-                        FrameNavigation::get(NavigationTarget::Container(container), src);
+                        FrameNavigation::srcdoc(NavigationTarget::Container(container), markup);
                     self.navigate_frame(child, parent, &navigation);
+                } else {
+                    let src = self
+                        .frames
+                        .get(&parent)
+                        .and_then(|document| document.frame_src(container));
+                    if let Some(src) = src {
+                        let navigation =
+                            FrameNavigation::get(NavigationTarget::Container(container), src);
+                        self.navigate_frame(child, parent, &navigation);
+                    }
                 }
                 if let Some(document) = self.frames.get_mut(&parent) {
                     document.mark_frame_load_pending(container);
@@ -714,6 +726,16 @@ impl Engine {
             let shared = self.runtime.shared.borrow();
             (shared.tree.parent(child), shared.tree.container(child))
         };
+        // A `srcdoc` attribute takes priority over `src`: the frame navigates
+        // to `about:srcdoc` with the attribute's value as the document source
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+        if let Some(markup) = &navigation.srcdoc {
+            self.load_frame_srcdoc(child, initiator, markup);
+            if let (Some(embedder), Some(container)) = (embedder, container) {
+                self.mark_frame_load_pending(container, embedder);
+            }
+            return;
+        }
         // An empty `src` is a container with no URL to load; it keeps its
         // `about:blank`. Every other navigation resolves an empty string
         // against the initiator document, which is that document's own URL
@@ -1025,6 +1047,37 @@ impl Engine {
         }
     }
 
+    /// Loads a frame's `about:srcdoc` document, inheriting the creator's base
+    /// URL, origin, and policy container
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
+    fn load_frame_srcdoc(&mut self, child: FrameId, parent: FrameId, markup: &str) {
+        let inherited = self.frames.get(&parent).map(|document| {
+            let world = document.world();
+            let world = world.borrow();
+            (
+                document.base_url(),
+                world.origin.clone(),
+                world.referrer_policy.clone(),
+            )
+        });
+        let policy = self.inherited_policy(parent);
+        let Some(document) = self.frames.get_mut(&child) else {
+            return;
+        };
+        match inherited {
+            Some((base, origin, referrer_policy)) => {
+                document.load_frame_srcdoc(&base, origin, &policy, &referrer_policy, markup);
+            }
+            None => document.load_frame_srcdoc(
+                &Url::parse("about:blank").expect("about:blank parses"),
+                url::Origin::new_opaque(),
+                &policy,
+                "",
+                markup,
+            ),
+        }
+    }
+
     /// A `data:` frame URL decodes in-process. A malformed URL fails the
     /// navigation and leaves the frame on its current document
     /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
@@ -1129,11 +1182,13 @@ impl Engine {
             }
             if let Some(container) = container {
                 self.publish_frame_document(container, frame);
-                if closed
-                    && let Some(parent) = self.runtime.shared.borrow().tree.parent(frame)
-                    && let Some(document) = self.frames.get_mut(&parent)
-                {
-                    document.mark_frame_load_pending(container);
+                if closed {
+                    // The written document is a fresh load: it supersedes the
+                    // insertion firing, so its own `load` must fire.
+                    let parent = self.runtime.shared.borrow().tree.parent(frame);
+                    if let Some(parent) = parent {
+                        self.mark_frame_load_pending(container, parent);
+                    }
                 }
             }
         }

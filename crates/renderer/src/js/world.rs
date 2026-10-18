@@ -548,6 +548,10 @@ pub(crate) struct FrameNavigation {
     /// The spec to navigate to, absolute or resolvable against the queuing
     /// document.
     pub(crate) spec: String,
+    /// The `srcdoc` markup that replaces the spec, navigating to
+    /// `about:srcdoc`
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
+    pub(crate) srcdoc: Option<String>,
     /// HTTP method; `GET` for every navigation but a form submission.
     pub(crate) method: String,
     /// Request body, empty for a GET.
@@ -566,11 +570,21 @@ impl FrameNavigation {
         Self {
             target,
             spec,
+            srcdoc: None,
             method: "GET".to_owned(),
             body: Vec::new(),
             content_type: None,
             referrer_policy: String::new(),
         }
+    }
+
+    /// A `srcdoc` navigation: the markup loads as the frame's
+    /// `about:srcdoc` document
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
+    pub(crate) fn srcdoc(target: NavigationTarget, markup: String) -> Self {
+        let mut navigation = Self::get(target, String::new());
+        navigation.srcdoc = Some(markup);
+        navigation
     }
 
     /// The policy this navigation's referrer is determined under, overriding
@@ -839,6 +853,11 @@ pub(crate) struct World {
     /// observers through the union drain.
     owned: HashSet<u32>,
     pub document_url: Url,
+    /// The creator document's base URL while this document is an `iframe
+    /// srcdoc document`. Its own URL cannot be a base, so its fallback base
+    /// URL — what relative URLs resolve against — is the creator's
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    pub(crate) base_url: Option<Url>,
     /// Origin captured for this document. `Url::origin()` on `about:blank`,
     /// `data:`, and `file:` yields a fresh `Origin::Opaque` each call, so
     /// blob lookups and same-origin checks must reuse this value
@@ -1115,6 +1134,7 @@ impl World {
             owned: HashSet::new(),
             origin: document_url.origin(),
             document_url,
+            base_url: None,
             referrer_policy: String::new(),
             csp: crate::csp::List::default(),
             applied_csp_metas: HashSet::new(),
@@ -1640,6 +1660,19 @@ impl World {
     pub(crate) fn set_url_with_origin(&mut self, url: Url, origin: url::Origin) {
         self.document_url = url;
         self.origin = origin;
+    }
+
+    /// Resolves `spec` against this document's URL, falling back to the
+    /// creator's base URL for an `about:srcdoc` document, whose own URL
+    /// cannot be a base
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    pub(crate) fn resolve_relative(&self, spec: &str) -> Option<Url> {
+        Url::parse(spec).ok().or_else(|| {
+            self.document_url
+                .join(spec)
+                .ok()
+                .or_else(|| self.base_url.as_ref().and_then(|base| base.join(spec).ok()))
+        })
     }
 
     /// Whether `url` is same-origin with this document's captured origin.

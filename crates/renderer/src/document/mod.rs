@@ -544,6 +544,18 @@ impl Document {
         (!value.is_empty()).then_some(value)
     }
 
+    /// The `iframe`'s `srcdoc` attribute value, when the element has one —
+    /// even an empty one, which loads the empty `about:srcdoc` document
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
+    #[must_use]
+    pub(crate) fn frame_srcdoc(&self, container: crate::dom::tree::NodeId) -> Option<String> {
+        let world = self.world.borrow();
+        world.document(container).and_then(|parsed| {
+            crate::dom::tree::attr(&parsed.document.base, container.node, "srcdoc")
+                .map(str::to_owned)
+        })
+    }
+
     /// Resolves one of the frame's URLs the way an attribute would: absolute
     /// against the document, or joined with its base URL
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#parse-a-url>).
@@ -830,6 +842,34 @@ impl Document {
         self.load_html("");
         self.initial_blank = true;
         self.ensure_js_ok();
+    }
+
+    /// Loads the frame's `about:srcdoc` document: `markup` parsed as HTML,
+    /// the document URL `about:srcdoc`, and the creator's base URL, origin,
+    /// referrer policy, and CSP list inherited. Relative URLs inside an
+    /// `iframe srcdoc document` resolve against the creator's base URL,
+    /// which the document's own URL cannot supply
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>,
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    pub(crate) fn load_frame_srcdoc(
+        &mut self,
+        base: &Url,
+        origin: url::Origin,
+        policy: &crate::csp::List,
+        referrer_policy: &str,
+        markup: &str,
+    ) {
+        let url = Url::parse("about:srcdoc").expect("about:srcdoc parses");
+        self.http_status = 0;
+        {
+            let mut world = self.world.borrow_mut();
+            world.set_url_with_origin(url, origin);
+            world.base_url = Some(base.clone());
+            world.csp = policy.clone();
+            referrer_policy.clone_into(&mut world.referrer_policy);
+        }
+        self.initial_blank = false;
+        self.load_html(markup);
     }
 
     /// Installs the initial `about:blank` tree without creating a realm
@@ -1269,6 +1309,9 @@ impl Document {
         self.initial_blank = false;
         let mut world = self.world.borrow_mut();
         world.set_url(self.url.clone());
+        // A response document resolves against its own URL; any inherited
+        // `about:srcdoc` base stops applying.
+        world.base_url = None;
         drop(world);
         // The realm is already new when this runs; this opens the parser and
         // the decoder for the response that will feed it.
@@ -1611,13 +1654,17 @@ impl Document {
     /// explicitly), the frame's base URL, and the process-shared font
     /// context (fresh scans cost ~25ms per document).
     fn blitz_config(&self) -> blitz_dom::DocumentConfig {
+        // Subresource URLs in the markup resolve against the document's base
+        // URL, which for `about:srcdoc` is the creator's
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+        let base_url = self.base_url();
         blitz_dom::DocumentConfig {
             net_provider: Some(std::sync::Arc::clone(&self.net_provider)
                 as std::sync::Arc<dyn blitz_traits::net::NetProvider>),
             navigation_provider: Some(std::sync::Arc::clone(&self.blitz_nav)
                 as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>),
             shell_provider: Some(std::sync::Arc::new(crate::render::TinyShell)),
-            base_url: Some(crate::render::blitz_base_url(&self.url)),
+            base_url: Some(crate::render::blitz_base_url(&base_url)),
             font_ctx: Some(self.shared_font_ctx()),
             ..blitz_dom::DocumentConfig::default()
         }
@@ -2361,8 +2408,15 @@ impl Document {
         Ok(url)
     }
 
-    fn base_url(&self) -> Url {
+    /// This frame's base URL: the first `base` element's `href` resolved
+    /// against the fallback base URL, or the fallback itself
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+    pub(crate) fn base_url(&self) -> Url {
         let world = self.world.borrow();
+        // An `about:srcdoc` document's own URL cannot be a base; its
+        // fallback base URL is the creator document's base URL
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+        let document_url = world.base_url.clone().unwrap_or_else(|| self.url.clone());
         let base_href = world
             .with_main_document(|parsed| {
                 let base = &parsed.document.base;
@@ -2372,9 +2426,9 @@ impl Document {
             })
             .flatten();
         let Some(href) = base_href else {
-            return self.url.clone();
+            return document_url;
         };
-        self.url.join(&href).unwrap_or_else(|_| self.url.clone())
+        document_url.join(&href).unwrap_or(document_url)
     }
 
     pub(in crate::document) fn finish_dial(&mut self, done: CompletedDial) {
