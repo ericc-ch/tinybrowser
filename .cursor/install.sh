@@ -20,7 +20,7 @@ set -euo pipefail
 # Run from the repository root regardless of where install is invoked.
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# WPT (`tools/wpt/run`) needs the vendored suite. It is a large submodule, so it
+# WPT (`tools/wpt/cli.py`) needs the vendored suite. It is a large submodule, so it
 # is opt-in to keep environment builds lean (Nix snapshot and default image):
 #   TINYBROWSER_INIT_WPT=1 .cursor/install.sh
 if [ "${TINYBROWSER_INIT_WPT:-0}" = "1" ]; then
