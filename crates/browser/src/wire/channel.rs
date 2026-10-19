@@ -43,8 +43,8 @@ pub const HEADER_BYTES: usize = 16;
 /// `storage` event carries both the old and the new encoded value, so the worst
 /// legal frame is roughly twice the quota plus field overhead. A cap below that
 /// bound turns a legal `setItem` into a transport error, and an oversize control
-/// frame stops the renderer, so this cap clears the bound until bulk payloads
-/// move to the chunk lane.
+/// frame stops the renderer, so the cap keeps 2.4× headroom over the bound until
+/// bulk payloads move to the chunk lane.
 pub const MAX_CONTROL_BYTES: usize = 24 * 1024 * 1024;
 
 /// Maximum size of one raw response-body chunk.
@@ -373,6 +373,57 @@ mod tests {
                 assert!(number.is_nan());
             }
             other => panic!("expected NaN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_remote_value_variant_survives_the_wire() {
+        // Postcard is not self-describing and rejects `deserialize_any`, so a
+        // value shape it cannot decode fails only when it first crosses, not at
+        // compile time. The JSON codec's `serde(with)` number shim was exactly
+        // that trap; walk every variant through the real frame codec.
+        let values = [
+            renderer::RemoteValue::Undefined,
+            renderer::RemoteValue::Null,
+            renderer::RemoteValue::Bool(true),
+            renderer::RemoteValue::Number(1.5),
+            renderer::RemoteValue::Number(-0.0),
+            renderer::RemoteValue::Number(f64::INFINITY),
+            renderer::RemoteValue::String("x".into()),
+            renderer::RemoteValue::List(vec![
+                renderer::RemoteValue::Number(1.0),
+                renderer::RemoteValue::Null,
+            ]),
+            renderer::RemoteValue::Map(vec![("k".into(), renderer::RemoteValue::Node(7))]),
+            renderer::RemoteValue::Node(9),
+        ];
+        for (raw_id, value) in (1_u64..).zip(values) {
+            let expected = format!("{value:?}");
+            let message: crate::wire::FromRenderer = crate::exchange::Frame::Reply {
+                id: crate::exchange::RequestId::new(raw_id),
+                body: crate::wire::RendererReply {
+                    assignment: crate::wire::RendererAssignmentId::new(1),
+                    reply: crate::wire::Reply::Value(Ok(value)),
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &message).expect("write");
+            let back: crate::wire::FromRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Reply {
+                body: crate::wire::RendererReply { reply, .. },
+                ..
+            } = back
+            else {
+                panic!("expected a reply frame");
+            };
+            let crate::wire::Reply::Value(Ok(back)) = reply else {
+                panic!("expected a value reply");
+            };
+            // `Debug` keeps `NaN` comparable and distinguishes `-0.0`.
+            assert_eq!(format!("{back:?}"), expected, "round trip");
         }
     }
 
