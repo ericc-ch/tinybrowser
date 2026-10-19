@@ -13,8 +13,10 @@ net = { workspace = true }
 renderer = { workspace = true }
 webstorage = { workspace = true }
 logging = { workspace = true }
-# The renderer wire is serde-encoded JSON control plus raw body frames.
+# The renderer wire is postcard-encoded control plus raw body frames. The
+# format is not self-describing: both ends are the same binary, so field names
+# and JSON string escaping buy nothing and cost ~100 KiB of derived impls.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 tokio = { version = "1.53", default-features = false, features = ["rt", "sync", "time", "macros", "io-util", "net", "process"] }
 url = "2"

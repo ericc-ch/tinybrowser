@@ -8,10 +8,10 @@
 //! ```
 //!
 //! The version byte is [`PROTOCOL_VERSION`]; a mismatch fails closed. Control
-//! payloads are JSON and capped at [`MAX_CONTROL_BYTES`]. Stream chunks are raw
-//! bytes and capped at [`MAX_BODY_CHUNK_BYTES`]. Readers validate the header and
-//! length before they allocate or read the payload, so a corrupt or hostile
-//! peer cannot force an unbounded allocation.
+//! payloads are postcard-encoded and capped at [`MAX_CONTROL_BYTES`]. Stream
+//! chunks are raw bytes and capped at [`MAX_BODY_CHUNK_BYTES`]. Readers validate
+//! the header and length before they allocate or read the payload, so a corrupt
+//! or hostile peer cannot force an unbounded allocation.
 //!
 //! The first frame in each direction is the handshake: the browser sends
 //! [`HostNotice::Hello`](crate::wire::HostNotice::Hello) and the renderer replies
@@ -29,23 +29,22 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// added cross-tab messaging, session copies, and remote session reads.
 /// Version 8 added `BroadcastChannel`. Version 9 replaced operation-specific
 /// body messages with directional exchange stream chunks. Version 10 dropped
-/// `content_language` from mount, response-start, and dial outcomes.
-pub const PROTOCOL_VERSION: u8 = 10;
+/// `content_language` from mount, response-start, and dial outcomes. Version 11
+/// replaced JSON control payloads with postcard.
+pub const PROTOCOL_VERSION: u8 = 11;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
 
-/// Maximum encoded size of one JSON control payload.
+/// Maximum encoded size of one control payload.
 ///
-/// Storage is the largest legal control payload, and it is double-encoded:
-/// one origin may hold [`webstorage::STORAGE_QUOTA_BYTES`] (5 MiB) of
-/// JSON-encoded keys and values, and the wire escapes that encoded text a
-/// second time. The worst legal frames are a `setItem` request, a `getItem`
-/// reply (one encoded value), and a `storage` event carrying both the old and
-/// the new encoded value: 2 × 5 MiB × 2 plus JSON overhead. A cap below that
-/// bound turns a legal `setItem` into a transport error, and an oversize
-/// control frame stops the renderer, so this cap clears the bound until bulk
-/// payloads move to the chunk lane.
+/// Storage is the largest legal control payload. One origin may hold
+/// [`webstorage::STORAGE_QUOTA_BYTES`] (5 MiB) of encoded keys and values, and a
+/// `storage` event carries both the old and the new encoded value, so the worst
+/// legal frame is roughly twice the quota plus field overhead. A cap below that
+/// bound turns a legal `setItem` into a transport error, and an oversize control
+/// frame stops the renderer, so the cap keeps 2.4× headroom over the bound until
+/// bulk payloads move to the chunk lane.
 pub const MAX_CONTROL_BYTES: usize = 24 * 1024 * 1024;
 
 /// Maximum size of one raw response-body chunk.
@@ -58,7 +57,7 @@ const KIND_RESPONSE_CHUNK: u8 = 2;
 /// Payload class of one frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
-    /// JSON control message.
+    /// Encoded control message.
     Control,
     /// Raw bytes uploaded with a request.
     RequestChunk,
@@ -101,13 +100,13 @@ pub struct Frame {
     pub request: u64,
 }
 
-/// Writes one control message as a JSON frame.
+/// Writes one control message as a postcard frame.
 ///
 /// # Errors
 ///
 /// Serialization failure or a payload larger than [`MAX_CONTROL_BYTES`].
 pub fn write_control<T: Serialize>(writer: &mut impl Write, message: &T) -> io::Result<()> {
-    let payload = serde_json::to_vec(message).map_err(io::Error::other)?;
+    let payload = postcard::to_allocvec(message).map_err(io::Error::other)?;
     write_frame(writer, FrameKind::Control, 0, &payload)
 }
 
@@ -138,7 +137,7 @@ pub fn write_frame(
     writer.flush()
 }
 
-/// Writes one control message as a JSON frame on an async writer.
+/// Writes one control message as a postcard frame on an async writer.
 ///
 /// # Errors
 ///
@@ -147,7 +146,7 @@ pub async fn write_control_async<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     message: &impl Serialize,
 ) -> io::Result<()> {
-    let payload = serde_json::to_vec(message).map_err(io::Error::other)?;
+    let payload = postcard::to_allocvec(message).map_err(io::Error::other)?;
     write_frame_async(writer, FrameKind::Control, 0, &payload).await
 }
 
@@ -251,7 +250,7 @@ pub async fn read_frame_async<R: AsyncRead + Unpin + ?Sized>(
 ///
 /// # Errors
 ///
-/// I/O failure, a body frame, invalid JSON, or a protocol violation.
+/// I/O failure, a body frame, an invalid payload, or a protocol violation.
 #[cfg(test)]
 pub fn read_control<T: DeserializeOwned>(
     reader: &mut impl Read,
@@ -286,12 +285,21 @@ pub fn read_body(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<Opt
 
 /// Decodes one control-frame payload after its frame header has been read.
 ///
+/// The frame length is the payload's exact extent, so anything left over after
+/// the message is a framing bug, not slack. `postcard::from_bytes` would drop
+/// the remainder silently.
+///
 /// # Errors
 ///
-/// Invalid JSON or a payload that does not match `T`.
+/// Invalid postcard bytes, a payload that does not match `T`, or trailing bytes.
 pub fn decode_control<T: DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
-    serde_json::from_slice(payload)
-        .map_err(|error| invalid(format!("invalid renderer IPC JSON: {error}")))
+    let (message, trailing) = postcard::take_from_bytes(payload)
+        .map_err(|error| invalid(format!("invalid renderer IPC payload: {error}")))?;
+    if trailing.is_empty() {
+        Ok(message)
+    } else {
+        Err(invalid("renderer IPC payload has trailing bytes"))
+    }
 }
 
 fn read_exact(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<()> {
@@ -335,6 +343,88 @@ mod tests {
         bytes.extend_from_slice(&request.to_be_bytes());
         bytes.extend_from_slice(&length.to_be_bytes());
         bytes
+    }
+
+    #[test]
+    fn non_finite_numbers_survive_the_wire() {
+        let message: crate::wire::FromRenderer = crate::exchange::Frame::Reply {
+            id: crate::exchange::RequestId::new(9),
+            body: crate::wire::RendererReply {
+                assignment: crate::wire::RendererAssignmentId::new(1),
+                reply: crate::wire::Reply::Value(Ok(renderer::RemoteValue::Number(f64::NAN))),
+            },
+        };
+        let mut bytes = Vec::new();
+        write_control(&mut bytes, &message).expect("write");
+        let mut reader = Cursor::new(bytes);
+        let mut buffer = Vec::new();
+        let back: crate::wire::FromRenderer = read_control(&mut reader, &mut buffer)
+            .expect("read")
+            .expect("one frame");
+        let crate::exchange::Frame::Reply {
+            body: crate::wire::RendererReply { reply, .. },
+            ..
+        } = back
+        else {
+            panic!("expected a reply frame");
+        };
+        match reply {
+            crate::wire::Reply::Value(Ok(renderer::RemoteValue::Number(number))) => {
+                assert!(number.is_nan());
+            }
+            other => panic!("expected NaN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_remote_value_variant_survives_the_wire() {
+        // Postcard is not self-describing and rejects `deserialize_any`, so a
+        // value shape it cannot decode fails only when it first crosses, not at
+        // compile time. The JSON codec's `serde(with)` number shim was exactly
+        // that trap; walk every variant through the real frame codec.
+        let values = [
+            renderer::RemoteValue::Undefined,
+            renderer::RemoteValue::Null,
+            renderer::RemoteValue::Bool(true),
+            renderer::RemoteValue::Number(1.5),
+            renderer::RemoteValue::Number(-0.0),
+            renderer::RemoteValue::Number(f64::INFINITY),
+            renderer::RemoteValue::String("x".into()),
+            renderer::RemoteValue::List(vec![
+                renderer::RemoteValue::Number(1.0),
+                renderer::RemoteValue::Null,
+            ]),
+            renderer::RemoteValue::Map(vec![("k".into(), renderer::RemoteValue::Node(7))]),
+            renderer::RemoteValue::Node(9),
+        ];
+        for (raw_id, value) in (1_u64..).zip(values) {
+            let expected = format!("{value:?}");
+            let message: crate::wire::FromRenderer = crate::exchange::Frame::Reply {
+                id: crate::exchange::RequestId::new(raw_id),
+                body: crate::wire::RendererReply {
+                    assignment: crate::wire::RendererAssignmentId::new(1),
+                    reply: crate::wire::Reply::Value(Ok(value)),
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &message).expect("write");
+            let back: crate::wire::FromRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Reply {
+                body: crate::wire::RendererReply { reply, .. },
+                ..
+            } = back
+            else {
+                panic!("expected a reply frame");
+            };
+            let crate::wire::Reply::Value(Ok(back)) = reply else {
+                panic!("expected a value reply");
+            };
+            // `Debug` keeps `NaN` comparable and distinguishes `-0.0`.
+            assert_eq!(format!("{back:?}"), expected, "round trip");
+        }
     }
 
     #[test]
@@ -434,13 +524,23 @@ mod tests {
         assert!(read_frame(&mut Cursor::new(header(KIND_CONTROL, 1, 0, 0)), &mut buffer).is_err());
 
         assert!(
-            read_control::<serde_json::Value>(
+            read_control::<crate::wire::ToRenderer>(
                 &mut Cursor::new(header(KIND_RESPONSE_CHUNK, 0, 1, 0)),
                 &mut buffer
             )
             .is_err()
         );
         assert!(read_body(&mut Cursor::new(header(KIND_CONTROL, 0, 0, 0)), &mut buffer).is_err());
+    }
+
+    #[test]
+    fn control_payloads_reject_trailing_bytes() {
+        let message: crate::wire::ToRenderer =
+            crate::exchange::Frame::Notify(crate::wire::HostNotice::Shutdown);
+        let mut payload = postcard::to_allocvec(&message).expect("encode");
+        assert!(decode_control::<crate::wire::ToRenderer>(&payload).is_ok());
+        payload.push(0);
+        assert!(decode_control::<crate::wire::ToRenderer>(&payload).is_err());
     }
 
     #[test]
@@ -451,10 +551,12 @@ mod tests {
         partial.push(b'{');
         assert!(read_frame(&mut Cursor::new(partial), &mut buffer).is_err());
 
-        let mut invalid_json = header(KIND_CONTROL, 0, 0, 1);
-        invalid_json.push(b'{');
         assert!(
-            read_control::<serde_json::Value>(&mut Cursor::new(invalid_json), &mut buffer).is_err()
+            read_control::<crate::wire::ToRenderer>(
+                &mut Cursor::new(header(KIND_CONTROL, 0, 0, 0)),
+                &mut buffer
+            )
+            .is_err()
         );
     }
 

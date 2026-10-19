@@ -16,7 +16,34 @@ pass/unexp/timeout/crash counts, and a release smoke via
 | nightly + `[unstable] build-std` (std at `opt-level = "z"`) | 11.86 MiB |
 | `panic = "immediate-abort"` (interim) | 10.94 MiB |
 | `force-unwind-tables=no`, `tools/release` deleted (interim, immediate-abort) | 9.79 MiB |
-| current: `panic = "abort"` + synchronous panic hook for diagnostics | **10.61 MiB** |
+| panic = "abort" + synchronous panic hook for diagnostics | 10.61 MiB |
+| postcard renderer IPC control payloads | 10.47 MiB |
+| current: shared interface installer funnel | **10.43 MiB** |
+
+The generated bindings emitted the same six-line installer for all 90
+interfaces — look up the constructor the web shims created, take its prototype,
+add members, add constants to the interface object as well as the prototype,
+mark the unscopables — inlined into every caller at roughly 590 B apiece. One
+`#[inline(never)]` funnel (`host::install_interface`) holds that body now: the
+install family fell from 183 KiB to 136 KiB and `.text` by 47 KiB. Generated
+modules also stopped importing `Object`: the three places that name it spell
+`rquickjs::Object`, so the import list is fixed rather than conditional on which
+pieces a given interface emits.
+
+The renderer channel is the only wire we own, and both ends are the same
+binary, so JSON's field names and string escaping bought nothing: the derived
+`serde_json` impls for `Frame`, `ServiceCall`, `Command`, `StorageCall`,
+`ServiceReply`, and friends were 100 KiB of `.text` (one enum's deserializer
+alone was 19.5 KiB). Postcard encodes the same derives as varint tags and
+positional fields, so `.text` fell 126 KiB (8,556,052 → 8,427,016 B) and every
+command and renderer event stopped paying a JSON parse. The frame header, body-chunk lane, and
+control-size cap are unchanged; `RemoteValue::Number` lost its JSON-only
+`serde(with)` shim with it, since postcard carries `f64` natively. One
+validation had to be rebuilt rather than inherited: `postcard::from_bytes`
+discards whatever follows the message, where `serde_json::from_slice` rejected
+trailing characters, and a frame's length is the payload's exact extent, so
+`decode_control` now decodes through `take_from_bytes` and rejects a remainder
+(1.4 KiB of `.text` for the check and its message).
 
 `panic = "abort"` costs 0.82 MiB over `immediate-abort` (10.61 vs 9.79 MiB
 measured): the panic formatting machinery from every dependency. It buys the
@@ -38,6 +65,18 @@ in a JS callback (see `docs/upstream.md`).
 
 ## Experiments measured flat (do not retry)
 
+- Replacing `serde_json` in the protocol layer (`cdp`, `webdriver`, `server`).
+  Measured in a standalone probe with the same flags (`opt-level = "z"`, fat
+  LTO, `codegen-units = 1`, `panic = "abort"`), same workload, byte-identical
+  output: `serde_json` costs 29.5 KiB over a no-JSON baseline, a hand-rolled
+  DOM 37.3 KiB, a direct writer (no response tree) 35.7 KiB, and `miniserde`
+  23.4 KiB. miniserde is the only winner, at ~6 KiB of library plus ~100 B per
+  `json!` site, so ~15-25 KiB (0.2%) for rewriting 259 `Value` references and
+  149 `json!` sites across the three crates — not worth it. The hand-rolled
+  variants lose on float tables (`core`'s `POWER_OF_FIVE_128` 10.4 KiB plus
+  `ryu`'s `DOUBLE_POW5_*` 10.7 KiB) that `serde_json` avoids with its own 2.5
+  KiB `POW10` table and `zmij`. The per-type codegen that JSON used to cost is
+  already gone: the binary holds 13.8 KiB of derived `serde` impls in total.
 - `#[inline(never)]` on generated dispatch groups: flat (outlining relocates code).
 - `#[inline(never)]` on conversion helpers alone: flat (arms still inlined their own copies).
 - Link-time `--icf=all`: flat (no identical function bodies to fold).

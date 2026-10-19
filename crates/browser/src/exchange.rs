@@ -39,7 +39,7 @@ impl RequestId {
 ///
 /// A byte transport may encode the two chunk variants outside its control
 /// serializer. The renderer socket does this so document and image bytes stay
-/// out of JSON.
+/// off the control lane.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Frame<C, R, N> {
     Call {

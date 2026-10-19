@@ -15,7 +15,7 @@ use url::Url;
 /// Default per-call fetch timeout on a [`TabNetworkHandle`].
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on one body carried inside a JSON control reply.
+/// Upper bound on one body carried inside a control reply.
 ///
 /// A top-level navigation document streams under
 /// [`renderer::MAX_RESPONSE_BODY_BYTES`]. This limit is the control reply,
