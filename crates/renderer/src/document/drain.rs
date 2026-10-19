@@ -132,6 +132,8 @@ impl Document {
             }
             let mut completed_data = false;
             for dial in queued {
+                // The queue holds the parsed URL's serialization, so the
+                // prefix test is the scheme test (see `DialRequest::url`).
                 if dial.req.url.starts_with("data:") {
                     completed_data = true;
                     // Same ceiling as a streamed navigation body. Decoding an
