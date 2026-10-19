@@ -404,3 +404,39 @@ pub enum ServiceReply {
     /// No payload (`CookieSet`).
     Unit,
 }
+
+impl ServiceReply {
+    /// The benign answer to `call`: the transport must always answer a
+    /// service call so the renderer's synchronous path returns, even when the
+    /// call was released, cancels itself, or is fire-and-forget and no one
+    /// reads the reply. Each answer is that call type's empty value.
+    #[must_use]
+    pub fn benign(call: &ServiceCall) -> Self {
+        match call {
+            ServiceCall::Network(NetworkCall::Dial(_)) => {
+                ServiceReply::Dial(Err(DialFailure::Connect))
+            }
+            ServiceCall::Network(NetworkCall::CookieGet { .. }) => {
+                ServiceReply::Cookie(String::new())
+            }
+            ServiceCall::Network(
+                NetworkCall::CancelDial { .. } | NetworkCall::CookieSet { .. },
+            )
+            | ServiceCall::Messaging(MessagingCall::BroadcastPost { .. })
+            | ServiceCall::BrowsingContext(
+                BrowsingContextCall::WindowClose { .. } | BrowsingContextCall::WindowMessage { .. },
+            ) => ServiceReply::Unit,
+            ServiceCall::Storage(StorageCall::Get { .. })
+            | ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet { .. }) => {
+                ServiceReply::StorageValue(None)
+            }
+            ServiceCall::Storage(StorageCall::Keys { .. }) => ServiceReply::StorageKeys(Vec::new()),
+            ServiceCall::Storage(
+                StorageCall::Set { .. } | StorageCall::Remove { .. } | StorageCall::Clear { .. },
+            ) => ServiceReply::StorageChanged(Ok(None)),
+            ServiceCall::BrowsingContext(
+                BrowsingContextCall::WindowOpen { .. } | BrowsingContextCall::Opener,
+            ) => ServiceReply::Window(None),
+        }
+    }
+}

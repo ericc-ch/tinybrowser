@@ -1006,7 +1006,10 @@ fn broadcast_local_storage_event(
 }
 
 /// Answers a late call from a released assignment so the renderer's blocking
-/// service path stays unblocked while its engine is torn down.
+/// service path stays unblocked while its engine is torn down. Only the dial
+/// answer differs from the benign default: the submitted dial is cancelled,
+/// and its completion gets a typed cancellation failure rather than a
+/// transport one.
 async fn send_released_reply(
     responder: &BrowserServiceResponder,
     id: RequestId,
@@ -1016,23 +1019,7 @@ async fn send_released_reply(
         ServiceCall::Network(NetworkCall::Dial(_)) => {
             ServiceReply::Dial(Err(renderer::DialFailure::Cancelled))
         }
-        ServiceCall::Network(NetworkCall::CookieGet { .. }) => ServiceReply::Cookie(String::new()),
-        ServiceCall::Network(NetworkCall::CookieSet { .. } | NetworkCall::CancelDial { .. })
-        | ServiceCall::Messaging(MessagingCall::BroadcastPost { .. })
-        | ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowClose { .. } | BrowsingContextCall::WindowMessage { .. },
-        ) => ServiceReply::Unit,
-        ServiceCall::Storage(StorageCall::Get { .. })
-        | ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet { .. }) => {
-            ServiceReply::StorageValue(None)
-        }
-        ServiceCall::Storage(StorageCall::Keys { .. }) => ServiceReply::StorageKeys(Vec::new()),
-        ServiceCall::Storage(
-            StorageCall::Set { .. } | StorageCall::Remove { .. } | StorageCall::Clear { .. },
-        ) => ServiceReply::StorageChanged(Ok(None)),
-        ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowOpen { .. } | BrowsingContextCall::Opener,
-        ) => ServiceReply::Window(None),
+        call => ServiceReply::benign(call),
     };
     send_reply(responder, id, reply).await
 }
