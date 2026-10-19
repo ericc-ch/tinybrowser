@@ -442,19 +442,25 @@ fn mixin_implementations_install_on_includers() {
         .iter()
         .find(|binding| binding.interface == "Nodes")
         .expect("mixin binding");
-    let source = binding.rust.replace(' ', "");
+    // Generated installers route through `host::install_interface`; whitespace
+    // spanning the call's arguments is normalized for the match.
+    let source: String = binding
+        .rust
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '\n' | '\t'))
+        .collect();
     for target in ["Element", "Document"] {
         assert!(
-            source.contains(&format!("ctx.globals().get(\"{target}\")")),
+            source.contains(&format!("host::install_interface(ctx,\"{target}\"")),
             "missing install target {target}"
         );
     }
     assert!(
-        !source.contains("ctx.globals().get(\"Nodes\")"),
+        !source.contains("host::install_interface(ctx,\"Nodes\""),
         "mixin must not install on itself"
     );
     assert!(
-        !source.contains("ctx.globals().get(\"Ghost\")"),
+        !source.contains("host::install_interface(ctx,\"Ghost\""),
         "mixin must not install on unimplemented includers"
     );
 }
