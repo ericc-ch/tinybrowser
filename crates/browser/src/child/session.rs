@@ -9,9 +9,7 @@ use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
 
-use renderer::{
-    Engine, FrameId, MAX_RESPONSE_BODY_BYTES, ResponseHead, Stop, TURN_SCRIPT_BUDGET, TabError,
-};
+use renderer::{Engine, FrameId, MAX_RESPONSE_BODY_BYTES, Stop, TURN_SCRIPT_BUDGET, TabError};
 use tokio::sync::Notify;
 
 use super::{AssignmentServices, ChannelServices};
@@ -424,24 +422,7 @@ impl ResponseStreams {
         if self.active.contains_key(&id) {
             return Err(stream_error("duplicate response start"));
         }
-        engine.open_body(
-            response.frame,
-            &ResponseHead {
-                url: response.final_url.clone(),
-                status: response.status,
-                content_type: response.content_type.clone(),
-                content_security_policy: response.content_security_policy.clone(),
-                content_security_policy_report_only: response
-                    .content_security_policy_report_only
-                    .clone(),
-                reporting_endpoints: response.reporting_endpoints.clone(),
-                no_sniff: response.no_sniff,
-                http_response: response.http_response,
-                history: response.history.clone(),
-                viewport: response.viewport,
-                init_scripts: response.init_scripts.clone(),
-            },
-        )?;
+        engine.open_body(response.frame, &response.head)?;
         self.active.insert(
             id,
             ActiveResponse {

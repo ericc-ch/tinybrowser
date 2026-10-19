@@ -262,12 +262,9 @@ impl RendererHandle {
         self: &Arc<Self>,
         assignment: RendererAssignmentId,
         frame: FrameId,
-        status: u16,
         mount: Mount,
     ) -> Result<Reply, TabError> {
-        let response = self
-            .start_response(assignment, frame, status, &mount)
-            .await?;
+        let response = self.start_response(assignment, frame, &mount).await?;
         for chunk in mount
             .body
             .chunks(crate::wire::channel::MAX_BODY_CHUNK_BYTES)
@@ -281,23 +278,12 @@ impl RendererHandle {
         self: &Arc<Self>,
         assignment: RendererAssignmentId,
         frame: FrameId,
-        status: u16,
         mount: &Mount,
     ) -> Result<ResponseWriter, TabError> {
         let start = ResponseStart {
             assignment,
             frame,
-            status,
-            final_url: mount.url.clone(),
-            content_type: mount.content_type.clone(),
-            content_security_policy: mount.content_security_policy.clone(),
-            content_security_policy_report_only: mount.content_security_policy_report_only.clone(),
-            reporting_endpoints: mount.reporting_endpoints.clone(),
-            no_sniff: mount.no_sniff,
-            http_response: mount.http_response,
-            history: mount.history.clone(),
-            viewport: mount.viewport,
-            init_scripts: mount.init_scripts.clone(),
+            head: mount.head.clone(),
         };
         let upload = if let Ok(result) = timeout(
             request_timeout(),

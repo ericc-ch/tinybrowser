@@ -155,7 +155,7 @@ impl Engine {
         if frame == FrameId::MAIN {
             self.init_scripts
                 .borrow_mut()
-                .clone_from(&mount.init_scripts);
+                .clone_from(&mount.head.init_scripts);
         }
         self.remove_descendants(frame);
         self.frame_mut(frame)?.mount(mount)?;
@@ -177,30 +177,8 @@ impl Engine {
         }
         self.remove_descendants(frame);
         let document = self.frame_mut(frame)?;
-        document.world().borrow_mut().history = head.history.clone();
-        let url = Url::parse(&head.url).ok();
-        document.begin_response(
-            url.as_ref(),
-            head.content_type.as_deref(),
-            head.viewport,
-            crate::csp::List::from_headers(
-                head.content_security_policy.as_deref(),
-                head.content_security_policy_report_only.as_deref(),
-            ),
-            crate::sniff::MimeGuard {
-                no_sniff: head.no_sniff,
-                http: head.http_response,
-            },
-        );
-        // The document's own HTTP status, after the fresh response reset it:
-        // violation `status-code` reports it
-        // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-        document.http_status = head.status;
-        document.reporting_endpoints = head
-            .reporting_endpoints
-            .as_deref()
-            .map(crate::csp::parse_reporting_endpoints_value)
-            .unwrap_or_default();
+        document.set_history(&head.history);
+        document.install_head(head, None);
         Ok(())
     }
 
@@ -1091,13 +1069,11 @@ impl Engine {
             return;
         };
         if let Some(document) = self.frames.get_mut(&child) {
-            document.load_frame_response(
-                url,
-                Some(content_type.as_str()),
-                &body,
-                policy,
-                crate::sniff::MimeGuard::default(),
-            );
+            // A `data:` URL inherits the initiator's policy container
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
+            let mut head = ResponseHead::non_http(url.to_string(), Some(content_type));
+            head.inherited_policy = Some(policy);
+            document.install_frame_response(&head, &body, None);
         }
     }
 
@@ -1120,14 +1096,13 @@ impl Engine {
         };
         let policy = self.inherited_policy(parent);
         if let Some(document) = self.frames.get_mut(&child) {
-            document.load_frame_response_with_origin(
-                url,
-                content_type.as_deref(),
-                contents.as_bytes(),
-                origin,
-                policy,
-                crate::sniff::MimeGuard::default(),
-            );
+            // A `blob:` URL inherits the initiator's policy container, and the
+            // child's origin is the store entry's creator
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
+            let mut head =
+                ResponseHead::non_http(url.to_string(), content_type.as_deref().map(String::from));
+            head.inherited_policy = Some(policy);
+            document.install_frame_response(&head, contents.as_bytes(), Some(origin));
         }
     }
 

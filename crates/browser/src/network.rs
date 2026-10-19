@@ -22,15 +22,10 @@ pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// including a child frame whose response is returned in that reply.
 pub(crate) const CONTROL_BODY_LIMIT: usize = 1_048_576;
 
-/// One completed navigation dial.
+/// One completed navigation dial: the response head the tab mounts plus the
+/// streaming body.
 pub(crate) struct NavOutcome {
-    pub status: u16,
-    pub final_url: Url,
-    pub content_type: Option<String>,
-    pub content_security_policy: Option<String>,
-    pub content_security_policy_report_only: Option<String>,
-    pub reporting_endpoints: Option<String>,
-    pub no_sniff: bool,
+    pub head: renderer::ResponseHead,
     pub body: net::Body,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -190,21 +185,23 @@ impl TabNetworkHandle {
             started.elapsed()
         );
         let headers = response.headers();
-        let content_type = content_type_header(headers);
-        let content_security_policy = list_header(headers, "content-security-policy");
-        let content_security_policy_report_only =
-            list_header(headers, "content-security-policy-report-only");
-        let reporting_endpoints = list_header(headers, "reporting-endpoints");
-        let no_sniff = header_nosniff(headers);
+        let head = renderer::ResponseHead {
+            url: final_url.to_string(),
+            status,
+            content_type: content_type_header(headers),
+            content_security_policy: list_header(headers, "content-security-policy"),
+            content_security_policy_report_only: list_header(
+                headers,
+                "content-security-policy-report-only",
+            ),
+            reporting_endpoints: list_header(headers, "reporting-endpoints"),
+            no_sniff: header_nosniff(headers),
+            http_response: true,
+            ..renderer::ResponseHead::non_http("", None)
+        };
         let body = response.into_body();
         Ok(NavOutcome {
-            status,
-            final_url,
-            content_type,
-            content_security_policy,
-            content_security_policy_report_only,
-            reporting_endpoints,
-            no_sniff,
+            head,
             body,
             _permit: permits,
         })

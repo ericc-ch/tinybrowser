@@ -186,43 +186,17 @@ pub enum HostNotice {
     },
 }
 
-/// Metadata sent before the raw bytes of a top-level response.
+/// Metadata sent before the raw bytes of a top-level response: the document
+/// that receives it plus the response head it installs. The body arrives in
+/// bounded raw frames after the postcard control message.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseStart {
     /// Top-level document receiving this response.
     pub assignment: RendererAssignmentId,
     /// Frame that will receive the document.
     pub frame: FrameId,
-    /// Final HTTP status.
-    pub status: u16,
-    /// Final URL after redirects.
-    pub final_url: String,
-    /// HTTP `Content-Type`, when present.
-    pub content_type: Option<String>,
-    /// Combined `Content-Security-Policy` header, when the response sent one.
-    #[serde(default)]
-    pub content_security_policy: Option<String>,
-    /// Combined `Content-Security-Policy-Report-Only` header.
-    #[serde(default)]
-    pub content_security_policy_report_only: Option<String>,
-    /// Combined `Reporting-Endpoints` header, when the response sent one.
-    #[serde(default)]
-    pub reporting_endpoints: Option<String>,
-    /// `X-Content-Type-Options: nosniff` on the response.
-    #[serde(default)]
-    pub no_sniff: bool,
-    /// The body came from HTTP, so the Apache `text/plain` check applies.
-    #[serde(default)]
-    pub http_response: bool,
-    /// Session history applied before the new realm parses response bytes.
-    pub history: renderer::HistorySnapshot,
-    /// Emulated viewport size to apply before the document lays out, when the
-    /// browser has one.
-    #[serde(default)]
-    pub viewport: Option<(u32, u32)>,
-    /// Page-scoped init scripts to register before the document's realm runs.
-    #[serde(default)]
-    pub init_scripts: Vec<(u64, String)>,
+    /// The response head the document installs.
+    pub head: renderer::ResponseHead,
 }
 
 /// One renderer-originated browser-service call.

@@ -31,7 +31,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// body messages with directional exchange stream chunks. Version 10 dropped
 /// `content_language` from mount, response-start, and dial outcomes. Version 11
 /// replaced JSON control payloads with postcard.
-pub const PROTOCOL_VERSION: u8 = 11;
+pub const PROTOCOL_VERSION: u8 = 12;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::wire::{Command as RendererCommand, Reply};
 use renderer::{
     DialFailure, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue,
-    RendererEvent, ResourceLimit, TabError,
+    RendererEvent, ResourceLimit, ResponseHead, TabError,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -721,17 +721,16 @@ impl Tab {
             .or_else(|| self.site.clone())
             .unwrap_or_else(|| Site::opaque(self.id));
         let mount = Mount {
-            url: self.document_url.to_string(),
-            content_type: Some("text/html; charset=utf-8".to_owned()),
-            content_security_policy: None,
-            content_security_policy_report_only: None,
-            reporting_endpoints: None,
-            no_sniff: false,
-            http_response: false,
+            head: ResponseHead {
+                url: self.document_url.to_string(),
+                status: 200,
+                content_type: Some("text/html; charset=utf-8".to_owned()),
+                history: self.history.snapshot(),
+                viewport: Some(self.viewport),
+                init_scripts: self.init_scripts.clone(),
+                ..ResponseHead::non_http("", None)
+            },
             body: html.as_bytes().to_vec(),
-            history: self.history.snapshot(),
-            viewport: Some(self.viewport),
-            init_scripts: self.init_scripts.clone(),
         };
         if self.renderer.is_none() && self.document_url.scheme() == "about" {
             self.pending_mount = Some(mount);
@@ -742,7 +741,7 @@ impl Tab {
             self.record_event(TabEvent::Load).await;
             return Ok(());
         }
-        self.mount(&site, 200, mount).await
+        self.mount(&site, mount).await
     }
 
     fn goto(&mut self, spec: &str) -> Result<(), TabError> {
@@ -791,16 +790,16 @@ impl Tab {
         Ok(())
     }
 
-    async fn mount(&mut self, site: &Site, status: u16, mount: Mount) -> Result<(), TabError> {
+    async fn mount(&mut self, site: &Site, mount: Mount) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
-        let document_url = mount.url.clone();
+        let document_url = mount.head.url.clone();
         let result = self
             .renderer
             .as_ref()
             .ok_or(TabError::ActorStopped)?
-            .mount(FrameId::MAIN, status, mount)
+            .mount(FrameId::MAIN, mount)
             .await
             .and_then(reply_unit);
         if result.is_err() {
@@ -814,18 +813,15 @@ impl Tab {
     async fn mount_stream(
         &mut self,
         site: &Site,
-        status: u16,
         mount: Mount,
         mut body: net::Body,
     ) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
-        let document_url = mount.url.clone();
+        let document_url = mount.head.url.clone();
         let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
-        let stream = renderer
-            .start_response(FrameId::MAIN, status, &mount)
-            .await?;
+        let stream = renderer.start_response(FrameId::MAIN, &mount).await?;
         let mut received = 0usize;
         loop {
             match body.read_chunk().await {
@@ -938,12 +934,12 @@ impl Tab {
         let mut mount = self.pending_mount.take().unwrap_or_else(blank_mount);
         // The replacement renderer must come up with the tab's emulated
         // viewport and script list, not the defaults.
-        mount.viewport = Some(self.viewport);
-        mount.init_scripts = self.init_scripts.clone();
+        mount.head.viewport = Some(self.viewport);
+        mount.head.init_scripts = self.init_scripts.clone();
         let site = Site::for_url(&self.document_url)
             .or_else(|| self.site.clone())
             .unwrap_or_else(|| Site::opaque(self.id));
-        self.mount(&site, 200, mount).await
+        self.mount(&site, mount).await
     }
 
     /// Takes a pending `data:` navigation so it can be committed without a dial.
@@ -976,19 +972,18 @@ impl Tab {
             return false;
         }
         let mount = Mount {
-            url: url.to_string(),
-            content_type: Some(content_type),
+            head: ResponseHead {
+                url: url.to_string(),
+                status: 200,
+                content_type: Some(content_type),
+                history: history.snapshot(),
+                viewport: Some(self.viewport),
+                init_scripts: self.init_scripts.clone(),
+                ..ResponseHead::non_http("", None)
+            },
             body,
-            history: history.snapshot(),
-            viewport: Some(self.viewport),
-            init_scripts: self.init_scripts.clone(),
-            content_security_policy: None,
-            content_security_policy_report_only: None,
-            reporting_endpoints: None,
-            no_sniff: false,
-            http_response: false,
         };
-        if let Err(error) = self.mount(&site, 200, mount).await {
+        if let Err(error) = self.mount(&site, mount).await {
             logging::error!(
                 target: "browser::tab",
                 "data navigation mount failed for {}: {error}",
@@ -1069,46 +1064,48 @@ impl Tab {
 
     /// Returns true when the new document mounted.
     async fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
-        let site = Site::for_url(&outcome.final_url).unwrap_or_else(|| Site::opaque(self.id));
+        let Ok(final_url) = Url::parse(&outcome.head.url) else {
+            self.navigation_failed = true;
+            return false;
+        };
+        let site = Site::for_url(&final_url).unwrap_or_else(|| Site::opaque(self.id));
         let mut history = self.history.clone();
-        if !history.navigate(outcome.final_url.clone(), self.traversal.take()) {
+        if !history.navigate(final_url.clone(), self.traversal.take()) {
             logging::error!(
                 target: "browser::tab",
                 "navigation rejected by history for {}",
-                log_url(&outcome.final_url)
+                log_url(&final_url)
             );
             self.navigation_failed = true;
             return false;
         }
-        let mount = Mount {
-            url: outcome.final_url.to_string(),
-            content_type: outcome.content_type.clone(),
-            content_security_policy: outcome.content_security_policy.clone(),
-            content_security_policy_report_only: outcome
-                .content_security_policy_report_only
-                .clone(),
-            reporting_endpoints: outcome.reporting_endpoints.clone(),
-            no_sniff: outcome.no_sniff,
-            http_response: true,
-            body: Vec::new(),
+        let head = ResponseHead {
             history: history.snapshot(),
             viewport: Some(self.viewport),
             init_scripts: self.init_scripts.clone(),
+            ..outcome.head
         };
         if let Err(error) = self
-            .mount_stream(&site, outcome.status, mount, outcome.body)
+            .mount_stream(
+                &site,
+                Mount {
+                    head,
+                    body: Vec::new(),
+                },
+                outcome.body,
+            )
             .await
         {
             logging::error!(
                 target: "browser::tab",
                 "navigation mount failed for {}: {error}",
-                log_url(&outcome.final_url)
+                log_url(&final_url)
             );
             self.navigation_failed = true;
             return false;
         }
         self.history = history;
-        self.document_url = outcome.final_url;
+        self.document_url = final_url;
         true
     }
 
@@ -1213,17 +1210,16 @@ impl Tab {
 
 fn blank_mount() -> Mount {
     Mount {
-        url: "about:blank".into(),
-        content_type: Some("text/html; charset=utf-8".into()),
-        content_security_policy: None,
-        content_security_policy_report_only: None,
-        reporting_endpoints: None,
-        no_sniff: false,
-        http_response: false,
+        head: ResponseHead {
+            url: "about:blank".into(),
+            // The wire carries the browser-chosen mount status, and the
+            // document installs it: violation `status-code` reads it
+            // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+            status: 200,
+            content_type: Some("text/html; charset=utf-8".into()),
+            ..ResponseHead::non_http("about:blank", None)
+        },
         body: b"<!doctype html><title></title>".to_vec(),
-        history: HistorySnapshot::default(),
-        viewport: None,
-        init_scripts: Vec::new(),
     }
 }
 
