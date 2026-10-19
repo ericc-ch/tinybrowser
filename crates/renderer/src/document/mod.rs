@@ -1542,7 +1542,6 @@ impl Document {
         while self.blitz_fetch_rx.try_recv().is_ok() {}
         self.subresource_bytes.clear();
         self.world.borrow_mut().clear_images();
-        self.world.borrow_mut().take_image_updates();
         self.image_selected_src.clear();
         self.in_flight_images.clear();
         self.connected_images.clear();
@@ -3104,7 +3103,7 @@ impl Document {
     ) {
         if !force
             && (self.in_flight_images.contains(&element)
-                || self.world.borrow().images.contains_key(&element))
+                || self.world.borrow().images.sizes.contains_key(&element))
         {
             return;
         }

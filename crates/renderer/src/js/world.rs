@@ -876,8 +876,6 @@ pub(crate) struct World {
     pub pending_fetch_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     frame_navigations: Vec<FrameNavigation>,
-    /// Connected `<img>` elements whose `src` changed inside script.
-    image_updates: Vec<NodeId>,
     /// Connected `<script src>` elements whose fetch prepare steps queued a
     /// load (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
     pending_scripts: Vec<NodeId>,
@@ -971,22 +969,8 @@ pub(crate) struct World {
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Decoded `<img>` dimensions for script geometry (`naturalWidth/Height`).
-    /// Blitz owns the pixels; this only records the settled size.
-    pub(crate) images: HashMap<NodeId, (u32, u32)>,
-    /// `<img>` elements whose current request has not finished, including a
-    /// `src` mutation waiting for `update the image data`
-    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
-    pub(crate) image_loading: HashSet<NodeId>,
-    /// Selected URL for each `<img>` current request
-    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
-    pub(crate) image_current_src: HashMap<NodeId, String>,
-    /// Current request is broken and there is no pending request
-    /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
-    pub(crate) image_broken: HashSet<NodeId>,
-    /// Elements whose current request already dispatched its `error` event,
-    /// so a later scan does not repeat it.
-    pub(crate) image_error_reported: HashSet<NodeId>,
+    /// Every per-element map an `<img>` request writes.
+    pub(crate) images: ImageState,
     /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
     /// without touching the content attribute
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
@@ -1006,6 +990,59 @@ pub(crate) struct World {
     /// reports these as `sourceFile`, `lineNumber`, and `columnNumber`
     /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
     pub(crate) creator_stacks: HashMap<NodeId, CreatorInfo>,
+}
+
+/// Per-element `<img>` loading state for the realm.
+///
+/// Written only by the image update steps, so the concern owns every map an
+/// image request touches and drops them together when the document that
+/// owned the elements goes away; no clear list can forget the next field
+/// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+#[derive(Default)]
+pub(crate) struct ImageState {
+    /// Decoded dimensions for script geometry (`naturalWidth/Height`). Blitz
+    /// owns the pixels; this only records the settled size.
+    pub(crate) sizes: HashMap<NodeId, (u32, u32)>,
+    /// Elements whose current request has not finished, including a `src`
+    /// mutation waiting for `update the image data`
+    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
+    pub(crate) loading: HashSet<NodeId>,
+    /// Selected URL for each element's current request
+    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
+    pub(crate) current_src: HashMap<NodeId, String>,
+    /// Current request is broken and there is no pending request
+    /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
+    pub(crate) broken: HashSet<NodeId>,
+    /// Elements whose current request already dispatched its `error` event,
+    /// so a later scan does not repeat it.
+    pub(crate) error_reported: HashSet<NodeId>,
+    /// Connected elements whose `src` changed inside script, awaiting the
+    /// drain's update step.
+    updates: Vec<NodeId>,
+}
+
+impl ImageState {
+    /// Queues `element` for the drain, at most once.
+    fn queue_update(&mut self, element: NodeId) {
+        if !self.updates.contains(&element) {
+            self.updates.push(element);
+        }
+    }
+
+    fn take_updates(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.updates)
+    }
+
+    /// Drops every element's state; called when the document that owned the
+    /// elements is replaced or forgotten.
+    fn clear(&mut self) {
+        self.sizes.clear();
+        self.loading.clear();
+        self.current_src.clear();
+        self.broken.clear();
+        self.error_reported.clear();
+        self.updates.clear();
+    }
 }
 
 /// The top JS frame that triggered a subresource fetch: the script URL as
@@ -1144,7 +1181,6 @@ impl World {
             pending_fetch_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
-            image_updates: Vec::new(),
             pending_scripts: Vec::new(),
             pending_csp_violations: Vec::new(),
             parser_inserted: HashSet::new(),
@@ -1179,11 +1215,7 @@ impl World {
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
-            images: HashMap::new(),
-            image_loading: HashSet::new(),
-            image_current_src: HashMap::new(),
-            image_broken: HashSet::new(),
-            image_error_reported: HashSet::new(),
+            images: ImageState::default(),
             nonce_slots: HashMap::new(),
             creator_stacks: HashMap::new(),
         }
@@ -1212,11 +1244,10 @@ impl World {
         self.active_elements.clear();
         self.selections.clear();
         self.frame_navigations.clear();
-        self.image_updates.clear();
         self.pending_scripts.clear();
         self.pending_csp_violations.clear();
         self.parser_inserted.clear();
-        self.clear_images();
+        self.images.clear();
         self.remote_ids.clear();
         self.remote_nodes.clear();
         // Sessions die with the realm: a navigation must not inherit a
@@ -1839,14 +1870,12 @@ impl World {
         // Mark unavailable now so `complete` is false while the update waits
         // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
         // <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
-        self.image_loading.insert(element);
-        if !self.image_updates.contains(&element) {
-            self.image_updates.push(element);
-        }
+        self.images.loading.insert(element);
+        self.images.queue_update(element);
     }
 
     pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
-        std::mem::take(&mut self.image_updates)
+        self.images.take_updates()
     }
 
     /// Queues a connected `<script src>` element for its fetch prepare steps.
@@ -1915,11 +1944,11 @@ impl World {
     /// keep its pixels and `currentSrc` until this request commits
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
-        self.image_loading.insert(element);
-        self.image_broken.remove(&element);
-        self.image_error_reported.remove(&element);
-        if !self.images.contains_key(&element) {
-            self.image_current_src.insert(element, url);
+        self.images.loading.insert(element);
+        self.images.broken.remove(&element);
+        self.images.error_reported.remove(&element);
+        if !self.images.sizes.contains_key(&element) {
+            self.images.current_src.insert(element, url);
         }
     }
 
@@ -1931,29 +1960,30 @@ impl World {
         height: u32,
         url: String,
     ) {
-        self.image_loading.remove(&element);
-        self.image_broken.remove(&element);
-        self.images.remove(&element);
-        self.image_current_src.insert(element, url);
-        self.images.insert(element, (width, height));
+        self.images.loading.remove(&element);
+        self.images.broken.remove(&element);
+        self.images.sizes.remove(&element);
+        self.images.current_src.insert(element, url);
+        self.images.sizes.insert(element, (width, height));
     }
 
     /// The current request finished without usable pixels. `url` is the
     /// selected source, or the selected source string when URL parsing failed
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn fail_image(&mut self, element: NodeId, url: String) {
-        self.image_loading.remove(&element);
-        self.images.remove(&element);
-        self.image_current_src.insert(element, url);
-        self.image_broken.insert(element);
+        self.images.loading.remove(&element);
+        self.images.sizes.remove(&element);
+        self.images.current_src.insert(element, url);
+        self.images.broken.insert(element);
     }
 
     /// Whether `element`'s current request already failed for `url`, so a
     /// later scan must not register a waiter that no delivery will settle.
     pub(crate) fn image_failed(&self, element: NodeId, url: &str) -> bool {
-        self.image_broken.contains(&element)
+        self.images.broken.contains(&element)
             && self
-                .image_current_src
+                .images
+                .current_src
                 .get(&element)
                 .is_some_and(|current| current == url)
     }
@@ -1961,23 +1991,19 @@ impl World {
     /// Records the first `error` event for `element`'s current request.
     /// Returns false when it was already reported.
     pub(crate) fn report_image_error(&mut self, element: NodeId) -> bool {
-        self.image_error_reported.insert(element)
+        self.images.error_reported.insert(element)
     }
 
     pub(crate) fn forget_image(&mut self, element: NodeId) {
-        self.image_loading.remove(&element);
-        self.image_current_src.remove(&element);
-        self.image_broken.remove(&element);
-        self.image_error_reported.remove(&element);
-        self.images.remove(&element);
+        self.images.loading.remove(&element);
+        self.images.current_src.remove(&element);
+        self.images.broken.remove(&element);
+        self.images.error_reported.remove(&element);
+        self.images.sizes.remove(&element);
     }
 
     pub(crate) fn clear_images(&mut self) {
         self.images.clear();
-        self.image_loading.clear();
-        self.image_current_src.clear();
-        self.image_broken.clear();
-        self.image_error_reported.clear();
     }
 
     pub(crate) fn queue_document_stream(

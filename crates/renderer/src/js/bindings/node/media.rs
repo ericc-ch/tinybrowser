@@ -527,13 +527,13 @@ impl JsNode {
         }
         let world = world(&ctx)?;
         let world = world.borrow();
-        if world.image_loading.contains(&self.handle.0) {
+        if world.images.loading.contains(&self.handle.0) {
             return Ok(false);
         }
-        if world.images.contains_key(&self.handle.0) {
+        if world.images.sizes.contains_key(&self.handle.0) {
             return Ok(true);
         }
-        if world.image_broken.contains(&self.handle.0) {
+        if world.images.broken.contains(&self.handle.0) {
             return Ok(true);
         }
         let src = world.document(self.handle.0).and_then(|parsed| {
@@ -542,7 +542,7 @@ impl JsNode {
         if src.as_deref().is_none_or(str::is_empty) {
             return Ok(true);
         }
-        Ok(world.image_broken.contains(&self.handle.0))
+        Ok(world.images.broken.contains(&self.handle.0))
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
@@ -560,7 +560,7 @@ impl JsNode {
         let world = world(&ctx)?;
         Ok(world
             .borrow()
-            .image_current_src
+            .images.current_src
             .get(&self.handle.0)
             .cloned()
             .unwrap_or_default())
@@ -575,7 +575,7 @@ pub(super) fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> 
         return Ok(None);
     }
     let world = world(ctx)?;
-    Ok(world.borrow().images.get(&id).copied())
+    Ok(world.borrow().images.sizes.get(&id).copied())
 }
 
 /// Whether the input is in the image button state (`type=image`, ASCII
