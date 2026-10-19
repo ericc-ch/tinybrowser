@@ -1068,7 +1068,10 @@ impl JsRealm {
                         node: parsed.document.base.root_node().id,
                     });
                     if let Some(target) = target {
-                        world.pending_csp_violations.push((target, violations));
+                        world
+                            .state
+                            .pending_csp_violations
+                            .push((target, violations));
                     }
                 }
                 !blocked
@@ -1662,7 +1665,7 @@ fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
     // local-scheme rule below would send nothing where browsers send the
     // embedding document's URL.
     let source = world.base_url.as_ref().unwrap_or(&world.document_url);
-    referrer_for_policy(&world.referrer_policy, source, request_url)
+    referrer_for_policy(&world.state.referrer_policy, source, request_url)
 }
 
 /// The violations compiling `source` produces against the document's policies,

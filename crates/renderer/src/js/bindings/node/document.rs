@@ -1150,7 +1150,7 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript
     pub(super) fn current_script<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let world = world(ctx)?;
-        let current = world.borrow().current_script;
+        let current = world.borrow().state.current_script;
         match current {
             Some(id) if id.document_id() == self.handle.0.document_id() => wrap_node(ctx, id),
             _ => Ok(Value::new_null(ctx.clone())),
@@ -1551,6 +1551,7 @@ pub(super) fn construct_node_in_owner<'js>(
             // element rather than allocating a second wrapper.
             let id = world(ctx)?
                 .borrow_mut()
+                .state
                 .custom_construction
                 .pop()
                 .ok_or_else(|| Exception::throw_type(ctx, "Illegal constructor"))?;
@@ -1590,7 +1591,7 @@ pub(super) fn push_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) ->
             "custom element candidate is not an element",
         ));
     }
-    world(&ctx)?.borrow_mut().custom_construction.push(id);
+    world(&ctx)?.borrow_mut().state.custom_construction.push(id);
     Ok(())
 }
 
@@ -1604,8 +1605,8 @@ pub(super) fn discard_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>)
     };
     let world = world(&ctx)?;
     let mut world = world.borrow_mut();
-    if world.custom_construction.last() == Some(&id) {
-        world.custom_construction.pop();
+    if world.state.custom_construction.last() == Some(&id) {
+        world.state.custom_construction.pop();
     }
     Ok(())
 }
@@ -2041,7 +2042,7 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
     let Ok(world) = world(ctx) else {
         return;
     };
-    world.borrow_mut().referrer_policy = policy;
+    world.borrow_mut().state.referrer_policy = policy;
 }
 
 /// `meta http-equiv=content-security-policy` insertion appends one policy
@@ -2133,7 +2134,7 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     let violations = {
         let world = world(ctx)?;
         let world = world.borrow();
-        let slot = world.nonce_slots.get(&id).map(String::as_str);
+        let slot = world.state.nonce_slots.get(&id).map(String::as_str);
         let (nonce, nonceable) = world.document(id).map_or_else(
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
@@ -2155,8 +2156,8 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     if crate::csp::blocks(&violations) {
         return Ok(());
     }
-    let previous = world(ctx)?.borrow().current_script;
-    world(ctx)?.borrow_mut().current_script = Some(id);
+    let previous = world(ctx)?.borrow().state.current_script;
+    world(ctx)?.borrow_mut().state.current_script = Some(id);
     let mut options = EvalOptions::default();
     options.strict = false;
     // Text-set scripts run under the document URL so their stacks attribute
@@ -2174,7 +2175,7 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script>).
         crate::js::report_script_error(ctx, &error, base_line, &filename);
     }
-    world(ctx)?.borrow_mut().current_script = previous;
+    world(ctx)?.borrow_mut().state.current_script = previous;
     Ok(())
 }
 
@@ -2199,14 +2200,21 @@ pub(super) fn clear_nonce_on_connect(ctx: &Ctx<'_>, inserted: &[NodeId]) -> Resu
     }
     for id in ids {
         let owner = world_for_node(ctx, id)?;
-        let saved = owner.borrow().nonce_slots.get(&id).cloned().or_else(|| {
-            owner.borrow().document(id).and_then(|parsed| {
-                crate::dom::tree::attr(&parsed.document.base, id.node, "nonce").map(str::to_owned)
-            })
-        });
+        let saved = owner
+            .borrow()
+            .state
+            .nonce_slots
+            .get(&id)
+            .cloned()
+            .or_else(|| {
+                owner.borrow().document(id).and_then(|parsed| {
+                    crate::dom::tree::attr(&parsed.document.base, id.node, "nonce")
+                        .map(str::to_owned)
+                })
+            });
         set_attribute_sync(ctx, id, "nonce", "")?;
         if let Some(slot) = saved {
-            owner.borrow_mut().nonce_slots.insert(id, slot);
+            owner.borrow_mut().state.nonce_slots.insert(id, slot);
         }
     }
     Ok(())

@@ -95,14 +95,14 @@ fn retarget_adopted_subtree(ctx: &Ctx<'_>, from: NodeId, to: NodeId) -> Result<(
         {
             if std::rc::Rc::ptr_eq(&from_owner, &to_owner) {
                 let mut world = from_owner.borrow_mut();
-                if let Some(slot) = world.nonce_slots.remove(&from) {
-                    world.nonce_slots.insert(to, slot);
+                if let Some(slot) = world.state.nonce_slots.remove(&from) {
+                    world.state.nonce_slots.insert(to, slot);
                 }
             } else {
-                let slot = from_owner.borrow().nonce_slots.get(&from).cloned();
+                let slot = from_owner.borrow().state.nonce_slots.get(&from).cloned();
                 if let Some(slot) = slot {
-                    from_owner.borrow_mut().nonce_slots.remove(&from);
-                    to_owner.borrow_mut().nonce_slots.insert(to, slot);
+                    from_owner.borrow_mut().state.nonce_slots.remove(&from);
+                    to_owner.borrow_mut().state.nonce_slots.insert(to, slot);
                 }
             }
         }
@@ -233,8 +233,8 @@ pub(crate) fn copy_nonce_subtree(
     };
     let mut world = owner.borrow_mut();
     for (from_id, to_id) in pairs {
-        if let Some(slot) = world.nonce_slots.get(&from_id).cloned() {
-            world.nonce_slots.insert(to_id, slot);
+        if let Some(slot) = world.state.nonce_slots.get(&from_id).cloned() {
+            world.state.nonce_slots.insert(to_id, slot);
         }
     }
 }

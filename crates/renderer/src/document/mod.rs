@@ -779,7 +779,11 @@ impl Document {
         self.image_selected_src.remove(&element);
         // A re-insertion starts a new load: drop the old trigger so the
         // move attributes to itself rather than to a stale `src` set.
-        self.world.borrow_mut().creator_stacks.remove(&element);
+        self.world
+            .borrow_mut()
+            .state
+            .creator_stacks
+            .remove(&element);
         self.world.borrow_mut().forget_image(element);
     }
 
@@ -853,7 +857,7 @@ impl Document {
             world.set_url_with_origin(url, origin);
             world.base_url = Some(base.clone());
             world.csp = policy.clone();
-            referrer_policy.clone_into(&mut world.referrer_policy);
+            referrer_policy.clone_into(&mut world.state.referrer_policy);
         }
         self.initial_blank = false;
         self.load_html(markup);
@@ -1556,7 +1560,7 @@ impl Document {
         self.executed_scripts.clear();
         self.parser_eof = true;
         self.world.borrow_mut().parser_active = false;
-        self.world.borrow_mut().current_script = None;
+        self.world.borrow_mut().state.current_script = None;
         let mut world = self.world.borrow_mut();
         let bytes = world
             .pending_html_writes
@@ -1595,13 +1599,13 @@ impl Document {
         filename: &str,
     ) {
         // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
-        let previous = self.world.borrow().current_script;
-        self.world.borrow_mut().current_script = element;
+        let previous = self.world.borrow().state.current_script;
+        self.world.borrow_mut().state.current_script = element;
         if !self.ensure_js_ok() {
             return;
         }
         self.fire_js(|js| js.eval_classic_script(source, base_line, filename));
-        self.world.borrow_mut().current_script = previous;
+        self.world.borrow_mut().state.current_script = previous;
         self.adopt_js_work();
     }
 
@@ -1910,7 +1914,7 @@ impl Document {
         id: crate::dom::tree::NodeId,
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
-        let slot = world.nonce_slots.get(&id).map(String::as_str);
+        let slot = world.state.nonce_slots.get(&id).map(String::as_str);
         let parser_inserted = world.is_parser_inserted(id);
         let (nonce, nonceable) = world.document(id).map_or_else(
             || (String::new(), false),
@@ -1951,7 +1955,7 @@ impl Document {
         id: crate::dom::tree::NodeId,
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
-        let slot = world.nonce_slots.get(&id).map(String::as_str);
+        let slot = world.state.nonce_slots.get(&id).map(String::as_str);
         let parser_inserted = world.is_parser_inserted(id);
         let (nonce, integrity) = world.document(id).map_or_else(
             || (String::new(), String::new()),
@@ -2036,7 +2040,7 @@ impl Document {
                 if violation.source_file.is_none()
                     && violation.blocked_uri != "inline"
                     && violation.blocked_uri != "eval"
-                    && let Some(creator) = world.creator_stacks.get(&target)
+                    && let Some(creator) = world.state.creator_stacks.get(&target)
                 {
                     violation.source_file = Some(creator.url.clone());
                     violation.line_number = creator.line;

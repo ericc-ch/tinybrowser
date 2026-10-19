@@ -254,7 +254,7 @@ impl Document {
             self.queue_image(element, true);
         }
         self.queue_dynamic_scripts();
-        let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
+        let violations = std::mem::take(&mut self.world.borrow_mut().state.pending_csp_violations);
         for (target, violations) in violations {
             self.fire_csp_violations(target, &violations);
         }
@@ -319,7 +319,7 @@ impl Document {
             self.queue_image(element, true);
         }
         self.queue_dynamic_scripts();
-        let violations = std::mem::take(&mut self.world.borrow_mut().pending_csp_violations);
+        let violations = std::mem::take(&mut self.world.borrow_mut().state.pending_csp_violations);
         for (target, violations) in violations {
             self.fire_csp_violations(target, &violations);
         }

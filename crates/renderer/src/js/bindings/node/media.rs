@@ -560,7 +560,8 @@ impl JsNode {
         let world = world(&ctx)?;
         Ok(world
             .borrow()
-            .images.current_src
+            .images
+            .current_src
             .get(&self.handle.0)
             .cloned()
             .unwrap_or_default())

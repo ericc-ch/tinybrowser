@@ -759,7 +759,7 @@ impl Engine {
             let world = document.world();
             let world = world.borrow();
             let policy = if policy.is_empty() {
-                world.referrer_policy.as_str()
+                world.state.referrer_policy.as_str()
             } else {
                 policy
             };
@@ -1050,7 +1050,7 @@ impl Engine {
             (
                 document.base_url(),
                 world.origin.clone(),
-                world.referrer_policy.clone(),
+                world.state.referrer_policy.clone(),
             )
         });
         let policy = self.inherited_policy(parent);
