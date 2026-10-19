@@ -1,5 +1,5 @@
 use super::{CompletedDial, DialContext, QueuedDial};
-use crate::protocol::{DialKind, DialOutcome, DialRequest};
+use crate::protocol::DialOutcome;
 use crate::sniff::sniff_encoding;
 
 /// Decodes a response body that may arrive in pieces.
@@ -91,44 +91,22 @@ fn decode_chunk(decoder: &mut encoding_rs::Decoder, bytes: &[u8], last: bool) ->
     }
 }
 
-pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
-    let kind = match dial.context {
-        DialContext::JsFetch { .. } => DialKind::JsFetch,
-        DialContext::ClassicScript { .. } => DialKind::ClassicScript,
-        DialContext::FrameLoad { .. } => DialKind::FrameLoad,
-        // Plain page subresources; no carrier policy keys off the kind
-        // except for script-initiated fetches.
-        DialContext::BlitzResource { .. } => DialKind::Image,
-        DialContext::CspReport => DialKind::CspReport,
-    };
-    DialRequest {
-        kind,
-        url: dial.url.to_string(),
-        initiator: dial.initiator.to_string(),
-        read_body: true,
-        method: dial.method.clone(),
-        body: dial.body.clone(),
-        content_type: dial.content_type.clone(),
-        headers: dial.headers.clone(),
-        referrer: dial.referrer.clone(),
-        timeout_ms: 0,
-        csp: dial.csp.clone().map(Box::new),
-        cors: dial.cors,
-    }
-}
-
 pub(in crate::document) fn complete(
-    dial: &QueuedDial,
+    dial: QueuedDial,
     outcome: Result<DialOutcome, crate::protocol::DialFailure>,
 ) -> Result<CompletedDial, DialContext> {
-    let context = dial.context;
+    let QueuedDial {
+        context,
+        req,
+        ancestors,
+        integrity,
+    } = dial;
     let outcome = outcome.map_err(|_| context)?;
     Ok(CompletedDial {
         context,
         outcome,
-        request_url: dial.url.to_string(),
-        csp: dial.csp.clone(),
-        ancestors: dial.ancestors.clone(),
-        integrity: dial.integrity.clone(),
+        req,
+        ancestors,
+        integrity,
     })
 }
