@@ -119,7 +119,7 @@ impl GuestTab for Tab {
                 url,
                 status: 0,
                 content_type: Some("text/html; charset=utf-8".into()),
-                ..renderer::ResponseHead::non_http("", None)
+                ..renderer::ResponseHead::default()
             },
             body: html.into_bytes(),
         };

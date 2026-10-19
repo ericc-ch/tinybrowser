@@ -2198,7 +2198,7 @@ mod realm_tests {
                     head: crate::protocol::ResponseHead {
                         url: "https://example.test/".into(),
                         content_type: Some("text/html".into()),
-                        ..crate::protocol::ResponseHead::non_http("", None)
+                        ..crate::protocol::ResponseHead::default()
                     },
                     body: html.as_bytes().to_vec(),
                 },
@@ -2242,7 +2242,7 @@ mod realm_tests {
                 head: crate::protocol::ResponseHead {
                     url: "https://example.test/".into(),
                     content_type: Some("text/html".into()),
-                    ..crate::protocol::ResponseHead::non_http("", None)
+                    ..crate::protocol::ResponseHead::default()
                 },
                 body: html.as_bytes().to_vec(),
             })

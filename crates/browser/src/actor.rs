@@ -728,7 +728,7 @@ impl Tab {
                 history: self.history.snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
-                ..ResponseHead::non_http("", None)
+                ..ResponseHead::default()
             },
             body: html.as_bytes().to_vec(),
         };
@@ -979,7 +979,7 @@ impl Tab {
                 history: history.snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
-                ..ResponseHead::non_http("", None)
+                ..ResponseHead::default()
             },
             body,
         };
@@ -1217,7 +1217,7 @@ fn blank_mount() -> Mount {
             // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
             status: 200,
             content_type: Some("text/html; charset=utf-8".into()),
-            ..ResponseHead::non_http("about:blank", None)
+            ..ResponseHead::default()
         },
         body: b"<!doctype html><title></title>".to_vec(),
     }

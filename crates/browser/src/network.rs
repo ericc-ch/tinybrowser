@@ -185,20 +185,19 @@ impl TabNetworkHandle {
             started.elapsed()
         );
         let headers = response.headers();
-        let head = renderer::ResponseHead {
-            url: final_url.to_string(),
+        // The renderer owns the response-head derivation (`ResponseHead::http`),
+        // so the top-level path and the child-frame path cannot disagree about
+        // how a header becomes policy, endpoints, or the nosniff flag.
+        let pairs: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
+            .collect();
+        let head = renderer::ResponseHead::http(
             status,
-            content_type: content_type_header(headers),
-            content_security_policy: list_header(headers, "content-security-policy"),
-            content_security_policy_report_only: list_header(
-                headers,
-                "content-security-policy-report-only",
-            ),
-            reporting_endpoints: list_header(headers, "reporting-endpoints"),
-            no_sniff: header_nosniff(headers),
-            http_response: true,
-            ..renderer::ResponseHead::non_http("", None)
-        };
+            final_url.to_string(),
+            content_type_header(headers),
+            &pairs,
+        );
         let body = response.into_body();
         Ok(NavOutcome {
             head,
@@ -573,31 +572,11 @@ fn sends_default_ua_client_hints(url: &Url) -> bool {
     }
 }
 
-/// Combined list-header values for `name`, comma-joined.
-fn list_header(headers: &net::HeaderMap, name: &str) -> Option<String> {
-    net::combined_header(
-        headers
-            .get_all(name)
-            .filter_map(|value| std::str::from_utf8(value).ok()),
-    )
-}
-
 /// Header values are byte sequences; each byte is exposed as the same code
 /// point so the page never sees a replacement character
 /// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
 fn isomorphic_decode(bytes: &[u8]) -> String {
     bytes.iter().map(|&byte| char::from(byte)).collect()
-}
-
-/// Whether `X-Content-Type-Options` on the response is `nosniff`
-/// (<https://fetch.spec.whatwg.org/#determine-nosniff>). The renderer owns
-/// the algorithm because the renderer-side dials share it.
-fn header_nosniff(headers: &net::HeaderMap) -> bool {
-    let values: Vec<String> = headers
-        .get_all("x-content-type-options")
-        .map(isomorphic_decode)
-        .collect();
-    renderer::sniff::nosniff(&values.join(", "))
 }
 
 /// Every `Content-Type` value from the response as one string: the values
