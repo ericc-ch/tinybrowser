@@ -17,6 +17,7 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 - 791d7655 drop the on-demand style context inside the layout state. SequentialTaskList::drop asserts the state, so getComputedStyle on display:none panicked as soon as the context dropped.
 - 9f10f12e display:contents generates no box for resolved values. Per CSSOM, no box means the resolved value is the computed value; it reported 0px and leaked min/max clamping in.
 - 19672f4f tag requests with their resource kind (stylesheets, images, fonts). Per-destination policy (CSP `img-src` / `style-src` / `font-src`) cannot be applied from the URL alone; the embedder would have to guess the destination.
+- 4736fc73 accept a leading `+` in canvas width/height attributes. The HTML non-negative integer parser allows it, so `width="+100"` is 100.
 - 83251583 parse canvas width/height attributes as non-negative integers. `100%`, `100e1`, and `0x100` are 100, 100, and 0, not a CSS length and a parse failure; the intrinsic size and the computed width both depend on it.
 - 82eb84a8 expose the document font context. Canvas text must shape with the database holding `@font-face` fonts; the shared process context does not see them, so an embedder cannot otherwise measure or draw the fonts a page declares.
 
