@@ -55,15 +55,17 @@ svgtypes = "0.16"
 style = { package = "stylo", version = "0.22.0" }
 style_traits = { package = "stylo_traits", version = "0.22.0" }
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
-# Pinned exact: beta drift is fast, and Cargo.lock pins the rest.
+# Pinned exact: beta drift is fast, and Cargo.lock pins the rest. The pin
+# must track `version.workspace` in third_party/blitz/Cargo.toml, or
+# [patch.crates-io] stops matching and the registry beta compiles instead.
 # `floats` is not a Blitz default but the published stylo_taffy only
 # initializes `float`/`clear` with it.
-blitz-dom = { version = "=0.3.0-beta.3", features = ["floats"] }
-blitz-html = "=0.3.0-beta.3"
-blitz-paint = "=0.3.0-beta.3"
+blitz-dom = { version = "=0.3.0-beta.4", features = ["floats"] }
+blitz-html = "=0.3.0-beta.4"
+blitz-paint = "=0.3.0-beta.4"
 anyrender = "=0.14.0"
 anyrender_tiny_skia = { path = "../anyrender-tiny-skia" }
-blitz-traits = "=0.3.0-beta.3"
+blitz-traits = "=0.3.0-beta.4"
 # Inflates the build-compressed JS shims (`js::blob`). Same instance `png`
 # already retains, so this adds no new crate to the binary.
 flate2 = "1"
