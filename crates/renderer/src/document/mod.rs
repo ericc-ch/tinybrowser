@@ -20,7 +20,8 @@ use crate::ReadyState;
 use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
 use crate::messaging::SharedHandle;
 use crate::protocol::{
-    BrowserServices, DialOutcome, FrameId, Mount, RendererEvent, ScriptFailure, TabError,
+    BrowserServices, DialOutcome, FrameId, Mount, RendererEvent, ResponseHead, ScriptFailure,
+    TabError,
 };
 
 pub(crate) mod dial;
@@ -389,11 +390,14 @@ pub(crate) struct Document {
     /// `Reporting-Endpoints` headers. A violated policy's `report-to`
     /// directive resolves its first known name here
     /// (<https://w3c.github.io/reporting/#header>).
-    pub(crate) reporting_endpoints: Vec<(String, String)>,
+    ///
+    /// Only [`Document::install_head`] and `set_reporting_endpoints` write
+    /// it; no caller reaches around them.
+    reporting_endpoints: Vec<(String, String)>,
     /// HTTP status of the committed navigation response, reported as the
     /// violation `status-code`. Zero when unknown
     /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-    pub(crate) http_status: u16,
+    http_status: u16,
     /// First 1445 raw response bytes, the MIME sniff resource header.
     sniff_header: Vec<u8>,
     /// Whether [`Document::finish_parse`] runs the MIME sniffing algorithm.
@@ -898,26 +902,6 @@ impl Document {
         self.initial_blank
     }
 
-    /// Replaces this frame's document with a complete response, as the frame's
-    /// own `src` load delivers it.
-    pub(crate) fn load_frame_response(
-        &mut self,
-        url: &Url,
-        content_type: Option<&str>,
-        body: &[u8],
-        policy: crate::csp::List,
-        mime: crate::sniff::MimeGuard,
-    ) {
-        self.load_response_body(url, content_type, body, policy, mime);
-        // Nested HTML documents without scripts skip a realm at parse;
-        // `fire_ready_frame_loads` creates one when the parent is not in the
-        // encoding-label burst
-        // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
-        if self.js.is_none() && self.shared.borrow().tree.parent(self.frame).is_none() {
-            self.ensure_js_ok();
-        }
-    }
-
     /// Runs one `javascript:` frame URL's script in the frame's current realm,
     /// replacing the document only when the result is a string. A void
     /// result leaves the document (and its realm) untouched; the script
@@ -984,6 +968,12 @@ impl Document {
             self.url = url.clone();
             self.world.borrow_mut().document_url = url;
         }
+    }
+
+    /// Sets the realm-visible session history of a new document, before its
+    /// realm runs so the `history` bindings read the fresh entry.
+    pub(crate) fn set_history(&mut self, history: &crate::protocol::HistorySnapshot) {
+        self.world.borrow_mut().history = history.clone();
     }
 
     /// Restores a same-document session history entry while preserving the realm.
@@ -1225,31 +1215,14 @@ impl Document {
     /// Replaces the document from a host mount: new realm, decoded bytes,
     /// parsed to load. The host has already dialed and chosen this renderer.
     pub(crate) fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
-        let url = Url::parse(&mount.url).map_err(|_| TabError::InvalidUrl {
-            spec: mount.url.clone(),
-        })?;
-        if let Some((width, height)) = mount.viewport {
-            self.viewport_size = (width, height);
+        // An invalid mount spec fails before anything is touched.
+        if Url::parse(&mount.head.url).is_err() {
+            return Err(TabError::InvalidUrl {
+                spec: mount.head.url.clone(),
+            });
         }
-        self.world.borrow_mut().history = mount.history.clone();
-        self.reporting_endpoints = mount
-            .reporting_endpoints
-            .as_deref()
-            .map(crate::csp::parse_reporting_endpoints_value)
-            .unwrap_or_default();
-        self.load_response_body(
-            &url,
-            mount.content_type.as_deref(),
-            &mount.body,
-            crate::csp::List::from_headers(
-                mount.content_security_policy.as_deref(),
-                mount.content_security_policy_report_only.as_deref(),
-            ),
-            crate::sniff::MimeGuard {
-                no_sniff: mount.no_sniff,
-                http: mount.http_response,
-            },
-        );
+        self.set_history(&mount.head.history);
+        self.install_response(&mount.head, &mount.body, None);
         Ok(())
     }
 
@@ -1283,35 +1256,45 @@ impl Document {
         self.character_set = "UTF-8";
     }
 
-    /// Starts a document from a network response: a new realm, the response's
-    /// URL, and a body that may arrive in pieces.
+    /// One funnel: opens the realm from a response head — new realm, URL
+    /// (with an optional captured origin), status, CSP policy, MIME guard,
+    /// and reporting endpoints — then opens a carrier-owned parser that
+    /// consumes bytes until [`Self::end_body`].
     ///
-    /// A URL that does not parse leaves the document on its previous URL.
-    pub(crate) fn begin_response(
-        &mut self,
-        url: Option<&Url>,
-        content_type: Option<&str>,
-        viewport: Option<(u32, u32)>,
-        policy: crate::csp::List,
-        mime: crate::sniff::MimeGuard,
-    ) {
+    /// Every response-install path runs the same derivation in one order
+    /// here; callers only choose when the body arrives. A URL that does not
+    /// parse leaves the document on its previous URL, as a streamed response
+    /// with an unusable final URL does.
+    pub(crate) fn install_head(&mut self, head: &ResponseHead, origin: Option<url::Origin>) {
         self.reset_js_realm();
-        // A new response brings its own HTTP status: the HTTP entries set it
-        // after this runs, so documents without one (blank, data) report
-        // zero rather than a previous page's status.
-        self.http_status = 0;
-        if let Some((width, height)) = viewport {
+        // A new response brings its own HTTP status: documents without one
+        // (blank, data) report zero rather than a previous page's status.
+        // Violation `status-code` reports it
+        // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+        self.http_status = head.status;
+        self.set_reporting_endpoints(head);
+        if let Some((width, height)) = head.viewport {
             self.viewport_size = (width, height);
         }
-        if let Some(url) = url {
+        // The parsed URL decides; an unparseable response URL leaves the
+        // previous URL in place.
+        let url = Url::parse(&head.url).ok();
+        if let Some(url) = &url {
             self.url = url.clone();
         }
         self.initial_blank = false;
         let mut world = self.world.borrow_mut();
-        world.set_url(self.url.clone());
         // A response document resolves against its own URL; any inherited
         // `about:srcdoc` base stops applying.
         world.base_url = None;
+        match origin {
+            // A `blob:` response carries its store entry's creator, which is
+            // not what `Url::origin()` returns for the blob URL
+            // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
+            // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+            Some(origin) => world.set_url_with_origin(self.url.clone(), origin),
+            None => world.set_url(self.url.clone()),
+        }
         drop(world);
         // The realm is already new when this runs; this opens the parser and
         // the decoder for the response that will feed it.
@@ -1324,67 +1307,67 @@ impl Document {
             // `a;charset=x, b` does not decode `b`
             // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
             Some(dial::ResponseDecoder::new(
-                content_type.and_then(crate::sniff::extract_mime_type),
+                head.content_type
+                    .as_deref()
+                    .and_then(crate::sniff::extract_mime_type),
             )),
         );
         // Kept raw until `finish_parse`: the Apache `text/plain` check needs
         // the exact bytes the server sent before the extraction runs
         // (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
-        self.response_content_type = content_type.map(str::to_owned);
-        self.response_policy = policy;
+        self.response_content_type.clone_from(&head.content_type);
+        self.response_policy = head.inherited_policy.clone().unwrap_or_else(|| {
+            crate::csp::List::from_headers(
+                head.content_security_policy.as_deref(),
+                head.content_security_policy_report_only.as_deref(),
+            )
+        });
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
-        self.mime_guard = mime;
+        self.mime_guard = crate::sniff::MimeGuard {
+            no_sniff: head.no_sniff,
+            http: head.http_response,
+        };
     }
 
-    /// Starts a document from a complete response: new realm, the response's
-    /// URL, and the whole body.
-    fn load_response_body(
-        &mut self,
-        url: &Url,
-        content_type: Option<&str>,
-        body: &[u8],
-        policy: crate::csp::List,
-        mime: crate::sniff::MimeGuard,
-    ) {
-        self.load_response_body_with_origin(url, content_type, body, None, policy, mime);
-    }
-
-    /// [`Document::load_response_body`] that stores `origin` instead of
-    /// `Url::origin()`. A `blob:` document's origin is the store entry's
-    /// creator, which is not what `Url::origin()` returns for the blob URL
-    /// (<https://w3c.github.io/FileAPI/#blob-url-entry>,
-    /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
-    fn load_response_body_with_origin(
-        &mut self,
-        url: &Url,
-        content_type: Option<&str>,
-        body: &[u8],
-        origin: Option<url::Origin>,
-        policy: crate::csp::List,
-        mime: crate::sniff::MimeGuard,
-    ) {
-        self.begin_response(Some(url), content_type, None, policy, mime);
-        if let Some(origin) = origin {
-            self.world
-                .borrow_mut()
-                .set_url_with_origin(url.clone(), origin);
-        }
+    /// Installs a complete response head and body: [`Self::install_head`]
+    /// plus the whole body, ending the parse at once.
+    fn install_response(&mut self, head: &ResponseHead, body: &[u8], origin: Option<url::Origin>) {
+        self.install_head(head, origin);
         self.write_body(body);
         self.end_body();
     }
 
-    /// Loads a complete response whose captured origin is `origin`.
-    pub(crate) fn load_frame_response_with_origin(
+    /// Installs a complete response into this frame's document, as the
+    /// frame's own `src` load or a committed child-frame response delivers.
+    pub(crate) fn install_frame_response(
         &mut self,
-        url: &Url,
-        content_type: Option<&str>,
+        head: &ResponseHead,
         body: &[u8],
-        origin: url::Origin,
-        policy: crate::csp::List,
-        mime: crate::sniff::MimeGuard,
+        origin: Option<url::Origin>,
     ) {
-        self.load_response_body_with_origin(url, content_type, body, Some(origin), policy, mime);
+        self.install_response(head, body, origin);
+        // Nested HTML documents without scripts skip a realm at parse;
+        // `fire_ready_frame_loads` creates one when the parent is not in the
+        // encoding-label burst
+        // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
+        if self.js.is_none() && self.shared.borrow().tree.parent(self.frame).is_none() {
+            self.ensure_js_ok();
+        }
+    }
+
+    /// Installs the response's `Reporting-Endpoints` endpoints: a violated
+    /// policy's `report-to` directive resolves its endpoint names against
+    /// them (<https://w3c.github.io/reporting/#header>). A refused
+    /// `frame-ancestors` response dispatches its violations on the fallback
+    /// document against the new response's endpoints, so this is also set
+    /// before the check.
+    fn set_reporting_endpoints(&mut self, head: &ResponseHead) {
+        self.reporting_endpoints = head
+            .reporting_endpoints
+            .as_deref()
+            .map(crate::csp::parse_reporting_endpoints_value)
+            .unwrap_or_default();
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
@@ -2550,12 +2533,20 @@ impl Document {
         embedder: Option<FrameId>,
         ancestors: &[Url],
     ) {
-        let policy = crate::csp::List::from_headers(
-            crate::csp::combined_header(&outcome.headers, "content-security-policy").as_deref(),
-            crate::csp::combined_header(&outcome.headers, "content-security-policy-report-only")
-                .as_deref(),
+        let head = ResponseHead::http(
+            outcome.status,
+            url.to_string(),
+            outcome.content_type.clone(),
+            &outcome.headers,
         );
-        self.reporting_endpoints = crate::csp::reporting_endpoints(&outcome.headers);
+        let policy = crate::csp::List::from_headers(
+            head.content_security_policy.as_deref(),
+            head.content_security_policy_report_only.as_deref(),
+        );
+        // Set before the `frame-ancestors` decision: a refused response
+        // dispatches its violations on the fallback document against the new
+        // response's endpoints.
+        self.set_reporting_endpoints(&head);
         if embedder.is_some()
             && !ancestors.is_empty()
             && self.note_frame_ancestors_block(embedder, url, &policy, ancestors)
@@ -2569,20 +2560,7 @@ impl Document {
         self.record_event(RendererEvent::Navigated {
             url: url.to_string(),
         });
-        self.load_frame_response(
-            url,
-            outcome.content_type.as_deref(),
-            &outcome.body,
-            policy,
-            crate::sniff::MimeGuard {
-                no_sniff: crate::sniff::headers_nosniff(&outcome.headers),
-                http: true,
-            },
-        );
-        // The document's own HTTP status, after the fresh response reset it:
-        // violation `status-code` reports it
-        // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-        self.http_status = outcome.status;
+        self.install_frame_response(&head, &outcome.body, None);
     }
 
     /// Hands one Blitz subresource response to its handler. A redirect the

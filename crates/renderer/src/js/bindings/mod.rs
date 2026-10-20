@@ -2195,17 +2195,12 @@ mod realm_tests {
             .mount_frame(
                 FrameId::MAIN,
                 &crate::protocol::Mount {
-                    url: "https://example.test/".into(),
-                    content_type: Some("text/html".into()),
+                    head: crate::protocol::ResponseHead {
+                        url: "https://example.test/".into(),
+                        content_type: Some("text/html".into()),
+                        ..crate::protocol::ResponseHead::default()
+                    },
                     body: html.as_bytes().to_vec(),
-                    history: crate::protocol::HistorySnapshot::default(),
-                    viewport: None,
-                    init_scripts: Vec::new(),
-                    content_security_policy: None,
-                    content_security_policy_report_only: None,
-                    reporting_endpoints: None,
-                    no_sniff: false,
-                    http_response: false,
                 },
             )
             .expect("mount");
@@ -2244,17 +2239,12 @@ mod realm_tests {
         let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
         renderer
             .mount_for_test(&crate::protocol::Mount {
-                url: "https://example.test/".into(),
-                content_type: Some("text/html".into()),
-                content_security_policy: None,
-                content_security_policy_report_only: None,
-                reporting_endpoints: None,
-                no_sniff: false,
-                http_response: false,
+                head: crate::protocol::ResponseHead {
+                    url: "https://example.test/".into(),
+                    content_type: Some("text/html".into()),
+                    ..crate::protocol::ResponseHead::default()
+                },
                 body: html.as_bytes().to_vec(),
-                history: crate::protocol::HistorySnapshot::default(),
-                viewport: None,
-                init_scripts: Vec::new(),
             })
             .expect("mount");
         let yielded = renderer.drain_for(std::time::Duration::from_millis(400));

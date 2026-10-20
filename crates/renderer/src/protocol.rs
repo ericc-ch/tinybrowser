@@ -234,52 +234,29 @@ impl StorageKind {
     }
 }
 
-/// One document to mount.
+/// One top-level response: a complete [`ResponseHead`] plus its body. The
+/// head travels in the embedded/wasm carrier path; the browser streams the
+/// same head separately in its wire protocol and the body arrives in raw
+/// bounded IPC frames.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mount {
-    /// Absolute document URL.
-    pub url: String,
-    /// Every `Content-Type` response header value joined with `", "`
-    /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>),
-    /// when the document came from the network.
-    pub content_type: Option<String>,
-    /// Combined `Content-Security-Policy` header, when the response sent one.
-    #[serde(default)]
-    pub content_security_policy: Option<String>,
-    /// Combined `Content-Security-Policy-Report-Only` header.
-    #[serde(default)]
-    pub content_security_policy_report_only: Option<String>,
-    /// Combined `Reporting-Endpoints` header, when the response sent one.
-    /// A violated policy's `report-to` directive resolves its endpoint names
-    /// against it (<https://w3c.github.io/reporting/#header>).
-    #[serde(default)]
-    pub reporting_endpoints: Option<String>,
-    /// `X-Content-Type-Options: nosniff` on the response.
-    #[serde(default)]
-    pub no_sniff: bool,
-    /// The body came from HTTP, so the Apache `text/plain` check applies.
-    #[serde(default)]
-    pub http_response: bool,
-    /// Raw document bytes; the renderer decodes them.
+    /// Response metadata installed before the body parses.
+    pub head: ResponseHead,
+    /// Raw document bytes; the renderer decodes them. It never travels in a
+    /// control message, so it stays out of any serialized `Mount`.
     #[serde(skip, default)]
     pub body: Vec<u8>,
-    /// Session history visible in the newly mounted document.
-    #[serde(default)]
-    pub history: HistorySnapshot,
-    /// Emulated viewport size to apply before the document lays out, when the
-    /// browser has one
-    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
-    #[serde(default)]
-    pub viewport: Option<(u32, u32)>,
-    /// Page-scoped init scripts to register before the document's realm runs
-    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
-    #[serde(default)]
-    pub init_scripts: Vec<(u64, String)>,
 }
 
-/// The document state a streaming response starts from: everything a
-/// [`Mount`] carries except the body.
-#[derive(Clone, Debug, Default)]
+/// The document state a response installs: URL, HTTP status, response
+/// headers that shape the document, and the browser-supplied page state.
+///
+/// Every response-install path builds one of these — the browser streams the
+/// top-level response, and carriers, `data:`/`blob:` frames, and child-frame
+/// commits construct it locally — so the renderer derives policy, MIME
+/// guard, reporting endpoints, and status from one head, in one order, in
+/// one place (`Document::install_head`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ResponseHead {
     /// Absolute document URL.
     pub url: String,
@@ -311,6 +288,71 @@ pub struct ResponseHead {
     /// Page-scoped init scripts to register before the document's realm runs
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
     pub init_scripts: Vec<(u64, String)>,
+    /// The policy container a local-scheme response (`data:`, `blob:`)
+    /// inherits from its initiator, already parsed
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
+    /// When set it replaces the head's CSP header derivation.
+    pub inherited_policy: Option<crate::csp::List>,
+}
+
+impl ResponseHead {
+    /// An HTTP response head derived from raw response headers: CSP
+    /// directives, `Reporting-Endpoints`, and the nosniff flag all come from
+    /// `headers`, so every summary path needs nothing but status, URL,
+    /// `Content-Type`, and the pairs.
+    ///
+    /// History, viewport, and init scripts are caller state; they are
+    /// pasted in before the head is installed.
+    #[must_use]
+    pub fn http(
+        status: u16,
+        final_url: impl Into<String>,
+        content_type: Option<String>,
+        headers: &[(String, String)],
+    ) -> Self {
+        Self {
+            url: final_url.into(),
+            status,
+            content_type,
+            content_security_policy: crate::csp::combined_header(
+                headers,
+                "content-security-policy",
+            ),
+            content_security_policy_report_only: crate::csp::combined_header(
+                headers,
+                "content-security-policy-report-only",
+            ),
+            reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
+            no_sniff: crate::sniff::headers_nosniff(headers),
+            http_response: true,
+            history: HistorySnapshot::default(),
+            viewport: None,
+            init_scripts: Vec::new(),
+            inherited_policy: None,
+        }
+    }
+
+    /// The head of a response that is not an HTTP response: an inline
+    /// `<!doctype html>` document, embedded/wasm carrier mounts, or a decoded
+    /// `data:`/`blob:` URL. HTTP-derived state is empty and the document's
+    /// own status reports zero; CSP still arrives through policy inheritance.
+    #[must_use]
+    pub fn non_http(final_url: impl Into<String>, content_type: Option<String>) -> Self {
+        Self {
+            url: final_url.into(),
+            status: 0,
+            content_type,
+            content_security_policy: None,
+            content_security_policy_report_only: None,
+            reporting_endpoints: None,
+            no_sniff: false,
+            http_response: false,
+            history: HistorySnapshot::default(),
+            viewport: None,
+            init_scripts: Vec::new(),
+            inherited_policy: None,
+        }
+    }
 }
 
 /// Browser-owned history state passed to a newly created document realm.

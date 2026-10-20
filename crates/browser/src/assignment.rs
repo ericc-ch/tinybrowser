@@ -103,24 +103,16 @@ impl Assignment {
         self.process.request_bytes(self.id, command).await
     }
 
-    pub(crate) async fn mount(
-        &self,
-        frame: FrameId,
-        status: u16,
-        mount: Mount,
-    ) -> Result<Reply, TabError> {
-        self.process.mount(self.id, frame, status, mount).await
+    pub(crate) async fn mount(&self, frame: FrameId, mount: Mount) -> Result<Reply, TabError> {
+        self.process.mount(self.id, frame, mount).await
     }
 
     pub(crate) async fn start_response(
         &self,
         frame: FrameId,
-        status: u16,
         mount: &Mount,
     ) -> Result<ResponseWriter, TabError> {
-        self.process
-            .start_response(self.id, frame, status, mount)
-            .await
+        self.process.start_response(self.id, frame, mount).await
     }
 
     /// Subscribes to this document's frame-tagged events after this call.

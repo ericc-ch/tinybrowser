@@ -105,8 +105,12 @@ pub(crate) fn blocks(violations: &[Violation]) -> bool {
 }
 
 /// The document's CSP list and the origin `'self'` is resolved against.
+///
+/// The fields stay private: consumers pass the list around as an opaque
+/// policy container. It is `pub` because a response head carries it as the
+/// inherited policy container of a local-scheme document.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub(crate) struct List {
+pub struct List {
     policies: Vec<Policy>,
 }
 
@@ -314,16 +318,6 @@ fn report_to(policy: &Policy) -> Vec<String> {
         .iter()
         .find(|(name, _)| name == "report-to")
         .map_or_else(Vec::new, |(_, values)| values.clone())
-}
-
-/// Endpoint names and URLs from the response's `Reporting-Endpoints`
-/// headers, in order (<https://w3c.github.io/reporting/#header>).
-#[must_use]
-pub(crate) fn reporting_endpoints(headers: &[(String, String)]) -> Vec<(String, String)> {
-    let Some(combined) = combined_header(headers, "reporting-endpoints") else {
-        return Vec::new();
-    };
-    parse_reporting_endpoints_value(&combined)
 }
 
 /// Endpoint names and URLs from one combined `Reporting-Endpoints` value.
