@@ -41,6 +41,10 @@ pub(crate) struct Canvas2D {
     origin_clean: bool,
 }
 
+impl<'js> rquickjs::class::Trace<'js> for Canvas2D {
+    fn trace<'a>(&self, _tracer: rquickjs::class::Tracer<'a, 'js>) {}
+}
+
 #[derive(Clone)]
 struct State {
     transform: Transform,
@@ -1139,15 +1143,16 @@ impl Canvas2D {
     }
 
     pub(crate) fn is_point_in_path(&self, x: f32, y: f32, even_odd: bool) -> bool {
-        // The query point is in the canvas coordinate space, unaffected by the
-        // current transform; path points are already stored there
-        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ispointinpath>).
-        if !x.is_finite() || !y.is_finite() || !transform_is_invertible(self.state.transform) {
-            return false;
-        }
         let Some(path) = self.build_path() else {
             return false;
         };
+        self.is_point_in_built_path(&path, x, y, even_odd)
+    }
+
+    fn is_point_in_built_path(&self, path: &Path, x: f32, y: f32, even_odd: bool) -> bool {
+        if !x.is_finite() || !y.is_finite() || !transform_is_invertible(self.state.transform) {
+            return false;
+        }
         let rule = if even_odd {
             FillRule::EvenOdd
         } else {
@@ -1155,23 +1160,27 @@ impl Canvas2D {
         };
         // The point is in canvas space, unaffected by the CTM
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ispointinpath>).
-        path_contains(&path, rule, Point::from_xy(x, y))
+        path_contains(path, rule, Point::from_xy(x, y))
     }
 
     pub(crate) fn is_point_in_stroke(&self, x: f32, y: f32) -> bool {
-        if !(x.is_finite() && y.is_finite()) {
-            return false;
-        }
         let Some(path) = self.build_path() else {
             return false;
         };
+        self.is_point_in_built_stroke(&path, x, y)
+    }
+
+    fn is_point_in_built_stroke(&self, path: &Path, x: f32, y: f32) -> bool {
+        if !(x.is_finite() && y.is_finite()) {
+            return false;
+        }
         if !transform_is_invertible(self.state.transform) {
             return false;
         }
         let Some(inverse) = self.state.transform.invert() else {
             return false;
         };
-        let Some(user_path) = path.transform(inverse) else {
+        let Some(user_path) = path.clone().transform(inverse) else {
             return false;
         };
         let stroke = self.stroke_options();
@@ -1196,6 +1205,106 @@ impl Canvas2D {
         Mask::new(width, height)
     }
 
+    /// A `Path2D`'s segments are in user space; the canvas paints them
+    /// through its current transform
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fill>).
+    pub(crate) fn fill_borrowed_path(&mut self, other: &Canvas2D, even_odd: bool) {
+        let Some(user_path) = other.build_path() else {
+            return;
+        };
+        let Some(device_path) = user_path.transform(self.state.transform) else {
+            return;
+        };
+        self.fill_path(&device_path, even_odd);
+    }
+
+    pub(crate) fn stroke_borrowed_path(&mut self, other: &Canvas2D) {
+        let Some(user_path) = other.build_path() else {
+            return;
+        };
+        let Some(device_path) = user_path.transform(self.state.transform) else {
+            return;
+        };
+        self.stroke_path(&device_path);
+    }
+
+    pub(crate) fn clip_borrowed_path(&mut self, other: &Canvas2D, even_odd: bool) {
+        let Some(user_path) = other.build_path() else {
+            return;
+        };
+        let Some(device_path) = user_path.transform(self.state.transform) else {
+            return;
+        };
+        self.clip_built_path(&device_path, even_odd);
+    }
+
+    pub(crate) fn is_point_in_borrowed_path(
+        &self,
+        other: &Canvas2D,
+        x: f32,
+        y: f32,
+        even_odd: bool,
+    ) -> bool {
+        let Some(user_path) = other.build_path() else {
+            return false;
+        };
+        let Some(device_path) = user_path.transform(self.state.transform) else {
+            return false;
+        };
+        self.is_point_in_built_path(&device_path, x, y, even_odd)
+    }
+
+    pub(crate) fn is_point_in_borrowed_stroke(&self, other: &Canvas2D, x: f32, y: f32) -> bool {
+        let Some(user_path) = other.build_path() else {
+            return false;
+        };
+        let Some(device_path) = user_path.transform(self.state.transform) else {
+            return false;
+        };
+        self.is_point_in_built_stroke(&device_path, x, y)
+    }
+
+    /// The path in user space, for a `Path2D` consumer.
+    pub(crate) fn user_path(&self) -> Option<Path> {
+        self.build_path()
+    }
+
+    /// Appends every segment of `path`, for `Path2D.addPath`.
+    pub(crate) fn append_path(&mut self, path: &Path) {
+        for segment in path.segments() {
+            match segment {
+                tiny_skia::PathSegment::MoveTo(point) => {
+                    self.path.push(Segment::MoveTo(point));
+                    self.current = Some(point);
+                    self.subpath_start = point;
+                }
+                tiny_skia::PathSegment::LineTo(point) => {
+                    self.path.push(Segment::LineTo(point));
+                    self.current = Some(point);
+                }
+                tiny_skia::PathSegment::QuadTo(control, point) => {
+                    self.path.push(Segment::Quad(control, point));
+                    self.current = Some(point);
+                }
+                tiny_skia::PathSegment::CubicTo(first, second, point) => {
+                    self.path.push(Segment::Cubic(first, second, point));
+                    self.current = Some(point);
+                }
+                tiny_skia::PathSegment::Close => {
+                    self.path.push(Segment::Close);
+                    self.current = Some(self.subpath_start);
+                }
+            }
+        }
+    }
+
+    /// Copies another `Path2D`'s segments, for `new Path2D(other)`.
+    pub(crate) fn copy_path(&mut self, other: &Canvas2D) {
+        self.path.clone_from(&other.path);
+        self.current = other.current;
+        self.subpath_start = other.subpath_start;
+    }
+
     // ---- painting --------------------------------------------------------
 
     pub(crate) fn fill(&mut self, even_odd: bool) {
@@ -1213,23 +1322,27 @@ impl Canvas2D {
     }
 
     pub(crate) fn clip(&mut self, even_odd: bool) {
+        let Some(path) = self.build_path() else {
+            self.state.clip = self.canvas_mask();
+            return;
+        };
+        self.clip_built_path(&path, even_odd);
+    }
+
+    fn clip_built_path(&mut self, path: &Path, even_odd: bool) {
         let rule = if even_odd {
             FillRule::EvenOdd
         } else {
             FillRule::Winding
         };
-        let Some(path) = self.build_path() else {
-            self.state.clip = self.canvas_mask().map(Arc::new);
-            return;
-        };
         if let Some(mask) = &mut self.state.clip {
             // Saving the state must not copy a multi-megabyte coverage mask.
-            Arc::make_mut(mask).intersect_path(&path, rule, true, Transform::identity());
+            Arc::make_mut(mask).intersect_path(path, rule, true, Transform::identity());
         } else {
             let Some(mut mask) = self.canvas_mask() else {
                 return;
             };
-            mask.fill_path(&path, rule, true, Transform::identity());
+            mask.fill_path(path, rule, true, Transform::identity());
             self.state.clip = Some(Arc::new(mask));
         }
     }
