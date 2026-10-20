@@ -169,10 +169,10 @@ impl Document {
                     }
                     continue;
                 }
-                let task_dial = dial.clone();
                 let completed = self.dial_tx.clone();
                 let wake = Arc::clone(&self.wake);
                 let stop = Arc::clone(&self.stop);
+                let context = dial.context;
                 let request = dial.req.clone();
                 self.in_flight_dials = self.in_flight_dials.saturating_add(1);
                 let cancel = self.services.start_dial(
@@ -181,12 +181,12 @@ impl Document {
                         if stop.is_set() {
                             return;
                         }
-                        let result = super::dial::complete(task_dial, outcome);
+                        let result = super::dial::complete(dial, outcome);
                         let _send_result = completed.send(result);
                         wake.notify_one();
                     }),
                 );
-                if let DialContext::JsFetch { epoch, id } = dial.context {
+                if let DialContext::JsFetch { epoch, id } = context {
                     self.fetch_cancellations.insert((epoch, id), cancel);
                 }
             }
