@@ -23,8 +23,6 @@ pub(crate) struct DialLedger {
     rx: Receiver<Result<CompletedDial, DialContext>>,
     /// Dials waiting for the drain to start them.
     queued: Vec<QueuedDial>,
-    /// Started dials whose completion has not arrived yet.
-    in_flight: usize,
     /// Page-fetch cancellation handles, keyed by `(epoch, fetch id)`.
     cancellations: HashMap<(u64, i32), DialCancellation>,
     /// A frame that is shutting down drops completions instead of waking the
@@ -41,7 +39,6 @@ impl DialLedger {
             tx,
             rx,
             queued: Vec::new(),
-            in_flight: 0,
             cancellations: HashMap::new(),
             stop,
             wake,
@@ -78,7 +75,6 @@ impl DialLedger {
         let stop = Arc::clone(&self.stop);
         let context = dial.context;
         let request = dial.req.clone();
-        self.in_flight = self.in_flight.saturating_add(1);
         let cancel = start(
             request,
             Box::new(move |outcome| {
@@ -100,7 +96,6 @@ impl DialLedger {
     pub(crate) fn adopt(&mut self) -> Vec<Result<CompletedDial, DialContext>> {
         let mut completed = Vec::new();
         while let Ok(outcome) = self.rx.try_recv() {
-            self.in_flight = self.in_flight.saturating_sub(1);
             let context = match &outcome {
                 Ok(done) => done.context,
                 Err(context) => *context,
@@ -113,10 +108,11 @@ impl DialLedger {
         completed
     }
 
-    /// Page fetches in flight or waiting to start. Non-fetch dials count
-    /// toward the in-flight total, exactly as the old ledger did.
+    /// Page fetches in flight or waiting to start. Only page fetches count:
+    /// navigations, scripts, images, and reports have their own budgets, so
+    /// a busy document does not make `fetch` fail early.
     pub(crate) fn pending_js_fetches(&self) -> usize {
-        self.in_flight
+        self.cancellations.len()
             + self
                 .queued
                 .iter()
@@ -156,20 +152,12 @@ impl DialLedger {
     }
 
     /// Cancels page-fetch handles and drops queued dials. Dials already
-    /// started keep their slot in `in_flight`, because their completions still
-    /// arrive and must decrement it.
+    /// started keep running; their completions are adopted or dropped by the
+    /// document that owns the ledger.
     pub(crate) fn discard_queued(&mut self) {
         for (_, cancel) in self.cancellations.drain() {
             cancel();
         }
         self.queued.clear();
-    }
-
-    /// Cancels every handle, drops all queued work, and forgets the in-flight
-    /// count. The document is being torn down and no completion will be
-    /// adopted.
-    pub(crate) fn reset(&mut self) {
-        self.discard_queued();
-        self.in_flight = 0;
     }
 }

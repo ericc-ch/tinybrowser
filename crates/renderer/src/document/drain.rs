@@ -80,7 +80,7 @@ impl Document {
     }
 
     pub(crate) fn release(&mut self) {
-        self.dials.reset();
+        self.dials.discard_queued();
         self.decoder = None;
         self.frame_load_in_flight = false;
         self.shared.borrow_mut().close_frame_ports(self.frame);
