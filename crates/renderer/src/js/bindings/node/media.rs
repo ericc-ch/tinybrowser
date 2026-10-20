@@ -1,7 +1,7 @@
 //! Media interfaces: images, canvas, audio/video, meters, progress,
 //! and marquee.
 
-use super::super::{attribute_value, host, set_attribute_sync, throw_dom, world, world_for_node};
+use super::super::{attribute_value, host, set_attribute_sync, world, world_for_node};
 
 use rquickjs::{Ctx, Result, Value};
 
@@ -212,7 +212,12 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
             // (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-context-mode>).
             return Ok(None);
         }
-        let value = canvas_context_object(&ctx, self.handle.0, member)?;
+        let value = match member {
+            crate::js::world::SameObject::Canvas2d => {
+                crate::js::canvas::context_object(&ctx, self.handle.0)?
+            }
+            _ => bitmap_context_object(&ctx, self.handle.0)?,
+        };
         let weak = super::super::make_weak(&ctx, value.clone())?;
         world_rc.borrow_mut().intern_same_object(
             self.handle.0,
@@ -650,6 +655,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_progress_element_generated::install(ctx)?;
     html_marquee_element_generated::install(ctx)?;
     html_audio_element_generated::install(ctx)?;
+    crate::js::canvas::install(ctx)?;
     Ok(())
 }
 
@@ -665,17 +671,23 @@ fn context_variant(member: crate::js::world::SameObject, value: Value<'_>) -> Re
     }
 }
 
-fn canvas_context_object<'js>(
-    ctx: &Ctx<'js>,
-    id: NodeId,
-    member: crate::js::world::SameObject,
-) -> Result<Value<'js>> {
-    let name = if member == crate::js::world::SameObject::CanvasBitmap {
-        "ImageBitmapRenderingContext"
-    } else {
-        "CanvasRenderingContext2D"
-    };
-    let ctor = canvas_constructor(ctx, name)?;
+/// `getContext("bitmaprenderer")`: the object exists but transfers nothing
+/// until `ImageBitmap` decoding lands.
+fn bitmap_context_object<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
+    let globals = ctx.globals();
+    let ctor =
+        if let Ok(existing) = globals.get::<_, rquickjs::Function>("ImageBitmapRenderingContext") {
+            existing
+        } else {
+            // A plain `Function::new` owns a non-writable `name`, and QuickJS
+            // throws on assignment, so the interface constructor keeps its
+            // inferred name.
+            let ctor = rquickjs::Function::new(ctx.clone(), || {})?;
+            let prototype = rquickjs::Object::new(ctx.clone())?;
+            ctor.set("prototype", prototype)?;
+            globals.set("ImageBitmapRenderingContext", ctor.clone())?;
+            ctor
+        };
     let prototype: rquickjs::Object = ctor.get("prototype")?;
     let object = rquickjs::Object::new(ctx.clone())?;
     object.set_prototype(Some(&prototype))?;
@@ -683,149 +695,4 @@ fn canvas_context_object<'js>(
     object.set("__tbDoc", id.document)?;
     object.set("__tbNode", id.node.as_u64())?;
     Ok(object.into_value())
-}
-
-fn canvas_constructor<'js>(ctx: &Ctx<'js>, name: &str) -> Result<rquickjs::Function<'js>> {
-    let globals = ctx.globals();
-    if let Ok(existing) = globals.get::<_, rquickjs::Function>(name) {
-        return Ok(existing);
-    }
-    // A plain `Function::new` owns a non-writable `name`, and QuickJS throws
-    // on assignment, so the interface constructor keeps its inferred name.
-    let ctor = rquickjs::Function::new(ctx.clone(), || {})?;
-    let prototype = rquickjs::Object::new(ctx.clone())?;
-    if name == "CanvasRenderingContext2D" {
-        prototype.set("fillRect", rquickjs::prelude::Func::from(fill_rect))?;
-        prototype.set(
-            "getImageData",
-            rquickjs::prelude::Func::from(get_image_data),
-        )?;
-    }
-    ctor.set("prototype", prototype)?;
-    globals.set(name, ctor.clone())?;
-    Ok(ctor)
-}
-
-fn canvas_target(object: &rquickjs::Object<'_>) -> Result<NodeId> {
-    let document: u32 = object.get("__tbDoc")?;
-    let node: u64 = object.get("__tbNode")?;
-    Ok(NodeId {
-        document,
-        node: blitz_traits::node_id::NodeId::from_u64(node),
-    })
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn fill_rect(
-    ctx: Ctx<'_>,
-    this: rquickjs::function::This<rquickjs::Object<'_>>,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-) -> Result<()> {
-    let id = canvas_target(&this.0)?;
-    let style: String = this
-        .0
-        .get("fillStyle")
-        .unwrap_or_else(|_| "#000000".to_owned());
-    let color = parse_fill(&style);
-    let width = canvas_dimension(&ctx, id, "width", 300);
-    let height = canvas_dimension(&ctx, id, "height", 150);
-    let world = world(&ctx)?;
-    world.borrow().registry().borrow_mut().fill_canvas(
-        id,
-        width,
-        height,
-        crate::js::world::CanvasRect {
-            x,
-            y,
-            width: w,
-            height: h,
-        },
-        color,
-    );
-    Ok(())
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn get_image_data<'js>(
-    ctx: Ctx<'js>,
-    this: rquickjs::function::This<rquickjs::Object<'js>>,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-) -> Result<rquickjs::Object<'js>> {
-    let id = canvas_target(&this.0)?;
-    // Non-finite arguments are a TypeError
-    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
-    if ![x, y, w, h].iter().all(|value| value.is_finite()) {
-        return Err(rquickjs::Exception::throw_type(
-            &ctx,
-            "getImageData arguments must be finite",
-        ));
-    }
-    let world = world(&ctx)?;
-    let width = canvas_dimension(&ctx, id, "width", 300);
-    let height = canvas_dimension(&ctx, id, "height", 150);
-    let sw = crate::js::world::canvas_u32(w);
-    let sh = crate::js::world::canvas_u32(h);
-    // A zero-sized request is an `IndexSizeError`
-    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
-    if sw == 0 || sh == 0 {
-        return Err(throw_dom(
-            &ctx,
-            "IndexSizeError",
-            "getImageData width and height must be non-zero",
-        ));
-    }
-    let Some(bytes) = world.borrow().registry().borrow_mut().canvas_pixels(
-        id,
-        width,
-        height,
-        crate::js::world::CanvasRect {
-            x,
-            y,
-            width: w,
-            height: h,
-        },
-    ) else {
-        return Err(throw_dom(
-            &ctx,
-            "IndexSizeError",
-            "getImageData area is too large",
-        ));
-    };
-    let source = rquickjs::TypedArray::<u8>::new(ctx.clone(), bytes)?;
-    ctx.globals().set("__tbCanvasBytes", source)?;
-    let data: Value = ctx.eval("new Uint8ClampedArray(__tbCanvasBytes)")?;
-    ctx.globals()
-        .set("__tbCanvasBytes", Value::new_undefined(ctx.clone()))?;
-    let image = rquickjs::Object::new(ctx)?;
-    image.set("data", data)?;
-    image.set("width", sw)?;
-    image.set("height", sh)?;
-    Ok(image)
-}
-
-fn parse_fill(style: &str) -> [u8; 4] {
-    let bytes = style.trim().as_bytes();
-    if bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(u8::is_ascii_hexdigit) {
-        let channel = |index: usize| {
-            u8::from_str_radix(
-                std::str::from_utf8(&bytes[index..index + 2]).unwrap_or("00"),
-                16,
-            )
-            .unwrap_or(0)
-        };
-        return [channel(1), channel(3), channel(5), 255];
-    }
-    [0, 0, 0, 255]
 }

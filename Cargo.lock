@@ -2639,6 +2639,7 @@ dependencies = [
  "stylo",
  "stylo_traits",
  "svgtypes",
+ "tiny-skia",
  "tokio",
  "url",
  "webidl-bindgen",

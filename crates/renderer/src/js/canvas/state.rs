@@ -1,0 +1,1827 @@
+//! Canvas 2D drawing state and rasterization.
+//!
+//! The bitmap is a `tiny-skia` pixmap. `tiny-skia` stores premultiplied RGBA,
+//! while canvas exposes straight RGBA through `getImageData` and `ImageData`,
+//! so the two conversions live here
+//! (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-bitmap>).
+
+use std::collections::HashMap;
+use std::f32::consts::{FRAC_PI_2, TAU};
+use std::sync::Arc;
+
+use tiny_skia::{
+    BlendMode, Color, ColorU8, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, Mask,
+    Paint, Path, PathBuilder, Pixmap, Point, Shader, SpreadMode, Stroke, StrokeDash, Transform,
+};
+
+/// One canvas rendering context.
+pub(crate) struct Canvas2D {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixmap: Option<Pixmap>,
+    state: State,
+    stack: Vec<State>,
+    path: Vec<Segment>,
+    current: Option<Point>,
+    subpath_start: Point,
+    gradients: HashMap<u32, Gradient>,
+    patterns: HashMap<u32, Pattern>,
+    next_resource: u32,
+}
+
+#[derive(Clone)]
+struct State {
+    transform: Transform,
+    fill: Style,
+    stroke: Style,
+    alpha: f32,
+    blend: BlendMode,
+    line_width: f32,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    miter_limit: f32,
+    dash: Vec<f32>,
+    dash_offset: f32,
+    shadow_color: [u8; 4],
+    shadow_blur: f32,
+    shadow_x: f32,
+    shadow_y: f32,
+    font: String,
+    text_align: TextAlign,
+    text_baseline: TextBaseline,
+    direction: Direction,
+    letter_spacing: String,
+    word_spacing: String,
+    font_kerning: String,
+    font_stretch: String,
+    font_variant_caps: String,
+    smoothing: bool,
+    smoothing_quality: String,
+    filter: String,
+    clip: Option<Mask>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Style {
+    Color([u8; 4]),
+    Gradient(u32),
+    Pattern(u32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextAlign {
+    Start,
+    End,
+    Left,
+    Right,
+    Center,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextBaseline {
+    Top,
+    Hanging,
+    Middle,
+    Alphabetic,
+    Ideographic,
+    Bottom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Inherit,
+    Ltr,
+    Rtl,
+}
+
+#[derive(Clone, Copy)]
+enum Segment {
+    MoveTo(Point),
+    LineTo(Point),
+    Quad(Point, Point),
+    Cubic(Point, Point, Point),
+    Close,
+}
+
+struct Gradient {
+    kind: GradientKind,
+    stops: Vec<(f32, [u8; 4])>,
+}
+
+enum GradientKind {
+    Linear {
+        start: Point,
+        end: Point,
+    },
+    Radial {
+        start: Point,
+        start_radius: f32,
+        end: Point,
+        end_radius: f32,
+    },
+    Conic {
+        center: Point,
+        angle: f32,
+    },
+}
+
+struct Pattern {
+    image: Arc<Pixmap>,
+    spread: SpreadMode,
+    quality: FilterQuality,
+}
+
+/// A decoded source image for `drawImage`: straight RGBA, row-major.
+pub(crate) struct SourceImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixels: Vec<u8>,
+}
+
+impl Canvas2D {
+    pub(crate) fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            pixmap: make_pixmap(width, height),
+            state: State::default(),
+            stack: Vec::new(),
+            path: Vec::new(),
+            current: None,
+            subpath_start: Point::zero(),
+            gradients: HashMap::new(),
+            patterns: HashMap::new(),
+            next_resource: 1,
+        }
+    }
+
+    /// `ctx.reset()`: clear the bitmap and return to the default state
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-reset>).
+    pub(crate) fn reset(&mut self) {
+        if let Some(pixmap) = &mut self.pixmap {
+            pixmap.fill(Color::TRANSPARENT);
+        }
+        self.reset_state();
+    }
+
+    fn reset_state(&mut self) {
+        self.state = State::default();
+        self.stack.clear();
+        self.path.clear();
+        self.current = None;
+        self.subpath_start = Point::zero();
+        self.gradients.clear();
+        self.patterns.clear();
+    }
+
+    // ---- state -----------------------------------------------------------
+
+    pub(crate) fn save(&mut self) {
+        self.stack.push(self.state.clone());
+    }
+
+    pub(crate) fn restore(&mut self) {
+        if let Some(state) = self.stack.pop() {
+            self.state = state;
+        }
+    }
+
+    pub(crate) fn transform(&mut self, m11: f32, m12: f32, m21: f32, m22: f32, dx: f32, dy: f32) {
+        if !(m11.is_finite()
+            && m12.is_finite()
+            && m21.is_finite()
+            && m22.is_finite()
+            && dx.is_finite()
+            && dy.is_finite())
+        {
+            return;
+        }
+        let matrix = Transform::from_row(m11, m12, m21, m22, dx, dy);
+        self.state.transform = self.state.transform.pre_concat(matrix);
+    }
+
+    pub(crate) fn set_transform(
+        &mut self,
+        m11: f32,
+        m12: f32,
+        m21: f32,
+        m22: f32,
+        dx: f32,
+        dy: f32,
+    ) {
+        if !(m11.is_finite()
+            && m12.is_finite()
+            && m21.is_finite()
+            && m22.is_finite()
+            && dx.is_finite()
+            && dy.is_finite())
+        {
+            return;
+        }
+        self.state.transform = Transform::from_row(m11, m12, m21, m22, dx, dy);
+    }
+
+    pub(crate) fn reset_transform(&mut self) {
+        self.state.transform = Transform::identity();
+    }
+
+    pub(crate) fn get_transform(&self) -> Transform {
+        self.state.transform
+    }
+
+    pub(crate) fn translate(&mut self, x: f32, y: f32) {
+        if x.is_finite() && y.is_finite() {
+            self.state.transform = self
+                .state
+                .transform
+                .pre_concat(Transform::from_translate(x, y));
+        }
+    }
+
+    pub(crate) fn scale(&mut self, x: f32, y: f32) {
+        if x.is_finite() && y.is_finite() {
+            self.state.transform = self.state.transform.pre_concat(Transform::from_scale(x, y));
+        }
+    }
+
+    pub(crate) fn rotate(&mut self, radians: f32) {
+        if radians.is_finite() {
+            self.state.transform = self
+                .state
+                .transform
+                .pre_concat(Transform::from_rotate(radians.to_degrees()));
+        }
+    }
+
+    // ---- properties ------------------------------------------------------
+
+    pub(crate) fn fill_style(&self) -> StyleValue {
+        StyleValue::from_style(self.state.fill)
+    }
+
+    pub(crate) fn set_fill_style(&mut self, value: StyleValue) {
+        self.state.fill = match value {
+            StyleValue::Color(color) => Style::Color(color),
+            StyleValue::Gradient(id) => Style::Gradient(id),
+            StyleValue::Pattern(id) => Style::Pattern(id),
+        };
+    }
+
+    pub(crate) fn stroke_style(&self) -> StyleValue {
+        StyleValue::from_style(self.state.stroke)
+    }
+
+    pub(crate) fn set_stroke_style(&mut self, value: StyleValue) {
+        self.state.stroke = match value {
+            StyleValue::Color(color) => Style::Color(color),
+            StyleValue::Gradient(id) => Style::Gradient(id),
+            StyleValue::Pattern(id) => Style::Pattern(id),
+        };
+    }
+
+    pub(crate) fn line_width(&self) -> f32 {
+        self.state.line_width
+    }
+
+    pub(crate) fn set_line_width(&mut self, value: f32) {
+        if value > 0.0 && value.is_finite() {
+            self.state.line_width = value;
+        }
+    }
+
+    pub(crate) fn line_cap(&self) -> &'static str {
+        match self.state.line_cap {
+            LineCap::Butt => "butt",
+            LineCap::Round => "round",
+            LineCap::Square => "square",
+        }
+    }
+
+    pub(crate) fn set_line_cap(&mut self, value: &str) {
+        self.state.line_cap = match value {
+            "butt" => LineCap::Butt,
+            "round" => LineCap::Round,
+            "square" => LineCap::Square,
+            _ => return,
+        };
+    }
+
+    pub(crate) fn line_join(&self) -> &'static str {
+        match self.state.line_join {
+            LineJoin::Miter | LineJoin::MiterClip => "miter",
+            LineJoin::Round => "round",
+            LineJoin::Bevel => "bevel",
+        }
+    }
+
+    pub(crate) fn set_line_join(&mut self, value: &str) {
+        self.state.line_join = match value {
+            "miter" => LineJoin::Miter,
+            "round" => LineJoin::Round,
+            "bevel" => LineJoin::Bevel,
+            _ => return,
+        };
+    }
+
+    pub(crate) fn miter_limit(&self) -> f32 {
+        self.state.miter_limit
+    }
+
+    pub(crate) fn set_miter_limit(&mut self, value: f32) {
+        if value > 0.0 && value.is_finite() {
+            self.state.miter_limit = value;
+        }
+    }
+
+    pub(crate) fn line_dash(&self) -> Vec<f32> {
+        self.state.dash.clone()
+    }
+
+    pub(crate) fn set_line_dash(&mut self, mut dash: Vec<f32>) {
+        if dash.iter().any(|value| !value.is_finite() || *value < 0.0) {
+            return;
+        }
+        if dash.iter().all(|value| *value == 0.0) {
+            dash.clear();
+        }
+        if dash.len() % 2 == 1 {
+            let copy = dash.clone();
+            dash.extend(copy);
+        }
+        self.state.dash = dash;
+    }
+
+    pub(crate) fn line_dash_offset(&self) -> f32 {
+        self.state.dash_offset
+    }
+
+    pub(crate) fn set_line_dash_offset(&mut self, value: f32) {
+        if value.is_finite() {
+            self.state.dash_offset = value;
+        }
+    }
+
+    pub(crate) fn global_alpha(&self) -> f32 {
+        self.state.alpha
+    }
+
+    pub(crate) fn set_global_alpha(&mut self, value: f32) {
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            self.state.alpha = value;
+        }
+    }
+
+    pub(crate) fn global_composite_operation(&self) -> &'static str {
+        blend_name(self.state.blend)
+    }
+
+    pub(crate) fn set_global_composite_operation(&mut self, value: &str) {
+        if let Some(blend) = blend_from_name(value) {
+            self.state.blend = blend;
+        }
+    }
+
+    pub(crate) fn shadow_color(&self) -> [u8; 4] {
+        self.state.shadow_color
+    }
+
+    pub(crate) fn set_shadow_color(&mut self, color: [u8; 4]) {
+        self.state.shadow_color = color;
+    }
+
+    pub(crate) fn shadow_blur(&self) -> f32 {
+        self.state.shadow_blur
+    }
+
+    pub(crate) fn set_shadow_blur(&mut self, value: f32) {
+        if value >= 0.0 && value.is_finite() {
+            self.state.shadow_blur = value;
+        }
+    }
+
+    pub(crate) fn shadow_offset_x(&self) -> f32 {
+        self.state.shadow_x
+    }
+
+    pub(crate) fn set_shadow_offset_x(&mut self, value: f32) {
+        if value.is_finite() {
+            self.state.shadow_x = value;
+        }
+    }
+
+    pub(crate) fn shadow_offset_y(&self) -> f32 {
+        self.state.shadow_y
+    }
+
+    pub(crate) fn set_shadow_offset_y(&mut self, value: f32) {
+        if value.is_finite() {
+            self.state.shadow_y = value;
+        }
+    }
+
+    pub(crate) fn font(&self) -> &str {
+        &self.state.font
+    }
+
+    pub(crate) fn set_font(&mut self, value: &str) {
+        if !value.is_empty() {
+            value.clone_into(&mut self.state.font);
+        }
+    }
+
+    pub(crate) fn text_align(&self) -> &'static str {
+        match self.state.text_align {
+            TextAlign::Start => "start",
+            TextAlign::End => "end",
+            TextAlign::Left => "left",
+            TextAlign::Right => "right",
+            TextAlign::Center => "center",
+        }
+    }
+
+    pub(crate) fn set_text_align(&mut self, value: &str) {
+        self.state.text_align = match value {
+            "start" => TextAlign::Start,
+            "end" => TextAlign::End,
+            "left" => TextAlign::Left,
+            "right" => TextAlign::Right,
+            "center" => TextAlign::Center,
+            _ => return,
+        };
+    }
+
+    pub(crate) fn text_baseline(&self) -> &'static str {
+        match self.state.text_baseline {
+            TextBaseline::Top => "top",
+            TextBaseline::Hanging => "hanging",
+            TextBaseline::Middle => "middle",
+            TextBaseline::Alphabetic => "alphabetic",
+            TextBaseline::Ideographic => "ideographic",
+            TextBaseline::Bottom => "bottom",
+        }
+    }
+
+    pub(crate) fn set_text_baseline(&mut self, value: &str) {
+        self.state.text_baseline = match value {
+            "top" => TextBaseline::Top,
+            "hanging" => TextBaseline::Hanging,
+            "middle" => TextBaseline::Middle,
+            "alphabetic" => TextBaseline::Alphabetic,
+            "ideographic" => TextBaseline::Ideographic,
+            "bottom" => TextBaseline::Bottom,
+            _ => return,
+        };
+    }
+
+    pub(crate) fn direction(&self) -> &'static str {
+        match self.state.direction {
+            Direction::Inherit => "inherit",
+            Direction::Ltr => "ltr",
+            Direction::Rtl => "rtl",
+        }
+    }
+
+    pub(crate) fn set_direction(&mut self, value: &str) {
+        self.state.direction = match value {
+            "inherit" => Direction::Inherit,
+            "ltr" => Direction::Ltr,
+            "rtl" => Direction::Rtl,
+            _ => return,
+        };
+    }
+
+    pub(crate) fn letter_spacing(&self) -> &str {
+        &self.state.letter_spacing
+    }
+
+    pub(crate) fn set_letter_spacing(&mut self, value: &str) {
+        value.clone_into(&mut self.state.letter_spacing);
+    }
+
+    pub(crate) fn word_spacing(&self) -> &str {
+        &self.state.word_spacing
+    }
+
+    pub(crate) fn set_word_spacing(&mut self, value: &str) {
+        value.clone_into(&mut self.state.word_spacing);
+    }
+
+    pub(crate) fn font_kerning(&self) -> &str {
+        &self.state.font_kerning
+    }
+
+    pub(crate) fn set_font_kerning(&mut self, value: &str) {
+        value.clone_into(&mut self.state.font_kerning);
+    }
+
+    pub(crate) fn font_stretch(&self) -> &str {
+        &self.state.font_stretch
+    }
+
+    pub(crate) fn set_font_stretch(&mut self, value: &str) {
+        value.clone_into(&mut self.state.font_stretch);
+    }
+
+    pub(crate) fn font_variant_caps(&self) -> &str {
+        &self.state.font_variant_caps
+    }
+
+    pub(crate) fn set_font_variant_caps(&mut self, value: &str) {
+        value.clone_into(&mut self.state.font_variant_caps);
+    }
+
+    pub(crate) fn image_smoothing_enabled(&self) -> bool {
+        self.state.smoothing
+    }
+
+    pub(crate) fn set_image_smoothing_enabled(&mut self, value: bool) {
+        self.state.smoothing = value;
+    }
+
+    pub(crate) fn image_smoothing_quality(&self) -> &str {
+        &self.state.smoothing_quality
+    }
+
+    pub(crate) fn set_image_smoothing_quality(&mut self, value: &str) {
+        if value == "low" || value == "medium" || value == "high" {
+            value.clone_into(&mut self.state.smoothing_quality);
+        }
+    }
+
+    pub(crate) fn filter(&self) -> &str {
+        &self.state.filter
+    }
+
+    pub(crate) fn set_filter(&mut self, value: &str) {
+        value.clone_into(&mut self.state.filter);
+    }
+
+    // ---- paths -----------------------------------------------------------
+
+    pub(crate) fn begin_path(&mut self) {
+        self.path.clear();
+        self.current = None;
+        self.subpath_start = Point::zero();
+    }
+
+    pub(crate) fn move_to(&mut self, x: f32, y: f32) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
+        let mut point = Point::from_xy(x, y);
+        self.state.transform.map_point(&mut point);
+        self.path.push(Segment::MoveTo(point));
+        self.current = Some(point);
+        self.subpath_start = point;
+    }
+
+    pub(crate) fn line_to(&mut self, x: f32, y: f32) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
+        if self.current.is_none() {
+            self.move_to(x, y);
+            return;
+        }
+        let mut point = Point::from_xy(x, y);
+        self.state.transform.map_point(&mut point);
+        self.path.push(Segment::LineTo(point));
+        self.current = Some(point);
+    }
+
+    pub(crate) fn quadratic_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        if !(cx.is_finite() && cy.is_finite() && x.is_finite() && y.is_finite()) {
+            return;
+        }
+        if self.current.is_none() {
+            self.move_to(cx, cy);
+            self.line_to(x, y);
+            return;
+        }
+        let mut control = Point::from_xy(cx, cy);
+        let mut end = Point::from_xy(x, y);
+        self.state.transform.map_point(&mut control);
+        self.state.transform.map_point(&mut end);
+        self.path.push(Segment::Quad(control, end));
+        self.current = Some(end);
+    }
+
+    pub(crate) fn cubic_to(&mut self, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) {
+        if !(c1x.is_finite()
+            && c1y.is_finite()
+            && c2x.is_finite()
+            && c2y.is_finite()
+            && x.is_finite()
+            && y.is_finite())
+        {
+            return;
+        }
+        if self.current.is_none() {
+            self.move_to(c1x, c1y);
+        }
+        let mut first = Point::from_xy(c1x, c1y);
+        let mut second = Point::from_xy(c2x, c2y);
+        let mut end = Point::from_xy(x, y);
+        self.state.transform.map_point(&mut first);
+        self.state.transform.map_point(&mut second);
+        self.state.transform.map_point(&mut end);
+        self.path.push(Segment::Cubic(first, second, end));
+        self.current = Some(end);
+    }
+
+    pub(crate) fn close_path(&mut self) {
+        if self.current.is_none() {
+            return;
+        }
+        self.path.push(Segment::Close);
+        self.current = Some(self.subpath_start);
+    }
+
+    pub(crate) fn rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
+            return;
+        }
+        // A zero-area rect still starts a subpath at its origin.
+        if width == 0.0 && height == 0.0 {
+            self.move_to(x, y);
+            return;
+        }
+        let corners = [
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
+        ];
+        let mut first = true;
+        for (cx, cy) in corners {
+            let mut point = Point::from_xy(cx, cy);
+            self.state.transform.map_point(&mut point);
+            if first {
+                self.path.push(Segment::MoveTo(point));
+                self.subpath_start = point;
+                first = false;
+            } else {
+                self.path.push(Segment::LineTo(point));
+            }
+            self.current = Some(point);
+        }
+        self.path.push(Segment::Close);
+        self.current = Some(self.subpath_start);
+    }
+
+    /// `arc()`, with the angles and direction from the HTML Standard
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-arc>).
+    pub(crate) fn arc(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        start: f32,
+        end: f32,
+        counterclockwise: bool,
+    ) {
+        if !(cx.is_finite()
+            && cy.is_finite()
+            && radius.is_finite()
+            && start.is_finite()
+            && end.is_finite())
+        {
+            return;
+        }
+        if radius < 0.0 {
+            return;
+        }
+        // An empty arc still connects to its start point.
+        if radius == 0.0 || same_float(start, end) {
+            self.line_to(cx + radius * start.cos(), cy + radius * start.sin());
+            return;
+        }
+        self.ellipse_arc(cx, cy, radius, radius, 0.0, start, end, counterclockwise);
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
+    pub(crate) fn ellipse(
+        &mut self,
+        x: f32,
+        y: f32,
+        rx: f32,
+        ry: f32,
+        rotation: f32,
+        start: f32,
+        end: f32,
+        counterclockwise: bool,
+    ) {
+        if !(x.is_finite()
+            && y.is_finite()
+            && rx.is_finite()
+            && ry.is_finite()
+            && rotation.is_finite()
+            && start.is_finite()
+            && end.is_finite())
+        {
+            return;
+        }
+        if rx < 0.0 || ry < 0.0 {
+            return;
+        }
+        if rx == 0.0 || ry == 0.0 || same_float(start, end) {
+            self.line_to(x + rx * start.cos(), y + ry * start.sin());
+            return;
+        }
+        self.ellipse_arc(x, y, rx, ry, rotation, start, end, counterclockwise);
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "shared by arc() and ellipse()")]
+    fn ellipse_arc(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        rotation: f32,
+        start: f32,
+        end: f32,
+        counterclockwise: bool,
+    ) {
+        let mut delta = end - start;
+        if counterclockwise {
+            if delta > 0.0 {
+                delta -= TAU * ((delta / TAU).ceil());
+            }
+            delta = delta.min(0.0);
+        } else {
+            if delta < 0.0 {
+                delta += TAU * ((-delta / TAU).ceil());
+            }
+            delta = delta.max(0.0);
+        }
+        if delta == 0.0 {
+            return;
+        }
+        let start_point = ellipse_point(cx, cy, rx, ry, rotation, start);
+        match self.current {
+            Some(current) if current.distance(start_point) > f32::EPSILON => {
+                self.path.push(Segment::LineTo(start_point));
+            }
+            None => {
+                self.path.push(Segment::MoveTo(start_point));
+                self.subpath_start = start_point;
+            }
+            _ => {}
+        }
+        self.current = Some(start_point);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the count is a finite positive angle span, far below u32::MAX"
+        )]
+        let segments = ((delta.abs() / FRAC_PI_2).ceil() as u32).max(1);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "segment counts are far below 2^24"
+        )]
+        let step = delta / segments as f32;
+        for index in 0..segments {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "segment counts are far below 2^24"
+            )]
+            let index = index as f32;
+            let from = start + step * index;
+            let to = from + step;
+            let p0 = ellipse_point(cx, cy, rx, ry, rotation, from);
+            let p1 = ellipse_point(cx, cy, rx, ry, rotation, to);
+            let alpha = (4.0 / 3.0) * (step / 4.0).tan();
+            let d0 = ellipse_derivative(cx, cy, rx, ry, rotation, from);
+            let d1 = ellipse_derivative(cx, cy, rx, ry, rotation, to);
+            let c1 = Point::from_xy(p0.x + alpha * d0.x, p0.y + alpha * d0.y);
+            let c2 = Point::from_xy(p1.x - alpha * d1.x, p1.y - alpha * d1.y);
+            self.path.push(Segment::Cubic(c1, c2, p1));
+        }
+        if let Some(Segment::Cubic(_, _, end)) = self.path.last() {
+            self.current = Some(*end);
+        }
+    }
+
+    pub(crate) fn arc_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, radius: f32) {
+        if radius < 0.0 {
+            return;
+        }
+        if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
+            return;
+        }
+        let Some(current) = self.current else {
+            self.move_to(x1, y1);
+            return;
+        };
+        if radius == 0.0 || (same_float(current.x, x1) && same_float(current.y, y1)) {
+            self.line_to(x1, y1);
+            return;
+        }
+        let p0 = current;
+        let p1 = Point::from_xy(x1, y1);
+        let p2 = Point::from_xy(x2, y2);
+        let v1 = Point::from_xy(p0.x - p1.x, p0.y - p1.y);
+        let v2 = Point::from_xy(p2.x - p1.x, p2.y - p1.y);
+        let l1 = (v1.x * v1.x + v1.y * v1.y).sqrt();
+        let l2 = (v2.x * v2.x + v2.y * v2.y).sqrt();
+        if l1 == 0.0 || l2 == 0.0 {
+            self.line_to(x1, y1);
+            return;
+        }
+        let u1 = Point::from_xy(v1.x / l1, v1.y / l1);
+        let u2 = Point::from_xy(v2.x / l2, v2.y / l2);
+        let cross = u1.x * u2.y - u1.y * u2.x;
+        let dot = (u1.x * u2.x + u1.y * u2.y).clamp(-1.0, 1.0);
+        if cross.abs() < 1e-6 {
+            self.line_to(x1, y1);
+            return;
+        }
+        let angle = dot.acos();
+        let tangent = radius / (angle / 2.0).tan().abs();
+        if !tangent.is_finite() {
+            self.line_to(x1, y1);
+            return;
+        }
+        let t1 = Point::from_xy(p1.x + u1.x * tangent, p1.y + u1.y * tangent);
+        let t2 = Point::from_xy(p1.x + u2.x * tangent, p1.y + u2.y * tangent);
+        let bisector = Point::from_xy(u1.x + u2.x, u1.y + u2.y);
+        let length = (bisector.x * bisector.x + bisector.y * bisector.y).sqrt();
+        if length == 0.0 {
+            self.line_to(x1, y1);
+            return;
+        }
+        let distance = radius / (angle / 2.0).sin().abs();
+        let center = Point::from_xy(
+            p1.x + bisector.x / length * distance,
+            p1.y + bisector.y / length * distance,
+        );
+        self.line_to(t1.x, t1.y);
+        let start = (t1.y - center.y).atan2(t1.x - center.x);
+        let end = (t2.y - center.y).atan2(t2.x - center.x);
+        self.ellipse_arc(
+            center.x,
+            center.y,
+            radius,
+            radius,
+            0.0,
+            start,
+            end,
+            cross < 0.0,
+        );
+    }
+
+    pub(crate) fn round_rect(&mut self, x: f32, y: f32, width: f32, height: f32, radii: &[f32]) {
+        if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
+            return;
+        }
+        if width == 0.0 || height == 0.0 {
+            // A flat rect has no corners; keep the subpath.
+            self.rect(x, y, width, height);
+            return;
+        }
+        let (tl, tr, br, bl) = round_rect_radii(radii, width, height);
+        if [tl, tr, br, bl]
+            .iter()
+            .any(|radius| !radius.is_finite() || *radius < 0.0)
+        {
+            return;
+        }
+        let right = x + width;
+        let bottom = y + height;
+        let mut points: Vec<(Point, Point, Point)> = Vec::new();
+        // Each corner: start, control, end, in user space.
+        corner(&mut points, x + tl, y, x, y, x, y + tl);
+        corner(&mut points, right - tr, y, right, y, right, y + tr);
+        corner(
+            &mut points,
+            right,
+            bottom - br,
+            right,
+            bottom,
+            right - br,
+            bottom,
+        );
+        corner(&mut points, x + bl, bottom, x, bottom, x, bottom - bl);
+        let mut start = true;
+        for (a, control, b) in points {
+            let mut a = a;
+            let mut control = control;
+            let mut b = b;
+            self.state.transform.map_point(&mut a);
+            self.state.transform.map_point(&mut control);
+            self.state.transform.map_point(&mut b);
+            if start {
+                self.path.push(Segment::MoveTo(a));
+                self.subpath_start = a;
+                start = false;
+            } else {
+                self.path.push(Segment::LineTo(a));
+            }
+            self.path.push(Segment::Quad(control, b));
+            self.current = Some(b);
+        }
+        self.path.push(Segment::Close);
+        self.current = Some(self.subpath_start);
+    }
+
+    fn build_path(&self) -> Option<Path> {
+        let mut builder = PathBuilder::new();
+        for segment in &self.path {
+            match *segment {
+                Segment::MoveTo(point) => builder.move_to(point.x, point.y),
+                Segment::LineTo(point) => builder.line_to(point.x, point.y),
+                Segment::Quad(control, end) => {
+                    builder.quad_to(control.x, control.y, end.x, end.y);
+                }
+                Segment::Cubic(first, second, end) => {
+                    builder.cubic_to(first.x, first.y, second.x, second.y, end.x, end.y);
+                }
+                Segment::Close => builder.close(),
+            }
+        }
+        builder.finish()
+    }
+
+    pub(crate) fn is_point_in_path(&self, x: f32, y: f32, even_odd: bool) -> bool {
+        let Some(path) = self.build_path() else {
+            return false;
+        };
+        let rule = if even_odd {
+            FillRule::EvenOdd
+        } else {
+            FillRule::Winding
+        };
+        self.mask_contains(
+            &path,
+            rule,
+            point_in_canvas_space(x, y, self.state.transform),
+        )
+    }
+
+    pub(crate) fn is_point_in_stroke(&self, x: f32, y: f32) -> bool {
+        let Some(path) = self.build_path() else {
+            return false;
+        };
+        let stroke = self.stroke_options();
+        let Some(outline) = path.stroke(&stroke, 1.0) else {
+            return false;
+        };
+        self.mask_contains(
+            &outline,
+            FillRule::Winding,
+            point_in_canvas_space(x, y, self.state.transform),
+        )
+    }
+
+    fn mask_contains(&self, path: &Path, rule: FillRule, point: Point) -> bool {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "canvas coordinates are finite f32; the i64 floor then narrows to u32"
+        )]
+        let x = point.x.floor() as i64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "canvas coordinates are finite f32; the i64 floor then narrows to u32"
+        )]
+        let y = point.y.floor() as i64;
+        let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+            return false;
+        };
+        if x >= self.width || y >= self.height {
+            return false;
+        }
+        let Some(mut mask) = Mask::new(self.width, self.height) else {
+            return false;
+        };
+        mask.fill_path(path, rule, false, Transform::identity());
+        let index = y as usize * self.width as usize + x as usize;
+        mask.data().get(index).is_some_and(|alpha| *alpha != 0)
+    }
+
+    // ---- painting --------------------------------------------------------
+
+    pub(crate) fn fill(&mut self, even_odd: bool) {
+        let Some(path) = self.build_path() else {
+            return;
+        };
+        self.fill_path(&path, even_odd);
+    }
+
+    pub(crate) fn stroke(&mut self) {
+        let Some(path) = self.build_path() else {
+            return;
+        };
+        self.stroke_path(&path);
+    }
+
+    pub(crate) fn clip(&mut self, even_odd: bool) {
+        let rule = if even_odd {
+            FillRule::EvenOdd
+        } else {
+            FillRule::Winding
+        };
+        let Some(path) = self.build_path() else {
+            self.state.clip = Mask::new(self.width.max(1), self.height.max(1));
+            return;
+        };
+        if let Some(mask) = &mut self.state.clip {
+            mask.intersect_path(&path, rule, true, Transform::identity());
+        } else {
+            let Some(mut mask) = Mask::new(self.width, self.height) else {
+                return;
+            };
+            mask.fill_path(&path, rule, true, Transform::identity());
+            self.state.clip = Some(mask);
+        }
+    }
+
+    pub(crate) fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
+            return;
+        }
+        if width == 0.0 || height == 0.0 {
+            return;
+        }
+        let Some(path) = self.rect_path(x, y, width, height) else {
+            return;
+        };
+        self.fill_path(&path, false);
+    }
+
+    pub(crate) fn stroke_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
+            return;
+        }
+        if width == 0.0 || height == 0.0 {
+            return;
+        }
+        let Some(path) = self.rect_path(x, y, width, height) else {
+            return;
+        };
+        self.stroke_path(&path);
+    }
+
+    pub(crate) fn clear_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
+            return;
+        }
+        if width == 0.0 || height == 0.0 {
+            return;
+        }
+        let Some(path) = self.rect_path(x, y, width, height) else {
+            return;
+        };
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        let paint = Paint {
+            blend_mode: BlendMode::Clear,
+            ..Paint::default()
+        };
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            self.state.clip.as_ref(),
+        );
+    }
+
+    fn rect_path(&self, x: f32, y: f32, width: f32, height: f32) -> Option<Path> {
+        let corners = [
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
+        ];
+        let mut builder = PathBuilder::new();
+        for (index, (cx, cy)) in corners.into_iter().enumerate() {
+            let mut point = Point::from_xy(cx, cy);
+            self.state.transform.map_point(&mut point);
+            if index == 0 {
+                builder.move_to(point.x, point.y);
+            } else {
+                builder.line_to(point.x, point.y);
+            }
+        }
+        builder.close();
+        builder.finish()
+    }
+
+    fn fill_path(&mut self, path: &Path, even_odd: bool) {
+        let rule = if even_odd {
+            FillRule::EvenOdd
+        } else {
+            FillRule::Winding
+        };
+        let style = self.state.fill;
+        let alpha = self.state.alpha;
+        let pattern = match style {
+            Style::Pattern(id) => self.patterns.get(&id).map(|entry| entry.image.clone()),
+            _ => None,
+        };
+        let shader = match style {
+            Style::Color([r, g, b, a]) => {
+                let alpha = f32::from(a) / 255.0 * alpha;
+                Shader::SolidColor(Color::from_rgba8(r, g, b, to_u8(alpha)))
+            }
+            Style::Gradient(id) => {
+                let Some(shader) = self.gradient_shader(id, alpha) else {
+                    return;
+                };
+                shader
+            }
+            Style::Pattern(id) => {
+                let Some(image) = &pattern else {
+                    return;
+                };
+                let Some(entry) = self.patterns.get(&id) else {
+                    return;
+                };
+                tiny_skia::Pattern::new(
+                    image.as_ref().as_ref(),
+                    entry.spread,
+                    entry.quality,
+                    alpha,
+                    self.state.transform,
+                )
+            }
+        };
+        let paint = Paint {
+            shader,
+            blend_mode: self.state.blend,
+            anti_alias: true,
+            ..Paint::default()
+        };
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        pixmap.fill_path(
+            path,
+            &paint,
+            rule,
+            Transform::identity(),
+            self.state.clip.as_ref(),
+        );
+    }
+
+    fn stroke_path(&mut self, path: &Path) {
+        let stroke = self.stroke_options();
+        let style = self.state.stroke;
+        let alpha = self.state.alpha;
+        let pattern = match style {
+            Style::Pattern(id) => self.patterns.get(&id).map(|entry| entry.image.clone()),
+            _ => None,
+        };
+        let shader = match style {
+            Style::Color([r, g, b, a]) => {
+                let alpha = f32::from(a) / 255.0 * alpha;
+                Shader::SolidColor(Color::from_rgba8(r, g, b, to_u8(alpha)))
+            }
+            Style::Gradient(id) => {
+                let Some(shader) = self.gradient_shader(id, alpha) else {
+                    return;
+                };
+                shader
+            }
+            Style::Pattern(id) => {
+                let Some(image) = &pattern else {
+                    return;
+                };
+                let Some(entry) = self.patterns.get(&id) else {
+                    return;
+                };
+                tiny_skia::Pattern::new(
+                    image.as_ref().as_ref(),
+                    entry.spread,
+                    entry.quality,
+                    alpha,
+                    self.state.transform,
+                )
+            }
+        };
+        let paint = Paint {
+            shader,
+            blend_mode: self.state.blend,
+            anti_alias: true,
+            ..Paint::default()
+        };
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        pixmap.stroke_path(
+            path,
+            &paint,
+            &stroke,
+            Transform::identity(),
+            self.state.clip.as_ref(),
+        );
+    }
+
+    fn gradient_shader(&self, id: u32, alpha: f32) -> Option<Shader<'static>> {
+        let gradient = self.gradients.get(&id)?;
+        if gradient.stops.is_empty() {
+            return None;
+        }
+        let stops: Vec<GradientStop> = gradient
+            .stops
+            .iter()
+            .map(|(offset, [r, g, b, a])| {
+                GradientStop::new(
+                    *offset,
+                    Color::from_rgba8(*r, *g, *b, to_u8(f32::from(*a) / 255.0 * alpha)),
+                )
+            })
+            .collect();
+        let transform = self.state.transform;
+        match gradient.kind {
+            GradientKind::Linear { start, end } => {
+                tiny_skia::LinearGradient::new(start, end, stops, SpreadMode::Pad, transform)
+            }
+            GradientKind::Radial {
+                start,
+                start_radius,
+                end,
+                end_radius,
+            } => tiny_skia::RadialGradient::new(
+                start,
+                start_radius,
+                end,
+                end_radius,
+                stops,
+                SpreadMode::Pad,
+                transform,
+            ),
+            GradientKind::Conic { center, angle } => tiny_skia::SweepGradient::new(
+                center,
+                angle.to_degrees(),
+                angle.to_degrees() + 360.0,
+                stops,
+                SpreadMode::Pad,
+                transform,
+            ),
+        }
+    }
+
+    // ---- resources -------------------------------------------------------
+
+    pub(crate) fn create_linear_gradient(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) -> u32 {
+        let id = self.next_resource;
+        self.next_resource += 1;
+        self.gradients.insert(
+            id,
+            Gradient {
+                kind: GradientKind::Linear {
+                    start: Point::from_xy(x0, y0),
+                    end: Point::from_xy(x1, y1),
+                },
+                stops: Vec::new(),
+            },
+        );
+        id
+    }
+
+    pub(crate) fn create_radial_gradient(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
+    ) -> u32 {
+        let id = self.next_resource;
+        self.next_resource += 1;
+        self.gradients.insert(
+            id,
+            Gradient {
+                kind: GradientKind::Radial {
+                    start: Point::from_xy(x0, y0),
+                    start_radius: r0,
+                    end: Point::from_xy(x1, y1),
+                    end_radius: r1,
+                },
+                stops: Vec::new(),
+            },
+        );
+        id
+    }
+
+    pub(crate) fn create_conic_gradient(&mut self, x: f32, y: f32, angle: f32) -> u32 {
+        let id = self.next_resource;
+        self.next_resource += 1;
+        self.gradients.insert(
+            id,
+            Gradient {
+                kind: GradientKind::Conic {
+                    center: Point::from_xy(x, y),
+                    angle,
+                },
+                stops: Vec::new(),
+            },
+        );
+        id
+    }
+
+    pub(crate) fn add_color_stop(&mut self, id: u32, offset: f32, color: [u8; 4]) -> bool {
+        let Some(gradient) = self.gradients.get_mut(&id) else {
+            return false;
+        };
+        if !(0.0..=1.0).contains(&offset) {
+            return false;
+        }
+        let index = gradient
+            .stops
+            .iter()
+            .position(|(existing, _)| *existing > offset)
+            .unwrap_or(gradient.stops.len());
+        gradient.stops.insert(index, (offset, color));
+        true
+    }
+
+    pub(crate) fn create_pattern(
+        &mut self,
+        source: SourceImage,
+        repetition: &str,
+        smoothing: bool,
+    ) -> Option<u32> {
+        let pixmap = Pixmap::from_vec(
+            to_premultiplied(&source.pixels),
+            tiny_skia::IntSize::from_wh(source.width, source.height)?,
+        )?;
+        let spread = match repetition {
+            "repeat" | "repeat-x" | "repeat-y" => SpreadMode::Repeat,
+            "no-repeat" => SpreadMode::Pad,
+            _ => return None,
+        };
+        let quality = if smoothing {
+            FilterQuality::Bilinear
+        } else {
+            FilterQuality::Nearest
+        };
+        let id = self.next_resource;
+        self.next_resource += 1;
+        self.patterns.insert(
+            id,
+            Pattern {
+                image: Arc::new(pixmap),
+                spread,
+                quality,
+            },
+        );
+        Some(id)
+    }
+
+    // ---- pixels ----------------------------------------------------------
+
+    /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
+    /// transparent black
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
+    pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
+        let mut out = vec![0; width as usize * height as usize * 4];
+        let Some(pixmap) = &self.pixmap else {
+            return out;
+        };
+        for row in 0..height {
+            for column in 0..width {
+                let sx = i64::from(x) + i64::from(column);
+                let sy = i64::from(y) + i64::from(row);
+                if sx < 0 || sy < 0 {
+                    continue;
+                }
+                let (Ok(sx), Ok(sy)) = (u32::try_from(sx), u32::try_from(sy)) else {
+                    continue;
+                };
+                let Some(pixel) = pixmap.pixel(sx, sy) else {
+                    continue;
+                };
+                let color = pixel.demultiply();
+                let offset = (row as usize * width as usize + column as usize) * 4;
+                out[offset] = color.red();
+                out[offset + 1] = color.green();
+                out[offset + 2] = color.blue();
+                out[offset + 3] = color.alpha();
+            }
+        }
+        out
+    }
+
+    /// `putImageData`: straight RGBA source, no transform, alpha, or
+    /// compositing
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-putimagedata>).
+    pub(crate) fn write_pixels(
+        &mut self,
+        source: &[u8],
+        source_width: u32,
+        source_height: u32,
+        dx: i32,
+        dy: i32,
+        dirty: Option<(u32, u32, u32, u32)>,
+    ) {
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        let (dirty_x, dirty_y, dirty_width, dirty_height) =
+            dirty.unwrap_or((0, 0, source_width, source_height));
+        let dirty_width = dirty_width.min(source_width.saturating_sub(dirty_x));
+        let dirty_height = dirty_height.min(source_height.saturating_sub(dirty_y));
+        for row in 0..dirty_height {
+            for column in 0..dirty_width {
+                let sx = dirty_x + column;
+                let sy = dirty_y + row;
+                let src = ((sy as usize * source_width as usize) + sx as usize) * 4;
+                let Some(pixel) = source.get(src..src + 4) else {
+                    continue;
+                };
+                let target_x = i64::from(dx) + i64::from(column);
+                let target_y = i64::from(dy) + i64::from(row);
+                if target_x < 0 || target_y < 0 {
+                    continue;
+                }
+                let (Ok(target_x), Ok(target_y)) =
+                    (u32::try_from(target_x), u32::try_from(target_y))
+                else {
+                    continue;
+                };
+                if target_x >= pixmap.width() || target_y >= pixmap.height() {
+                    continue;
+                }
+                let color =
+                    ColorU8::from_rgba(pixel[0], pixel[1], pixel[2], pixel[3]).premultiply();
+                let index = (target_y as usize * pixmap.width() as usize + target_x as usize) * 4;
+                if let Some(slot) = pixmap.data_mut().get_mut(index..index + 4) {
+                    slot.copy_from_slice(&[
+                        color.red(),
+                        color.green(),
+                        color.blue(),
+                        color.alpha(),
+                    ]);
+                }
+            }
+        }
+    }
+
+    /// `drawImage`, with the source already decoded to straight RGBA.
+    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
+    pub(crate) fn draw_image(
+        &mut self,
+        source: &SourceImage,
+        sx: f32,
+        sy: f32,
+        sw: f32,
+        sh: f32,
+        dx: f32,
+        dy: f32,
+        dw: f32,
+        dh: f32,
+    ) {
+        if !(sx.is_finite()
+            && sy.is_finite()
+            && sw.is_finite()
+            && sh.is_finite()
+            && dx.is_finite()
+            && dy.is_finite()
+            && dw.is_finite()
+            && dh.is_finite())
+        {
+            return;
+        }
+        if sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
+            return;
+        }
+        let Some(pixmap) = Pixmap::from_vec(
+            to_premultiplied(&source.pixels),
+            tiny_skia::IntSize::from_wh(source.width, source.height)
+                .unwrap_or(tiny_skia::IntSize::from_wh(1, 1).expect("1x1 is a valid size")),
+        ) else {
+            return;
+        };
+        let pattern = Arc::new(pixmap);
+        let quality = if self.state.smoothing {
+            FilterQuality::Bilinear
+        } else {
+            FilterQuality::Nearest
+        };
+        let scale_x = dw / sw;
+        let scale_y = dh / sh;
+        let image_to_user = Transform::from_row(
+            scale_x,
+            0.0,
+            0.0,
+            scale_y,
+            dx - sx * scale_x,
+            dy - sy * scale_y,
+        );
+        let transform = self.state.transform.pre_concat(image_to_user);
+        let paint = Paint {
+            shader: tiny_skia::Pattern::new(
+                pattern.as_ref().as_ref(),
+                SpreadMode::Pad,
+                quality,
+                self.state.alpha,
+                transform,
+            ),
+            blend_mode: self.state.blend,
+            anti_alias: true,
+            ..Paint::default()
+        };
+        let Some(path) = self.rect_path(dx, dy, dw, dh) else {
+            return;
+        };
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            self.state.clip.as_ref(),
+        );
+    }
+
+    fn stroke_options(&self) -> Stroke {
+        let dash = if self.state.dash.is_empty() {
+            None
+        } else {
+            StrokeDash::new(self.state.dash.clone(), self.state.dash_offset)
+        };
+        Stroke {
+            width: self.state.line_width,
+            miter_limit: self.state.miter_limit,
+            line_cap: self.state.line_cap,
+            line_join: self.state.line_join,
+            dash,
+        }
+    }
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            transform: Transform::identity(),
+            fill: Style::Color([0, 0, 0, 255]),
+            stroke: Style::Color([0, 0, 0, 255]),
+            alpha: 1.0,
+            blend: BlendMode::SourceOver,
+            line_width: 1.0,
+            line_cap: LineCap::Butt,
+            line_join: LineJoin::Miter,
+            miter_limit: 10.0,
+            dash: Vec::new(),
+            dash_offset: 0.0,
+            shadow_color: [0, 0, 0, 0],
+            shadow_blur: 0.0,
+            shadow_x: 0.0,
+            shadow_y: 0.0,
+            font: "10px sans-serif".to_owned(),
+            text_align: TextAlign::Start,
+            text_baseline: TextBaseline::Alphabetic,
+            direction: Direction::Inherit,
+            letter_spacing: "0px".to_owned(),
+            word_spacing: "0px".to_owned(),
+            font_kerning: "auto".to_owned(),
+            font_stretch: "normal".to_owned(),
+            font_variant_caps: "normal".to_owned(),
+            smoothing: true,
+            smoothing_quality: "low".to_owned(),
+            filter: "none".to_owned(),
+            clip: None,
+        }
+    }
+}
+
+/// A value assigned to `fillStyle` or `strokeStyle`.
+#[derive(Clone, Copy)]
+pub(crate) enum StyleValue {
+    Color([u8; 4]),
+    Gradient(u32),
+    Pattern(u32),
+}
+
+impl StyleValue {
+    fn from_style(style: Style) -> Self {
+        match style {
+            Style::Color(color) => Self::Color(color),
+            Style::Gradient(id) => Self::Gradient(id),
+            Style::Pattern(id) => Self::Pattern(id),
+        }
+    }
+}
+
+fn make_pixmap(width: u32, height: u32) -> Option<Pixmap> {
+    Pixmap::new(width.max(1), height.max(1))
+}
+
+fn to_u8(value: f32) -> u8 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is clamped to 0..=255 before the cast"
+    )]
+    let channel = value.mul_add(255.0, 0.5).clamp(0.0, 255.0) as u8;
+    channel
+}
+
+/// Exact float equality, which is what Blink uses for canvas angle and point
+/// comparisons (`canvas_path.cc`, `AdjustEndAngle`).
+fn same_float(left: f32, right: f32) -> bool {
+    left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal)
+}
+
+fn point_in_canvas_space(x: f32, y: f32, transform: Transform) -> Point {
+    let mut point = Point::from_xy(x, y);
+    transform.map_point(&mut point);
+    point
+}
+
+fn ellipse_point(cx: f32, cy: f32, rx: f32, ry: f32, rotation: f32, angle: f32) -> Point {
+    let (sin, cos) = rotation.sin_cos();
+    let x = rx * angle.cos();
+    let y = ry * angle.sin();
+    Point::from_xy(cx + x * cos - y * sin, cy + x * sin + y * cos)
+}
+
+fn ellipse_derivative(cx: f32, cy: f32, rx: f32, ry: f32, rotation: f32, angle: f32) -> Point {
+    let _ = (cx, cy);
+    let (sin, cos) = rotation.sin_cos();
+    let x = -rx * angle.sin();
+    let y = ry * angle.cos();
+    Point::from_xy(x * cos - y * sin, x * sin + y * cos)
+}
+
+fn corner(
+    points: &mut Vec<(Point, Point, Point)>,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    x3: f32,
+    y3: f32,
+) {
+    points.push((
+        Point::from_xy(x1, y1),
+        Point::from_xy(x2, y2),
+        Point::from_xy(x3, y3),
+    ));
+}
+
+/// CSS border-radius expansion for `roundRect`: 1, 2, 3, or 4 values, each
+/// clamped to half the box side
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-roundrect>).
+fn round_rect_radii(radii: &[f32], width: f32, height: f32) -> (f32, f32, f32, f32) {
+    let values: Vec<f32> = match radii {
+        [] => vec![0.0],
+        [one] => vec![*one],
+        [first, second] => vec![*first, *second, *first, *second],
+        [first, second, third] => vec![*first, *second, *third, *second],
+        [first, second, third, fourth, ..] => vec![*first, *second, *third, *fourth],
+    };
+    let scale = {
+        let mut scale = 1.0f32;
+        let sides = [
+            (values[0] + values[1], width),
+            (values[1] + values[2], height),
+            (values[2] + values[3], width),
+            (values[3] + values[0], height),
+        ];
+        for (sum, side) in sides {
+            if sum > 0.0 && sum > side {
+                scale = scale.min(side / sum);
+            }
+        }
+        scale
+    };
+    (
+        values[0] * scale,
+        values[1] * scale,
+        values[2] * scale,
+        values[3] * scale,
+    )
+}
+
+fn to_premultiplied(straight: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(straight.len());
+    for pixel in straight.as_chunks::<4>().0 {
+        let color = ColorU8::from_rgba(pixel[0], pixel[1], pixel[2], pixel[3]).premultiply();
+        out.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
+    }
+    out
+}
+
+fn blend_from_name(name: &str) -> Option<BlendMode> {
+    Some(match name {
+        "source-over" => BlendMode::SourceOver,
+        "source-in" => BlendMode::SourceIn,
+        "source-out" => BlendMode::SourceOut,
+        "source-atop" => BlendMode::SourceAtop,
+        "destination-over" => BlendMode::DestinationOver,
+        "destination-in" => BlendMode::DestinationIn,
+        "destination-out" => BlendMode::DestinationOut,
+        "destination-atop" => BlendMode::DestinationAtop,
+        "lighter" => BlendMode::Plus,
+        "copy" => BlendMode::Source,
+        "xor" => BlendMode::Xor,
+        "multiply" => BlendMode::Multiply,
+        "screen" => BlendMode::Screen,
+        "overlay" => BlendMode::Overlay,
+        "darken" => BlendMode::Darken,
+        "lighten" => BlendMode::Lighten,
+        "color-dodge" => BlendMode::ColorDodge,
+        "color-burn" => BlendMode::ColorBurn,
+        "hard-light" => BlendMode::HardLight,
+        "soft-light" => BlendMode::SoftLight,
+        "difference" => BlendMode::Difference,
+        "exclusion" => BlendMode::Exclusion,
+        "hue" => BlendMode::Hue,
+        "saturation" => BlendMode::Saturation,
+        "color" => BlendMode::Color,
+        "luminosity" => BlendMode::Luminosity,
+        _ => return None,
+    })
+}
+
+fn blend_name(blend: BlendMode) -> &'static str {
+    match blend {
+        BlendMode::SourceOver => "source-over",
+        BlendMode::SourceIn => "source-in",
+        BlendMode::SourceOut => "source-out",
+        BlendMode::SourceAtop => "source-atop",
+        BlendMode::DestinationOver => "destination-over",
+        BlendMode::DestinationIn => "destination-in",
+        BlendMode::DestinationOut => "destination-out",
+        BlendMode::DestinationAtop => "destination-atop",
+        BlendMode::Plus => "lighter",
+        BlendMode::Source => "copy",
+        BlendMode::Xor => "xor",
+        BlendMode::Multiply => "multiply",
+        BlendMode::Screen => "screen",
+        BlendMode::Overlay => "overlay",
+        BlendMode::Darken => "darken",
+        BlendMode::Lighten => "lighten",
+        BlendMode::ColorDodge => "color-dodge",
+        BlendMode::ColorBurn => "color-burn",
+        BlendMode::HardLight => "hard-light",
+        BlendMode::SoftLight => "soft-light",
+        BlendMode::Difference => "difference",
+        BlendMode::Exclusion => "exclusion",
+        BlendMode::Hue => "hue",
+        BlendMode::Saturation => "saturation",
+        BlendMode::Color => "color",
+        BlendMode::Luminosity => "luminosity",
+        BlendMode::Clear => "clear",
+        BlendMode::Destination => "destination",
+        BlendMode::Modulate => "modulate",
+    }
+}
+
+/// Serializes a color the way canvas reports it back: `#rrggbb` when opaque,
+/// `rgba(...)` otherwise.
+pub(crate) fn serialize_color([r, g, b, a]: [u8; 4]) -> String {
+    if a == 255 {
+        format!("#{r:02x}{g:02x}{b:02x}")
+    } else {
+        let alpha = f32::from(a) / 255.0;
+        let alpha = (alpha * 1000.0).round() / 1000.0;
+        format!("rgba({r}, {g}, {b}, {alpha})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_rect_paints_pixels() {
+        let mut canvas = Canvas2D::new(4, 4);
+        canvas.set_fill_style(StyleValue::Color([255, 0, 0, 255]));
+        canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
+        let pixels = canvas.read_pixels(0, 0, 4, 4);
+        assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
+        assert_eq!(&pixels[12..16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn transform_applies_to_fill_rect() {
+        let mut canvas = Canvas2D::new(4, 4);
+        canvas.set_fill_style(StyleValue::Color([0, 0, 255, 255]));
+        canvas.translate(2.0, 0.0);
+        canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
+        let pixels = canvas.read_pixels(0, 0, 4, 4);
+        assert_eq!(&pixels[8..12], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn clip_limits_fill() {
+        let mut canvas = Canvas2D::new(4, 4);
+        canvas.set_fill_style(StyleValue::Color([0, 255, 0, 255]));
+        canvas.begin_path();
+        canvas.rect(0.0, 0.0, 2.0, 4.0);
+        canvas.clip(false);
+        canvas.fill_rect(0.0, 0.0, 4.0, 4.0);
+        let pixels = canvas.read_pixels(0, 0, 4, 4);
+        assert_eq!(&pixels[0..4], &[0, 255, 0, 255]);
+        assert_eq!(&pixels[8..12], &[0, 0, 0, 0]);
+    }
+}
