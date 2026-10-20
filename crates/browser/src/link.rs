@@ -502,8 +502,8 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
                 event,
             }) => route_event(&context, assignment, frame, &event),
             ServerInput::Notify(RendererNotice::Ready)
-            | ServerInput::RequestChunk { .. }
-            | ServerInput::RequestEnd { .. }
+            | ServerInput::RequestChunk
+            | ServerInput::RequestEnd
             | ServerInput::Cancel { .. } => Err(RendererViolation),
         };
         if result.is_err() {

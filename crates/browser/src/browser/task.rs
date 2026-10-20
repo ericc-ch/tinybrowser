@@ -186,8 +186,8 @@ impl BrowserTask {
                     }
                 },
                 ServerInput::Notify(Notice::Close) => break,
-                ServerInput::RequestChunk { .. }
-                | ServerInput::RequestEnd { .. }
+                ServerInput::RequestChunk
+                | ServerInput::RequestEnd
                 | ServerInput::Cancel { .. } => {}
             }
         }
