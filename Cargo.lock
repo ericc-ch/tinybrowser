@@ -2628,6 +2628,7 @@ dependencies = [
  "icu_provider",
  "icu_provider_adapters",
  "icu_provider_blob",
+ "image",
  "markup5ever",
  "net",
  "parley",

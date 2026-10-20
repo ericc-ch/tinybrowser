@@ -135,7 +135,18 @@ enum GradientKind {
 struct Pattern {
     image: Arc<Pixmap>,
     spread: SpreadMode,
+    repetition: PatternRepeat,
     quality: FilterQuality,
+}
+
+/// How `createPattern`'s repetition string clips and tiles
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createpattern>).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternRepeat {
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
 }
 
 /// A decoded source image for `drawImage`: straight RGBA, row-major.
@@ -1233,11 +1244,15 @@ impl Canvas2D {
         } else {
             FillRule::Winding
         };
+        self.clear_uncovered(path, rule);
         self.paint_shadow(path, rule, None);
         let style = self.state.fill;
         let alpha = self.state.alpha;
         let pattern = match style {
-            Style::Pattern(id) => self.patterns.get(&id).map(|entry| entry.image.clone()),
+            Style::Pattern(id) => self
+                .patterns
+                .get(&id)
+                .map(|entry| (entry.image.clone(), entry.repetition)),
             _ => None,
         };
         let shader = match style {
@@ -1252,7 +1267,7 @@ impl Canvas2D {
                 shader
             }
             Style::Pattern(id) => {
-                let Some(image) = &pattern else {
+                let Some((image, _)) = &pattern else {
                     return;
                 };
                 let Some(entry) = self.patterns.get(&id) else {
@@ -1273,16 +1288,101 @@ impl Canvas2D {
             anti_alias: true,
             ..Paint::default()
         };
+        let pattern_mask = pattern
+            .as_ref()
+            .and_then(|(image, repetition)| self.pattern_mask(image, *repetition));
+        let mask = pattern_mask.as_ref().or(self.state.clip.as_deref());
         let Some(pixmap) = &mut self.pixmap else {
             return;
         };
-        pixmap.fill_path(
-            path,
-            &paint,
-            rule,
-            Transform::identity(),
-            self.state.clip.as_deref(),
-        );
+        pixmap.fill_path(path, &paint, rule, Transform::identity(), mask);
+    }
+
+    /// Composites where the destination has no coverage. `copy`, `source-in`,
+    /// `source-out`, `destination-in`, and `destination-atop` clear the area
+    /// the shape does not cover, so the operation must run against the whole
+    /// canvas, not just the shape
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-globalcompositeoperation>).
+    fn clear_uncovered(&mut self, path: &Path, rule: FillRule) {
+        if !matches!(
+            self.state.blend,
+            BlendMode::Source
+                | BlendMode::SourceIn
+                | BlendMode::SourceOut
+                | BlendMode::DestinationIn
+                | BlendMode::DestinationAtop
+        ) {
+            return;
+        }
+        let Some(mut shape) = Mask::new(self.width, self.height) else {
+            return;
+        };
+        shape.fill_path(path, rule, true, Transform::identity());
+        let clip = match &self.state.clip {
+            None => None,
+            Some(clip) => {
+                let size = tiny_skia::IntSize::from_wh(clip.width(), clip.height());
+                let Some(clip) = size.and_then(|size| Mask::from_vec(clip.data().to_vec(), size))
+                else {
+                    return;
+                };
+                Some(clip)
+            }
+        };
+        let Some(mut mask) = Mask::new(self.width, self.height) else {
+            return;
+        };
+        for (index, target) in mask.data_mut().iter_mut().enumerate() {
+            let coverage = u16::from(*shape.data().get(index).unwrap_or(&0));
+            let clip = clip
+                .as_ref()
+                .map_or(255, |clip| u16::from(*clip.data().get(index).unwrap_or(&0)));
+            let cleared = clip * (255 - coverage) / 255;
+            *target = u8::try_from(255 - cleared).unwrap_or(0);
+        }
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        pixmap.apply_mask(&mask);
+    }
+
+    /// The strip a `repeat-x`, `repeat-y`, or `no-repeat` pattern may paint
+    /// in; the shader itself only knows how to repeat or pad
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createpattern>).
+    fn pattern_mask(&self, image: &Arc<Pixmap>, repetition: PatternRepeat) -> Option<Mask> {
+        const LIMIT: f32 = 1_000_000.0;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "pattern images are far below 2^24 pixels per side"
+        )]
+        let (width, height) = (image.width() as f32, image.height() as f32);
+        let rect = match repetition {
+            PatternRepeat::Repeat => return None,
+            PatternRepeat::RepeatX => tiny_skia::Rect::from_ltrb(-LIMIT, 0.0, LIMIT, height)?,
+            PatternRepeat::RepeatY => tiny_skia::Rect::from_ltrb(0.0, -LIMIT, width, LIMIT)?,
+            PatternRepeat::NoRepeat => tiny_skia::Rect::from_ltrb(0.0, 0.0, width, height)?,
+        };
+        let band = PathBuilder::from_rect(rect).transform(self.state.transform)?;
+        let mut mask = if let Some(clip) = &self.state.clip {
+            let size = tiny_skia::IntSize::from_wh(clip.width(), clip.height())?;
+            Mask::from_vec(clip.data().to_vec(), size)?
+        } else {
+            let mut mask = Mask::new(self.width, self.height)?;
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "canvas sides are far below 2^24"
+            )]
+            let full = tiny_skia::Rect::from_xywh(0.0, 0.0, self.width as f32, self.height as f32)?;
+            mask.fill_path(
+                &PathBuilder::from_rect(full),
+                FillRule::Winding,
+                false,
+                Transform::identity(),
+            );
+            mask
+        };
+        mask.intersect_path(&band, FillRule::Winding, true, Transform::identity());
+        Some(mask)
     }
 
     fn stroke_path(&mut self, path: &Path) {
@@ -1491,9 +1591,11 @@ impl Canvas2D {
             to_premultiplied(&source.pixels),
             tiny_skia::IntSize::from_wh(source.width, source.height)?,
         )?;
-        let spread = match repetition {
-            "repeat" | "repeat-x" | "repeat-y" => SpreadMode::Repeat,
-            "no-repeat" => SpreadMode::Pad,
+        let (spread, repetition) = match repetition {
+            "repeat" => (SpreadMode::Repeat, PatternRepeat::Repeat),
+            "repeat-x" => (SpreadMode::Repeat, PatternRepeat::RepeatX),
+            "repeat-y" => (SpreadMode::Repeat, PatternRepeat::RepeatY),
+            "no-repeat" => (SpreadMode::Pad, PatternRepeat::NoRepeat),
             _ => return None,
         };
         let quality = if smoothing {
@@ -1508,6 +1610,7 @@ impl Canvas2D {
             Pattern {
                 image: Arc::new(pixmap),
                 spread,
+                repetition,
                 quality,
             },
         );
@@ -1723,6 +1826,7 @@ impl Canvas2D {
         let Some(path) = self.rect_path(dx, dy, dw, dh) else {
             return;
         };
+        self.clear_uncovered(&path, FillRule::Winding);
         self.paint_image_shadow(&path, &pattern, quality, transform);
         let Some(pixmap) = &mut self.pixmap else {
             return;
@@ -2384,6 +2488,7 @@ fn blend_from_name(name: &str) -> Option<BlendMode> {
         "destination-atop" => BlendMode::DestinationAtop,
         "lighter" => BlendMode::Plus,
         "copy" => BlendMode::Source,
+        "clear" => BlendMode::Clear,
         "xor" => BlendMode::Xor,
         "multiply" => BlendMode::Multiply,
         "screen" => BlendMode::Screen,
@@ -2416,6 +2521,7 @@ fn blend_name(blend: BlendMode) -> &'static str {
         BlendMode::DestinationAtop => "destination-atop",
         BlendMode::Plus => "lighter",
         BlendMode::Source => "copy",
+        BlendMode::Clear => "clear",
         BlendMode::Xor => "xor",
         BlendMode::Multiply => "multiply",
         BlendMode::Screen => "screen",
@@ -2432,7 +2538,6 @@ fn blend_name(blend: BlendMode) -> &'static str {
         BlendMode::Saturation => "saturation",
         BlendMode::Color => "color",
         BlendMode::Luminosity => "luminosity",
-        BlendMode::Clear => "clear",
         BlendMode::Destination => "destination",
         BlendMode::Modulate => "modulate",
     }

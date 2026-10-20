@@ -412,3 +412,26 @@ Object.defineProperty(globalThis.DataTransfer.prototype, Symbol.toStringTag, {
 // A `type=file` input with no files still contributes an entry, an empty File
 // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 host.__tbEmptyFile = () => new globalThis.File([], '');
+
+// https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-createimagebitmap
+globalThis.createImageBitmap = function createImageBitmap(source, options) {
+  return new Promise((resolve, reject) => {
+    try {
+      if (source !== null && typeof source === 'object' && __tbBlobData.get(source) !== undefined) {
+        source.arrayBuffer().then(
+          buffer => {
+            try {
+              resolve(host.createImageBitmapDecode(new __tbUint8Array(buffer), options));
+            } catch (error) {
+              reject(error);
+            }
+          },
+          reject);
+        return;
+      }
+      resolve(host.createImageBitmapFromSource(source, options));
+    } catch (error) {
+      reject(error);
+    }
+  });
+};
