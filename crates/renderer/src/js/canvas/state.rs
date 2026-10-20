@@ -71,6 +71,7 @@ struct State {
     font_kerning: String,
     font_stretch: String,
     font_variant_caps: String,
+    text_rendering: String,
     smoothing: bool,
     smoothing_quality: String,
     filter: String,
@@ -172,6 +173,19 @@ pub(crate) struct SourceImage {
 }
 
 impl Canvas2D {
+    /// Resets the bitmap and drawing state, keeping the gradient and pattern
+    /// objects alive: resizing a canvas does not invalidate them
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
+    pub(crate) fn reset_for_resize(&mut self, width: u32, height: u32) {
+        let gradients = std::mem::take(&mut self.gradients);
+        let patterns = std::mem::take(&mut self.patterns);
+        let next_resource = self.next_resource;
+        *self = Canvas2D::new(width, height);
+        self.gradients = gradients;
+        self.patterns = patterns;
+        self.next_resource = next_resource;
+    }
+
     pub(crate) fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -611,6 +625,14 @@ impl Canvas2D {
 
     pub(crate) fn set_font_stretch(&mut self, value: &str) {
         value.clone_into(&mut self.state.font_stretch);
+    }
+
+    pub(crate) fn text_rendering(&self) -> &str {
+        &self.state.text_rendering
+    }
+
+    pub(crate) fn set_text_rendering(&mut self, value: &str) {
+        value.clone_into(&mut self.state.text_rendering);
     }
 
     pub(crate) fn font_variant_caps(&self) -> &str {
@@ -2322,6 +2344,7 @@ impl Default for State {
             font_kerning: "auto".to_owned(),
             font_stretch: "normal".to_owned(),
             font_variant_caps: "normal".to_owned(),
+            text_rendering: "auto".to_owned(),
             smoothing: true,
             smoothing_quality: "low".to_owned(),
             filter: "none".to_owned(),

@@ -149,6 +149,14 @@ impl<'js> html_video_element_generated::HTMLVideoElement<'js> for JsNode {
     }
 }
 
+/// Resets the context after a dimension setter, even when the value is
+/// unchanged.
+fn reset_canvas(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, id)?;
+    world.borrow().registry().borrow_mut().reset_canvas(id);
+    Ok(())
+}
+
 impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width
     fn get_width(&self, ctx: &Ctx<'js>) -> Result<usize> {
@@ -162,7 +170,8 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
         // Out-of-range values write the default rather than the raw value
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
         let value = if value > 2_147_483_647 { 300 } else { value };
-        set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())
+        set_attribute_sync(ctx, self.handle.0, "width", &value.to_string())?;
+        reset_canvas(ctx, self.handle.0)
     }
 
     // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height
@@ -177,7 +186,8 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
         // Out-of-range values write the default rather than the raw value
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-height>).
         let value = if value > 2_147_483_647 { 150 } else { value };
-        set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())
+        set_attribute_sync(ctx, self.handle.0, "height", &value.to_string())?;
+        reset_canvas(ctx, self.handle.0)
     }
 
     // https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext
