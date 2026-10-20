@@ -1087,7 +1087,18 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("xmp", "HTMLPreElement"),
 ];
 
-fn html_element_interface(local: &str) -> &'static str {
+/// Element interfaces whose receiver check passes through an intermediate
+/// interface: an audio or video element implements `HTMLMediaElement`
+/// between its own interface and `HTMLElement`
+/// (<https://html.spec.whatwg.org/multipage/dom.html#htmlmediaelement>). Child
+/// first, parent second; [`node_interface_matches`](super::host) derives the
+/// media receiver check from these pairs instead of re-listing the tags.
+pub(super) const ELEMENT_INTERFACE_PARENTS: &[(&str, &str)] = &[
+    ("HTMLAudioElement", "HTMLMediaElement"),
+    ("HTMLVideoElement", "HTMLMediaElement"),
+];
+
+pub(super) fn html_element_interface(local: &str) -> &'static str {
     if let Some((_, interface)) = ELEMENT_INTERFACES.iter().find(|(name, _)| *name == local) {
         return interface;
     }
@@ -1150,6 +1161,23 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
     let entries = table
         .props::<String, Object>()
         .collect::<Result<Vec<(String, Object)>>>()?;
+    // Cross-check: [`ELEMENT_INTERFACES`] and `brands.js` are one fact stated
+    // twice, in Rust and in the shim. Every element interface the table names
+    // must have the prototype brands.js installed; a table that names an
+    // interface the shim does not define fails this realm install at startup
+    // instead of misbranding pages later
+    // (<https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom>).
+    let defined: std::collections::HashSet<&str> =
+        entries.iter().map(|(name, _)| name.as_str()).collect();
+    let missing: std::collections::BTreeSet<&str> = ELEMENT_INTERFACES
+        .iter()
+        .map(|(_, interface)| *interface)
+        .filter(|interface| !defined.contains(interface))
+        .collect();
+    if !missing.is_empty() {
+        let message = format!("brands: missing element prototypes: {missing:?}");
+        return Err(Exception::throw_internal(ctx, message.as_str()));
+    }
     for (name, proto) in entries {
         world(ctx)?
             .borrow_mut()

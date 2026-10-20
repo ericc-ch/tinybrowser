@@ -530,10 +530,6 @@ pub(crate) trait SharedClass {
 
 /// Whether `data` implements the named node interface, or `None` when the
 /// name is not one the shared payload can represent.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one match arm per node interface name; splitting the table is a refactor, not a lint fix"
-)]
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
     xml_document: bool,
@@ -637,91 +633,41 @@ fn node_interface_matches(
         "HTMLHyperlinkElementUtils" => {
             crate::dom::tree::is_html_tag(data, "a") || crate::dom::tree::is_html_tag(data, "area")
         }
-        // HTML element interfaces check the element's local name.
-        "HTMLFormElement" => crate::dom::tree::is_html_tag(data, "form"),
-        "HTMLInputElement" => crate::dom::tree::is_html_tag(data, "input"),
-        "HTMLTextAreaElement" => crate::dom::tree::is_html_tag(data, "textarea"),
-        "HTMLSelectElement" => crate::dom::tree::is_html_tag(data, "select"),
-        "HTMLOptionElement" => crate::dom::tree::is_html_tag(data, "option"),
-        "HTMLButtonElement" => crate::dom::tree::is_html_tag(data, "button"),
-        "HTMLFieldSetElement" => crate::dom::tree::is_html_tag(data, "fieldset"),
-        "HTMLOptGroupElement" => crate::dom::tree::is_html_tag(data, "optgroup"),
-        "HTMLIFrameElement" => crate::dom::tree::is_html_tag(data, "iframe"),
-        "HTMLFrameElement" => crate::dom::tree::is_html_tag(data, "frame"),
-        "HTMLImageElement" => crate::dom::tree::is_html_tag(data, "img"),
-        "HTMLCanvasElement" => crate::dom::tree::is_html_tag(data, "canvas"),
-        "HTMLBaseElement" => crate::dom::tree::is_html_tag(data, "base"),
-        "HTMLLinkElement" => crate::dom::tree::is_html_tag(data, "link"),
-        "HTMLMediaElement" => {
-            crate::dom::tree::is_html_tag(data, "audio")
-                || crate::dom::tree::is_html_tag(data, "video")
+        // Every remaining name is an HTML element interface, checked against
+        // the DOM interface the element table derives for the tag. A name
+        // outside that family cannot name a node interface here at all.
+        _ => {
+            return interface
+                .starts_with("HTML")
+                .then(|| html_element_interface_matches(data, interface));
         }
-        "HTMLEmbedElement" => crate::dom::tree::is_html_tag(data, "embed"),
-        "HTMLScriptElement" => crate::dom::tree::is_html_tag(data, "script"),
-        "HTMLSourceElement" => crate::dom::tree::is_html_tag(data, "source"),
-        "HTMLTrackElement" => crate::dom::tree::is_html_tag(data, "track"),
-        "HTMLMetaElement" => crate::dom::tree::is_html_tag(data, "meta"),
-        "HTMLMapElement" => crate::dom::tree::is_html_tag(data, "map"),
-        "HTMLObjectElement" => crate::dom::tree::is_html_tag(data, "object"),
-        "HTMLOutputElement" => crate::dom::tree::is_html_tag(data, "output"),
-        "HTMLParamElement" => crate::dom::tree::is_html_tag(data, "param"),
-        "HTMLSlotElement" => crate::dom::tree::is_html_tag(data, "slot"),
-        "HTMLTemplateElement" => crate::dom::tree::is_html_tag(data, "template"),
-        "HTMLAnchorElement" => crate::dom::tree::is_html_tag(data, "a"),
-        "HTMLAreaElement" => crate::dom::tree::is_html_tag(data, "area"),
-        "HTMLAudioElement" => crate::dom::tree::is_html_tag(data, "audio"),
-        "HTMLBodyElement" => crate::dom::tree::is_html_tag(data, "body"),
-        "HTMLBRElement" => crate::dom::tree::is_html_tag(data, "br"),
-        "HTMLDataElement" => crate::dom::tree::is_html_tag(data, "data"),
-        "HTMLDataListElement" => crate::dom::tree::is_html_tag(data, "datalist"),
-        "HTMLDetailsElement" => crate::dom::tree::is_html_tag(data, "details"),
-        "HTMLDialogElement" => crate::dom::tree::is_html_tag(data, "dialog"),
-        "HTMLDirectoryElement" => crate::dom::tree::is_html_tag(data, "dir"),
-        "HTMLDivElement" => crate::dom::tree::is_html_tag(data, "div"),
-        "HTMLDListElement" => crate::dom::tree::is_html_tag(data, "dl"),
-        "HTMLFontElement" => crate::dom::tree::is_html_tag(data, "font"),
-        "HTMLFrameSetElement" => crate::dom::tree::is_html_tag(data, "frameset"),
-        "HTMLHeadElement" => crate::dom::tree::is_html_tag(data, "head"),
-        "HTMLHeadingElement" => {
-            crate::dom::tree::is_html_tag(data, "h1")
-                || crate::dom::tree::is_html_tag(data, "h2")
-                || crate::dom::tree::is_html_tag(data, "h3")
-                || crate::dom::tree::is_html_tag(data, "h4")
-                || crate::dom::tree::is_html_tag(data, "h5")
-                || crate::dom::tree::is_html_tag(data, "h6")
-        }
-        "HTMLHRElement" => crate::dom::tree::is_html_tag(data, "hr"),
-        "HTMLHtmlElement" => crate::dom::tree::is_html_tag(data, "html"),
-        "HTMLLabelElement" => crate::dom::tree::is_html_tag(data, "label"),
-        "HTMLLegendElement" => crate::dom::tree::is_html_tag(data, "legend"),
-        "HTMLLIElement" => crate::dom::tree::is_html_tag(data, "li"),
-        "HTMLMenuElement" => crate::dom::tree::is_html_tag(data, "menu"),
-        "HTMLMarqueeElement" => crate::dom::tree::is_html_tag(data, "marquee"),
-        "HTMLMeterElement" => crate::dom::tree::is_html_tag(data, "meter"),
-        "HTMLModElement" => {
-            crate::dom::tree::is_html_tag(data, "ins") || crate::dom::tree::is_html_tag(data, "del")
-        }
-        "HTMLOListElement" => crate::dom::tree::is_html_tag(data, "ol"),
-        "HTMLParagraphElement" => crate::dom::tree::is_html_tag(data, "p"),
-        "HTMLPictureElement" => crate::dom::tree::is_html_tag(data, "picture"),
-        "HTMLPreElement" => {
-            crate::dom::tree::is_html_tag(data, "pre")
-                || crate::dom::tree::is_html_tag(data, "listing")
-                || crate::dom::tree::is_html_tag(data, "xmp")
-        }
-        "HTMLProgressElement" => crate::dom::tree::is_html_tag(data, "progress"),
-        "HTMLQuoteElement" => {
-            crate::dom::tree::is_html_tag(data, "blockquote")
-                || crate::dom::tree::is_html_tag(data, "q")
-        }
-        "HTMLSpanElement" => crate::dom::tree::is_html_tag(data, "span"),
-        "HTMLStyleElement" => crate::dom::tree::is_html_tag(data, "style"),
-        "HTMLTimeElement" => crate::dom::tree::is_html_tag(data, "time"),
-        "HTMLTitleElement" => crate::dom::tree::is_html_tag(data, "title"),
-        "HTMLUListElement" => crate::dom::tree::is_html_tag(data, "ul"),
-        "HTMLVideoElement" => crate::dom::tree::is_html_tag(data, "video"),
-        _ => html_table_interface(data, interface)?,
     })
+}
+
+/// Whether an HTML element's DOM interface is `interface`, per the one
+/// element table ([`super::ELEMENT_INTERFACES`]): tag names map to
+/// interfaces once, and this receiver check derives from that mapping
+/// instead of re-listing tags per interface
+/// (<https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom>).
+/// A tag the table does not map is an `HTMLUnknownElement`
+/// (<https://html.spec.whatwg.org/multipage/dom.html#html-unknown-element>),
+/// and an audio or video element also implements the `HTMLMediaElement` its
+/// prototype chains to; nothing else in the table has an intermediate
+/// parent.
+fn html_element_interface_matches(data: Option<&blitz_dom::NodeData>, interface: &str) -> bool {
+    let element = match data {
+        Some(blitz_dom::NodeData::Element(element))
+            if element.name.ns == crate::dom::tree::html_namespace() =>
+        {
+            element
+        }
+        _ => return false,
+    };
+    let dom_interface = super::html_element_interface(element.name.local.as_str());
+    dom_interface == interface
+        || super::ELEMENT_INTERFACE_PARENTS
+            .iter()
+            .any(|(child, parent)| *parent == interface && *child == dom_interface)
 }
 
 pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str) -> Result<()> {
@@ -743,24 +689,6 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
     }
-}
-
-/// Whether table `data` implements one of the HTML table element
-/// interfaces, matched by tag name.
-fn html_table_interface(data: Option<&blitz_dom::NodeData>, interface: &str) -> Option<bool> {
-    let tags: &[&str] = match interface {
-        "HTMLTableElement" => &["table"],
-        "HTMLTableCaptionElement" => &["caption"],
-        "HTMLTableColElement" => &["col", "colgroup"],
-        "HTMLTableSectionElement" => &["tbody", "thead", "tfoot"],
-        "HTMLTableRowElement" => &["tr"],
-        "HTMLTableCellElement" => &["td", "th"],
-        _ => return None,
-    };
-    Some(
-        tags.iter()
-            .any(|tag| crate::dom::tree::is_html_tag(data, tag)),
-    )
 }
 
 /// Whether the JS value is a platform object implementing `interface`. The
