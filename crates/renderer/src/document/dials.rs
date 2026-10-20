@@ -91,8 +91,8 @@ impl DialLedger {
         }
     }
 
-    /// Collects finished dials, newest first, and drops their cancellation
-    /// handles.
+    /// Collects finished dials in completion order (oldest first) and drops
+    /// their cancellation handles.
     pub(crate) fn adopt(&mut self) -> Vec<Result<CompletedDial, DialContext>> {
         let mut completed = Vec::new();
         while let Ok(outcome) = self.rx.try_recv() {
@@ -151,9 +151,9 @@ impl DialLedger {
         })
     }
 
-    /// Cancels page-fetch handles and drops queued dials. Dials already
-    /// started keep running; their completions are adopted or dropped by the
-    /// document that owns the ledger.
+    /// Drops queued dials and cancels every started page fetch, forgetting its
+    /// handle. Other started dials keep running; their completions are adopted
+    /// or dropped by the document that owns the ledger.
     pub(crate) fn discard_queued(&mut self) {
         for (_, cancel) in self.cancellations.drain() {
             cancel();
