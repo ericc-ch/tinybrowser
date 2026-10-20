@@ -23,13 +23,14 @@ use rquickjs::function::This;
 use rquickjs::object::Accessor;
 use rquickjs::prelude::{Func, Opt};
 use rquickjs::{
-    Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result, TypedArray, Value,
+    Array, Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result, TypedArray, Value,
 };
 
 use crate::dom::tree::NodeId;
-use crate::js::bindings::{world, wrap_node};
+use crate::js::bindings::{attribute_value, world, wrap_node};
 use path2d::JsPath2D;
 use state::serialize_color;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A `WebIDL` `DOMString` argument: coerces like `ToString`, then owns the
 /// UTF-8 bytes for the duration of the call.
@@ -116,6 +117,8 @@ fn install_methods<'js>(ctx: &Ctx<'js>, prototype: &Object<'js>) -> Result<()> {
     method!("reset", 0, reset);
     method!("beginLayer", 0, begin_layer);
     method!("endLayer", 0, end_layer);
+    method!("fillTextCluster", 2, fill_text_cluster);
+    method!("strokeTextCluster", 2, stroke_text_cluster);
     method!("scale", 2, scale);
     method!("rotate", 1, rotate);
     method!("translate", 2, translate);
@@ -286,7 +289,7 @@ fn install_paint_accessors(prototype: &Object<'_>) -> Result<()> {
 }
 
 fn install_text_accessors(prototype: &Object<'_>) -> Result<()> {
-    string_prop!(prototype, "font", font, set_font);
+    prototype.prop("font", Accessor::new(get_font, set_font_binding))?;
     string_prop!(prototype, "textAlign", text_align, set_text_align);
     string_prop!(prototype, "textBaseline", text_baseline, set_text_baseline);
     string_prop!(prototype, "direction", direction, set_direction);
@@ -299,6 +302,7 @@ fn install_text_accessors(prototype: &Object<'_>) -> Result<()> {
     string_prop!(prototype, "wordSpacing", word_spacing, set_word_spacing);
     string_prop!(prototype, "fontKerning", font_kerning, set_font_kerning);
     string_prop!(prototype, "fontStretch", font_stretch, set_font_stretch);
+    string_prop!(prototype, "lang", lang, set_lang);
     string_prop!(
         prototype,
         "textRendering",
@@ -2297,6 +2301,68 @@ fn stroke_text(
     draw_text(this, &text, *x, *y, max_width.0.as_deref().copied(), true)
 }
 
+fn fill_text_cluster<'js>(
+    this: This<Object<'js>>,
+    cluster: Value<'js>,
+    x: Coerced<f64>,
+    y: Coerced<f64>,
+    options: Opt<Value<'js>>,
+) -> Result<()> {
+    draw_text_cluster(this, cluster, *x, *y, options, false)
+}
+
+fn stroke_text_cluster<'js>(
+    this: This<Object<'js>>,
+    cluster: Value<'js>,
+    x: Coerced<f64>,
+    y: Coerced<f64>,
+    options: Opt<Value<'js>>,
+) -> Result<()> {
+    draw_text_cluster(this, cluster, *x, *y, options, true)
+}
+
+fn draw_text_cluster<'js>(
+    this: This<Object<'js>>,
+    cluster: Value<'js>,
+    x: f64,
+    y: f64,
+    options: Opt<Value<'js>>,
+    stroke: bool,
+) -> Result<()> {
+    let ctx = this.0.ctx();
+    let Some(cluster) = cluster.as_object() else {
+        return Err(Exception::throw_type(
+            ctx,
+            "fillTextCluster needs a cluster",
+        ));
+    };
+    let text: String = cluster.get("text")?;
+    let mut align = None;
+    let mut baseline = None;
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    if let Some(options) = options.0.as_ref().and_then(Value::as_object) {
+        align = options.get::<_, String>("align").ok();
+        baseline = options.get::<_, String>("baseline").ok();
+        dx = options
+            .get::<_, Coerced<f64>>("x")
+            .map_or(0.0, |value| *value);
+        dy = options
+            .get::<_, Coerced<f64>>("y")
+            .map_or(0.0, |value| *value);
+    }
+    draw_text_with(
+        this,
+        &text,
+        x + dx,
+        y + dy,
+        None,
+        stroke,
+        align.as_deref(),
+        baseline.as_deref(),
+    )
+}
+
 fn draw_text(
     this: This<Object<'_>>,
     text: &str,
@@ -2305,17 +2371,45 @@ fn draw_text(
     max_width: Option<f64>,
     stroke: bool,
 ) -> Result<()> {
+    draw_text_with(this, text, x, y, max_width, stroke, None, None)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cluster drawing overrides the context's align and baseline"
+)]
+fn draw_text_with(
+    this: This<Object<'_>>,
+    text: &str,
+    x: f64,
+    y: f64,
+    max_width: Option<f64>,
+    stroke: bool,
+    align_override: Option<&str>,
+    baseline_override: Option<&str>,
+) -> Result<()> {
     if !x.is_finite() || !y.is_finite() {
         return Ok(());
     }
     let ctx = this.0.ctx();
-    let (font, align, baseline) = with_canvas(ctx, &this.0, |canvas| {
-        (
-            canvas.font().to_owned(),
-            canvas.text_align().to_owned(),
-            canvas.text_baseline().to_owned(),
-        )
-    })?;
+    let (font, align, baseline, letter_spacing, word_spacing, lang, kerning) =
+        with_canvas(ctx, &this.0, |canvas| {
+            (
+                canvas.font().to_owned(),
+                canvas.text_align().to_owned(),
+                canvas.text_baseline().to_owned(),
+                canvas.letter_spacing().to_owned(),
+                canvas.word_spacing().to_owned(),
+                canvas.lang().to_owned(),
+                canvas.font_kerning().to_owned(),
+            )
+        })?;
+    let language = resolved_language(ctx, &this.0, &lang);
+    let align = align_override.map_or(align, str::to_owned);
+    let baseline = baseline_override.map_or(baseline, str::to_owned);
+    let font_size = text::font_size(&font);
+    let letter_spacing = text::length_px(&letter_spacing, font_size);
+    let word_spacing = text::length_px(&word_spacing, font_size);
     let max_width = match max_width {
         None => None,
         Some(value) if value.is_finite() && value > 0.0 => Some(f32_of(value)),
@@ -2324,12 +2418,23 @@ fn draw_text(
         Some(_) => return Ok(()),
     };
     let mut font_ctx = document_font_context(ctx, &this.0)?;
-    let shaped = text::shape(text, &font, max_width, &mut font_ctx);
+    let shaped = text::shape(
+        text,
+        &font,
+        max_width,
+        letter_spacing,
+        word_spacing,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+    );
     let Some(path) = shaped.path.as_ref() else {
         return Ok(());
     };
     let width = shaped.width * shaped.scale_x;
-    let dx = match align.as_str() {
+    let direction = with_canvas(ctx, &this.0, |canvas| canvas.direction().to_owned())?;
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let dx = match resolved {
         "center" => -width / 2.0,
         "right" | "end" => -width,
         _ => 0.0,
@@ -2339,10 +2444,10 @@ fn draw_text(
     // (<https://html.spec.whatwg.org/multipage/canvas.html#text-baselines>).
     let dy = match baseline.as_str() {
         "top" => 0.0,
-        "hanging" => -shaped.ascent * 0.8,
+        "hanging" => shaped.hanging_baseline - shaped.ascent,
         "middle" => -(shaped.ascent + shaped.descent) / 2.0,
         "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -(shaped.ascent + shaped.descent) + shaped.descent * 0.2,
+        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
         _ => -shaped.ascent,
     };
     let (x, y) = (f32_of(x) + dx, f32_of(y) + dy);
@@ -2355,24 +2460,328 @@ fn draw_text(
     })
 }
 
+/// UTF-16 ranges come from `WebIDL` `unsigned long`; negatives are a `TypeError`
+/// and a range outside the string or reversed is an `IndexSizeError`
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-textmetrics-gettextclusters>).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "indices were validated non-negative and within the UTF-16 length"
+)]
+fn text_range<'js>(
+    ctx: &Ctx<'js>,
+    text: &str,
+    args: &[Value<'js>],
+    default_full: bool,
+) -> Result<(usize, usize)> {
+    let length = text.encode_utf16().count();
+    let mut index = 0;
+    let mut options = None;
+    if let Some(value) = args.first()
+        && value.is_object()
+        && !value.is_null()
+    {
+        options = Some(value.clone());
+        index = 1;
+    }
+    if options.is_some() {
+        return Ok((0, length));
+    }
+    if args.len() <= index {
+        if default_full {
+            return Ok((0, length));
+        }
+        return Err(Exception::throw_type(
+            ctx,
+            "a start and end index are required",
+        ));
+    }
+    let start = *Coerced::<f64>::from_js(ctx, args[index].clone())?;
+    let end = match args.get(index + 1) {
+        Some(value) => Some(*Coerced::<f64>::from_js(ctx, value.clone())?),
+        None if default_full => Some(length as f64),
+        None => None,
+    };
+    if start < 0.0 || end.is_some_and(|end| end < 0.0) {
+        return Err(Exception::throw_type(ctx, "indices must be non-negative"));
+    }
+    let Some(end) = end else {
+        return Err(Exception::throw_type(ctx, "an end index is required"));
+    };
+    let (start, end) = (start as usize, end as usize);
+    if start > length || end > length || start > end {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "IndexSizeError",
+            &format!("index is outside the text (start {start}, end {end}, len {length})"),
+        ));
+    }
+    Ok((start, end))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "TextMetrics UTF-16 offsets fit in unsigned long"
+)]
+fn get_text_clusters<'js>(
+    this: This<Object<'js>>,
+    args: rquickjs::function::Rest<Value<'js>>,
+) -> Result<Array<'js>> {
+    let ctx = this.0.ctx();
+    let text: String = this.0.get("__tbText")?;
+    let (start, end) = text_range(ctx, &text, &args.0, true)?;
+    let align: String = this.0.get("__tbAlign")?;
+    let baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
+    let width: f32 = this.0.get("width").unwrap_or(0.0);
+    let ascent: f32 = this.0.get("emHeightAscent").unwrap_or(0.0);
+    let descent: f32 = this.0.get("emHeightDescent").unwrap_or(0.0);
+    let mut align = align;
+    let mut baseline = baseline;
+    if let Some(options) = args.0.first().and_then(Value::as_object) {
+        if let Ok(value) = options.get::<_, String>("align") {
+            align = value;
+        }
+        if let Ok(value) = options.get::<_, String>("baseline") {
+            baseline = value;
+        }
+    }
+    let x = match align.as_str() {
+        "center" => width / 2.0,
+        "right" | "end" => width,
+        _ => 0.0,
+    };
+    let y = match baseline.as_str() {
+        "top" | "hanging" => 0.0,
+        "middle" => f32::midpoint(ascent, descent),
+        "bottom" | "ideographic" => ascent + descent,
+        _ => ascent,
+    };
+    let array = Array::new(ctx.clone())?;
+    let mut utf16 = 0usize;
+    for (byte_index, grapheme) in text.grapheme_indices(true) {
+        let cluster_start = text[..byte_index].encode_utf16().count();
+        let cluster_end = cluster_start + grapheme.encode_utf16().count();
+        utf16 = cluster_end;
+        if cluster_start < start || cluster_end > end {
+            continue;
+        }
+        let cluster = Object::new(ctx.clone())?;
+        cluster.set("start", cluster_start as u32)?;
+        cluster.set("end", cluster_end as u32)?;
+        cluster.set("x", x)?;
+        cluster.set("y", y)?;
+        cluster.set("text", grapheme)?;
+        array.set(array.len(), cluster)?;
+    }
+    if utf16 < end {
+        let _ = utf16;
+    }
+    Ok(array)
+}
+
+fn get_actual_bounding_box<'js>(
+    this: This<Object<'js>>,
+    args: rquickjs::function::Rest<Value<'js>>,
+) -> Result<Object<'js>> {
+    let ctx = this.0.ctx();
+    let text: String = this.0.get("__tbText")?;
+    let (start, end) = text_range(ctx, &text, &args.0, false)?;
+    let padded: String = {
+        let mut padded = String::with_capacity(text.len());
+        let mut offset = 0usize;
+        for ch in text.chars() {
+            let length = ch.len_utf16();
+            if offset >= start && offset + length <= end {
+                padded.push(ch);
+            } else {
+                for _ in 0..length {
+                    padded.push(' ');
+                }
+            }
+            offset += length;
+        }
+        padded
+    };
+    let font: String = this.0.get("__tbFont")?;
+    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
+    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
+    let lang: String = this
+        .0
+        .get("__tbLang")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let language = resolved_language(ctx, &this.0, &lang);
+    let kerning: String = this
+        .0
+        .get("__tbKerning")
+        .unwrap_or_else(|_| "auto".to_owned());
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(
+        &padded,
+        &font,
+        None,
+        letter,
+        word,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+    );
+    let align: String = this
+        .0
+        .get("__tbAlign")
+        .unwrap_or_else(|_| "left".to_owned());
+    let direction: String = this
+        .0
+        .get("__tbDirection")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let (left, right) = match resolved {
+        "right" | "end" => (
+            shaped.width - shaped.ink_min_x,
+            shaped.width - shaped.ink_max_x,
+        ),
+        "center" => (
+            shaped.width / 2.0 - shaped.ink_min_x,
+            shaped.width / 2.0 - shaped.ink_max_x,
+        ),
+        _ => (shaped.ink_min_x.abs(), shaped.ink_max_x),
+    };
+    let object = Object::new(ctx.clone())?;
+    object.set("x", -left)?;
+    object.set("y", -shaped.actual_ascent)?;
+    object.set("width", left + right)?;
+    object.set("height", shaped.actual_ascent + shaped.actual_descent)?;
+    Ok(object)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "indices were checked non-negative and within the UTF-16 length"
+)]
+fn get_selection_rects<'js>(
+    this: This<Object<'js>>,
+    args: rquickjs::function::Rest<Value<'js>>,
+) -> Result<Array<'js>> {
+    let ctx = this.0.ctx();
+    let text: String = this.0.get("__tbText")?;
+    let length = text.encode_utf16().count();
+    let start = *Coerced::<f64>::from_js(ctx, args.0[0].clone())?;
+    let end = *Coerced::<f64>::from_js(ctx, args.0[1].clone())?;
+    if start < 0.0 || end < 0.0 {
+        return Err(Exception::throw_type(ctx, "indices must be non-negative"));
+    }
+    let (start, end) = (start as usize, end as usize);
+    if start > length || end > length {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "IndexSizeError",
+            "index is outside the text",
+        ));
+    }
+    // Selection rectangles are empty for a reversed or empty range.
+    let _ = (start, end);
+    Array::new(ctx.clone())
+}
+
+/// Nearest cluster boundary to a horizontal offset. Cluster starts delimit
+/// the text, so this returns the closest UTF-16 start index.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "the offset is clamped to the text width and indices fit in unsigned long"
+)]
+fn get_index_from_offset(this: This<Object<'_>>, offset: Coerced<f64>) -> Result<u32> {
+    let text: String = this.0.get("__tbText")?;
+    let width: f32 = this.0.get("width").unwrap_or(0.0);
+    if width <= 0.0 {
+        return Ok(0);
+    }
+    let ratio = (f32_of(*offset) / width).clamp(0.0, 1.0);
+    let target = ratio * text.encode_utf16().count() as f32;
+    let mut best = 0u32;
+    let mut best_distance = f32::MAX;
+    for (byte_index, _) in text.grapheme_indices(true) {
+        let start = text[..byte_index].encode_utf16().count();
+        let distance = (start as f32 - target).abs();
+        if distance < best_distance {
+            best_distance = distance;
+            best = start as u32;
+        }
+    }
+    Ok(best)
+}
+
 fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     let ctx = this.0.ctx();
-    let font = with_canvas(ctx, &this.0, |canvas| canvas.font().to_owned())?;
+    let (font, align, baseline, direction, letter_spacing, word_spacing, lang, kerning) =
+        with_canvas(ctx, &this.0, |canvas| {
+            (
+                canvas.font().to_owned(),
+                canvas.text_align().to_owned(),
+                canvas.text_baseline().to_owned(),
+                canvas.direction().to_owned(),
+                canvas.letter_spacing().to_owned(),
+                canvas.word_spacing().to_owned(),
+                canvas.lang().to_owned(),
+                canvas.font_kerning().to_owned(),
+            )
+        })?;
+    let language = resolved_language(ctx, &this.0, &lang);
+    let font_size = text::font_size(&font);
+    let letter_spacing = text::length_px(&letter_spacing, font_size);
+    let word_spacing = text::length_px(&word_spacing, font_size);
     let mut font_ctx = document_font_context(ctx, &this.0)?;
-    let shaped = text::shape(&text, &font, None, &mut font_ctx);
+    let shaped = text::shape(
+        &text,
+        &font,
+        None,
+        letter_spacing,
+        word_spacing,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+    );
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let (actual_left, actual_right) = match resolved {
+        "right" | "end" => (
+            shaped.width - shaped.ink_min_x,
+            shaped.width - shaped.ink_max_x,
+        ),
+        "center" => (
+            shaped.width / 2.0 - shaped.ink_min_x,
+            shaped.width / 2.0 - shaped.ink_max_x,
+        ),
+        _ => (shaped.ink_min_x.abs(), shaped.ink_max_x),
+    };
     let object = Object::new(ctx.clone())?;
+    object.set("__tbText", text.to_string())?;
+    object.set("__tbFont", font)?;
+    object.set("__tbAlign", align)?;
+    object.set("__tbBaseline", baseline)?;
+    object.set("__tbDirection", direction)?;
+    object.set("__tbLetterSpacing", letter_spacing)?;
+    object.set("__tbWordSpacing", word_spacing)?;
+    object.set("__tbLang", lang)?;
+    object.set("__tbKerning", kerning)?;
+    object.set("__tbDoc", this.0.get::<_, u32>("__tbDoc")?)?;
+    object.set("__tbNode", this.0.get::<_, u64>("__tbNode")?)?;
+    object.set("getTextClusters", Func::from(get_text_clusters))?;
+    object.set("getActualBoundingBox", Func::from(get_actual_bounding_box))?;
+    object.set("getSelectionRects", Func::from(get_selection_rects))?;
+    object.set("getIndexFromOffset", Func::from(get_index_from_offset))?;
     object.set("width", shaped.width)?;
-    object.set("actualBoundingBoxLeft", 0.0)?;
-    object.set("actualBoundingBoxRight", shaped.width)?;
-    object.set("actualBoundingBoxAscent", shaped.ascent)?;
-    object.set("actualBoundingBoxDescent", shaped.descent)?;
-    object.set("fontBoundingBoxAscent", shaped.ascent)?;
-    object.set("fontBoundingBoxDescent", shaped.descent)?;
-    object.set("emHeightAscent", shaped.ascent)?;
-    object.set("emHeightDescent", shaped.descent)?;
-    object.set("hangingBaseline", shaped.ascent * 0.8)?;
+    object.set("actualBoundingBoxLeft", actual_left)?;
+    object.set("actualBoundingBoxRight", actual_right)?;
+    object.set("actualBoundingBoxAscent", shaped.actual_ascent)?;
+    object.set("actualBoundingBoxDescent", shaped.actual_descent)?;
+    object.set("fontBoundingBoxAscent", shaped.font_ascent)?;
+    object.set("fontBoundingBoxDescent", shaped.font_descent)?;
+    object.set("emHeightAscent", shaped.em_ascent)?;
+    object.set("emHeightDescent", shaped.em_descent)?;
+    object.set("hangingBaseline", shaped.hanging_baseline)?;
     object.set("alphabeticBaseline", 0.0)?;
-    object.set("ideographicBaseline", -shaped.descent * 0.2)?;
+    object.set("ideographicBaseline", shaped.ideographic_baseline)?;
     Ok(object)
 }
 
@@ -2602,6 +3011,108 @@ fn set_style_value<'js>(
         return Ok(());
     };
     with_canvas(ctx, object, |canvas| set(canvas, style))
+}
+
+fn get_font(this: This<Object<'_>>) -> Result<Value<'_>> {
+    let font = with_canvas(this.0.ctx(), &this.0, |canvas| canvas.font().to_owned())?;
+    Ok(rquickjs::String::from_str(this.0.ctx().clone(), &font)?.into_value())
+}
+
+fn set_font_binding(this: This<Object<'_>>, value: DomString) -> Result<()> {
+    let ctx = this.0.ctx();
+    let id = canvas_id(&this.0)?;
+    let style = attribute_value(ctx, id, "style").unwrap_or_default();
+    let (base_size, line_height) = canvas_style_metrics(&style);
+    let Some(font) = text::canonical_font(&value, base_size, line_height) else {
+        return Ok(());
+    };
+    with_canvas(ctx, &this.0, |canvas| canvas.set_font(&font))
+}
+
+/// The canvas element's font-size and line-height from its inline style. A
+/// canvas with no font-size resolves relative lengths against the context's
+/// 10px initial font
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-font>).
+fn canvas_style_metrics(style: &str) -> (f32, f32) {
+    let mut size = 10.0;
+    let mut line_height = None;
+    for declaration in style.split(';') {
+        let Some((name, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "font-size" => {
+                if let Some(px) = value
+                    .strip_suffix("px")
+                    .and_then(|value| value.trim().parse::<f32>().ok())
+                {
+                    size = px;
+                }
+            }
+            "line-height" => line_height = Some(value),
+            _ => {}
+        }
+    }
+    let line_height = line_height.map_or(size * 1.2, |value| {
+        value
+            .strip_suffix("px")
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .or_else(|| value.trim().parse::<f32>().ok().map(|value| value * size))
+            .unwrap_or(size * 1.2)
+    });
+    (size, line_height)
+}
+
+/// `ctx.lang` inherits the canvas element's `lang` attribute; parley uses it
+/// for locale-sensitive shaping
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-lang>).
+fn resolved_language(ctx: &Ctx<'_>, object: &Object<'_>, lang: &str) -> Option<String> {
+    if lang != "inherit" && !lang.is_empty() {
+        return Some(lang.to_owned());
+    }
+    canvas_id(object)
+        .ok()
+        .and_then(|id| attribute_value(ctx, id, "lang").ok())
+        .filter(|lang| !lang.trim().is_empty())
+}
+
+/// Resolves `start`/`end` using the context direction, then the canvas
+/// element's `dir` attribute
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-textalign>).
+fn resolved_alignment(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    align: &str,
+    direction: &str,
+) -> &'static str {
+    let rtl = match direction {
+        "rtl" => true,
+        "ltr" => false,
+        _ => canvas_id(object)
+            .ok()
+            .and_then(|id| attribute_value(ctx, id, "dir").ok())
+            .is_some_and(|dir| dir.trim().eq_ignore_ascii_case("rtl")),
+    };
+    match align {
+        "start" => {
+            if rtl {
+                "right"
+            } else {
+                "left"
+            }
+        }
+        "end" => {
+            if rtl {
+                "left"
+            } else {
+                "right"
+            }
+        }
+        "center" => "center",
+        "right" => "right",
+        _ => "left",
+    }
 }
 
 fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {

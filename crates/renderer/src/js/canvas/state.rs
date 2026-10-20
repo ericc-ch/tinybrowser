@@ -44,6 +44,26 @@ pub(crate) struct Canvas2D {
     layers: Vec<usize>,
 }
 
+/// Canvas spacing accepts only a CSS length; the unit is serialized in lower
+/// case and an invalid or non-finite value leaves the previous spacing
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing>).
+fn normalize_length(value: &str) -> Option<String> {
+    let text = value.trim().to_ascii_lowercase();
+    let split = text.find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+')))?;
+    let (number, unit) = text.split_at(split);
+    let unit = unit.trim();
+    if !matches!(
+        unit,
+        "px" | "em" | "ex" | "ch" | "ic" | "rem" | "in" | "cm" | "mm" | "pt" | "pc" | "q" | "%"
+    ) {
+        return None;
+    }
+    if !number.parse::<f32>().is_ok_and(f32::is_finite) {
+        return None;
+    }
+    Some(format!("{number}{unit}"))
+}
+
 impl<'js> rquickjs::class::Trace<'js> for Canvas2D {
     fn trace<'a>(&self, _tracer: rquickjs::class::Tracer<'a, 'js>) {}
 }
@@ -75,6 +95,7 @@ struct State {
     font_stretch: String,
     font_variant_caps: String,
     text_rendering: String,
+    lang: String,
     smoothing: bool,
     smoothing_quality: String,
     filter: String,
@@ -659,7 +680,9 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_letter_spacing(&mut self, value: &str) {
-        value.clone_into(&mut self.state.letter_spacing);
+        if let Some(value) = normalize_length(value) {
+            self.state.letter_spacing = value;
+        }
     }
 
     pub(crate) fn word_spacing(&self) -> &str {
@@ -667,7 +690,9 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_word_spacing(&mut self, value: &str) {
-        value.clone_into(&mut self.state.word_spacing);
+        if let Some(value) = normalize_length(value) {
+            self.state.word_spacing = value;
+        }
     }
 
     pub(crate) fn font_kerning(&self) -> &str {
@@ -701,6 +726,14 @@ impl Canvas2D {
         }
     }
 
+    pub(crate) fn lang(&self) -> &str {
+        &self.state.lang
+    }
+
+    pub(crate) fn set_lang(&mut self, value: &str) {
+        value.clone_into(&mut self.state.lang);
+    }
+
     pub(crate) fn text_rendering(&self) -> &str {
         &self.state.text_rendering
     }
@@ -708,7 +741,7 @@ impl Canvas2D {
     pub(crate) fn set_text_rendering(&mut self, value: &str) {
         if matches!(
             value,
-            "auto" | "optimizespeed" | "optimizelegibility" | "geometricprecision"
+            "auto" | "optimizeSpeed" | "optimizeLegibility" | "geometricPrecision"
         ) {
             value.clone_into(&mut self.state.text_rendering);
         }
@@ -2427,6 +2460,7 @@ impl Default for State {
             font_stretch: "normal".to_owned(),
             font_variant_caps: "normal".to_owned(),
             text_rendering: "auto".to_owned(),
+            lang: "inherit".to_owned(),
             smoothing: true,
             smoothing_quality: "low".to_owned(),
             filter: "none".to_owned(),
