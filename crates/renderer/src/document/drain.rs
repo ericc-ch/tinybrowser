@@ -54,7 +54,7 @@ impl Document {
                 self.fetch_cancellations.remove(&(epoch, id));
             }
             match completed {
-                Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
+                Ok(done) => self.tasks.push_back(Task::DialFinished(Box::new(done))),
                 Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
             }
         }
@@ -132,21 +132,29 @@ impl Document {
             }
             let mut completed_data = false;
             for dial in queued {
-                if dial.url.scheme() == "data" {
+                // The queue holds the parsed URL's serialization, so the
+                // prefix test is the scheme test (see `DialRequest::url`).
+                if dial.req.url.starts_with("data:") {
                     completed_data = true;
                     // Same ceiling as a streamed navigation body. Decoding an
                     // unbounded `data:` URL would sit entirely in this process.
-                    match crate::engine::decode_data_url_bounded(dial.url.as_str()) {
+                    match crate::engine::decode_data_url_bounded(&dial.req.url) {
                         Some((content_type, body)) => {
+                            let QueuedDial {
+                                context,
+                                req,
+                                ancestors,
+                                integrity,
+                            } = dial;
+                            let final_url = req.url.clone();
                             self.finish_dial(super::CompletedDial {
-                                context: dial.context,
-                                request_url: dial.url.to_string(),
-                                csp: dial.csp.clone(),
-                                ancestors: dial.ancestors.clone(),
-                                integrity: dial.integrity.clone(),
+                                context,
+                                req,
+                                ancestors,
+                                integrity,
                                 outcome: crate::protocol::DialOutcome {
                                     status: 200,
-                                    final_url: dial.url.to_string(),
+                                    final_url,
                                     content_type: Some(content_type.clone()),
                                     // Scheme fetch serves the data: MIME type
                                     // as the response's `Content-Type` header
@@ -161,11 +169,11 @@ impl Document {
                     }
                     continue;
                 }
-                let task_dial = dial.clone();
                 let completed = self.dial_tx.clone();
                 let wake = Arc::clone(&self.wake);
                 let stop = Arc::clone(&self.stop);
-                let request = super::dial::request(&dial);
+                let context = dial.context;
+                let request = dial.req.clone();
                 self.in_flight_dials = self.in_flight_dials.saturating_add(1);
                 let cancel = self.services.start_dial(
                     request,
@@ -173,12 +181,12 @@ impl Document {
                         if stop.is_set() {
                             return;
                         }
-                        let result = super::dial::complete(&task_dial, outcome);
+                        let result = super::dial::complete(dial, outcome);
                         let _send_result = completed.send(result);
                         wake.notify_one();
                     }),
                 );
-                if let DialContext::JsFetch { epoch, id } = dial.context {
+                if let DialContext::JsFetch { epoch, id } = context {
                     self.fetch_cancellations.insert((epoch, id), cancel);
                 }
             }
@@ -202,7 +210,7 @@ impl Document {
                 self.timers.retain(|timer| timer.id != id);
                 self.adopt_js_work();
             }
-            Task::DialFinished(done) => self.finish_dial(done),
+            Task::DialFinished(done) => self.finish_dial(*done),
             Task::DialFailed(fail) => self.fail_dial(fail),
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
@@ -361,16 +369,17 @@ impl Document {
                 self.fire_js(|js| js.fire_node_error(element));
                 continue;
             }
-            let initiator = self.url.clone();
-            let mut dial = QueuedDial::get(
+            let mut dial = QueuedDial::new(
                 DialContext::ClassicScript {
                     element,
                     epoch: self.js_epoch,
                 },
-                url,
-                initiator,
+                &url,
+                &self.url,
             );
-            dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
+            dial.req.csp = Some(Box::new(
+                self.redirect_gate(crate::csp::Destination::Script),
+            ));
             dial.integrity = self.script_integrity(element);
             self.queued_dials.push(dial);
         }
@@ -412,24 +421,24 @@ impl Document {
                     self.settle_js_fetch(fetch.js_id, None);
                     continue;
                 }
-                let initiator = self.url.clone();
-                self.queued_dials.push(QueuedDial {
-                    context: DialContext::JsFetch {
+                let mut dial = QueuedDial::new(
+                    DialContext::JsFetch {
                         id: fetch.js_id,
                         epoch: self.js_epoch,
                     },
-                    url,
-                    initiator,
-                    method: fetch.method,
-                    body: fetch.body,
-                    content_type: fetch.content_type,
-                    headers: fetch.headers,
-                    referrer: fetch.referrer,
-                    cors: fetch.cors,
-                    csp: Some(self.redirect_gate(crate::csp::Destination::Connect)),
-                    ancestors: Vec::new(),
-                    integrity: None,
-                });
+                    &url,
+                    &self.url,
+                );
+                dial.req.method = fetch.method;
+                dial.req.body = fetch.body;
+                dial.req.content_type = fetch.content_type;
+                dial.req.headers = fetch.headers;
+                dial.req.referrer = fetch.referrer;
+                dial.req.cors = fetch.cors;
+                dial.req.csp = Some(Box::new(
+                    self.redirect_gate(crate::csp::Destination::Connect),
+                ));
+                self.queued_dials.push(dial);
             } else {
                 self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, None);

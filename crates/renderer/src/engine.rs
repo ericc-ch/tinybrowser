@@ -744,7 +744,7 @@ impl Engine {
             }
             return;
         };
-        self.load_frame_url(child, url, initiator, navigation);
+        self.load_frame_url(child, &url, initiator, navigation);
         if let (Some(embedder), Some(container)) = (embedder, container) {
             self.mark_frame_load_pending(container, embedder);
         }
@@ -908,7 +908,7 @@ impl Engine {
     fn load_frame_url(
         &mut self,
         child: FrameId,
-        url: Url,
+        url: &Url,
         initiator: FrameId,
         navigation: &FrameNavigation,
     ) {
@@ -917,10 +917,10 @@ impl Engine {
         // only show `about:blank` again
         // (<https://w3c.github.io/webappsec-csp/#effective-directive-for-a-request>).
         let embedder = self.runtime.shared.borrow().tree.parent(child);
-        let check_frame_src = self.frame_src_applies(child, &url);
+        let check_frame_src = self.frame_src_applies(child, url);
         if check_frame_src
             && let Some(embedder) = embedder
-            && self.frame_src_blocked(embedder, child, &url)
+            && self.frame_src_blocked(embedder, child, url)
         {
             return;
         }
@@ -935,7 +935,7 @@ impl Engine {
             .flatten();
         match url.scheme() {
             "about" => self.keep_initial_blank(child, initiator),
-            "data" => self.load_data_frame(child, initiator, &url),
+            "data" => self.load_data_frame(child, initiator, url),
             "javascript" => {
                 // Navigate to a javascript: URL returns when the initiator
                 // is not same origin-domain with the target's active
@@ -978,7 +978,7 @@ impl Engine {
                     }
                 }
             }
-            "blob" => self.load_blob_frame(child, initiator, &url),
+            "blob" => self.load_blob_frame(child, initiator, url),
             "http" | "https" => {
                 // The document the navigation started from, which supplies the
                 // request's initiator.
@@ -993,27 +993,42 @@ impl Engine {
                 // policy
                 // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
                 let referrer =
-                    self.navigation_referrer(initiator, &navigation.referrer_policy, &url);
-                // Ancestor document URLs nearest-first for the child's
-                // `frame-ancestors` check at commit
+                    self.navigation_referrer(initiator, &navigation.referrer_policy, url);
+                // The embedder's `frame-src` gate re-checks every redirect hop,
+                // and the ancestor URLs back the child response's
+                // `frame-ancestors` check at commit — both only when the
+                // embedder's gate applies
                 // (<https://w3c.github.io/webappsec-csp/#frame-ancestors-navigation-response>).
-                let ancestors = if embedder.is_some() && frame_gate.is_some() {
-                    self.ancestor_urls(embedder)
-                } else {
-                    Vec::new()
-                };
-                if let Some(document) = self.frames.get_mut(&child) {
-                    document.navigate_to(
-                        url,
-                        source,
-                        navigation.method.clone(),
-                        navigation.body.clone(),
-                        navigation.content_type.clone(),
-                        referrer,
-                    );
+                let (embedder, gate, ancestors) =
                     if let (Some(embedder), Some(gate)) = (embedder, frame_gate) {
-                        document.set_pending_frame_policy(embedder, gate, ancestors);
-                    }
+                        (
+                            Some(embedder),
+                            Some(gate),
+                            self.ancestor_urls(Some(embedder)),
+                        )
+                    } else {
+                        (None, None, Vec::new())
+                    };
+                if let Some(document) = self.frames.get_mut(&child) {
+                    document.navigate(
+                        embedder,
+                        crate::protocol::DialRequest {
+                            kind: crate::protocol::DialKind::FrameLoad,
+                            url: url.to_string(),
+                            initiator: source.to_string(),
+                            // The frame's document always reads the body.
+                            read_body: true,
+                            method: navigation.method.clone(),
+                            body: navigation.body.clone(),
+                            content_type: navigation.content_type.clone(),
+                            headers: Vec::new(),
+                            referrer,
+                            timeout_ms: 0,
+                            csp: gate.map(Box::new),
+                            cors: None,
+                        },
+                        ancestors,
+                    );
                 }
             }
             _ => {

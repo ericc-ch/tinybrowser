@@ -20,8 +20,8 @@ use crate::ReadyState;
 use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
 use crate::messaging::SharedHandle;
 use crate::protocol::{
-    BrowserServices, DialOutcome, FrameId, Mount, RendererEvent, ResponseHead, ScriptFailure,
-    TabError,
+    BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent, ResponseHead,
+    ScriptFailure, TabError,
 };
 
 pub(crate) mod dial;
@@ -41,7 +41,9 @@ const MAX_PENDING_EVENTS: usize = 2048;
 
 enum Task {
     Timer(u32),
-    DialFinished(CompletedDial),
+    /// Boxed: a completed dial carries the request and response with it, and
+    /// the variant otherwise dominates every other task's size.
+    DialFinished(Box<CompletedDial>),
     DialFailed(DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
@@ -116,27 +118,15 @@ pub(crate) enum DialContext {
     CspReport,
 }
 
-/// One dial waiting to start, with the URL and initiator it runs under.
+/// One dial waiting to start: the wire request plus the dial-local context
+/// the backend keeps for the response.
 #[derive(Clone)]
 pub(crate) struct QueuedDial {
     pub(crate) context: DialContext,
-    pub(crate) url: Url,
-    pub(crate) initiator: Url,
-    /// HTTP method. Every dial except a form navigation is a GET.
-    pub(crate) method: String,
-    /// Request body, empty for a GET.
-    pub(crate) body: Vec<u8>,
-    /// `Content-Type` for `body`, when there is one.
-    pub(crate) content_type: Option<String>,
-    pub(crate) headers: Vec<(String, String)>,
-    /// Browser-generated `Referer` URL. `None` omits the header.
-    pub(crate) referrer: Option<String>,
-    /// Policy the network re-checks on every redirect. `None` for a top-level
-    /// document navigation. A nested frame navigation carries `frame-src`.
-    pub(crate) csp: Option<crate::RedirectGate>,
-    /// CORS protocol parameters for a page `fetch`/XHR. `None` for
-    /// navigation and subresource dials, which are not CORS-enabled.
-    pub(crate) cors: Option<crate::protocol::CorsRequest>,
+    /// The request the dial starts as, built where the dial is queued: kind,
+    /// URLs, method, body, referrer, CSP redirect gate, and CORS parameters
+    /// are final.
+    pub(crate) req: DialRequest,
     /// Ancestor document URLs nearest-first, snapshotted when a nested frame
     /// navigation starts. The child's `frame-ancestors` policy is checked
     /// against these at commit
@@ -148,19 +138,39 @@ pub(crate) struct QueuedDial {
 }
 
 impl QueuedDial {
-    /// A GET dial, the shape of every dial but a form navigation.
-    pub(crate) fn get(context: DialContext, url: Url, initiator: Url) -> Self {
+    /// The wire kind a dial context maps to. Plain page subresources reuse
+    /// the image kind; no carrier policy keys off the kind except for
+    /// script-initiated fetches.
+    fn dial_kind(context: &DialContext) -> crate::protocol::DialKind {
+        match context {
+            DialContext::JsFetch { .. } => crate::protocol::DialKind::JsFetch,
+            DialContext::ClassicScript { .. } => crate::protocol::DialKind::ClassicScript,
+            DialContext::FrameLoad { .. } => crate::protocol::DialKind::FrameLoad,
+            DialContext::BlitzResource { .. } => crate::protocol::DialKind::Image,
+            DialContext::CspReport => crate::protocol::DialKind::CspReport,
+        }
+    }
+
+    /// A fresh GET dial: the shape of every dial but a form submission and a
+    /// page `fetch`. The call sites that need more set the request's fields
+    /// directly (`dial.req.…`).
+    pub(crate) fn new(context: DialContext, url: &Url, initiator: &Url) -> Self {
         Self {
+            req: crate::protocol::DialRequest {
+                kind: Self::dial_kind(&context),
+                url: url.to_string(),
+                initiator: initiator.to_string(),
+                read_body: true,
+                method: "GET".to_owned(),
+                body: Vec::new(),
+                content_type: None,
+                headers: Vec::new(),
+                referrer: None,
+                timeout_ms: 0,
+                csp: None,
+                cors: None,
+            },
             context,
-            url,
-            initiator,
-            method: "GET".to_owned(),
-            body: Vec::new(),
-            content_type: None,
-            headers: Vec::new(),
-            referrer: None,
-            cors: None,
-            csp: None,
             ancestors: Vec::new(),
             integrity: None,
         }
@@ -171,11 +181,9 @@ impl QueuedDial {
 pub(crate) struct CompletedDial {
     pub(crate) context: DialContext,
     pub(crate) outcome: DialOutcome,
-    /// URL the dial asked for, so a response can tell a redirect from the
-    /// original hop.
-    pub(crate) request_url: String,
-    /// Policy carried with the dial, used when a redirect is reported.
-    pub(crate) csp: Option<crate::RedirectGate>,
+    /// The wire request the dial started as: the request URL tells a redirect
+    /// from the original hop, and the CSP gate reports refused redirects.
+    pub(crate) req: DialRequest,
     /// Ancestor document URLs for a nested frame navigation, checked against
     /// the response's `frame-ancestors` at commit.
     pub(crate) ancestors: Vec<Url>,
@@ -775,57 +783,32 @@ impl Document {
         self.world.borrow_mut().forget_image(element);
     }
 
-    /// Starts the frame's own navigation. The dial runs on this document, so
-    /// a navigation that replaces the frame cancels an unfinished one.
-    pub(crate) fn navigate_to(
+    /// Starts one frame-load dial. `req` is the wire request, with the method,
+    /// body, `Content-Type`, referrer, and the embedder's `frame-src` redirect
+    /// gate already on it; `ancestors` are the ancestor URLs the child
+    /// response's `frame-ancestors` is checked against at commit. This stamps
+    /// the request kind and the frame-load sequence, and forces the response
+    /// body to be read: a load started later supersedes this one.
+    pub(crate) fn navigate(
         &mut self,
-        url: Url,
-        initiator: Url,
-        method: String,
-        body: Vec<u8>,
-        content_type: Option<String>,
-        referrer: Option<String>,
+        embedder: Option<FrameId>,
+        mut req: crate::protocol::DialRequest,
+        ancestors: Vec<Url>,
     ) {
+        req.kind = crate::protocol::DialKind::FrameLoad;
+        req.read_body = true;
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
         self.initial_blank = false;
         self.queued_dials.push(QueuedDial {
             context: DialContext::FrameLoad {
                 sequence: self.frame_load_sequence,
-                embedder: None,
+                embedder,
             },
-            url,
-            initiator,
-            method,
-            body,
-            content_type,
-            headers: Vec::new(),
-            referrer,
-            cors: None,
-            csp: None,
-            ancestors: Vec::new(),
+            req,
+            ancestors,
             integrity: None,
         });
-    }
-
-    /// Attaches the embedder's `frame-src` gate to the navigation just queued,
-    /// plus the ancestor URLs the child's `frame-ancestors` policy is checked
-    /// against at commit.
-    pub(crate) fn set_pending_frame_policy(
-        &mut self,
-        embedder: FrameId,
-        gate: crate::RedirectGate,
-        ancestors: Vec<Url>,
-    ) {
-        let Some(dial) = self.queued_dials.last_mut() else {
-            return;
-        };
-        let DialContext::FrameLoad { embedder: slot, .. } = &mut dial.context else {
-            return;
-        };
-        *slot = Some(embedder);
-        dial.csp = Some(gate);
-        dial.ancestors = ancestors;
     }
 
     /// Loads the frame's initial `about:blank`, inheriting `inherited_url` as
@@ -2082,7 +2065,7 @@ impl Document {
             // (<https://w3c.github.io/webappsec-csp/#directive-report-to>).
             if let Some(url) = self.reporting_url(&violation.report_to) {
                 let body = Self::reporting_api_body(violation);
-                self.queue_report(url, body, "application/reports+json");
+                self.queue_report(&url, body, "application/reports+json");
                 continue;
             }
             if violation.report_uris.is_empty() {
@@ -2125,7 +2108,7 @@ impl Document {
                 if !matches!(url.scheme(), "http" | "https") {
                     continue;
                 }
-                self.queue_report(url, body.clone(), "application/csp-report");
+                self.queue_report(&url, body.clone(), "application/csp-report");
             }
         }
     }
@@ -2151,21 +2134,12 @@ impl Document {
 
     /// Queues one violation report POST. The response is dropped and the
     /// dial never gates load.
-    fn queue_report(&mut self, url: Url, body: Vec<u8>, content_type: &str) {
-        self.queued_dials.push(QueuedDial {
-            context: DialContext::CspReport,
-            url,
-            initiator: self.url.clone(),
-            method: "POST".to_owned(),
-            body,
-            content_type: Some(content_type.to_owned()),
-            headers: Vec::new(),
-            referrer: None,
-            cors: None,
-            csp: None,
-            ancestors: Vec::new(),
-            integrity: None,
-        });
+    fn queue_report(&mut self, url: &Url, body: Vec<u8>, content_type: &str) {
+        let mut dial = QueuedDial::new(DialContext::CspReport, url, &self.url);
+        "POST".clone_into(&mut dial.req.method);
+        dial.req.body = body;
+        dial.req.content_type = Some(content_type.to_owned());
+        self.queued_dials.push(dial);
     }
 
     /// The Reporting API envelope for a violation, with the
@@ -2354,16 +2328,17 @@ impl Document {
             return false;
         }
         self.parser_blocked_script = Some(id);
-        let initiator = self.url.clone();
-        let mut dial = QueuedDial::get(
+        let mut dial = QueuedDial::new(
             DialContext::ClassicScript {
                 element: id,
                 epoch: self.js_epoch,
             },
-            url,
-            initiator,
+            &url,
+            &self.url,
         );
-        dial.csp = Some(self.redirect_gate(crate::csp::Destination::Script));
+        dial.req.csp = Some(Box::new(
+            self.redirect_gate(crate::csp::Destination::Script),
+        ));
         dial.integrity = self.script_integrity(id);
         self.queued_dials.push(dial);
         true
@@ -2418,12 +2393,11 @@ impl Document {
         let CompletedDial {
             context,
             outcome,
-            request_url,
-            csp,
+            req,
             ancestors,
             integrity,
         } = done;
-        let redirected = outcome.final_url != request_url;
+        let redirected = outcome.final_url != req.url;
         match context {
             DialContext::JsFetch { id, epoch } => {
                 self.record_event(RendererEvent::Fetch {
@@ -2436,7 +2410,7 @@ impl Document {
                     let blocked = redirected
                         && self.response_url_blocked(
                             &outcome.final_url,
-                            &request_url,
+                            &req.url,
                             crate::csp::Destination::Connect,
                             None,
                         );
@@ -2468,7 +2442,7 @@ impl Document {
                     let blocked = redirected
                         && self.response_url_blocked(
                             &outcome.final_url,
-                            &request_url,
+                            &req.url,
                             crate::csp::Destination::Script,
                             Some(element),
                         );
@@ -2503,8 +2477,8 @@ impl Document {
                 // <https://w3c.github.io/webappsec-csp/#should-block-response>
                 if redirected
                     && let Some(embedder) = embedder
-                    && let Some(gate) = csp.as_ref()
-                    && self.note_frame_redirect(embedder, gate, &outcome.final_url, &request_url)
+                    && let Some(gate) = req.csp.as_deref()
+                    && self.note_frame_redirect(embedder, gate, &outcome.final_url, &req.url)
                 {
                     // Leave the current document in place.
                 } else if let Ok(url) = Url::parse(&outcome.final_url) {
@@ -2512,7 +2486,7 @@ impl Document {
                 }
             }
             DialContext::BlitzResource { id, destination } => {
-                self.deliver_blitz_resource(id, destination, &outcome, &request_url, redirected);
+                self.deliver_blitz_resource(id, destination, &outcome, &req.url, redirected);
             }
             // Fire-and-forget: the endpoint already stored the report, if it
             // cares. A failure is invisible by design.
@@ -2938,16 +2912,15 @@ impl Document {
             // provider never sees the document URL, so it stamps the target
             // as initiator and the document corrects it here
             // (<https://fetch.spec.whatwg.org/#concept-request-initiator>).
-            let initiator = self.url.clone();
-            let mut dial = QueuedDial::get(
+            let mut dial = QueuedDial::new(
                 DialContext::BlitzResource {
                     id: fetch.id,
                     destination,
                 },
-                fetch.url,
-                initiator,
+                &fetch.url,
+                &self.url,
             );
-            dial.csp = destination.map(|destination| self.redirect_gate(destination));
+            dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
             self.queued_dials.push(dial);
         }
     }

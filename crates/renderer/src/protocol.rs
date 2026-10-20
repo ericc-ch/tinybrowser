@@ -440,7 +440,9 @@ pub struct ScreenshotClip {
 pub struct DialRequest {
     /// Why the dial happens.
     pub kind: DialKind,
-    /// Absolute request URL.
+    /// Absolute request URL, canonically serialized: every queue site
+    /// stringifies a parsed [`url::Url`], so the scheme is lowercase and a
+    /// `scheme:` prefix test is exact.
     pub url: String,
     /// Document URL used as the `SameSite`/`Sec-Fetch-*` initiator.
     pub initiator: String,
