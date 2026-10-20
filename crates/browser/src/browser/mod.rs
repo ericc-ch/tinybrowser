@@ -139,7 +139,7 @@ pub(super) trait BrowserOperation {
     /// Reply extraction; `None` means the owner answered for another operation.
     fn unwrap(reply: Reply) -> Option<Self::Output>;
     /// Owner-side execution.
-    async fn serve(self, task: &mut BrowserTask) -> Reply;
+    fn serve(self, task: &mut BrowserTask) -> Reply;
 }
 
 /// Starts a tab coordinator and returns its handle.

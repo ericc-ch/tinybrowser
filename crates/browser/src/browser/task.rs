@@ -196,14 +196,14 @@ impl BrowserTask {
 
     async fn dispatch(&mut self, command: Command) -> DispatchOutcome {
         let reply = match command {
-            Command::CreateTab => CreateTab.serve(self).await,
-            Command::Tabs => ListTabs.serve(self).await,
-            Command::Tab { id } => GetTab { id }.serve(self).await,
-            Command::CloseTab { id } => CloseTab { id }.serve(self).await,
-            Command::CookieRecords { url } => CookieRecords { url }.serve(self).await,
-            Command::ClearCookies => ClearCookies.serve(self).await,
-            Command::AddCookie { cookie, url } => AddCookie { cookie, url }.serve(self).await,
-            Command::OpenWindow(request) => request.serve(self).await,
+            Command::CreateTab => CreateTab.serve(self),
+            Command::Tabs => ListTabs.serve(self),
+            Command::Tab { id } => GetTab { id }.serve(self),
+            Command::CloseTab { id } => CloseTab { id }.serve(self),
+            Command::CookieRecords { url } => CookieRecords { url }.serve(self),
+            Command::ClearCookies => ClearCookies.serve(self),
+            Command::AddCookie { cookie, url } => AddCookie { cookie, url }.serve(self),
+            Command::OpenWindow(request) => request.serve(self),
             Command::Close => {
                 let result = self.shutdown().await;
                 return DispatchOutcome::Stop(Reply::Close(result));
@@ -278,11 +278,7 @@ impl BrowserOperation for CreateTab {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::CreateTab(task.create_tab())
     }
 }
@@ -301,11 +297,7 @@ impl BrowserOperation for ListTabs {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::Tabs(task.tabs.ids())
     }
 }
@@ -324,11 +316,7 @@ impl BrowserOperation for GetTab {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::Tab(task.tabs.tab(self.id).ok_or(BrowserError::UnknownTab))
     }
 }
@@ -347,11 +335,7 @@ impl BrowserOperation for CloseTab {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::CloseTab(task.close_tab(self.id))
     }
 }
@@ -370,11 +354,7 @@ impl BrowserOperation for CookieRecords {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::CookieRecords(task.context.cookie_records(&self.url))
     }
 }
@@ -393,11 +373,7 @@ impl BrowserOperation for ClearCookies {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         task.context.clear_cookies();
         Reply::ClearCookies
     }
@@ -420,11 +396,7 @@ impl BrowserOperation for AddCookie {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::AddCookie(task.context.add_cookie(&self.cookie, &self.url))
     }
 }
@@ -443,11 +415,7 @@ impl BrowserOperation for OpenWindowOptions {
         }
     }
 
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
+    fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::OpenWindow(task.open_window(self))
     }
 }
