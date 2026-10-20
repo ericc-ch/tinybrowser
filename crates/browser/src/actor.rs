@@ -176,6 +176,9 @@ struct ServeContext<'a> {
 enum TabOutcome {
     /// The coordinator keeps serving.
     Continue,
+    /// A waiter owns the exchange acknowledgement and sends it when it
+    /// resolves, so dropping the caller keeps its cancellation armed.
+    Retained,
     /// The operation stopped the renderer; the loop returns.
     Shutdown,
 }
@@ -1222,12 +1225,12 @@ async fn coordinator_loop(
                     // The frame's realm is gone, so its `run_until_js_true`
                     // waiters cannot settle; resolve them instead of polling to
                     // the deadline.
-                    resolve_frame_waiters(&mut waiters, frame);
+                    resolve_frame_waiters(&server, &mut waiters, frame).await;
                 }
             }
             Wake::Renderer(None) => {
                 tab.drop_renderer();
-                fail_waiters(&mut waiters, &TabError::ActorStopped);
+                fail_waiters(&server, &mut waiters, &TabError::ActorStopped).await;
             }
             Wake::Delivery(Some(payload)) => {
                 let _result = tab.deliver_window_message(payload).await;
@@ -1237,7 +1240,7 @@ async fn coordinator_loop(
                 delivery_rx = None;
             }
         }
-        resolve_waiters(&mut tab, &mut waiters).await;
+        resolve_waiters(&mut tab, &server, &mut waiters).await;
     }
     tab.stop_renderer();
 }
@@ -1277,14 +1280,49 @@ async fn handle_command(
     command: Command,
     waiters: &mut Vec<Waiter>,
 ) -> bool {
-    let outcome = command.serve(ServeContext { tab, waiters, id }).await;
-    // Acknowledge the exchange call so its request id is released. The
-    // operation's result travels on the channel built into the variant.
-    let _ack = server.reply(id, ()).await;
+    // A cancellation on the control lane can overtake its call on the data
+    // lane. The caller's receiver is already dropped then, so skip a side
+    // effect nobody observes. `Shutdown` always runs.
+    let outcome = if command.abandoned() {
+        TabOutcome::Continue
+    } else {
+        command.serve(ServeContext { tab, waiters, id }).await
+    };
+    // A retained waiter acknowledges when it resolves; an immediate ack would
+    // disarm the caller's `CancelOnDrop` and leave a dropped waiter to poll
+    // until its deadline. Everything else acknowledges here.
+    if !matches!(outcome, TabOutcome::Retained) {
+        let _ack = server.reply(id, ()).await;
+    }
     matches!(outcome, TabOutcome::Shutdown)
 }
 
 impl Command {
+    /// True when the caller dropped its receiver before dispatch.
+    ///
+    /// `Shutdown` is exempt: the renderer must stop even when the caller
+    /// stopped waiting. Every other variant must be listed here, so a new
+    /// command cannot silently run after its caller cancelled.
+    fn abandoned(&self) -> bool {
+        match self {
+            Command::Shutdown { .. } => false,
+            Command::LoadHtml { reply, .. } | Command::Goto { reply, .. } => reply.is_closed(),
+            Command::Execute { reply, .. } => reply.is_closed(),
+            Command::AddInitScript { reply, .. } => reply.is_closed(),
+            Command::RemoveInitScript { reply, .. } | Command::SetViewport { reply, .. } => {
+                reply.is_closed()
+            }
+            Command::ViewportSize { reply } => reply.is_closed(),
+            Command::ContentSize { reply, .. } => reply.is_closed(),
+            Command::Screenshot { reply, .. } => reply.is_closed(),
+            Command::RunUntilLoadTimeout { reply, .. } | Command::RunUntilJsTrue { reply, .. } => {
+                reply.is_closed()
+            }
+            Command::DocumentUrl { reply } => reply.is_closed(),
+            Command::LastNavigationFailed { reply } => reply.is_closed(),
+        }
+    }
+
     /// Runs one operation and sends its typed result. The sender in the
     /// variant is the only way out, so a command cannot answer with another
     /// command's type.
@@ -1346,15 +1384,9 @@ impl Command {
                 let _result = reply.send(result);
             }
             Command::RunUntilLoadTimeout { timeout, reply } => {
-                retain_waiter(
-                    waiters,
-                    Waiter {
-                        id,
-                        deadline: Instant::now() + timeout,
-                        source: None,
-                        reply,
-                    },
-                );
+                if retain_load_waiter(waiters, id, timeout, reply) {
+                    return TabOutcome::Retained;
+                }
             }
             Command::RunUntilJsTrue {
                 frame,
@@ -1362,15 +1394,9 @@ impl Command {
                 timeout,
                 reply,
             } => {
-                retain_waiter(
-                    waiters,
-                    Waiter {
-                        id,
-                        deadline: Instant::now() + timeout,
-                        source: Some((frame, source)),
-                        reply,
-                    },
-                );
+                if retain_js_waiter(waiters, id, frame, source, timeout, reply) {
+                    return TabOutcome::Retained;
+                }
             }
             Command::DocumentUrl { reply } => {
                 let _result = reply.send(Ok(tab.document_url.to_string()));
@@ -1466,32 +1492,70 @@ async fn screenshot_frame(
         .await
 }
 
-fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter) {
+fn retain_load_waiter(
+    waiters: &mut Vec<Waiter>,
+    id: RequestId,
+    timeout: Duration,
+    reply: ReplySender<bool>,
+) -> bool {
+    retain_waiter(
+        waiters,
+        Waiter {
+            id,
+            deadline: Instant::now() + timeout,
+            source: None,
+            reply,
+        },
+    )
+}
+
+fn retain_js_waiter(
+    waiters: &mut Vec<Waiter>,
+    id: RequestId,
+    frame: FrameId,
+    source: renderer::ScriptSource,
+    timeout: Duration,
+    reply: ReplySender<bool>,
+) -> bool {
+    retain_waiter(
+        waiters,
+        Waiter {
+            id,
+            deadline: Instant::now() + timeout,
+            source: Some((frame, source)),
+            reply,
+        },
+    )
+}
+
+fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter) -> bool {
     // The caller may already have dropped its future while the command was in
     // the queue; a receiver-less waiter would sit until its deadline.
     if waiter.reply.is_closed() {
-        return;
+        return false;
     }
     if waiters.len() < MAX_WAITERS {
         waiters.push(waiter);
-        return;
+        return true;
     }
     let error = TabError::ResourceLimit {
         resource: ResourceLimit::TabWaiters,
     };
     let _result = waiter.reply.send(Err(error));
+    false
 }
 
-fn fail_waiters(waiters: &mut Vec<Waiter>, error: &TabError) {
+async fn fail_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, error: &TabError) {
     for waiter in waiters.drain(..) {
         let _result = waiter.reply.send(Err(error.clone()));
+        let _ack = server.reply(waiter.id, ()).await;
     }
 }
 
 /// Resolves the `RunUntilJs` waiters for a frame that just navigated: the
 /// predicate ran against the old realm and cannot settle, so reply `false`
 /// instead of polling to the deadline.
-fn resolve_frame_waiters(waiters: &mut Vec<Waiter>, frame: FrameId) {
+async fn resolve_frame_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, frame: FrameId) {
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
         if waiter
@@ -1500,6 +1564,7 @@ fn resolve_frame_waiters(waiters: &mut Vec<Waiter>, frame: FrameId) {
             .is_some_and(|(wait_frame, _)| *wait_frame == frame)
         {
             let _result = waiter.reply.send(Ok(false));
+            let _ack = server.reply(waiter.id, ()).await;
         } else {
             pending.push(waiter);
         }
@@ -1507,27 +1572,24 @@ fn resolve_frame_waiters(waiters: &mut Vec<Waiter>, frame: FrameId) {
     *waiters = pending;
 }
 
-async fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
+async fn resolve_waiters(tab: &mut Tab, server: &TabServer, waiters: &mut Vec<Waiter>) {
     let now = Instant::now();
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
-        // The caller dropped its future; nothing can receive this answer.
+        // The caller dropped its future; its `Cancel` (or the exchange closing)
+        // already released the request, so there is nothing left to answer.
         if waiter.reply.is_closed() {
             continue;
         }
-        match waiter.source.clone() {
+        let result = match waiter.source.clone() {
             // A load wait finishes as soon as the tab stops waiting, before
             // its deadline is considered.
-            None if !tab.waiting_for_load() => {
-                let _result = waiter.reply.send(Ok(true));
-            }
-            None if now >= waiter.deadline => {
-                let _result = waiter.reply.send(Ok(false));
-            }
-            None => pending.push(waiter),
+            None if !tab.waiting_for_load() => Some(Ok(true)),
+            None if now >= waiter.deadline => Some(Ok(false)),
+            None => None,
             Some((frame, source)) => {
                 if now >= waiter.deadline {
-                    let _result = waiter.reply.send(Ok(false));
+                    Some(Ok(false))
                 } else if matches!(
                     tab.renderer_request(RendererCommand::ExecuteScript {
                         frame,
@@ -1537,11 +1599,17 @@ async fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
                     .await,
                     Ok(Reply::Value(Ok(RemoteValue::Bool(true))))
                 ) {
-                    let _result = waiter.reply.send(Ok(true));
+                    Some(Ok(true))
                 } else {
-                    pending.push(waiter);
+                    None
                 }
             }
+        };
+        if let Some(result) = result {
+            let _result = waiter.reply.send(result);
+            let _ack = server.reply(waiter.id, ()).await;
+        } else {
+            pending.push(waiter);
         }
     }
     *waiters = pending;

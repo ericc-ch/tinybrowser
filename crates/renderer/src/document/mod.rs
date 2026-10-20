@@ -1268,15 +1268,22 @@ impl Document {
         if let Some((width, height)) = head.viewport {
             self.viewport_size = (width, height);
         }
-        // The parsed URL decides; an unparseable response URL leaves the
-        // previous URL in place.
-        let url = Url::parse(&head.url).unwrap_or_else(|_| self.url.clone());
+        // The parsed URL decides. An unparseable response URL leaves the
+        // previous URL in place, and with it the captured origin: `about:blank`,
+        // `data:`, and `blob:` URLs cannot re-derive one.
         self.initial_blank = false;
         // A `blob:` response carries its store entry's creator, which is not
         // what `Url::origin()` returns for the blob URL
         // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
         // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
-        self.set_document_url(url, origin);
+        match Url::parse(&head.url) {
+            Ok(url) => self.set_document_url(url, origin),
+            Err(_) => {
+                if let Some(origin) = origin {
+                    self.set_document_url(self.url.clone(), Some(origin));
+                }
+            }
+        }
         let mut world = self.world.borrow_mut();
         // A response document resolves against its own URL; any inherited
         // `about:srcdoc` base stops applying.
@@ -1517,8 +1524,8 @@ impl Document {
 
     fn reset_js_realm(&mut self) {
         // Every queued dial belongs to the old realm; the ledger drops them
-        // and runs their cancellation handles. Dials already in flight keep
-        // their slot until their completions arrive.
+        // and cancels the old realm's page fetches. Other dials already in
+        // flight keep running and their completions are still adopted.
         self.dials.discard_queued();
         // The old realm's ports are gone with it; the peers fire `close`
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).

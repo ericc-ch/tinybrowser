@@ -271,10 +271,13 @@ impl RealmRegistry {
         height: u32,
         rect: CanvasRect,
     ) -> Option<Vec<u8>> {
-        let bitmap = self.canvas_bitmap(id, width, height)?;
         let sw = canvas_u32(rect.width.max(0.0).ceil());
         let sh = canvas_u32(rect.height.max(0.0).ceil());
-        let mut out = vec![0; canvas_bytes(sw, sh)?];
+        // Check the output budget before `canvas_bitmap` allocates a backing
+        // store the request cannot use.
+        let bytes = canvas_bytes(sw, sh)?;
+        let bitmap = self.canvas_bitmap(id, width, height)?;
+        let mut out = vec![0; bytes];
         let x0 = canvas_i32(rect.x.floor());
         let y0 = canvas_i32(rect.y.floor());
         for row in 0..sh {
