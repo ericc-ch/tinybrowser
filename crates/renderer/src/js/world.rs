@@ -1306,6 +1306,11 @@ impl World {
         let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
+        // `reset` drops the old document's queued stream commands. Drain them
+        // first so the bytes they reserved leave the shared budget; the
+        // stream methods own that accounting.
+        let pending_stream = self.take_document_stream();
+        drop(pending_stream);
         self.state.reset();
         // Navigation keeps the realm's window object, so window-scoped
         // handlers survive; the old document's listeners and element handlers
