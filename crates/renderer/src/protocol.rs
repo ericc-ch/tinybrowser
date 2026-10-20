@@ -236,13 +236,15 @@ impl StorageKind {
 
 /// One top-level response: a complete [`ResponseHead`] plus its body. The
 /// head travels in the embedded/wasm carrier path; the browser streams the
-/// same head separately ([`renderer::ResponseStart`] in its wire) and the
-/// body arrives in raw bounded IPC frames.
+/// same head separately in its wire protocol and the body arrives in raw
+/// bounded IPC frames.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mount {
     /// Response metadata installed before the body parses.
     pub head: ResponseHead,
-    /// Raw document bytes; the renderer decodes them.
+    /// Raw document bytes; the renderer decodes them. It never travels in a
+    /// control message, so it stays out of any serialized `Mount`.
+    #[serde(skip, default)]
     pub body: Vec<u8>,
 }
 
@@ -253,7 +255,7 @@ pub struct Mount {
 /// top-level response, and carriers, `data:`/`blob:` frames, and child-frame
 /// commits construct it locally — so the renderer derives policy, MIME
 /// guard, reporting endpoints, and status from one head, in one order, in
-/// one place ([`crate::document::Document::install_head`]).
+/// one place (`Document::install_head`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ResponseHead {
     /// Absolute document URL.

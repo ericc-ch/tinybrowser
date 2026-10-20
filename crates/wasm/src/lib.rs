@@ -115,12 +115,7 @@ impl GuestTab for Tab {
         let owner = services.owner;
         let mut renderer = EmbeddedRenderer::new(services);
         let mount = Mount {
-            head: renderer::ResponseHead {
-                url,
-                status: 0,
-                content_type: Some("text/html; charset=utf-8".into()),
-                ..renderer::ResponseHead::default()
-            },
+            head: renderer::ResponseHead::non_http(url, Some("text/html; charset=utf-8".into())),
             body: html.into_bytes(),
         };
         renderer.mount(&mount).map_err(|error| error.to_string())?;

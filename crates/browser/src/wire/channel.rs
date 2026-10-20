@@ -30,7 +30,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Version 8 added `BroadcastChannel`. Version 9 replaced operation-specific
 /// body messages with directional exchange stream chunks. Version 10 dropped
 /// `content_language` from mount, response-start, and dial outcomes. Version 11
-/// replaced JSON control payloads with postcard.
+/// replaced JSON control payloads with postcard. Version 12 replaced
+/// response-start's flat metadata fields with one shared response head.
 pub const PROTOCOL_VERSION: u8 = 12;
 
 /// Fixed frame header size in bytes.

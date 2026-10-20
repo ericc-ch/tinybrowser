@@ -722,13 +722,13 @@ impl Tab {
             .unwrap_or_else(|| Site::opaque(self.id));
         let mount = Mount {
             head: ResponseHead {
-                url: self.document_url.to_string(),
-                status: 200,
-                content_type: Some("text/html; charset=utf-8".to_owned()),
                 history: self.history.snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
-                ..ResponseHead::default()
+                ..ResponseHead::non_http(
+                    self.document_url.to_string(),
+                    Some("text/html; charset=utf-8".to_owned()),
+                )
             },
             body: html.as_bytes().to_vec(),
         };
@@ -973,13 +973,10 @@ impl Tab {
         }
         let mount = Mount {
             head: ResponseHead {
-                url: url.to_string(),
-                status: 200,
-                content_type: Some(content_type),
                 history: history.snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
-                ..ResponseHead::default()
+                ..ResponseHead::non_http(url.to_string(), Some(content_type))
             },
             body,
         };
@@ -1210,15 +1207,7 @@ impl Tab {
 
 fn blank_mount() -> Mount {
     Mount {
-        head: ResponseHead {
-            url: "about:blank".into(),
-            // The wire carries the browser-chosen mount status, and the
-            // document installs it: violation `status-code` reads it
-            // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-            status: 200,
-            content_type: Some("text/html; charset=utf-8".into()),
-            ..ResponseHead::default()
-        },
+        head: ResponseHead::non_http("about:blank", Some("text/html; charset=utf-8".to_owned())),
         body: b"<!doctype html><title></title>".to_vec(),
     }
 }
