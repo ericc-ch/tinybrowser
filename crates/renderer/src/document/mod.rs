@@ -525,7 +525,7 @@ impl Document {
     /// The serialized origin of the frame's document.
     #[must_use]
     pub(crate) fn origin_string(&self) -> String {
-        self.url.origin().ascii_serialization()
+        self.world.borrow().origin.ascii_serialization()
     }
 
     /// The root node of the frame's active document.
@@ -846,9 +846,9 @@ impl Document {
     ) {
         let url = Url::parse("about:srcdoc").expect("about:srcdoc parses");
         self.http_status = 0;
+        self.set_document_url(url, Some(origin));
         {
             let mut world = self.world.borrow_mut();
-            world.set_url_with_origin(url, origin);
             world.base_url = Some(base.clone());
             world.csp = policy.clone();
             referrer_policy.clone_into(&mut world.state.referrer_policy);
@@ -933,21 +933,32 @@ impl Document {
         }
     }
 
+    /// Writes the document URL and its captured origin together.
+    ///
+    /// [`Self::url`] and [`World::document_url`] are mirrors, and origin
+    /// checks read the captured origin rather than the URL's serialization.
+    /// A navigation that writes one and not the other leaves the document
+    /// reporting a stale URL or origin to the next frame.
+    fn set_document_url(&mut self, url: Url, origin: Option<url::Origin>) {
+        let mut world = self.world.borrow_mut();
+        match origin {
+            Some(origin) => world.set_url_with_origin(url.clone(), origin),
+            None => world.set_url(url.clone()),
+        }
+        drop(world);
+        self.url = url;
+    }
+
     fn apply_document_url(&mut self, url: &str, origin: Option<url::Origin>) {
         if let Ok(url) = Url::parse(url) {
-            self.url = url.clone();
-            let mut world = self.world.borrow_mut();
-            match origin {
-                Some(origin) => world.set_url_with_origin(url, origin),
-                None => world.set_url(url),
-            }
+            self.set_document_url(url, origin);
         }
     }
 
     fn apply_document_url_same_origin(&mut self, url: &str) {
         if let Ok(url) = Url::parse(url) {
-            self.url = url.clone();
-            self.world.borrow_mut().document_url = url;
+            let origin = self.world.borrow().origin.clone();
+            self.set_document_url(url, Some(origin));
         }
     }
 
@@ -1259,23 +1270,17 @@ impl Document {
         }
         // The parsed URL decides; an unparseable response URL leaves the
         // previous URL in place.
-        let url = Url::parse(&head.url).ok();
-        if let Some(url) = &url {
-            self.url = url.clone();
-        }
+        let url = Url::parse(&head.url).unwrap_or_else(|_| self.url.clone());
         self.initial_blank = false;
+        // A `blob:` response carries its store entry's creator, which is not
+        // what `Url::origin()` returns for the blob URL
+        // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
+        // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+        self.set_document_url(url, origin);
         let mut world = self.world.borrow_mut();
         // A response document resolves against its own URL; any inherited
         // `about:srcdoc` base stops applying.
         world.base_url = None;
-        match origin {
-            // A `blob:` response carries its store entry's creator, which is
-            // not what `Url::origin()` returns for the blob URL
-            // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
-            // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
-            Some(origin) => world.set_url_with_origin(self.url.clone(), origin),
-            None => world.set_url(self.url.clone()),
-        }
         drop(world);
         // The realm is already new when this runs; this opens the parser and
         // the decoder for the response that will feed it.
