@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -44,15 +43,7 @@ impl Document {
     }
 
     fn adopt_dial_completions(&mut self) {
-        while let Ok(completed) = self.dial_rx.try_recv() {
-            self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
-            let context = match &completed {
-                Ok(done) => done.context,
-                Err(context) => *context,
-            };
-            if let DialContext::JsFetch { epoch, id } = context {
-                self.fetch_cancellations.remove(&(epoch, id));
-            }
+        for completed in self.dials.adopt() {
             match completed {
                 Ok(done) => self.tasks.push_back(Task::DialFinished(Box::new(done))),
                 Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
@@ -89,11 +80,7 @@ impl Document {
     }
 
     pub(crate) fn release(&mut self) {
-        for (_, cancel) in self.fetch_cancellations.drain() {
-            cancel();
-        }
-        self.queued_dials.clear();
-        self.in_flight_dials = 0;
+        self.dials.discard_queued();
         self.decoder = None;
         self.frame_load_in_flight = false;
         self.shared.borrow_mut().close_frame_ports(self.frame);
@@ -101,16 +88,8 @@ impl Document {
     }
 
     pub(crate) fn waiting_for_load(&self) -> bool {
-        let dial_waiting = self.queued_dials.iter().any(|dial| match &dial.context {
-            DialContext::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
-            DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
-            // Blitz tracks its own critical resources; ours never gate load.
-            // Reports are fire-and-forget and never gate load either.
-            DialContext::BlitzResource { .. }
-            | DialContext::JsFetch { .. }
-            | DialContext::CspReport => false,
-        });
-        dial_waiting
+        self.dials
+            .waiting_for_load(self.js_epoch, self.frame_load_sequence)
             || self.parser_blocked_script.is_some()
             || self.frame_load_in_flight
             || self.active_buffer.is_some()
@@ -126,7 +105,7 @@ impl Document {
         // queued; the wake below asks the session for another step instead
         // of waiting for unrelated work.
         for _ in 0..8 {
-            let queued = std::mem::take(&mut self.queued_dials);
+            let queued = self.dials.take_queued();
             if queued.is_empty() {
                 break;
             }
@@ -169,33 +148,17 @@ impl Document {
                     }
                     continue;
                 }
-                let completed = self.dial_tx.clone();
-                let wake = Arc::clone(&self.wake);
-                let stop = Arc::clone(&self.stop);
-                let context = dial.context;
-                let request = dial.req.clone();
-                self.in_flight_dials = self.in_flight_dials.saturating_add(1);
-                let cancel = self.services.start_dial(
-                    request,
-                    Box::new(move |outcome| {
-                        if stop.is_set() {
-                            return;
-                        }
-                        let result = super::dial::complete(dial, outcome);
-                        let _send_result = completed.send(result);
-                        wake.notify_one();
-                    }),
-                );
-                if let DialContext::JsFetch { epoch, id } = context {
-                    self.fetch_cancellations.insert((epoch, id), cancel);
-                }
+                let services = &*self.services;
+                self.dials.start(dial, &|request, completion| {
+                    services.start_dial(request, completion)
+                });
             }
             if !completed_data {
                 break;
             }
             self.drain_blitz_fetches();
         }
-        if !self.queued_dials.is_empty() {
+        if self.dials.has_queued() {
             self.wake.notify_one();
         }
     }
@@ -307,12 +270,7 @@ impl Document {
             std::mem::take(&mut self.world.borrow_mut().pending_fetch_cancels)
                 .into_iter()
                 .collect();
-        self.queued_dials.retain(|dial| !matches!(dial.context, DialContext::JsFetch { id, epoch } if epoch == self.js_epoch && fetch_cancels.contains(&id)));
-        for id in &fetch_cancels {
-            if let Some(cancel) = self.fetch_cancellations.remove(&(self.js_epoch, *id)) {
-                cancel();
-            }
-        }
+        self.dials.cancel_fetches(self.js_epoch, &fetch_cancels);
         self.queue_js_fetches(fetches, &fetch_cancels);
         let images = self.world.borrow_mut().take_image_updates();
         for element in images {
@@ -381,7 +339,7 @@ impl Document {
                 self.redirect_gate(crate::csp::Destination::Script),
             ));
             dial.integrity = self.script_integrity(element);
-            self.queued_dials.push(dial);
+            self.dials.queue(dial);
         }
     }
 
@@ -397,12 +355,7 @@ impl Document {
             if fetch_cancels.contains(&fetch.js_id) {
                 continue;
             }
-            let pending_js_fetches = self.in_flight_dials.saturating_add(
-                self.queued_dials
-                    .iter()
-                    .filter(|dial| matches!(&dial.context, DialContext::JsFetch { .. }))
-                    .count(),
-            );
+            let pending_js_fetches = self.dials.pending_js_fetches();
             if pending_js_fetches >= MAX_PENDING_JS_FETCHES {
                 self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, None);
@@ -438,7 +391,7 @@ impl Document {
                 dial.req.csp = Some(Box::new(
                     self.redirect_gate(crate::csp::Destination::Connect),
                 ));
-                self.queued_dials.push(dial);
+                self.dials.queue(dial);
             } else {
                 self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, None);

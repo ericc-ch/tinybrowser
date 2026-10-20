@@ -1,7 +1,7 @@
 //! Media interfaces: images, canvas, audio/video, meters, progress,
 //! and marquee.
 
-use super::super::{attribute_value, host, set_attribute_sync, world, world_for_node};
+use super::super::{attribute_value, host, set_attribute_sync, throw_dom, world, world_for_node};
 
 use rquickjs::{Ctx, Result, Value};
 
@@ -775,7 +775,18 @@ fn get_image_data<'js>(
     let world = world(&ctx)?;
     let width = canvas_dimension(&ctx, id, "width", 300);
     let height = canvas_dimension(&ctx, id, "height", 150);
-    let bytes = world.borrow().registry().borrow_mut().canvas_pixels(
+    let sw = crate::js::world::canvas_u32(w);
+    let sh = crate::js::world::canvas_u32(h);
+    // A zero-sized request is an `IndexSizeError`
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
+    if sw == 0 || sh == 0 {
+        return Err(throw_dom(
+            &ctx,
+            "IndexSizeError",
+            "getImageData width and height must be non-zero",
+        ));
+    }
+    let Some(bytes) = world.borrow().registry().borrow_mut().canvas_pixels(
         id,
         width,
         height,
@@ -785,9 +796,13 @@ fn get_image_data<'js>(
             width: w,
             height: h,
         },
-    );
-    let sw = crate::js::world::canvas_u32(w);
-    let sh = crate::js::world::canvas_u32(h);
+    ) else {
+        return Err(throw_dom(
+            &ctx,
+            "IndexSizeError",
+            "getImageData area is too large",
+        ));
+    };
     let source = rquickjs::TypedArray::<u8>::new(ctx.clone(), bytes)?;
     ctx.globals().set("__tbCanvasBytes", source)?;
     let data: Value = ctx.eval("new Uint8ClampedArray(__tbCanvasBytes)")?;

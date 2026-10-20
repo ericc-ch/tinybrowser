@@ -8,8 +8,8 @@
 //! disconnects.
 //!
 //! `recv` prefers the control lane, so a `Cancel` can overtake its own `Call`.
-//! Receivers treat a Cancel for an unknown id as a negative cache: drop the
-//! later Call and ignore leftover chunks instead of failing the conversation.
+//! A handler whose call carries its result must therefore skip work whose
+//! caller has gone; the tab coordinator checks the reply receiver at dispatch.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -648,8 +648,8 @@ impl<C, R, N, IR> Drop for Upload<C, R, N, IR> {
 pub(crate) enum ServerInput<C, N> {
     Call { id: RequestId, body: C },
     Notify(N),
-    RequestChunk { id: RequestId },
-    RequestEnd { id: RequestId },
+    RequestChunk,
+    RequestEnd,
     Cancel { id: RequestId },
 }
 
@@ -657,10 +657,9 @@ impl<C, N> Lane for ServerInput<C, N> {
     fn queue(&self) -> Queue {
         match self {
             Self::Cancel { .. } => Queue::Control,
-            Self::Call { .. }
-            | Self::Notify(_)
-            | Self::RequestChunk { .. }
-            | Self::RequestEnd { .. } => Queue::Data,
+            Self::Call { .. } | Self::Notify(_) | Self::RequestChunk | Self::RequestEnd => {
+                Queue::Data
+            }
         }
     }
 }
@@ -768,8 +767,8 @@ where
                     Err(error) => Err(error),
                 }
             }
-            Frame::RequestChunk { id, .. } => self.send_server(ServerInput::RequestChunk { id }),
-            Frame::RequestEnd { id, .. } => self.send_server(ServerInput::RequestEnd { id }),
+            Frame::RequestChunk { .. } => self.send_server(ServerInput::RequestChunk),
+            Frame::RequestEnd { .. } => self.send_server(ServerInput::RequestEnd),
             Frame::ResponseChunk { id, bytes } => route_chunk(&self.pending, id, &bytes),
             Frame::Cancel { id } => self.send_server(ServerInput::Cancel { id }),
         }
