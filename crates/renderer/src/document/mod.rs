@@ -786,9 +786,9 @@ impl Document {
     /// Starts one frame-load dial. `req` is the wire request, with the method,
     /// body, `Content-Type`, referrer, and the embedder's `frame-src` redirect
     /// gate already on it; `ancestors` are the ancestor URLs the child
-    /// response's `frame-ancestors` is checked against at commit. The
-    /// frame-load sequence is stamped here: a load started later supersedes
-    /// this one.
+    /// response's `frame-ancestors` is checked against at commit. This stamps
+    /// the request kind and the frame-load sequence, and forces the response
+    /// body to be read: a load started later supersedes this one.
     pub(crate) fn navigate(
         &mut self,
         embedder: Option<FrameId>,
@@ -796,6 +796,7 @@ impl Document {
         ancestors: Vec<Url>,
     ) {
         req.kind = crate::protocol::DialKind::FrameLoad;
+        req.read_body = true;
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
         self.initial_blank = false;
