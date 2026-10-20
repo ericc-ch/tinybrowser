@@ -23,6 +23,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     element::install(ctx)?;
     forms::install(ctx)?;
     media::install(ctx)?;
+    super::geometry::install(ctx)?;
     html_elements::install(ctx)?;
     Ok(())
 }

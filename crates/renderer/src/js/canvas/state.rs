@@ -13,6 +13,9 @@ use std::sync::Arc;
 /// temporary bitmaps from hostile coordinates.
 const MAX_SHADOW_SIDE: u32 = 4096;
 
+/// The standard circular-arc-to-cubic-Bezier constant.
+const KAPPA: f32 = 0.552_284_8;
+
 use tiny_skia::{
     BlendMode, Color, ColorU8, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, Mask,
     Paint, Path, PathBuilder, Pixmap, Point, Shader, SpreadMode, Stroke, StrokeDash, Transform,
@@ -762,7 +765,8 @@ impl Canvas2D {
         if delta == 0.0 {
             return;
         }
-        let start_point = ellipse_point(cx, cy, rx, ry, rotation, start);
+        let mut start_point = ellipse_point(cx, cy, rx, ry, rotation, start);
+        self.state.transform.map_point(&mut start_point);
         match self.current {
             Some(current) if current.distance(start_point) > f32::EPSILON => {
                 self.path.push(Segment::LineTo(start_point));
@@ -793,13 +797,16 @@ impl Canvas2D {
             let index = index as f32;
             let from = start + step * index;
             let to = from + step;
-            let p0 = ellipse_point(cx, cy, rx, ry, rotation, from);
-            let p1 = ellipse_point(cx, cy, rx, ry, rotation, to);
+            let mut p0 = ellipse_point(cx, cy, rx, ry, rotation, from);
+            let mut p1 = ellipse_point(cx, cy, rx, ry, rotation, to);
             let alpha = (4.0 / 3.0) * (step / 4.0).tan();
             let d0 = ellipse_derivative(cx, cy, rx, ry, rotation, from);
             let d1 = ellipse_derivative(cx, cy, rx, ry, rotation, to);
-            let c1 = Point::from_xy(p0.x + alpha * d0.x, p0.y + alpha * d0.y);
-            let c2 = Point::from_xy(p1.x - alpha * d1.x, p1.y - alpha * d1.y);
+            let mut c1 = Point::from_xy(p0.x + alpha * d0.x, p0.y + alpha * d0.y);
+            let mut c2 = Point::from_xy(p1.x - alpha * d1.x, p1.y - alpha * d1.y);
+            for point in [&mut p0, &mut p1, &mut c1, &mut c2] {
+                self.state.transform.map_point(point);
+            }
             self.path.push(Segment::Cubic(c1, c2, p1));
         }
         if let Some(Segment::Cubic(_, _, end)) = self.path.last() {
@@ -814,10 +821,14 @@ impl Canvas2D {
         if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
             return;
         }
-        let Some(current) = self.current else {
+        let Some(mut current) = self.current else {
             self.move_to(x1, y1);
             return;
         };
+        let Some(inverse) = self.state.transform.invert() else {
+            return;
+        };
+        inverse.map_point(&mut current);
         if radius == 0.0 || (same_float(current.x, x1) && same_float(current.y, y1)) {
             self.line_to(x1, y1);
             return;
@@ -875,58 +886,145 @@ impl Canvas2D {
         );
     }
 
-    pub(crate) fn round_rect(&mut self, x: f32, y: f32, width: f32, height: f32, radii: &[f32]) {
+    #[expect(
+        clippy::similar_names,
+        clippy::too_many_lines,
+        reason = "one corner radius per corner and axis is the spec's own model"
+    )]
+    pub(crate) fn round_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radii: &[(f32, f32)],
+    ) {
         if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
             return;
         }
         if width == 0.0 || height == 0.0 {
-            // A flat rect has no corners; keep the subpath.
             self.rect(x, y, width, height);
             self.start_round_rect_tail(x, y);
             return;
         }
-        let (tl, tr, br, bl) = round_rect_radii(radii, width, height);
-        if [tl, tr, br, bl]
+        if radii
             .iter()
-            .any(|radius| !radius.is_finite() || *radius < 0.0)
+            .any(|(rx, ry)| !rx.is_finite() || !ry.is_finite())
         {
             return;
         }
-        let right = x + width;
-        let bottom = y + height;
-        let mut points: Vec<(Point, Point, Point)> = Vec::new();
-        // Each corner: start, control, end, in user space.
-        corner(&mut points, x + tl, y, x, y, x, y + tl);
-        corner(&mut points, right - tr, y, right, y, right, y + tr);
-        corner(
-            &mut points,
-            right,
-            bottom - br,
-            right,
-            bottom,
-            right - br,
-            bottom,
-        );
-        corner(&mut points, x + bl, bottom, x, bottom, x, bottom - bl);
-        let mut start = true;
-        for (a, control, b) in points {
-            let mut a = a;
-            let mut control = control;
-            let mut b = b;
-            self.state.transform.map_point(&mut a);
-            self.state.transform.map_point(&mut control);
-            self.state.transform.map_point(&mut b);
-            if start {
-                self.path.push(Segment::MoveTo(a));
-                self.subpath_start = a;
-                start = false;
-            } else {
-                self.path.push(Segment::LineTo(a));
-            }
-            self.path.push(Segment::Quad(control, b));
-            self.current = Some(b);
+        // A negative side mirrors the box; its winding still follows the
+        // direction the box was drawn in
+        // (Blink `CanvasPath::roundRect`).
+        let clockwise = (width < 0.0) == (height < 0.0);
+        let flip_x = width < 0.0;
+        let flip_y = height < 0.0;
+        let (mut left, mut top) = (x, y);
+        let mut width = width;
+        let mut height = height;
+        if width < 0.0 {
+            left += width;
+            width = -width;
         }
-        self.path.push(Segment::Close);
+        if height < 0.0 {
+            top += height;
+            height = -height;
+        }
+        let [
+            (mut tl_x, mut tl_y),
+            (mut tr_x, mut tr_y),
+            (mut br_x, mut br_y),
+            (mut bl_x, mut bl_y),
+        ] = round_rect_radii(radii, width, height);
+        if flip_x {
+            std::mem::swap(&mut tl_x, &mut tr_x);
+            std::mem::swap(&mut tl_y, &mut tr_y);
+            std::mem::swap(&mut bl_x, &mut br_x);
+            std::mem::swap(&mut bl_y, &mut br_y);
+        }
+        if flip_y {
+            std::mem::swap(&mut tl_x, &mut bl_x);
+            std::mem::swap(&mut tl_y, &mut bl_y);
+            std::mem::swap(&mut tr_x, &mut br_x);
+            std::mem::swap(&mut tr_y, &mut br_y);
+        }
+        let start = {
+            let mut point = Point::from_xy(left + tl_x, top);
+            self.state.transform.map_point(&mut point);
+            point
+        };
+        let right = left + width;
+        let bottom = top + height;
+        let transform = self.state.transform;
+        let map = |x: f32, y: f32| {
+            let mut point = Point::from_xy(x, y);
+            transform.map_point(&mut point);
+            point
+        };
+        // Clockwise from the top-left tangent: top edge, right edge, bottom
+        // edge, left edge, then the top-left arc back to the start
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-roundrect>).
+        let cw = [
+            Segment::MoveTo(start),
+            Segment::LineTo(map(right - tr_x, top)),
+            Segment::Cubic(
+                map(right - tr_x * (1.0 - KAPPA), top),
+                map(right, top + tr_y * (1.0 - KAPPA)),
+                map(right, top + tr_y),
+            ),
+            Segment::LineTo(map(right, bottom - br_y)),
+            Segment::Cubic(
+                map(right, bottom - br_y * (1.0 - KAPPA)),
+                map(right - br_x * (1.0 - KAPPA), bottom),
+                map(right - br_x, bottom),
+            ),
+            Segment::LineTo(map(left + bl_x, bottom)),
+            Segment::Cubic(
+                map(left + bl_x * (1.0 - KAPPA), bottom),
+                map(left, bottom - bl_y * (1.0 - KAPPA)),
+                map(left, bottom - bl_y),
+            ),
+            Segment::LineTo(map(left, top + tl_y)),
+            Segment::Cubic(
+                map(left, top + tl_y * (1.0 - KAPPA)),
+                map(left + tl_x * (1.0 - KAPPA), top),
+                map(left + tl_x, top),
+            ),
+            Segment::Close,
+        ];
+        if clockwise {
+            self.path.extend_from_slice(&cw);
+        } else {
+            let [
+                Segment::MoveTo(start),
+                Segment::LineTo(tr_start),
+                Segment::Cubic(tr_1, tr_2, tr_end),
+                Segment::LineTo(br_start),
+                Segment::Cubic(br_1, br_2, br_end),
+                Segment::LineTo(bl_start),
+                Segment::Cubic(bl_1, bl_2, bl_end),
+                Segment::LineTo(tl_start),
+                Segment::Cubic(tl_1, tl_2, _),
+                Segment::Close,
+            ] = cw
+            else {
+                return;
+            };
+            // Walking the same contour backwards: each cubic keeps its
+            // endpoints but swaps its control points.
+            self.path.extend_from_slice(&[
+                Segment::MoveTo(start),
+                Segment::Cubic(tl_2, tl_1, tl_start),
+                Segment::LineTo(bl_end),
+                Segment::Cubic(bl_2, bl_1, bl_start),
+                Segment::LineTo(br_end),
+                Segment::Cubic(br_2, br_1, br_start),
+                Segment::LineTo(tr_end),
+                Segment::Cubic(tr_2, tr_1, tr_start),
+                Segment::LineTo(start),
+                Segment::Close,
+            ]);
+        }
         self.start_round_rect_tail(x, y);
     }
 
@@ -964,7 +1062,7 @@ impl Canvas2D {
         // The query point is in the canvas coordinate space, unaffected by the
         // current transform; path points are already stored there
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ispointinpath>).
-        if !x.is_finite() || !y.is_finite() {
+        if !x.is_finite() || !y.is_finite() || !transform_is_invertible(self.state.transform) {
             return false;
         }
         let Some(path) = self.build_path() else {
@@ -975,21 +1073,38 @@ impl Canvas2D {
         } else {
             FillRule::Winding
         };
-        self.mask_contains(&path, rule, Point::from_xy(x, y))
+        // The point is in canvas space, unaffected by the CTM
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ispointinpath>).
+        path_contains(&path, rule, Point::from_xy(x, y))
     }
 
     pub(crate) fn is_point_in_stroke(&self, x: f32, y: f32) -> bool {
-        if !x.is_finite() || !y.is_finite() {
+        if !(x.is_finite() && y.is_finite()) {
             return false;
         }
         let Some(path) = self.build_path() else {
             return false;
         };
-        let stroke = self.stroke_options();
-        let Some(outline) = path.stroke(&stroke, 1.0) else {
+        if !transform_is_invertible(self.state.transform) {
+            return false;
+        }
+        let Some(inverse) = self.state.transform.invert() else {
             return false;
         };
-        self.mask_contains(&outline, FillRule::Winding, Point::from_xy(x, y))
+        let Some(user_path) = path.transform(inverse) else {
+            return false;
+        };
+        let stroke = self.stroke_options();
+        let Some(user_path) = prune_degenerate(&user_path) else {
+            return false;
+        };
+        let Some(outline) = dash_and_stroke(&user_path, &stroke, self.state.transform) else {
+            return false;
+        };
+        let Some(outline) = outline.transform(self.state.transform) else {
+            return false;
+        };
+        path_contains(&outline, FillRule::Winding, Point::from_xy(x, y))
     }
 
     /// A full-canvas coverage mask, or `None` when the canvas exceeds the
@@ -999,31 +1114,6 @@ impl Canvas2D {
         let height = self.height.max(1);
         crate::js::world::canvas_bytes(width, height)?;
         Mask::new(width, height)
-    }
-
-    fn mask_contains(&self, path: &Path, rule: FillRule, point: Point) -> bool {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "canvas coordinates are finite f32; the i64 floor then narrows to u32"
-        )]
-        let x = point.x.floor() as i64;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "canvas coordinates are finite f32; the i64 floor then narrows to u32"
-        )]
-        let y = point.y.floor() as i64;
-        let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
-            return false;
-        };
-        if x >= self.width || y >= self.height {
-            return false;
-        }
-        let Some(mut mask) = self.canvas_mask() else {
-            return false;
-        };
-        mask.fill_path(path, rule, false, Transform::identity());
-        let index = y as usize * self.width as usize + x as usize;
-        mask.data().get(index).is_some_and(|alpha| *alpha != 0)
     }
 
     // ---- painting --------------------------------------------------------
@@ -1210,7 +1300,7 @@ impl Canvas2D {
                 Shader::SolidColor(Color::from_rgba8(r, g, b, to_u8(alpha)))
             }
             Style::Gradient(id) => {
-                let Some(shader) = self.gradient_shader(id, alpha) else {
+                let Some(shader) = self.gradient_shader_at(id, alpha, Transform::identity()) else {
                     return;
                 };
                 shader
@@ -1227,7 +1317,7 @@ impl Canvas2D {
                     entry.spread,
                     entry.quality,
                     alpha,
-                    self.state.transform,
+                    Transform::identity(),
                 )
             }
         };
@@ -1237,14 +1327,27 @@ impl Canvas2D {
             anti_alias: true,
             ..Paint::default()
         };
+        // The stored path is in canvas space. Stroking happens in user space
+        // so the CTM scales the line width, the dash lengths, and the outline
+        // exactly once
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-stroke>).
+        let Some(inverse) = self.state.transform.invert() else {
+            return;
+        };
+        let Some(user_path) = path.clone().transform(inverse) else {
+            return;
+        };
+        let Some(user_path) = prune_degenerate(&user_path) else {
+            return;
+        };
         let Some(pixmap) = &mut self.pixmap else {
             return;
         };
         pixmap.stroke_path(
-            path,
+            &user_path,
             &paint,
             &stroke,
-            Transform::identity(),
+            self.state.transform,
             self.state.clip.as_deref(),
         );
     }
@@ -1675,8 +1778,14 @@ impl Canvas2D {
         let blur_padding = (sigma * 3.0).ceil() + 1.0;
         // Path bounds cover the centerline; a stroke extends past it by half
         // the line width scaled by the miter limit at joins.
+        let scale = self
+            .state
+            .transform
+            .sx
+            .abs()
+            .max(self.state.transform.sy.abs());
         let stroke_padding = stroke.map_or(0.0, |stroke| {
-            stroke.width * stroke.miter_limit.max(1.0) + 1.0
+            stroke.width * scale * stroke.miter_limit.max(1.0) + 1.0
         });
         let padding = blur_padding + stroke_padding;
         let left = bounds.left() - padding;
@@ -1701,15 +1810,27 @@ impl Canvas2D {
         };
         let shift = Transform::from_translate(-left, -top);
         let style = stroke.map_or(self.state.fill, |_| self.state.stroke);
-        let Some(paint) = self.shadow_mask_paint(style, shift) else {
+        let Some(paint) = self.shadow_mask_paint(style) else {
             return;
         };
+        // The mask path is in user space, like a stroke, so shaders built in
+        // user space follow the same transform.
+        let Some(inverse) = self.state.transform.invert() else {
+            return;
+        };
+        let Some(user_path) = path.clone().transform(inverse) else {
+            return;
+        };
+        let target = shift.pre_concat(self.state.transform);
         match stroke {
             Some(stroke) => {
-                mask.stroke_path(path, &paint, stroke, shift, None);
+                let Some(user_path) = prune_degenerate(&user_path) else {
+                    return;
+                };
+                mask.stroke_path(&user_path, &paint, stroke, target, None);
             }
             None => {
-                mask.fill_path(path, &paint, rule, shift, None);
+                mask.fill_path(&user_path, &paint, rule, target, None);
             }
         }
         self.finish_shadow(mask, sigma, left, top);
@@ -1757,7 +1878,7 @@ impl Canvas2D {
 
     /// The shape's own coverage, so a transparent fill casts no shadow. RGB
     /// is discarded after rasterizing; only alpha survives.
-    fn shadow_mask_paint(&self, style: Style, shift: Transform) -> Option<Paint<'_>> {
+    fn shadow_mask_paint(&self, style: Style) -> Option<Paint<'_>> {
         let mut paint = Paint {
             blend_mode: BlendMode::SourceOver,
             anti_alias: true,
@@ -1767,9 +1888,7 @@ impl Canvas2D {
             Style::Color([_, _, _, alpha]) => {
                 Shader::SolidColor(Color::from_rgba8(255, 255, 255, alpha))
             }
-            Style::Gradient(id) => {
-                self.gradient_shader_at(id, 1.0, self.state.transform.pre_concat(shift))?
-            }
+            Style::Gradient(id) => self.gradient_shader_at(id, 1.0, Transform::identity())?,
             Style::Pattern(id) => {
                 let entry = self.patterns.get(&id)?;
                 tiny_skia::Pattern::new(
@@ -1777,7 +1896,7 @@ impl Canvas2D {
                     entry.spread,
                     entry.quality,
                     1.0,
-                    self.state.transform.pre_concat(shift),
+                    Transform::identity(),
                 )
             }
         };
@@ -1915,54 +2034,266 @@ fn ellipse_derivative(cx: f32, cy: f32, rx: f32, ry: f32, rotation: f32, angle: 
     Point::from_xy(x * cos - y * sin, x * sin + y * cos)
 }
 
-fn corner(
-    points: &mut Vec<(Point, Point, Point)>,
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    x3: f32,
-    y3: f32,
-) {
-    points.push((
-        Point::from_xy(x1, y1),
-        Point::from_xy(x2, y2),
-        Point::from_xy(x3, y3),
-    ));
-}
-
 /// CSS border-radius expansion for `roundRect`: 1, 2, 3, or 4 values, each
 /// clamped to half the box side
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-roundrect>).
-fn round_rect_radii(radii: &[f32], width: f32, height: f32) -> (f32, f32, f32, f32) {
-    let values: Vec<f32> = match radii {
-        [] => vec![0.0; 4],
-        [one] => vec![*one; 4],
-        [first, second] => vec![*first, *second, *first, *second],
-        [first, second, third] => vec![*first, *second, *third, *second],
-        [first, second, third, fourth, ..] => vec![*first, *second, *third, *fourth],
+fn round_rect_radii(radii: &[(f32, f32)], width: f32, height: f32) -> [(f32, f32); 4] {
+    let values: [(f32, f32); 4] = match radii {
+        [] => [(0.0, 0.0); 4],
+        [one] => [*one; 4],
+        [first, second] => [*first, *second, *first, *second],
+        [first, second, third] => [*first, *second, *third, *second],
+        [first, second, third, fourth, ..] => [*first, *second, *third, *fourth],
     };
-    let scale = {
-        let mut scale = 1.0f32;
-        let sides = [
-            (values[0] + values[1], width),
-            (values[1] + values[2], height),
-            (values[2] + values[3], width),
-            (values[3] + values[0], height),
-        ];
-        for (sum, side) in sides {
-            if sum > 0.0 && sum > side {
-                scale = scale.min(side / sum);
+    let mut scale = 1.0f32;
+    let sides = [
+        (values[0].0 + values[1].0, width),
+        (values[1].1 + values[2].1, height),
+        (values[2].0 + values[3].0, width),
+        (values[3].1 + values[0].1, height),
+    ];
+    for (sum, side) in sides {
+        if sum > side && sum > 0.0 {
+            scale = scale.min(side / sum);
+        }
+    }
+    values.map(|(rx, ry)| (rx * scale, ry * scale))
+}
+
+/// Point-in-path in canvas space. `tiny-skia` has no analytic `contains`, so
+/// curves flatten to short polylines and the result comes from a crossing
+/// count plus an on-boundary check
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ispointinpath>).
+fn path_contains(path: &Path, rule: FillRule, point: Point) -> bool {
+    if !(point.x.is_finite() && point.y.is_finite()) {
+        return false;
+    }
+    let mut crossings = 0_u32;
+    let mut winding = 0_i32;
+    let mut current = Point::zero();
+    let mut subpath_start = Point::zero();
+    let mut on_boundary = false;
+    let mut edge = |a: Point, b: Point| {
+        if point_on_segment(point, a, b) {
+            on_boundary = true;
+        }
+        if (a.y <= point.y && b.y > point.y) || (b.y <= point.y && a.y > point.y) {
+            let t = (point.y - a.y) / (b.y - a.y);
+            if a.x + t * (b.x - a.x) > point.x {
+                crossings += 1;
+                winding += if b.y > a.y { 1 } else { -1 };
             }
         }
-        scale
     };
-    (
-        values[0] * scale,
-        values[1] * scale,
-        values[2] * scale,
-        values[3] * scale,
-    )
+    for segment in path.segments() {
+        match segment {
+            tiny_skia::PathSegment::MoveTo(p) => {
+                current = p;
+                subpath_start = p;
+            }
+            tiny_skia::PathSegment::LineTo(p) => {
+                edge(current, p);
+                current = p;
+            }
+            tiny_skia::PathSegment::QuadTo(control, end) => {
+                let mut flattened = Vec::new();
+                flatten_quad(current, control, end, &mut flattened);
+                for p in flattened {
+                    edge(current, p);
+                    current = p;
+                }
+            }
+            tiny_skia::PathSegment::CubicTo(first, second, end) => {
+                let mut flattened = Vec::new();
+                flatten_cubic(current, first, second, end, &mut flattened);
+                for p in flattened {
+                    edge(current, p);
+                    current = p;
+                }
+            }
+            tiny_skia::PathSegment::Close => {
+                edge(current, subpath_start);
+                current = subpath_start;
+            }
+        }
+    }
+    if on_boundary {
+        return true;
+    }
+    match rule {
+        FillRule::EvenOdd => crossings % 2 == 1,
+        FillRule::Winding => winding != 0,
+    }
+}
+
+/// Boundary tolerance: canvas tests probe 0.01px outside a path, and f32
+/// flattening error stays far below that.
+const BOUNDARY_EPSILON: f32 = 1e-3;
+
+fn point_on_segment(point: Point, a: Point, b: Point) -> bool {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let length_squared = dx * dx + dy * dy;
+    if length_squared == 0.0 {
+        return (point.x - a.x).abs() <= BOUNDARY_EPSILON
+            && (point.y - a.y).abs() <= BOUNDARY_EPSILON;
+    }
+    let t = (((point.x - a.x) * dx + (point.y - a.y) * dy) / length_squared).clamp(0.0, 1.0);
+    let closest_x = a.x + t * dx;
+    let closest_y = a.y + t * dy;
+    (point.x - closest_x).hypot(point.y - closest_y) <= BOUNDARY_EPSILON
+}
+
+fn flatten_quad(start: Point, control: Point, end: Point, out: &mut Vec<Point>) {
+    flatten_quad_at(start, control, end, out, 0);
+}
+
+fn flatten_quad_at(start: Point, control: Point, end: Point, out: &mut Vec<Point>, depth: u32) {
+    if depth >= 16 || point_line_distance(control, start, end) <= FLATTEN_TOLERANCE {
+        out.push(end);
+        return;
+    }
+    let first = midpoint(start, control);
+    let second = midpoint(control, end);
+    let middle = midpoint(first, second);
+    flatten_quad_at(start, first, middle, out, depth + 1);
+    flatten_quad_at(middle, second, end, out, depth + 1);
+}
+
+fn flatten_cubic(start: Point, first: Point, second: Point, end: Point, out: &mut Vec<Point>) {
+    flatten_cubic_at(start, first, second, end, out, 0);
+}
+
+#[expect(
+    clippy::many_single_char_names,
+    reason = "the five points are the de Casteljau subdivision inputs"
+)]
+fn flatten_cubic_at(
+    start: Point,
+    first: Point,
+    second: Point,
+    end: Point,
+    out: &mut Vec<Point>,
+    depth: u32,
+) {
+    if depth >= 16
+        || (point_line_distance(first, start, end) <= FLATTEN_TOLERANCE
+            && point_line_distance(second, start, end) <= FLATTEN_TOLERANCE)
+    {
+        out.push(end);
+        return;
+    }
+    let a = midpoint(start, first);
+    let b = midpoint(first, second);
+    let c = midpoint(second, end);
+    let d = midpoint(a, b);
+    let e = midpoint(b, c);
+    let middle = midpoint(d, e);
+    flatten_cubic_at(start, a, d, middle, out, depth + 1);
+    flatten_cubic_at(middle, e, c, end, out, depth + 1);
+}
+
+/// `tiny_skia`'s `invert` maps a zero scale to infinity instead of failing,
+/// so canvas checks the determinant itself.
+fn transform_is_invertible(transform: Transform) -> bool {
+    let determinant = transform.sx * transform.sy - transform.kx * transform.ky;
+    determinant != 0.0 && determinant.is_finite()
+}
+
+fn midpoint(a: Point, b: Point) -> Point {
+    Point::from_xy(a.x.midpoint(b.x), a.y.midpoint(b.y))
+}
+
+/// Distance from `point` to the line through `a` and `b`. Curves whose
+/// controls sit near the chord flatten to a single segment.
+fn point_line_distance(point: Point, a: Point, b: Point) -> f32 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let length = dx.hypot(dy);
+    if length == 0.0 {
+        return (point.x - a.x).hypot(point.y - a.y);
+    }
+    ((point.x - a.x) * dy - (point.y - a.y) * dx).abs() / length
+}
+
+const FLATTEN_TOLERANCE: f32 = 0.1;
+
+/// Drops subpaths with no extent before stroking. A zero-length subpath
+/// would otherwise paint a cap dot, but the spec prunes degenerate segments
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-stroke>).
+fn prune_degenerate(path: &Path) -> Option<Path> {
+    let mut builder = PathBuilder::new();
+    let mut commands: Vec<tiny_skia::PathSegment> = Vec::new();
+    let mut bounds: Option<(Point, Point)> = None;
+    for segment in path.segments() {
+        match segment {
+            tiny_skia::PathSegment::MoveTo(point) => {
+                flush_subpath(&mut builder, &mut commands, &mut bounds);
+                extend_bounds(point, &mut bounds);
+            }
+            tiny_skia::PathSegment::LineTo(point) => extend_bounds(point, &mut bounds),
+            tiny_skia::PathSegment::QuadTo(control, end) => {
+                extend_bounds(control, &mut bounds);
+                extend_bounds(end, &mut bounds);
+            }
+            tiny_skia::PathSegment::CubicTo(first, second, end) => {
+                extend_bounds(first, &mut bounds);
+                extend_bounds(second, &mut bounds);
+                extend_bounds(end, &mut bounds);
+            }
+            tiny_skia::PathSegment::Close => {}
+        }
+        commands.push(segment);
+    }
+    flush_subpath(&mut builder, &mut commands, &mut bounds);
+    builder.finish()
+}
+
+fn extend_bounds(point: Point, bounds: &mut Option<(Point, Point)>) {
+    *bounds = Some(match *bounds {
+        None => (point, point),
+        Some((min, max)) => (
+            Point::from_xy(min.x.min(point.x), min.y.min(point.y)),
+            Point::from_xy(max.x.max(point.x), max.y.max(point.y)),
+        ),
+    });
+}
+
+fn flush_subpath(
+    builder: &mut PathBuilder,
+    commands: &mut Vec<tiny_skia::PathSegment>,
+    bounds: &mut Option<(Point, Point)>,
+) {
+    let keep = bounds
+        .take()
+        .is_some_and(|(min, max)| (max.x - min.x).max(max.y - min.y) > 0.0);
+    if keep {
+        for command in commands.drain(..) {
+            match command {
+                tiny_skia::PathSegment::MoveTo(p) => builder.move_to(p.x, p.y),
+                tiny_skia::PathSegment::LineTo(p) => builder.line_to(p.x, p.y),
+                tiny_skia::PathSegment::QuadTo(c, p) => builder.quad_to(c.x, c.y, p.x, p.y),
+                tiny_skia::PathSegment::CubicTo(a, b, p) => {
+                    builder.cubic_to(a.x, a.y, b.x, b.y, p.x, p.y);
+                }
+                tiny_skia::PathSegment::Close => builder.close(),
+            }
+        }
+    }
+    commands.clear();
+}
+
+/// Applies the dash pattern in user space, then strokes the result. Dash
+/// lengths scale with the CTM like the line width
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-setlinedash>).
+fn dash_and_stroke(path: &Path, stroke: &Stroke, transform: Transform) -> Option<Path> {
+    let scale = tiny_skia::PathStroker::compute_resolution_scale(&transform);
+    let dashed;
+    let input = if let Some(dash) = &stroke.dash {
+        dashed = path.dash(dash, scale)?;
+        &dashed
+    } else {
+        path
+    };
+    input.stroke(stroke, scale)
 }
 
 fn to_premultiplied(straight: &[u8]) -> Vec<u8> {
