@@ -2812,7 +2812,7 @@ pub(super) fn tab_index_default(base: &blitz_dom::BaseDocument, node: BlitzId) -
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
 pub(in crate::js::bindings) fn nonce_of(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
     let owner = world_for_node(ctx, id)?;
-    if let Some(slot) = owner.borrow().nonce_slots.get(&id) {
+    if let Some(slot) = owner.borrow().state.nonce_slots.get(&id) {
         return Ok(slot.clone());
     }
     Ok(content_attr(ctx, id, "nonce").unwrap_or_default())
@@ -2823,7 +2823,11 @@ pub(in crate::js::bindings) fn nonce_of(ctx: &Ctx<'_>, id: NodeId) -> Result<Str
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-nonce>).
 pub(super) fn set_nonce_slot(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
     let owner = world_for_node(ctx, id)?;
-    owner.borrow_mut().nonce_slots.insert(id, value.to_owned());
+    owner
+        .borrow_mut()
+        .state
+        .nonce_slots
+        .insert(id, value.to_owned());
     Ok(())
 }
 

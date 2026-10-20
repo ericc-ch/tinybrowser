@@ -144,7 +144,7 @@ fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
         .registry
         .borrow_mut()
         .allocate_decoder();
-    world_rc.borrow_mut().decoders.insert(
+    world_rc.borrow_mut().state.decoders.insert(
         id,
         super::world::DecoderSession::fresh(encoding, ignore_bom),
     );
@@ -171,7 +171,7 @@ fn decoder_decode(
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
     let world_rc = super::bindings::world(&ctx)?;
     let mut world = world_rc.borrow_mut();
-    let Some(session) = world.decoders.get_mut(&id) else {
+    let Some(session) = world.state.decoders.get_mut(&id) else {
         return Err(Exception::throw_type(&ctx, "The decoder is closed."));
     };
     let mut input = std::mem::take(&mut session.carry);
@@ -213,7 +213,7 @@ fn decoder_decode(
 )]
 fn decoder_free(ctx: Ctx<'_>, id: u64) {
     if let Ok(world) = super::bindings::world(&ctx) {
-        world.borrow_mut().decoders.remove(&id);
+        world.borrow_mut().state.decoders.remove(&id);
     }
 }
 

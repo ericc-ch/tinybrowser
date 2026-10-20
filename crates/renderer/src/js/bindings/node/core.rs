@@ -2438,6 +2438,7 @@ fn note_inserted_creators(ctx: &Ctx<'_>, inserted: &[NodeId]) {
         // element attributes its new load to the move.
         owner_rc
             .borrow_mut()
+            .state
             .creator_stacks
             .entry(target)
             .or_insert_with(|| {

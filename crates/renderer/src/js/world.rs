@@ -863,77 +863,29 @@ pub(crate) struct World {
     /// blob lookups and same-origin checks must reuse this value
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     pub(crate) origin: url::Origin,
-    /// Document referrer policy from a `meta name=referrer` insertion
-    /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
-    pub(crate) referrer_policy: String,
     /// Active Content Security Policy list for this document.
     pub(crate) csp: crate::csp::List,
-    /// `meta` elements whose policy was already appended.
-    pub(crate) applied_csp_metas: HashSet<NodeId>,
     pub(crate) history: crate::protocol::HistorySnapshot,
     pub(crate) pending_history: Vec<crate::protocol::RendererEvent>,
     pub pending_cancels: Vec<i32>,
     pub pending_fetch_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
-    frame_navigations: Vec<FrameNavigation>,
-    /// Connected `<img>` elements whose `src` changed inside script.
-    image_updates: Vec<NodeId>,
-    /// Connected `<script src>` elements whose fetch prepare steps queued a
-    /// load (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
-    pending_scripts: Vec<NodeId>,
-    /// Violations produced where dispatching is unsafe (inside the module
-    /// loader), flushed by the drain.
-    pub(crate) pending_csp_violations: Vec<(NodeId, Vec<crate::csp::Violation>)>,
-    /// Script elements the HTML parser inserted; script insertion clears the
-    /// bit (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
-    pub(crate) parser_inserted: HashSet<NodeId>,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
     input_files: HashMap<NodeId, Vec<Persistent<Value<'static>>>>,
-    /// Streaming `TextDecoder` sessions, keyed by platform id. The decoder
-    /// object buffers partial sequences internally across `decode()` calls,
-    /// exactly as the Encoding Standard's streaming decoder does; the entry
-    /// dies with the realm, and `FinalizationRegistry` frees it earlier when
-    /// the engine runs the callback
-    /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
-    pub(crate) decoders: HashMap<u64, DecoderSession>,
-    document_stream: Vec<DocumentStreamCommand>,
     budget: Rc<RefCell<ResourceBudget>>,
     pub parser_active: bool,
-    pub current_script: Option<NodeId>,
-    /// Existing elements being synchronously upgraded by a custom-element
-    /// constructor. `HTMLElement()` consumes the top candidate.
-    pub(crate) custom_construction: Vec<NodeId>,
-    /// The realm's window object, for event targets that belong to this world
-    /// but are reached from another realm's call frame.
-    window: Option<Persistent<Object<'static>>>,
-    listeners: HashMap<EventTargetKey, Vec<Rc<Listener>>>,
-    /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
-    standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
-    next_standalone_target: u64,
-    implementations: HashMap<u32, Persistent<Value<'static>>>,
-    /// The focused element of each document
-    /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
-    active_elements: HashMap<u32, NodeId>,
-    /// Text selection per control `(start, end, direction code)`: the
-    /// selection APIs clamp to the control's value length on read.
-    selections: HashMap<NodeId, (u32, u32, u8)>,
+    /// The realm's event-target graph: window object, listener registries,
+    /// standalone targets, and event handler attributes.
+    events: EventTargetState,
+    /// State that belongs to the documents this realm owns.
+    pub(crate) state: DocumentState,
     /// Elements whose `click()` is running, so a nested `click()` returns
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
     clicks_in_progress: HashSet<NodeId>,
     brands: HashMap<String, Persistent<Object<'static>>>,
     pub(crate) bridge: Option<Persistent<Object<'static>>>,
-    /// Event handler properties (`element.onload`, `window.onmessage`) live
-    /// here rather than on the wrapper, which may be collected while the node
-    /// stays alive. Keyed by `(None, name)` for the window and
-    /// `(Some(node), name)` for an element
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
-    handler_attributes: HashMap<(Option<NodeId>, String), Persistent<Value<'static>>>,
-    /// Handler properties explicitly set to null or undefined, so a dispatch
-    /// does not resurrect the element's content attribute
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
-    cleared_handlers: HashSet<(Option<NodeId>, String)>,
     /// Containers whose insertion steps already fired `load` (src-less
     /// iframes). A later container navigation clears the entry when it
     /// starts, so that navigation's own `load` still fires; `finish_frame_load`
@@ -941,9 +893,6 @@ pub(crate) struct World {
     /// `srcdoc` attributes
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
     pub(crate) insertion_load_fired: HashSet<NodeId>,
-    /// Stable `WebDriver` element ids for nodes, and the reverse lookup.
-    remote_ids: HashMap<NodeId, u64>,
-    remote_nodes: HashMap<u64, NodeId>,
     /// Registered `MutationObserver`s, keyed by their platform id.
     /// Pristine intrinsics captured at install, before page script runs.
     /// `WebIDL` conversions and scheduling must use these, never
@@ -971,22 +920,170 @@ pub(crate) struct World {
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Decoded `<img>` dimensions for script geometry (`naturalWidth/Height`).
-    /// Blitz owns the pixels; this only records the settled size.
-    pub(crate) images: HashMap<NodeId, (u32, u32)>,
-    /// `<img>` elements whose current request has not finished, including a
-    /// `src` mutation waiting for `update the image data`
+    /// Every per-element map an `<img>` request writes.
+    pub(crate) images: ImageState,
+}
+
+/// Per-element `<img>` loading state for the realm.
+///
+/// Written only by the image update steps, so the concern owns every map an
+/// image request touches and drops them together when the document that
+/// owned the elements goes away; no clear list can forget the next field
+/// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+#[derive(Default)]
+pub(crate) struct ImageState {
+    /// Decoded dimensions for script geometry (`naturalWidth/Height`). Blitz
+    /// owns the pixels; this only records the settled size.
+    pub(crate) sizes: HashMap<NodeId, (u32, u32)>,
+    /// Elements whose current request has not finished, including a `src`
+    /// mutation waiting for `update the image data`
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
-    pub(crate) image_loading: HashSet<NodeId>,
-    /// Selected URL for each `<img>` current request
+    pub(crate) loading: HashSet<NodeId>,
+    /// Selected URL for each element's current request
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
-    pub(crate) image_current_src: HashMap<NodeId, String>,
+    pub(crate) current_src: HashMap<NodeId, String>,
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
-    pub(crate) image_broken: HashSet<NodeId>,
+    pub(crate) broken: HashSet<NodeId>,
     /// Elements whose current request already dispatched its `error` event,
     /// so a later scan does not repeat it.
-    pub(crate) image_error_reported: HashSet<NodeId>,
+    pub(crate) error_reported: HashSet<NodeId>,
+    /// Connected elements whose `src` changed inside script, awaiting the
+    /// drain's update step.
+    updates: Vec<NodeId>,
+}
+
+impl ImageState {
+    /// Queues `element` for the drain, at most once.
+    fn queue_update(&mut self, element: NodeId) {
+        if !self.updates.contains(&element) {
+            self.updates.push(element);
+        }
+    }
+
+    fn take_updates(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.updates)
+    }
+
+    /// Drops every element's state; called when the document that owned the
+    /// elements is replaced or forgotten.
+    fn clear(&mut self) {
+        self.sizes.clear();
+        self.loading.clear();
+        self.current_src.clear();
+        self.broken.clear();
+        self.error_reported.clear();
+        self.updates.clear();
+    }
+}
+
+/// The realm's event-target graph.
+///
+/// The maps are keyed by document (`None` keys are the window), so the two
+/// teardowns — a navigation drops the old document's registrations, a
+/// forgotten document drops its elements' handlers — live here with them
+/// (<https://dom.spec.whatwg.org/#interface-eventtarget>,
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+#[derive(Default)]
+pub(crate) struct EventTargetState {
+    /// The realm's window object, for event targets that belong to this
+    /// world but are reached from another realm's call frame.
+    window: Option<Persistent<Object<'static>>>,
+    listeners: HashMap<EventTargetKey, Vec<Rc<Listener>>>,
+    /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
+    standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
+    next_standalone_target: u64,
+    /// Event handler properties (`element.onload`, `window.onmessage`) live
+    /// here rather than on the wrapper, which may be collected while the node
+    /// stays alive. Keyed by `(None, name)` for the window and
+    /// `(Some(node), name)` for an element
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+    handler_attributes: HashMap<(Option<NodeId>, String), Persistent<Value<'static>>>,
+    /// Handler properties explicitly set to null or undefined, so a dispatch
+    /// does not resurrect the element's content attribute
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
+    cleared_handlers: HashSet<(Option<NodeId>, String)>,
+}
+
+impl EventTargetState {
+    /// A navigation keeps the realm's window object, so window-scoped
+    /// handlers survive it; the old document's element handlers must not
+    /// fire in the new document, and neither must its listener
+    /// registrations
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+    fn reset_for_navigation(&mut self) {
+        self.listeners.clear();
+        self.handler_attributes
+            .retain(|(node, _), _| node.is_none());
+        self.cleared_handlers.retain(|(node, _)| node.is_none());
+    }
+
+    /// Drops every handler of one document's elements.
+    fn forget_document(&mut self, document: u32) {
+        self.handler_attributes
+            .retain(|(node, _), _| node.is_none_or(|node| node.document_id() != document));
+        self.cleared_handlers
+            .retain(|(node, _)| node.is_none_or(|node| node.document_id() != document));
+    }
+
+    /// Drops the whole graph, window object included; the realm is going.
+    fn clear_realm(&mut self) {
+        self.listeners.clear();
+        self.standalone_targets.clear();
+        self.window = None;
+        self.next_standalone_target = 0;
+        self.handler_attributes.clear();
+        self.cleared_handlers.clear();
+    }
+}
+
+/// Realm state that belongs to the documents this realm owns.
+///
+/// A navigation installs a fresh document and a forgotten document takes its
+/// entries with it, so the concern owns both teardowns: `reset` for the
+/// wholesale replacement and `forget_document` for one document's id-keyed
+/// maps. Every field here is dropped by one of the two, which is why the
+/// call sites no longer list fields.
+#[derive(Default)]
+pub(crate) struct DocumentState {
+    /// Document referrer policy from a `meta name=referrer` insertion
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+    pub(crate) referrer_policy: String,
+    /// `meta` elements whose policy was already appended.
+    pub(crate) applied_csp_metas: HashSet<NodeId>,
+    frame_navigations: Vec<FrameNavigation>,
+    /// Connected `<script src>` elements whose fetch prepare steps queued a
+    /// load (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    pending_scripts: Vec<NodeId>,
+    /// Violations produced where dispatching is unsafe (inside the module
+    /// loader), flushed by the drain.
+    pub(crate) pending_csp_violations: Vec<(NodeId, Vec<crate::csp::Violation>)>,
+    /// Script elements the HTML parser inserted; script insertion clears the
+    /// bit (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
+    pub(crate) parser_inserted: HashSet<NodeId>,
+    /// Streaming `TextDecoder` sessions, keyed by platform id. The decoder
+    /// object buffers partial sequences internally across `decode()` calls,
+    /// exactly as the Encoding Standard's streaming decoder does; the entry
+    /// dies with the realm, and `FinalizationRegistry` frees it earlier when
+    /// the engine runs the callback
+    /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
+    pub(crate) decoders: HashMap<u64, DecoderSession>,
+    document_stream: Vec<DocumentStreamCommand>,
+    pub current_script: Option<NodeId>,
+    /// Existing elements being synchronously upgraded by a custom-element
+    /// constructor. `HTMLElement()` consumes the top candidate.
+    pub(crate) custom_construction: Vec<NodeId>,
+    /// One `DOMImplementation` per document, for identity.
+    implementations: HashMap<u32, Persistent<Value<'static>>>,
+    /// The focused element of each document
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
+    active_elements: HashMap<u32, NodeId>,
+    /// Text selection per control `(start, end, direction code)`: the
+    /// selection APIs clamp to the control's value length on read.
+    selections: HashMap<NodeId, (u32, u32, u8)>,
+    /// Stable `WebDriver` element ids for nodes, and the reverse lookup.
+    remote_ids: HashMap<NodeId, u64>,
+    remote_nodes: HashMap<u64, NodeId>,
     /// Per-element cryptographic nonce slots, set by the `nonce` IDL setter
     /// without touching the content attribute
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
@@ -1006,6 +1103,37 @@ pub(crate) struct World {
     /// reports these as `sourceFile`, `lineNumber`, and `columnNumber`
     /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
     pub(crate) creator_stacks: HashMap<NodeId, CreatorInfo>,
+}
+
+impl DocumentState {
+    /// Drops everything keyed to the active document, which a navigation is
+    /// about to replace. Entries of *other* documents this realm still owns
+    /// (`owned`) survive, so `nonce_slots` and `creator_stacks` are pruned by
+    /// id in [`Self::forget_document`] instead.
+    fn reset(&mut self) {
+        self.referrer_policy.clear();
+        self.applied_csp_metas.clear();
+        self.frame_navigations.clear();
+        self.pending_scripts.clear();
+        self.pending_csp_violations.clear();
+        self.parser_inserted.clear();
+        self.decoders.clear();
+        self.document_stream.clear();
+        self.current_script = None;
+        self.custom_construction.clear();
+        self.implementations.clear();
+        self.active_elements.clear();
+        self.selections.clear();
+        self.remote_ids.clear();
+        self.remote_nodes.clear();
+    }
+
+    /// Drops the entries one document's nodes left behind.
+    fn forget_document(&mut self, document: u32) {
+        self.nonce_slots.retain(|node, _| node.document != document);
+        self.creator_stacks
+            .retain(|node, _| node.document != document);
+    }
 }
 
 /// The top JS frame that triggered a subresource fetch: the script URL as
@@ -1104,6 +1232,7 @@ impl Drop for World {
         self.unload_object_urls_for_frame();
         let mut budget = self.budget.borrow_mut();
         let stream_bytes = self
+            .state
             .document_stream
             .iter()
             .filter_map(|command| match command {
@@ -1135,41 +1264,21 @@ impl World {
             origin: document_url.origin(),
             document_url,
             base_url: None,
-            referrer_policy: String::new(),
             csp: crate::csp::List::default(),
-            applied_csp_metas: HashSet::new(),
             history: crate::protocol::HistorySnapshot::default(),
             pending_history: Vec::new(),
             pending_cancels: Vec::new(),
             pending_fetch_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
-            frame_navigations: Vec::new(),
-            image_updates: Vec::new(),
-            pending_scripts: Vec::new(),
-            pending_csp_violations: Vec::new(),
-            parser_inserted: HashSet::new(),
             input_files: HashMap::new(),
-            decoders: HashMap::new(),
-            document_stream: Vec::new(),
             budget: runtime.registry.borrow().budget(),
             parser_active: false,
-            current_script: None,
-            custom_construction: Vec::new(),
-            window: None,
-            listeners: HashMap::new(),
-            standalone_targets: HashMap::new(),
-            next_standalone_target: 0,
-            implementations: HashMap::new(),
-            active_elements: HashMap::new(),
-            selections: HashMap::new(),
+            events: EventTargetState::default(),
+            state: DocumentState::default(),
             clicks_in_progress: HashSet::new(),
             brands: HashMap::new(),
             bridge: None,
-            handler_attributes: HashMap::new(),
-            cleared_handlers: HashSet::new(),
             insertion_load_fired: HashSet::new(),
-            remote_ids: HashMap::new(),
-            remote_nodes: HashMap::new(),
             pristine_number: None,
             pristine_boolean: None,
             pristine_reflect_set: None,
@@ -1179,13 +1288,7 @@ impl World {
             event_ctors: HashMap::new(),
             weak_references: None,
             deliver_mutations_fn: None,
-            images: HashMap::new(),
-            image_loading: HashSet::new(),
-            image_current_src: HashMap::new(),
-            image_broken: HashSet::new(),
-            image_error_reported: HashSet::new(),
-            nonce_slots: HashMap::new(),
-            creator_stacks: HashMap::new(),
+            images: ImageState::default(),
         }
     }
 
@@ -1203,34 +1306,18 @@ impl World {
         let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
-        self.referrer_policy.clear();
-        self.applied_csp_metas.clear();
-        self.current_script = None;
-        self.custom_construction.clear();
-        self.listeners.clear();
-        self.implementations.clear();
-        self.active_elements.clear();
-        self.selections.clear();
-        self.frame_navigations.clear();
-        self.image_updates.clear();
-        self.pending_scripts.clear();
-        self.pending_csp_violations.clear();
-        self.parser_inserted.clear();
-        self.clear_images();
-        self.remote_ids.clear();
-        self.remote_nodes.clear();
-        // Sessions die with the realm: a navigation must not inherit a
-        // half-fed decoder.
-        self.decoders.clear();
-        // Navigation replaces the document's element handlers with it, but the
-        // realm keeps its window object, so window-scoped handlers survive:
-        // the old document's `onload` must not fire in the new document
+        // `reset` drops the old document's queued stream commands. Drain them
+        // first so the bytes they reserved leave the shared budget; the
+        // stream methods own that accounting.
+        let pending_stream = self.take_document_stream();
+        drop(pending_stream);
+        self.state.reset();
+        // Navigation keeps the realm's window object, so window-scoped
+        // handlers survive; the old document's listeners and element handlers
+        // must not fire in the new document
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
-        self.handler_attributes
-            .retain(|(node, _), _| node.is_none());
-        self.cleared_handlers.retain(|(node, _)| node.is_none());
-        let pending = self.take_document_stream();
-        drop(pending);
+        self.events.reset_for_navigation();
+        self.images.clear();
         // A new realm owns fresh observers; navigation drops the old ones.
         self.clear_observers();
         id
@@ -1246,7 +1333,7 @@ impl World {
             self.document = Some(id);
             self.owned.insert(id);
         }
-        self.current_script = None;
+        self.state.current_script = None;
         id
     }
 
@@ -1254,8 +1341,7 @@ impl World {
         if let Some(old) = self.document.take() {
             self.owned.remove(&old);
             self.unload_object_urls_for_document(old);
-            self.nonce_slots.retain(|node, _| node.document != old);
-            self.creator_stacks.retain(|node, _| node.document != old);
+            self.state.forget_document(old);
             self.runtime.documents.borrow_mut().remove(old);
             self.runtime.registry.borrow_mut().forget_document(old);
         }
@@ -1269,12 +1355,10 @@ impl World {
             self.unload_object_urls_for_document(id);
             self.runtime.documents.borrow_mut().remove(id);
             self.runtime.registry.borrow_mut().forget_document(id);
-            self.nonce_slots.retain(|node, _| node.document != id);
-            self.creator_stacks.retain(|node, _| node.document != id);
-            self.handler_attributes
-                .retain(|(node, _), _| node.is_some_and(|node| node.document_id() != id));
-            self.cleared_handlers
-                .retain(|(node, _)| node.is_none_or(|node| node.document_id() != id));
+            self.state.forget_document(id);
+            // The realm is going away; its window handlers go with it when
+            // the realm tears down (`clear_listeners`).
+            self.events.forget_document(id);
         }
         self.document = None;
     }
@@ -1316,11 +1400,11 @@ impl World {
 
     /// One `DOMImplementation` object per document, for identity.
     pub(crate) fn implementation(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.implementations.get(&id.document_id()).cloned()
+        self.state.implementations.get(&id.document_id()).cloned()
     }
 
     pub(crate) fn intern_implementation(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.implementations.insert(id.document_id(), value);
+        self.state.implementations.insert(id.document_id(), value);
     }
 
     /// The document tree that owns `id`.
@@ -1827,11 +1911,11 @@ impl World {
     }
 
     pub(crate) fn queue_frame_navigation(&mut self, navigation: FrameNavigation) {
-        self.frame_navigations.push(navigation);
+        self.state.frame_navigations.push(navigation);
     }
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
-        std::mem::take(&mut self.frame_navigations)
+        std::mem::take(&mut self.state.frame_navigations)
     }
 
     pub(crate) fn queue_image_update(&mut self, element: NodeId) {
@@ -1839,25 +1923,23 @@ impl World {
         // Mark unavailable now so `complete` is false while the update waits
         // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
         // <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
-        self.image_loading.insert(element);
-        if !self.image_updates.contains(&element) {
-            self.image_updates.push(element);
-        }
+        self.images.loading.insert(element);
+        self.images.queue_update(element);
     }
 
     pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
-        std::mem::take(&mut self.image_updates)
+        self.images.take_updates()
     }
 
     /// Queues a connected `<script src>` element for its fetch prepare steps.
     pub(crate) fn queue_script(&mut self, element: NodeId) {
-        if !self.pending_scripts.contains(&element) {
-            self.pending_scripts.push(element);
+        if !self.state.pending_scripts.contains(&element) {
+            self.state.pending_scripts.push(element);
         }
     }
 
     pub(crate) fn take_pending_scripts(&mut self) -> Vec<NodeId> {
-        std::mem::take(&mut self.pending_scripts)
+        std::mem::take(&mut self.state.pending_scripts)
     }
 
     /// Queues violations for targets the caller cannot dispatch into (the
@@ -1867,20 +1949,20 @@ impl World {
         target: NodeId,
         violations: Vec<crate::csp::Violation>,
     ) {
-        self.pending_csp_violations.push((target, violations));
+        self.state.pending_csp_violations.push((target, violations));
     }
 
     /// Appends one in-head `meta` policy the first time it is seen
     /// (<https://w3c.github.io/webappsec-csp/#meta-element>).
     pub(crate) fn apply_meta_policy(&mut self, id: NodeId) {
-        if self.applied_csp_metas.contains(&id) {
+        if self.state.applied_csp_metas.contains(&id) {
             return;
         }
         let content = self
             .document(id)
             .and_then(|parsed| crate::csp::meta_policy(&parsed.document.base, id.node));
         if let Some(content) = content
-            && self.applied_csp_metas.insert(id)
+            && self.state.applied_csp_metas.insert(id)
         {
             self.csp.push_meta(&content);
         }
@@ -1889,16 +1971,16 @@ impl World {
     /// Marks a script element the HTML parser inserted
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
     pub(crate) fn mark_parser_inserted(&mut self, id: NodeId) {
-        self.parser_inserted.insert(id);
+        self.state.parser_inserted.insert(id);
     }
 
     /// Clears the parser-inserted flag: script insertion unsets it.
     pub(crate) fn clear_parser_inserted(&mut self, id: NodeId) {
-        self.parser_inserted.remove(&id);
+        self.state.parser_inserted.remove(&id);
     }
 
     pub(crate) fn is_parser_inserted(&self, id: NodeId) -> bool {
-        self.parser_inserted.contains(&id)
+        self.state.parser_inserted.contains(&id)
     }
 
     /// Records the file list a script assigned to a `type=file` input.
@@ -1915,11 +1997,11 @@ impl World {
     /// keep its pixels and `currentSrc` until this request commits
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
-        self.image_loading.insert(element);
-        self.image_broken.remove(&element);
-        self.image_error_reported.remove(&element);
-        if !self.images.contains_key(&element) {
-            self.image_current_src.insert(element, url);
+        self.images.loading.insert(element);
+        self.images.broken.remove(&element);
+        self.images.error_reported.remove(&element);
+        if !self.images.sizes.contains_key(&element) {
+            self.images.current_src.insert(element, url);
         }
     }
 
@@ -1931,29 +2013,30 @@ impl World {
         height: u32,
         url: String,
     ) {
-        self.image_loading.remove(&element);
-        self.image_broken.remove(&element);
-        self.images.remove(&element);
-        self.image_current_src.insert(element, url);
-        self.images.insert(element, (width, height));
+        self.images.loading.remove(&element);
+        self.images.broken.remove(&element);
+        self.images.sizes.remove(&element);
+        self.images.current_src.insert(element, url);
+        self.images.sizes.insert(element, (width, height));
     }
 
     /// The current request finished without usable pixels. `url` is the
     /// selected source, or the selected source string when URL parsing failed
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn fail_image(&mut self, element: NodeId, url: String) {
-        self.image_loading.remove(&element);
-        self.images.remove(&element);
-        self.image_current_src.insert(element, url);
-        self.image_broken.insert(element);
+        self.images.loading.remove(&element);
+        self.images.sizes.remove(&element);
+        self.images.current_src.insert(element, url);
+        self.images.broken.insert(element);
     }
 
     /// Whether `element`'s current request already failed for `url`, so a
     /// later scan must not register a waiter that no delivery will settle.
     pub(crate) fn image_failed(&self, element: NodeId, url: &str) -> bool {
-        self.image_broken.contains(&element)
+        self.images.broken.contains(&element)
             && self
-                .image_current_src
+                .images
+                .current_src
                 .get(&element)
                 .is_some_and(|current| current == url)
     }
@@ -1961,23 +2044,19 @@ impl World {
     /// Records the first `error` event for `element`'s current request.
     /// Returns false when it was already reported.
     pub(crate) fn report_image_error(&mut self, element: NodeId) -> bool {
-        self.image_error_reported.insert(element)
+        self.images.error_reported.insert(element)
     }
 
     pub(crate) fn forget_image(&mut self, element: NodeId) {
-        self.image_loading.remove(&element);
-        self.image_current_src.remove(&element);
-        self.image_broken.remove(&element);
-        self.image_error_reported.remove(&element);
-        self.images.remove(&element);
+        self.images.loading.remove(&element);
+        self.images.current_src.remove(&element);
+        self.images.broken.remove(&element);
+        self.images.error_reported.remove(&element);
+        self.images.sizes.remove(&element);
     }
 
     pub(crate) fn clear_images(&mut self) {
         self.images.clear();
-        self.image_loading.clear();
-        self.image_current_src.clear();
-        self.image_broken.clear();
-        self.image_error_reported.clear();
     }
 
     pub(crate) fn queue_document_stream(
@@ -1989,12 +2068,12 @@ impl World {
         {
             return Err(());
         }
-        self.document_stream.push(command);
+        self.state.document_stream.push(command);
         Ok(())
     }
 
     pub(crate) fn take_document_stream(&mut self) -> Vec<DocumentStreamCommand> {
-        let commands = std::mem::take(&mut self.document_stream);
+        let commands = std::mem::take(&mut self.state.document_stream);
         let bytes = commands
             .iter()
             .map(|command| match command {
@@ -2140,7 +2219,11 @@ impl World {
             }
             return;
         }
-        self.listeners.entry(target).or_default().push(listener);
+        self.events
+            .listeners
+            .entry(target)
+            .or_default()
+            .push(listener);
     }
 
     /// A clone of one target's listener list, taken when dispatch invokes the
@@ -2157,7 +2240,11 @@ impl World {
                 .map(|entry| entry.listeners.clone())
                 .unwrap_or_default();
         }
-        self.listeners.get(&target).cloned().unwrap_or_default()
+        self.events
+            .listeners
+            .get(&target)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Drops one listener from a target's list; the listener's `removed` flag
@@ -2178,14 +2265,14 @@ impl World {
             }
             return;
         }
-        if let Some(list) = self.listeners.get_mut(&target) {
+        if let Some(list) = self.events.listeners.get_mut(&target) {
             list.retain(|existing| !Rc::ptr_eq(existing, listener));
         }
     }
 
     pub(crate) fn next_standalone_target(&mut self) -> u64 {
-        let id = self.next_standalone_target;
-        self.next_standalone_target = self.next_standalone_target.wrapping_add(1);
+        let id = self.events.next_standalone_target;
+        self.events.next_standalone_target = self.events.next_standalone_target.wrapping_add(1);
         id
     }
 
@@ -2194,21 +2281,21 @@ impl World {
         id: u64,
         target: Persistent<Object<'static>>,
     ) {
-        self.standalone_targets.insert(id, target);
+        self.events.standalone_targets.insert(id, target);
     }
 
     pub(crate) fn standalone_target(&self, id: u64) -> Option<Persistent<Object<'static>>> {
-        self.standalone_targets.get(&id).cloned()
+        self.events.standalone_targets.get(&id).cloned()
     }
 
     /// The window object of this realm; event dispatch uses it when a target
     /// from this world is reached from another realm's call frame.
     pub(crate) fn set_window(&mut self, window: Persistent<Object<'static>>) {
-        self.window = Some(window);
+        self.events.window = Some(window);
     }
 
     pub(crate) fn window_object(&self) -> Option<Persistent<Object<'static>>> {
-        self.window.clone()
+        self.events.window.clone()
     }
 
     /// The active document's readiness
@@ -2246,14 +2333,9 @@ impl World {
     }
 
     pub(crate) fn clear_listeners(&mut self) {
-        self.listeners.clear();
-        self.standalone_targets.clear();
-        self.window = None;
-        self.next_standalone_target = 0;
-        self.implementations.clear();
+        self.events.clear_realm();
+        self.state.implementations.clear();
         self.brands.clear();
-        self.handler_attributes.clear();
-        self.cleared_handlers.clear();
         self.clear_observers();
     }
 
@@ -2305,18 +2387,18 @@ impl World {
 
     /// The focused element of a document, if any.
     pub(crate) fn active_element(&self, document: u32) -> Option<NodeId> {
-        self.active_elements.get(&document).copied()
+        self.state.active_elements.get(&document).copied()
     }
 
     /// A control's `(start, end, direction)` selection, defaulting to a
     /// collapsed caret at 0.
     pub(crate) fn selection_of(&self, id: NodeId) -> (u32, u32, u8) {
-        self.selections.get(&id).copied().unwrap_or((0, 0, 0))
+        self.state.selections.get(&id).copied().unwrap_or((0, 0, 0))
     }
 
     /// Stores a control's `(start, end, direction)` selection.
     pub(crate) fn set_selection(&mut self, id: NodeId, start: u32, end: u32, direction: u8) {
-        self.selections.insert(id, (start, end, direction));
+        self.state.selections.insert(id, (start, end, direction));
     }
 
     /// The stable `WebDriver` element id for `node`, allocating one on first
@@ -2324,18 +2406,18 @@ impl World {
     /// between windows
     /// (<https://w3c.github.io/webdriver/#elements>).
     pub(crate) fn remote_id(&mut self, node: NodeId) -> u64 {
-        if let Some(&remote) = self.remote_ids.get(&node) {
+        if let Some(&remote) = self.state.remote_ids.get(&node) {
             return remote;
         }
         let remote = self.runtime.registry.borrow_mut().allocate_remote();
-        self.remote_ids.insert(node, remote);
-        self.remote_nodes.insert(remote, node);
+        self.state.remote_ids.insert(node, remote);
+        self.state.remote_nodes.insert(remote, node);
         remote
     }
 
     /// The node behind a `WebDriver` element id.
     pub(crate) fn node_for_remote(&self, remote: u64) -> Option<NodeId> {
-        self.remote_nodes.get(&remote).copied()
+        self.state.remote_nodes.get(&remote).copied()
     }
 
     /// Whether `node` is the realm's active document, which is what decides
@@ -2351,7 +2433,8 @@ impl World {
         node: Option<NodeId>,
         name: &str,
     ) -> Option<Persistent<Value<'static>>> {
-        self.handler_attributes
+        self.events
+            .handler_attributes
             .get(&(node, name.to_owned()))
             .cloned()
     }
@@ -2364,27 +2447,34 @@ impl World {
         value: Option<Persistent<Value<'static>>>,
     ) {
         if let Some(value) = value {
-            self.cleared_handlers.remove(&(node, name.to_owned()));
-            self.handler_attributes
+            self.events
+                .cleared_handlers
+                .remove(&(node, name.to_owned()));
+            self.events
+                .handler_attributes
                 .insert((node, name.to_owned()), value);
         } else {
-            self.handler_attributes.remove(&(node, name.to_owned()));
-            self.cleared_handlers.insert((node, name.to_owned()));
+            self.events
+                .handler_attributes
+                .remove(&(node, name.to_owned()));
+            self.events.cleared_handlers.insert((node, name.to_owned()));
         }
     }
 
     /// Whether one handler property was explicitly cleared by script.
     pub(crate) fn handler_cleared(&self, node: Option<NodeId>, name: &str) -> bool {
-        self.cleared_handlers.contains(&(node, name.to_owned()))
+        self.events
+            .cleared_handlers
+            .contains(&(node, name.to_owned()))
     }
 
     pub(crate) fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {
         match node {
             Some(node) => {
-                self.active_elements.insert(document, node);
+                self.state.active_elements.insert(document, node);
             }
             None => {
-                self.active_elements.remove(&document);
+                self.state.active_elements.remove(&document);
             }
         }
         // Mirror into the document so `:focus` and `:focus-within` match
