@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant as WallClock;
 
 use tokio::sync::Notify;
@@ -24,7 +23,10 @@ use crate::protocol::{
     ScriptFailure, TabError,
 };
 
+use self::dials::DialLedger;
+
 pub(crate) mod dial;
+mod dials;
 mod drain;
 mod intern;
 
@@ -312,11 +314,8 @@ pub(crate) struct Document {
     tasks: VecDeque<Task>,
     timers: Vec<Timer>,
     next_timer_id: u32,
-    dial_tx: Sender<Result<CompletedDial, DialContext>>,
-    dial_rx: Receiver<Result<CompletedDial, DialContext>>,
-    in_flight_dials: usize,
-    fetch_cancellations: HashMap<(u64, i32), crate::protocol::DialCancellation>,
-    queued_dials: Vec<QueuedDial>,
+    /// Every queued, in-flight, and cancelled dial for this document.
+    dials: DialLedger,
     /// `<img>` elements awaiting Blitz image state. They delay the document
     /// load event; Blitz fetches and decodes, we only watch.
     /// Selected source URL for the current request
@@ -439,7 +438,6 @@ impl Document {
         init_scripts: &Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
-        let (dial_tx, dial_rx) = mpsc::channel();
         let world = Rc::new(RefCell::new(World::new(
             document_url.clone(),
             frame,
@@ -479,11 +477,7 @@ impl Document {
             tasks: VecDeque::new(),
             timers: Vec::new(),
             next_timer_id: 1,
-            dial_tx,
-            dial_rx,
-            in_flight_dials: 0,
-            fetch_cancellations: HashMap::new(),
-            queued_dials: Vec::new(),
+            dials: DialLedger::new(Arc::clone(&runtime.stop), Arc::clone(&runtime.wake)),
             image_selected_src: HashMap::new(),
             in_flight_images: HashSet::new(),
             connected_images: HashSet::new(),
@@ -804,7 +798,7 @@ impl Document {
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
         self.initial_blank = false;
-        self.queued_dials.push(QueuedDial {
+        self.dials.queue(QueuedDial {
             context: DialContext::FrameLoad {
                 sequence: self.frame_load_sequence,
                 embedder,
@@ -1517,9 +1511,10 @@ impl Document {
     }
 
     fn reset_js_realm(&mut self) {
-        for (_, cancel) in self.fetch_cancellations.drain() {
-            cancel();
-        }
+        // Every queued dial belongs to the old realm; the ledger drops them
+        // and runs their cancellation handles. Dials already in flight keep
+        // their slot until their completions arrive.
+        self.dials.discard_queued();
         // The old realm's ports are gone with it; the peers fire `close`
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
         // A navigation also destroys this frame's own children.
@@ -1537,8 +1532,6 @@ impl Document {
         // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.js_epoch = self.js_epoch.saturating_add(1);
-        // Every queued dial belongs to the old realm; drop them all.
-        self.queued_dials.clear();
         for (_, handler) in self.blitz_handlers.drain() {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
         }
@@ -2142,7 +2135,7 @@ impl Document {
         "POST".clone_into(&mut dial.req.method);
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
-        self.queued_dials.push(dial);
+        self.dials.queue(dial);
     }
 
     /// The Reporting API envelope for a violation, with the
@@ -2343,7 +2336,7 @@ impl Document {
             self.redirect_gate(crate::csp::Destination::Script),
         ));
         dial.integrity = self.script_integrity(id);
-        self.queued_dials.push(dial);
+        self.dials.queue(dial);
         true
     }
 
@@ -2924,7 +2917,7 @@ impl Document {
                 &self.url,
             );
             dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
-            self.queued_dials.push(dial);
+            self.dials.queue(dial);
         }
     }
 
