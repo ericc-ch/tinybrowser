@@ -12,7 +12,7 @@ use std::time::Duration;
 use renderer::{Engine, FrameId, MAX_RESPONSE_BODY_BYTES, Stop, TURN_SCRIPT_BUDGET, TabError};
 use tokio::sync::Notify;
 
-use super::{AssignmentServices, ChannelServices};
+use super::{HostServices, ServiceClient};
 use crate::exchange::{self, Frame, RequestId};
 use crate::wire::channel::MAX_BODY_CHUNK_BYTES;
 use crate::wire::{
@@ -34,7 +34,7 @@ enum Handled {
 pub(super) async fn run(
     mut inbox: exchange::Receiver<ToRenderer>,
     outbox: &exchange::BlockingSender<FromRenderer>,
-    services: Arc<ChannelServices>,
+    client: Arc<ServiceClient>,
     stop: &Arc<Stop>,
     wake: Arc<Notify>,
 ) {
@@ -61,7 +61,7 @@ pub(super) async fn run(
                         &mut engines,
                         &mut responses,
                         outbox,
-                        &services,
+                        &client,
                         stop,
                         &wake,
                     ) {
@@ -79,7 +79,7 @@ pub(super) async fn run(
                             &mut engines,
                             &mut responses,
                             outbox,
-                            &services,
+                            &client,
                             stop,
                             &wake,
                         ) {
@@ -103,13 +103,13 @@ fn handle_host(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     responses: &mut ResponseStreams,
     outbox: &exchange::BlockingSender<FromRenderer>,
-    services: &Arc<ChannelServices>,
+    client: &Arc<ServiceClient>,
     stop: &Arc<Stop>,
     wake: &Arc<Notify>,
 ) -> bool {
     match received {
         Some(Frame::Notify(HostNotice::Assign { assignment })) => {
-            assign_engine(engines, assignment, services, stop, wake)
+            assign_engine(engines, assignment, client, stop, wake)
         }
         Some(Frame::Notify(HostNotice::Release { assignment })) => {
             responses.release(assignment, engines);
@@ -272,14 +272,14 @@ fn reply_result(
 fn assign_engine(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     assignment: RendererAssignmentId,
-    services: &Arc<ChannelServices>,
+    client: &Arc<ServiceClient>,
     stop: &Arc<Stop>,
     wake: &Arc<Notify>,
 ) -> bool {
     if engines.contains_key(&assignment) {
         return false;
     }
-    let assignment_services = Arc::new(AssignmentServices::new(assignment, Arc::clone(services)));
+    let assignment_services = Arc::new(HostServices::new(assignment, Arc::clone(client)));
     engines.insert(
         assignment,
         Engine::new(assignment_services, Arc::clone(stop), Arc::clone(wake)),

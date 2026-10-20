@@ -83,23 +83,23 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
         }
         result
     });
-    let services = Arc::new(ChannelServices::new(out_tx.clone()));
+    let client = Arc::new(BlockingClient::new(out_tx.clone()));
     let _ready = out_tx.try_send(Frame::Notify(RendererNotice::Ready));
     logging::info!(target: "renderer", "ready");
-    let reader_services = Arc::clone(&services);
+    let reader_client = Arc::clone(&client);
     let reader_stop = Arc::clone(&stop);
     let reader_wake = Arc::clone(&wake);
     thread::spawn(move || {
         read_messages(
             input,
             &command_tx,
-            &reader_services,
+            &reader_client,
             &reader_stop,
             &reader_wake,
         );
     });
-    session::run(command_rx, &out_tx, services, &stop, Arc::clone(&wake)).await;
-    // The reader returns on `Shutdown`, dropping its `ChannelServices` clone, so
+    session::run(command_rx, &out_tx, client, &stop, Arc::clone(&wake)).await;
+    // The reader returns on `Shutdown`, dropping its `ServiceClient` clone, so
     // the writer channel closes and the child can exit.
     drop(out_tx);
     Ok(writer)
@@ -126,7 +126,7 @@ fn endpoint() -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
 fn read_messages(
     mut input: Box<dyn Read + Send>,
     command_tx: &exchange::Sender<ToRenderer>,
-    services: &ChannelServices,
+    client: &Arc<ServiceClient>,
     stop: &Arc<Stop>,
     wake: &Arc<Notify>,
 ) {
@@ -165,7 +165,7 @@ fn read_messages(
                     continue;
                 }
                 Frame::Reply { id, body } => {
-                    services.deliver(id, body);
+                    client.deliver(id, body);
                     continue;
                 }
                 _ => {
@@ -174,7 +174,7 @@ fn read_messages(
                 }
             }
         }
-        if !route_message(message, command_tx, services) {
+        if !route_message(message, command_tx, client) {
             break;
         }
     }
@@ -182,7 +182,7 @@ fn read_messages(
     // browser: interrupt in-flight work and stop the loop.
     stop.request();
     wake.notify_one();
-    services.close();
+    client.close();
     let _result = command_tx.try_send(Frame::Notify(HostNotice::Shutdown));
 }
 
@@ -190,7 +190,7 @@ fn read_messages(
 fn route_message(
     message: ToRenderer,
     command_tx: &exchange::Sender<ToRenderer>,
-    services: &ChannelServices,
+    client: &Arc<ServiceClient>,
 ) -> bool {
     match message {
         Frame::Notify(HostNotice::Hello) => {
@@ -202,7 +202,7 @@ fn route_message(
             false
         }
         Frame::Reply { id, body } => {
-            services.deliver(id, body);
+            client.deliver(id, body);
             true
         }
         Frame::Notify(HostNotice::StorageEvent { .. } | HostNotice::BroadcastMessage { .. }) => {
@@ -230,28 +230,41 @@ fn write_messages(
     Ok(())
 }
 
-/// Renderer host-capability proxy that asks the browser process over the channel.
-pub(crate) struct ChannelServices {
-    client: BlockingClient<BrowserCall, RendererReply, RendererNotice, ServiceReply>,
+/// The blocking service client one child process shares: the reader thread
+/// delivers replies on it, and every assignment's web services bind it with
+/// their id.
+pub(crate) type ServiceClient =
+    BlockingClient<BrowserCall, RendererReply, RendererNotice, ServiceReply>;
+
+/// Web services for one renderer assignment, answered by the browser process
+/// over the control channel.
+pub(crate) struct HostServices {
+    assignment: RendererAssignmentId,
+    client: Arc<ServiceClient>,
 }
 
-impl ChannelServices {
-    fn new(out: exchange::BlockingSender<FromRenderer>) -> Self {
-        Self {
-            client: BlockingClient::new(out),
-        }
+impl HostServices {
+    pub(crate) fn new(assignment: RendererAssignmentId, client: Arc<ServiceClient>) -> Self {
+        Self { assignment, client }
     }
 
-    fn call(&self, assignment: RendererAssignmentId, call: ServiceCall) -> Option<ServiceReply> {
-        self.client.call(BrowserCall { assignment, call }).ok()
+    fn call(&self, call: ServiceCall) -> Option<ServiceReply> {
+        self.client
+            .call(BrowserCall {
+                assignment: self.assignment,
+                call,
+            })
+            .ok()
     }
+}
 
+impl NetworkHost for HostServices {
     fn start_dial(
-        self: &Arc<Self>,
-        assignment: RendererAssignmentId,
+        &self,
         request: DialRequest,
         completion: DialCompletion,
     ) -> renderer::DialCancellation {
+        let assignment = self.assignment;
         let id = self.client.call_with(
             BrowserCall {
                 assignment,
@@ -259,21 +272,13 @@ impl ChannelServices {
             },
             move |reply| match reply {
                 Ok(ServiceReply::Dial(outcome)) => completion(outcome),
-                Ok(
-                    ServiceReply::Cookie(_)
-                    | ServiceReply::StorageValue(_)
-                    | ServiceReply::StorageKeys(_)
-                    | ServiceReply::StorageChanged(_)
-                    | ServiceReply::Window(_)
-                    | ServiceReply::Unit,
-                )
-                | Err(_) => completion(Err(renderer::DialFailure::Connect)),
+                Ok(_) | Err(_) => completion(Err(renderer::DialFailure::Connect)),
             },
         );
-        let channel = self.clone();
+        let client = Arc::clone(&self.client);
         Box::new(move || {
             if let Some(id) = id {
-                let _call = channel.client.call_with(
+                let _call = client.call_with(
                     BrowserCall {
                         assignment,
                         call: ServiceCall::Network(NetworkCall::CancelDial { id }),
@@ -284,98 +289,50 @@ impl ChannelServices {
         })
     }
 
-    fn deliver(&self, id: RequestId, reply: ServiceReply) {
-        self.client.deliver(id, reply);
-    }
-
-    fn close(&self) {
-        self.client.close();
-    }
-}
-
-pub(crate) struct AssignmentServices {
-    assignment: RendererAssignmentId,
-    channel: Arc<ChannelServices>,
-}
-
-impl AssignmentServices {
-    pub(crate) fn new(assignment: RendererAssignmentId, channel: Arc<ChannelServices>) -> Self {
-        Self {
-            assignment,
-            channel,
-        }
-    }
-}
-
-impl NetworkHost for AssignmentServices {
-    fn start_dial(
-        &self,
-        request: DialRequest,
-        completion: DialCompletion,
-    ) -> renderer::DialCancellation {
-        self.channel
-            .start_dial(self.assignment, request, completion)
-    }
-
     fn dial_sync(
         &self,
         request: renderer::DialRequest,
     ) -> Result<renderer::DialOutcome, renderer::DialFailure> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::Network(NetworkCall::Dial(request)),
-        ) {
+        match self.call(ServiceCall::Network(NetworkCall::Dial(request))) {
             Some(ServiceReply::Dial(outcome)) => outcome,
             _ => Err(renderer::DialFailure::Connect),
         }
     }
 
     fn cookies_for(&self, url: &Url) -> String {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::Network(NetworkCall::CookieGet {
-                url: url.to_string(),
-            }),
-        ) {
+        match self.call(ServiceCall::Network(NetworkCall::CookieGet {
+            url: url.to_string(),
+        })) {
             Some(ServiceReply::Cookie(value)) => value,
             _ => String::new(),
         }
     }
 
     fn set_cookie(&self, value: &str, url: &Url) {
-        let _result = self.channel.call(
-            self.assignment,
-            ServiceCall::Network(NetworkCall::CookieSet {
-                value: value.to_owned(),
-                url: url.to_string(),
-            }),
-        );
+        let _result = self.call(ServiceCall::Network(NetworkCall::CookieSet {
+            value: value.to_owned(),
+            url: url.to_string(),
+        }));
     }
 }
 
-impl StorageHost for AssignmentServices {
+impl StorageHost for HostServices {
     fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::Storage(StorageCall::Get {
-                kind,
-                origin: origin.to_owned(),
-                key: key.to_owned(),
-            }),
-        ) {
+        match self.call(ServiceCall::Storage(StorageCall::Get {
+            kind,
+            origin: origin.to_owned(),
+            key: key.to_owned(),
+        })) {
             Some(ServiceReply::StorageValue(value)) => value,
             _ => None,
         }
     }
 
     fn storage_keys(&self, kind: StorageKind, origin: &str) -> Vec<String> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::Storage(StorageCall::Keys {
-                kind,
-                origin: origin.to_owned(),
-            }),
-        ) {
+        match self.call(ServiceCall::Storage(StorageCall::Keys {
+            kind,
+            origin: origin.to_owned(),
+        })) {
             Some(ServiceReply::StorageKeys(keys)) => keys,
             _ => Vec::new(),
         }
@@ -390,17 +347,14 @@ impl StorageHost for AssignmentServices {
         value: &str,
         source: FrameId,
     ) -> Result<Option<StorageChange>, StorageError> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::Storage(StorageCall::Set {
-                kind,
-                origin: origin.to_owned(),
-                url: url.to_owned(),
-                key: key.to_owned(),
-                value: value.to_owned(),
-                source,
-            }),
-        ) {
+        match self.call(ServiceCall::Storage(StorageCall::Set {
+            kind,
+            origin: origin.to_owned(),
+            url: url.to_owned(),
+            key: key.to_owned(),
+            value: value.to_owned(),
+            source,
+        })) {
             Some(ServiceReply::StorageChanged(change)) => change,
             _ => Ok(None),
         }
@@ -414,16 +368,13 @@ impl StorageHost for AssignmentServices {
         key: &str,
         source: FrameId,
     ) -> Option<StorageChange> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::Storage(StorageCall::Remove {
-                kind,
-                origin: origin.to_owned(),
-                url: url.to_owned(),
-                key: key.to_owned(),
-                source,
-            }),
-        ) {
+        match self.call(ServiceCall::Storage(StorageCall::Remove {
+            kind,
+            origin: origin.to_owned(),
+            url: url.to_owned(),
+            key: key.to_owned(),
+            source,
+        })) {
             Some(ServiceReply::StorageChanged(Ok(change))) => change,
             _ => None,
         }
@@ -436,88 +387,75 @@ impl StorageHost for AssignmentServices {
         url: &str,
         source: FrameId,
     ) -> Option<StorageChange> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::Storage(StorageCall::Clear {
-                kind,
-                origin: origin.to_owned(),
-                url: url.to_owned(),
-                source,
-            }),
-        ) {
+        match self.call(ServiceCall::Storage(StorageCall::Clear {
+            kind,
+            origin: origin.to_owned(),
+            url: url.to_owned(),
+            source,
+        })) {
             Some(ServiceReply::StorageChanged(Ok(change))) => change,
             _ => None,
         }
     }
 }
 
-impl BrowsingContextHost for AssignmentServices {
+impl BrowsingContextHost for HostServices {
     fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::BrowsingContext(BrowsingContextCall::WindowOpen {
+        match self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowOpen {
                 url: url.to_owned(),
                 name: name.to_owned(),
                 features: features.to_owned(),
-            }),
-        ) {
+            },
+        )) {
             Some(ServiceReply::Window(tab)) => tab,
             _ => None,
         }
     }
 
     fn window_close(&self, tab: u64) {
-        let _result = self.channel.call(
-            self.assignment,
-            ServiceCall::BrowsingContext(BrowsingContextCall::WindowClose { tab }),
-        );
+        let _result = self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowClose { tab },
+        ));
     }
 
     fn window_opener(&self) -> Option<u64> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::BrowsingContext(BrowsingContextCall::Opener),
-        ) {
+        match self.call(ServiceCall::BrowsingContext(BrowsingContextCall::Opener)) {
             Some(ServiceReply::Window(tab)) => tab,
             _ => None,
         }
     }
 
     fn window_post_message(&self, tab: u64, payload: &str) {
-        let _result = self.channel.call(
-            self.assignment,
-            ServiceCall::BrowsingContext(BrowsingContextCall::WindowMessage {
+        let _result = self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowMessage {
                 tab,
                 payload: payload.to_owned(),
-            }),
-        );
+            },
+        ));
     }
 
     fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String> {
-        match self.channel.call(
-            self.assignment,
-            ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet {
+        match self.call(ServiceCall::BrowsingContext(
+            BrowsingContextCall::RemoteSessionGet {
                 tab,
                 origin: origin.to_owned(),
                 key: key.to_owned(),
-            }),
-        ) {
+            },
+        )) {
             Some(ServiceReply::StorageValue(value)) => value,
             _ => None,
         }
     }
 }
 
-impl MessagingHost for AssignmentServices {
+impl MessagingHost for HostServices {
     fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64) {
-        let _result = self.channel.call(
-            self.assignment,
-            ServiceCall::Messaging(MessagingCall::BroadcastPost {
-                origin: origin.to_owned(),
-                name: name.to_owned(),
-                payload: payload.to_owned(),
-                channel,
-            }),
-        );
+        let _result = self.call(ServiceCall::Messaging(MessagingCall::BroadcastPost {
+            origin: origin.to_owned(),
+            name: name.to_owned(),
+            payload: payload.to_owned(),
+            channel,
+        }));
     }
 }
