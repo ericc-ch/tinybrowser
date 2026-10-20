@@ -153,11 +153,17 @@ enum Segment {
     Close,
 }
 
-struct Gradient {
+#[derive(Clone)]
+pub(crate) struct Gradient {
     kind: GradientKind,
     stops: Vec<(f32, [u8; 4])>,
+    /// A zero-length linear gradient or a radial gradient with equal radii
+    /// has no extent and paints nothing
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createlineargradient>).
+    degenerate: bool,
 }
 
+#[derive(Clone)]
 enum GradientKind {
     Linear {
         start: Point,
@@ -175,7 +181,8 @@ enum GradientKind {
     },
 }
 
-struct Pattern {
+#[derive(Clone)]
+pub(crate) struct Pattern {
     image: Arc<Pixmap>,
     spread: SpreadMode,
     repetition: PatternRepeat,
@@ -203,6 +210,68 @@ pub(crate) struct SourceImage {
     /// False when the source came from another origin; painting it clears the
     /// destination canvas's origin-clean flag.
     pub(crate) origin_clean: bool,
+}
+
+/// One color from a stop list at a periodic position in `0..1`.
+fn sample_stops(stops: &[(f32, [u8; 4])], offset: f32) -> [u8; 4] {
+    let offset = offset.rem_euclid(1.0);
+    let Some((first_offset, first)) = stops.first() else {
+        return [0, 0, 0, 0];
+    };
+    if offset <= *first_offset {
+        return *first;
+    }
+    let Some((last_offset, last)) = stops.last() else {
+        return *first;
+    };
+    if offset >= *last_offset {
+        return *last;
+    }
+    let index = stops.partition_point(|(stop, _)| *stop <= offset);
+    let (start_offset, start) = stops[index - 1];
+    let (end_offset, end) = stops[index];
+    let span = end_offset - start_offset;
+    let t = if span > 0.0 {
+        (offset - start_offset) / span
+    } else {
+        0.0
+    };
+    let channel = |start: u8, end: u8| {
+        let start = f32::from(start) / 255.0;
+        let end = f32::from(end) / 255.0;
+        to_u8(start + (end - start) * t)
+    };
+    [
+        channel(start[0], end[0]),
+        channel(start[1], end[1]),
+        channel(start[2], end[2]),
+        channel(start[3], end[3]),
+    ]
+}
+
+/// Rotates gradient stops so a conic gradient starts at `angle` degrees while
+/// tiny-skia sweeps from 0 to 360.
+fn conic_stops(stops: &[(f32, [u8; 4])], angle: f32, alpha: f32) -> Vec<GradientStop> {
+    let shift = angle.rem_euclid(360.0) / 360.0;
+    let boundary = sample_stops(stops, 1.0 - shift);
+    let mut rotated: Vec<(f32, [u8; 4])> = Vec::with_capacity(stops.len() + 2);
+    rotated.push((0.0, boundary));
+    rotated.extend(
+        stops
+            .iter()
+            .map(|(offset, color)| ((offset + shift).rem_euclid(1.0), *color)),
+    );
+    rotated.push((1.0, boundary));
+    rotated.sort_by(|left, right| left.0.total_cmp(&right.0));
+    rotated
+        .into_iter()
+        .map(|(offset, [r, g, b, a])| {
+            GradientStop::new(
+                offset,
+                Color::from_rgba8(r, g, b, to_u8(f32::from(a) / 255.0 * alpha)),
+            )
+        })
+        .collect()
 }
 
 impl Canvas2D {
@@ -1607,6 +1676,9 @@ impl Canvas2D {
                 let Some(entry) = self.patterns.get(&id) else {
                     return;
                 };
+                if entry.invalid {
+                    return;
+                }
                 tiny_skia::Pattern::new(
                     image.as_ref().as_ref(),
                     entry.spread,
@@ -1749,6 +1821,9 @@ impl Canvas2D {
                 let Some(entry) = self.patterns.get(&id) else {
                     return;
                 };
+                if entry.invalid {
+                    return;
+                }
                 tiny_skia::Pattern::new(
                     image.as_ref().as_ref(),
                     entry.spread,
@@ -1803,19 +1878,27 @@ impl Canvas2D {
         transform: Transform,
     ) -> Option<Shader<'static>> {
         let gradient = self.gradients.get(&id)?;
-        if gradient.stops.is_empty() {
+        if gradient.stops.is_empty() || gradient.degenerate {
             return None;
         }
-        let stops: Vec<GradientStop> = gradient
-            .stops
-            .iter()
-            .map(|(offset, [r, g, b, a])| {
-                GradientStop::new(
-                    *offset,
-                    Color::from_rgba8(*r, *g, *b, to_u8(f32::from(*a) / 255.0 * alpha)),
-                )
-            })
-            .collect();
+        let stops = match &gradient.kind {
+            // tiny-skia's sweep shader does not wrap negative angles. Rotate
+            // the color stops into a 0..360 sweep instead
+            // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createconicgradient>).
+            GradientKind::Conic { angle, .. } => {
+                conic_stops(&gradient.stops, angle.to_degrees(), alpha)
+            }
+            _ => gradient
+                .stops
+                .iter()
+                .map(|(offset, [r, g, b, a])| {
+                    GradientStop::new(
+                        *offset,
+                        Color::from_rgba8(*r, *g, *b, to_u8(f32::from(*a) / 255.0 * alpha)),
+                    )
+                })
+                .collect(),
+        };
         match gradient.kind {
             GradientKind::Linear { start, end } => {
                 tiny_skia::LinearGradient::new(start, end, stops, SpreadMode::Pad, transform)
@@ -1834,18 +1917,43 @@ impl Canvas2D {
                 SpreadMode::Pad,
                 transform,
             ),
-            GradientKind::Conic { center, angle } => tiny_skia::SweepGradient::new(
-                center,
-                angle.to_degrees(),
-                angle.to_degrees() + 360.0,
-                stops,
-                SpreadMode::Pad,
-                transform,
-            ),
+            GradientKind::Conic { center, .. } => {
+                tiny_skia::SweepGradient::new(center, 0.0, 360.0, stops, SpreadMode::Pad, transform)
+            }
         }
     }
 
     // ---- resources -------------------------------------------------------
+
+    pub(crate) fn has_gradient(&self, id: u32) -> bool {
+        self.gradients.contains_key(&id)
+    }
+
+    pub(crate) fn gradient_definition(&self, id: u32) -> Option<Gradient> {
+        self.gradients.get(&id).cloned()
+    }
+
+    pub(crate) fn insert_gradient(&mut self, gradient: Gradient) -> u32 {
+        let id = self.next_resource;
+        self.next_resource += 1;
+        self.gradients.insert(id, gradient);
+        id
+    }
+
+    pub(crate) fn has_pattern(&self, id: u32) -> bool {
+        self.patterns.contains_key(&id)
+    }
+
+    pub(crate) fn pattern_definition(&self, id: u32) -> Option<Pattern> {
+        self.patterns.get(&id).cloned()
+    }
+
+    pub(crate) fn insert_pattern(&mut self, pattern: Pattern) -> u32 {
+        let id = self.next_resource;
+        self.next_resource += 1;
+        self.patterns.insert(id, pattern);
+        id
+    }
 
     pub(crate) fn create_linear_gradient(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) -> u32 {
         let id = self.next_resource;
@@ -1858,6 +1966,7 @@ impl Canvas2D {
                     end: Point::from_xy(x1, y1),
                 },
                 stops: Vec::new(),
+                degenerate: (x0 - x1).abs() < f32::EPSILON && (y0 - y1).abs() < f32::EPSILON,
             },
         );
         id
@@ -1884,6 +1993,12 @@ impl Canvas2D {
                     end_radius: r1,
                 },
                 stops: Vec::new(),
+                // Equal radii paint a cylinder when the centers differ; only
+                // identical circles have no extent
+                // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createradialgradient>).
+                degenerate: (r0 - r1).abs() < f32::EPSILON
+                    && (x0 - x1).abs() < f32::EPSILON
+                    && (y0 - y1).abs() < f32::EPSILON,
             },
         );
         id
@@ -1900,6 +2015,7 @@ impl Canvas2D {
                     angle,
                 },
                 stops: Vec::new(),
+                degenerate: false,
             },
         );
         id
@@ -2899,7 +3015,7 @@ pub(crate) fn serialize_color([r, g, b, a]: [u8; 4]) -> String {
         format!("#{r:02x}{g:02x}{b:02x}")
     } else {
         let alpha = f32::from(a) / 255.0;
-        let alpha = (alpha * 1000.0).round() / 1000.0;
+        let alpha = (alpha * 100.0).round() / 100.0;
         format!("rgba({r}, {g}, {b}, {alpha})")
     }
 }
@@ -3092,6 +3208,22 @@ mod tests {
         // the normalized list.
         let mut default_radii = Canvas2D::new(100, 50);
         default_radii.round_rect(1.0, 2.0, 20.0, 10.0, &[]);
+    }
+
+    #[test]
+    fn conic_gradient_rotates_stops() {
+        let mut canvas = Canvas2D::new(100, 50);
+        let id = canvas.create_conic_gradient(50.0, 25.0, 1.5 * std::f32::consts::PI);
+        assert!(canvas.add_color_stop(id, 0.0, [255, 0, 0, 255]));
+        assert!(canvas.add_color_stop(id, 0.25, [0, 255, 0, 255]));
+        assert!(canvas.add_color_stop(id, 0.5, [0, 255, 0, 255]));
+        assert!(canvas.add_color_stop(id, 0.75, [255, 0, 0, 255]));
+        canvas.set_fill_style(StyleValue::Gradient(id));
+        canvas.fill_rect(0.0, 0.0, 100.0, 50.0);
+        let pixels = canvas.read_pixels(0, 0, 100, 50);
+        let pixel = |x: usize, y: usize| &pixels[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4];
+        assert_eq!(pixel(25, 15), &[255, 0, 0, 255]);
+        assert_eq!(pixel(75, 40), &[0, 255, 0, 255]);
     }
 
     #[test]

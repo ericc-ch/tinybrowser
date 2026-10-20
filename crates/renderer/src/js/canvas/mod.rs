@@ -17,7 +17,7 @@ mod path2d;
 mod state;
 mod text;
 
-pub(crate) use state::{Canvas2D, SourceImage, StyleValue};
+pub(crate) use state::{Canvas2D, Gradient, Pattern, SourceImage, StyleValue};
 
 use rquickjs::function::This;
 use rquickjs::object::Accessor;
@@ -78,6 +78,8 @@ fn install_gradient_objects(ctx: &Ctx<'_>) -> Result<()> {
         let prototype = Object::new(ctx.clone())?;
         if name == "CanvasGradient" {
             prototype.set("addColorStop", Func::from(add_color_stop))?;
+        } else {
+            prototype.set("setTransform", Func::from(set_pattern_transform))?;
         }
         let ctor = Function::new(ctx.clone(), || {})?;
         ctor.set("prototype", prototype.clone())?;
@@ -1181,9 +1183,9 @@ fn create_radial_gradient(
 
 fn create_conic_gradient(
     this: This<Object<'_>>,
+    angle: Coerced<f64>,
     x: Coerced<f64>,
     y: Coerced<f64>,
-    angle: Coerced<f64>,
 ) -> Result<Value<'_>> {
     if ![*x, *y, *angle].iter().all(|value| value.is_finite()) {
         return Err(Exception::throw_type(
@@ -1323,6 +1325,36 @@ fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString
 
 fn resource_id(object: &Object<'_>, kind: &str) -> Option<u32> {
     object.get::<_, u32>(format!("__tb{kind}")).ok()
+}
+
+fn set_pattern_transform(this: This<Object<'_>>, matrix: Value<'_>) -> Result<()> {
+    let Some(matrix) = matrix.as_object() else {
+        return Ok(());
+    };
+    for key in matrix.keys::<String>() {
+        let key = key?;
+        if !matches!(key.as_str(), "a" | "b" | "c" | "d" | "e" | "f") {
+            return Err(Exception::throw_type(
+                this.0.ctx(),
+                "invalid DOMMatrix2DInit member",
+            ));
+        }
+    }
+    let finite = ["a", "b", "c", "d", "e", "f"].iter().all(|key| {
+        matrix
+            .get::<_, Coerced<f64>>(*key)
+            .is_ok_and(|value| value.is_finite())
+    });
+    if finite {
+        return Ok(());
+    }
+    let id = resource_id(&this.0, "Pattern").unwrap_or_default();
+    let wrapper = Object::new(this.0.ctx().clone())?;
+    wrapper.set("__tbDoc", this.0.get::<_, u32>("__tbDoc")?)?;
+    wrapper.set("__tbNode", this.0.get::<_, u64>("__tbNode")?)?;
+    with_canvas(this.0.ctx(), &wrapper, |canvas| {
+        canvas.invalidate_pattern(id);
+    })
 }
 
 // ---- image data ----------------------------------------------------------
@@ -2159,13 +2191,15 @@ enum ImageLookup {
 fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     if let Some(id) = crate::js::bindings::host_node_id(ctx, &value) {
         let world = world(ctx)?;
-        let (loading, broken) = {
+        let (loading, broken, size) = {
             let world = world.borrow();
             (
                 world.images.loading.contains(&id),
                 world.images.broken.contains(&id),
+                world.images.sizes.get(&id).copied(),
             )
         };
+        let zero_size = size.is_some_and(|(width, height)| width == 0 || height == 0);
         if loading {
             return Ok(ImageLookup::NotReady);
         }
@@ -2189,42 +2223,7 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
         let mut lookup = world
             .borrow()
             .with_document(id, |parsed| {
-                let element = parsed.document.base.get_node(id.node)?;
-                let data = element.data.downcast_element()?;
-                if data.name.ns == crate::dom::tree::html_namespace()
-                    && data.name.local.as_str() == "canvas"
-                {
-                    // A canvas without a context is still an empty bitmap.
-                    let width = canvas_dimension(ctx, id, "width", 300);
-                    let height = canvas_dimension(ctx, id, "height", 150);
-                    if width == 0 || height == 0 {
-                        return Some(ImageLookup::Invalid);
-                    }
-                    let pixels = crate::js::world::canvas_bytes(width, height)
-                        .map_or_else(Vec::new, |bytes| vec![0; bytes]);
-                    return Some(ImageLookup::Decoded(SourceImage {
-                        width,
-                        height,
-                        pixels,
-                        origin_clean: true,
-                    }));
-                }
-                if !(data.name.ns == crate::dom::tree::html_namespace()
-                    && data.name.local.as_str() == "img")
-                {
-                    return Some(ImageLookup::Unsupported);
-                }
-                match data.raster_image_data() {
-                    Some(raster) => Some(ImageLookup::Decoded(SourceImage {
-                        width: raster.width,
-                        height: raster.height,
-                        pixels: raster.data.as_ref().to_vec(),
-                        origin_clean: true,
-                    })),
-                    // Still loading, or failed to load: drawing paints
-                    // nothing and does not throw.
-                    None => Some(ImageLookup::NotReady),
-                }
+                source_element(ctx, id, parsed, zero_size, broken)
             })
             .flatten()
             .unwrap_or(ImageLookup::Unsupported);
@@ -2277,6 +2276,81 @@ fn image_is_same_origin(world: &crate::js::world::World, id: NodeId) -> bool {
         return true;
     }
     world.origin == url.origin()
+}
+
+/// Looks up a canvas, SVG image, or HTML image element by node id.
+fn source_element(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    parsed: &crate::Parsed,
+    zero_size: bool,
+    broken: bool,
+) -> Option<ImageLookup> {
+    let element = parsed.document.base.get_node(id.node)?;
+    let data = element.data.downcast_element()?;
+    let zero_size = zero_size
+        || matches!(
+            data.image_data(),
+            Some(blitz_dom::node::ImageData::Svg(svg))
+                if svg.intrinsic_width() == Some(0.0) || svg.intrinsic_height() == Some(0.0)
+        );
+
+    if data.name.ns == crate::dom::tree::html_namespace() && data.name.local.as_str() == "canvas" {
+        // A canvas without a context is still an empty bitmap.
+        let width = canvas_dimension(ctx, id, "width", 300);
+        let height = canvas_dimension(ctx, id, "height", 150);
+        if width == 0 || height == 0 {
+            return Some(ImageLookup::Invalid);
+        }
+        let pixels = crate::js::world::canvas_bytes(width, height)
+            .map_or_else(Vec::new, |bytes| vec![0; bytes]);
+        return Some(ImageLookup::Decoded(SourceImage {
+            width,
+            height,
+            pixels,
+            origin_clean: true,
+        }));
+    }
+    if data.name.ns == crate::dom::tree::svg_namespace() && data.name.local.as_str() == "image" {
+        // A rasterized SVG image is usable; zero-sized and detached sources are null.
+        let has_source = data.attrs().iter().any(|attribute| {
+            matches!(attribute.name.local.as_str(), "href" | "src")
+                && !attribute.value.trim().is_empty()
+        });
+        let connected = crate::dom::tree::is_connected(&parsed.document.base, id.node);
+        return Some(match data.raster_image_data() {
+            Some(raster) => ImageLookup::Decoded(SourceImage {
+                width: raster.width,
+                height: raster.height,
+                pixels: raster.data.as_ref().to_vec(),
+                origin_clean: true,
+            }),
+            None if broken => ImageLookup::Invalid,
+            None if zero_size || !connected || !has_source => ImageLookup::NotReady,
+            // A connected SVG image that Blitz did not rasterize and did not
+            // mark broken has no usable pixels yet.
+            None => ImageLookup::NotReady,
+        });
+    }
+    if !(data.name.ns == crate::dom::tree::html_namespace() && data.name.local.as_str() == "img") {
+        return Some(ImageLookup::Unsupported);
+    }
+    let has_source = data.attrs().iter().any(|attribute| {
+        attribute.name.local.as_str() == "src" && !attribute.value.trim().is_empty()
+    });
+    let connected = crate::dom::tree::is_connected(&parsed.document.base, id.node);
+    match data.raster_image_data() {
+        Some(raster) => Some(ImageLookup::Decoded(SourceImage {
+            width: raster.width,
+            height: raster.height,
+            pixels: raster.data.as_ref().to_vec(),
+            origin_clean: true,
+        })),
+        // A connected missing resource is invalid; a zero-sized image, a
+        // detached image, or one with no source is not ready.
+        None if has_source && connected && !zero_size => Some(ImageLookup::Invalid),
+        None => Some(ImageLookup::NotReady),
+    }
 }
 
 // ---- text ----------------------------------------------------------------
@@ -2987,12 +3061,61 @@ fn style_value<'js>(
     }
 }
 
+/// Copies a gradient or pattern into the target canvas when the style comes
+/// from another canvas
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>).
+fn import_resource(
+    ctx: &Ctx<'_>,
+    target: &Object<'_>,
+    resource: &Object<'_>,
+    style: StyleValue,
+) -> Result<StyleValue> {
+    match style {
+        StyleValue::Gradient(id) => {
+            if with_canvas(ctx, target, |canvas| canvas.has_gradient(id))? {
+                return Ok(style);
+            }
+            let source = canvas_id(resource)?;
+            let definition = {
+                let world = world(ctx)?;
+                let registry = world.borrow().registry();
+                registry.borrow().canvas_gradient(source, id)
+            };
+            let Some(definition) = definition else {
+                return Ok(style);
+            };
+            Ok(StyleValue::Gradient(with_canvas(ctx, target, |canvas| {
+                canvas.insert_gradient(definition)
+            })?))
+        }
+        StyleValue::Pattern(id) => {
+            if with_canvas(ctx, target, |canvas| canvas.has_pattern(id))? {
+                return Ok(style);
+            }
+            let source = canvas_id(resource)?;
+            let definition = {
+                let world = world(ctx)?;
+                let registry = world.borrow().registry();
+                registry.borrow().canvas_pattern(source, id)
+            };
+            let Some(definition) = definition else {
+                return Ok(style);
+            };
+            Ok(StyleValue::Pattern(with_canvas(ctx, target, |canvas| {
+                canvas.insert_pattern(definition)
+            })?))
+        }
+        StyleValue::Color(_) => Ok(style),
+    }
+}
+
 fn set_style_value<'js>(
     ctx: &Ctx<'js>,
     object: &Object<'js>,
     value: Value<'js>,
     set: impl FnOnce(&mut Canvas2D, StyleValue),
 ) -> Result<()> {
+    let resource = value.as_object().cloned();
     let style = if let Some(string) = value.as_string() {
         let text = string.to_string()?;
         match css_color(ctx, object, &text)? {
@@ -3009,8 +3132,8 @@ fn set_style_value<'js>(
         .and_then(|object| resource_id(object, "Pattern"))
     {
         Some(StyleValue::Pattern(pattern))
-    } else if value.is_object() {
-        return Ok(());
+    } else if let Some(color) = value.as_object().and_then(color_object) {
+        Some(StyleValue::Color(color))
     } else {
         let text = Coerced::<rquickjs::String<'_>>::from_js(ctx, value)?.to_string()?;
         match css_color(ctx, object, &text)? {
@@ -3021,7 +3144,35 @@ fn set_style_value<'js>(
     let Some(style) = style else {
         return Ok(());
     };
+    let style = match resource {
+        Some(resource) => import_resource(ctx, object, &resource, style)?,
+        None => style,
+    };
     with_canvas(ctx, object, |canvas| set(canvas, style))
+}
+
+/// A color object is a dictionary with numeric `r`, `g`, and `b` in the
+/// 0..1 range, plus an optional `a`/`alpha`
+/// (<https://drafts.csswg.org/css-color-5/#color-conversion>).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "channels are clamped to 0..1 before scaling to 0..255"
+)]
+fn color_object(object: &Object<'_>) -> Option<[u8; 4]> {
+    let finite = |key: &str| {
+        object
+            .get::<_, Coerced<f64>>(key)
+            .ok()
+            .map(|value| *value)
+            .filter(|value| value.is_finite())
+    };
+    let r = finite("r")?;
+    let g = finite("g")?;
+    let b = finite("b")?;
+    let alpha = finite("a").or_else(|| finite("alpha")).unwrap_or(1.0);
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some([channel(r), channel(g), channel(b), channel(alpha)])
 }
 
 fn get_font(this: This<Object<'_>>) -> Result<Value<'_>> {

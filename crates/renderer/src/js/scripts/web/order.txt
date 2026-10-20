@@ -21,3 +21,5 @@ form_data.js
 input.js
 fonts.js
 canvas_filter.js
+css_color_api.js
+geometry.js
