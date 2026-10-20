@@ -1040,7 +1040,7 @@ impl Canvas2D {
         if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
             return;
         }
-        if width == 0.0 || height == 0.0 {
+        if width == 0.0 && height == 0.0 {
             return;
         }
         let Some(path) = self.rect_path(x, y, width, height) else {
@@ -1053,7 +1053,7 @@ impl Canvas2D {
         if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
             return;
         }
-        if width == 0.0 || height == 0.0 {
+        if width == 0.0 && height == 0.0 {
             return;
         }
         let Some(path) = self.rect_path(x, y, width, height) else {
@@ -1066,7 +1066,7 @@ impl Canvas2D {
         if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
             return;
         }
-        if width == 0.0 || height == 0.0 {
+        if width == 0.0 && height == 0.0 {
             return;
         }
         let Some(path) = self.rect_path(x, y, width, height) else {
