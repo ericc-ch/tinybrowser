@@ -167,7 +167,6 @@ impl SameObject {
 pub(crate) struct CanvasBitmap {
     pub width: u32,
     pub height: u32,
-    pub fill: [u8; 4],
     pub pixels: Vec<u8>,
 }
 
@@ -178,6 +177,21 @@ pub(crate) struct CanvasRect {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+/// Largest canvas backing store the renderer allocates. A page controls
+/// `canvas.width` and `canvas.height`, so an unchecked `width * height * 4`
+/// is a process abort, not a rendering bug.
+const MAX_CANVAS_BYTES: usize = 64 * 1024 * 1024;
+
+/// Byte length of a `width` x `height` RGBA bitmap, or `None` when it exceeds
+/// [`MAX_CANVAS_BYTES`] or would overflow.
+fn canvas_bytes(width: u32, height: u32) -> Option<usize> {
+    usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(4)
+        .filter(|bytes| *bytes <= MAX_CANVAS_BYTES)
 }
 
 /// Non-finite and negative canvas lengths become zero. Larger values saturate
@@ -217,6 +231,8 @@ impl RealmRegistry {
     /// Fills a rectangle of the canvas bitmap. The buffer is the canvas size
     /// in CSS pixels, transparent black until painted
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-bitmap>).
+    /// A canvas past the bitmap budget has no backing store, so drawing is a
+    /// no-op.
     pub(crate) fn fill_canvas(
         &mut self,
         id: NodeId,
@@ -225,8 +241,9 @@ impl RealmRegistry {
         rect: CanvasRect,
         color: [u8; 4],
     ) {
-        let bitmap = self.canvas_bitmap(id, width, height);
-        bitmap.fill = color;
+        let Some(bitmap) = self.canvas_bitmap(id, width, height) else {
+            return;
+        };
         let x0 = canvas_u32(rect.x.floor());
         let y0 = canvas_u32(rect.y.floor());
         let x1 = canvas_u32((rect.x + rect.width).ceil());
@@ -245,18 +262,19 @@ impl RealmRegistry {
         }
     }
 
-    /// Copies a rectangle out of the canvas bitmap.
+    /// Copies a rectangle out of the canvas bitmap. `None` means the request
+    /// exceeds the bitmap budget; the caller throws instead of allocating it.
     pub(crate) fn canvas_pixels(
         &mut self,
         id: NodeId,
         width: u32,
         height: u32,
         rect: CanvasRect,
-    ) -> Vec<u8> {
-        let bitmap = self.canvas_bitmap(id, width, height);
+    ) -> Option<Vec<u8>> {
+        let bitmap = self.canvas_bitmap(id, width, height)?;
         let sw = canvas_u32(rect.width.max(0.0).ceil());
         let sh = canvas_u32(rect.height.max(0.0).ceil());
-        let mut out = vec![0; (sw as usize) * (sh as usize) * 4];
+        let mut out = vec![0; canvas_bytes(sw, sh)?];
         let x0 = canvas_i32(rect.x.floor());
         let y0 = canvas_i32(rect.y.floor());
         for row in 0..sh {
@@ -280,12 +298,13 @@ impl RealmRegistry {
                 }
             }
         }
-        out
+        Some(out)
     }
 
-    fn canvas_bitmap(&mut self, id: NodeId, width: u32, height: u32) -> &mut CanvasBitmap {
+    fn canvas_bitmap(&mut self, id: NodeId, width: u32, height: u32) -> Option<&mut CanvasBitmap> {
         let width = width.max(1);
         let height = height.max(1);
+        let bytes = canvas_bytes(width, height)?;
         let stale = self
             .canvas_bitmaps
             .get(&id)
@@ -293,14 +312,15 @@ impl RealmRegistry {
         if stale {
             self.canvas_bitmaps.remove(&id);
         }
-        self.canvas_bitmaps
-            .entry(id)
-            .or_insert_with(|| CanvasBitmap {
-                width,
-                height,
-                fill: [0, 0, 0, 255],
-                pixels: vec![0; (width as usize) * (height as usize) * 4],
-            })
+        Some(
+            self.canvas_bitmaps
+                .entry(id)
+                .or_insert_with(|| CanvasBitmap {
+                    width,
+                    height,
+                    pixels: vec![0; bytes],
+                }),
+        )
     }
 
     /// The next process-unique `WebDriver` element id.
