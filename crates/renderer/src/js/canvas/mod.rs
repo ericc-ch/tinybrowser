@@ -374,6 +374,23 @@ fn f32_of(value: f64) -> f32 {
     value
 }
 
+/// `WebIDL` `[EnforceRange] long`: reject non-finite values and values outside
+/// the long range with `TypeError`, then truncate.
+fn enforce_long(ctx: &Ctx<'_>, value: f64) -> Result<i32> {
+    if !value.is_finite() {
+        return Err(Exception::throw_type(ctx, "value must be finite"));
+    }
+    let value = value.trunc();
+    if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
+        return Err(Exception::throw_type(ctx, "value is outside the long range"));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the value is finite, integral, and inside the i32 range"
+    )]
+    Ok(value as i32)
+}
+
 fn i32_of(value: f64) -> i32 {
     if !value.is_finite() {
         return 0;
@@ -1246,13 +1263,14 @@ fn get_image_data(
     sw: Coerced<f64>,
     sh: Coerced<f64>,
 ) -> Result<Value<'_>> {
-    if [*sx, *sy, *sw, *sh].iter().any(|value| !value.is_finite()) {
-        return Err(Exception::throw_type(
-            this.0.ctx(),
-            "getImageData arguments must be finite",
-        ));
-    }
-    if *sw == 0.0 || *sh == 0.0 {
+    // The IDL marks every argument `[EnforceRange] long`.
+    let (mut sx, mut sy, mut sw, mut sh) = (
+        f64::from(enforce_long(this.0.ctx(), *sx)?),
+        f64::from(enforce_long(this.0.ctx(), *sy)?),
+        f64::from(enforce_long(this.0.ctx(), *sw)?),
+        f64::from(enforce_long(this.0.ctx(), *sh)?),
+    );
+    if sw == 0.0 || sh == 0.0 {
         return Err(crate::js::bindings::throw_dom(
             this.0.ctx(),
             "IndexSizeError",
@@ -1261,7 +1279,6 @@ fn get_image_data(
     }
     // Negative extents move the origin and normalize, like Blink
     // (`base_rendering_context_2d.cc`, getImageDataInternal).
-    let (mut sx, mut sy, mut sw, mut sh) = (*sx, *sy, *sw, *sh);
     if sw < 0.0 {
         sx += sw;
         sw = -sw;
@@ -1307,30 +1324,24 @@ fn put_image_data<'js>(
             .ok_or_else(|| Exception::throw_type(ctx, "missing argument"))?;
         Ok(**value)
     };
-    let (dx, dy) = (number(0)?, number(1)?);
-    if !dx.is_finite() || !dy.is_finite() {
-        return Err(Exception::throw_type(
-            ctx,
-            "putImageData coordinates must be finite",
-        ));
-    }
+    let (dx, dy) = (
+        enforce_long(ctx, number(0)?)?,
+        enforce_long(ctx, number(1)?)?,
+    );
     let Some((width, height, pixels)) = read_image_data(&data)? else {
         return Err(Exception::throw_type(ctx, "putImageData expects ImageData"));
     };
     let dirty = match (number(2), number(3), number(4), number(5)) {
-        (Ok(x), Ok(y), Ok(width), Ok(height)) => {
-            if ![x, y, width, height].iter().all(|value| value.is_finite()) {
-                return Err(Exception::throw_type(
-                    ctx,
-                    "putImageData dirty rectangle must be finite",
-                ));
-            }
-            Some((i32_of(x), i32_of(y), i32_of(width), i32_of(height)))
-        }
+        (Ok(x), Ok(y), Ok(width), Ok(height)) => Some((
+            enforce_long(ctx, x)?,
+            enforce_long(ctx, y)?,
+            enforce_long(ctx, width)?,
+            enforce_long(ctx, height)?,
+        )),
         _ => None,
     };
     with_canvas(ctx, &this.0, |canvas| {
-        canvas.write_pixels(&pixels, width, height, i32_of(dx), i32_of(dy), dirty);
+        canvas.write_pixels(&pixels, width, height, dx, dy, dirty);
     })
 }
 
@@ -1344,16 +1355,11 @@ fn create_image_data<'js>(
     if let Some(second) = second.0 {
         let width = *Coerced::<f64>::from_js(ctx, first)?;
         let height = *second;
-        if !width.is_finite() || !height.is_finite() {
-            return Err(Exception::throw_type(
-                ctx,
-                "ImageData dimensions must be finite",
-            ));
-        }
         // Blink takes the absolute value of both dimensions
-        // (`BaseRenderingContext2D::createImageData`).
-        let width = canvas_u32(width.abs());
-        let height = canvas_u32(height.abs());
+        // (`BaseRenderingContext2D::createImageData`), but both are
+        // `[EnforceRange] long` first.
+        let width = enforce_long(ctx, width)?.unsigned_abs();
+        let height = enforce_long(ctx, height)?.unsigned_abs();
         if width == 0 || height == 0 {
             return Err(crate::js::bindings::throw_dom(
                 ctx,
