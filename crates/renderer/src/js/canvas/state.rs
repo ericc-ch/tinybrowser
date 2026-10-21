@@ -2072,6 +2072,7 @@ fn path_contains(path: &Path, rule: FillRule, point: Point) -> bool {
     let mut winding = 0_i32;
     let mut current = Point::zero();
     let mut subpath_start = Point::zero();
+    let mut subpath_open = false;
     let mut on_boundary = false;
     let mut edge = |a: Point, b: Point| {
         if point_on_segment(point, a, b) {
@@ -2088,8 +2089,13 @@ fn path_contains(path: &Path, rule: FillRule, point: Point) -> bool {
     for segment in path.segments() {
         match segment {
             tiny_skia::PathSegment::MoveTo(p) => {
+                // Filling closes every open subpath implicitly.
+                if subpath_open {
+                    edge(current, subpath_start);
+                }
                 current = p;
                 subpath_start = p;
+                subpath_open = true;
             }
             tiny_skia::PathSegment::LineTo(p) => {
                 edge(current, p);
@@ -2114,8 +2120,12 @@ fn path_contains(path: &Path, rule: FillRule, point: Point) -> bool {
             tiny_skia::PathSegment::Close => {
                 edge(current, subpath_start);
                 current = subpath_start;
+                subpath_open = false;
             }
         }
+    }
+    if subpath_open {
+        edge(current, subpath_start);
     }
     if on_boundary {
         return true;
@@ -2148,6 +2158,9 @@ fn flatten_quad(start: Point, control: Point, end: Point, out: &mut Vec<Point>) 
 }
 
 fn flatten_quad_at(start: Point, control: Point, end: Point, out: &mut Vec<Point>, depth: u32) {
+    if out.len() >= MAX_FLATTEN_POINTS {
+        return;
+    }
     if depth >= 16 || point_line_distance(control, start, end) <= FLATTEN_TOLERANCE {
         out.push(end);
         return;
@@ -2175,6 +2188,9 @@ fn flatten_cubic_at(
     out: &mut Vec<Point>,
     depth: u32,
 ) {
+    if out.len() >= MAX_FLATTEN_POINTS {
+        return;
+    }
     if depth >= 16
         || (point_line_distance(first, start, end) <= FLATTEN_TOLERANCE
             && point_line_distance(second, start, end) <= FLATTEN_TOLERANCE)
@@ -2215,6 +2231,10 @@ fn point_line_distance(point: Point, a: Point, b: Point) -> f32 {
 }
 
 const FLATTEN_TOLERANCE: f32 = 0.1;
+
+/// Cap flattened points per curve so a path with huge coordinates cannot
+/// allocate 65k points per segment inside a hit test.
+const MAX_FLATTEN_POINTS: usize = 4096;
 
 /// Drops subpaths with no extent before stroking. A zero-length subpath
 /// would otherwise paint a cap dot, but the spec prunes degenerate segments
@@ -2549,9 +2569,19 @@ mod tests {
     }
 
     #[test]
+    fn open_subpath_is_closed_for_containment() {
+        let mut canvas = Canvas2D::new(30, 30);
+        canvas.begin_path();
+        canvas.move_to(20.0, 0.0);
+        canvas.line_to(0.0, 0.0);
+        canvas.line_to(0.0, 20.0);
+        assert!(canvas.is_point_in_path(5.0, 10.0, false));
+    }
+
+    #[test]
     fn round_rect_leaves_a_subpath_at_its_origin() {
         let mut canvas = Canvas2D::new(100, 50);
-        canvas.round_rect(5.0, 6.0, 20.0, 10.0, &[2.0]);
+        canvas.round_rect(5.0, 6.0, 20.0, 10.0, &[(2.0, 2.0)]);
         let Some(Segment::MoveTo(origin)) = canvas.path.last() else {
             panic!("roundRect must leave a trailing move");
         };

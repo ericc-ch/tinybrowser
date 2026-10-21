@@ -1322,6 +1322,13 @@ impl World {
         self.runtime.documents.borrow()
     }
 
+    /// Whether this realm created the document `id` belongs to. Canvas
+    /// identity is carried by page-visible properties, so a forged pair must
+    /// not reach another frame's registry entry.
+    pub(crate) fn owns_node(&self, id: NodeId) -> bool {
+        self.owned.contains(&id.document)
+    }
+
     /// Runs `reader` against the tree owning `id`.
     ///
     /// Prefer this to [`World::document`] when a guard would outlive the

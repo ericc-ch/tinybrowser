@@ -316,9 +316,34 @@ fn with_canvas<R>(
     run: impl FnOnce(&mut Canvas2D) -> R,
 ) -> Result<R> {
     let id = canvas_id(object)?;
+    // `__tbDoc` and `__tbNode` are writable, so they carry a claim, not
+    // proof. Require a document this frame created and a real HTML canvas;
+    // otherwise a page could retarget another frame's canvas, or any element,
+    // in the shared registry.
+    let world = world(ctx)?;
+    {
+        let owner = world.borrow();
+        let is_canvas = owner
+            .with_document(id, |parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(id.node)
+                    .is_some_and(|node| {
+                        crate::dom::tree::is_html_tag(Some(&node.data), "canvas")
+                    })
+            })
+            .unwrap_or(false);
+        if !owner.owns_node(id) || !is_canvas {
+            return Err(crate::js::bindings::throw_dom(
+                ctx,
+                "InvalidStateError",
+                "canvas does not belong to this frame",
+            ));
+        }
+    }
     let width = canvas_dimension(ctx, id, "width", 300);
     let height = canvas_dimension(ctx, id, "height", 150);
-    let world = world(ctx)?;
     let registry = world.borrow().registry();
     let mut registry = registry.borrow_mut();
     let canvas = registry.canvas(id, width, height);
@@ -732,9 +757,17 @@ fn round_rect_radii(value: &Value<'_>) -> Result<Option<Vec<(f32, f32)>>> {
 /// missing members read zero.
 fn round_rect_radius(value: &Value<'_>) -> Result<Option<(f32, f32)>> {
     if let Some(object) = value.as_object() {
-        let x = object.get::<_, Coerced<f64>>("x").map(|x| f32_of(*x))?;
-        let y = object.get::<_, Coerced<f64>>("y").map(|y| f32_of(*y))?;
-        return Ok(Some((x, y)));
+        // WebIDL dictionary conversion: a missing or undefined member is 0,
+        // not NaN from ToNumber(undefined).
+        let read = |name: &str| -> Result<f32> {
+            let member: Value = object.get(name)?;
+            if member.is_undefined() || member.is_null() {
+                return Ok(0.0);
+            }
+            let number = Coerced::<f64>::from_js(value.ctx(), member)?;
+            Ok(f32_of(*number))
+        };
+        return Ok(Some((read("x")?, read("y")?)));
     }
     let number = Coerced::<f64>::from_js(value.ctx(), value.clone())?;
     let number = f32_of(*number);
@@ -1403,6 +1436,11 @@ fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<[u8; 4]> {
     let id = canvas_id(object)?;
     let world = world(ctx)?;
     let world = world.borrow();
+    // `__tbDoc`/`__tbNode` are writable; do not read another frame's
+    // stylesheet for a forged context.
+    if !world.owns_node(id) {
+        return Ok(BLACK);
+    }
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(BLACK);
     };
