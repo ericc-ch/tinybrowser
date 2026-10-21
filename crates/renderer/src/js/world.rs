@@ -16,7 +16,7 @@ use crate::dom::tree::{NodeId, attr, is_connected, is_iframe_element};
 use crate::dom_string::DomString;
 
 use crate::js::FrameRuntime;
-use crate::js::canvas::{Canvas2D, SourceImage};
+use crate::js::canvas::{Canvas2D, Gradient, Pattern, SourceImage};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
 use crate::storage::PendingStorageEvent;
@@ -269,6 +269,18 @@ impl RealmRegistry {
         })
     }
 
+    /// A gradient defined on another canvas, for cross-canvas styles
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#canvasgradient>).
+    pub(crate) fn canvas_gradient(&self, id: NodeId, resource: u32) -> Option<Gradient> {
+        self.canvases.get(&id)?.gradient_definition(resource)
+    }
+
+    /// A pattern defined on another canvas, for cross-canvas styles
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#canvaspattern>).
+    pub(crate) fn canvas_pattern(&self, id: NodeId, resource: u32) -> Option<Pattern> {
+        self.canvases.get(&id)?.pattern_definition(resource)
+    }
+
     /// The next process-unique `WebDriver` element id.
     pub(crate) fn allocate_remote(&mut self) -> u64 {
         self.next_remote = self.next_remote.saturating_add(1);
@@ -399,6 +411,9 @@ impl RealmRegistry {
         }
         if let Some(world) = self.creation_realms.remove(&from) {
             self.creation_realms.insert(to, world);
+        }
+        if let Some(canvas) = self.canvases.remove(&from) {
+            self.canvases.insert(to, canvas);
         }
     }
 

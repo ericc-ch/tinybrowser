@@ -71,10 +71,12 @@ fn parse_hex(hex: &str) -> Option<[u8; 4]> {
     }
 }
 
-/// Splits `name(...)` into its argument string, lowercased.
+/// Splits `name(...)` into its argument string, lowercased. A color function
+/// at EOF is closed by the parser, so the final `)` may be missing
+/// (<https://drafts.csswg.org/css-syntax-3/#consume-function>).
 fn function_args<'a>(input: &'a str, name: &str) -> Option<&'a str> {
     let rest = input.strip_prefix(name)?.strip_prefix('(')?;
-    rest.strip_suffix(')')
+    Some(rest.strip_suffix(')').unwrap_or(rest))
 }
 
 /// One color function's components, separated by commas or whitespace, with
@@ -82,6 +84,8 @@ fn function_args<'a>(input: &'a str, name: &str) -> Option<&'a str> {
 struct Args {
     components: Vec<String>,
     alpha: Option<String>,
+    /// Legacy comma-separated syntax, which cannot carry a `/` alpha.
+    comma: bool,
 }
 
 fn split_args(input: &str) -> Args {
@@ -89,16 +93,37 @@ fn split_args(input: &str) -> Args {
         Some((body, alpha)) => (body, Some(alpha.trim().to_owned())),
         None => (input, None),
     };
-    let components = if body.contains(',') {
+    let comma = body.contains(',');
+    let components = if comma {
         body.split(',').map(|part| part.trim().to_owned()).collect()
     } else {
         body.split_whitespace().map(ToOwned::to_owned).collect()
     };
-    Args { components, alpha }
+    Args {
+        components,
+        alpha,
+        comma,
+    }
 }
 
+/// A CSS number. Values beyond `f32` are saturated instead of rejected so
+/// `rgb()` clamps them like any other out-of-range component
+/// (<https://drafts.csswg.org/css-syntax-3/#consume-number>).
 fn number(text: &str) -> Option<f32> {
-    text.parse::<f32>().ok().filter(|value| value.is_finite())
+    // `1.` is not a CSS number; the digit after the dot is mandatory.
+    if text.ends_with('.') {
+        return None;
+    }
+    let value = text.parse::<f64>().ok()?;
+    if value.is_nan() {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the value is saturated to the f32 range before any channel clamp"
+    )]
+    let value = value.clamp(-1.0e30, 1.0e30) as f32;
+    Some(value)
 }
 
 fn percentage(text: &str) -> Option<f32> {
@@ -138,7 +163,20 @@ fn legacy_alpha(args: &Args) -> Option<(&[String], Option<&str>)> {
 }
 
 fn parse_rgb(args: &Args) -> Option<[u8; 4]> {
+    if args.comma && args.alpha.is_some() {
+        return None;
+    }
     let (components, alpha_text) = legacy_alpha(args)?;
+    if args.comma {
+        // Legacy comma syntax cannot mix percentages and numbers.
+        let percentages = components[0].ends_with('%');
+        if components
+            .iter()
+            .any(|component| component.ends_with('%') != percentages)
+        {
+            return None;
+        }
+    }
     let mut rgb = [0u8; 3];
     for (slot, text) in rgb.iter_mut().zip(components) {
         *slot = channel(rgb_component(text)?);
@@ -162,6 +200,9 @@ fn hue(text: &str) -> Option<f32> {
 }
 
 fn parse_hsl(args: &Args) -> Option<[u8; 4]> {
+    if args.comma && args.alpha.is_some() {
+        return None;
+    }
     let (components, alpha_text) = legacy_alpha(args)?;
     let hue = hue(&components[0])? / 360.0;
     let saturation = percentage(&components[1])?.clamp(0.0, 1.0);
@@ -202,6 +243,9 @@ fn hue_to_rgb(low: f32, high: f32, position: f32) -> f32 {
 }
 
 fn parse_hwb(args: &Args) -> Option<[u8; 4]> {
+    if args.comma && args.alpha.is_some() {
+        return None;
+    }
     let (components, alpha_text) = legacy_alpha(args)?;
     let hue = hue(&components[0])? / 360.0;
     let whiteness = percentage(&components[1])?.clamp(0.0, 1.0);
@@ -218,8 +262,59 @@ fn parse_hwb(args: &Args) -> Option<[u8; 4]> {
 }
 
 fn named(name: &str) -> Option<[u8; 4]> {
-    let rgb = NAMED.iter().find(|(key, _)| *key == name)?.1.to_be_bytes();
-    Some([rgb[1], rgb[2], rgb[3], 255])
+    if let Some(rgb) = NAMED.iter().find(|(key, _)| *key == name) {
+        let rgb = rgb.1.to_be_bytes();
+        return Some([rgb[1], rgb[2], rgb[3], 255]);
+    }
+    // CSS system colors resolve to the UA's palette. tinybrowser has no theme,
+    // so they resolve to black; the important part is that they parse
+    // (<https://drafts.csswg.org/css-color-4/#css-system-colors>).
+    matches!(
+        name,
+        "accentcolor"
+            | "accentcolortext"
+            | "activetext"
+            | "buttonborder"
+            | "buttonface"
+            | "buttontext"
+            | "canvas"
+            | "canvastext"
+            | "field"
+            | "fieldtext"
+            | "graytext"
+            | "highlight"
+            | "highlighttext"
+            | "linktext"
+            | "mark"
+            | "marktext"
+            | "selecteditem"
+            | "selecteditemtext"
+            | "visitedtext"
+            | "activeborder"
+            | "activecaption"
+            | "appworkspace"
+            | "background"
+            | "buttonhighlight"
+            | "buttonshadow"
+            | "captiontext"
+            | "inactiveborder"
+            | "inactivecaption"
+            | "inactivecaptiontext"
+            | "infobackground"
+            | "infotext"
+            | "menu"
+            | "menutext"
+            | "scrollbar"
+            | "threeddarkshadow"
+            | "threedface"
+            | "threedhighlight"
+            | "threedlightshadow"
+            | "threedshadow"
+            | "window"
+            | "windowframe"
+            | "windowtext"
+    )
+    .then_some([0, 0, 0, 255])
 }
 
 /// CSS named colors, `0xRRGGBB`.
