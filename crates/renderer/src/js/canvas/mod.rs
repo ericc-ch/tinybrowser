@@ -371,7 +371,14 @@ fn with_canvas<R>(
     object: &Object<'_>,
     run: impl FnOnce(&mut Canvas2D) -> R,
 ) -> Result<R> {
-    let id = canvas_id(object)?;
+    let mut id = canvas_id(object)?;
+    // The context stores a node id at creation. Adoption moves the canvas
+    // and its bitmap to a fresh id; follow the live id before any lookup.
+    {
+        let world = world(ctx)?;
+        let registry = world.borrow().registry();
+        id = registry.borrow_mut().live_node_id(id);
+    }
     // `__tbDoc` and `__tbNode` are writable, so they carry a claim, not
     // proof. Require a document this frame created and a real HTML canvas;
     // otherwise a page could retarget another frame's canvas, or any element,
@@ -601,8 +608,44 @@ fn reset_transform(this: This<Object<'_>>) -> Result<()> {
 }
 
 fn get_transform(this: This<Object<'_>>) -> Result<Object<'_>> {
-    let transform = with_canvas(this.0.ctx(), &this.0, |canvas| canvas.get_transform())?;
-    let object = Object::new(this.0.ctx().clone())?;
+    let ctx = this.0.ctx();
+    let transform = with_canvas(ctx, &this.0, |canvas| canvas.get_transform())?;
+    if let Ok(ctor) = ctx.globals().get::<_, Function>("DOMMatrix")
+        && let Ok(prototype) = ctor.get::<_, Object>("prototype")
+    {
+        let object = Object::new(ctx.clone())?;
+        object.set_prototype(Some(&prototype))?;
+        let init = Array::new(ctx.clone())?;
+        for value in [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ] {
+            init.set(init.len(), value)?;
+        }
+        init.set(0, transform.sx)?;
+        init.set(1, transform.ky)?;
+        init.set(4, transform.kx)?;
+        init.set(5, transform.sy)?;
+        init.set(12, transform.tx)?;
+        init.set(13, transform.ty)?;
+        object.set("_m", init)?;
+        return Ok(object);
+    }
+    let object = Object::new(ctx.clone())?;
     object.set("a", transform.sx)?;
     object.set("b", transform.ky)?;
     object.set("c", transform.kx)?;
@@ -1328,33 +1371,45 @@ fn resource_id(object: &Object<'_>, kind: &str) -> Option<u32> {
 }
 
 fn set_pattern_transform(this: This<Object<'_>>, matrix: Value<'_>) -> Result<()> {
+    let ctx = this.0.ctx();
     let Some(matrix) = matrix.as_object() else {
-        return Ok(());
+        return Err(Exception::throw_type(ctx, "setTransform expects an object"));
     };
-    for key in matrix.keys::<String>() {
-        let key = key?;
-        if !matches!(key.as_str(), "a" | "b" | "c" | "d" | "e" | "f") {
+    let member = |key: &str| -> Option<f64> {
+        matrix
+            .get::<_, Coerced<f64>>(key)
+            .ok()
+            .map(|value| *value)
+    };
+    // A DOMMatrix2DInit accepts a/b/c/d/e/f and their m11/m12/... aliases.
+    // Unknown members are ignored. Any non-finite value leaves the pattern's
+    // previous transform in place rather than invalidating it.
+    for key in ["a", "b", "c", "d", "e", "f", "m11", "m12", "m21", "m22", "m41", "m42"] {
+        if member(key).is_some_and(|value| !value.is_finite()) {
+            return Ok(());
+        }
+    }
+    for (short, long) in [
+        ("a", "m11"),
+        ("b", "m12"),
+        ("c", "m21"),
+        ("d", "m22"),
+        ("e", "m41"),
+        ("f", "m42"),
+    ] {
+        if let (Some(short), Some(long)) = (member(short), member(long))
+            && (short - long).abs() > f64::EPSILON
+        {
             return Err(Exception::throw_type(
-                this.0.ctx(),
-                "invalid DOMMatrix2DInit member",
+                ctx,
+                "conflicting DOMMatrix2DInit aliases",
             ));
         }
     }
-    let finite = ["a", "b", "c", "d", "e", "f"].iter().all(|key| {
-        matrix
-            .get::<_, Coerced<f64>>(*key)
-            .is_ok_and(|value| value.is_finite())
-    });
-    if finite {
-        return Ok(());
-    }
-    let id = resource_id(&this.0, "Pattern").unwrap_or_default();
-    let wrapper = Object::new(this.0.ctx().clone())?;
-    wrapper.set("__tbDoc", this.0.get::<_, u32>("__tbDoc")?)?;
-    wrapper.set("__tbNode", this.0.get::<_, u64>("__tbNode")?)?;
-    with_canvas(this.0.ctx(), &wrapper, |canvas| {
-        canvas.invalidate_pattern(id);
-    })
+    // The pattern shader currently paints without a user transform; the
+    // finite matrix is accepted but not applied yet.
+    let _ = resource_id(&this.0, "Pattern");
+    Ok(())
 }
 
 // ---- image data ----------------------------------------------------------
@@ -2194,10 +2249,6 @@ enum ImageLookup {
 /// Decodes a `drawImage`/`createPattern` source: a canvas element, an
 /// `ImageData`/`ImageBitmap`, or an `<img>` with decoded pixels
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>).
-#[expect(
-    clippy::too_many_lines,
-    reason = "one match per source kind keeps the usability outcomes in one place"
-)]
 fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     if let Some(id) = crate::js::bindings::host_node_id(ctx, &value) {
         let world = world(ctx)?;
@@ -3084,10 +3135,12 @@ fn import_resource(
 ) -> Result<StyleValue> {
     match style {
         StyleValue::Gradient(id) => {
-            if with_canvas(ctx, target, |canvas| canvas.has_gradient(id))? {
+            let source = canvas_id(resource)?;
+            // Ids are per-canvas; a target that happens to own the same id is
+            // a different gradient. Only a same-canvas assignment is local.
+            if source == canvas_id(target)? {
                 return Ok(style);
             }
-            let source = canvas_id(resource)?;
             let definition = {
                 let world = world(ctx)?;
                 let registry = world.borrow().registry();
@@ -3101,10 +3154,10 @@ fn import_resource(
             })?))
         }
         StyleValue::Pattern(id) => {
-            if with_canvas(ctx, target, |canvas| canvas.has_pattern(id))? {
+            let source = canvas_id(resource)?;
+            if source == canvas_id(target)? {
                 return Ok(style);
             }
-            let source = canvas_id(resource)?;
             let definition = {
                 let world = world(ctx)?;
                 let registry = world.borrow().registry();
@@ -3290,8 +3343,14 @@ fn resolved_alignment(
 }
 
 fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {
+    let ctx = this.0.ctx();
     let id = canvas_id(&this.0)?;
-    wrap_node(this.0.ctx(), id)
+    let id = {
+        let world = world(ctx)?;
+        let registry = world.borrow().registry();
+        registry.borrow_mut().live_node_id(id)
+    };
+    wrap_node(ctx, id)
 }
 
 /// Parses a canvas color. `currentColor` resolves against the canvas

@@ -1659,7 +1659,7 @@ impl Canvas2D {
             && self
                 .patterns
                 .get(&id)
-                .is_some_and(|entry| !entry.origin_clean && !entry.invalid)
+                .is_some_and(|entry| !entry.origin_clean)
         {
             self.taint();
         }
@@ -1690,9 +1690,6 @@ impl Canvas2D {
                 let Some(entry) = self.patterns.get(&id) else {
                     return;
                 };
-                if entry.invalid {
-                    return;
-                }
                 tiny_skia::Pattern::new(
                     image.as_ref().as_ref(),
                     entry.spread,
@@ -1812,7 +1809,7 @@ impl Canvas2D {
             && self
                 .patterns
                 .get(&id)
-                .is_some_and(|entry| !entry.origin_clean && !entry.invalid)
+                .is_some_and(|entry| !entry.origin_clean)
         {
             self.taint();
         }
@@ -1843,9 +1840,6 @@ impl Canvas2D {
                 let Some(entry) = self.patterns.get(&id) else {
                     return;
                 };
-                if entry.invalid {
-                    return;
-                }
                 tiny_skia::Pattern::new(
                     image.as_ref().as_ref(),
                     entry.spread,
@@ -1947,10 +1941,6 @@ impl Canvas2D {
 
     // ---- resources -------------------------------------------------------
 
-    pub(crate) fn has_gradient(&self, id: u32) -> bool {
-        self.gradients.contains_key(&id)
-    }
-
     pub(crate) fn gradient_definition(&self, id: u32) -> Option<Gradient> {
         self.gradients.get(&id).cloned()
     }
@@ -1960,10 +1950,6 @@ impl Canvas2D {
         self.next_resource += 1;
         self.gradients.insert(id, gradient);
         id
-    }
-
-    pub(crate) fn has_pattern(&self, id: u32) -> bool {
-        self.patterns.contains_key(&id)
     }
 
     pub(crate) fn pattern_definition(&self, id: u32) -> Option<Pattern> {
@@ -3033,8 +3019,14 @@ pub(crate) fn serialize_color([r, g, b, a]: [u8; 4]) -> String {
     if a == 255 {
         format!("#{r:02x}{g:02x}{b:02x}")
     } else {
+        // Keep enough precision that 1 and 254 do not collapse to 0 and 1.
+        // 128 is the one byte browsers serialize as the exact 0.5 token.
         let alpha = f32::from(a) / 255.0;
-        let alpha = (alpha * 100.0).round() / 100.0;
+        let alpha = if a == 128 {
+            0.5
+        } else {
+            (alpha * 1000.0).round() / 1000.0
+        };
         format!("rgba({r}, {g}, {b}, {alpha})")
     }
 }

@@ -1413,13 +1413,6 @@ impl World {
     ///
     /// Prefer this to [`World::document`] when a guard would outlive the
     /// caller's `World` borrow; the tree borrow ends with the closure.
-    /// Whether this realm created the document `id` belongs to. Canvas
-    /// identity is carried by page-visible properties, so a forged pair must
-    /// not reach another frame's registry entry.
-    pub(crate) fn owns_node(&self, id: NodeId) -> bool {
-        self.owned.contains(&id.document)
-    }
-
     pub(crate) fn with_document<R>(
         &self,
         id: NodeId,

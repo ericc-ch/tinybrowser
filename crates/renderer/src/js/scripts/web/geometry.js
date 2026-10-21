@@ -12,7 +12,20 @@
   function values(init) {
     var matrix = identity();
     if (Array.isArray(init)) {
-      for (var index = 0; index < 16 && index < init.length; index += 1) {
+      if (init.length === 6) {
+        // 2D sequence order: m11, m12, m21, m22, m41, m42.
+        matrix[0] = Number(init[0]);
+        matrix[1] = Number(init[1]);
+        matrix[4] = Number(init[2]);
+        matrix[5] = Number(init[3]);
+        matrix[12] = Number(init[4]);
+        matrix[13] = Number(init[5]);
+        return matrix;
+      }
+      if (init.length !== 16) {
+        throw new TypeError('DOMMatrix sequence must have 6 or 16 elements');
+      }
+      for (var index = 0; index < 16; index += 1) {
         matrix[index] = Number(init[index]);
       }
       return matrix;
