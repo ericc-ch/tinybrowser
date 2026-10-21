@@ -123,15 +123,67 @@ fn canvas_to_blob_bytes<'js>(
     Ok(canvas_png(&ctx, &source)?.unwrap_or_default())
 }
 
+/// `OffscreenCanvas.transferToImageBitmap()`: snapshot the bitmap, reset the
+/// canvas to transparent black, and wrap the pixels in an `ImageBitmap`
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-transfertoimagebitmap>).
+fn canvas_transfer_to_image_bitmap<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Value<'js>> {
+    let node = source
+        .as_object()
+        .and_then(|object| object.get::<_, Value>("__tbCanvas").ok())
+        .filter(|hidden| !hidden.is_undefined() && !hidden.is_null())
+        .unwrap_or_else(|| source.clone());
+    let Some(id) = crate::js::bindings::host_node_id(&ctx, &node) else {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "the canvas is not usable",
+        ));
+    };
+    let width = canvas_dimension(&ctx, id, "width", 300);
+    let height = canvas_dimension(&ctx, id, "height", 150);
+    let image = {
+        let world = world(&ctx)?;
+        let registry = world.borrow().registry();
+        let mut registry = registry.borrow_mut();
+        if registry.canvas(id, width, height).has_open_layer() {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "a layer is open",
+            ));
+        }
+        let Some(image) = registry.canvas_snapshot(id) else {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "the canvas has no bitmap",
+            ));
+        };
+        registry.canvas(id, width, height).reset();
+        image
+    };
+    image_bitmap_object(
+        &ctx,
+        image.width,
+        image.height,
+        image.pixels,
+        image.origin_clean,
+    )
+}
+
 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
     ctx.globals()
         .set("__tbCanvasToDataURL", Func::from(canvas_to_data_url))?;
     ctx.globals()
         .set("__tbCanvasToBlobBytes", Func::from(canvas_to_blob_bytes))?;
+    ctx.globals().set(
+        "__tbCanvasTransferToImageBitmap",
+        Func::from(canvas_transfer_to_image_bitmap),
+    )?;
     let ctor = Function::new(ctx.clone(), || {})?;
     let prototype = Object::new(ctx.clone())?;
     install_members(ctx, &prototype)?;
-    ctor.set("prototype", prototype)?;
+    ctor.prop("prototype", prototype)?;
     ctx.globals().set("CanvasRenderingContext2D", ctor)?;
     install_gradient_objects(ctx)?;
     install_path2d(ctx)?;

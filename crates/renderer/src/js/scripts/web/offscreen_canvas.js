@@ -27,7 +27,11 @@
       writable: true,
       value: OffscreenCanvasRenderingContext2D,
     });
-    OffscreenCanvasRenderingContext2D.prototype = prototype;
+    Object.defineProperty(OffscreenCanvasRenderingContext2D, 'prototype', {
+      value: prototype,
+      writable: false,
+      configurable: false,
+    });
     globalThis.OffscreenCanvasRenderingContext2D = OffscreenCanvasRenderingContext2D;
     offscreenPrototype = prototype;
   }
@@ -89,7 +93,7 @@
     }
 
     transferToImageBitmap() {
-      throw new DOMException('transferToImageBitmap is not implemented', 'NotSupportedError');
+      return globalThis.__tbCanvasTransferToImageBitmap(this.__tbCanvas);
     }
 
     convertToBlob(options) {
