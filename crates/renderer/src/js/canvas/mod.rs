@@ -66,7 +66,7 @@ fn install_gradient_objects(ctx: &Ctx<'_>) -> Result<()> {
     for name in ["CanvasGradient", "CanvasPattern"] {
         let prototype = Object::new(ctx.clone())?;
         if name == "CanvasGradient" {
-            prototype.prop("addColorStop", Func::from(add_color_stop))?;
+            prototype.set("addColorStop", Func::from(add_color_stop))?;
         }
         let ctor = Function::new(ctx.clone(), || {})?;
         ctor.set("prototype", prototype.clone())?;
@@ -139,7 +139,7 @@ fn install_methods<'js>(ctx: &Ctx<'js>, prototype: &Object<'js>) -> Result<()> {
 
     method!("createLinearGradient", 4, create_linear_gradient);
     method!("createRadialGradient", 6, create_radial_gradient);
-    method!("createConicGradient", 2, create_conic_gradient);
+    method!("createConicGradient", 3, create_conic_gradient);
     method!("createPattern", 2, create_pattern);
 
     method!("getImageData", 4, get_image_data);
@@ -1062,8 +1062,16 @@ fn resource_object<'js>(this: &Object<'js>, kind: &str, id: u32) -> Result<Value
     } else {
         "CanvasPattern"
     };
-    let ctor: Function = this.ctx().globals().get(ctor_name)?;
-    let prototype: Object = ctor.get("prototype")?;
+    // Use the intrinsic prototype captured at install time. The global is
+    // page-writable, the intrinsic is not.
+    let prototype: Object = if let Some(prototype) =
+        world(this.ctx())?.borrow().brand(ctor_name)
+    {
+        prototype.restore(this.ctx())?
+    } else {
+        let ctor: Function = this.ctx().globals().get(ctor_name)?;
+        ctor.get("prototype")?
+    };
     object.set_prototype(Some(&prototype))?;
     object.set("__tbDoc", this.get::<_, u32>("__tbDoc")?)?;
     object.set("__tbNode", this.get::<_, u64>("__tbNode")?)?;
@@ -1081,6 +1089,15 @@ fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString
             "color stop offset must be finite",
         ));
     }
+    // The offset check precedes color parsing, so an out-of-range offset
+    // reports IndexSizeError even when the color is also invalid.
+    if !(0.0..=1.0).contains(&*offset) {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "IndexSizeError",
+            "offset out of range",
+        ));
+    }
     // `currentColor` in a gradient stop resolves to opaque black: canvas
     // color stops do not inherit the element's CSS color
     // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvasgradient-addcolorstop>).
@@ -1095,13 +1112,6 @@ fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString
             "invalid color for addColorStop",
         ));
     };
-    if !(0.0..=1.0).contains(&*offset) {
-        return Err(crate::js::bindings::throw_dom(
-            this.0.ctx(),
-            "IndexSizeError",
-            "offset out of range",
-        ));
-    }
     let object = this.0.clone();
     let id_wrapper = Object::new(this.0.ctx().clone())?;
     id_wrapper.set("__tbDoc", object.get::<_, u32>("__tbDoc")?)?;
