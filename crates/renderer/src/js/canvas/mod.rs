@@ -19,6 +19,7 @@ mod text;
 
 pub(crate) use state::{Canvas2D, Gradient, Pattern, SourceImage, StyleValue};
 
+use base64::Engine as _;
 use rquickjs::function::This;
 use rquickjs::object::Accessor;
 use rquickjs::prelude::{Func, Opt};
@@ -52,7 +53,81 @@ impl<'js> FromJs<'js> for DomString {
 }
 
 /// Builds the `CanvasRenderingContext2D` constructor and its prototype.
+/// Encodes a canvas element's bitmap as PNG. `None` means an unsupported or
+/// zero-sized canvas, which `toDataURL` reports as `data:,`.
+fn canvas_png<'js>(ctx: &Ctx<'js>, source: &Value<'js>) -> Result<Option<Vec<u8>>> {
+    let node = source
+        .as_object()
+        .and_then(|object| object.get::<_, Value>("__tbCanvas").ok())
+        .filter(|hidden| !hidden.is_undefined() && !hidden.is_null())
+        .unwrap_or_else(|| source.clone());
+    let Some(id) = crate::js::bindings::host_node_id(ctx, &node) else {
+        return Ok(None);
+    };
+    let width = canvas_dimension(ctx, id, "width", 300);
+    let height = canvas_dimension(ctx, id, "height", 150);
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    let world = world(ctx)?;
+    let registry = world.borrow().registry();
+    let mut registry = registry.borrow_mut();
+    let canvas = registry.canvas(id, width, height);
+    if canvas.has_open_layer() {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "InvalidStateError",
+            "a layer is open",
+        ));
+    }
+    Ok(canvas.to_png())
+}
+
+fn canvas_to_data_url<'js>(
+    ctx: Ctx<'js>,
+    source: Value<'js>,
+    mime: Opt<Value<'js>>,
+    _quality: Opt<Value<'js>>,
+) -> Result<String> {
+    let mime = mime
+        .0
+        .as_ref()
+        .and_then(Value::as_string)
+        .map(|mime| mime.to_string().unwrap_or_default());
+    if mime.as_deref().is_some_and(|mime| mime != "image/png") {
+        return Ok("data:,".to_owned());
+    }
+    let Some(png) = canvas_png(&ctx, &source)? else {
+        return Ok("data:,".to_owned());
+    };
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    ))
+}
+
+fn canvas_to_blob_bytes<'js>(
+    ctx: Ctx<'js>,
+    source: Value<'js>,
+    mime: Opt<Value<'js>>,
+    _quality: Opt<Value<'js>>,
+) -> Result<Vec<u8>> {
+    let mime = mime
+        .0
+        .as_ref()
+        .and_then(Value::as_string)
+        .map(|mime| mime.to_string().unwrap_or_default());
+    if mime.as_deref().is_some_and(|mime| mime != "image/png") {
+        return Ok(Vec::new());
+    }
+    Ok(canvas_png(&ctx, &source)?.unwrap_or_default())
+}
+
 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
+    ctx.globals()
+        .set("__tbCanvasToDataURL", Func::from(canvas_to_data_url))?;
+    ctx.globals()
+        .set("__tbCanvasToBlobBytes", Func::from(canvas_to_blob_bytes))?;
     let ctor = Function::new(ctx.clone(), || {})?;
     let prototype = Object::new(ctx.clone())?;
     install_members(ctx, &prototype)?;
@@ -2731,11 +2806,11 @@ fn get_text_clusters<'js>(
     let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
     let width = shaped.width * shaped.scale_x;
     let x = match resolved {
-        "center" => -width / 2.0,
-        "right" | "end" => -width,
+        "center" => width / 2.0,
+        "right" | "end" => width,
         _ => 0.0,
     };
-    let y = match baseline.as_str() {
+    let baseline_offset = match baseline.as_str() {
         "top" => 0.0,
         "hanging" => shaped.hanging_baseline - shaped.ascent,
         "middle" => -(shaped.ascent + shaped.descent) / 2.0,
@@ -2743,6 +2818,9 @@ fn get_text_clusters<'js>(
         "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
         _ => -shaped.ascent,
     };
+    // Cluster coordinates are measured downward/rightward from the text
+    // origin, not from the drawing anchor.
+    let y = -baseline_offset;
     let array = Array::new(ctx.clone())?;
     for cluster in &shaped.clusters {
         if cluster.utf16_start < start || cluster.utf16_end > end {
@@ -2848,14 +2926,50 @@ fn get_actual_bounding_box<'js>(
     Ok(object)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "range parsing, shaping, alignment, and run grouping stay together"
+)]
 fn get_selection_rects<'js>(
     this: This<Object<'js>>,
     args: rquickjs::function::Rest<Value<'js>>,
 ) -> Result<Array<'js>> {
     let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
-    let (start, end) = text_range(ctx, &text, &args.0, false)?;
-    if start == end {
+    let length = text.encode_utf16().count();
+    let cursor = usize::from(
+        args.0
+            .first()
+            .is_some_and(|value| value.is_object() && !value.is_null()),
+    );
+    let start = args
+        .0
+        .get(cursor)
+        .ok_or_else(|| Exception::throw_type(ctx, "getSelectionRects needs a start"))?;
+    let end = args
+        .0
+        .get(cursor + 1)
+        .ok_or_else(|| Exception::throw_type(ctx, "getSelectionRects needs an end"))?;
+    let start = *Coerced::<f64>::from_js(ctx, start.clone())?;
+    let end = *Coerced::<f64>::from_js(ctx, end.clone())?;
+    if start < 0.0 || end < 0.0 {
+        return Err(Exception::throw_type(ctx, "indices must be non-negative"));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "indices were checked non-negative and within the UTF-16 length"
+    )]
+    let (start, end) = (start as usize, end as usize);
+    if start > length || end > length {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "IndexSizeError",
+            "index is outside the text",
+        ));
+    }
+    // A reversed or empty range has no selection.
+    if start >= end {
         return Array::new(ctx.clone());
     }
     let font: String = this.0.get("__tbFont")?;
@@ -2932,13 +3046,22 @@ fn get_selection_rects<'js>(
             runs.push((left, right));
         }
     }
+    let shift = -shaped.ascent - baseline_dy;
+    let top = -shaped.font_ascent - shift;
+    let bottom = shaped.font_descent - shift;
     let array = Array::new(ctx.clone())?;
     for (left, right) in runs {
         let rect = Object::new(ctx.clone())?;
-        rect.set("x", align_dx + left)?;
-        rect.set("y", baseline_dy)?;
-        rect.set("width", right - left)?;
-        rect.set("height", shaped.ascent + shaped.descent)?;
+        let x = align_dx + left;
+        let width = right - left;
+        rect.set("x", x)?;
+        rect.set("y", top)?;
+        rect.set("width", width)?;
+        rect.set("height", bottom - top)?;
+        rect.set("left", x)?;
+        rect.set("right", x + width)?;
+        rect.set("top", top)?;
+        rect.set("bottom", bottom)?;
         array.set(array.len(), rect)?;
     }
     Ok(array)

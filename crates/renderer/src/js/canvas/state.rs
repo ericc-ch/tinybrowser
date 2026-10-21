@@ -18,7 +18,8 @@ const KAPPA: f32 = 0.552_284_8;
 
 use tiny_skia::{
     BlendMode, Color, ColorU8, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, Mask,
-    Paint, Path, PathBuilder, Pixmap, Point, Shader, SpreadMode, Stroke, StrokeDash, Transform,
+    Paint, Path, PathBuilder, Pixmap, PixmapPaint, Point, Shader, SpreadMode, Stroke, StrokeDash,
+    Transform,
 };
 
 /// One canvas rendering context.
@@ -39,9 +40,10 @@ pub(crate) struct Canvas2D {
     /// `SecurityError`
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
     origin_clean: bool,
-    /// Save-stack depths where each open layer started
+    /// Open layers, each with its parent bitmap and the state captured at
+    /// `beginLayer`
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-beginlayer>).
-    layers: Vec<usize>,
+    layers: Vec<Layer>,
 }
 
 /// Canvas spacing accepts only a CSS length; the unit is serialized in lower
@@ -179,6 +181,12 @@ enum GradientKind {
         center: Point,
         angle: f32,
     },
+}
+
+struct Layer {
+    base: usize,
+    parent: Option<Pixmap>,
+    state: State,
 }
 
 #[derive(Clone)]
@@ -327,6 +335,10 @@ impl Canvas2D {
     /// `ctx.reset()`: clear the bitmap and return to the default state
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-reset>).
     pub(crate) fn reset(&mut self) {
+        // Dropping an open layer must not leave its bitmap as the canvas.
+        while let Some(layer) = self.layers.pop() {
+            self.pixmap = layer.parent;
+        }
         if let Some(pixmap) = &mut self.pixmap {
             pixmap.fill(Color::TRANSPARENT);
         }
@@ -358,7 +370,7 @@ impl Canvas2D {
         if self
             .layers
             .last()
-            .is_some_and(|base| self.stack.len() <= base + 1)
+            .is_some_and(|layer| self.stack.len() <= layer.base + 1)
         {
             return false;
         }
@@ -368,12 +380,20 @@ impl Canvas2D {
         true
     }
 
-    /// Opens a layer: the rendering state resets inside it, and `endLayer`
-    /// restores the state captured here.
+    /// Opens a layer: drawing goes to a fresh transparent bitmap, the
+    /// rendering state resets inside it, and `endLayer` composites the bitmap
+    /// with the state captured here.
     pub(crate) fn begin_layer(&mut self) {
         let base = self.stack.len();
-        self.stack.push(self.state.clone());
-        self.layers.push(base);
+        let captured = self.state.clone();
+        let parent = self.pixmap.take();
+        self.pixmap = make_pixmap(self.width, self.height);
+        self.layers.push(Layer {
+            base,
+            parent,
+            state: captured.clone(),
+        });
+        self.stack.push(captured);
         self.state.alpha = 1.0;
         self.state.blend = BlendMode::SourceOver;
         self.state.shadow_color = [0, 0, 0, 0];
@@ -386,16 +406,40 @@ impl Canvas2D {
     /// Closes the innermost layer, unless a `save()` opened after it is still
     /// unbalanced.
     pub(crate) fn end_layer(&mut self) -> bool {
-        let Some(base) = self.layers.last().copied() else {
+        let Some(base) = self.layers.last().map(|layer| layer.base) else {
             return false;
         };
         if self.stack.len() != base + 1 {
             return false;
         }
-        self.layers.pop();
-        if let Some(state) = self.stack.pop() {
-            self.state = state;
+        let Some(layer) = self.layers.pop() else {
+            return false;
+        };
+        let Layer {
+            mut parent,
+            state,
+            ..
+        } = layer;
+        let layer_pixmap = self.pixmap.take();
+        if let (Some(mut parent_pixmap), Some(layer_pixmap)) = (parent.take(), layer_pixmap) {
+            parent_pixmap.draw_pixmap(
+                0,
+                0,
+                layer_pixmap.as_ref(),
+                &PixmapPaint {
+                    opacity: state.alpha.clamp(0.0, 1.0),
+                    blend_mode: state.blend,
+                    quality: FilterQuality::Nearest,
+                },
+                Transform::identity(),
+                state.clip.as_deref(),
+            );
+            self.pixmap = Some(parent_pixmap);
+        } else {
+            self.pixmap = parent;
         }
+        self.state = state;
+        self.stack.pop();
         true
     }
 
@@ -2097,6 +2141,21 @@ impl Canvas2D {
     /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
     /// transparent black
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
+    /// Encodes the bitmap as PNG for `canvas.toDataURL`/`toBlob`.
+    pub(crate) fn to_png(&self) -> Option<Vec<u8>> {
+        let pixels = self.read_pixels(0, 0, self.width, self.height)?;
+        let mut png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut png),
+            &pixels,
+            self.width,
+            self.height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .ok()?;
+        Some(png)
+    }
+
     pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Option<Vec<u8>> {
         let mut out = vec![0; crate::js::world::canvas_bytes(width, height)?];
         let Some(pixmap) = &self.pixmap else {

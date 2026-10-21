@@ -43,10 +43,14 @@
       throw new DOMException('transferToImageBitmap is not implemented', 'NotSupportedError');
     }
 
-    convertToBlob() {
-      return Promise.reject(
-        new DOMException('convertToBlob is not implemented', 'NotSupportedError'),
-      );
+    convertToBlob(options) {
+      try {
+        const type = options && options.type ? options.type : 'image/png';
+        const bytes = globalThis.__tbCanvasToBlobBytes(this, type, options && options.quality);
+        return Promise.resolve(new Blob([new Uint8Array(bytes)], { type }));
+      } catch (error) {
+        return Promise.reject(error);
+      }
     }
   }
 
