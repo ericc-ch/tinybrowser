@@ -114,7 +114,139 @@ struct State {
     smoothing: bool,
     smoothing_quality: String,
     filter: String,
+    /// Color matrix from the active `CanvasFilter` or layer filter. Filters
+    /// that cannot be represented as a color matrix leave this `None`.
+    filter_matrix: Option<ColorMatrix>,
     clip: Option<Arc<Mask>>,
+}
+
+/// A 4x5 row-major color matrix from a `colorMatrix` filter
+/// (<https://drafts.fxtf.org/filter-effects/#feColorMatrixElement>).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ColorMatrix([f32; 20]);
+
+impl ColorMatrix {
+    pub(crate) const IDENTITY: Self = Self([
+        1.0, 0.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0, 0.0,
+    ]);
+
+    pub(crate) fn hue_rotate(degrees: f32) -> Self {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        Self([
+            0.213 + cos * 0.787 - sin * 0.213,
+            0.715 - cos * 0.715 - sin * 0.715,
+            0.072 - cos * 0.072 + sin * 0.928,
+            0.0,
+            0.0,
+            0.213 - cos * 0.213 + sin * 0.143,
+            0.715 + cos * 0.285 + sin * 0.140,
+            0.072 - cos * 0.072 - sin * 0.283,
+            0.0,
+            0.0,
+            0.213 - cos * 0.213 - sin * 0.787,
+            0.715 - cos * 0.715 + sin * 0.715,
+            0.072 + cos * 0.928 + sin * 0.072,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        ])
+    }
+
+    pub(crate) fn saturate(amount: f32) -> Self {
+        let saturate = amount;
+        Self([
+            0.213 + 0.787 * saturate,
+            0.715 - 0.715 * saturate,
+            0.072 - 0.072 * saturate,
+            0.0,
+            0.0,
+            0.213 - 0.213 * saturate,
+            0.715 + 0.285 * saturate,
+            0.072 - 0.072 * saturate,
+            0.0,
+            0.0,
+            0.213 - 0.213 * saturate,
+            0.715 - 0.715 * saturate,
+            0.072 + 0.928 * saturate,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        ])
+    }
+
+    pub(crate) fn luminance_to_alpha() -> Self {
+        Self([
+            0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.2126, 0.7152, 0.0722, 0.0, 0.0,
+        ])
+    }
+
+    pub(crate) fn from_values(values: [f32; 20]) -> Self {
+        Self(values)
+    }
+
+    /// Composes `next` after `self` by multiplying the augmented matrices.
+    pub(crate) fn then(self, next: Self) -> Self {
+        let left = self.0;
+        let right = next.0;
+        let mut out = [0.0; 20];
+        for row in 0..4 {
+            for column in 0..5 {
+                let mut sum = 0.0;
+                for inner in 0..4 {
+                    sum += right[row * 5 + inner] * left[inner * 5 + column];
+                }
+                if column == 4 {
+                    sum += right[row * 5 + 4];
+                }
+                out[row * 5 + column] = sum;
+            }
+        }
+        Self(out)
+    }
+}
+
+/// Applies `matrix` to every pixel of `pixmap`, in unpremultiplied sRGB like
+/// `feColorMatrix` (<https://drafts.fxtf.org/filter-effects/#feColorMatrixElement>).
+fn apply_color_matrix(pixmap: &mut Pixmap, matrix: &ColorMatrix) {
+    let coefficients = &matrix.0;
+    for pixel in pixmap.pixels_mut() {
+        let color = pixel.demultiply();
+        let alpha = f32::from(color.alpha()) / 255.0;
+        let red = f32::from(color.red()) / 255.0;
+        let green = f32::from(color.green()) / 255.0;
+        let blue = f32::from(color.blue()) / 255.0;
+        let channel = |row: usize| {
+            let row = row * 5;
+            (coefficients[row] * red
+                + coefficients[row + 1] * green
+                + coefficients[row + 2] * blue
+                + coefficients[row + 3] * alpha
+                + coefficients[row + 4])
+                .clamp(0.0, 1.0)
+        };
+        let out_alpha = channel(3);
+        *pixel = ColorU8::from_rgba(
+            to_u8(channel(0)),
+            to_u8(channel(1)),
+            to_u8(channel(2)),
+            to_u8(out_alpha),
+        )
+        .premultiply();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -191,6 +323,8 @@ struct Layer {
     base: usize,
     parent: Option<Pixmap>,
     state: State,
+    /// Filter applied to this layer's bitmap in `endLayer`, before compositing.
+    filter_matrix: Option<ColorMatrix>,
 }
 
 #[derive(Clone)]
@@ -388,6 +522,13 @@ impl Canvas2D {
     /// rendering state resets inside it, and `endLayer` composites the bitmap
     /// with the state captured here.
     pub(crate) fn begin_layer(&mut self) {
+        self.begin_layer_filtered(None);
+    }
+
+    /// Opens a layer whose bitmap is passed through `filter` when
+    /// `endLayer` composites it
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-beginlayer>).
+    pub(crate) fn begin_layer_filtered(&mut self, filter: Option<ColorMatrix>) {
         let base = self.stack.len();
         let captured = self.state.clone();
         let parent = self.pixmap.take();
@@ -396,6 +537,7 @@ impl Canvas2D {
             base,
             parent,
             state: captured.clone(),
+            filter_matrix: filter,
         });
         self.stack.push(captured);
         self.state.alpha = 1.0;
@@ -405,6 +547,7 @@ impl Canvas2D {
         self.state.shadow_x = 0.0;
         self.state.shadow_y = 0.0;
         "none".clone_into(&mut self.state.filter);
+        self.state.filter_matrix = None;
     }
 
     /// Closes the innermost layer, unless a `save()` opened after it is still
@@ -422,9 +565,13 @@ impl Canvas2D {
         let Layer {
             mut parent,
             state,
+            filter_matrix,
             ..
         } = layer;
-        let layer_pixmap = self.pixmap.take();
+        let mut layer_pixmap = self.pixmap.take();
+        if let (Some(pixmap), Some(matrix)) = (layer_pixmap.as_mut(), filter_matrix) {
+            apply_color_matrix(pixmap, &matrix);
+        }
         if let (Some(mut parent_pixmap), Some(layer_pixmap)) = (parent.take(), layer_pixmap) {
             parent_pixmap.draw_pixmap(
                 0,
@@ -453,6 +600,10 @@ impl Canvas2D {
 
     pub(crate) fn set_filter(&mut self, value: &str) {
         value.clone_into(&mut self.state.filter);
+    }
+
+    pub(crate) fn set_filter_matrix(&mut self, matrix: Option<ColorMatrix>) {
+        self.state.filter_matrix = matrix;
     }
 
     pub(crate) fn transform(&mut self, m11: f32, m12: f32, m21: f32, m22: f32, dx: f32, dy: f32) {
@@ -1732,7 +1883,48 @@ impl Canvas2D {
         builder.finish()
     }
 
+    /// Applies a `colorMatrix` filter to a single drawing operation. The
+    /// operation renders into a transparent layer, the matrix runs on that
+    /// layer, and the result composites with the state's blend mode
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#filters>).
+    fn with_draw_filter(&mut self, draw: impl FnOnce(&mut Self)) {
+        let Some(matrix) = self.state.filter_matrix else {
+            draw(self);
+            return;
+        };
+        let parent = self.pixmap.take();
+        self.pixmap = make_pixmap(self.width, self.height);
+        draw(self);
+        let mut layer = self.pixmap.take();
+        if let Some(pixmap) = layer.as_mut() {
+            apply_color_matrix(pixmap, &matrix);
+        }
+        let Some(mut parent_pixmap) = parent else {
+            self.pixmap = None;
+            return;
+        };
+        if let Some(layer_pixmap) = layer {
+            parent_pixmap.draw_pixmap(
+                0,
+                0,
+                layer_pixmap.as_ref(),
+                &PixmapPaint {
+                    opacity: 1.0,
+                    blend_mode: self.state.blend,
+                    quality: FilterQuality::Nearest,
+                },
+                Transform::identity(),
+                None,
+            );
+        }
+        self.pixmap = Some(parent_pixmap);
+    }
+
     fn fill_path(&mut self, path: &Path, even_odd: bool) {
+        self.with_draw_filter(|canvas| canvas.fill_path_inner(path, even_odd));
+    }
+
+    fn fill_path_inner(&mut self, path: &Path, even_odd: bool) {
         let rule = if even_odd {
             FillRule::EvenOdd
         } else {
@@ -1888,6 +2080,10 @@ impl Canvas2D {
     }
 
     fn stroke_path(&mut self, path: &Path) {
+        self.with_draw_filter(|canvas| canvas.stroke_path_inner(path));
+    }
+
+    fn stroke_path_inner(&mut self, path: &Path) {
         let stroke = self.stroke_options();
         self.paint_shadow(path, FillRule::Winding, Some(&stroke));
         if let Style::Pattern(id) = self.state.stroke
@@ -2340,6 +2536,23 @@ impl Canvas2D {
         dw: f32,
         dh: f32,
     ) {
+        self.with_draw_filter(|canvas| {
+            canvas.draw_image_inner(source, sx, sy, sw, sh, dx, dy, dw, dh);
+        });
+    }
+
+    fn draw_image_inner(
+        &mut self,
+        source: &SourceImage,
+        sx: f32,
+        sy: f32,
+        sw: f32,
+        sh: f32,
+        dx: f32,
+        dy: f32,
+        dw: f32,
+        dh: f32,
+    ) {
         if !(sx.is_finite()
             && sy.is_finite()
             && sw.is_finite()
@@ -2704,6 +2917,7 @@ impl Default for State {
             smoothing: true,
             smoothing_quality: "low".to_owned(),
             filter: "none".to_owned(),
+            filter_matrix: None,
             clip: None,
         }
     }

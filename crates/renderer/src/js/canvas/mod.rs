@@ -17,7 +17,7 @@ mod path2d;
 mod state;
 mod text;
 
-pub(crate) use state::{Canvas2D, Gradient, Pattern, SourceImage, StyleValue};
+pub(crate) use state::{Canvas2D, ColorMatrix, Gradient, Pattern, SourceImage, StyleValue};
 
 use base64::Engine as _;
 use rquickjs::function::This;
@@ -562,6 +562,7 @@ fn restore(this: This<Object<'_>>) -> Result<()> {
 
 fn begin_layer<'js>(this: This<Object<'js>>, options: Opt<Value<'js>>) -> Result<()> {
     let ctx = this.0.ctx();
+    let mut matrix = None;
     if let Some(value) = options.0 {
         if value.is_null() || value.is_undefined() {
             return with_canvas(ctx, &this.0, state::Canvas2D::begin_layer);
@@ -576,12 +577,16 @@ fn begin_layer<'js>(this: This<Object<'js>>, options: Opt<Value<'js>>) -> Result
             && let Ok(filter) = object.get::<_, Value>("filter")
             && filter.is_object()
             && !filter.is_null()
-            && let Ok(validate) = ctx.globals().get::<_, Function>("__tbValidateFilter")
         {
-            validate.call::<_, ()>((filter,))?;
+            matrix = color_matrix_from_filter(&filter);
+            if let Ok(validate) = ctx.globals().get::<_, Function>("__tbValidateFilter") {
+                validate.call::<_, ()>((filter,))?;
+            }
         }
     }
-    with_canvas(ctx, &this.0, state::Canvas2D::begin_layer)
+    with_canvas(ctx, &this.0, |canvas| {
+        canvas.begin_layer_filtered(matrix);
+    })
 }
 
 fn end_layer(this: This<Object<'_>>) -> Result<()> {
@@ -3257,8 +3262,9 @@ fn set_filter_binding<'js>(this: This<Object<'js>>, value: Value<'js>) -> Result
             .is_ok_and(|ctor| object.is_instance_of(&ctor))
     });
     if is_canvas_filter {
+        let matrix = color_matrix_from_filter(&value);
         this.0.set("__tbFilterObject", value)?;
-        return Ok(());
+        return with_canvas(ctx, &this.0, |canvas| canvas.set_filter_matrix(matrix));
     }
     let text = DomString::from_js(ctx, value)?.to_string();
     if !valid_filter(&text) {
@@ -3266,7 +3272,63 @@ fn set_filter_binding<'js>(this: This<Object<'js>>, value: Value<'js>) -> Result
     }
     this.0
         .set("__tbFilterObject", Value::new_undefined(ctx.clone()))?;
-    with_canvas(ctx, &this.0, |canvas| canvas.set_filter(&text))
+    with_canvas(ctx, &this.0, |canvas| {
+        canvas.set_filter(&text);
+        canvas.set_filter_matrix(None);
+    })
+}
+
+/// Reads a `colorMatrix` filter init dictionary (or a list of them) into one
+/// matrix. Returns `None` for filters this engine cannot represent as a color
+/// matrix, so the drawing path stays unfiltered instead of wrong.
+fn color_matrix_from_filter(value: &Value<'_>) -> Option<ColorMatrix> {
+    let object = value.as_object()?;
+    let init = object
+        .get::<_, Value>("__tbInit")
+        .ok()
+        .filter(|value| !value.is_undefined())
+        .unwrap_or_else(|| value.clone());
+    if let Some(array) = init.as_array() {
+        let mut matrix = ColorMatrix::IDENTITY;
+        for index in 0..array.len() {
+            let item = array.get::<Value>(index).ok()?;
+            matrix = matrix.then(color_matrix_from_single(&item)?);
+        }
+        return Some(matrix);
+    }
+    color_matrix_from_single(&init)
+}
+
+fn color_matrix_from_single(value: &Value<'_>) -> Option<ColorMatrix> {
+    let object = value.as_object()?;
+    let name: String = object.get("name").ok()?;
+    if name != "colorMatrix" {
+        return None;
+    }
+    let kind: Option<String> = object.get("type").ok();
+    match kind.as_deref() {
+        Some("hueRotate") => {
+            let degrees: Coerced<f64> = object.get("values").ok()?;
+            Some(ColorMatrix::hue_rotate(f32_of(*degrees)))
+        }
+        Some("saturate") => {
+            let amount: Coerced<f64> = object.get("values").ok()?;
+            Some(ColorMatrix::saturate(f32_of(*amount)))
+        }
+        Some("luminanceToAlpha") => Some(ColorMatrix::luminance_to_alpha()),
+        _ => {
+            let values = object.get::<_, Array>("values").ok()?;
+            if values.len() != 20 {
+                return None;
+            }
+            let mut matrix = [0.0; 20];
+            for (index, slot) in matrix.iter_mut().enumerate() {
+                let value: Coerced<f64> = values.get(index).ok()?;
+                *slot = f32_of(*value);
+            }
+            Some(ColorMatrix::from_values(matrix))
+        }
+    }
 }
 
 /// Index of the `)` matching the opening `(` that was already consumed,
