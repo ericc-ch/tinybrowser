@@ -211,6 +211,10 @@ impl Canvas2D {
         self.origin_clean
     }
 
+    pub(crate) fn has_open_layer(&self) -> bool {
+        !self.layers.is_empty()
+    }
+
     fn taint(&mut self) {
         self.origin_clean = false;
     }
