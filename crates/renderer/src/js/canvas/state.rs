@@ -87,6 +87,7 @@ struct State {
     /// Exact CSS serialization for a color function such as `color(srgb …)`.
     fill_text: Option<String>,
     stroke_text: Option<String>,
+    shadow_text: Option<String>,
     alpha: f32,
     blend: BlendMode,
     line_width: f32,
@@ -693,8 +694,15 @@ impl Canvas2D {
         self.state.shadow_color
     }
 
-    pub(crate) fn set_shadow_color(&mut self, color: [u8; 4]) {
+    /// The exact CSS serialization of `shadowColor`, when it was set from a
+    /// color function such as `color(srgb …)` or `lab()`.
+    pub(crate) fn shadow_serialized(&self) -> Option<&str> {
+        self.state.shadow_text.as_deref()
+    }
+
+    pub(crate) fn set_shadow_color_exact(&mut self, color: [u8; 4], text: Option<String>) {
         self.state.shadow_color = color;
+        self.state.shadow_text = text;
     }
 
     pub(crate) fn shadow_blur(&self) -> f32 {
@@ -2661,6 +2669,7 @@ impl Default for State {
             stroke: Style::Color([0, 0, 0, 255]),
             fill_text: None,
             stroke_text: None,
+            shadow_text: None,
             alpha: 1.0,
             blend: BlendMode::SourceOver,
             line_width: 1.0,
@@ -3371,7 +3380,7 @@ mod tests {
     fn shadow_offset_paints_below_the_shape() {
         let mut canvas = Canvas2D::new(4, 4);
         canvas.set_fill_style(StyleValue::Color([255, 0, 0, 255]));
-        canvas.set_shadow_color([0, 255, 0, 255]);
+        canvas.set_shadow_color_exact([0, 255, 0, 255], None);
         canvas.set_shadow_offset_y(2.0);
         canvas.fill_rect(0.0, 0.0, 4.0, 2.0);
         let pixels = canvas.read_pixels(0, 0, 4, 4).unwrap();

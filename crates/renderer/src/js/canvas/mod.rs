@@ -335,15 +335,16 @@ fn install_paint_accessors(prototype: &Object<'_>) -> Result<()> {
         "shadowColor",
         Accessor::new(
             |this: This<Object<'_>>| {
-                with_canvas(this.0.ctx(), &this.0, |canvas| {
-                    serialize_color(canvas.shadow_color())
+                with_canvas(this.0.ctx(), &this.0, |canvas| match canvas.shadow_serialized() {
+                    Some(text) => text.to_owned(),
+                    None => serialize_color(canvas.shadow_color()),
                 })
             },
             |this: This<Object<'_>>, value: DomString| {
-                let color = css_color(this.0.ctx(), &this.0, &value)?;
+                let color = css_color_exact(this.0.ctx(), &this.0, &value)?;
                 with_canvas(this.0.ctx(), &this.0, |canvas| {
-                    if let Some(color) = color {
-                        canvas.set_shadow_color(color);
+                    if let Some((color, text)) = color {
+                        canvas.set_shadow_color_exact(color, text);
                     }
                 })
             },
@@ -3636,21 +3637,11 @@ fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {
     wrap_node(ctx, id)
 }
 
-/// Parses a canvas color. `currentColor` resolves against the canvas
-/// element's computed `color` at assignment time, not at paint time
+/// Parses a canvas color, preserving the `color(srgb …)` serialization that
+/// `fillStyle`/`strokeStyle`/`shadowColor` must report for color functions and
+/// `color-mix`. `currentColor` resolves against the canvas element's computed
+/// `color` at assignment time, not at paint time
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>).
-fn css_color(ctx: &Ctx<'_>, object: &Object<'_>, text: &str) -> Result<Option<[u8; 4]>> {
-    if let Some(color) = color::parse(text) {
-        return Ok(Some(color));
-    }
-    if text.trim().eq_ignore_ascii_case("currentColor") {
-        return Ok(Some(current_color(ctx, object)?));
-    }
-    Ok(None)
-}
-
-/// Like [`css_color`], but preserves the `color(srgb …)` serialization that
-/// `fillStyle`/`strokeStyle` must report for color functions and `color-mix`.
 fn css_color_exact(
     ctx: &Ctx<'_>,
     object: &Object<'_>,
