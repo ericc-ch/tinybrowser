@@ -3158,6 +3158,31 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
         &kerning,
         &mut font_ctx,
     );
+    // Canvas `width` is a double, and `word-spacing` is a double of layout
+    // units. Parley accumulates spacing in f32, which rounds the total before
+    // the caller adds the same spacing in f64 (WPT's wordSpacing.change.font
+    // compares exactly). Shape once without spacing and add it in f64.
+    let width = if word_spacing == 0.0 {
+        f64::from(shaped.width)
+    } else {
+        let unspaced = text::shape(
+            &text,
+            &font,
+            None,
+            letter_spacing,
+            0.0,
+            language.as_deref(),
+            &kerning,
+            &mut font_ctx,
+        );
+        let spaces = text.chars().filter(char::is_ascii_whitespace).count();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a string with more than 2^53 spaces cannot fit in memory"
+        )]
+        let spacing = f64::from(word_spacing) * spaces as f64;
+        f64::from(unspaced.width) + spacing
+    };
     let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
     let (actual_left, actual_right) = match resolved {
         "right" | "end" => (
@@ -3198,7 +3223,7 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     object.set("getActualBoundingBox", Func::from(get_actual_bounding_box))?;
     object.set("getSelectionRects", Func::from(get_selection_rects))?;
     object.set("getIndexFromOffset", Func::from(get_index_from_offset))?;
-    object.set("width", shaped.width)?;
+    object.set("width", width)?;
     object.set("actualBoundingBoxLeft", actual_left)?;
     object.set("actualBoundingBoxRight", actual_right)?;
     object.set("actualBoundingBoxAscent", shaped.actual_ascent + shift)?;
