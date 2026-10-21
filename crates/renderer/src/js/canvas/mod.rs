@@ -1422,7 +1422,7 @@ fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString
     // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvasgradient-addcolorstop>).
     let color = if color.trim().eq_ignore_ascii_case("currentColor") {
         [0, 0, 0, 255]
-    } else if let Some(color) = css_color(this.0.ctx(), &this.0, &color)? {
+    } else if let Some((color, _)) = css_color_exact(this.0.ctx(), &this.0, &color)? {
         color
     } else {
         return Err(crate::js::bindings::throw_dom(
@@ -3387,6 +3387,9 @@ fn style_value<'js>(
         StyleValue::Color(color) => {
             Ok(rquickjs::String::from_str(ctx.clone(), &serialize_color(color))?.into_value())
         }
+        StyleValue::ColorExact(_, text) => {
+            Ok(rquickjs::String::from_str(ctx.clone(), &text)?.into_value())
+        }
         StyleValue::Gradient(id) | StyleValue::Pattern(id) => {
             let resources: Object = object.get("__tbRes")?;
             if let Ok(value) = resources.get::<_, Value>(id.to_string()) {
@@ -3444,7 +3447,7 @@ fn import_resource(
                 canvas.insert_pattern(definition)
             })?))
         }
-        StyleValue::Color(_) => Ok(style),
+        StyleValue::Color(_) | StyleValue::ColorExact(..) => Ok(style),
     }
 }
 
@@ -3457,8 +3460,11 @@ fn set_style_value<'js>(
     let resource = value.as_object().cloned();
     let style = if let Some(string) = value.as_string() {
         let text = string.to_string()?;
-        match css_color(ctx, object, &text)? {
-            Some(color) => Some(StyleValue::Color(color)),
+        match css_color_exact(ctx, object, &text)? {
+            Some((color, serialized)) => Some(match serialized {
+                Some(serialized) => StyleValue::ColorExact(color, serialized),
+                None => StyleValue::Color(color),
+            }),
             None => return Ok(()),
         }
     } else if let Some(gradient) = value
@@ -3475,8 +3481,11 @@ fn set_style_value<'js>(
         Some(StyleValue::Color(color))
     } else {
         let text = Coerced::<rquickjs::String<'_>>::from_js(ctx, value)?.to_string()?;
-        match css_color(ctx, object, &text)? {
-            Some(color) => Some(StyleValue::Color(color)),
+        match css_color_exact(ctx, object, &text)? {
+            Some((color, serialized)) => Some(match serialized {
+                Some(serialized) => StyleValue::ColorExact(color, serialized),
+                None => StyleValue::Color(color),
+            }),
             None => return Ok(()),
         }
     };
@@ -3638,6 +3647,27 @@ fn css_color(ctx: &Ctx<'_>, object: &Object<'_>, text: &str) -> Result<Option<[u
         return Ok(Some(current_color(ctx, object)?));
     }
     Ok(None)
+}
+
+/// Like [`css_color`], but preserves the `color(srgb …)` serialization that
+/// `fillStyle`/`strokeStyle` must report for color functions and `color-mix`.
+fn css_color_exact(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    text: &str,
+) -> Result<Option<([u8; 4], Option<String>)>> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("currentColor") {
+        return Ok(Some((current_color(ctx, object)?, None)));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let source = if lower.contains("currentcolor") {
+        let [r, g, b, _] = current_color(ctx, object)?;
+        lower.replace("currentcolor", &format!("rgb({r} {g} {b})"))
+    } else {
+        lower
+    };
+    Ok(color::parse_exact(&source).map(|parsed| (parsed.bytes, parsed.serialized)))
 }
 
 /// The canvas element's computed `color`, or black when it has no computed

@@ -6,6 +6,39 @@
 //! functions (`lab()`, `oklch()`, `color()`) are not parsed yet and are
 //! treated as invalid assignments, leaving the previous value in place.
 
+/// A parsed color plus the exact CSS serialization, when the syntax has no
+/// sRGB-byte equivalent (`color()`, relative colors, `color-mix()`).
+pub(crate) struct ParsedColor {
+    pub(crate) bytes: [u8; 4],
+    pub(crate) value: [f32; 4],
+    pub(crate) serialized: Option<String>,
+}
+
+/// Parses the color syntaxes that canvas may need to report as `color(srgb …)`
+/// in addition to the legacy sRGB forms.
+pub(crate) fn parse_exact(input: &str) -> Option<ParsedColor> {
+    let input = input.trim().to_ascii_lowercase();
+    if let Some(inner) = function_args(&input, "color-mix") {
+        return parse_color_mix(inner);
+    }
+    if let Some(inner) = function_args(&input, "rgb")
+        && let Some(relative) = inner.trim().strip_prefix("from ")
+    {
+        return parse_relative(relative, false);
+    }
+    if let Some(inner) = function_args(&input, "color") {
+        if let Some(relative) = inner.trim().strip_prefix("from ") {
+            return parse_relative(relative, true);
+        }
+        return parse_color_function(inner);
+    }
+    parse(&input).map(|bytes| ParsedColor {
+        bytes,
+        value: from_bytes(bytes),
+        serialized: None,
+    })
+}
+
 /// Parse a CSS color into straight (non-premultiplied) sRGB bytes.
 pub(crate) fn parse(input: &str) -> Option<[u8; 4]> {
     let input = input.trim();
@@ -468,6 +501,219 @@ static NAMED: &[(&str, u32)] = &[
     ("yellow", 0x00ff_ff00),
     ("yellowgreen", 0x009a_cd32),
 ];
+
+/// Splits a relative-color body into its source color and channel list.
+fn split_source(rest: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_u32;
+    for (index, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ' ' | '\t' if depth == 0 => {
+                let source = &rest[..index];
+                let channels = rest[index..].trim();
+                if !source.is_empty() && !channels.is_empty() {
+                    return Some((source, channels));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(text[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(text[start..].trim());
+    parts
+}
+
+fn format_number(value: f32) -> String {
+    let mut text = format!("{value:.4}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    if text == "-0" {
+        "0".to_owned()
+    } else {
+        text
+    }
+}
+
+fn from_bytes(bytes: [u8; 4]) -> [f32; 4] {
+    [
+        f32::from(bytes[0]) / 255.0,
+        f32::from(bytes[1]) / 255.0,
+        f32::from(bytes[2]) / 255.0,
+        f32::from(bytes[3]) / 255.0,
+    ]
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "channels are clamped to 0..1 before scaling to 0..255"
+)]
+fn to_bytes([r, g, b, a]: [f32; 4]) -> [u8; 4] {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [channel(r), channel(g), channel(b), channel(a)]
+}
+
+fn serialized_srgb([r, g, b, a]: [f32; 4]) -> String {
+    let alpha = if a < 1.0 {
+        format!(" / {}", format_number(a))
+    } else {
+        String::new()
+    };
+    format!(
+        "color(srgb {} {} {}{alpha})",
+        format_number(r),
+        format_number(g),
+        format_number(b)
+    )
+}
+
+fn parse_color_function(inner: &str) -> Option<ParsedColor> {
+    let inner = inner.trim().strip_prefix("srgb")?.trim();
+    let (channels, alpha) = inner.split_once('/').map_or((inner, None), |(channels, alpha)| {
+        (channels.trim(), Some(alpha.trim()))
+    });
+    let channels: Vec<f32> = channels
+        .split_whitespace()
+        .map(|value| value.trim_end_matches('%').parse::<f32>().ok())
+        .collect::<Option<_>>()?;
+    if channels.len() < 3 {
+        return None;
+    }
+    let alpha = alpha
+        .and_then(|value| value.trim_end_matches('%').parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let value = [channels[0], channels[1], channels[2], alpha];
+    Some(ParsedColor {
+        bytes: to_bytes(value),
+        value,
+        serialized: Some(serialized_srgb(value)),
+    })
+}
+
+fn parse_relative(rest: &str, color_function: bool) -> Option<ParsedColor> {
+    let (source, channels) = split_source(rest)?;
+    let source = parse_exact(source)
+        .or_else(|| parse(source).map(|bytes| ParsedColor {
+            bytes,
+            value: from_bytes(bytes),
+            serialized: None,
+        }))?;
+    let source = source.value;
+    let channels = if color_function {
+        channels.trim().strip_prefix("srgb")?.trim()
+    } else {
+        channels
+    };
+    let (channels, alpha) = channels.split_once('/').map_or((channels, None), |(channels, alpha)| {
+        (channels.trim(), Some(alpha.trim()))
+    });
+    let evaluate = |token: &str, fallback: f32| -> f32 {
+        match token {
+            "r" => source[0],
+            "g" => source[1],
+            "b" => source[2],
+            "alpha" => source[3],
+            _ => token.parse::<f32>().unwrap_or(fallback).clamp(0.0, 1.0),
+        }
+    };
+    if channels.contains(')') || channels.contains(',') {
+        return None;
+    }
+    let tokens: Vec<&str> = channels.split_whitespace().collect();
+    let valid = |token: &str| {
+        matches!(token, "r" | "g" | "b" | "alpha")
+            || token.trim_end_matches('%').parse::<f32>().is_ok()
+    };
+    if tokens.len() > 3 || tokens.iter().any(|token| !valid(token)) {
+        return None;
+    }
+    if alpha.is_some_and(|alpha| !valid(alpha) || alpha.contains(char::is_whitespace)) {
+        return None;
+    }
+    let value = [
+        evaluate(tokens.first().copied().unwrap_or("r"), 0.0),
+        evaluate(tokens.get(1).copied().unwrap_or("g"), 0.0),
+        evaluate(tokens.get(2).copied().unwrap_or("b"), 0.0),
+        alpha.map_or(source[3], |alpha| evaluate(alpha, source[3])),
+    ];
+    Some(ParsedColor {
+        bytes: to_bytes(value),
+        value,
+        serialized: Some(serialized_srgb(value)),
+    })
+}
+
+fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
+    let inner = inner.trim().strip_prefix("in srgb")?.trim_start_matches(',').trim();
+    let parts = split_commas(inner);
+    if parts.len() != 2 {
+        return None;
+    }
+    let split = |part: &str| -> Option<(ParsedColor, Option<f32>)> {
+        let part = part.trim();
+        let (color, percentage) = part.rsplit_once(char::is_whitespace).map_or((part, None), |(color, percentage)| {
+            if percentage.trim().ends_with('%') {
+                (
+                    color.trim(),
+                    percentage.trim().trim_end_matches('%').parse::<f32>().ok(),
+                )
+            } else {
+                (part, None)
+            }
+        });
+        let color = parse_exact(color).or_else(|| {
+            parse(color).map(|bytes| ParsedColor {
+                bytes,
+                value: from_bytes(bytes),
+                serialized: None,
+            })
+        })?;
+        Some((color, percentage))
+    };
+    let (first, first_weight) = split(parts[0])?;
+    let (second, second_weight) = split(parts[1])?;
+    let (first_weight, second_weight) = match (first_weight, second_weight) {
+        (None, None) => (50.0, 50.0),
+        (Some(weight), None) => (weight, 100.0 - weight),
+        (None, Some(weight)) => (100.0 - weight, weight),
+        (Some(first), Some(second)) => (first, second),
+    };
+    let total = first_weight + second_weight;
+    if total <= 0.0 {
+        return None;
+    }
+    let (first, second) = (first.value, second.value);
+    let weight = first_weight / total;
+    let mix = |index: usize| first[index] * weight + second[index] * (1.0 - weight);
+    let value = [mix(0), mix(1), mix(2), mix(3)];
+    Some(ParsedColor {
+        bytes: to_bytes(value),
+        value,
+        serialized: Some(serialized_srgb(value)),
+    })
+}
 
 #[cfg(test)]
 mod tests {

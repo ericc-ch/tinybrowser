@@ -84,6 +84,9 @@ struct State {
     transform: Transform,
     fill: Style,
     stroke: Style,
+    /// Exact CSS serialization for a color function such as `color(srgb …)`.
+    fill_text: Option<String>,
+    stroke_text: Option<String>,
     alpha: f32,
     blend: BlendMode,
     line_width: f32,
@@ -521,12 +524,22 @@ impl Canvas2D {
     // ---- properties ------------------------------------------------------
 
     pub(crate) fn fill_style(&self) -> StyleValue {
-        StyleValue::from_style(self.state.fill)
+        match &self.state.fill_text {
+            Some(text) => match self.state.fill {
+                Style::Color(color) => StyleValue::ColorExact(color, text.clone()),
+                _ => StyleValue::from_style(self.state.fill),
+            },
+            None => StyleValue::from_style(self.state.fill),
+        }
     }
 
     pub(crate) fn set_fill_style(&mut self, value: StyleValue) {
+        self.state.fill_text = match &value {
+            StyleValue::ColorExact(_, text) => Some(text.clone()),
+            _ => None,
+        };
         let style = match value {
-            StyleValue::Color(color) => Style::Color(color),
+            StyleValue::Color(color) | StyleValue::ColorExact(color, _) => Style::Color(color),
             StyleValue::Gradient(id) => Style::Gradient(id),
             StyleValue::Pattern(id) => {
                 if self
@@ -543,12 +556,22 @@ impl Canvas2D {
     }
 
     pub(crate) fn stroke_style(&self) -> StyleValue {
-        StyleValue::from_style(self.state.stroke)
+        match &self.state.stroke_text {
+            Some(text) => match self.state.stroke {
+                Style::Color(color) => StyleValue::ColorExact(color, text.clone()),
+                _ => StyleValue::from_style(self.state.stroke),
+            },
+            None => StyleValue::from_style(self.state.stroke),
+        }
     }
 
     pub(crate) fn set_stroke_style(&mut self, value: StyleValue) {
+        self.state.stroke_text = match &value {
+            StyleValue::ColorExact(_, text) => Some(text.clone()),
+            _ => None,
+        };
         let style = match value {
-            StyleValue::Color(color) => Style::Color(color),
+            StyleValue::Color(color) | StyleValue::ColorExact(color, _) => Style::Color(color),
             StyleValue::Gradient(id) => Style::Gradient(id),
             StyleValue::Pattern(id) => {
                 if self
@@ -2636,6 +2659,8 @@ impl Default for State {
             transform: Transform::identity(),
             fill: Style::Color([0, 0, 0, 255]),
             stroke: Style::Color([0, 0, 0, 255]),
+            fill_text: None,
+            stroke_text: None,
             alpha: 1.0,
             blend: BlendMode::SourceOver,
             line_width: 1.0,
@@ -2668,9 +2693,10 @@ impl Default for State {
 }
 
 /// A value assigned to `fillStyle` or `strokeStyle`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum StyleValue {
     Color([u8; 4]),
+    ColorExact([u8; 4], String),
     Gradient(u32),
     Pattern(u32),
 }
