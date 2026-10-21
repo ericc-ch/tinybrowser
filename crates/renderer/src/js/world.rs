@@ -202,7 +202,7 @@ impl RealmRegistry {
         Some(SourceImage {
             width: canvas.width,
             height: canvas.height,
-            pixels: canvas.read_pixels(0, 0, canvas.width, canvas.height),
+            pixels: canvas.read_pixels(0, 0, canvas.width, canvas.height)?,
         })
     }
 

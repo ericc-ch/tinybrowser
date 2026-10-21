@@ -423,14 +423,21 @@ fn set_transform(
     dx: Opt<Coerced<f64>>,
     dy: Opt<Coerced<f64>>,
 ) -> Result<()> {
-    let (Some(m11), Some(m12), Some(m21), Some(m22), Some(dx), Some(dy)) = (
+    let args = (
         m11.0.as_ref(),
         m12.0.as_ref(),
         m21.0.as_ref(),
         m22.0.as_ref(),
         dx.0.as_ref(),
         dy.0.as_ref(),
-    ) else {
+    );
+    let (Some(m11), Some(m12), Some(m21), Some(m22), Some(dx), Some(dy)) = args else {
+        // The one-argument overload takes a dictionary; with no members the
+        // transform resets to the identity
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-settransform>).
+        if args == (None, None, None, None, None, None) {
+            return with_canvas(this.0.ctx(), &this.0, state::Canvas2D::reset_transform);
+        }
         return Ok(());
     };
     with_canvas(this.0.ctx(), &this.0, |canvas| {
@@ -934,6 +941,13 @@ fn get_image_data(
     let y = i32_of(sy);
     let bytes = with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.read_pixels(x, y, width, height)
+    })?
+    .ok_or_else(|| {
+        crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "IndexSizeError",
+            "getImageData area is too large",
+        )
     })?;
     image_data_object(this.0.ctx(), width, height, bytes)
 }
@@ -978,12 +992,21 @@ fn create_image_data(
     // (`BaseRenderingContext2D::createImageData`).
     let width = canvas_u32(width.abs());
     let height = canvas_u32(height.abs());
-    image_data_object(
-        this.0.ctx(),
-        width,
-        height,
-        vec![0; width as usize * height as usize * 4],
-    )
+    if width == 0 || height == 0 {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "IndexSizeError",
+            "createImageData width and height must be non-zero",
+        ));
+    }
+    let Some(bytes) = crate::js::world::canvas_bytes(width, height) else {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "IndexSizeError",
+            "createImageData area is too large",
+        ));
+    };
+    image_data_object(this.0.ctx(), width, height, vec![0; bytes])
 }
 
 fn image_data_object<'js>(

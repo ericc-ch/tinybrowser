@@ -974,6 +974,15 @@ impl Canvas2D {
         )
     }
 
+    /// A full-canvas coverage mask, or `None` when the canvas exceeds the
+    /// bitmap budget. `Mask::new` does not cap its own allocation.
+    fn canvas_mask(&self) -> Option<Mask> {
+        let width = self.width.max(1);
+        let height = self.height.max(1);
+        crate::js::world::canvas_bytes(width, height)?;
+        Mask::new(width, height)
+    }
+
     fn mask_contains(&self, path: &Path, rule: FillRule, point: Point) -> bool {
         #[expect(
             clippy::cast_possible_truncation,
@@ -991,7 +1000,7 @@ impl Canvas2D {
         if x >= self.width || y >= self.height {
             return false;
         }
-        let Some(mut mask) = Mask::new(self.width, self.height) else {
+        let Some(mut mask) = self.canvas_mask() else {
             return false;
         };
         mask.fill_path(path, rule, false, Transform::identity());
@@ -1022,13 +1031,13 @@ impl Canvas2D {
             FillRule::Winding
         };
         let Some(path) = self.build_path() else {
-            self.state.clip = Mask::new(self.width.max(1), self.height.max(1));
+            self.state.clip = self.canvas_mask();
             return;
         };
         if let Some(mask) = &mut self.state.clip {
             mask.intersect_path(&path, rule, true, Transform::identity());
         } else {
-            let Some(mut mask) = Mask::new(self.width, self.height) else {
+            let Some(mut mask) = self.canvas_mask() else {
                 return;
             };
             mask.fill_path(&path, rule, true, Transform::identity());
@@ -1378,10 +1387,16 @@ impl Canvas2D {
     /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
     /// transparent black
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
-    pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
-        let mut out = vec![0; width as usize * height as usize * 4];
+    pub(crate) fn read_pixels(
+        &self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        let mut out = vec![0; crate::js::world::canvas_bytes(width, height)?];
         let Some(pixmap) = &self.pixmap else {
-            return out;
+            return Some(out);
         };
         for row in 0..height {
             for column in 0..width {
@@ -1404,7 +1419,7 @@ impl Canvas2D {
                 out[offset + 3] = color.alpha();
             }
         }
-        out
+        Some(out)
     }
 
     /// `putImageData`: straight RGBA source, no transform, alpha, or
@@ -1611,7 +1626,10 @@ impl StyleValue {
 }
 
 fn make_pixmap(width: u32, height: u32) -> Option<Pixmap> {
-    Pixmap::new(width.max(1), height.max(1))
+    let width = width.max(1);
+    let height = height.max(1);
+    crate::js::world::canvas_bytes(width, height)?;
+    Pixmap::new(width, height)
 }
 
 fn to_u8(value: f32) -> u8 {
@@ -1797,7 +1815,7 @@ mod tests {
         let mut canvas = Canvas2D::new(4, 4);
         canvas.set_fill_style(StyleValue::Color([255, 0, 0, 255]));
         canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
-        let pixels = canvas.read_pixels(0, 0, 4, 4);
+        let pixels = canvas.read_pixels(0, 0, 4, 4).unwrap();
         assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
         assert_eq!(&pixels[12..16], &[0, 0, 0, 0]);
     }
@@ -1808,7 +1826,7 @@ mod tests {
         canvas.set_fill_style(StyleValue::Color([0, 0, 255, 255]));
         canvas.translate(2.0, 0.0);
         canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
-        let pixels = canvas.read_pixels(0, 0, 4, 4);
+        let pixels = canvas.read_pixels(0, 0, 4, 4).unwrap();
         assert_eq!(&pixels[8..12], &[0, 0, 255, 255]);
     }
 
@@ -1820,7 +1838,7 @@ mod tests {
         canvas.rect(0.0, 0.0, 2.0, 4.0);
         canvas.clip(false);
         canvas.fill_rect(0.0, 0.0, 4.0, 4.0);
-        let pixels = canvas.read_pixels(0, 0, 4, 4);
+        let pixels = canvas.read_pixels(0, 0, 4, 4).unwrap();
         assert_eq!(&pixels[0..4], &[0, 255, 0, 255]);
         assert_eq!(&pixels[8..12], &[0, 0, 0, 0]);
     }
