@@ -34,6 +34,11 @@ pub(crate) struct Canvas2D {
     gradients: HashMap<u32, Gradient>,
     patterns: HashMap<u32, Pattern>,
     next_resource: u32,
+    /// Whether every image painted into this canvas was same-origin. A
+    /// cross-origin image clears the flag, and `getImageData` then throws
+    /// `SecurityError`
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
+    origin_clean: bool,
 }
 
 #[derive(Clone)]
@@ -137,6 +142,9 @@ struct Pattern {
     spread: SpreadMode,
     repetition: PatternRepeat,
     quality: FilterQuality,
+    /// False when the pattern's image was not origin-clean; assigning it to a
+    /// fill or stroke taints the canvas.
+    origin_clean: bool,
 }
 
 /// How `createPattern`'s repetition string clips and tiles
@@ -154,6 +162,9 @@ pub(crate) struct SourceImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pixels: Vec<u8>,
+    /// False when the source came from another origin; painting it clears the
+    /// destination canvas's origin-clean flag.
+    pub(crate) origin_clean: bool,
 }
 
 impl Canvas2D {
@@ -170,7 +181,16 @@ impl Canvas2D {
             gradients: HashMap::new(),
             patterns: HashMap::new(),
             next_resource: 1,
+            origin_clean: true,
         }
+    }
+
+    pub(crate) fn origin_clean(&self) -> bool {
+        self.origin_clean
+    }
+
+    fn taint(&mut self) {
+        self.origin_clean = false;
     }
 
     /// `ctx.reset()`: clear the bitmap and return to the default state
@@ -188,8 +208,8 @@ impl Canvas2D {
         self.path.clear();
         self.current = None;
         self.subpath_start = Point::zero();
-        self.gradients.clear();
-        self.patterns.clear();
+        // Gradients and patterns are independent objects: resetting the
+        // context must not invalidate ids a script still holds.
     }
 
     // ---- state -----------------------------------------------------------
@@ -278,11 +298,21 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_fill_style(&mut self, value: StyleValue) {
-        self.state.fill = match value {
+        let style = match value {
             StyleValue::Color(color) => Style::Color(color),
             StyleValue::Gradient(id) => Style::Gradient(id),
-            StyleValue::Pattern(id) => Style::Pattern(id),
+            StyleValue::Pattern(id) => {
+                if self
+                    .patterns
+                    .get(&id)
+                    .is_some_and(|pattern| !pattern.origin_clean)
+                {
+                    self.taint();
+                }
+                Style::Pattern(id)
+            }
         };
+        self.state.fill = style;
     }
 
     pub(crate) fn stroke_style(&self) -> StyleValue {
@@ -290,11 +320,21 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_stroke_style(&mut self, value: StyleValue) {
-        self.state.stroke = match value {
+        let style = match value {
             StyleValue::Color(color) => Style::Color(color),
             StyleValue::Gradient(id) => Style::Gradient(id),
-            StyleValue::Pattern(id) => Style::Pattern(id),
+            StyleValue::Pattern(id) => {
+                if self
+                    .patterns
+                    .get(&id)
+                    .is_some_and(|pattern| !pattern.origin_clean)
+                {
+                    self.taint();
+                }
+                Style::Pattern(id)
+            }
         };
+        self.state.stroke = style;
     }
 
     pub(crate) fn line_width(&self) -> f32 {
@@ -1391,7 +1431,10 @@ impl Canvas2D {
         let style = self.state.stroke;
         let alpha = self.state.alpha;
         let pattern = match style {
-            Style::Pattern(id) => self.patterns.get(&id).map(|entry| entry.image.clone()),
+            Style::Pattern(id) => self
+                .patterns
+                .get(&id)
+                .map(|entry| (entry.image.clone(), entry.repetition)),
             _ => None,
         };
         let shader = match style {
@@ -1406,7 +1449,7 @@ impl Canvas2D {
                 shader
             }
             Style::Pattern(id) => {
-                let Some(image) = &pattern else {
+                let Some((image, _)) = &pattern else {
                     return;
                 };
                 let Some(entry) = self.patterns.get(&id) else {
@@ -1440,16 +1483,19 @@ impl Canvas2D {
         let Some(user_path) = prune_degenerate(&user_path) else {
             return;
         };
+        if let Some(outline) = user_path.stroke(&stroke, 1.0)
+            && let Some(outline) = outline.transform(self.state.transform)
+        {
+            self.clear_uncovered(&outline, FillRule::Winding);
+        }
+        let pattern_mask = pattern
+            .as_ref()
+            .and_then(|(image, repetition)| self.pattern_mask(image, *repetition));
+        let mask = pattern_mask.as_ref().or(self.state.clip.as_deref());
         let Some(pixmap) = &mut self.pixmap else {
             return;
         };
-        pixmap.stroke_path(
-            &user_path,
-            &paint,
-            &stroke,
-            self.state.transform,
-            self.state.clip.as_deref(),
-        );
+        pixmap.stroke_path(&user_path, &paint, &stroke, self.state.transform, mask);
     }
 
     fn gradient_shader(&self, id: u32, alpha: f32) -> Option<Shader<'static>> {
@@ -1591,6 +1637,7 @@ impl Canvas2D {
             to_premultiplied(&source.pixels),
             tiny_skia::IntSize::from_wh(source.width, source.height)?,
         )?;
+        let origin_clean = source.origin_clean;
         let (spread, repetition) = match repetition {
             "repeat" => (SpreadMode::Repeat, PatternRepeat::Repeat),
             "repeat-x" => (SpreadMode::Repeat, PatternRepeat::RepeatX),
@@ -1612,6 +1659,7 @@ impl Canvas2D {
                 spread,
                 repetition,
                 quality,
+                origin_clean,
             },
         );
         Some(id)
@@ -1783,6 +1831,11 @@ impl Canvas2D {
             && dh.is_finite())
         {
             return;
+        }
+        // Tainting is unconditional in the drawImage algorithm, even when the
+        // destination rectangle is empty.
+        if !source.origin_clean {
+            self.taint();
         }
         if sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
             return;
@@ -2756,5 +2809,27 @@ mod tests {
         assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
         // Row 2 is the shadow: green, drawn under the red shape.
         assert_eq!(&pixels[32..36], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn cross_origin_image_taints_the_canvas() {
+        let mut canvas = Canvas2D::new(1, 1);
+        canvas.draw_image(
+            &SourceImage {
+                width: 1,
+                height: 1,
+                pixels: vec![255, 0, 0, 255],
+                origin_clean: false,
+            },
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+        );
+        assert!(!canvas.origin_clean());
     }
 }

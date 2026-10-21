@@ -1328,10 +1328,17 @@ fn get_image_data(
     }
     let x = i32_of(sx);
     let y = i32_of(sy);
-    let bytes = with_canvas(this.0.ctx(), &this.0, |canvas| {
-        canvas.read_pixels(x, y, width, height)
-    })?
-    .ok_or_else(|| {
+    let (pixels, origin_clean) = with_canvas(this.0.ctx(), &this.0, |canvas| {
+        (canvas.read_pixels(x, y, width, height), canvas.origin_clean())
+    })?;
+    if !origin_clean {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "SecurityError",
+            "the canvas is not origin-clean",
+        ));
+    }
+    let bytes = pixels.ok_or_else(|| {
         crate::js::bindings::throw_dom(
             this.0.ctx(),
             "IndexSizeError",
@@ -1550,17 +1557,13 @@ fn image_bitmap_height(this: This<Object<'_>>) -> Result<u32> {
 }
 
 fn image_bitmap_close(this: This<Object<'_>>) -> Result<()> {
-    let ctx = this.0.ctx();
-    let data = data_array(ctx, Vec::new())?.into_value();
-    set_image_data(
-        ctx,
-        &this.0,
-        0,
-        0,
-        data,
-        "srgb".to_owned(),
-        "rgba-unorm8".to_owned(),
-    )?;
+    if let Ok(id) = this.0.get::<_, u64>("__tbBitmap")
+        && let Ok(world) = world(this.0.ctx())
+    {
+        world.borrow().registry().borrow_mut().remove_bitmap(id);
+    }
+    this.0.set("__tbWidth", 0)?;
+    this.0.set("__tbHeight", 0)?;
     this.0.set("__tbClosed", true)?;
     Ok(())
 }
@@ -1577,19 +1580,35 @@ fn create_image_bitmap_decode<'js>(
         ));
     };
     let options = bitmap_options(options.0.as_ref().and_then(|value| value.as_object()))?;
-    let image = image::ImageReader::new(std::io::Cursor::new(bytes))
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| {
             crate::js::bindings::throw_dom(&ctx, "InvalidStateError", "image could not be read")
-        })?
-        .decode()
-        .map_err(|_| {
-            crate::js::bindings::throw_dom(&ctx, "InvalidStateError", "image could not be decoded")
         })?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(crate::js::world::MAX_CANVAS_BYTES as u64);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|_| {
+        crate::js::bindings::throw_dom(&ctx, "InvalidStateError", "image could not be decoded")
+    })?;
+    if crate::js::world::canvas_bytes(image.width(), image.height()).is_none() {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "image is too large",
+        ));
+    }
     let image = image.to_rgba8();
     let (width, height) = (image.width(), image.height());
-    let (width, height, pixels) = resize_bitmap(width, height, image.into_raw(), &options);
-    image_bitmap_object(&ctx, width, height, pixels)
+    let Some((width, height, pixels)) = resize_bitmap(width, height, image.into_raw(), &options)
+    else {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "bitmap is too large",
+        ));
+    };
+    image_bitmap_object(&ctx, width, height, pixels, true)
 }
 
 fn create_image_bitmap_from_source<'js>(
@@ -1614,8 +1633,17 @@ fn create_image_bitmap_from_source<'js>(
             ));
         }
     };
-    let (width, height, pixels) = resize_bitmap(image.width, image.height, image.pixels, &options);
-    image_bitmap_object(&ctx, width, height, pixels)
+    let origin_clean = image.origin_clean;
+    let Some((width, height, pixels)) =
+        resize_bitmap(image.width, image.height, image.pixels, &options)
+    else {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "bitmap is too large",
+        ));
+    };
+    image_bitmap_object(&ctx, width, height, pixels, origin_clean)
 }
 
 fn image_bitmap_object<'js>(
@@ -1623,21 +1651,29 @@ fn image_bitmap_object<'js>(
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+    origin_clean: bool,
 ) -> Result<Value<'js>> {
     let ctor: Function = ctx.globals().get("ImageBitmap")?;
     let prototype: Object = ctor.get("prototype")?;
     let image = Object::new(ctx.clone())?;
     image.set_prototype(Some(&prototype))?;
-    let data = data_array(ctx, pixels)?.into_value();
-    set_image_data(
-        ctx,
-        &image,
-        width,
-        height,
-        data,
-        "srgb".to_owned(),
-        "rgba-unorm8".to_owned(),
+    let bitmap_id = world(ctx)?
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .insert_bitmap(width, height, pixels, origin_clean);
+    image.set("__tbBitmap", bitmap_id)?;
+    image.set("__tbWidth", width)?;
+    image.set("__tbHeight", height)?;
+    image.set(
+        "__tbColorSpace",
+        rquickjs::String::from_str(ctx.clone(), "srgb")?,
     )?;
+    image.set(
+        "__tbPixelFormat",
+        rquickjs::String::from_str(ctx.clone(), "rgba-unorm8")?,
+    )?;
+    image.set("__tbOriginClean", origin_clean)?;
     image.set("__tbClosed", false)?;
     Ok(image.into_value())
 }
@@ -1713,10 +1749,8 @@ fn resize_bitmap(
     height: u32,
     pixels: Vec<u8>,
     options: &BitmapOptions,
-) -> (u32, u32, Vec<u8>) {
-    let Some(buffer) = image::RgbaImage::from_raw(width, height, pixels) else {
-        return (0, 0, Vec::new());
-    };
+) -> Option<(u32, u32, Vec<u8>)> {
+    let buffer = image::RgbaImage::from_raw(width, height, pixels)?;
     let (source_width, source_height) = (buffer.width(), buffer.height());
     let (target_width, target_height) = match (options.resize_width, options.resize_height) {
         (None, None) => (source_width, source_height),
@@ -1724,6 +1758,7 @@ fn resize_bitmap(
         (None, Some(height)) => (scaled_side(source_width, height, source_height), height),
         (Some(width), Some(height)) => (width, height),
     };
+    crate::js::world::canvas_bytes(target_width, target_height)?;
     let resized = if (target_width, target_height) == (source_width, source_height) {
         buffer
     } else {
@@ -1734,7 +1769,7 @@ fn resize_bitmap(
     } else {
         resized
     };
-    (resized.width(), resized.height(), resized.into_raw())
+    Some((resized.width(), resized.height(), resized.into_raw()))
 }
 
 /// The unspecified resize axis keeps the source aspect ratio, rounded to the
@@ -1862,7 +1897,7 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
                 ImageLookup::Decoded(snapshot)
             });
         }
-        let lookup = world
+        let mut lookup = world
             .borrow()
             .with_document(id, |parsed| {
                 let element = parsed.document.base.get_node(id.node)?;
@@ -1876,10 +1911,13 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
                     if width == 0 || height == 0 {
                         return Some(ImageLookup::Invalid);
                     }
+                    let pixels = crate::js::world::canvas_bytes(width, height)
+                        .map_or_else(Vec::new, |bytes| vec![0; bytes]);
                     return Some(ImageLookup::Decoded(SourceImage {
                         width,
                         height,
-                        pixels: vec![0; width as usize * height as usize * 4],
+                        pixels,
+                        origin_clean: true,
                     }));
                 }
                 if !(data.name.ns == crate::dom::tree::html_namespace()
@@ -1892,28 +1930,64 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
                         width: raster.width,
                         height: raster.height,
                         pixels: raster.data.as_ref().to_vec(),
+                        origin_clean: true,
                     })),
                     // Still loading, or failed to load: drawing paints
                     // nothing and does not throw.
                     None => Some(ImageLookup::NotReady),
                 }
             })
-            .flatten();
-        return Ok(lookup.unwrap_or(ImageLookup::Unsupported));
+            .flatten()
+            .unwrap_or(ImageLookup::Unsupported);
+        if let ImageLookup::Decoded(image) = &mut lookup {
+            image.origin_clean &= image_is_same_origin(&world.borrow(), id);
+        }
+        return Ok(lookup);
     }
     if let Some(object) = value.as_object()
         && object.get::<_, bool>("__tbClosed").unwrap_or(false)
     {
         return Ok(ImageLookup::Invalid);
     }
+    if let Some(object) = value.as_object()
+        && let Ok(id) = object.get::<_, u64>("__tbBitmap")
+    {
+        let image = world(ctx)?
+            .borrow()
+            .registry()
+            .borrow()
+            .bitmap(id);
+        return Ok(image.map_or(ImageLookup::Invalid, ImageLookup::Decoded));
+    }
     let Some((width, height, pixels)) = read_image_data(&value)? else {
         return Ok(ImageLookup::Unsupported);
     };
+    let origin_clean = value
+        .as_object()
+        .and_then(|object| object.get::<_, bool>("__tbOriginClean").ok())
+        .unwrap_or(true);
     Ok(ImageLookup::Decoded(SourceImage {
         width,
         height,
         pixels,
+        origin_clean,
     }))
+}
+
+/// Whether the image element's current request is same-origin with the
+/// document. `data:` images are treated as clean, like browsers do; a URL
+/// that does not parse is treated as cross-origin.
+fn image_is_same_origin(world: &crate::js::world::World, id: NodeId) -> bool {
+    let Some(src) = world.images.current_src.get(&id) else {
+        return true;
+    };
+    let Ok(url) = url::Url::parse(src) else {
+        return false;
+    };
+    if url.scheme() == "data" {
+        return true;
+    }
+    world.origin == url.origin()
 }
 
 // ---- text ----------------------------------------------------------------
