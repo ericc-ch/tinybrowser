@@ -2578,12 +2578,17 @@ fn draw_text_cluster<'js>(
     if let Some(options) = options.0.as_ref().and_then(Value::as_object) {
         align = options.get::<_, String>("align").ok();
         baseline = options.get::<_, String>("baseline").ok();
+        // A missing member is absent, not `undefined` converted to NaN.
         dx = options
-            .get::<_, Coerced<f64>>("x")
-            .map_or(0.0, |value| *value);
+            .get::<_, Option<f64>>("x")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
         dy = options
-            .get::<_, Coerced<f64>>("y")
-            .map_or(0.0, |value| *value);
+            .get::<_, Option<f64>>("y")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
     }
     draw_text_with(
         this,

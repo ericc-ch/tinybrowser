@@ -258,11 +258,23 @@ fn layout_font_metrics(layout: &parley::Layout<[u8; 4]>, size: f32) -> FontMetri
                 continue;
             };
             let metrics = font_ref.metrics(Size::new(run.font_size()), LocationRef::default());
+            // The em square is the font size. A font whose typo metrics do
+            // not add up to the em size (the CanvasTest-ascent256 fixture is
+            // 256/-256 over 1024 units) is scaled to fill it
+            // (<https://html.spec.whatwg.org/multipage/canvas.html#textmetrics>).
+            let raw_ascent = metrics.ascent.max(0.0);
+            let raw_descent = (-metrics.descent).max(0.0);
+            let em_sum = raw_ascent + raw_descent;
+            let em_scale = if em_sum > 0.0 {
+                run.font_size() / em_sum
+            } else {
+                1.0
+            };
             return FontMetrics {
-                em_ascent: metrics.ascent.max(0.0),
-                em_descent: (-metrics.descent).max(0.0),
-                font_ascent: metrics.ascent.max(0.0),
-                font_descent: (-metrics.descent).max(0.0),
+                em_ascent: raw_ascent * em_scale,
+                em_descent: raw_descent * em_scale,
+                font_ascent: raw_ascent,
+                font_descent: raw_descent,
                 hanging: size * 0.5,
                 ideographic: size * 0.125,
             };
