@@ -32,14 +32,29 @@
     offscreenPrototype = prototype;
   }
 
+  // `[EnforceRange] unsigned long` rejects non-finite and out-of-range
+  // values instead of coercing them to zero
+  // (<https://webidl.spec.whatwg.org/#es-unsigned-long>).
+  function toUnsignedLong(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      throw new TypeError('value is not a finite number');
+    }
+    const integer = Math.trunc(number);
+    if (integer < 0 || integer > 4294967295) {
+      throw new TypeError('value is outside the unsigned long range');
+    }
+    return integer;
+  }
+
   class OffscreenCanvas {
     constructor(width, height) {
       if (arguments.length < 2) {
         throw new TypeError('OffscreenCanvas needs width and height');
       }
       const canvas = document.createElement('canvas');
-      canvas.width = Number(width);
-      canvas.height = Number(height);
+      canvas.width = toUnsignedLong(width);
+      canvas.height = toUnsignedLong(height);
       Object.defineProperties(this, {
         __tbCanvas: { value: canvas, configurable: true },
         __tbDoc: { value: canvas.__tbDoc, configurable: true },
@@ -48,10 +63,10 @@
     }
 
     get width() { return this.__tbCanvas.width; }
-    set width(value) { this.__tbCanvas.width = Number(value); }
+    set width(value) { this.__tbCanvas.width = toUnsignedLong(value); }
 
     get height() { return this.__tbCanvas.height; }
-    set height(value) { this.__tbCanvas.height = Number(value); }
+    set height(value) { this.__tbCanvas.height = toUnsignedLong(value); }
 
     getContext(type, options) {
       if (arguments.length === 0) {

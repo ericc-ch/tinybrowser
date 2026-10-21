@@ -6,7 +6,7 @@
 //! (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-bitmap>).
 
 use std::collections::HashMap;
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::f32::consts::{FRAC_PI_4, TAU};
 use std::sync::Arc;
 
 /// Shadows larger than this are skipped rather than allocating unbounded
@@ -1131,22 +1131,26 @@ impl Canvas2D {
         end: f32,
         counterclockwise: bool,
     ) {
-        // A span of at least 2π in the requested direction is the whole
-        // circumference. Any other span follows the requested direction from
-        // start to end, so it is at most 2π and may wrap through zero
-        // (<https://html.spec.whatwg.org/multipage/canvas.html#ellipse-method-steps>).
-        let swept = end - start;
-        let delta = if counterclockwise {
-            if start - end >= TAU {
-                -TAU
-            } else {
-                swept.rem_euclid(TAU) - TAU
-            }
-        } else if end - start >= TAU {
+        // The arc runs from the start point to the end point in the requested
+        // direction, covering at most one full turn. A negative exact
+        // multiple of 2π is a full turn, not an empty arc
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ellipse>).
+        let raw = if counterclockwise {
+            start - end
+        } else {
+            end - start
+        };
+        let sweep = if raw >= TAU {
             TAU
         } else {
-            swept.rem_euclid(TAU)
+            let modulo = raw.rem_euclid(TAU);
+            if modulo == 0.0 && raw < 0.0 {
+                TAU
+            } else {
+                modulo
+            }
         };
+        let delta = if counterclockwise { -sweep } else { sweep };
         let mut start_point = ellipse_point(cx, cy, rx, ry, rotation, start);
         self.state.transform.map_point(&mut start_point);
         match self.current {
@@ -1165,7 +1169,11 @@ impl Canvas2D {
             clippy::cast_sign_loss,
             reason = "the count is a finite positive angle span, far below u32::MAX"
         )]
-        let segments = ((delta.abs() / FRAC_PI_2).ceil() as u32).max(1);
+        // A quarter-turn cubic approximates a circular arc to about 0.03% of
+        // the radius; that error is visible once a non-uniform transform
+        // stretches the radius, so use eighth-turns
+        // (Skia's `SkPath::arcTo` uses a comparable angular step).
+        let segments = ((delta.abs() / FRAC_PI_4).ceil() as u32).max(1);
         #[expect(
             clippy::cast_precision_loss,
             reason = "segment counts are far below 2^24"
@@ -1264,7 +1272,7 @@ impl Canvas2D {
             0.0,
             start,
             end,
-            cross < 0.0,
+            cross > 0.0,
         );
     }
 
@@ -3409,5 +3417,19 @@ mod tests {
             1.0,
         );
         assert!(!canvas.origin_clean());
+    }
+
+    #[test]
+    fn full_turn_from_2pi_to_zero_is_a_full_ellipse() {
+        let mut canvas = Canvas2D::new(100, 50);
+        canvas.set_line_dash(vec![10.0, 21.4159]);
+        canvas.scale(20.0, 20.0);
+        canvas.ellipse(6.0, 10.0, 5.0, 5.0, 0.0, std::f32::consts::TAU, 0.0, false);
+        canvas.stroke();
+        assert!(canvas.is_point_in_path(120.0, 200.0, false));
+        assert!(canvas.is_point_in_stroke(220.0, 200.0));
+        assert!(canvas.is_point_in_stroke(174.0, 284.2));
+        assert!(canvas.is_point_in_stroke(82.0, 292.6));
+        assert!(!canvas.is_point_in_stroke(74.8, 289.2));
     }
 }
