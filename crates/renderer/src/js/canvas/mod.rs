@@ -2638,48 +2638,47 @@ fn get_actual_bounding_box<'js>(
     let (left, right) = match resolved {
         "right" | "end" => (
             shaped.width - shaped.ink_min_x,
-            shaped.width - shaped.ink_max_x,
+            shaped.ink_max_x - shaped.width,
         ),
         "center" => (
             shaped.width / 2.0 - shaped.ink_min_x,
-            shaped.width / 2.0 - shaped.ink_max_x,
+            shaped.ink_max_x - shaped.width / 2.0,
         ),
-        _ => (shaped.ink_min_x.abs(), shaped.ink_max_x),
+        _ => (-shaped.ink_min_x, shaped.ink_max_x),
     };
+    let baseline: String = this
+        .0
+        .get("__tbBaseline")
+        .unwrap_or_else(|_| "alphabetic".to_owned());
+    let dy = match baseline.as_str() {
+        "top" => 0.0,
+        "hanging" => shaped.hanging_baseline - shaped.ascent,
+        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
+        "bottom" => -(shaped.ascent + shaped.descent),
+        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        _ => -shaped.ascent,
+    };
+    let shift = -shaped.ascent - dy;
+    let ascent = shaped.actual_ascent + shift;
+    let descent = shaped.actual_descent - shift;
     let object = Object::new(ctx.clone())?;
     object.set("x", -left)?;
-    object.set("y", -shaped.actual_ascent)?;
+    object.set("y", -ascent)?;
     object.set("width", left + right)?;
-    object.set("height", shaped.actual_ascent + shaped.actual_descent)?;
+    object.set("height", ascent + descent)?;
     Ok(object)
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "indices were checked non-negative and within the UTF-16 length"
-)]
 fn get_selection_rects<'js>(
     this: This<Object<'js>>,
     args: rquickjs::function::Rest<Value<'js>>,
 ) -> Result<Array<'js>> {
     let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
-    let length = text.encode_utf16().count();
-    let start = *Coerced::<f64>::from_js(ctx, args.0[0].clone())?;
-    let end = *Coerced::<f64>::from_js(ctx, args.0[1].clone())?;
-    if start < 0.0 || end < 0.0 {
-        return Err(Exception::throw_type(ctx, "indices must be non-negative"));
-    }
-    let (start, end) = (start as usize, end as usize);
-    if start > length || end > length {
-        return Err(crate::js::bindings::throw_dom(
-            ctx,
-            "IndexSizeError",
-            "index is outside the text",
-        ));
-    }
-    // Selection rectangles are empty for a reversed or empty range.
+    let (start, end) = text_range(ctx, &text, &args.0, false)?;
+    // Selection rectangles are empty for a reversed or empty range. The
+    // shaped cluster advances are not exposed yet; returning an empty list is
+    // deliberate, but the arguments are still validated.
     let _ = (start, end);
     Array::new(ctx.clone())
 }
@@ -2746,14 +2745,26 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     let (actual_left, actual_right) = match resolved {
         "right" | "end" => (
             shaped.width - shaped.ink_min_x,
-            shaped.width - shaped.ink_max_x,
+            shaped.ink_max_x - shaped.width,
         ),
         "center" => (
             shaped.width / 2.0 - shaped.ink_min_x,
-            shaped.width / 2.0 - shaped.ink_max_x,
+            shaped.ink_max_x - shaped.width / 2.0,
         ),
-        _ => (shaped.ink_min_x.abs(), shaped.ink_max_x),
+        _ => (-shaped.ink_min_x, shaped.ink_max_x),
     };
+    // Every y metric is measured from the selected text baseline. `shift` is
+    // the distance from the alphabetic baseline to that baseline (negative
+    // above it).
+    let dy = match baseline.as_str() {
+        "top" => 0.0,
+        "hanging" => shaped.hanging_baseline - shaped.ascent,
+        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
+        "bottom" => -(shaped.ascent + shaped.descent),
+        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        _ => -shaped.ascent,
+    };
+    let shift = -shaped.ascent - dy;
     let object = Object::new(ctx.clone())?;
     object.set("__tbText", text.to_string())?;
     object.set("__tbFont", font)?;
@@ -2773,15 +2784,15 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     object.set("width", shaped.width)?;
     object.set("actualBoundingBoxLeft", actual_left)?;
     object.set("actualBoundingBoxRight", actual_right)?;
-    object.set("actualBoundingBoxAscent", shaped.actual_ascent)?;
-    object.set("actualBoundingBoxDescent", shaped.actual_descent)?;
-    object.set("fontBoundingBoxAscent", shaped.font_ascent)?;
-    object.set("fontBoundingBoxDescent", shaped.font_descent)?;
-    object.set("emHeightAscent", shaped.em_ascent)?;
-    object.set("emHeightDescent", shaped.em_descent)?;
-    object.set("hangingBaseline", shaped.hanging_baseline)?;
-    object.set("alphabeticBaseline", 0.0)?;
-    object.set("ideographicBaseline", shaped.ideographic_baseline)?;
+    object.set("actualBoundingBoxAscent", shaped.actual_ascent + shift)?;
+    object.set("actualBoundingBoxDescent", shaped.actual_descent - shift)?;
+    object.set("fontBoundingBoxAscent", shaped.font_ascent + shift)?;
+    object.set("fontBoundingBoxDescent", shaped.font_descent - shift)?;
+    object.set("emHeightAscent", shaped.em_ascent + shift)?;
+    object.set("emHeightDescent", shaped.em_descent - shift)?;
+    object.set("hangingBaseline", shaped.hanging_baseline + shift)?;
+    object.set("alphabeticBaseline", shift)?;
+    object.set("ideographicBaseline", shaped.ideographic_baseline + shift)?;
     Ok(object)
 }
 

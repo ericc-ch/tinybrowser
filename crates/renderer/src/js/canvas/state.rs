@@ -49,12 +49,21 @@ pub(crate) struct Canvas2D {
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing>).
 fn normalize_length(value: &str) -> Option<String> {
     let text = value.trim().to_ascii_lowercase();
-    let split = text.find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+')))?;
+    let Some(split) =
+        text.find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+')))
+    else {
+        // Unitless zero is a valid CSS length; every other unitless number is
+        // not.
+        return text
+            .parse::<f32>()
+            .ok()
+            .filter(|number| *number == 0.0)
+            .map(|_| "0px".to_owned());
+    };
     let (number, unit) = text.split_at(split);
-    let unit = unit.trim();
     if !matches!(
         unit,
-        "px" | "em" | "ex" | "ch" | "ic" | "rem" | "in" | "cm" | "mm" | "pt" | "pc" | "q" | "%"
+        "px" | "em" | "ex" | "ch" | "ic" | "rem" | "in" | "cm" | "mm" | "pt" | "pc" | "q"
     ) {
         return None;
     }

@@ -102,7 +102,7 @@ pub(crate) fn shape(
     }
     let text = prepared.as_str();
     let mut layout_ctx = LayoutContext::<[u8; 4]>::new();
-    let mut builder = layout_ctx.ranged_builder(font_ctx, &text, 1.0, true);
+    let mut builder = layout_ctx.ranged_builder(font_ctx, text, 1.0, true);
     builder.push_default(StyleProperty::FontSize(parsed.size));
     if let Some(family) = parsed.family {
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family.into())));
@@ -122,17 +122,20 @@ pub(crate) fn shape(
     if let Some(language) = language.and_then(|language| Language::parse(language).ok()) {
         builder.push_default(StyleProperty::Locale(Some(language)));
     }
+    // One FontFeatures range: a second push would overwrite the first.
+    let mut features = Vec::new();
     if parsed.small_caps {
-        builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::from(
-            "smcp",
-        )));
+        features.push("smcp");
     }
     if kerning == "none" {
+        features.push("\"kern\" 0");
+    }
+    if !features.is_empty() {
         builder.push_default(StyleProperty::FontFeatures(parley::FontFeatures::from(
-            "\"kern\" 0",
+            features.join(", ").as_str(),
         )));
     }
-    let mut layout = builder.build(&text);
+    let mut layout = builder.build(text);
     layout.break_all_lines(None);
     let metrics = layout.root_span_metrics();
     let (ascent, descent) = metrics.map_or((parsed.size, parsed.size * 0.25), |metrics| {
