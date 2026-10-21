@@ -669,7 +669,10 @@ fn set_transform(
         if args == (None, None, None, None, None, None) {
             return with_canvas(this.0.ctx(), &this.0, state::Canvas2D::reset_transform);
         }
-        return Ok(());
+        return Err(Exception::throw_type(
+            this.0.ctx(),
+            "setTransform needs all six arguments or one dictionary",
+        ));
     };
     with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.set_transform(
@@ -1328,13 +1331,17 @@ fn create_pattern<'js>(
     repetition: Opt<Value<'js>>,
 ) -> Result<Value<'js>> {
     reject_open_layer(this.0.ctx(), &this.0)?;
-    let repetition = match repetition.0 {
-        None => "repeat".to_owned(),
-        Some(value) if value.is_null() => "repeat".to_owned(),
-        Some(value) => {
-            let ctx = value.ctx().clone();
-            DomString::from_js(&ctx, value)?.to_string()
-        }
+    let Some(repetition) = repetition.0 else {
+        return Err(Exception::throw_type(
+            this.0.ctx(),
+            "createPattern needs a repetition",
+        ));
+    };
+    let repetition = if repetition.is_null() {
+        "repeat".to_owned()
+    } else {
+        let ctx = repetition.ctx().clone();
+        DomString::from_js(&ctx, repetition)?.to_string()
     };
     if !matches!(
         repetition.as_str(),
@@ -2498,6 +2505,12 @@ fn source_element(
     if !(data.name.ns == crate::dom::tree::html_namespace() && data.name.local.as_str() == "img") {
         return Some(ImageLookup::Unsupported);
     }
+    if let Some(blitz_dom::node::ImageData::Svg(svg)) = data.image_data() {
+        if zero_size {
+            return Some(ImageLookup::NotReady);
+        }
+        return Some(svg_source_image(svg).map_or(ImageLookup::NotReady, ImageLookup::Decoded));
+    }
     let has_source = data.attrs().iter().any(|attribute| {
         attribute.name.local.as_str() == "src" && !attribute.value.trim().is_empty()
     });
@@ -2514,6 +2527,50 @@ fn source_element(
         None if has_source && connected && !zero_size => Some(ImageLookup::Invalid),
         None => Some(ImageLookup::NotReady),
     }
+}
+
+/// Rasterizes an SVG `<img>` at its intrinsic size into straight RGBA pixels
+/// for `drawImage` / `createPattern`.
+fn svg_source_image(svg: &blitz_dom::node::SvgImageData) -> Option<SourceImage> {
+    let (width, height) = crate::render::svg_natural_size(svg);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut painter = anyrender_tiny_skia::TinySkiaScenePainter::new(width, height);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "SVG raster sizes are bounded by the pixmap budget"
+    )]
+    let viewport = svg.viewport_transform(width as f32, height as f32);
+    anyrender_svg::render_svg_tree(
+        &mut painter,
+        &svg.tree,
+        kurbo::Affine::new([
+            f64::from(viewport.sx),
+            f64::from(viewport.ky),
+            f64::from(viewport.kx),
+            f64::from(viewport.sy),
+            f64::from(viewport.tx),
+            f64::from(viewport.ty),
+        ]),
+    );
+    let pixmap = painter.pixmap();
+    let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for pixel in pixmap.pixels() {
+        let color = pixel.demultiply();
+        pixels.extend_from_slice(&[
+            color.red(),
+            color.green(),
+            color.blue(),
+            color.alpha(),
+        ]);
+    }
+    Some(SourceImage {
+        width,
+        height,
+        pixels,
+        origin_clean: true,
+    })
 }
 
 // ---- text ----------------------------------------------------------------

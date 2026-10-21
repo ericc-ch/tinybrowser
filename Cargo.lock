@@ -2608,6 +2608,7 @@ name = "renderer"
 version = "0.1.0"
 dependencies = [
  "anyrender",
+ "anyrender_svg",
  "anyrender_tiny_skia",
  "base64",
  "blitz-dom",
@@ -2629,6 +2630,7 @@ dependencies = [
  "icu_provider_adapters",
  "icu_provider_blob",
  "image",
+ "kurbo",
  "markup5ever",
  "net",
  "parley",

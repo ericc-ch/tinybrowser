@@ -2541,6 +2541,7 @@ impl Canvas2D {
         });
     }
 
+    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
     fn draw_image_inner(
         &mut self,
         source: &SourceImage,
@@ -2572,6 +2573,13 @@ impl Canvas2D {
         if sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
             return;
         }
+        // A negative width or height describes the same rectangle from the
+        // opposite corner; it does not reverse the image
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-drawimage>).
+        let (sx, sw) = if sw < 0.0 { (sx + sw, -sw) } else { (sx, sw) };
+        let (sy, sh) = if sh < 0.0 { (sy + sh, -sh) } else { (sy, sh) };
+        let (dx, dw) = if dw < 0.0 { (dx + dw, -dw) } else { (dx, dw) };
+        let (dy, dh) = if dh < 0.0 { (dy + dh, -dh) } else { (dy, dh) };
         let Some(pixmap) = Pixmap::from_vec(
             to_premultiplied(&source.pixels),
             tiny_skia::IntSize::from_wh(source.width, source.height)

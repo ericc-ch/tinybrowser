@@ -1754,9 +1754,14 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     if is_img || is_script {
         note_src_creator(ctx, element);
     }
+    // An `<img>` loads from its `src` even while detached (`new Image()`
+    // never enters a document) (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    if is_img {
+        world.borrow_mut().queue_image_update(element);
+        return Ok(());
+    }
     // A detached `iframe` has no browsing context yet; insertion reads the
-    // current attribute, so queueing here would navigate it twice. The same
-    // is true of `<img>`: connection starts the fetch.
+    // current attribute, so queueing here would navigate it twice.
     let connected = world
         .borrow()
         .document(element)
@@ -1779,8 +1784,6 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
                     spec,
                 )),
         }
-    } else if is_img {
-        world.borrow_mut().queue_image_update(element);
     } else {
         // `src` set on a connected classic script runs the prepare steps,
         // including the fetch when the element is not already started.

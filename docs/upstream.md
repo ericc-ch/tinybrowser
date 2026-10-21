@@ -21,6 +21,7 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 - 83251583 parse canvas width/height attributes as non-negative integers. `100%`, `100e1`, and `0x100` are 100, 100, and 0, not a CSS length and a parse failure; the intrinsic size and the computed width both depend on it.
 - 82eb84a8 expose the document font context. Canvas text must shape with the database holding `@font-face` fonts; the shared process context does not see them, so an embedder cannot otherwise measure or draw the fonts a page declares.
 - c198da78 accept zero-sized SVG images. usvg rejects width or height 0, so a valid image with no painted area was reported as a failed load; the declared intrinsic size now survives and `naturalWidth` / `naturalHeight` can be 0 without an error.
+- ab3cb6c3 load `<img src>` while detached. `new Image()` never enters a document, but the spec starts the image request when `src` is set; the special-attribute path returned early for detached nodes, so script-created images never fetched and canvas `drawImage` waited forever for `load`.
 
 ### html5ever (third_party/html5ever, master)
 
