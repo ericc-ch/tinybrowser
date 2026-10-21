@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use rquickjs::class::Trace;
 use rquickjs::function::Opt;
 use rquickjs::prelude::Coerced;
-use rquickjs::{Class, Ctx, Exception, Result, Value};
+use rquickjs::{Class, Ctx, Exception, FromJs, Result, Value};
 
 use super::state::Canvas2D;
 use super::{f32_of, round_rect_radii};
@@ -45,23 +45,33 @@ impl JsPath2D {
     }
 
     #[qjs(rename = "addPath")]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "class methods share the fallible host signature"
-    )]
-    fn add_path(
+    fn add_path<'js>(
         &self,
-        ctx: Ctx<'_>,
-        path: Class<'_, JsPath2D>,
-        transform: Opt<Value<'_>>,
+        ctx: Ctx<'js>,
+        path: Class<'js, JsPath2D>,
+        transform: Opt<Value<'js>>,
     ) -> Result<()> {
-        let _ = (&ctx, transform);
-        // Appending keeps the source path in its own coordinates. The
-        // optional DOMMatrix transform is applied through a path transform.
-        let source = path.borrow();
-        let source = source.canvas.borrow();
-        if let Some(source_path) = source.user_path() {
-            self.canvas.borrow_mut().append_path(&source_path);
+        let matrix = add_path_transform(&ctx, transform.0.as_ref())?;
+        // End the source borrows before touching self: `addPath(p)` on the
+        // same object shares one RefCell.
+        let source_path = {
+            let source = path.borrow();
+            let source = source.canvas.borrow();
+            source.user_path()
+        };
+        if let Some(mut source_path) = source_path {
+            if let Some(matrix) = matrix {
+                let Some(transformed) = source_path.transform(matrix) else {
+                    return Ok(());
+                };
+                source_path = transformed;
+            }
+            let mut target = self.canvas.borrow_mut();
+            target.append_path(&source_path);
+            // Step 8: start a new subpath at the copied path's last point.
+            if let Some(current) = target.current_point() {
+                target.move_to(current.x, current.y);
+            }
         }
         Ok(())
     }
@@ -268,6 +278,51 @@ impl JsPath2D {
         );
         Ok(())
     }
+}
+
+/// Reads `addPath`'s optional `DOMMatrix2DInit`. Missing members use the
+/// identity values; any non-finite member returns no transform, which leaves
+/// the source path unchanged
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-path2d-addpath>).
+fn add_path_transform<'js>(
+    ctx: &Ctx<'js>,
+    value: Option<&Value<'js>>,
+) -> Result<Option<tiny_skia::Transform>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(Exception::throw_type(
+            ctx,
+            "addPath transform must be an object",
+        ));
+    };
+    let read = |name: &str| -> Result<Option<f32>> {
+        let member: Value = object.get(name)?;
+        if member.is_undefined() || member.is_null() {
+            return Ok(None);
+        }
+        let number = Coerced::<f64>::from_js(ctx, member)?;
+        Ok(Some(f32_of(*number)))
+    };
+    let m11 = read("a")?.unwrap_or(1.0);
+    let m12 = read("b")?.unwrap_or(0.0);
+    let m21 = read("c")?.unwrap_or(0.0);
+    let m22 = read("d")?.unwrap_or(1.0);
+    let dx = read("e")?.unwrap_or(0.0);
+    let dy = read("f")?.unwrap_or(0.0);
+    if [m11, m12, m21, m22, dx, dy]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Ok(None);
+    }
+    Ok(Some(tiny_skia::Transform::from_row(
+        m11, m12, m21, m22, dx, dy,
+    )))
 }
 
 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {

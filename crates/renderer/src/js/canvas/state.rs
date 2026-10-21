@@ -1230,6 +1230,8 @@ impl Canvas2D {
 
     pub(crate) fn clip_borrowed_path(&mut self, other: &Canvas2D, even_odd: bool) {
         let Some(user_path) = other.build_path() else {
+            // An empty path describes no area: the clip becomes empty.
+            self.state.clip = self.canvas_mask().map(Arc::new);
             return;
         };
         let Some(device_path) = user_path.transform(self.state.transform) else {
@@ -1267,6 +1269,10 @@ impl Canvas2D {
     /// The path in user space, for a `Path2D` consumer.
     pub(crate) fn user_path(&self) -> Option<Path> {
         self.build_path()
+    }
+
+    pub(crate) fn current_point(&self) -> Option<Point> {
+        self.current
     }
 
     /// Appends every segment of `path`, for `Path2D.addPath`.
@@ -1323,7 +1329,7 @@ impl Canvas2D {
 
     pub(crate) fn clip(&mut self, even_odd: bool) {
         let Some(path) = self.build_path() else {
-            self.state.clip = self.canvas_mask();
+            self.state.clip = self.canvas_mask().map(Arc::new);
             return;
         };
         self.clip_built_path(&path, even_odd);
