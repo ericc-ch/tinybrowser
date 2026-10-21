@@ -24,5 +24,6 @@ media.js
 canvas_filter.js
 css_color_api.js
 geometry.js
+image_data.js
 offscreen_canvas.js
 canvas_host.js

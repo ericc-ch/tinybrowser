@@ -1630,96 +1630,112 @@ fn image_data_construct<'js>(
     let Some(first) = args.0.first() else {
         return Err(Exception::throw_type(ctx, "ImageData needs arguments"));
     };
-    let Some(data) = first
+    if let Some(data) = first
         .as_object()
         .and_then(|object| object.as_typed_array::<rquickjs::U8Clamped>())
-    else {
-        if first.as_object().is_some() {
+    {
+        let Some(sw) = args.0.get(1) else {
+            return Err(Exception::throw_type(ctx, "ImageData needs a width"));
+        };
+        let sw = *Coerced::<f64>::from_js(ctx, sw.clone())?;
+        let sh = args
+            .0
+            .get(2)
+            .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
+            .transpose()?;
+        let settings = args.0.get(3);
+        validate_image_data_settings(ctx, settings)?;
+        initialize_image_data_from_data(ctx, &object, data.len(), first, sw, sh, settings)?;
+        return Ok(object);
+    }
+    // The other data-overload member is Float16Array, which this engine does
+    // not implement. Any other typed array falls through to the numeric
+    // overload, where ToUint32(array) is 0.
+    if first.is_null() {
+        return Err(Exception::throw_type(ctx, "ImageData needs a numeric width"));
+    }
+    if let Some(object) = first.as_object() {
+        let shared = object
+            .get::<_, Value>("buffer")
+            .ok()
+            .and_then(|buffer| buffer.as_object().cloned())
+            .and_then(|buffer| buffer.get::<_, Function>("constructor").ok())
+            .and_then(|ctor| ctor.get::<_, String>("name").ok())
+            .is_some_and(|name| name == "SharedArrayBuffer");
+        if shared {
             return Err(Exception::throw_type(
                 ctx,
-                "ImageData data must be a Uint8ClampedArray",
+                "ImageData does not accept shared buffers",
             ));
         }
-        let width = *Coerced::<f64>::from_js(ctx, first.clone())?;
-        let height = args
-            .0
-            .get(1)
-            .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
-            .transpose()?
-            .ok_or_else(|| Exception::throw_type(ctx, "ImageData needs a height"))?;
-        new_blank_image_data(ctx, &object, width, height, args.0.get(2))?;
-        return Ok(object);
-    };
-    let byte_length = data.len();
-    let width = args
+        let typed_array = object.contains_key("buffer").unwrap_or(false)
+            && object.contains_key("byteLength").unwrap_or(false);
+        if !typed_array {
+            return Err(Exception::throw_type(ctx, "ImageData needs a numeric width"));
+        }
+    }
+    let width = *Coerced::<f64>::from_js(ctx, first.clone())?;
+    let height = args
         .0
         .get(1)
         .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
-        .transpose()?;
-    let height = args
-        .0
-        .get(2)
-        .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
-        .transpose()?;
-    let explicit_dimensions = width.is_some() && height.is_some();
-    let (width, height) = match (width, height) {
-        (None, _) => (u32::try_from(byte_length / 4).unwrap_or(u32::MAX), 1),
-        (Some(width), None) => {
-            let width = canvas_u32(width);
-            if width == 0 {
-                return Err(crate::js::bindings::throw_dom(
-                    ctx,
-                    "IndexSizeError",
-                    "ImageData width must be nonzero",
-                ));
-            }
-            let height = byte_length / 4 / width as usize;
-            (width, u32::try_from(height).unwrap_or(u32::MAX))
-        }
-        (Some(width), Some(height)) => {
-            if !width.is_finite() || !height.is_finite() {
-                return Err(Exception::throw_type(
-                    ctx,
-                    "ImageData dimensions must be finite",
-                ));
-            }
-            (canvas_u32(width), canvas_u32(height))
-        }
-    };
-    if width == 0 || (explicit_dimensions && height == 0) {
+        .transpose()?
+        .ok_or_else(|| Exception::throw_type(ctx, "ImageData needs a height"))?;
+    let settings = args.0.get(2);
+    validate_image_data_settings(ctx, settings)?;
+    new_blank_image_data(ctx, &object, width, height, settings)?;
+    Ok(object)
+}
+
+/// The data overload of the `ImageData` constructor
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-imagedata-with-data>).
+fn initialize_image_data_from_data<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    byte_length: usize,
+    data: &Value<'js>,
+    sw: f64,
+    sh: Option<f64>,
+    settings: Option<&Value<'js>>,
+) -> Result<()> {
+    if byte_length == 0 || !byte_length.is_multiple_of(4) {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "InvalidStateError",
+            "ImageData data length must be a nonzero multiple of four",
+        ));
+    }
+    let length = byte_length / 4;
+    let width = canvas_u32(sw);
+    let width_usize = usize::try_from(width).unwrap_or(usize::MAX);
+    if width == 0 || !length.is_multiple_of(width_usize) {
         return Err(crate::js::bindings::throw_dom(
             ctx,
             "IndexSizeError",
-            "ImageData dimensions must be nonzero",
+            "ImageData data length does not match its width",
         ));
     }
-    let expected = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|bytes| bytes.checked_mul(4));
-    if height == 0 || expected != Some(byte_length as u64) {
-        let name = if explicit_dimensions {
-            "IndexSizeError"
-        } else {
-            "InvalidStateError"
-        };
+    let height = length / width_usize;
+    let height = u32::try_from(height).unwrap_or(u32::MAX);
+    if let Some(sh) = sh
+        && canvas_u32(sh) != height
+    {
         return Err(crate::js::bindings::throw_dom(
             ctx,
-            name,
-            "ImageData data length does not match its dimensions",
+            "IndexSizeError",
+            "ImageData data length does not match its height",
         ));
     }
-    let settings = args.0.get(if args.0.len() > 3 { 3 } else { 2 });
     let (color_space, pixel_format) = image_data_settings(settings);
     set_image_data(
         ctx,
-        &object,
+        object,
         width,
         height,
-        first.clone(),
+        data.clone(),
         color_space,
         pixel_format,
-    )?;
-    Ok(object)
+    )
 }
 
 fn new_blank_image_data<'js>(
@@ -1729,12 +1745,6 @@ fn new_blank_image_data<'js>(
     height: f64,
     settings: Option<&Value<'js>>,
 ) -> Result<()> {
-    if !width.is_finite() || !height.is_finite() {
-        return Err(Exception::throw_type(
-            ctx,
-            "ImageData dimensions must be finite",
-        ));
-    }
     let width = canvas_u32(width);
     let height = canvas_u32(height);
     if width == 0 || height == 0 {
@@ -1754,6 +1764,23 @@ fn new_blank_image_data<'js>(
     let data = data_array(ctx, vec![0; bytes])?.into_value();
     let (color_space, pixel_format) = image_data_settings(settings);
     set_image_data(ctx, object, width, height, data, color_space, pixel_format)
+}
+
+/// A dictionary argument must be an object (or null/undefined). Other
+/// primitives cannot convert to `ImageDataSettings` and throw `TypeError`
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>).
+fn validate_image_data_settings(ctx: &Ctx<'_>, settings: Option<&Value<'_>>) -> Result<()> {
+    if let Some(value) = settings
+        && !value.is_null()
+        && !value.is_undefined()
+        && value.as_object().is_none()
+    {
+        return Err(Exception::throw_type(
+            ctx,
+            "ImageData settings must be an object",
+        ));
+    }
+    Ok(())
 }
 
 fn image_data_settings(settings: Option<&Value<'_>>) -> (String, String) {
