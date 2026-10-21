@@ -227,6 +227,15 @@ impl RealmRegistry {
         self.bitmaps.remove(&id);
     }
 
+    /// Drops the bitmap and context state. Setting `canvas.width` or
+    /// `canvas.height` resets the context even when the value is unchanged
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-width>).
+    pub(crate) fn reset_canvas(&mut self, id: NodeId, width: u32, height: u32) {
+        if let Some(canvas) = self.canvases.get_mut(&id) {
+            canvas.reset_for_resize(width, height);
+        }
+    }
+
     /// The 2D context state for `id`, reallocated when its content attributes
     /// changed size
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
@@ -235,8 +244,8 @@ impl RealmRegistry {
             .canvases
             .get(&id)
             .is_some_and(|canvas| canvas.width != width || canvas.height != height);
-        if stale {
-            self.canvases.remove(&id);
+        if stale && let Some(canvas) = self.canvases.get_mut(&id) {
+            canvas.reset_for_resize(width, height);
         }
         self.canvases
             .entry(id)

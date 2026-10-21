@@ -94,7 +94,6 @@ pub(crate) fn context_object<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'j
     object.set_prototype(Some(&prototype))?;
     object.set("__tbDoc", id.document)?;
     object.set("__tbNode", id.node.as_u64())?;
-    object.set("canvas", wrap_node(ctx, id)?)?;
     let resources = Object::new(ctx.clone())?;
     object.set("__tbRes", resources)?;
     Ok(object.into_value())
@@ -199,6 +198,7 @@ macro_rules! string_prop {
     };
 }
 fn install_accessors(prototype: &Object<'_>) -> Result<()> {
+    prototype.prop("canvas", Accessor::from(canvas_object))?;
     install_paint_accessors(prototype)?;
     install_text_accessors(prototype)?;
     prototype.prop(
@@ -297,6 +297,12 @@ fn install_text_accessors(prototype: &Object<'_>) -> Result<()> {
     string_prop!(prototype, "wordSpacing", word_spacing, set_word_spacing);
     string_prop!(prototype, "fontKerning", font_kerning, set_font_kerning);
     string_prop!(prototype, "fontStretch", font_stretch, set_font_stretch);
+    string_prop!(
+        prototype,
+        "textRendering",
+        text_rendering,
+        set_text_rendering
+    );
     string_prop!(
         prototype,
         "fontVariantCaps",
@@ -2398,6 +2404,11 @@ fn set_style_value<'js>(
         return Ok(());
     };
     with_canvas(ctx, object, |canvas| set(canvas, style))
+}
+
+fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {
+    let id = canvas_id(&this.0)?;
+    wrap_node(this.0.ctx(), id)
 }
 
 /// Parses a canvas color. `currentColor` resolves against the canvas
