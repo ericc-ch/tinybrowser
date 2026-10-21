@@ -7,6 +7,31 @@
     return;
   }
 
+  const base = globalThis.CanvasRenderingContext2D;
+  let offscreenPrototype = base && base.prototype;
+  if (base) {
+    function OffscreenCanvasRenderingContext2D() {}
+    const prototype = Object.create(Object.prototype);
+    for (const key of Object.getOwnPropertyNames(base.prototype)) {
+      if (key === 'constructor') {
+        continue;
+      }
+      Object.defineProperty(
+        prototype,
+        key,
+        Object.getOwnPropertyDescriptor(base.prototype, key),
+      );
+    }
+    Object.defineProperty(prototype, 'constructor', {
+      configurable: true,
+      writable: true,
+      value: OffscreenCanvasRenderingContext2D,
+    });
+    OffscreenCanvasRenderingContext2D.prototype = prototype;
+    globalThis.OffscreenCanvasRenderingContext2D = OffscreenCanvasRenderingContext2D;
+    offscreenPrototype = prototype;
+  }
+
   class OffscreenCanvas {
     constructor(width, height) {
       if (arguments.length < 2) {
@@ -29,8 +54,17 @@
     set height(value) { this.__tbCanvas.height = Number(value); }
 
     getContext(type, options) {
-      const context = this.__tbCanvas.getContext(type, options);
+      if (arguments.length === 0) {
+        throw new TypeError('getContext needs a context type');
+      }
+      if (String(type) !== '2d') {
+        throw new TypeError('unsupported context type');
+      }
+      const context = this.__tbCanvas.getContext('2d', options);
       if (context && !context.__tbOffscreenCanvas) {
+        if (offscreenPrototype) {
+          Object.setPrototypeOf(context, offscreenPrototype);
+        }
         Object.defineProperties(context, {
           canvas: { value: this, configurable: true },
           __tbOffscreenCanvas: { value: this, configurable: true },
