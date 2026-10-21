@@ -15,6 +15,16 @@ use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::{FontRef, GlyphId, MetadataProvider};
 use tiny_skia::{Path, PathBuilder, Transform};
 
+/// One shaped grapheme cluster in text space.
+pub(crate) struct TextCluster {
+    pub(crate) byte_start: usize,
+    pub(crate) byte_end: usize,
+    pub(crate) utf16_start: usize,
+    pub(crate) utf16_end: usize,
+    pub(crate) offset: f32,
+    pub(crate) advance: f32,
+}
+
 /// One shaped string, in glyph-local coordinates (baseline at y = 0).
 pub(crate) struct ShapedText {
     pub(crate) path: Option<Path>,
@@ -23,6 +33,8 @@ pub(crate) struct ShapedText {
     pub(crate) descent: f32,
     /// Horizontal squeeze applied by `fillText`'s `maxWidth`.
     pub(crate) scale_x: f32,
+    /// Shaped grapheme clusters, in visual order.
+    pub(crate) clusters: Vec<TextCluster>,
     /// Glyph ink bounds relative to the alignment point and baseline
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#textmetrics>).
     pub(crate) ink_min_x: f32,
@@ -88,6 +100,7 @@ pub(crate) fn shape(
             ascent: parsed.size,
             descent: parsed.size * 0.25,
             scale_x: 1.0,
+            clusters: Vec::new(),
             ink_min_x: 0.0,
             ink_max_x: 0.0,
             actual_ascent: 0.0,
@@ -146,6 +159,26 @@ pub(crate) fn shape(
     let scale_x = max_width
         .filter(|max| *max > 0.0 && width > *max)
         .map_or(1.0, |max| max / width);
+    let utf16_offsets = cluster_utf16_offsets(text);
+    let mut clusters = Vec::new();
+    for line in layout.lines() {
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(run) = item else {
+                continue;
+            };
+            for cluster in run.run().clusters() {
+                let range = cluster.text_range();
+                clusters.push(TextCluster {
+                    byte_start: range.start,
+                    byte_end: range.end,
+                    utf16_start: utf16_offsets[range.start],
+                    utf16_end: utf16_offsets[range.end],
+                    offset: cluster.visual_offset().unwrap_or(0.0),
+                    advance: cluster.advance(),
+                });
+            }
+        }
+    }
     let font_metrics = layout_font_metrics(&layout, parsed.size);
     // The glyph path stays in text space; the drawing transform applies the
     // maxWidth squeeze. Metrics need their own squeezed copy.
@@ -173,6 +206,7 @@ pub(crate) fn shape(
         ascent,
         descent,
         scale_x,
+        clusters,
         ink_min_x,
         ink_max_x,
         actual_ascent,
@@ -184,6 +218,20 @@ pub(crate) fn shape(
         hanging_baseline: font_metrics.hanging,
         ideographic_baseline: font_metrics.ideographic,
     }
+}
+
+/// Maps every byte boundary in `text` to its UTF-16 offset.
+fn cluster_utf16_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0; text.len() + 1];
+    let mut utf16 = 0;
+    for (byte, ch) in text.char_indices() {
+        for slot in &mut offsets[byte..byte + ch.len_utf8()] {
+            *slot = utf16;
+        }
+        utf16 += ch.len_utf16();
+    }
+    offsets[text.len()] = utf16;
+    offsets
 }
 
 struct FontMetrics {

@@ -30,7 +30,6 @@ use crate::dom::tree::NodeId;
 use crate::js::bindings::{attribute_value, world, wrap_node};
 use path2d::JsPath2D;
 use state::serialize_color;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// A `WebIDL` `DOMString` argument: coerces like `ToString`, then owns the
 /// UTF-8 bytes for the duration of the call.
@@ -1376,10 +1375,7 @@ fn set_pattern_transform(this: This<Object<'_>>, matrix: Value<'_>) -> Result<()
         return Err(Exception::throw_type(ctx, "setTransform expects an object"));
     };
     let member = |key: &str| -> Option<f64> {
-        matrix
-            .get::<_, Coerced<f64>>(key)
-            .ok()
-            .map(|value| *value)
+        matrix.get::<_, Option<f64>>(key).ok().flatten()
     };
     // A DOMMatrix2DInit accepts a/b/c/d/e/f and their m11/m12/... aliases.
     // Unknown members are ignored. Any non-finite value leaves the pattern's
@@ -1406,10 +1402,27 @@ fn set_pattern_transform(this: This<Object<'_>>, matrix: Value<'_>) -> Result<()
             ));
         }
     }
-    // The pattern shader currently paints without a user transform; the
-    // finite matrix is accepted but not applied yet.
-    let _ = resource_id(&this.0, "Pattern");
-    Ok(())
+    let read = |short: &str, long: &str, default: f64| {
+        member(short).or_else(|| member(long)).unwrap_or(default)
+    };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "canvas matrices are f32 in tiny-skia"
+    )]
+    let transform = tiny_skia::Transform::from_row(
+        read("a", "m11", 1.0) as f32,
+        read("b", "m12", 0.0) as f32,
+        read("c", "m21", 0.0) as f32,
+        read("d", "m22", 1.0) as f32,
+        read("e", "m41", 0.0) as f32,
+        read("f", "m42", 0.0) as f32,
+    );
+    let Some(id) = resource_id(&this.0, "Pattern") else {
+        return Ok(());
+    };
+    with_canvas(ctx, &this.0, |canvas| {
+        canvas.set_pattern_transform(id, transform);
+    })
 }
 
 // ---- image data ----------------------------------------------------------
@@ -2480,6 +2493,8 @@ fn draw_text_cluster<'js>(
         ));
     };
     let text: String = cluster.get("text")?;
+    let cluster_x: f32 = cluster.get("x").unwrap_or(0.0);
+    let cluster_y: f32 = cluster.get("y").unwrap_or(0.0);
     let mut align = None;
     let mut baseline = None;
     let mut dx = 0.0;
@@ -2497,12 +2512,14 @@ fn draw_text_cluster<'js>(
     draw_text_with(
         this,
         &text,
-        x + dx,
-        y + dy,
+        x + dx + f64::from(cluster_x),
+        y + dy + f64::from(cluster_y),
         None,
         stroke,
-        align.as_deref(),
-        baseline.as_deref(),
+        // The cluster's stored x/y already include the context alignment and
+        // baseline; only an explicit option changes them here.
+        align.as_deref().or(Some("left")),
+        baseline.as_deref().or(Some("top")),
     )
 }
 
@@ -2674,13 +2691,31 @@ fn get_text_clusters<'js>(
     let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
     let (start, end) = text_range(ctx, &text, &args.0, true)?;
-    let align: String = this.0.get("__tbAlign")?;
-    let baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
-    let width: f32 = this.0.get("width").unwrap_or(0.0);
-    let ascent: f32 = this.0.get("emHeightAscent").unwrap_or(0.0);
-    let descent: f32 = this.0.get("emHeightDescent").unwrap_or(0.0);
-    let mut align = align;
-    let mut baseline = baseline;
+    let font: String = this.0.get("__tbFont")?;
+    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
+    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
+    let lang: String = this
+        .0
+        .get("__tbLang")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let kerning: String = this
+        .0
+        .get("__tbKerning")
+        .unwrap_or_else(|_| "auto".to_owned());
+    let language = resolved_language(ctx, &this.0, &lang);
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(
+        &text,
+        &font,
+        None,
+        letter,
+        word,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+    );
+    let mut align: String = this.0.get("__tbAlign")?;
+    let mut baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
     if let Some(options) = args.0.first().and_then(Value::as_object) {
         if let Ok(value) = options.get::<_, String>("align") {
             align = value;
@@ -2689,36 +2724,37 @@ fn get_text_clusters<'js>(
             baseline = value;
         }
     }
-    let x = match align.as_str() {
-        "center" => width / 2.0,
-        "right" | "end" => width,
+    let direction: String = this
+        .0
+        .get("__tbDirection")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let width = shaped.width * shaped.scale_x;
+    let x = match resolved {
+        "center" => -width / 2.0,
+        "right" | "end" => -width,
         _ => 0.0,
     };
     let y = match baseline.as_str() {
-        "top" | "hanging" => 0.0,
-        "middle" => f32::midpoint(ascent, descent),
-        "bottom" | "ideographic" => ascent + descent,
-        _ => ascent,
+        "top" => 0.0,
+        "hanging" => shaped.hanging_baseline - shaped.ascent,
+        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
+        "bottom" => -(shaped.ascent + shaped.descent),
+        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        _ => -shaped.ascent,
     };
     let array = Array::new(ctx.clone())?;
-    let mut utf16 = 0usize;
-    for (byte_index, grapheme) in text.grapheme_indices(true) {
-        let cluster_start = text[..byte_index].encode_utf16().count();
-        let cluster_end = cluster_start + grapheme.encode_utf16().count();
-        utf16 = cluster_end;
-        if cluster_start < start || cluster_end > end {
+    for cluster in &shaped.clusters {
+        if cluster.utf16_start < start || cluster.utf16_end > end {
             continue;
         }
-        let cluster = Object::new(ctx.clone())?;
-        cluster.set("start", cluster_start as u32)?;
-        cluster.set("end", cluster_end as u32)?;
-        cluster.set("x", x)?;
-        cluster.set("y", y)?;
-        cluster.set("text", grapheme)?;
-        array.set(array.len(), cluster)?;
-    }
-    if utf16 < end {
-        let _ = utf16;
+        let object = Object::new(ctx.clone())?;
+        object.set("start", cluster.utf16_start as u32)?;
+        object.set("end", cluster.utf16_end as u32)?;
+        object.set("x", x + cluster.offset * shaped.scale_x)?;
+        object.set("y", y)?;
+        object.set("text", &text[cluster.byte_start..cluster.byte_end])?;
+        array.set(array.len(), object)?;
     }
     Ok(array)
 }
@@ -2819,36 +2855,145 @@ fn get_selection_rects<'js>(
     let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
     let (start, end) = text_range(ctx, &text, &args.0, false)?;
-    // Selection rectangles are empty for a reversed or empty range. The
-    // shaped cluster advances are not exposed yet; returning an empty list is
-    // deliberate, but the arguments are still validated.
-    let _ = (start, end);
-    Array::new(ctx.clone())
+    if start == end {
+        return Array::new(ctx.clone());
+    }
+    let font: String = this.0.get("__tbFont")?;
+    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
+    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
+    let lang: String = this
+        .0
+        .get("__tbLang")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let kerning: String = this
+        .0
+        .get("__tbKerning")
+        .unwrap_or_else(|_| "auto".to_owned());
+    let language = resolved_language(ctx, &this.0, &lang);
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(
+        &text,
+        &font,
+        None,
+        letter,
+        word,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+    );
+    let mut align: String = this.0.get("__tbAlign")?;
+    let mut baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
+    if let Some(options) = args.0.first().and_then(Value::as_object) {
+        if let Ok(value) = options.get::<_, String>("align") {
+            align = value;
+        }
+        if let Ok(value) = options.get::<_, String>("baseline") {
+            baseline = value;
+        }
+    }
+    let direction: String = this
+        .0
+        .get("__tbDirection")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let width = shaped.width * shaped.scale_x;
+    let align_dx = match resolved {
+        "center" => -width / 2.0,
+        "right" | "end" => -width,
+        _ => 0.0,
+    };
+    let baseline_dy = match baseline.as_str() {
+        "top" => 0.0,
+        "hanging" => shaped.hanging_baseline - shaped.ascent,
+        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
+        "bottom" => -(shaped.ascent + shaped.descent),
+        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        _ => -shaped.ascent,
+    };
+    let mut selected: Vec<(f32, f32)> = shaped
+        .clusters
+        .iter()
+        .filter(|cluster| cluster.utf16_start >= start && cluster.utf16_end <= end)
+        .map(|cluster| {
+            (
+                cluster.offset * shaped.scale_x,
+                (cluster.offset + cluster.advance) * shaped.scale_x,
+            )
+        })
+        .collect();
+    selected.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut runs: Vec<(f32, f32)> = Vec::new();
+    for (left, right) in selected {
+        if let Some(last) = runs.last_mut()
+            && (left - last.1).abs() <= 0.01
+        {
+            last.1 = last.1.max(right);
+        } else {
+            runs.push((left, right));
+        }
+    }
+    let array = Array::new(ctx.clone())?;
+    for (left, right) in runs {
+        let rect = Object::new(ctx.clone())?;
+        rect.set("x", align_dx + left)?;
+        rect.set("y", baseline_dy)?;
+        rect.set("width", right - left)?;
+        rect.set("height", shaped.ascent + shaped.descent)?;
+        array.set(array.len(), rect)?;
+    }
+    Ok(array)
 }
 
-/// Nearest cluster boundary to a horizontal offset. Cluster starts delimit
-/// the text, so this returns the closest UTF-16 start index.
+/// Nearest cluster boundary to a horizontal offset.
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "the offset is clamped to the text width and indices fit in unsigned long"
+    reason = "cluster indices are UTF-16 offsets in an unsigned long"
 )]
 fn get_index_from_offset(this: This<Object<'_>>, offset: Coerced<f64>) -> Result<u32> {
+    let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
-    let width: f32 = this.0.get("width").unwrap_or(0.0);
+    let font: String = this.0.get("__tbFont")?;
+    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
+    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
+    let lang: String = this
+        .0
+        .get("__tbLang")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let kerning: String = this
+        .0
+        .get("__tbKerning")
+        .unwrap_or_else(|_| "auto".to_owned());
+    let language = resolved_language(ctx, &this.0, &lang);
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(
+        &text,
+        &font,
+        None,
+        letter,
+        word,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+    );
+    let width = shaped.width * shaped.scale_x;
     if width <= 0.0 {
         return Ok(0);
     }
-    let ratio = (f32_of(*offset) / width).clamp(0.0, 1.0);
-    let target = ratio * text.encode_utf16().count() as f32;
-    let mut best = 0u32;
+    let target = f32_of(*offset).clamp(0.0, width);
+    let mut best = 0_u32;
     let mut best_distance = f32::MAX;
-    for (byte_index, _) in text.grapheme_indices(true) {
-        let start = text[..byte_index].encode_utf16().count();
-        let distance = (start as f32 - target).abs();
-        if distance < best_distance {
-            best_distance = distance;
-            best = start as u32;
+    for cluster in &shaped.clusters {
+        let start = cluster.offset * shaped.scale_x;
+        let end = start + cluster.advance * shaped.scale_x;
+        for (boundary, position) in [
+            (cluster.utf16_start, start),
+            (cluster.utf16_end, end),
+        ] {
+            let distance = (position - target).abs();
+            if distance < best_distance {
+                best_distance = distance;
+                best = boundary as u32;
+            }
         }
     }
     Ok(best)

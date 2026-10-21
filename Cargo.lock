@@ -2643,7 +2643,6 @@ dependencies = [
  "svgtypes",
  "tiny-skia",
  "tokio",
- "unicode-segmentation",
  "url",
  "webidl-bindgen",
  "webstorage",

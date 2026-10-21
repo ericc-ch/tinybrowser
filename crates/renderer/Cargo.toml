@@ -71,8 +71,6 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 # Canvas text draws the glyph outlines parley shaped. The same skrifa version
 # is already linked by anyrender-tiny-skia.
 skrifa = "0.44"
-# TextMetrics clusters follow extended grapheme boundaries.
-unicode-segmentation = "1"
 # createImageBitmap decodes Blob bytes. Blitz already enables these formats
 # for <img>, so the decoders are in the binary either way.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

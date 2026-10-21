@@ -190,6 +190,8 @@ pub(crate) struct Pattern {
     /// False when the pattern's image was not origin-clean; assigning it to a
     /// fill or stroke taints the canvas.
     origin_clean: bool,
+    /// `CanvasPattern.setTransform` in pattern space.
+    transform: Transform,
 }
 
 /// How `createPattern`'s repetition string clips and tiles
@@ -1695,7 +1697,7 @@ impl Canvas2D {
                     entry.spread,
                     entry.quality,
                     alpha,
-                    self.state.transform,
+                    self.state.transform.pre_concat(entry.transform),
                 )
             }
         };
@@ -1845,7 +1847,7 @@ impl Canvas2D {
                     entry.spread,
                     entry.quality,
                     alpha,
-                    Transform::identity(),
+                    entry.transform,
                 )
             }
         };
@@ -1950,6 +1952,12 @@ impl Canvas2D {
         self.next_resource += 1;
         self.gradients.insert(id, gradient);
         id
+    }
+
+    pub(crate) fn set_pattern_transform(&mut self, id: u32, transform: Transform) {
+        if let Some(pattern) = self.patterns.get_mut(&id) {
+            pattern.transform = transform;
+        }
     }
 
     pub(crate) fn pattern_definition(&self, id: u32) -> Option<Pattern> {
@@ -2078,6 +2086,7 @@ impl Canvas2D {
                 repetition,
                 quality,
                 origin_clean,
+                transform: Transform::identity(),
             },
         );
         Some(id)
