@@ -230,7 +230,7 @@ fn install_paint_accessors(prototype: &Object<'_>) -> Result<()> {
                 })
             },
             |this: This<Object<'_>>, value: DomString| {
-                let color = color::parse(&value);
+                let color = css_color(this.0.ctx(), &this.0, &value)?;
                 with_canvas(this.0.ctx(), &this.0, |canvas| {
                     if let Some(color) = color {
                         canvas.set_shadow_color(color);
@@ -316,9 +316,34 @@ fn with_canvas<R>(
     run: impl FnOnce(&mut Canvas2D) -> R,
 ) -> Result<R> {
     let id = canvas_id(object)?;
+    // `__tbDoc` and `__tbNode` are writable, so they carry a claim, not
+    // proof. Require a document this frame created and a real HTML canvas;
+    // otherwise a page could retarget another frame's canvas, or any element,
+    // in the shared registry.
+    let world = world(ctx)?;
+    {
+        let owner = world.borrow();
+        let is_canvas = owner
+            .with_document(id, |parsed| {
+                parsed
+                    .document
+                    .base
+                    .get_node(id.node)
+                    .is_some_and(|node| {
+                        crate::dom::tree::is_html_tag(Some(&node.data), "canvas")
+                    })
+            })
+            .unwrap_or(false);
+        if !owner.owns_node(id) || !is_canvas {
+            return Err(crate::js::bindings::throw_dom(
+                ctx,
+                "InvalidStateError",
+                "canvas does not belong to this frame",
+            ));
+        }
+    }
     let width = canvas_dimension(ctx, id, "width", 300);
     let height = canvas_dimension(ctx, id, "height", 150);
-    let world = world(ctx)?;
     let registry = world.borrow().registry();
     let mut registry = registry.borrow_mut();
     let canvas = registry.canvas(id, width, height);
@@ -536,6 +561,14 @@ fn arc(
     counterclockwise: Opt<Coerced<bool>>,
 ) -> Result<()> {
     let counterclockwise = counterclockwise.0.is_some_and(|value| *value);
+    if !(*x).is_finite()
+        || !(*y).is_finite()
+        || !(*radius).is_finite()
+        || !(*start).is_finite()
+        || !(*end).is_finite()
+    {
+        return Ok(());
+    }
     if *radius < 0.0 {
         return Err(crate::js::bindings::throw_dom(
             this.0.ctx(),
@@ -563,6 +596,14 @@ fn arc_to(
     y2: Coerced<f64>,
     radius: Coerced<f64>,
 ) -> Result<()> {
+    if !(*x1).is_finite()
+        || !(*y1).is_finite()
+        || !(*x2).is_finite()
+        || !(*y2).is_finite()
+        || !(*radius).is_finite()
+    {
+        return Ok(());
+    }
     if *radius < 0.0 {
         return Err(crate::js::bindings::throw_dom(
             this.0.ctx(),
@@ -599,6 +640,12 @@ fn ellipse<'js>(this: This<Object<'js>>, args: rquickjs::function::Rest<Value<'j
         .map(|value| Coerced::<bool>::from_js(ctx, value.clone()))
         .transpose()?
         .is_some_and(|value| *value);
+    if ![x, y, radius_x, radius_y, rotation, start, end]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return Ok(());
+    }
     if radius_x < 0.0 || radius_y < 0.0 {
         return Err(crate::js::bindings::throw_dom(
             ctx,
@@ -649,28 +696,32 @@ fn round_rect<'js>(
     {
         return Ok(());
     }
-    let radii = radii
-        .0
-        .map(|value| round_rect_radii(&value))
-        .transpose()?;
-    if radii
-        .as_ref()
-        .is_some_and(|radii| !(1..=4).contains(&radii.len()))
-    {
-        return Err(crate::js::bindings::throw_dom(
-            this.0.ctx(),
-            "RangeError",
-            "radii must contain one to four entries",
-        ));
-    }
-    let radii = radii.unwrap_or_default();
-    if radii.iter().any(|radius| *radius < 0.0) {
-        return Err(crate::js::bindings::throw_dom(
-            this.0.ctx(),
-            "RangeError",
-            "radius is negative",
-        ));
-    }
+    let radii = match radii.0 {
+        Some(value) if !value.is_undefined() => round_rect_radii(&value)?,
+        _ => None,
+    };
+    let radii = if let Some(radii) = radii {
+        if radii.is_empty() || radii.len() > 4 {
+            return Err(Exception::throw_range(
+                this.0.ctx(),
+                "Between one and four radii are necessary",
+            ));
+        }
+        if radii
+            .iter()
+            .any(|(rx, ry)| !rx.is_finite() || !ry.is_finite())
+        {
+            return Ok(());
+        }
+        if radii.iter().any(|(rx, ry)| *rx < 0.0 || *ry < 0.0) {
+            return Err(Exception::throw_range(this.0.ctx(), "radius is negative"));
+        }
+        radii
+    } else {
+        // An omitted radii argument uses one zero radius. It still draws the
+        // rectangle and leaves the step-14 subpath at (x, y).
+        vec![(0.0, 0.0)]
+    };
     with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.round_rect(
             f32_of(*x),
@@ -682,18 +733,45 @@ fn round_rect<'js>(
     })
 }
 
-/// Reads the `roundRect` radii argument: one number or a sequence of numbers
+/// Reads the `roundRect` radii argument: one number or `DOMPointInit`, or a
+/// sequence of either
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-roundrect>).
-fn round_rect_radii(value: &Value<'_>) -> Result<Vec<f32>> {
-    if let Some(array) = value.as_array() {
-        let mut radii = Vec::new();
-        for item in array.iter::<Coerced<f64>>() {
-            radii.push(f32_of(*item?));
-        }
-        return Ok(radii);
+fn round_rect_radii(value: &Value<'_>) -> Result<Option<Vec<(f32, f32)>>> {
+    let Some(array) = value.as_array() else {
+        let Some(pair) = round_rect_radius(value)? else {
+            return Ok(None);
+        };
+        return Ok(Some(vec![pair]));
+    };
+    let mut radii = Vec::new();
+    for item in array.iter::<Value>() {
+        let Some(pair) = round_rect_radius(&item?)? else {
+            return Ok(None);
+        };
+        radii.push(pair);
+    }
+    Ok(Some(radii))
+}
+
+/// One radius: a number for both axes, or a `DOMPointInit` dictionary whose
+/// missing members read zero.
+fn round_rect_radius(value: &Value<'_>) -> Result<Option<(f32, f32)>> {
+    if let Some(object) = value.as_object() {
+        // WebIDL dictionary conversion: a missing or undefined member is 0,
+        // not NaN from ToNumber(undefined).
+        let read = |name: &str| -> Result<f32> {
+            let member: Value = object.get(name)?;
+            if member.is_undefined() || member.is_null() {
+                return Ok(0.0);
+            }
+            let number = Coerced::<f64>::from_js(value.ctx(), member)?;
+            Ok(f32_of(*number))
+        };
+        return Ok(Some((read("x")?, read("y")?)));
     }
     let number = Coerced::<f64>::from_js(value.ctx(), value.clone())?;
-    Ok(vec![f32_of(*number)])
+    let number = f32_of(*number);
+    Ok(Some((number, number)))
 }
 
 // ---- painting ------------------------------------------------------------
@@ -1308,7 +1386,7 @@ fn set_style_value<'js>(
 ) -> Result<()> {
     let style = if let Some(string) = value.as_string() {
         let text = string.to_string()?;
-        match color::parse(&text) {
+        match css_color(ctx, object, &text)? {
             Some(color) => Some(StyleValue::Color(color)),
             None => return Ok(()),
         }
@@ -1326,7 +1404,7 @@ fn set_style_value<'js>(
         return Ok(());
     } else {
         let text = Coerced::<rquickjs::String<'_>>::from_js(ctx, value)?.to_string()?;
-        match color::parse(&text) {
+        match css_color(ctx, object, &text)? {
             Some(color) => Some(StyleValue::Color(color)),
             None => return Ok(()),
         }
@@ -1335,6 +1413,41 @@ fn set_style_value<'js>(
         return Ok(());
     };
     with_canvas(ctx, object, |canvas| set(canvas, style))
+}
+
+/// Parses a canvas color. `currentColor` resolves against the canvas
+/// element's computed `color` at assignment time, not at paint time
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>).
+fn css_color(ctx: &Ctx<'_>, object: &Object<'_>, text: &str) -> Result<Option<[u8; 4]>> {
+    if let Some(color) = color::parse(text) {
+        return Ok(Some(color));
+    }
+    if text.trim().eq_ignore_ascii_case("currentColor") {
+        return Ok(Some(current_color(ctx, object)?));
+    }
+    Ok(None)
+}
+
+/// The canvas element's computed `color`, or black when it has no computed
+/// style (detached elements have none)
+/// (<https://drafts.csswg.org/css-color-4/#currentcolor-color>).
+fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<[u8; 4]> {
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    let id = canvas_id(object)?;
+    let world = world(ctx)?;
+    let world = world.borrow();
+    // `__tbDoc`/`__tbNode` are writable; do not read another frame's
+    // stylesheet for a forged context.
+    if !world.owns_node(id) {
+        return Ok(BLACK);
+    }
+    let Some(mut parsed) = world.document_mut(id) else {
+        return Ok(BLACK);
+    };
+    let base = &mut parsed.document.base;
+    base.resolve(0.0);
+    let text = base.resolved_style_value(id.node, "color");
+    Ok(color::parse(&text).unwrap_or(BLACK))
 }
 
 #[cfg(test)]
