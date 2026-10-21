@@ -53,8 +53,26 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
     install_members(ctx, &prototype)?;
     ctor.set("prototype", prototype)?;
     ctx.globals().set("CanvasRenderingContext2D", ctor)?;
+    install_gradient_objects(ctx)?;
     install_image_data(ctx)?;
     install_image_bitmap(ctx)?;
+    Ok(())
+}
+
+/// `CanvasGradient` and `CanvasPattern` constructors: canvas returns branded
+/// instances, and the globals make `instanceof` and prototype checks work
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#canvasgradient>).
+fn install_gradient_objects(ctx: &Ctx<'_>) -> Result<()> {
+    for name in ["CanvasGradient", "CanvasPattern"] {
+        let prototype = Object::new(ctx.clone())?;
+        if name == "CanvasGradient" {
+            prototype.set("addColorStop", Func::from(add_color_stop))?;
+        }
+        let ctor = Function::new(ctx.clone(), || {})?;
+        ctor.set("prototype", prototype.clone())?;
+        prototype.set("constructor", ctor.clone())?;
+        ctx.globals().set(name, ctor)?;
+    }
     Ok(())
 }
 
@@ -121,7 +139,7 @@ fn install_methods<'js>(ctx: &Ctx<'js>, prototype: &Object<'js>) -> Result<()> {
 
     method!("createLinearGradient", 4, create_linear_gradient);
     method!("createRadialGradient", 6, create_radial_gradient);
-    method!("createConicGradient", 2, create_conic_gradient);
+    method!("createConicGradient", 3, create_conic_gradient);
     method!("createPattern", 2, create_pattern);
 
     method!("getImageData", 4, get_image_data);
@@ -911,6 +929,12 @@ fn create_linear_gradient(
     x1: Coerced<f64>,
     y1: Coerced<f64>,
 ) -> Result<Value<'_>> {
+    if ![*x0, *y0, *x1, *y1].iter().all(|value| value.is_finite()) {
+        return Err(Exception::throw_type(
+            this.0.ctx(),
+            "gradient coordinates must be finite",
+        ));
+    }
     let id = with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.create_linear_gradient(f32_of(*x0), f32_of(*y0), f32_of(*x1), f32_of(*y1))
     })?;
@@ -927,6 +951,22 @@ fn create_radial_gradient(
     y1: Coerced<f64>,
     r1: Coerced<f64>,
 ) -> Result<Value<'_>> {
+    if ![*x0, *y0, *r0, *x1, *y1, *r1]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return Err(Exception::throw_type(
+            this.0.ctx(),
+            "gradient coordinates must be finite",
+        ));
+    }
+    if *r0 < 0.0 || *r1 < 0.0 {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "IndexSizeError",
+            "radii must not be negative",
+        ));
+    }
     let id = with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.create_radial_gradient(
             f32_of(*x0),
@@ -946,6 +986,12 @@ fn create_conic_gradient(
     y: Coerced<f64>,
     angle: Coerced<f64>,
 ) -> Result<Value<'_>> {
+    if ![*x, *y, *angle].iter().all(|value| value.is_finite()) {
+        return Err(Exception::throw_type(
+            this.0.ctx(),
+            "gradient coordinates must be finite",
+        ));
+    }
     let id = with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.create_conic_gradient(f32_of(*x), f32_of(*y), f32_of(*angle))
     })?;
@@ -1011,12 +1057,25 @@ fn create_pattern<'js>(
 
 fn resource_object<'js>(this: &Object<'js>, kind: &str, id: u32) -> Result<Value<'js>> {
     let object = Object::new(this.ctx().clone())?;
+    let ctor_name = if kind == "Gradient" {
+        "CanvasGradient"
+    } else {
+        "CanvasPattern"
+    };
+    // Use the intrinsic prototype captured at install time. The global is
+    // page-writable, the intrinsic is not.
+    let prototype: Object = if let Some(prototype) =
+        world(this.ctx())?.borrow().brand(ctor_name)
+    {
+        prototype.restore(this.ctx())?
+    } else {
+        let ctor: Function = this.ctx().globals().get(ctor_name)?;
+        ctor.get("prototype")?
+    };
+    object.set_prototype(Some(&prototype))?;
     object.set("__tbDoc", this.get::<_, u32>("__tbDoc")?)?;
     object.set("__tbNode", this.get::<_, u64>("__tbNode")?)?;
     object.set(format!("__tb{kind}"), id)?;
-    if kind == "Gradient" {
-        object.set("addColorStop", Func::from(add_color_stop))?;
-    }
     let resources: Object = this.get("__tbRes")?;
     resources.set(id.to_string(), object.clone())?;
     Ok(object.into_value())
@@ -1024,12 +1083,14 @@ fn resource_object<'js>(this: &Object<'js>, kind: &str, id: u32) -> Result<Value
 
 fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString) -> Result<()> {
     let id: u32 = this.0.get("__tbGradient")?;
-    let Some(color) = color::parse(&color) else {
-        return Err(Exception::throw_syntax(
+    if !offset.is_finite() {
+        return Err(Exception::throw_type(
             this.0.ctx(),
-            "invalid color for addColorStop",
+            "color stop offset must be finite",
         ));
-    };
+    }
+    // The offset check precedes color parsing, so an out-of-range offset
+    // reports IndexSizeError even when the color is also invalid.
     if !(0.0..=1.0).contains(&*offset) {
         return Err(crate::js::bindings::throw_dom(
             this.0.ctx(),
@@ -1037,6 +1098,20 @@ fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString
             "offset out of range",
         ));
     }
+    // `currentColor` in a gradient stop resolves to opaque black: canvas
+    // color stops do not inherit the element's CSS color
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvasgradient-addcolorstop>).
+    let color = if color.trim().eq_ignore_ascii_case("currentColor") {
+        [0, 0, 0, 255]
+    } else if let Some(color) = css_color(this.0.ctx(), &this.0, &color)? {
+        color
+    } else {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "SyntaxError",
+            "invalid color for addColorStop",
+        ));
+    };
     let object = this.0.clone();
     let id_wrapper = Object::new(this.0.ctx().clone())?;
     id_wrapper.set("__tbDoc", object.get::<_, u32>("__tbDoc")?)?;
