@@ -34,6 +34,11 @@ pub(crate) struct Canvas2D {
     gradients: HashMap<u32, Gradient>,
     patterns: HashMap<u32, Pattern>,
     next_resource: u32,
+    /// Whether every image painted into this canvas was same-origin. A
+    /// cross-origin image clears the flag, and `getImageData` then throws
+    /// `SecurityError`
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
+    origin_clean: bool,
 }
 
 #[derive(Clone)]
@@ -135,7 +140,21 @@ enum GradientKind {
 struct Pattern {
     image: Arc<Pixmap>,
     spread: SpreadMode,
+    repetition: PatternRepeat,
     quality: FilterQuality,
+    /// False when the pattern's image was not origin-clean; assigning it to a
+    /// fill or stroke taints the canvas.
+    origin_clean: bool,
+}
+
+/// How `createPattern`'s repetition string clips and tiles
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createpattern>).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternRepeat {
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
 }
 
 /// A decoded source image for `drawImage`: straight RGBA, row-major.
@@ -143,6 +162,9 @@ pub(crate) struct SourceImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pixels: Vec<u8>,
+    /// False when the source came from another origin; painting it clears the
+    /// destination canvas's origin-clean flag.
+    pub(crate) origin_clean: bool,
 }
 
 impl Canvas2D {
@@ -159,7 +181,16 @@ impl Canvas2D {
             gradients: HashMap::new(),
             patterns: HashMap::new(),
             next_resource: 1,
+            origin_clean: true,
         }
+    }
+
+    pub(crate) fn origin_clean(&self) -> bool {
+        self.origin_clean
+    }
+
+    fn taint(&mut self) {
+        self.origin_clean = false;
     }
 
     /// `ctx.reset()`: clear the bitmap and return to the default state
@@ -177,8 +208,8 @@ impl Canvas2D {
         self.path.clear();
         self.current = None;
         self.subpath_start = Point::zero();
-        self.gradients.clear();
-        self.patterns.clear();
+        // Gradients and patterns are independent objects: resetting the
+        // context must not invalidate ids a script still holds.
     }
 
     // ---- state -----------------------------------------------------------
@@ -267,11 +298,21 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_fill_style(&mut self, value: StyleValue) {
-        self.state.fill = match value {
+        let style = match value {
             StyleValue::Color(color) => Style::Color(color),
             StyleValue::Gradient(id) => Style::Gradient(id),
-            StyleValue::Pattern(id) => Style::Pattern(id),
+            StyleValue::Pattern(id) => {
+                if self
+                    .patterns
+                    .get(&id)
+                    .is_some_and(|pattern| !pattern.origin_clean)
+                {
+                    self.taint();
+                }
+                Style::Pattern(id)
+            }
         };
+        self.state.fill = style;
     }
 
     pub(crate) fn stroke_style(&self) -> StyleValue {
@@ -279,11 +320,21 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_stroke_style(&mut self, value: StyleValue) {
-        self.state.stroke = match value {
+        let style = match value {
             StyleValue::Color(color) => Style::Color(color),
             StyleValue::Gradient(id) => Style::Gradient(id),
-            StyleValue::Pattern(id) => Style::Pattern(id),
+            StyleValue::Pattern(id) => {
+                if self
+                    .patterns
+                    .get(&id)
+                    .is_some_and(|pattern| !pattern.origin_clean)
+                {
+                    self.taint();
+                }
+                Style::Pattern(id)
+            }
         };
+        self.state.stroke = style;
     }
 
     pub(crate) fn line_width(&self) -> f32 {
@@ -1233,11 +1284,15 @@ impl Canvas2D {
         } else {
             FillRule::Winding
         };
+        self.clear_uncovered(path, rule);
         self.paint_shadow(path, rule, None);
         let style = self.state.fill;
         let alpha = self.state.alpha;
         let pattern = match style {
-            Style::Pattern(id) => self.patterns.get(&id).map(|entry| entry.image.clone()),
+            Style::Pattern(id) => self
+                .patterns
+                .get(&id)
+                .map(|entry| (entry.image.clone(), entry.repetition)),
             _ => None,
         };
         let shader = match style {
@@ -1252,7 +1307,7 @@ impl Canvas2D {
                 shader
             }
             Style::Pattern(id) => {
-                let Some(image) = &pattern else {
+                let Some((image, _)) = &pattern else {
                     return;
                 };
                 let Some(entry) = self.patterns.get(&id) else {
@@ -1273,16 +1328,101 @@ impl Canvas2D {
             anti_alias: true,
             ..Paint::default()
         };
+        let pattern_mask = pattern
+            .as_ref()
+            .and_then(|(image, repetition)| self.pattern_mask(image, *repetition));
+        let mask = pattern_mask.as_ref().or(self.state.clip.as_deref());
         let Some(pixmap) = &mut self.pixmap else {
             return;
         };
-        pixmap.fill_path(
-            path,
-            &paint,
-            rule,
-            Transform::identity(),
-            self.state.clip.as_deref(),
-        );
+        pixmap.fill_path(path, &paint, rule, Transform::identity(), mask);
+    }
+
+    /// Composites where the destination has no coverage. `copy`, `source-in`,
+    /// `source-out`, `destination-in`, and `destination-atop` clear the area
+    /// the shape does not cover, so the operation must run against the whole
+    /// canvas, not just the shape
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-globalcompositeoperation>).
+    fn clear_uncovered(&mut self, path: &Path, rule: FillRule) {
+        if !matches!(
+            self.state.blend,
+            BlendMode::Source
+                | BlendMode::SourceIn
+                | BlendMode::SourceOut
+                | BlendMode::DestinationIn
+                | BlendMode::DestinationAtop
+        ) {
+            return;
+        }
+        let Some(mut shape) = Mask::new(self.width, self.height) else {
+            return;
+        };
+        shape.fill_path(path, rule, true, Transform::identity());
+        let clip = match &self.state.clip {
+            None => None,
+            Some(clip) => {
+                let size = tiny_skia::IntSize::from_wh(clip.width(), clip.height());
+                let Some(clip) = size.and_then(|size| Mask::from_vec(clip.data().to_vec(), size))
+                else {
+                    return;
+                };
+                Some(clip)
+            }
+        };
+        let Some(mut mask) = Mask::new(self.width, self.height) else {
+            return;
+        };
+        for (index, target) in mask.data_mut().iter_mut().enumerate() {
+            let coverage = u16::from(*shape.data().get(index).unwrap_or(&0));
+            let clip = clip
+                .as_ref()
+                .map_or(255, |clip| u16::from(*clip.data().get(index).unwrap_or(&0)));
+            let cleared = clip * (255 - coverage) / 255;
+            *target = u8::try_from(255 - cleared).unwrap_or(0);
+        }
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        pixmap.apply_mask(&mask);
+    }
+
+    /// The strip a `repeat-x`, `repeat-y`, or `no-repeat` pattern may paint
+    /// in; the shader itself only knows how to repeat or pad
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-createpattern>).
+    fn pattern_mask(&self, image: &Arc<Pixmap>, repetition: PatternRepeat) -> Option<Mask> {
+        const LIMIT: f32 = 1_000_000.0;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "pattern images are far below 2^24 pixels per side"
+        )]
+        let (width, height) = (image.width() as f32, image.height() as f32);
+        let rect = match repetition {
+            PatternRepeat::Repeat => return None,
+            PatternRepeat::RepeatX => tiny_skia::Rect::from_ltrb(-LIMIT, 0.0, LIMIT, height)?,
+            PatternRepeat::RepeatY => tiny_skia::Rect::from_ltrb(0.0, -LIMIT, width, LIMIT)?,
+            PatternRepeat::NoRepeat => tiny_skia::Rect::from_ltrb(0.0, 0.0, width, height)?,
+        };
+        let band = PathBuilder::from_rect(rect).transform(self.state.transform)?;
+        let mut mask = if let Some(clip) = &self.state.clip {
+            let size = tiny_skia::IntSize::from_wh(clip.width(), clip.height())?;
+            Mask::from_vec(clip.data().to_vec(), size)?
+        } else {
+            let mut mask = Mask::new(self.width, self.height)?;
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "canvas sides are far below 2^24"
+            )]
+            let full = tiny_skia::Rect::from_xywh(0.0, 0.0, self.width as f32, self.height as f32)?;
+            mask.fill_path(
+                &PathBuilder::from_rect(full),
+                FillRule::Winding,
+                false,
+                Transform::identity(),
+            );
+            mask
+        };
+        mask.intersect_path(&band, FillRule::Winding, true, Transform::identity());
+        Some(mask)
     }
 
     fn stroke_path(&mut self, path: &Path) {
@@ -1291,7 +1431,10 @@ impl Canvas2D {
         let style = self.state.stroke;
         let alpha = self.state.alpha;
         let pattern = match style {
-            Style::Pattern(id) => self.patterns.get(&id).map(|entry| entry.image.clone()),
+            Style::Pattern(id) => self
+                .patterns
+                .get(&id)
+                .map(|entry| (entry.image.clone(), entry.repetition)),
             _ => None,
         };
         let shader = match style {
@@ -1306,7 +1449,7 @@ impl Canvas2D {
                 shader
             }
             Style::Pattern(id) => {
-                let Some(image) = &pattern else {
+                let Some((image, _)) = &pattern else {
                     return;
                 };
                 let Some(entry) = self.patterns.get(&id) else {
@@ -1340,16 +1483,19 @@ impl Canvas2D {
         let Some(user_path) = prune_degenerate(&user_path) else {
             return;
         };
+        if let Some(outline) = user_path.stroke(&stroke, 1.0)
+            && let Some(outline) = outline.transform(self.state.transform)
+        {
+            self.clear_uncovered(&outline, FillRule::Winding);
+        }
+        let pattern_mask = pattern
+            .as_ref()
+            .and_then(|(image, repetition)| self.pattern_mask(image, *repetition));
+        let mask = pattern_mask.as_ref().or(self.state.clip.as_deref());
         let Some(pixmap) = &mut self.pixmap else {
             return;
         };
-        pixmap.stroke_path(
-            &user_path,
-            &paint,
-            &stroke,
-            self.state.transform,
-            self.state.clip.as_deref(),
-        );
+        pixmap.stroke_path(&user_path, &paint, &stroke, self.state.transform, mask);
     }
 
     fn gradient_shader(&self, id: u32, alpha: f32) -> Option<Shader<'static>> {
@@ -1491,9 +1637,12 @@ impl Canvas2D {
             to_premultiplied(&source.pixels),
             tiny_skia::IntSize::from_wh(source.width, source.height)?,
         )?;
-        let spread = match repetition {
-            "repeat" | "repeat-x" | "repeat-y" => SpreadMode::Repeat,
-            "no-repeat" => SpreadMode::Pad,
+        let origin_clean = source.origin_clean;
+        let (spread, repetition) = match repetition {
+            "repeat" => (SpreadMode::Repeat, PatternRepeat::Repeat),
+            "repeat-x" => (SpreadMode::Repeat, PatternRepeat::RepeatX),
+            "repeat-y" => (SpreadMode::Repeat, PatternRepeat::RepeatY),
+            "no-repeat" => (SpreadMode::Pad, PatternRepeat::NoRepeat),
             _ => return None,
         };
         let quality = if smoothing {
@@ -1508,7 +1657,9 @@ impl Canvas2D {
             Pattern {
                 image: Arc::new(pixmap),
                 spread,
+                repetition,
                 quality,
+                origin_clean,
             },
         );
         Some(id)
@@ -1681,6 +1832,11 @@ impl Canvas2D {
         {
             return;
         }
+        // Tainting is unconditional in the drawImage algorithm, even when the
+        // destination rectangle is empty.
+        if !source.origin_clean {
+            self.taint();
+        }
         if sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
             return;
         }
@@ -1723,6 +1879,7 @@ impl Canvas2D {
         let Some(path) = self.rect_path(dx, dy, dw, dh) else {
             return;
         };
+        self.clear_uncovered(&path, FillRule::Winding);
         self.paint_image_shadow(&path, &pattern, quality, transform);
         let Some(pixmap) = &mut self.pixmap else {
             return;
@@ -2384,6 +2541,7 @@ fn blend_from_name(name: &str) -> Option<BlendMode> {
         "destination-atop" => BlendMode::DestinationAtop,
         "lighter" => BlendMode::Plus,
         "copy" => BlendMode::Source,
+        "clear" => BlendMode::Clear,
         "xor" => BlendMode::Xor,
         "multiply" => BlendMode::Multiply,
         "screen" => BlendMode::Screen,
@@ -2416,6 +2574,7 @@ fn blend_name(blend: BlendMode) -> &'static str {
         BlendMode::DestinationAtop => "destination-atop",
         BlendMode::Plus => "lighter",
         BlendMode::Source => "copy",
+        BlendMode::Clear => "clear",
         BlendMode::Xor => "xor",
         BlendMode::Multiply => "multiply",
         BlendMode::Screen => "screen",
@@ -2432,7 +2591,6 @@ fn blend_name(blend: BlendMode) -> &'static str {
         BlendMode::Saturation => "saturation",
         BlendMode::Color => "color",
         BlendMode::Luminosity => "luminosity",
-        BlendMode::Clear => "clear",
         BlendMode::Destination => "destination",
         BlendMode::Modulate => "modulate",
     }
@@ -2651,5 +2809,27 @@ mod tests {
         assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
         // Row 2 is the shadow: green, drawn under the red shape.
         assert_eq!(&pixels[32..36], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn cross_origin_image_taints_the_canvas() {
+        let mut canvas = Canvas2D::new(1, 1);
+        canvas.draw_image(
+            &SourceImage {
+                width: 1,
+                height: 1,
+                pixels: vec![255, 0, 0, 255],
+                origin_clean: false,
+            },
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+        );
+        assert!(!canvas.origin_clean());
     }
 }

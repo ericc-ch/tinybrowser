@@ -54,6 +54,7 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
     ctor.set("prototype", prototype)?;
     ctx.globals().set("CanvasRenderingContext2D", ctor)?;
     install_image_data(ctx)?;
+    install_image_bitmap(ctx)?;
     Ok(())
 }
 
@@ -954,18 +955,47 @@ fn create_conic_gradient(
 fn create_pattern<'js>(
     this: This<Object<'js>>,
     source: Value<'js>,
-    repetition: Opt<DomString>,
+    repetition: Opt<Value<'js>>,
 ) -> Result<Value<'js>> {
-    let repetition = repetition
-        .0
-        .as_ref()
-        .map_or_else(|| "repeat".to_owned(), |value| value.to_string());
-    let Some(source) = source_image(this.0.ctx(), source)? else {
+    let repetition = match repetition.0 {
+        None => "repeat".to_owned(),
+        Some(value) if value.is_null() => "repeat".to_owned(),
+        Some(value) => {
+            let ctx = value.ctx().clone();
+            DomString::from_js(&ctx, value)?.to_string()
+        }
+    };
+    if !matches!(
+        repetition.as_str(),
+        "repeat" | "repeat-x" | "repeat-y" | "no-repeat" | ""
+    ) {
         return Err(crate::js::bindings::throw_dom(
             this.0.ctx(),
-            "InvalidStateError",
-            "image is not decoded",
+            "SyntaxError",
+            "invalid repetition value",
         ));
+    }
+    let repetition = if repetition.is_empty() {
+        "repeat".to_owned()
+    } else {
+        repetition
+    };
+    let source = match source_image(this.0.ctx(), source)? {
+        ImageLookup::Decoded(source) => source,
+        ImageLookup::NotReady => return Ok(Value::new_null(this.0.ctx().clone())),
+        ImageLookup::Unsupported => {
+            return Err(Exception::throw_type(
+                this.0.ctx(),
+                "createPattern expects an image source",
+            ));
+        }
+        ImageLookup::Invalid => {
+            return Err(crate::js::bindings::throw_dom(
+                this.0.ctx(),
+                "InvalidStateError",
+                "the image source is not valid",
+            ));
+        }
     };
     let smoothing = with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.image_smoothing_enabled()
@@ -1298,10 +1328,17 @@ fn get_image_data(
     }
     let x = i32_of(sx);
     let y = i32_of(sy);
-    let bytes = with_canvas(this.0.ctx(), &this.0, |canvas| {
-        canvas.read_pixels(x, y, width, height)
-    })?
-    .ok_or_else(|| {
+    let (pixels, origin_clean) = with_canvas(this.0.ctx(), &this.0, |canvas| {
+        (canvas.read_pixels(x, y, width, height), canvas.origin_clean())
+    })?;
+    if !origin_clean {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "SecurityError",
+            "the canvas is not origin-clean",
+        ));
+    }
+    let bytes = pixels.ok_or_else(|| {
         crate::js::bindings::throw_dom(
             this.0.ctx(),
             "IndexSizeError",
@@ -1425,7 +1462,18 @@ fn read_image_data(value: &Value<'_>) -> Result<Option<(u32, u32, Vec<u8>)>> {
     let Ok(height) = object.get::<_, u32>("height") else {
         return Ok(None);
     };
-    let Some(data) = object.get::<_, Value>("data").ok() else {
+    let usable = |value: Value<'_>| !value.is_undefined() && !value.is_null();
+    let data = object
+        .get::<_, Value>("data")
+        .ok()
+        .filter(|value| usable(value.clone()))
+        .or_else(|| {
+            object
+                .get::<_, Value>("__tbData")
+                .ok()
+                .filter(|value| usable(value.clone()))
+        });
+    let Some(data) = data else {
         return Ok(None);
     };
     let Some(bytes) = typed_array_bytes(&data)? else {
@@ -1470,6 +1518,278 @@ fn canvas_u32(value: f64) -> u32 {
     value
 }
 
+// ---- image bitmaps -------------------------------------------------------
+
+/// `ImageBitmap` and the host half of `createImageBitmap`
+/// (<https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagebitmaps>).
+fn install_image_bitmap(ctx: &Ctx<'_>) -> Result<()> {
+    let prototype = Object::new(ctx.clone())?;
+    prototype.prop(
+        "width",
+        Accessor::new(image_bitmap_width, image_data_read_only),
+    )?;
+    prototype.prop(
+        "height",
+        Accessor::new(image_bitmap_height, image_data_read_only),
+    )?;
+    prototype.prop("close", Func::from(image_bitmap_close))?;
+    let ctor = Function::new(ctx.clone(), || {})?;
+    ctor.set("prototype", prototype)?;
+    ctx.globals().set("ImageBitmap", ctor)?;
+    let host = crate::js::bridge::object(ctx)?;
+    host.set(
+        "createImageBitmapDecode",
+        Func::from(create_image_bitmap_decode),
+    )?;
+    host.set(
+        "createImageBitmapFromSource",
+        Func::from(create_image_bitmap_from_source),
+    )?;
+    Ok(())
+}
+
+fn image_bitmap_width(this: This<Object<'_>>) -> Result<u32> {
+    this.0.get("__tbWidth")
+}
+
+fn image_bitmap_height(this: This<Object<'_>>) -> Result<u32> {
+    this.0.get("__tbHeight")
+}
+
+fn image_bitmap_close(this: This<Object<'_>>) -> Result<()> {
+    if let Ok(id) = this.0.get::<_, u64>("__tbBitmap")
+        && let Ok(world) = world(this.0.ctx())
+    {
+        world.borrow().registry().borrow_mut().remove_bitmap(id);
+    }
+    this.0.set("__tbWidth", 0)?;
+    this.0.set("__tbHeight", 0)?;
+    this.0.set("__tbClosed", true)?;
+    Ok(())
+}
+
+fn create_image_bitmap_decode<'js>(
+    ctx: Ctx<'js>,
+    bytes: Value<'js>,
+    options: Opt<Value<'js>>,
+) -> Result<Value<'js>> {
+    let Some(bytes) = typed_array_bytes(&bytes)? else {
+        return Err(Exception::throw_type(
+            &ctx,
+            "createImageBitmap expects a BufferSource",
+        ));
+    };
+    let options = bitmap_options(options.0.as_ref().and_then(|value| value.as_object()))?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| {
+            crate::js::bindings::throw_dom(&ctx, "InvalidStateError", "image could not be read")
+        })?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(crate::js::world::MAX_CANVAS_BYTES as u64);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|_| {
+        crate::js::bindings::throw_dom(&ctx, "InvalidStateError", "image could not be decoded")
+    })?;
+    if crate::js::world::canvas_bytes(image.width(), image.height()).is_none() {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "image is too large",
+        ));
+    }
+    let image = image.to_rgba8();
+    let (width, height) = (image.width(), image.height());
+    let Some((width, height, pixels)) = resize_bitmap(width, height, image.into_raw(), &options)
+    else {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "bitmap is too large",
+        ));
+    };
+    image_bitmap_object(&ctx, width, height, pixels, true)
+}
+
+fn create_image_bitmap_from_source<'js>(
+    ctx: Ctx<'js>,
+    source: Value<'js>,
+    options: Opt<Value<'js>>,
+) -> Result<Value<'js>> {
+    let options = bitmap_options(options.0.as_ref().and_then(|value| value.as_object()))?;
+    let image = match source_image(&ctx, source)? {
+        ImageLookup::Decoded(image) => image,
+        ImageLookup::Unsupported => {
+            return Err(Exception::throw_type(
+                &ctx,
+                "createImageBitmap cannot use this source",
+            ));
+        }
+        ImageLookup::NotReady | ImageLookup::Invalid => {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "the image source is not usable",
+            ));
+        }
+    };
+    let origin_clean = image.origin_clean;
+    let Some((width, height, pixels)) =
+        resize_bitmap(image.width, image.height, image.pixels, &options)
+    else {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "bitmap is too large",
+        ));
+    };
+    image_bitmap_object(&ctx, width, height, pixels, origin_clean)
+}
+
+fn image_bitmap_object<'js>(
+    ctx: &Ctx<'js>,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    origin_clean: bool,
+) -> Result<Value<'js>> {
+    let ctor: Function = ctx.globals().get("ImageBitmap")?;
+    let prototype: Object = ctor.get("prototype")?;
+    let image = Object::new(ctx.clone())?;
+    image.set_prototype(Some(&prototype))?;
+    let bitmap_id = world(ctx)?
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .insert_bitmap(width, height, pixels, origin_clean);
+    image.set("__tbBitmap", bitmap_id)?;
+    image.set("__tbWidth", width)?;
+    image.set("__tbHeight", height)?;
+    image.set(
+        "__tbColorSpace",
+        rquickjs::String::from_str(ctx.clone(), "srgb")?,
+    )?;
+    image.set(
+        "__tbPixelFormat",
+        rquickjs::String::from_str(ctx.clone(), "rgba-unorm8")?,
+    )?;
+    image.set("__tbOriginClean", origin_clean)?;
+    image.set("__tbClosed", false)?;
+    Ok(image.into_value())
+}
+
+struct BitmapOptions {
+    resize_width: Option<u32>,
+    resize_height: Option<u32>,
+    quality: image::imageops::FilterType,
+    flip_y: bool,
+}
+
+fn bitmap_options(options: Option<&Object<'_>>) -> Result<BitmapOptions> {
+    let read = |name: &str| {
+        options
+            .and_then(|object| object.get::<_, Value>(name).ok())
+            .filter(|value| !value.is_undefined() && !value.is_null())
+    };
+    let dimension = |value: Option<Value<'_>>| -> Result<Option<u32>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let ctx = value.ctx().clone();
+        let number = *Coerced::<f64>::from_js(&ctx, value)?;
+        if !number.is_finite() {
+            return Err(Exception::throw_type(
+                &ctx,
+                "resize dimensions must be finite",
+            ));
+        }
+        let number = canvas_u32(number);
+        if number == 0 {
+            return Err(Exception::throw_type(
+                &ctx,
+                "resize dimensions must be nonzero",
+            ));
+        }
+        Ok(Some(number))
+    };
+    let resize_width = dimension(read("resizeWidth"))?;
+    let resize_height = dimension(read("resizeHeight"))?;
+    let quality = read("resizeQuality")
+        .map(|value| {
+            let ctx = value.ctx().clone();
+            DomString::from_js(&ctx, value)
+        })
+        .transpose()?
+        .map_or(
+            image::imageops::FilterType::Triangle,
+            |value| match &*value {
+                "pixelated" => image::imageops::FilterType::Nearest,
+                "medium" => image::imageops::FilterType::CatmullRom,
+                "high" => image::imageops::FilterType::Lanczos3,
+                _ => image::imageops::FilterType::Triangle,
+            },
+        );
+    let flip_y = read("imageOrientation")
+        .map(|value| {
+            let ctx = value.ctx().clone();
+            DomString::from_js(&ctx, value)
+        })
+        .transpose()?
+        .is_some_and(|value| &*value == "flipY");
+    Ok(BitmapOptions {
+        resize_width,
+        resize_height,
+        quality,
+        flip_y,
+    })
+}
+
+fn resize_bitmap(
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    options: &BitmapOptions,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let buffer = image::RgbaImage::from_raw(width, height, pixels)?;
+    let (source_width, source_height) = (buffer.width(), buffer.height());
+    let (target_width, target_height) = match (options.resize_width, options.resize_height) {
+        (None, None) => (source_width, source_height),
+        (Some(width), None) => (width, scaled_side(source_height, width, source_width)),
+        (None, Some(height)) => (scaled_side(source_width, height, source_height), height),
+        (Some(width), Some(height)) => (width, height),
+    };
+    crate::js::world::canvas_bytes(target_width, target_height)?;
+    let resized = if (target_width, target_height) == (source_width, source_height) {
+        buffer
+    } else {
+        image::imageops::resize(&buffer, target_width, target_height, options.quality)
+    };
+    let resized = if options.flip_y {
+        image::imageops::flip_vertical(&resized)
+    } else {
+        resized
+    };
+    Some((resized.width(), resized.height(), resized.into_raw()))
+}
+
+/// The unspecified resize axis keeps the source aspect ratio, rounded to the
+/// nearest pixel
+/// (<https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-createimagebitmap>).
+fn scaled_side(side: u32, target: u32, source: u32) -> u32 {
+    if source == 0 {
+        return 1;
+    }
+    let ratio = f64::from(target) / f64::from(source);
+    let scaled = (f64::from(side) * ratio).round();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the scale is positive and bounded by the target dimension"
+    )]
+    let scaled = scaled.max(1.0) as u32;
+    scaled
+}
+
 // ---- images --------------------------------------------------------------
 
 fn draw_image<'js>(
@@ -1477,12 +1797,22 @@ fn draw_image<'js>(
     source: Value<'js>,
     args: rquickjs::function::Rest<Coerced<f64>>,
 ) -> Result<()> {
-    let Some(image) = source_image(this.0.ctx(), source)? else {
-        return Err(crate::js::bindings::throw_dom(
-            this.0.ctx(),
-            "InvalidStateError",
-            "image is not decoded",
-        ));
+    let image = match source_image(this.0.ctx(), source)? {
+        ImageLookup::Decoded(image) => image,
+        ImageLookup::NotReady => return Ok(()),
+        ImageLookup::Unsupported => {
+            return Err(Exception::throw_type(
+                this.0.ctx(),
+                "drawImage expects an image source",
+            ));
+        }
+        ImageLookup::Invalid => {
+            return Err(crate::js::bindings::throw_dom(
+                this.0.ctx(),
+                "InvalidStateError",
+                "the image source is not usable",
+            ));
+        }
     };
     let values: Vec<f64> = args.0.iter().map(|value| **value).collect();
     let (sx, sy, sw, sh, dx, dy, dw, dh) = match values.as_slice() {
@@ -1529,16 +1859,45 @@ fn draw_image<'js>(
     })
 }
 
+/// A `drawImage`/`createPattern` source lookup.
+enum ImageLookup {
+    Decoded(SourceImage),
+    /// A canvas or image that exists but has no pixels yet; drawing it is a
+    /// no-op, not an error.
+    NotReady,
+    /// The object is not an image source at all.
+    Unsupported,
+    /// The source is invalid (zero-sized canvas, closed bitmap).
+    Invalid,
+}
+
 /// Decodes a `drawImage`/`createPattern` source: a canvas element, an
-/// `ImageData`, or an `<img>` with decoded pixels.
-fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Option<SourceImage>> {
+/// `ImageData`/`ImageBitmap`, or an `<img>` with decoded pixels
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>).
+fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     if let Some(id) = crate::js::bindings::host_node_id(ctx, &value) {
         let world = world(ctx)?;
-        let registry = world.borrow().registry();
-        if let Some(image) = registry.borrow().canvas_snapshot(id) {
-            return Ok(Some(image));
+        let (loading, broken) = {
+            let world = world.borrow();
+            (
+                world.images.loading.contains(&id),
+                world.images.broken.contains(&id),
+            )
+        };
+        if loading {
+            return Ok(ImageLookup::NotReady);
         }
-        if let Some(image) = world
+        if broken {
+            return Ok(ImageLookup::Invalid);
+        }
+        if let Some(snapshot) = world.borrow().registry().borrow().canvas_snapshot(id) {
+            return Ok(if snapshot.width == 0 || snapshot.height == 0 {
+                ImageLookup::Invalid
+            } else {
+                ImageLookup::Decoded(snapshot)
+            });
+        }
+        let mut lookup = world
             .borrow()
             .with_document(id, |parsed| {
                 let element = parsed.document.base.get_node(id.node)?;
@@ -1549,32 +1908,86 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Option<SourceI
                     // A canvas without a context is still an empty bitmap.
                     let width = canvas_dimension(ctx, id, "width", 300);
                     let height = canvas_dimension(ctx, id, "height", 150);
-                    return Some(SourceImage {
+                    if width == 0 || height == 0 {
+                        return Some(ImageLookup::Invalid);
+                    }
+                    let pixels = crate::js::world::canvas_bytes(width, height)
+                        .map_or_else(Vec::new, |bytes| vec![0; bytes]);
+                    return Some(ImageLookup::Decoded(SourceImage {
                         width,
                         height,
-                        pixels: vec![0; width as usize * height as usize * 4],
-                    });
+                        pixels,
+                        origin_clean: true,
+                    }));
                 }
-                let raster = data.raster_image_data()?;
-                Some(SourceImage {
-                    width: raster.width,
-                    height: raster.height,
-                    pixels: raster.data.as_ref().to_vec(),
-                })
+                if !(data.name.ns == crate::dom::tree::html_namespace()
+                    && data.name.local.as_str() == "img")
+                {
+                    return Some(ImageLookup::Unsupported);
+                }
+                match data.raster_image_data() {
+                    Some(raster) => Some(ImageLookup::Decoded(SourceImage {
+                        width: raster.width,
+                        height: raster.height,
+                        pixels: raster.data.as_ref().to_vec(),
+                        origin_clean: true,
+                    })),
+                    // Still loading, or failed to load: drawing paints
+                    // nothing and does not throw.
+                    None => Some(ImageLookup::NotReady),
+                }
             })
             .flatten()
-        {
-            return Ok(Some(image));
+            .unwrap_or(ImageLookup::Unsupported);
+        if let ImageLookup::Decoded(image) = &mut lookup {
+            image.origin_clean &= image_is_same_origin(&world.borrow(), id);
         }
+        return Ok(lookup);
+    }
+    if let Some(object) = value.as_object()
+        && object.get::<_, bool>("__tbClosed").unwrap_or(false)
+    {
+        return Ok(ImageLookup::Invalid);
+    }
+    if let Some(object) = value.as_object()
+        && let Ok(id) = object.get::<_, u64>("__tbBitmap")
+    {
+        let image = world(ctx)?
+            .borrow()
+            .registry()
+            .borrow()
+            .bitmap(id);
+        return Ok(image.map_or(ImageLookup::Invalid, ImageLookup::Decoded));
     }
     let Some((width, height, pixels)) = read_image_data(&value)? else {
-        return Ok(None);
+        return Ok(ImageLookup::Unsupported);
     };
-    Ok(Some(SourceImage {
+    let origin_clean = value
+        .as_object()
+        .and_then(|object| object.get::<_, bool>("__tbOriginClean").ok())
+        .unwrap_or(true);
+    Ok(ImageLookup::Decoded(SourceImage {
         width,
         height,
         pixels,
+        origin_clean,
     }))
+}
+
+/// Whether the image element's current request is same-origin with the
+/// document. `data:` images are treated as clean, like browsers do; a URL
+/// that does not parse is treated as cross-origin.
+fn image_is_same_origin(world: &crate::js::world::World, id: NodeId) -> bool {
+    let Some(src) = world.images.current_src.get(&id) else {
+        return true;
+    };
+    let Ok(url) = url::Url::parse(src) else {
+        return false;
+    };
+    if url.scheme() == "data" {
+        return true;
+    }
+    world.origin == url.origin()
 }
 
 // ---- text ----------------------------------------------------------------

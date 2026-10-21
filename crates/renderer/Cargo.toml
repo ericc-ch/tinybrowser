@@ -68,6 +68,9 @@ anyrender_tiny_skia = { path = "../anyrender-tiny-skia" }
 # Canvas 2D rasterization. Already in the graph through anyrender_tiny_skia,
 # so the canvas context adds no new crate to the binary.
 tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
+# createImageBitmap decodes Blob bytes. Blitz already enables these formats
+# for <img>, so the decoders are in the binary either way.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 blitz-traits = "=0.3.0-beta.4"
 # Inflates the build-compressed JS shims (`js::blob`). Same instance `png`
 # already retains, so this adds no new crate to the binary.

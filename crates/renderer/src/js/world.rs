@@ -67,6 +67,11 @@ pub(crate) struct RealmRegistry {
     next_remote: u64,
     /// Canvas 2D state and bitmaps, keyed by the canvas element.
     canvases: HashMap<NodeId, Canvas2D>,
+    /// Decoded `ImageBitmap` pixels, keyed by an opaque id. The id is exposed
+    /// on the JS object; the pixels are not, so a page cannot read a
+    /// cross-origin image through the bitmap's internal storage.
+    bitmaps: HashMap<u64, BitmapPixels>,
+    next_bitmap: u64,
     /// `TextDecoder` session ids, allocated across every world and frame so
     /// a freed id can never alias a live session, even if a finalizer runs
     /// under another realm.
@@ -179,7 +184,49 @@ pub(crate) fn canvas_bytes(width: u32, height: u32) -> Option<usize> {
         .filter(|bytes| *bytes <= MAX_CANVAS_BYTES)
 }
 
+pub(crate) struct BitmapPixels {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixels: Vec<u8>,
+    pub(crate) origin_clean: bool,
+}
+
 impl RealmRegistry {
+    pub(crate) fn insert_bitmap(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        origin_clean: bool,
+    ) -> u64 {
+        self.next_bitmap = self.next_bitmap.saturating_add(1);
+        let id = self.next_bitmap;
+        self.bitmaps.insert(
+            id,
+            BitmapPixels {
+                width,
+                height,
+                pixels,
+                origin_clean,
+            },
+        );
+        id
+    }
+
+    pub(crate) fn bitmap(&self, id: u64) -> Option<SourceImage> {
+        let bitmap = self.bitmaps.get(&id)?;
+        Some(SourceImage {
+            width: bitmap.width,
+            height: bitmap.height,
+            pixels: bitmap.pixels.clone(),
+            origin_clean: bitmap.origin_clean,
+        })
+    }
+
+    pub(crate) fn remove_bitmap(&mut self, id: u64) {
+        self.bitmaps.remove(&id);
+    }
+
     /// The 2D context state for `id`, reallocated when its content attributes
     /// changed size
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
@@ -203,6 +250,7 @@ impl RealmRegistry {
             width: canvas.width,
             height: canvas.height,
             pixels: canvas.read_pixels(0, 0, canvas.width, canvas.height)?,
+            origin_clean: canvas.origin_clean(),
         })
     }
 
@@ -404,6 +452,8 @@ impl RealmRegistry {
         self.creation_realms.clear();
         self.adopted_ids.clear();
         self.object_urls.clear();
+        self.canvases.clear();
+        self.bitmaps.clear();
     }
 
     fn budget(&self) -> Rc<RefCell<ResourceBudget>> {
