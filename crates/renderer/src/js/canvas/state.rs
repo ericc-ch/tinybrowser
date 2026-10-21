@@ -1635,7 +1635,9 @@ impl Canvas2D {
                 SpreadMode::Pad,
                 quality,
                 1.0,
-                image_transform.pre_concat(shift),
+                // The mask path is shifted into mask space, so the image must
+                // be shifted first and then drawn through its own transform.
+                shift.pre_concat(image_transform),
             ),
             blend_mode: BlendMode::SourceOver,
             anti_alias: true,
@@ -1749,7 +1751,7 @@ impl Canvas2D {
             &shadow_paint,
             FillRule::Winding,
             Transform::identity(),
-            self.state.clip.as_ref(),
+            self.state.clip.as_deref(),
         );
     }
 
