@@ -1162,17 +1162,8 @@ fn draw_image<'js>(
 
 /// Decodes a `drawImage`/`createPattern` source: a canvas element, an
 /// `ImageData`, or an `<img>` with decoded pixels.
-fn source_image(ctx: &Ctx<'_>, value: Value<'_>) -> Result<Option<SourceImage>> {
-    let Some(object) = value.as_object() else {
-        return Ok(None);
-    };
-    if let Ok(document) = object.get::<_, u32>("__tbDoc")
-        && let Ok(node) = object.get::<_, u64>("__tbNode")
-    {
-        let id = NodeId {
-            document,
-            node: blitz_traits::node_id::NodeId::from_u64(node),
-        };
+fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Option<SourceImage>> {
+    if let Some(id) = crate::js::bindings::host_node_id(ctx, &value) {
         let world = world(ctx)?;
         let registry = world.borrow().registry();
         if let Some(image) = registry.borrow().canvas_snapshot(id) {
@@ -1183,6 +1174,18 @@ fn source_image(ctx: &Ctx<'_>, value: Value<'_>) -> Result<Option<SourceImage>> 
             .with_document(id, |parsed| {
                 let element = parsed.document.base.get_node(id.node)?;
                 let data = element.data.downcast_element()?;
+                if data.name.ns == crate::dom::tree::html_namespace()
+                    && data.name.local.as_str() == "canvas"
+                {
+                    // A canvas without a context is still an empty bitmap.
+                    let width = canvas_dimension(ctx, id, "width", 300);
+                    let height = canvas_dimension(ctx, id, "height", 150);
+                    return Some(SourceImage {
+                        width,
+                        height,
+                        pixels: vec![0; width as usize * height as usize * 4],
+                    });
+                }
                 let raster = data.raster_image_data()?;
                 Some(SourceImage {
                     width: raster.width,

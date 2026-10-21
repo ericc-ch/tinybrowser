@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
 use std::sync::Arc;
 
+/// Shadows larger than this are skipped rather than allocating unbounded
+/// temporary bitmaps from hostile coordinates.
+const MAX_SHADOW_SIDE: u32 = 4096;
+
 use tiny_skia::{
     BlendMode, Color, ColorU8, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, Mask,
     Paint, Path, PathBuilder, Pixmap, Point, Shader, SpreadMode, Stroke, StrokeDash, Transform,
@@ -1139,6 +1143,7 @@ impl Canvas2D {
         } else {
             FillRule::Winding
         };
+        self.paint_shadow(path, rule, None);
         let style = self.state.fill;
         let alpha = self.state.alpha;
         let pattern = match style {
@@ -1192,6 +1197,7 @@ impl Canvas2D {
 
     fn stroke_path(&mut self, path: &Path) {
         let stroke = self.stroke_options();
+        self.paint_shadow(path, FillRule::Winding, Some(&stroke));
         let style = self.state.stroke;
         let alpha = self.state.alpha;
         let pattern = match style {
@@ -1244,6 +1250,15 @@ impl Canvas2D {
     }
 
     fn gradient_shader(&self, id: u32, alpha: f32) -> Option<Shader<'static>> {
+        self.gradient_shader_at(id, alpha, self.state.transform)
+    }
+
+    fn gradient_shader_at(
+        &self,
+        id: u32,
+        alpha: f32,
+        transform: Transform,
+    ) -> Option<Shader<'static>> {
         let gradient = self.gradients.get(&id)?;
         if gradient.stops.is_empty() {
             return None;
@@ -1258,7 +1273,6 @@ impl Canvas2D {
                 )
             })
             .collect();
-        let transform = self.state.transform;
         match gradient.kind {
             GradientKind::Linear { start, end } => {
                 tiny_skia::LinearGradient::new(start, end, stops, SpreadMode::Pad, transform)
@@ -1559,6 +1573,7 @@ impl Canvas2D {
         let Some(path) = self.rect_path(dx, dy, dw, dh) else {
             return;
         };
+        self.paint_image_shadow(&path, &pattern, quality, transform);
         let Some(pixmap) = &mut self.pixmap else {
             return;
         };
@@ -1569,6 +1584,228 @@ impl Canvas2D {
             Transform::identity(),
             self.state.clip.as_deref(),
         );
+    }
+
+    /// The shadow of `drawImage`: the image's own alpha, tinted and offset.
+    fn paint_image_shadow(
+        &mut self,
+        path: &Path,
+        pattern: &Arc<Pixmap>,
+        quality: FilterQuality,
+        image_transform: Transform,
+    ) {
+        let [_, _, _, alpha] = self.state.shadow_color;
+        if alpha == 0
+            || (self.state.shadow_blur == 0.0
+                && self.state.shadow_x == 0.0
+                && self.state.shadow_y == 0.0)
+        {
+            return;
+        }
+        let bounds = path.bounds();
+        if !(bounds.width().is_finite() && bounds.height().is_finite()) {
+            return;
+        }
+        let sigma = self.state.shadow_blur / 2.0;
+        let padding = (sigma * 3.0).ceil() + 1.0;
+        let left = bounds.left() - padding;
+        let top = bounds.top() - padding;
+        let width = bounds.width() + padding * 2.0;
+        let height = bounds.height() + padding * 2.0;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the bitmap sides are checked against a fixed cap below"
+        )]
+        let (bitmap_width, bitmap_height) = (width.ceil() as u32, height.ceil() as u32);
+        if bitmap_width == 0
+            || bitmap_height == 0
+            || bitmap_width > MAX_SHADOW_SIDE
+            || bitmap_height > MAX_SHADOW_SIDE
+        {
+            return;
+        }
+        let Some(mut mask) = Pixmap::new(bitmap_width, bitmap_height) else {
+            return;
+        };
+        let shift = Transform::from_translate(-left, -top);
+        let paint = Paint {
+            shader: tiny_skia::Pattern::new(
+                pattern.as_ref().as_ref(),
+                SpreadMode::Pad,
+                quality,
+                1.0,
+                // The mask path is shifted into mask space, so the image must
+                // be shifted first and then drawn through its own transform.
+                shift.pre_concat(image_transform),
+            ),
+            blend_mode: BlendMode::SourceOver,
+            anti_alias: true,
+            ..Paint::default()
+        };
+        let Some(shifted) = path.clone().transform(shift) else {
+            return;
+        };
+        mask.fill_path(
+            &shifted,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+        self.finish_shadow(mask, sigma, left, top);
+    }
+
+    /// Paints the shadow pass for a shape before the shape itself
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#shadows>).
+    fn paint_shadow(&mut self, path: &Path, rule: FillRule, stroke: Option<&Stroke>) {
+        let [_, _, _, alpha] = self.state.shadow_color;
+        if alpha == 0
+            || (self.state.shadow_blur == 0.0
+                && self.state.shadow_x == 0.0
+                && self.state.shadow_y == 0.0)
+        {
+            return;
+        }
+        let bounds = path.bounds();
+        if !(bounds.width().is_finite() && bounds.height().is_finite()) {
+            return;
+        }
+        let sigma = self.state.shadow_blur / 2.0;
+        let blur_padding = (sigma * 3.0).ceil() + 1.0;
+        // Path bounds cover the centerline; a stroke extends past it by half
+        // the line width scaled by the miter limit at joins.
+        let stroke_padding = stroke.map_or(0.0, |stroke| {
+            stroke.width * stroke.miter_limit.max(1.0) + 1.0
+        });
+        let padding = blur_padding + stroke_padding;
+        let left = bounds.left() - padding;
+        let top = bounds.top() - padding;
+        let width = bounds.width() + padding * 2.0;
+        let height = bounds.height() + padding * 2.0;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the bitmap sides are checked against a fixed cap below"
+        )]
+        let (bitmap_width, bitmap_height) = (width.ceil() as u32, height.ceil() as u32);
+        if bitmap_width == 0
+            || bitmap_height == 0
+            || bitmap_width > MAX_SHADOW_SIDE
+            || bitmap_height > MAX_SHADOW_SIDE
+        {
+            return;
+        }
+        let Some(mut mask) = Pixmap::new(bitmap_width, bitmap_height) else {
+            return;
+        };
+        let shift = Transform::from_translate(-left, -top);
+        let style = stroke.map_or(self.state.fill, |_| self.state.stroke);
+        let Some(paint) = self.shadow_mask_paint(style, shift) else {
+            return;
+        };
+        match stroke {
+            Some(stroke) => {
+                mask.stroke_path(path, &paint, stroke, shift, None);
+            }
+            None => {
+                mask.fill_path(path, &paint, rule, shift, None);
+            }
+        }
+        self.finish_shadow(mask, sigma, left, top);
+    }
+
+    /// Tints, blurs, offsets, and composites a shadow mask. The mask covers
+    /// the canvas region starting at `(left, top)`.
+    fn finish_shadow(&mut self, mut mask: Pixmap, sigma: f32, left: f32, top: f32) {
+        Self::tint_shadow(&mut mask, self.state.shadow_color);
+        blur_pixmap(&mut mask, sigma);
+        let offset =
+            Transform::from_translate(self.state.shadow_x + left, self.state.shadow_y + top);
+        let shadow_paint = Paint {
+            shader: tiny_skia::Pattern::new(
+                mask.as_ref(),
+                SpreadMode::Pad,
+                FilterQuality::Nearest,
+                self.state.alpha,
+                offset,
+            ),
+            blend_mode: self.state.blend,
+            anti_alias: true,
+            ..Paint::default()
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "canvas sides are capped well below 2^24"
+        )]
+        let (canvas_width, canvas_height) = (self.width as f32, self.height as f32);
+        let Some(cover) = tiny_skia::Rect::from_xywh(0.0, 0.0, canvas_width, canvas_height) else {
+            return;
+        };
+        let cover = PathBuilder::from_rect(cover);
+        let Some(pixmap) = &mut self.pixmap else {
+            return;
+        };
+        pixmap.fill_path(
+            &cover,
+            &shadow_paint,
+            FillRule::Winding,
+            Transform::identity(),
+            self.state.clip.as_deref(),
+        );
+    }
+
+    /// The shape's own coverage, so a transparent fill casts no shadow. RGB
+    /// is discarded after rasterizing; only alpha survives.
+    fn shadow_mask_paint(&self, style: Style, shift: Transform) -> Option<Paint<'_>> {
+        let mut paint = Paint {
+            blend_mode: BlendMode::SourceOver,
+            anti_alias: true,
+            ..Paint::default()
+        };
+        paint.shader = match style {
+            Style::Color([_, _, _, alpha]) => {
+                Shader::SolidColor(Color::from_rgba8(255, 255, 255, alpha))
+            }
+            Style::Gradient(id) => {
+                self.gradient_shader_at(id, 1.0, self.state.transform.pre_concat(shift))?
+            }
+            Style::Pattern(id) => {
+                let entry = self.patterns.get(&id)?;
+                tiny_skia::Pattern::new(
+                    entry.image.as_ref().as_ref(),
+                    entry.spread,
+                    entry.quality,
+                    1.0,
+                    self.state.transform.pre_concat(shift),
+                )
+            }
+        };
+        Some(paint)
+    }
+
+    /// Replaces a shape's pixels with the shadow color, keeping its alpha.
+    fn tint_shadow(mask: &mut Pixmap, [red, green, blue, alpha]: [u8; 4]) {
+        let shadow_alpha = u32::from(alpha);
+        for pixel in mask.data_mut().as_chunks_mut::<4>().0 {
+            let coverage = u32::from(pixel[3]);
+            let tinted = (coverage * shadow_alpha + 127) / 255;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "channel products divided by 255 stay below 256"
+            )]
+            let (red, green, blue) = (
+                (u32::from(red) * tinted / 255) as u8,
+                (u32::from(green) * tinted / 255) as u8,
+                (u32::from(blue) * tinted / 255) as u8,
+            );
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "channel products divided by 255 stay below 256"
+            )]
+            let tinted = tinted as u8;
+            pixel.copy_from_slice(&[red, green, blue, tinted]);
+        }
     }
 
     fn stroke_options(&self) -> Stroke {
@@ -1815,6 +2052,124 @@ pub(crate) fn serialize_color([r, g, b, a]: [u8; 4]) -> String {
     }
 }
 
+/// Blurs premultiplied RGBA with three box passes, matching Skia's Gaussian
+/// approximation. `sigma` is half of `shadowBlur`
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-shadowblur>).
+fn blur_pixmap(pixmap: &mut Pixmap, sigma: f32) {
+    if sigma <= 0.0 {
+        return;
+    }
+    for radius in box_radii(sigma, 3) {
+        box_blur(pixmap, radius);
+    }
+}
+
+/// Box sizes whose repeated application approximates a Gaussian of `sigma`
+/// (Kovesi, "Fast almost-Gaussian filtering").
+fn box_radii(sigma: f32, passes: usize) -> Vec<usize> {
+    let passes = passes.max(1);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the pass count is a small constant"
+    )]
+    let count = passes as f32;
+    let ideal = (12.0 * sigma * sigma / count + 1.0).sqrt();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the ideal box width is small for canvas blur radii"
+    )]
+    let mut lower = ideal.floor() as i32;
+    if lower % 2 == 0 {
+        lower -= 1;
+    }
+    let upper = lower + 2;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the pass count is a small constant"
+    )]
+    let lower_f = lower as f32;
+    let m =
+        ((12.0 * sigma * sigma - count * lower_f * lower_f - 4.0 * count * lower_f - 3.0 * count)
+            / (-4.0 * lower_f - 4.0))
+            .round();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the mixed-box count is bounded by the pass count"
+    )]
+    let mixed = m as i32;
+    (0..passes)
+        .map(|index| {
+            let index = i32::try_from(index).unwrap_or(i32::MAX);
+            let width = if index < mixed { lower } else { upper };
+            usize::try_from((width.max(1) - 1) / 2).unwrap_or(0)
+        })
+        .collect()
+}
+
+fn box_blur(pixmap: &mut Pixmap, radius: usize) {
+    if radius == 0 {
+        return;
+    }
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+    let data = pixmap.data_mut();
+    box_blur_horizontal(data, width, height, radius);
+    box_blur_vertical(data, width, height, radius);
+}
+
+fn box_blur_horizontal(data: &mut [u8], width: usize, height: usize, radius: usize) {
+    let mut out = vec![0u8; data.len()];
+    let window = u32::try_from(radius * 2 + 1).unwrap_or(u32::MAX);
+    for y in 0..height {
+        let row = y * width;
+        let mut sums = [0u32; 4];
+        for offset in 0..=(radius * 2) {
+            let x = offset.saturating_sub(radius).min(width - 1);
+            for (channel, sum) in sums.iter_mut().enumerate() {
+                *sum += u32::from(data[(row + x) * 4 + channel]);
+            }
+        }
+        for x in 0..width {
+            for (channel, sum) in sums.iter().enumerate() {
+                out[(row + x) * 4 + channel] = u8::try_from(sum / window).unwrap_or(255);
+            }
+            let leaving = x.saturating_sub(radius).min(width - 1);
+            let entering = (x + radius + 1).min(width - 1);
+            for (channel, sum) in sums.iter_mut().enumerate() {
+                *sum = *sum - u32::from(data[(row + leaving) * 4 + channel])
+                    + u32::from(data[(row + entering) * 4 + channel]);
+            }
+        }
+    }
+    data.copy_from_slice(&out);
+}
+
+fn box_blur_vertical(data: &mut [u8], width: usize, height: usize, radius: usize) {
+    let mut out = vec![0u8; data.len()];
+    let window = u32::try_from(radius * 2 + 1).unwrap_or(u32::MAX);
+    for x in 0..width {
+        let mut sums = [0u32; 4];
+        for offset in 0..=(radius * 2) {
+            let y = offset.saturating_sub(radius).min(height - 1);
+            for (channel, sum) in sums.iter_mut().enumerate() {
+                *sum += u32::from(data[(y * width + x) * 4 + channel]);
+            }
+        }
+        for y in 0..height {
+            for (channel, sum) in sums.iter().enumerate() {
+                out[(y * width + x) * 4 + channel] = u8::try_from(sum / window).unwrap_or(255);
+            }
+            let leaving = y.saturating_sub(radius).min(height - 1);
+            let entering = (y + radius + 1).min(height - 1);
+            for (channel, sum) in sums.iter_mut().enumerate() {
+                *sum = *sum - u32::from(data[(leaving * width + x) * 4 + channel])
+                    + u32::from(data[(entering * width + x) * 4 + channel]);
+            }
+        }
+    }
+    data.copy_from_slice(&out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1875,5 +2230,18 @@ mod tests {
         // the normalized list.
         let mut default_radii = Canvas2D::new(100, 50);
         default_radii.round_rect(1.0, 2.0, 20.0, 10.0, &[]);
+    }
+
+    #[test]
+    fn shadow_offset_paints_below_the_shape() {
+        let mut canvas = Canvas2D::new(4, 4);
+        canvas.set_fill_style(StyleValue::Color([255, 0, 0, 255]));
+        canvas.set_shadow_color([0, 255, 0, 255]);
+        canvas.set_shadow_offset_y(2.0);
+        canvas.fill_rect(0.0, 0.0, 4.0, 2.0);
+        let pixels = canvas.read_pixels(0, 0, 4, 4).unwrap();
+        assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
+        // Row 2 is the shadow: green, drawn under the red shape.
+        assert_eq!(&pixels[32..36], &[0, 255, 0, 255]);
     }
 }
