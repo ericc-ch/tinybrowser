@@ -7,6 +7,7 @@
 mod bindings;
 mod blob;
 mod bridge;
+mod canvas;
 mod encoding;
 mod events;
 mod intl;
