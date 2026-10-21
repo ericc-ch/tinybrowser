@@ -13,6 +13,7 @@
 )]
 
 mod color;
+mod path2d;
 mod state;
 mod text;
 
@@ -21,10 +22,13 @@ pub(crate) use state::{Canvas2D, SourceImage, StyleValue};
 use rquickjs::function::This;
 use rquickjs::object::Accessor;
 use rquickjs::prelude::{Func, Opt};
-use rquickjs::{Coerced, Ctx, Exception, FromJs, Function, Object, Result, TypedArray, Value};
+use rquickjs::{
+    Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result, TypedArray, Value,
+};
 
 use crate::dom::tree::NodeId;
 use crate::js::bindings::{world, wrap_node};
+use path2d::JsPath2D;
 use state::serialize_color;
 
 /// A `WebIDL` `DOMString` argument: coerces like `ToString`, then owns the
@@ -55,9 +59,14 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
     ctor.set("prototype", prototype)?;
     ctx.globals().set("CanvasRenderingContext2D", ctor)?;
     install_gradient_objects(ctx)?;
+    install_path2d(ctx)?;
     install_image_data(ctx)?;
     install_image_bitmap(ctx)?;
     Ok(())
+}
+
+fn install_path2d(ctx: &Ctx<'_>) -> Result<()> {
+    path2d::install(ctx)
 }
 
 /// `CanvasGradient` and `CanvasPattern` constructors: canvas returns branded
@@ -813,47 +822,165 @@ fn round_rect_radius(value: &Value<'_>) -> Result<Option<(f32, f32)>> {
 
 // ---- painting ------------------------------------------------------------
 
-/// Converts the `CanvasFillRule` enum. `WebIDL` rejects every value other than
-/// the two enum strings with `TypeError`, so an unknown string cannot silently
-/// fall back to nonzero
-/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fill>).
+/// `CanvasFillRule`: an absent rule is nonzero, and any other string is a
+/// `TypeError`
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#canvasfillrule>).
 fn fill_rule(ctx: &Ctx<'_>, rule: Option<&DomString>) -> Result<bool> {
-    match rule.map(|rule| &**rule) {
-        None | Some("nonzero") => Ok(false),
-        Some("evenodd") => Ok(true),
-        Some(_) => Err(Exception::throw_type(ctx, "invalid fill rule")),
+    match rule {
+        None => Ok(false),
+        Some(rule) => match &**rule {
+            "nonzero" | "undefined" => Ok(false),
+            "evenodd" => Ok(true),
+            _ => Err(Exception::throw_type(ctx, "invalid fill rule")),
+        },
     }
 }
 
-fn fill(this: This<Object<'_>>, rule: Opt<DomString>) -> Result<()> {
-    let even_odd = fill_rule(this.0.ctx(), rule.0.as_ref())?;
-    with_canvas(this.0.ctx(), &this.0, |canvas| canvas.fill(even_odd))
+fn fill<'js>(
+    this: This<Object<'js>>,
+    first: Opt<Value<'js>>,
+    second: Opt<DomString>,
+) -> Result<()> {
+    let ctx = this.0.ctx();
+    if let Some(value) = first.0 {
+        if value.is_undefined() {
+            if second.0.is_some() {
+                return Err(Exception::throw_type(ctx, "fill expects a Path2D"));
+            }
+            return with_canvas(ctx, &this.0, |canvas| canvas.fill(false));
+        }
+        if let Ok(path) = Class::<JsPath2D>::from_value(&value) {
+            let even_odd = fill_rule(ctx, second.0.as_ref())?;
+            let path = path.borrow();
+            return with_canvas(ctx, &this.0, |canvas| {
+                canvas.fill_borrowed_path(&path.canvas.borrow(), even_odd);
+            });
+        }
+        // The two-argument overload only accepts a Path2D first.
+        if second.0.is_some() {
+            return Err(Exception::throw_type(ctx, "fill expects a Path2D"));
+        }
+        let rule = DomString::from_js(ctx, value)?;
+        let even_odd = fill_rule(ctx, Some(&rule))?;
+        return with_canvas(ctx, &this.0, |canvas| canvas.fill(even_odd));
+    }
+    with_canvas(ctx, &this.0, |canvas| canvas.fill(false))
 }
 
-fn stroke(this: This<Object<'_>>) -> Result<()> {
-    with_canvas(this.0.ctx(), &this.0, state::Canvas2D::stroke)
+fn stroke<'js>(this: This<Object<'js>>, path: Opt<Value<'js>>) -> Result<()> {
+    let ctx = this.0.ctx();
+    if let Some(value) = path.0 {
+        if value.is_undefined() {
+            return with_canvas(ctx, &this.0, state::Canvas2D::stroke);
+        }
+        let Ok(path) = Class::<JsPath2D>::from_value(&value) else {
+            return Err(Exception::throw_type(ctx, "stroke expects a Path2D"));
+        };
+        let path = path.borrow();
+        return with_canvas(ctx, &this.0, |canvas| {
+            canvas.stroke_borrowed_path(&path.canvas.borrow());
+        });
+    }
+    with_canvas(ctx, &this.0, state::Canvas2D::stroke)
 }
 
-fn clip(this: This<Object<'_>>, rule: Opt<DomString>) -> Result<()> {
-    let even_odd = fill_rule(this.0.ctx(), rule.0.as_ref())?;
-    with_canvas(this.0.ctx(), &this.0, |canvas| canvas.clip(even_odd))
+fn clip<'js>(
+    this: This<Object<'js>>,
+    first: Opt<Value<'js>>,
+    second: Opt<DomString>,
+) -> Result<()> {
+    let ctx = this.0.ctx();
+    if let Some(value) = first.0 {
+        if value.is_undefined() {
+            if second.0.is_some() {
+                return Err(Exception::throw_type(ctx, "clip expects a Path2D"));
+            }
+            return with_canvas(ctx, &this.0, |canvas| canvas.clip(false));
+        }
+        if let Ok(path) = Class::<JsPath2D>::from_value(&value) {
+            let even_odd = fill_rule(ctx, second.0.as_ref())?;
+            let path = path.borrow();
+            return with_canvas(ctx, &this.0, |canvas| {
+                canvas.clip_borrowed_path(&path.canvas.borrow(), even_odd);
+            });
+        }
+        if second.0.is_some() {
+            return Err(Exception::throw_type(ctx, "clip expects a Path2D"));
+        }
+        let rule = DomString::from_js(ctx, value)?;
+        let even_odd = fill_rule(ctx, Some(&rule))?;
+        return with_canvas(ctx, &this.0, |canvas| canvas.clip(even_odd));
+    }
+    with_canvas(ctx, &this.0, |canvas| canvas.clip(false))
 }
 
-fn is_point_in_path(
-    this: This<Object<'_>>,
-    x: Coerced<f64>,
-    y: Coerced<f64>,
-    rule: Opt<DomString>,
+fn is_point_in_path<'js>(
+    this: This<Object<'js>>,
+    args: rquickjs::function::Rest<Value<'js>>,
 ) -> Result<bool> {
-    let even_odd = fill_rule(this.0.ctx(), rule.0.as_ref())?;
-    with_canvas(this.0.ctx(), &this.0, |canvas| {
-        canvas.is_point_in_path(f32_of(*x), f32_of(*y), even_odd)
+    let ctx = this.0.ctx();
+    let (path, offset) = match args.0.first() {
+        Some(value) => match Class::<JsPath2D>::from_value(value) {
+            Ok(path) => (Some(path), 1),
+            Err(_) => (None, 0),
+        },
+        None => (None, 0),
+    };
+    let x = args
+        .0
+        .get(offset)
+        .ok_or_else(|| Exception::throw_type(ctx, "isPointInPath needs x"))?;
+    let y = args
+        .0
+        .get(offset + 1)
+        .ok_or_else(|| Exception::throw_type(ctx, "isPointInPath needs y"))?;
+    let x = f32_of(*Coerced::<f64>::from_js(ctx, x.clone())?);
+    let y = f32_of(*Coerced::<f64>::from_js(ctx, y.clone())?);
+    let rule = args
+        .0
+        .get(offset + 2)
+        .map(|value| DomString::from_js(ctx, value.clone()))
+        .transpose()?;
+    let even_odd = fill_rule(ctx, rule.as_ref())?;
+    let Some(path) = path else {
+        return with_canvas(ctx, &this.0, |canvas| {
+            canvas.is_point_in_path(x, y, even_odd)
+        });
+    };
+    let path = path.borrow();
+    with_canvas(ctx, &this.0, |canvas| {
+        canvas.is_point_in_borrowed_path(&path.canvas.borrow(), x, y, even_odd)
     })
 }
 
-fn is_point_in_stroke(this: This<Object<'_>>, x: Coerced<f64>, y: Coerced<f64>) -> Result<bool> {
-    with_canvas(this.0.ctx(), &this.0, |canvas| {
-        canvas.is_point_in_stroke(f32_of(*x), f32_of(*y))
+fn is_point_in_stroke<'js>(
+    this: This<Object<'js>>,
+    args: rquickjs::function::Rest<Value<'js>>,
+) -> Result<bool> {
+    let ctx = this.0.ctx();
+    let (path, offset) = match args.0.first() {
+        Some(value) => match Class::<JsPath2D>::from_value(value) {
+            Ok(path) => (Some(path), 1),
+            Err(_) => (None, 0),
+        },
+        None => (None, 0),
+    };
+    let x = args
+        .0
+        .get(offset)
+        .ok_or_else(|| Exception::throw_type(ctx, "isPointInStroke needs x"))?;
+    let y = args
+        .0
+        .get(offset + 1)
+        .ok_or_else(|| Exception::throw_type(ctx, "isPointInStroke needs y"))?;
+    let x = f32_of(*Coerced::<f64>::from_js(ctx, x.clone())?);
+    let y = f32_of(*Coerced::<f64>::from_js(ctx, y.clone())?);
+    let Some(path) = path else {
+        return with_canvas(ctx, &this.0, |canvas| canvas.is_point_in_stroke(x, y));
+    };
+    let path = path.borrow();
+    with_canvas(ctx, &this.0, |canvas| {
+        canvas.is_point_in_borrowed_stroke(&path.canvas.borrow(), x, y)
     })
 }
 
