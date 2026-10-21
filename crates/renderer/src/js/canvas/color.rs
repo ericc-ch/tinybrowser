@@ -560,11 +560,7 @@ fn format_number(value: f32) -> String {
     if text.ends_with('.') {
         text.pop();
     }
-    if text == "-0" {
-        "0".to_owned()
-    } else {
-        text
-    }
+    if text == "-0" { "0".to_owned() } else { text }
 }
 
 fn from_bytes(bytes: [u8; 4]) -> [f32; 4] {
@@ -741,7 +737,9 @@ fn parse_lab(inner: &str) -> Option<ParsedColor> {
     let a = lab_axis(parts[1])?;
     let b = lab_axis(parts[2])?;
     let alpha_value = alpha.map_or(1.0, |text| {
-        Component::parse(text).and_then(Component::number).unwrap_or(1.0)
+        Component::parse(text)
+            .and_then(Component::number)
+            .unwrap_or(1.0)
     });
     Some(ParsedColor {
         bytes: lab_to_srgb(lightness, a, b, alpha_value),
@@ -795,21 +793,24 @@ fn lab_to_srgb(lightness: f32, a_axis: f32, b_axis: f32, alpha: f32) -> [u8; 4] 
 
 fn parse_relative(rest: &str, color_function: bool) -> Option<ParsedColor> {
     let (source, channels) = split_source(rest)?;
-    let source = parse_exact(source)
-        .or_else(|| parse(source).map(|bytes| ParsedColor {
+    let source = parse_exact(source).or_else(|| {
+        parse(source).map(|bytes| ParsedColor {
             bytes,
             value: from_bytes(bytes),
             serialized: None,
-        }))?;
+        })
+    })?;
     let source = source.value;
     let channels = if color_function {
         channels.trim().strip_prefix("srgb")?.trim()
     } else {
         channels
     };
-    let (channels, alpha) = channels.split_once('/').map_or((channels, None), |(channels, alpha)| {
-        (channels.trim(), Some(alpha.trim()))
-    });
+    let (channels, alpha) = channels
+        .split_once('/')
+        .map_or((channels, None), |(channels, alpha)| {
+            (channels.trim(), Some(alpha.trim()))
+        });
     let evaluate = |token: &str, fallback: f32| -> f32 {
         match token {
             "r" => source[0],
@@ -847,23 +848,29 @@ fn parse_relative(rest: &str, color_function: bool) -> Option<ParsedColor> {
 }
 
 fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
-    let inner = inner.trim().strip_prefix("in srgb")?.trim_start_matches(',').trim();
+    let inner = inner
+        .trim()
+        .strip_prefix("in srgb")?
+        .trim_start_matches(',')
+        .trim();
     let parts = split_commas(inner);
     if parts.len() != 2 {
         return None;
     }
     let split = |part: &str| -> Option<(ParsedColor, Option<f32>)> {
         let part = part.trim();
-        let (color, percentage) = part.rsplit_once(char::is_whitespace).map_or((part, None), |(color, percentage)| {
-            if percentage.trim().ends_with('%') {
-                (
-                    color.trim(),
-                    percentage.trim().trim_end_matches('%').parse::<f32>().ok(),
-                )
-            } else {
-                (part, None)
-            }
-        });
+        let (color, percentage) =
+            part.rsplit_once(char::is_whitespace)
+                .map_or((part, None), |(color, percentage)| {
+                    if percentage.trim().ends_with('%') {
+                        (
+                            color.trim(),
+                            percentage.trim().trim_end_matches('%').parse::<f32>().ok(),
+                        )
+                    } else {
+                        (part, None)
+                    }
+                });
         let color = parse_exact(color).or_else(|| {
             parse(color).map(|bytes| ParsedColor {
                 bytes,

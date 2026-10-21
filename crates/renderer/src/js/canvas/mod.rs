@@ -386,9 +386,11 @@ fn install_paint_accessors(prototype: &Object<'_>) -> Result<()> {
         "shadowColor",
         Accessor::new(
             |this: This<Object<'_>>| {
-                with_canvas(this.0.ctx(), &this.0, |canvas| match canvas.shadow_serialized() {
-                    Some(text) => text.to_owned(),
-                    None => serialize_color(canvas.shadow_color()),
+                with_canvas(this.0.ctx(), &this.0, |canvas| {
+                    match canvas.shadow_serialized() {
+                        Some(text) => text.to_owned(),
+                        None => serialize_color(canvas.shadow_color()),
+                    }
                 })
             },
             |this: This<Object<'_>>, value: DomString| {
@@ -512,17 +514,14 @@ fn with_canvas<R>(
     let world = world(ctx)?;
     {
         let owner = world.borrow();
-        let is_canvas = owner
-            .with_document(id, |parsed| {
-                parsed
-                    .document
-                    .base
-                    .get_node(id.node)
-                    .is_some_and(|node| {
+        let is_canvas =
+            owner
+                .with_document(id, |parsed| {
+                    parsed.document.base.get_node(id.node).is_some_and(|node| {
                         crate::dom::tree::is_html_tag(Some(&node.data), "canvas")
                     })
-            })
-            .unwrap_or(false);
+                })
+                .unwrap_or(false);
         if !owner.owns_node(id) || !is_canvas {
             return Err(crate::js::bindings::throw_dom(
                 ctx,
@@ -571,7 +570,10 @@ fn enforce_long(ctx: &Ctx<'_>, value: f64) -> Result<i32> {
     }
     let value = value.trunc();
     if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
-        return Err(Exception::throw_type(ctx, "value is outside the long range"));
+        return Err(Exception::throw_type(
+            ctx,
+            "value is outside the long range",
+        ));
     }
     #[expect(
         clippy::cast_possible_truncation,
@@ -751,22 +753,7 @@ fn get_transform(this: This<Object<'_>>) -> Result<Object<'_>> {
         object.set_prototype(Some(&prototype))?;
         let init = Array::new(ctx.clone())?;
         for value in [
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ] {
             init.set(init.len(), value)?;
         }
@@ -1447,9 +1434,7 @@ fn resource_object<'js>(this: &Object<'js>, kind: &str, id: u32) -> Result<Value
     };
     // Use the intrinsic prototype captured at install time. The global is
     // page-writable, the intrinsic is not.
-    let prototype: Object = if let Some(prototype) =
-        world(this.ctx())?.borrow().brand(ctor_name)
-    {
+    let prototype: Object = if let Some(prototype) = world(this.ctx())?.borrow().brand(ctor_name) {
         prototype.restore(this.ctx())?
     } else {
         let ctor: Function = this.ctx().globals().get(ctor_name)?;
@@ -1513,13 +1498,13 @@ fn set_pattern_transform(this: This<Object<'_>>, matrix: Value<'_>) -> Result<()
     let Some(matrix) = matrix.as_object() else {
         return Err(Exception::throw_type(ctx, "setTransform expects an object"));
     };
-    let member = |key: &str| -> Option<f64> {
-        matrix.get::<_, Option<f64>>(key).ok().flatten()
-    };
+    let member = |key: &str| -> Option<f64> { matrix.get::<_, Option<f64>>(key).ok().flatten() };
     // A DOMMatrix2DInit accepts a/b/c/d/e/f and their m11/m12/... aliases.
     // Unknown members are ignored. Any non-finite value leaves the pattern's
     // previous transform in place rather than invalidating it.
-    for key in ["a", "b", "c", "d", "e", "f", "m11", "m12", "m21", "m22", "m41", "m42"] {
+    for key in [
+        "a", "b", "c", "d", "e", "f", "m11", "m12", "m21", "m22", "m41", "m42",
+    ] {
         if member(key).is_some_and(|value| !value.is_finite()) {
             return Ok(());
         }
@@ -1652,7 +1637,10 @@ fn image_data_construct<'js>(
     // not implement. Any other typed array falls through to the numeric
     // overload, where ToUint32(array) is 0.
     if first.is_null() {
-        return Err(Exception::throw_type(ctx, "ImageData needs a numeric width"));
+        return Err(Exception::throw_type(
+            ctx,
+            "ImageData needs a numeric width",
+        ));
     }
     if let Some(object) = first.as_object() {
         let shared = object
@@ -1671,7 +1659,10 @@ fn image_data_construct<'js>(
         let typed_array = object.contains_key("buffer").unwrap_or(false)
             && object.contains_key("byteLength").unwrap_or(false);
         if !typed_array {
-            return Err(Exception::throw_type(ctx, "ImageData needs a numeric width"));
+            return Err(Exception::throw_type(
+                ctx,
+                "ImageData needs a numeric width",
+            ));
         }
     }
     let width = *Coerced::<f64>::from_js(ctx, first.clone())?;
@@ -1871,7 +1862,10 @@ fn get_image_data(
     let x = i32_of(sx);
     let y = i32_of(sy);
     let (pixels, origin_clean) = with_canvas(this.0.ctx(), &this.0, |canvas| {
-        (canvas.read_pixels(x, y, width, height), canvas.origin_clean())
+        (
+            canvas.read_pixels(x, y, width, height),
+            canvas.origin_clean(),
+        )
     })?;
     if !origin_clean {
         return Err(crate::js::bindings::throw_dom(
@@ -2210,11 +2204,12 @@ fn image_bitmap_object<'js>(
     let prototype: Object = ctor.get("prototype")?;
     let image = Object::new(ctx.clone())?;
     image.set_prototype(Some(&prototype))?;
-    let bitmap_id = world(ctx)?
-        .borrow()
-        .registry()
-        .borrow_mut()
-        .insert_bitmap(width, height, pixels, origin_clean);
+    let bitmap_id = world(ctx)?.borrow().registry().borrow_mut().insert_bitmap(
+        width,
+        height,
+        pixels,
+        origin_clean,
+    );
     image.set("__tbBitmap", bitmap_id)?;
     image.set("__tbWidth", width)?;
     image.set("__tbHeight", height)?;
@@ -2498,11 +2493,7 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     if let Some(object) = value.as_object()
         && let Ok(id) = object.get::<_, u64>("__tbBitmap")
     {
-        let image = world(ctx)?
-            .borrow()
-            .registry()
-            .borrow()
-            .bitmap(id);
+        let image = world(ctx)?.borrow().registry().borrow().bitmap(id);
         return Ok(image.map_or(ImageLookup::Invalid, ImageLookup::Decoded));
     }
     let Some((width, height, pixels)) = read_image_data(&value)? else {
@@ -2654,12 +2645,7 @@ fn svg_source_image(svg: &blitz_dom::node::SvgImageData) -> Option<SourceImage> 
     let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 4);
     for pixel in pixmap.pixels() {
         let color = pixel.demultiply();
-        pixels.extend_from_slice(&[
-            color.red(),
-            color.green(),
-            color.blue(),
-            color.alpha(),
-        ]);
+        pixels.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
     }
     Some(SourceImage {
         width,
@@ -3272,10 +3258,7 @@ fn get_index_from_offset(this: This<Object<'_>>, offset: Coerced<f64>) -> Result
     for cluster in &shaped.clusters {
         let start = cluster.offset * shaped.scale_x;
         let end = start + cluster.advance * shaped.scale_x;
-        for (boundary, position) in [
-            (cluster.utf16_start, start),
-            (cluster.utf16_end, end),
-        ] {
+        for (boundary, position) in [(cluster.utf16_start, start), (cluster.utf16_end, end)] {
             let distance = (position - target).abs();
             if distance < best_distance {
                 best_distance = distance;

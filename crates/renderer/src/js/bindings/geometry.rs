@@ -5,7 +5,7 @@
 
 //! Geometry interfaces used by canvas and CSSOM View.
 //!
-//! [`DOMPoint`] and [`DOMPointReadOnly`] are dictionaries with identity in
+//! `DOMPoint` and `DOMPointReadOnly` are dictionaries with identity in
 //! JavaScript; canvas consumes them as `DOMPointInit` when reading
 //! `roundRect` radii
 //! (<https://drafts.fxtf.org/geometry/#DOMPoint>,

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use rquickjs::{prelude::Func, Ctx, Result};
+use rquickjs::{Ctx, Result, prelude::Func};
 
 use crate::js::bindings::world;
 
@@ -43,10 +43,9 @@ fn register_font(ctx: Ctx<'_>, family: String, data: Vec<u8>) -> Result<()> {
     }
     // Detached canvases fall back to the runtime context, so register there
     // too.
-    world
-        .runtime
-        .font_ctx
-        .collection
-        .register_fonts(parley::fontique::Blob::new(Arc::new(data)), Some(override_name));
+    world.runtime.font_ctx.collection.register_fonts(
+        parley::fontique::Blob::new(Arc::new(data)),
+        Some(override_name),
+    );
     Ok(())
 }

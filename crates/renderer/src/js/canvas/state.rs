@@ -51,8 +51,7 @@ pub(crate) struct Canvas2D {
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing>).
 fn normalize_length(value: &str) -> Option<String> {
     let text = value.trim().to_ascii_lowercase();
-    let Some(split) =
-        text.find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+')))
+    let Some(split) = text.find(|ch: char| !(ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+')))
     else {
         // Unitless zero is a valid CSS length; every other unitless number is
         // not.

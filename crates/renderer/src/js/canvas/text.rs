@@ -294,7 +294,9 @@ fn layout_font_metrics(layout: &parley::Layout<[u8; 4]>, size: f32) -> FontMetri
 fn glyph_path(layout: &parley::Layout<[u8; 4]>) -> Option<Path> {
     let mut builder = PathBuilder::new();
     let mut placed_any = false;
-    let root_ascent = layout.root_span_metrics().map_or(0.0, |metrics| metrics.ascent);
+    let root_ascent = layout
+        .root_span_metrics()
+        .map_or(0.0, |metrics| metrics.ascent);
     for line in layout.lines() {
         // Parley places glyphs on the CSS line box; canvas text baselines are
         // defined by the font's em metrics, so drop the half-leading.

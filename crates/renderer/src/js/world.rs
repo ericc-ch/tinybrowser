@@ -253,9 +253,7 @@ impl RealmRegistry {
     }
 
     pub(crate) fn canvas_has_open_layer(&self, id: NodeId) -> bool {
-        self.canvases
-            .get(&id)
-            .is_some_and(Canvas2D::has_open_layer)
+        self.canvases.get(&id).is_some_and(Canvas2D::has_open_layer)
     }
 
     /// A straight-RGBA copy of a canvas bitmap, for `drawImage` and patterns.
