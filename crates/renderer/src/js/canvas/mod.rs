@@ -2688,7 +2688,7 @@ fn draw_text_with(
         "hanging" => shaped.hanging_baseline - shaped.ascent,
         "middle" => -(shaped.ascent + shaped.descent) / 2.0,
         "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        "ideographic" => shaped.ideographic_baseline - shaped.ascent,
         _ => -shaped.ascent,
     };
     let (x, y) = (f32_of(x) + dx, f32_of(y) + dy);
@@ -2821,7 +2821,7 @@ fn get_text_clusters<'js>(
         "hanging" => shaped.hanging_baseline - shaped.ascent,
         "middle" => -(shaped.ascent + shaped.descent) / 2.0,
         "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        "ideographic" => shaped.ideographic_baseline - shaped.ascent,
         _ => -shaped.ascent,
     };
     // Cluster coordinates are measured downward/rightward from the text
@@ -2918,7 +2918,7 @@ fn get_actual_bounding_box<'js>(
         "hanging" => shaped.hanging_baseline - shaped.ascent,
         "middle" => -(shaped.ascent + shaped.descent) / 2.0,
         "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        "ideographic" => shaped.ideographic_baseline - shaped.ascent,
         _ => -shaped.ascent,
     };
     let shift = -shaped.ascent - dy;
@@ -3027,7 +3027,7 @@ fn get_selection_rects<'js>(
         "hanging" => shaped.hanging_baseline - shaped.ascent,
         "middle" => -(shaped.ascent + shaped.descent) / 2.0,
         "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        "ideographic" => shaped.ideographic_baseline - shaped.ascent,
         _ => -shaped.ascent,
     };
     let mut selected: Vec<(f32, f32)> = shaped
@@ -3178,7 +3178,7 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
         "hanging" => shaped.hanging_baseline - shaped.ascent,
         "middle" => -(shaped.ascent + shaped.descent) / 2.0,
         "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
+        "ideographic" => shaped.ideographic_baseline - shaped.ascent,
         _ => -shaped.ascent,
     };
     let shift = -shaped.ascent - dy;
@@ -3587,10 +3587,26 @@ fn resolved_language(ctx: &Ctx<'_>, object: &Object<'_>, lang: &str) -> Option<S
     if lang != "inherit" && !lang.is_empty() {
         return Some(lang.to_owned());
     }
-    canvas_id(object)
-        .ok()
-        .and_then(|id| attribute_value(ctx, id, "lang").ok())
-        .filter(|lang| !lang.trim().is_empty())
+    let id = canvas_id(object).ok()?;
+    let owner = crate::js::bindings::world_for_node(ctx, id).ok()?;
+    let owner = owner.borrow();
+    let parsed = owner.document(id)?;
+    // `lang` inherits from the nearest ancestor that declares it, and an empty
+    // declaration stops the search
+    // (<https://html.spec.whatwg.org/multipage/dom.html#attr-lang>). An
+    // OffscreenCanvas has no element of its own, so it reads the document root,
+    // which is where `documentElement.lang` lives.
+    for ancestor in crate::dom::tree::ancestor_chain(&parsed.document.base, id.document, id.node) {
+        if let Some(value) = crate::dom::tree::attr(&parsed.document.base, ancestor.node, "lang") {
+            return (!value.trim().is_empty()).then(|| value.to_owned());
+        }
+    }
+    // A detached canvas (the OffscreenCanvas backing element) has no ancestor
+    // chain into the document, so read the document root explicitly.
+    let root = parsed.document.base.root_element().id;
+    crate::dom::tree::attr(&parsed.document.base, root, "lang")
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Resolves `start`/`end` using the context direction, then the canvas

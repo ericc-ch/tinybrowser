@@ -138,7 +138,8 @@ pub(crate) fn shape(
     // One FontFeatures range: a second push would overwrite the first.
     let mut features = Vec::new();
     if parsed.small_caps {
-        features.push("smcp");
+        // `parse_css_list` requires quoted tags: `"smcp" on`.
+        features.push("\"smcp\" 1");
     }
     if kerning == "none" {
         features.push("\"kern\" 0");
