@@ -294,7 +294,6 @@ fn install_methods<'js>(ctx: &Ctx<'js>, prototype: &Object<'js>) -> Result<()> {
     method!("strokeText", 3, stroke_text);
     method!("measureText", 1, measure_text);
     method!("drawFocusIfNeeded", 1, noop);
-    method!("scrollPathIntoView", 0, noop);
 
     Ok(())
 }
@@ -2553,6 +2552,12 @@ fn source_element(
             // mark broken has no usable pixels yet.
             None => ImageLookup::NotReady,
         });
+    }
+    if data.name.ns == crate::dom::tree::html_namespace() && data.name.local.as_str() == "video" {
+        // Video decoding is not implemented, so a video element never has a
+        // frame to draw. It is a valid source type, not an unsupported one
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#canvasimagesource>).
+        return Some(ImageLookup::NotReady);
     }
     if !(data.name.ns == crate::dom::tree::html_namespace() && data.name.local.as_str() == "img") {
         return Some(ImageLookup::Unsupported);
