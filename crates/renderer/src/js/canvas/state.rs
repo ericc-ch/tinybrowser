@@ -461,9 +461,13 @@ impl Canvas2D {
     /// `scale_x` is the `maxWidth` squeeze
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-filltext>).
     pub(crate) fn fill_text_path(&mut self, path: &Path, x: f32, y: f32, scale_x: f32) {
-        let transform = Transform::from_scale(scale_x, 1.0)
+        // Canvas space: CTM first, then the text anchor, then the maxWidth
+        // squeeze. `pre_concat` is `self * other`, so build in that order.
+        let transform = self
+            .state
+            .transform
             .pre_concat(Transform::from_translate(x, y))
-            .pre_concat(self.state.transform);
+            .pre_concat(Transform::from_scale(scale_x, 1.0));
         let Some(path) = path.clone().transform(transform) else {
             return;
         };
@@ -471,9 +475,11 @@ impl Canvas2D {
     }
 
     pub(crate) fn stroke_text_path(&mut self, path: &Path, x: f32, y: f32, scale_x: f32) {
-        let transform = Transform::from_scale(scale_x, 1.0)
+        let transform = self
+            .state
+            .transform
             .pre_concat(Transform::from_translate(x, y))
-            .pre_concat(self.state.transform);
+            .pre_concat(Transform::from_scale(scale_x, 1.0));
         let Some(path) = path.clone().transform(transform) else {
             return;
         };

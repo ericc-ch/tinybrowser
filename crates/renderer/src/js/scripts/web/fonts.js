@@ -19,9 +19,13 @@ __tbFontFaceSet.ready = Promise.resolve(__tbFontFaceSet);
 
 if (globalThis.document !== undefined) {
   const prototype = Object.getPrototypeOf(document);
-  Object.defineProperty(prototype, 'fonts', {
-    configurable: true,
-    enumerable: true,
-    get() { return __tbFontFaceSet; },
-  });
+  // A realm can exist before its document is installed; timers.js then uses
+  // a plain {} placeholder. Never define `fonts` on Object.prototype.
+  if (prototype !== Object.prototype) {
+    Object.defineProperty(prototype, 'fonts', {
+      configurable: true,
+      enumerable: false,
+      get() { return __tbFontFaceSet; },
+    });
+  }
 }

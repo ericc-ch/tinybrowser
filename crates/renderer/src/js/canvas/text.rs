@@ -34,9 +34,22 @@ pub(crate) fn shape(
     max_width: Option<f32>,
     font_ctx: &mut FontContext,
 ) -> ShapedText {
+    // Canvas text preparation replaces ASCII whitespace with U+0020 and
+    // shapes one line; newlines are not mandatory breaks
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm>).
+    let text: String = text
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\r' | '\t' | '\x0c') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
     let parsed = parse_font(font);
     let mut layout_ctx = LayoutContext::<[u8; 4]>::new();
-    let mut builder = layout_ctx.ranged_builder(font_ctx, text, 1.0, true);
+    let mut builder = layout_ctx.ranged_builder(font_ctx, &text, 1.0, true);
     builder.push_default(StyleProperty::FontSize(parsed.size));
     if let Some(family) = parsed.family {
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family.into())));
@@ -47,17 +60,18 @@ pub(crate) fn shape(
     if parsed.italic {
         builder.push_default(StyleProperty::FontStyle(FontStyle::Italic));
     }
-    let mut layout = builder.build(text);
+    let mut layout = builder.build(&text);
     layout.break_all_lines(None);
     let metrics = layout.root_span_metrics();
     let (ascent, descent) = metrics.map_or((parsed.size, parsed.size * 0.25), |metrics| {
         (metrics.ascent, metrics.descent)
     });
-    let width = layout.width();
+    // `width()` excludes trailing whitespace; canvas measures it.
+    let width = layout.full_width();
     let scale_x = max_width
         .filter(|max| *max > 0.0 && width > *max)
         .map_or(1.0, |max| max / width);
-    let path = glyph_path(&layout, scale_x);
+    let path = glyph_path(&layout);
     ShapedText {
         path,
         width,
@@ -67,7 +81,7 @@ pub(crate) fn shape(
     }
 }
 
-fn glyph_path(layout: &parley::Layout<[u8; 4]>, scale_x: f32) -> Option<Path> {
+fn glyph_path(layout: &parley::Layout<[u8; 4]>) -> Option<Path> {
     let mut builder = PathBuilder::new();
     let mut placed_any = false;
     for line in layout.lines() {
@@ -81,7 +95,6 @@ fn glyph_path(layout: &parley::Layout<[u8; 4]>, scale_x: f32) -> Option<Path> {
                 continue;
             };
             let outlines = font_ref.outline_glyphs();
-            let run_scale = Transform::from_scale(scale_x, 1.0);
             for glyph in run.positioned_glyphs() {
                 let Some(outline) = outlines.get(GlyphId::new(glyph.id)) else {
                     continue;
@@ -97,7 +110,7 @@ fn glyph_path(layout: &parley::Layout<[u8; 4]>, scale_x: f32) -> Option<Path> {
                 let Some(path) = pen.finish() else {
                     continue;
                 };
-                let placement = Transform::from_translate(glyph.x, glyph.y).pre_concat(run_scale);
+                let placement = Transform::from_translate(glyph.x, glyph.y);
                 let Some(path) = path.transform(placement) else {
                     continue;
                 };
