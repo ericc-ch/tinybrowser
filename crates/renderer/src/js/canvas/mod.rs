@@ -1132,7 +1132,10 @@ fn image_data_construct<'js>(
             "ImageData dimensions must be nonzero",
         ));
     }
-    if height == 0 || u64::from(width) * u64::from(height) * 4 != byte_length as u64 {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|bytes| bytes.checked_mul(4));
+    if height == 0 || expected != Some(byte_length as u64) {
         let name = if explicit_dimensions {
             "IndexSizeError"
         } else {
