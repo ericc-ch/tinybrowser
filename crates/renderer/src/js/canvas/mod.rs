@@ -640,11 +640,30 @@ fn round_rect<'js>(
     height: Coerced<f64>,
     radii: Opt<Value<'js>>,
 ) -> Result<()> {
+    // Step 1 returns before the radii list is validated, so a non-finite
+    // rectangle never throws for its corners
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-roundrect>).
+    if [*x, *y, *width, *height]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Ok(());
+    }
     let radii = radii
         .0
         .map(|value| round_rect_radii(&value))
-        .transpose()?
-        .unwrap_or_default();
+        .transpose()?;
+    if radii
+        .as_ref()
+        .is_some_and(|radii| !(1..=4).contains(&radii.len()))
+    {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "RangeError",
+            "radii must contain one to four entries",
+        ));
+    }
+    let radii = radii.unwrap_or_default();
     if radii.iter().any(|radius| *radius < 0.0) {
         return Err(crate::js::bindings::throw_dom(
             this.0.ctx(),
@@ -679,8 +698,20 @@ fn round_rect_radii(value: &Value<'_>) -> Result<Vec<f32>> {
 
 // ---- painting ------------------------------------------------------------
 
+/// Converts the `CanvasFillRule` enum. `WebIDL` rejects every value other than
+/// the two enum strings with `TypeError`, so an unknown string cannot silently
+/// fall back to nonzero
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fill>).
+fn fill_rule(ctx: &Ctx<'_>, rule: Option<&DomString>) -> Result<bool> {
+    match rule.map(|rule| &**rule) {
+        None | Some("nonzero") => Ok(false),
+        Some("evenodd") => Ok(true),
+        Some(_) => Err(Exception::throw_type(ctx, "invalid fill rule")),
+    }
+}
+
 fn fill(this: This<Object<'_>>, rule: Opt<DomString>) -> Result<()> {
-    let even_odd = rule.0.as_ref().is_some_and(|rule| &**rule == "evenodd");
+    let even_odd = fill_rule(this.0.ctx(), rule.0.as_ref())?;
     with_canvas(this.0.ctx(), &this.0, |canvas| canvas.fill(even_odd))
 }
 
@@ -689,7 +720,7 @@ fn stroke(this: This<Object<'_>>) -> Result<()> {
 }
 
 fn clip(this: This<Object<'_>>, rule: Opt<DomString>) -> Result<()> {
-    let even_odd = rule.0.as_ref().is_some_and(|rule| &**rule == "evenodd");
+    let even_odd = fill_rule(this.0.ctx(), rule.0.as_ref())?;
     with_canvas(this.0.ctx(), &this.0, |canvas| canvas.clip(even_odd))
 }
 
@@ -699,7 +730,7 @@ fn is_point_in_path(
     y: Coerced<f64>,
     rule: Opt<DomString>,
 ) -> Result<bool> {
-    let even_odd = rule.0.as_ref().is_some_and(|rule| &**rule == "evenodd");
+    let even_odd = fill_rule(this.0.ctx(), rule.0.as_ref())?;
     with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.is_point_in_path(f32_of(*x), f32_of(*y), even_odd)
     })

@@ -58,7 +58,7 @@ struct State {
     smoothing: bool,
     smoothing_quality: String,
     filter: String,
-    clip: Option<Mask>,
+    clip: Option<Arc<Mask>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -878,6 +878,7 @@ impl Canvas2D {
         if width == 0.0 || height == 0.0 {
             // A flat rect has no corners; keep the subpath.
             self.rect(x, y, width, height);
+            self.start_round_rect_tail(x, y);
             return;
         }
         let (tl, tr, br, bl) = round_rect_radii(radii, width, height);
@@ -922,7 +923,19 @@ impl Canvas2D {
             self.current = Some(b);
         }
         self.path.push(Segment::Close);
-        self.current = Some(self.subpath_start);
+        self.start_round_rect_tail(x, y);
+    }
+
+    /// Step 14 of `roundRect`: a new subpath containing only `(x, y)`, so a
+    /// following segment starts at the rectangle origin rather than at the
+    /// first corner tangent
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-roundrect>).
+    fn start_round_rect_tail(&mut self, x: f32, y: f32) {
+        let mut origin = Point::from_xy(x, y);
+        self.state.transform.map_point(&mut origin);
+        self.path.push(Segment::MoveTo(origin));
+        self.subpath_start = origin;
+        self.current = Some(origin);
     }
 
     fn build_path(&self) -> Option<Path> {
@@ -944,6 +957,12 @@ impl Canvas2D {
     }
 
     pub(crate) fn is_point_in_path(&self, x: f32, y: f32, even_odd: bool) -> bool {
+        // The query point is in the canvas coordinate space, unaffected by the
+        // current transform; path points are already stored there
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ispointinpath>).
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
         let Some(path) = self.build_path() else {
             return false;
         };
@@ -952,14 +971,13 @@ impl Canvas2D {
         } else {
             FillRule::Winding
         };
-        self.mask_contains(
-            &path,
-            rule,
-            point_in_canvas_space(x, y, self.state.transform),
-        )
+        self.mask_contains(&path, rule, Point::from_xy(x, y))
     }
 
     pub(crate) fn is_point_in_stroke(&self, x: f32, y: f32) -> bool {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
         let Some(path) = self.build_path() else {
             return false;
         };
@@ -967,11 +985,7 @@ impl Canvas2D {
         let Some(outline) = path.stroke(&stroke, 1.0) else {
             return false;
         };
-        self.mask_contains(
-            &outline,
-            FillRule::Winding,
-            point_in_canvas_space(x, y, self.state.transform),
-        )
+        self.mask_contains(&outline, FillRule::Winding, Point::from_xy(x, y))
     }
 
     /// A full-canvas coverage mask, or `None` when the canvas exceeds the
@@ -1031,17 +1045,18 @@ impl Canvas2D {
             FillRule::Winding
         };
         let Some(path) = self.build_path() else {
-            self.state.clip = self.canvas_mask();
+            self.state.clip = self.canvas_mask().map(Arc::new);
             return;
         };
         if let Some(mask) = &mut self.state.clip {
-            mask.intersect_path(&path, rule, true, Transform::identity());
+            // Saving the state must not copy a multi-megabyte coverage mask.
+            Arc::make_mut(mask).intersect_path(&path, rule, true, Transform::identity());
         } else {
             let Some(mut mask) = self.canvas_mask() else {
                 return;
             };
             mask.fill_path(&path, rule, true, Transform::identity());
-            self.state.clip = Some(mask);
+            self.state.clip = Some(Arc::new(mask));
         }
     }
 
@@ -1093,7 +1108,7 @@ impl Canvas2D {
             &paint,
             FillRule::Winding,
             Transform::identity(),
-            self.state.clip.as_ref(),
+            self.state.clip.as_deref(),
         );
     }
 
@@ -1171,7 +1186,7 @@ impl Canvas2D {
             &paint,
             rule,
             Transform::identity(),
-            self.state.clip.as_ref(),
+            self.state.clip.as_deref(),
         );
     }
 
@@ -1224,7 +1239,7 @@ impl Canvas2D {
             &paint,
             &stroke,
             Transform::identity(),
-            self.state.clip.as_ref(),
+            self.state.clip.as_deref(),
         );
     }
 
@@ -1552,7 +1567,7 @@ impl Canvas2D {
             &paint,
             FillRule::Winding,
             Transform::identity(),
-            self.state.clip.as_ref(),
+            self.state.clip.as_deref(),
         );
     }
 
@@ -1648,12 +1663,6 @@ fn same_float(left: f32, right: f32) -> bool {
     left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal)
 }
 
-fn point_in_canvas_space(x: f32, y: f32, transform: Transform) -> Point {
-    let mut point = Point::from_xy(x, y);
-    transform.map_point(&mut point);
-    point
-}
-
 fn ellipse_point(cx: f32, cy: f32, rx: f32, ry: f32, rotation: f32, angle: f32) -> Point {
     let (sin, cos) = rotation.sin_cos();
     let x = rx * angle.cos();
@@ -1690,8 +1699,8 @@ fn corner(
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-roundrect>).
 fn round_rect_radii(radii: &[f32], width: f32, height: f32) -> (f32, f32, f32, f32) {
     let values: Vec<f32> = match radii {
-        [] => vec![0.0],
-        [one] => vec![*one],
+        [] => vec![0.0; 4],
+        [one] => vec![*one; 4],
         [first, second] => vec![*first, *second, *first, *second],
         [first, second, third] => vec![*first, *second, *third, *second],
         [first, second, third, fourth, ..] => vec![*first, *second, *third, *fourth],
@@ -1841,5 +1850,30 @@ mod tests {
         let pixels = canvas.read_pixels(0, 0, 4, 4).unwrap();
         assert_eq!(&pixels[0..4], &[0, 255, 0, 255]);
         assert_eq!(&pixels[8..12], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn is_point_in_path_ignores_the_current_transform() {
+        let mut canvas = Canvas2D::new(100, 50);
+        canvas.translate(50.0, 0.0);
+        canvas.rect(0.0, 0.0, 20.0, 20.0);
+        assert!(canvas.is_point_in_path(51.0, 10.0, false));
+        assert!(!canvas.is_point_in_path(10.0, 10.0, false));
+        assert!(!canvas.is_point_in_path(f32::NAN, 10.0, false));
+    }
+
+    #[test]
+    fn round_rect_leaves_a_subpath_at_its_origin() {
+        let mut canvas = Canvas2D::new(100, 50);
+        canvas.round_rect(5.0, 6.0, 20.0, 10.0, &[2.0]);
+        let Some(Segment::MoveTo(origin)) = canvas.path.last() else {
+            panic!("roundRect must leave a trailing move");
+        };
+        assert_eq!((origin.x, origin.y), (5.0, 6.0));
+
+        // Omitted radii use the one-value default; they must not index past
+        // the normalized list.
+        let mut default_radii = Canvas2D::new(100, 50);
+        default_radii.round_rect(1.0, 2.0, 20.0, 10.0, &[]);
     }
 }
