@@ -152,8 +152,15 @@ impl<'js> html_video_element_generated::HTMLVideoElement<'js> for JsNode {
 /// Resets the context after a dimension setter, even when the value is
 /// unchanged.
 fn reset_canvas(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    // Read the new attributes, not the bitmap's previous dimensions.
+    let width = crate::js::canvas::canvas_dimension(ctx, id, "width", 300);
+    let height = crate::js::canvas::canvas_dimension(ctx, id, "height", 150);
     let world = world_for_node(ctx, id)?;
-    world.borrow().registry().borrow_mut().reset_canvas(id);
+    world
+        .borrow()
+        .registry()
+        .borrow_mut()
+        .reset_canvas(id, width, height);
     Ok(())
 }
 

@@ -198,7 +198,7 @@ macro_rules! string_prop {
     };
 }
 fn install_accessors(prototype: &Object<'_>) -> Result<()> {
-    prototype.prop("canvas", Accessor::new(canvas_object, canvas_read_only))?;
+    prototype.prop("canvas", Accessor::from(canvas_object))?;
     install_paint_accessors(prototype)?;
     install_text_accessors(prototype)?;
     prototype.prop(
@@ -2409,14 +2409,6 @@ fn set_style_value<'js>(
 fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {
     let id = canvas_id(&this.0)?;
     wrap_node(this.0.ctx(), id)
-}
-
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "accessor setters use the fallible host signature"
-)]
-fn canvas_read_only(_this: This<Object<'_>>, _value: Value<'_>) -> Result<()> {
-    Ok(())
 }
 
 /// Parses a canvas color. `currentColor` resolves against the canvas

@@ -616,7 +616,9 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_font_kerning(&mut self, value: &str) {
-        value.clone_into(&mut self.state.font_kerning);
+        if matches!(value, "auto" | "normal" | "none") {
+            value.clone_into(&mut self.state.font_kerning);
+        }
     }
 
     pub(crate) fn font_stretch(&self) -> &str {
@@ -624,7 +626,20 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_font_stretch(&mut self, value: &str) {
-        value.clone_into(&mut self.state.font_stretch);
+        if matches!(
+            value,
+            "ultra-condensed"
+                | "extra-condensed"
+                | "condensed"
+                | "semi-condensed"
+                | "normal"
+                | "semi-expanded"
+                | "expanded"
+                | "extra-expanded"
+                | "ultra-expanded"
+        ) {
+            value.clone_into(&mut self.state.font_stretch);
+        }
     }
 
     pub(crate) fn text_rendering(&self) -> &str {
@@ -632,7 +647,12 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_text_rendering(&mut self, value: &str) {
-        value.clone_into(&mut self.state.text_rendering);
+        if matches!(
+            value,
+            "auto" | "optimizespeed" | "optimizelegibility" | "geometricprecision"
+        ) {
+            value.clone_into(&mut self.state.text_rendering);
+        }
     }
 
     pub(crate) fn font_variant_caps(&self) -> &str {
@@ -640,7 +660,18 @@ impl Canvas2D {
     }
 
     pub(crate) fn set_font_variant_caps(&mut self, value: &str) {
-        value.clone_into(&mut self.state.font_variant_caps);
+        if matches!(
+            value,
+            "normal"
+                | "small-caps"
+                | "all-small-caps"
+                | "petite-caps"
+                | "all-petite-caps"
+                | "unicase"
+                | "titling-caps"
+        ) {
+            value.clone_into(&mut self.state.font_variant_caps);
+        }
     }
 
     pub(crate) fn image_smoothing_enabled(&self) -> bool {
