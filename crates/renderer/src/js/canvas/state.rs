@@ -1540,6 +1540,11 @@ impl Canvas2D {
                 let (Ok(sx), Ok(sy)) = (u32::try_from(sx), u32::try_from(sy)) else {
                     continue;
                 };
+                // `Pixmap::pixel` only checks the linear index, so an x past
+                // the row would read the next row.
+                if sx >= pixmap.width() || sy >= pixmap.height() {
+                    continue;
+                }
                 let Some(pixel) = pixmap.pixel(sx, sy) else {
                     continue;
                 };
@@ -1557,6 +1562,10 @@ impl Canvas2D {
     /// `putImageData`: straight RGBA source, no transform, alpha, or
     /// compositing
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-putimagedata>).
+    #[expect(
+        clippy::similar_names,
+        reason = "source and target corners are named for their axis"
+    )]
     pub(crate) fn write_pixels(
         &mut self,
         source: &[u8],
@@ -1564,36 +1573,74 @@ impl Canvas2D {
         source_height: u32,
         dx: i32,
         dy: i32,
-        dirty: Option<(u32, u32, u32, u32)>,
+        dirty: Option<(i32, i32, i32, i32)>,
     ) {
         let Some(pixmap) = &mut self.pixmap else {
             return;
         };
-        let (dirty_x, dirty_y, dirty_width, dirty_height) =
-            dirty.unwrap_or((0, 0, source_width, source_height));
-        let dirty_width = dirty_width.min(source_width.saturating_sub(dirty_x));
-        let dirty_height = dirty_height.min(source_height.saturating_sub(dirty_y));
-        for row in 0..dirty_height {
-            for column in 0..dirty_width {
-                let sx = dirty_x + column;
-                let sy = dirty_y + row;
-                let src = ((sy as usize * source_width as usize) + sx as usize) * 4;
-                let Some(pixel) = source.get(src..src + 4) else {
+        let (mut dirty_x, mut dirty_y, mut dirty_width, mut dirty_height) = dirty.unwrap_or((
+            0,
+            0,
+            i32::try_from(source_width).unwrap_or(i32::MAX),
+            i32::try_from(source_height).unwrap_or(i32::MAX),
+        ));
+        // Blink normalizes a negative dirty rectangle against its origin
+        // (`BaseRenderingContext2D::putImageData`).
+        if dirty_width < 0 {
+            if dirty_x < 0 {
+                dirty_x = 0;
+                dirty_width = 0;
+            } else {
+                dirty_x += dirty_width;
+                dirty_width = -dirty_width;
+            }
+        }
+        if dirty_height < 0 {
+            if dirty_y < 0 {
+                dirty_y = 0;
+                dirty_height = 0;
+            } else {
+                dirty_y += dirty_height;
+                dirty_height = -dirty_height;
+            }
+        }
+        let mut source_x0 = i64::from(dirty_x).max(0);
+        let mut source_y0 = i64::from(dirty_y).max(0);
+        let mut source_x1 =
+            (i64::from(dirty_x) + i64::from(dirty_width)).min(i64::from(source_width));
+        let mut source_y1 =
+            (i64::from(dirty_y) + i64::from(dirty_height)).min(i64::from(source_height));
+        if source_x1 <= source_x0 || source_y1 <= source_y0 {
+            return;
+        }
+        // Destination = source + (dx, dy), clipped to the bitmap; clipping
+        // trims the source range by the same amount
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-putimagedata>).
+        let target_x0 = source_x0 + i64::from(dx);
+        let target_y0 = source_y0 + i64::from(dy);
+        let target_x1 = source_x1 + i64::from(dx);
+        let target_y1 = source_y1 + i64::from(dy);
+        let clip_x0 = target_x0.max(0);
+        let clip_y0 = target_y0.max(0);
+        let clip_x1 = target_x1.min(i64::from(pixmap.width()));
+        let clip_y1 = target_y1.min(i64::from(pixmap.height()));
+        if clip_x1 <= clip_x0 || clip_y1 <= clip_y0 {
+            return;
+        }
+        source_x0 += clip_x0 - target_x0;
+        source_y0 += clip_y0 - target_y0;
+        source_x1 += clip_x1 - target_x1;
+        source_y1 += clip_y1 - target_y1;
+        for sy in source_y0..source_y1 {
+            for sx in source_x0..source_x1 {
+                let source_row = usize::try_from(sy).unwrap_or(0);
+                let source_column = usize::try_from(sx).unwrap_or(0);
+                let source_offset = (source_row * source_width as usize + source_column) * 4;
+                let Some(pixel) = source.get(source_offset..source_offset + 4) else {
                     continue;
                 };
-                let target_x = i64::from(dx) + i64::from(column);
-                let target_y = i64::from(dy) + i64::from(row);
-                if target_x < 0 || target_y < 0 {
-                    continue;
-                }
-                let (Ok(target_x), Ok(target_y)) =
-                    (u32::try_from(target_x), u32::try_from(target_y))
-                else {
-                    continue;
-                };
-                if target_x >= pixmap.width() || target_y >= pixmap.height() {
-                    continue;
-                }
+                let target_x = u32::try_from(sx + i64::from(dx)).unwrap_or(u32::MAX);
+                let target_y = u32::try_from(sy + i64::from(dy)).unwrap_or(u32::MAX);
                 let color =
                     ColorU8::from_rgba(pixel[0], pixel[1], pixel[2], pixel[3]).premultiply();
                 let index = (target_y as usize * pixmap.width() as usize + target_x as usize) * 4;

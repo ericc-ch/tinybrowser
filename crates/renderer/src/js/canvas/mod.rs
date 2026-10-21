@@ -374,6 +374,23 @@ fn f32_of(value: f64) -> f32 {
     value
 }
 
+/// `WebIDL` `[EnforceRange] long`: reject non-finite values and values outside
+/// the long range with `TypeError`, then truncate.
+fn enforce_long(ctx: &Ctx<'_>, value: f64) -> Result<i32> {
+    if !value.is_finite() {
+        return Err(Exception::throw_type(ctx, "value must be finite"));
+    }
+    let value = value.trunc();
+    if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
+        return Err(Exception::throw_type(ctx, "value is outside the long range"));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the value is finite, integral, and inside the i32 range"
+    )]
+    Ok(value as i32)
+}
+
 fn i32_of(value: f64) -> i32 {
     if !value.is_finite() {
         return 0;
@@ -1006,11 +1023,237 @@ fn resource_id(object: &Object<'_>, kind: &str) -> Option<u32> {
 // ---- image data ----------------------------------------------------------
 
 fn install_image_data(ctx: &Ctx<'_>) -> Result<()> {
-    let ctor = Function::new(ctx.clone(), || {})?;
     let prototype = Object::new(ctx.clone())?;
-    ctor.set("prototype", prototype)?;
+    prototype.prop(
+        "width",
+        Accessor::new(image_data_width, image_data_read_only),
+    )?;
+    prototype.prop(
+        "height",
+        Accessor::new(image_data_height, image_data_read_only),
+    )?;
+    prototype.prop("data", Accessor::new(image_data_data, image_data_read_only))?;
+    prototype.prop(
+        "colorSpace",
+        Accessor::new(image_data_color_space, image_data_read_only),
+    )?;
+    prototype.prop(
+        "pixelFormat",
+        Accessor::new(image_data_pixel_format, image_data_read_only),
+    )?;
+    let ctor =
+        rquickjs::function::Constructor::new_prototype(ctx, prototype, image_data_construct)?;
     ctx.globals().set("ImageData", ctor)?;
     Ok(())
+}
+
+fn image_data_width(this: This<Object<'_>>) -> Result<u32> {
+    this.0.get("__tbWidth")
+}
+
+fn image_data_height(this: This<Object<'_>>) -> Result<u32> {
+    this.0.get("__tbHeight")
+}
+
+fn image_data_data(this: This<Object<'_>>) -> Result<Value<'_>> {
+    this.0.get("__tbData")
+}
+
+fn image_data_color_space(this: This<Object<'_>>) -> Result<rquickjs::String<'_>> {
+    this.0.get("__tbColorSpace")
+}
+
+fn image_data_pixel_format(this: This<Object<'_>>) -> Result<rquickjs::String<'_>> {
+    this.0.get("__tbPixelFormat")
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "accessor setters use the fallible host signature"
+)]
+fn image_data_read_only(_this: This<Object<'_>>, _value: Value<'_>) -> Result<()> {
+    Ok(())
+}
+
+/// `ImageData` constructor, both overloads
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-imagedata-imagedata>).
+fn image_data_construct<'js>(
+    ctx: Ctx<'js>,
+    args: rquickjs::function::Rest<Value<'js>>,
+) -> Result<Object<'js>> {
+    let object = Object::new(ctx.clone())?;
+    let ctx = &ctx;
+    let Some(first) = args.0.first() else {
+        return Err(Exception::throw_type(ctx, "ImageData needs arguments"));
+    };
+    let Some(data) = first
+        .as_object()
+        .and_then(|object| object.as_typed_array::<rquickjs::U8Clamped>())
+    else {
+        if first.as_object().is_some() {
+            return Err(Exception::throw_type(
+                ctx,
+                "ImageData data must be a Uint8ClampedArray",
+            ));
+        }
+        let width = *Coerced::<f64>::from_js(ctx, first.clone())?;
+        let height = args
+            .0
+            .get(1)
+            .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
+            .transpose()?
+            .ok_or_else(|| Exception::throw_type(ctx, "ImageData needs a height"))?;
+        new_blank_image_data(ctx, &object, width, height, args.0.get(2))?;
+        return Ok(object);
+    };
+    let byte_length = data.len();
+    let width = args
+        .0
+        .get(1)
+        .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
+        .transpose()?;
+    let height = args
+        .0
+        .get(2)
+        .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
+        .transpose()?;
+    let explicit_dimensions = width.is_some() && height.is_some();
+    let (width, height) = match (width, height) {
+        (None, _) => (u32::try_from(byte_length / 4).unwrap_or(u32::MAX), 1),
+        (Some(width), None) => {
+            let width = canvas_u32(width);
+            if width == 0 {
+                return Err(crate::js::bindings::throw_dom(
+                    ctx,
+                    "IndexSizeError",
+                    "ImageData width must be nonzero",
+                ));
+            }
+            let height = byte_length / 4 / width as usize;
+            (width, u32::try_from(height).unwrap_or(u32::MAX))
+        }
+        (Some(width), Some(height)) => {
+            if !width.is_finite() || !height.is_finite() {
+                return Err(Exception::throw_type(
+                    ctx,
+                    "ImageData dimensions must be finite",
+                ));
+            }
+            (canvas_u32(width), canvas_u32(height))
+        }
+    };
+    if width == 0 || (explicit_dimensions && height == 0) {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "IndexSizeError",
+            "ImageData dimensions must be nonzero",
+        ));
+    }
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|bytes| bytes.checked_mul(4));
+    if height == 0 || expected != Some(byte_length as u64) {
+        let name = if explicit_dimensions {
+            "IndexSizeError"
+        } else {
+            "InvalidStateError"
+        };
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            name,
+            "ImageData data length does not match its dimensions",
+        ));
+    }
+    let settings = args.0.get(if args.0.len() > 3 { 3 } else { 2 });
+    let (color_space, pixel_format) = image_data_settings(settings);
+    set_image_data(
+        ctx,
+        &object,
+        width,
+        height,
+        first.clone(),
+        color_space,
+        pixel_format,
+    )?;
+    Ok(object)
+}
+
+fn new_blank_image_data<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    width: f64,
+    height: f64,
+    settings: Option<&Value<'js>>,
+) -> Result<()> {
+    if !width.is_finite() || !height.is_finite() {
+        return Err(Exception::throw_type(
+            ctx,
+            "ImageData dimensions must be finite",
+        ));
+    }
+    let width = canvas_u32(width);
+    let height = canvas_u32(height);
+    if width == 0 || height == 0 {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "IndexSizeError",
+            "ImageData dimensions must be nonzero",
+        ));
+    }
+    let Some(bytes) = crate::js::world::canvas_bytes(width, height) else {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "IndexSizeError",
+            "ImageData area is too large",
+        ));
+    };
+    let data = data_array(ctx, vec![0; bytes])?.into_value();
+    let (color_space, pixel_format) = image_data_settings(settings);
+    set_image_data(ctx, object, width, height, data, color_space, pixel_format)
+}
+
+fn image_data_settings(settings: Option<&Value<'_>>) -> (String, String) {
+    let read = |name: &str, default: &str| {
+        settings
+            .and_then(|value| value.as_object())
+            .and_then(|object| object.get::<_, DomString>(name).ok())
+            .map_or_else(|| default.to_owned(), |value| value.to_string())
+    };
+    (
+        read("colorSpace", "srgb"),
+        read("pixelFormat", "rgba-unorm8"),
+    )
+}
+
+fn set_image_data<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    width: u32,
+    height: u32,
+    data: Value<'js>,
+    color_space: String,
+    pixel_format: String,
+) -> Result<()> {
+    object.set("__tbWidth", width)?;
+    object.set("__tbHeight", height)?;
+    object.set("__tbData", data)?;
+    object.set(
+        "__tbColorSpace",
+        rquickjs::String::from_str(ctx.clone(), &color_space)?,
+    )?;
+    object.set(
+        "__tbPixelFormat",
+        rquickjs::String::from_str(ctx.clone(), &pixel_format)?,
+    )?;
+    Ok(())
+}
+
+fn data_array<'js>(ctx: &Ctx<'js>, bytes: Vec<u8>) -> Result<TypedArray<'js, rquickjs::U8Clamped>> {
+    let bytes = bytes
+        .into_iter()
+        .map(rquickjs::U8Clamped)
+        .collect::<Vec<_>>();
+    TypedArray::new(ctx.clone(), bytes)
 }
 
 fn get_image_data(
@@ -1020,13 +1263,14 @@ fn get_image_data(
     sw: Coerced<f64>,
     sh: Coerced<f64>,
 ) -> Result<Value<'_>> {
-    if [*sx, *sy, *sw, *sh].iter().any(|value| !value.is_finite()) {
-        return Err(Exception::throw_type(
-            this.0.ctx(),
-            "getImageData arguments must be finite",
-        ));
-    }
-    if *sw == 0.0 || *sh == 0.0 {
+    // The IDL marks every argument `[EnforceRange] long`.
+    let (mut sx, mut sy, mut sw, mut sh) = (
+        f64::from(enforce_long(this.0.ctx(), *sx)?),
+        f64::from(enforce_long(this.0.ctx(), *sy)?),
+        f64::from(enforce_long(this.0.ctx(), *sw)?),
+        f64::from(enforce_long(this.0.ctx(), *sh)?),
+    );
+    if sw == 0.0 || sh == 0.0 {
         return Err(crate::js::bindings::throw_dom(
             this.0.ctx(),
             "IndexSizeError",
@@ -1035,7 +1279,6 @@ fn get_image_data(
     }
     // Negative extents move the origin and normalize, like Blink
     // (`base_rendering_context_2d.cc`, getImageDataInternal).
-    let (mut sx, mut sy, mut sw, mut sh) = (*sx, *sy, *sw, *sh);
     if sw < 0.0 {
         sx += sw;
         sw = -sw;
@@ -1046,6 +1289,13 @@ fn get_image_data(
     }
     let width = canvas_u32(sw);
     let height = canvas_u32(sh);
+    if width == 0 || height == 0 {
+        return Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "IndexSizeError",
+            "source width or height rounds to zero",
+        ));
+    }
     let x = i32_of(sx);
     let y = i32_of(sy);
     let bytes = with_canvas(this.0.ctx(), &this.0, |canvas| {
@@ -1074,48 +1324,72 @@ fn put_image_data<'js>(
             .ok_or_else(|| Exception::throw_type(ctx, "missing argument"))?;
         Ok(**value)
     };
-    let (dx, dy) = (number(0)?, number(1)?);
+    let (dx, dy) = (
+        enforce_long(ctx, number(0)?)?,
+        enforce_long(ctx, number(1)?)?,
+    );
     let Some((width, height, pixels)) = read_image_data(&data)? else {
         return Err(Exception::throw_type(ctx, "putImageData expects ImageData"));
     };
     let dirty = match (number(2), number(3), number(4), number(5)) {
         (Ok(x), Ok(y), Ok(width), Ok(height)) => Some((
-            canvas_u32(x),
-            canvas_u32(y),
-            canvas_u32(width),
-            canvas_u32(height),
+            enforce_long(ctx, x)?,
+            enforce_long(ctx, y)?,
+            enforce_long(ctx, width)?,
+            enforce_long(ctx, height)?,
         )),
         _ => None,
     };
     with_canvas(ctx, &this.0, |canvas| {
-        canvas.write_pixels(&pixels, width, height, i32_of(dx), i32_of(dy), dirty);
+        canvas.write_pixels(&pixels, width, height, dx, dy, dirty);
     })
 }
 
-fn create_image_data(
-    this: This<Object<'_>>,
-    width: Coerced<f64>,
-    height: Coerced<f64>,
-) -> Result<Value<'_>> {
-    // Blink takes the absolute value of both dimensions
-    // (`BaseRenderingContext2D::createImageData`).
-    let width = canvas_u32(width.abs());
-    let height = canvas_u32(height.abs());
-    if width == 0 || height == 0 {
-        return Err(crate::js::bindings::throw_dom(
-            this.0.ctx(),
-            "IndexSizeError",
-            "createImageData width and height must be non-zero",
-        ));
+fn create_image_data<'js>(
+    this: This<Object<'js>>,
+    first: Value<'js>,
+    second: Opt<Coerced<f64>>,
+) -> Result<Value<'js>> {
+    let ctx = this.0.ctx();
+    canvas_id(&this.0)?;
+    if let Some(second) = second.0 {
+        let width = *Coerced::<f64>::from_js(ctx, first)?;
+        let height = *second;
+        // Blink takes the absolute value of both dimensions
+        // (`BaseRenderingContext2D::createImageData`), but both are
+        // `[EnforceRange] long` first.
+        let width = enforce_long(ctx, width)?.unsigned_abs();
+        let height = enforce_long(ctx, height)?.unsigned_abs();
+        if width == 0 || height == 0 {
+            return Err(crate::js::bindings::throw_dom(
+                ctx,
+                "IndexSizeError",
+                "ImageData dimensions must be nonzero",
+            ));
+        }
+        let Some(bytes) = crate::js::world::canvas_bytes(width, height) else {
+            return Err(crate::js::bindings::throw_dom(
+                ctx,
+                "IndexSizeError",
+                "ImageData area is too large",
+            ));
+        };
+        return image_data_object(ctx, width, height, vec![0; bytes]);
     }
-    let Some(bytes) = crate::js::world::canvas_bytes(width, height) else {
-        return Err(crate::js::bindings::throw_dom(
-            this.0.ctx(),
-            "IndexSizeError",
-            "createImageData area is too large",
+    let Some((width, height, _)) = read_image_data(&first)? else {
+        return Err(Exception::throw_type(
+            ctx,
+            "createImageData expects ImageData or a size",
         ));
     };
-    image_data_object(this.0.ctx(), width, height, vec![0; bytes])
+    let Some(bytes) = crate::js::world::canvas_bytes(width, height) else {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "IndexSizeError",
+            "ImageData area is too large",
+        ));
+    };
+    image_data_object(ctx, width, height, vec![0; bytes])
 }
 
 fn image_data_object<'js>(
@@ -1124,15 +1398,20 @@ fn image_data_object<'js>(
     height: u32,
     bytes: Vec<u8>,
 ) -> Result<Value<'js>> {
-    let source = TypedArray::<u8>::new(ctx.clone(), bytes)?;
-    ctx.globals().set("__tbCanvasBytes", source)?;
-    let data: Value = ctx.eval("new Uint8ClampedArray(__tbCanvasBytes)")?;
-    ctx.globals()
-        .set("__tbCanvasBytes", Value::new_undefined(ctx.clone()))?;
+    let ctor: Function = ctx.globals().get("ImageData")?;
+    let prototype: Object = ctor.get("prototype")?;
     let image = Object::new(ctx.clone())?;
-    image.set("data", data)?;
-    image.set("width", width)?;
-    image.set("height", height)?;
+    image.set_prototype(Some(&prototype))?;
+    let data = data_array(ctx, bytes)?.into_value();
+    set_image_data(
+        ctx,
+        &image,
+        width,
+        height,
+        data,
+        "srgb".to_owned(),
+        "rgba-unorm8".to_owned(),
+    )?;
     Ok(image.into_value())
 }
 
@@ -1146,24 +1425,36 @@ fn read_image_data(value: &Value<'_>) -> Result<Option<(u32, u32, Vec<u8>)>> {
     let Ok(height) = object.get::<_, u32>("height") else {
         return Ok(None);
     };
-    let bytes: Vec<u8> = if let Some(array) = object.as_typed_array::<u8>() {
-        let mut bytes = Vec::with_capacity(array.len());
-        for index in 0..array.len() {
-            let key = u32::try_from(index).unwrap_or(u32::MAX);
-            bytes.push(array.get::<_, u8>(key)?);
-        }
-        bytes
-    } else if let Some(array) = object.as_typed_array::<rquickjs::U8Clamped>() {
-        let mut bytes = Vec::with_capacity(array.len());
-        for index in 0..array.len() {
-            let key = u32::try_from(index).unwrap_or(u32::MAX);
-            bytes.push(array.get::<_, u8>(key)?);
-        }
-        bytes
-    } else {
+    let Some(data) = object.get::<_, Value>("data").ok() else {
+        return Ok(None);
+    };
+    let Some(bytes) = typed_array_bytes(&data)? else {
         return Ok(None);
     };
     Ok(Some((width, height, bytes)))
+}
+
+fn typed_array_bytes(value: &Value<'_>) -> Result<Option<Vec<u8>>> {
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    if let Some(array) = object.as_typed_array::<rquickjs::U8Clamped>() {
+        let mut bytes = Vec::with_capacity(array.len());
+        for index in 0..array.len() {
+            let key = u32::try_from(index).unwrap_or(u32::MAX);
+            bytes.push(array.get::<_, u8>(key)?);
+        }
+        return Ok(Some(bytes));
+    }
+    if let Some(array) = object.as_typed_array::<u8>() {
+        let mut bytes = Vec::with_capacity(array.len());
+        for index in 0..array.len() {
+            let key = u32::try_from(index).unwrap_or(u32::MAX);
+            bytes.push(array.get::<_, u8>(key)?);
+        }
+        return Ok(Some(bytes));
+    }
+    Ok(None)
 }
 
 fn canvas_u32(value: f64) -> u32 {
