@@ -2637,6 +2637,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "sha2",
+ "skrifa",
  "stylo",
  "stylo_traits",
  "svgtypes",

@@ -14,6 +14,7 @@
 
 mod color;
 mod state;
+mod text;
 
 pub(crate) use state::{Canvas2D, SourceImage, StyleValue};
 
@@ -2067,45 +2068,123 @@ fn image_is_same_origin(world: &crate::js::world::World, id: NodeId) -> bool {
 
 // ---- text ----------------------------------------------------------------
 
-#[expect(clippy::unnecessary_wraps, reason = "rquickjs callbacks return Result")]
 fn fill_text(
     this: This<Object<'_>>,
-    _text: DomString,
-    _x: Coerced<f64>,
-    _y: Coerced<f64>,
-    _max_width: Opt<Coerced<f64>>,
+    text: DomString,
+    x: Coerced<f64>,
+    y: Coerced<f64>,
+    max_width: Opt<Coerced<f64>>,
 ) -> Result<()> {
-    let _ = this;
-    Ok(())
+    draw_text(this, &text, *x, *y, max_width.0.as_deref().copied(), false)
 }
 
-#[expect(clippy::unnecessary_wraps, reason = "rquickjs callbacks return Result")]
 fn stroke_text(
     this: This<Object<'_>>,
-    _text: DomString,
-    _x: Coerced<f64>,
-    _y: Coerced<f64>,
-    _max_width: Opt<Coerced<f64>>,
+    text: DomString,
+    x: Coerced<f64>,
+    y: Coerced<f64>,
+    max_width: Opt<Coerced<f64>>,
 ) -> Result<()> {
-    let _ = this;
-    Ok(())
+    draw_text(this, &text, *x, *y, max_width.0.as_deref().copied(), true)
 }
 
-fn measure_text(this: This<Object<'_>>, _text: DomString) -> Result<Object<'_>> {
-    let object = Object::new(this.0.ctx().clone())?;
-    object.set("width", 0.0)?;
+fn draw_text(
+    this: This<Object<'_>>,
+    text: &str,
+    x: f64,
+    y: f64,
+    max_width: Option<f64>,
+    stroke: bool,
+) -> Result<()> {
+    if !x.is_finite() || !y.is_finite() {
+        return Ok(());
+    }
+    let ctx = this.0.ctx();
+    let (font, align, baseline) = with_canvas(ctx, &this.0, |canvas| {
+        (
+            canvas.font().to_owned(),
+            canvas.text_align().to_owned(),
+            canvas.text_baseline().to_owned(),
+        )
+    })?;
+    let max_width = match max_width {
+        None => None,
+        Some(value) if value.is_finite() && value > 0.0 => Some(f32_of(value)),
+        // A zero, negative, or non-finite maxWidth paints nothing
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-filltext>).
+        Some(_) => return Ok(()),
+    };
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(text, &font, max_width, &mut font_ctx);
+    let Some(path) = shaped.path.as_ref() else {
+        return Ok(());
+    };
+    let width = shaped.width * shaped.scale_x;
+    let dx = match align.as_str() {
+        "center" => -width / 2.0,
+        "right" | "end" => -width,
+        _ => 0.0,
+    };
+    // The shaped layout's origin is the top of the line, so shift it up by
+    // the distance from the top to the chosen baseline
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#text-baselines>).
+    let dy = match baseline.as_str() {
+        "top" => 0.0,
+        "hanging" => -shaped.ascent * 0.8,
+        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
+        "bottom" => -(shaped.ascent + shaped.descent),
+        "ideographic" => -(shaped.ascent + shaped.descent) + shaped.descent * 0.2,
+        _ => -shaped.ascent,
+    };
+    let (x, y) = (f32_of(x) + dx, f32_of(y) + dy);
+    with_canvas(ctx, &this.0, |canvas| {
+        if stroke {
+            canvas.stroke_text_path(path, x, y, shaped.scale_x);
+        } else {
+            canvas.fill_text_path(path, x, y, shaped.scale_x);
+        }
+    })
+}
+
+fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
+    let ctx = this.0.ctx();
+    let font = with_canvas(ctx, &this.0, |canvas| canvas.font().to_owned())?;
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(&text, &font, None, &mut font_ctx);
+    let object = Object::new(ctx.clone())?;
+    object.set("width", shaped.width)?;
     object.set("actualBoundingBoxLeft", 0.0)?;
-    object.set("actualBoundingBoxRight", 0.0)?;
-    object.set("actualBoundingBoxAscent", 0.0)?;
-    object.set("actualBoundingBoxDescent", 0.0)?;
-    object.set("fontBoundingBoxAscent", 0.0)?;
-    object.set("fontBoundingBoxDescent", 0.0)?;
-    object.set("emHeightAscent", 0.0)?;
-    object.set("emHeightDescent", 0.0)?;
-    object.set("hangingBaseline", 0.0)?;
+    object.set("actualBoundingBoxRight", shaped.width)?;
+    object.set("actualBoundingBoxAscent", shaped.ascent)?;
+    object.set("actualBoundingBoxDescent", shaped.descent)?;
+    object.set("fontBoundingBoxAscent", shaped.ascent)?;
+    object.set("fontBoundingBoxDescent", shaped.descent)?;
+    object.set("emHeightAscent", shaped.ascent)?;
+    object.set("emHeightDescent", shaped.descent)?;
+    object.set("hangingBaseline", shaped.ascent * 0.8)?;
     object.set("alphabeticBaseline", 0.0)?;
-    object.set("ideographicBaseline", 0.0)?;
+    object.set("ideographicBaseline", -shaped.descent * 0.2)?;
     Ok(object)
+}
+
+/// The document's Parley font context. It includes `@font-face` fonts, which
+/// the shared process context does not.
+fn document_font_context(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<parley::FontContext> {
+    let id = canvas_id(object)?;
+    let world = world(ctx)?;
+    let font_ctx = world
+        .borrow()
+        .document(id)
+        .map(|parsed| parsed.document.base.font_context());
+    font_ctx.map_or_else(
+        || Ok(world.borrow().runtime.font_ctx.clone()),
+        |font_ctx| {
+            Ok(font_ctx
+                .lock()
+                .map(|font_ctx| font_ctx.clone())
+                .unwrap_or_default())
+        },
+    )
 }
 
 // ---- style properties ----------------------------------------------------
