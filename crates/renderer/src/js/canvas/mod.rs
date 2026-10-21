@@ -1788,6 +1788,16 @@ fn read_image_data(value: &Value<'_>) -> Result<Option<(u32, u32, Vec<u8>)>> {
     let Some(bytes) = typed_array_bytes(&data)? else {
         return Ok(None);
     };
+    // A matching width and height do not validate the buffer: a page can hand
+    // `putImageData` any object with a short array and huge sizes, and the
+    // per-pixel loop would run for hours inside Rust, where the JS interrupt
+    // handler never runs.
+    let Some(expected) = crate::js::world::canvas_bytes(width, height) else {
+        return Ok(None);
+    };
+    if bytes.len() != expected {
+        return Ok(None);
+    }
     Ok(Some((width, height, bytes)))
 }
 
@@ -2302,6 +2312,8 @@ fn source_element(
         if width == 0 || height == 0 {
             return Some(ImageLookup::Invalid);
         }
+        // A context-less canvas is transparent, but its declared size is
+        // page-controlled: an over-budget one has no pixels to draw.
         let pixels = crate::js::world::canvas_bytes(width, height)
             .map_or_else(Vec::new, |bytes| vec![0; bytes]);
         return Some(ImageLookup::Decoded(SourceImage {

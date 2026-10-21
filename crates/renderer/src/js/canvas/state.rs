@@ -282,10 +282,14 @@ impl Canvas2D {
         let gradients = std::mem::take(&mut self.gradients);
         let patterns = std::mem::take(&mut self.patterns);
         let next_resource = self.next_resource;
+        // Resizing clears the bitmap and state, not the taint: a canvas that
+        // painted a cross-origin image stays unreadable.
+        let origin_clean = self.origin_clean;
         *self = Canvas2D::new(width, height);
         self.gradients = gradients;
         self.patterns = patterns;
         self.next_resource = next_resource;
+        self.origin_clean = origin_clean;
     }
 
     pub(crate) fn new(width: u32, height: u32) -> Self {
@@ -334,7 +338,8 @@ impl Canvas2D {
         self.current = None;
         self.subpath_start = Point::zero();
         // Gradients and patterns are independent objects: resetting the
-        // context must not invalidate ids a script still holds.
+        // context must not invalidate ids a script still holds
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-reset>).
         self.layers.clear();
     }
 
@@ -1049,21 +1054,22 @@ impl Canvas2D {
         end: f32,
         counterclockwise: bool,
     ) {
-        let mut delta = end - start;
-        if counterclockwise {
-            if delta > 0.0 {
-                delta -= TAU * ((delta / TAU).ceil());
+        // A span of at least 2π in the requested direction is the whole
+        // circumference. Any other span follows the requested direction from
+        // start to end, so it is at most 2π and may wrap through zero
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#ellipse-method-steps>).
+        let swept = end - start;
+        let delta = if counterclockwise {
+            if start - end >= TAU {
+                -TAU
+            } else {
+                swept.rem_euclid(TAU) - TAU
             }
-            delta = delta.min(0.0);
+        } else if end - start >= TAU {
+            TAU
         } else {
-            if delta < 0.0 {
-                delta += TAU * ((-delta / TAU).ceil());
-            }
-            delta = delta.max(0.0);
-        }
-        if delta == 0.0 {
-            return;
-        }
+            swept.rem_euclid(TAU)
+        };
         let mut start_point = ellipse_point(cx, cy, rx, ry, rotation, start);
         self.state.transform.map_point(&mut start_point);
         match self.current {
@@ -1649,6 +1655,14 @@ impl Canvas2D {
         };
         self.clear_uncovered(path, rule);
         self.paint_shadow(path, rule, None);
+        if let Style::Pattern(id) = self.state.fill
+            && self
+                .patterns
+                .get(&id)
+                .is_some_and(|entry| !entry.origin_clean && !entry.invalid)
+        {
+            self.taint();
+        }
         let style = self.state.fill;
         let alpha = self.state.alpha;
         let pattern = match style {
@@ -1794,6 +1808,14 @@ impl Canvas2D {
     fn stroke_path(&mut self, path: &Path) {
         let stroke = self.stroke_options();
         self.paint_shadow(path, FillRule::Winding, Some(&stroke));
+        if let Style::Pattern(id) = self.state.stroke
+            && self
+                .patterns
+                .get(&id)
+                .is_some_and(|entry| !entry.origin_clean && !entry.invalid)
+        {
+            self.taint();
+        }
         let style = self.state.stroke;
         let alpha = self.state.alpha;
         let pattern = match style {
@@ -2080,13 +2102,7 @@ impl Canvas2D {
     /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
     /// transparent black
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
-    pub(crate) fn read_pixels(
-        &self,
-        x: i32,
-        y: i32,
-        width: u32,
-        height: u32,
-    ) -> Option<Vec<u8>> {
+    pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Option<Vec<u8>> {
         let mut out = vec![0; crate::js::world::canvas_bytes(width, height)?];
         let Some(pixmap) = &self.pixmap else {
             return Some(out);
@@ -2301,6 +2317,9 @@ impl Canvas2D {
             Transform::identity(),
             self.state.clip.as_deref(),
         );
+        if !source.origin_clean {
+            self.taint();
+        }
     }
 
     /// The shadow of `drawImage`: the image's own alpha, tinted and offset.
@@ -3211,6 +3230,42 @@ mod tests {
     }
 
     #[test]
+    fn arc_points_follow_the_transform() {
+        let mut canvas = Canvas2D::new(100, 50);
+        canvas.scale(2.0, 0.5);
+        canvas.arc(25.0, 50.0, 56.0, 0.0, std::f32::consts::TAU, false);
+        let Some(Segment::MoveTo(start)) = canvas.path.first() else {
+            panic!("arc must move to its start point");
+        };
+        assert!((start.x - 162.0).abs() < 0.01, "x = {}", start.x);
+        assert!((start.y - 25.0).abs() < 0.01, "y = {}", start.y);
+    }
+
+    #[test]
+    fn arc_spans_cover_the_requested_sweep() {
+        let cubics = |canvas: &Canvas2D| {
+            canvas
+                .path
+                .iter()
+                .filter(|segment| matches!(segment, Segment::Cubic(..)))
+                .count()
+        };
+        let mut full = Canvas2D::new(4, 4);
+        full.arc(2.0, 2.0, 1.0, 0.0, std::f32::consts::TAU, false);
+        assert_eq!(cubics(&full), 4);
+
+        // A direction-mismatched 2π span is a full circle, not an empty arc.
+        let mut reversed = Canvas2D::new(4, 4);
+        reversed.arc(2.0, 2.0, 1.0, 0.0, std::f32::consts::TAU, true);
+        assert_eq!(cubics(&reversed), 4);
+
+        // A clockwise 2.5π span wraps to a 1.5π counterclockwise sweep.
+        let mut wrapped = Canvas2D::new(4, 4);
+        wrapped.arc(2.0, 2.0, 1.0, 0.0, 2.5 * std::f32::consts::PI, true);
+        assert_eq!(cubics(&wrapped), 3);
+    }
+
+    #[test]
     fn conic_gradient_rotates_stops() {
         let mut canvas = Canvas2D::new(100, 50);
         let id = canvas.create_conic_gradient(50.0, 25.0, 1.5 * std::f32::consts::PI);
@@ -3220,7 +3275,7 @@ mod tests {
         assert!(canvas.add_color_stop(id, 0.75, [255, 0, 0, 255]));
         canvas.set_fill_style(StyleValue::Gradient(id));
         canvas.fill_rect(0.0, 0.0, 100.0, 50.0);
-        let pixels = canvas.read_pixels(0, 0, 100, 50);
+        let pixels = canvas.read_pixels(0, 0, 100, 50).unwrap();
         let pixel = |x: usize, y: usize| &pixels[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4];
         assert_eq!(pixel(25, 15), &[255, 0, 0, 255]);
         assert_eq!(pixel(75, 40), &[0, 255, 0, 255]);
