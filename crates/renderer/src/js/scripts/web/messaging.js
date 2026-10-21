@@ -148,6 +148,7 @@ const __tbEncode = (value, transfer, sourcePort) => {
   // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializewithtransfer>).
   const buffers = new __tbPrivateMap();     // ArrayBuffer -> node slot, or -1 once listed
   const transferred = new __tbPrivateMap(); // MessagePort -> endpoint id
+  const canvases = new __tbPrivateMap();    // OffscreenCanvas -> node slot, or -1 once listed
   for (const item of __tbTransferList(transfer)) {
     if (item instanceof ArrayBuffer) {
       if (buffers.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
@@ -159,6 +160,11 @@ const __tbEncode = (value, transfer, sourcePort) => {
       if (itemData.closed) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
       if (transferred.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate ports', 'DataCloneError');
       transferred.set(item, itemData.id);
+    } else if (typeof globalThis.OffscreenCanvas === 'function'
+               && item instanceof globalThis.OffscreenCanvas) {
+      if (canvases.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate canvases', 'DataCloneError');
+      if (item.__tbDetached) throw new globalThis.DOMException('Cannot transfer a detached OffscreenCanvas', 'DataCloneError');
+      canvases.set(item, -1);
     } else {
       throw new globalThis.DOMException('Value not transferable', 'DataCloneError');
     }
@@ -194,6 +200,14 @@ const __tbEncode = (value, transfer, sourcePort) => {
       const index = slot(null);
       seen.set(input, index);
       buffers.set(input, index);
+      return index;
+    }
+    if (canvases.has(input)) {
+      // The receiver gets a fresh OffscreenCanvas; the sender is detached in
+      // the transfer step below.
+      const index = slot(['offscreen', input.width, input.height]);
+      seen.set(input, index);
+      canvases.set(input, index);
       return index;
     }
     if (__tbBlobData.get(input) !== undefined) {
@@ -310,6 +324,10 @@ const __tbEncode = (value, transfer, sourcePort) => {
       nodes[index] = __tbSetPrototypeOf(['buffer', __tbBase64Encode(new __tbUint8Array(moved))], null);
     }
   }
+  for (const [canvas] of canvases) {
+    canvas.__tbDetached = true;
+    if (canvas.__tbCanvas) canvas.__tbCanvas.__tbDetached = true;
+  }
   const ports = __tbPrivateArray();
   for (const [port, id] of transferred) {
     if (!host.__tbPortDetach(id)) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
@@ -356,6 +374,7 @@ const __tbDecode = (payload, ports) => {
       case 'number': values[index] = __tbNumberValue(descriptor[1]); break;
       case 'string': values[index] = descriptor[1]; break;
       case 'bigint': values[index] = BigInt(descriptor[1]); break;
+      case 'offscreen': values[index] = new globalThis.OffscreenCanvas(descriptor[1], descriptor[2]); break;
       case 'date': values[index] = new Date(__tbNumberValue(descriptor[1])); break;
       case 'regexp': values[index] = new RegExp(descriptor[1], descriptor[2]); break;
       case 'domexception': values[index] = new globalThis.DOMException(descriptor[2], descriptor[1]); break;

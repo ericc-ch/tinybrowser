@@ -2429,12 +2429,24 @@ enum ImageLookup {
 /// `ImageData`/`ImageBitmap`, or an `<img>` with decoded pixels
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>).
 fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
+    // A transferred OffscreenCanvas has no bitmap left to draw.
+    let detached = |value: &Value<'js>| {
+        value
+            .as_object()
+            .is_some_and(|object| object.get::<_, bool>("__tbDetached").unwrap_or(false))
+    };
+    if detached(&value) {
+        return Ok(ImageLookup::Invalid);
+    }
     // OffscreenCanvas forwards to a hidden canvas element.
     let node_value = value
         .as_object()
         .and_then(|object| object.get::<_, Value>("__tbCanvas").ok())
         .filter(|hidden| !hidden.is_undefined() && !hidden.is_null())
         .unwrap_or_else(|| value.clone());
+    if detached(&node_value) {
+        return Ok(ImageLookup::Invalid);
+    }
     if let Some(id) = crate::js::bindings::host_node_id(ctx, &node_value) {
         let world = world(ctx)?;
         let (loading, broken, size) = {

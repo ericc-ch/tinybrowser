@@ -73,6 +73,9 @@
     set height(value) { this.__tbCanvas.height = toUnsignedLong(value); }
 
     getContext(type, options) {
+      if (this.__tbDetached) {
+        throw new DOMException('the OffscreenCanvas is detached', 'InvalidStateError');
+      }
       if (arguments.length === 0) {
         throw new TypeError('getContext needs a context type');
       }
@@ -93,6 +96,9 @@
     }
 
     transferToImageBitmap() {
+      if (this.__tbDetached) {
+        throw new DOMException('the OffscreenCanvas is detached', 'InvalidStateError');
+      }
       return globalThis.__tbCanvasTransferToImageBitmap(this.__tbCanvas);
     }
 
