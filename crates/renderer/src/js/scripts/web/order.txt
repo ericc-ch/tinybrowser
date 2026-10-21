@@ -20,3 +20,4 @@ forms.js
 form_data.js
 input.js
 fonts.js
+canvas_filter.js

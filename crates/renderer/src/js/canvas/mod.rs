@@ -114,6 +114,8 @@ fn install_methods<'js>(ctx: &Ctx<'js>, prototype: &Object<'js>) -> Result<()> {
     method!("save", 0, save);
     method!("restore", 0, restore);
     method!("reset", 0, reset);
+    method!("beginLayer", 0, begin_layer);
+    method!("endLayer", 0, end_layer);
     method!("scale", 2, scale);
     method!("rotate", 1, rotate);
     method!("translate", 2, translate);
@@ -222,7 +224,7 @@ fn install_accessors(prototype: &Object<'_>) -> Result<()> {
         image_smoothing_quality,
         set_image_smoothing_quality
     );
-    string_prop!(prototype, "filter", filter, set_filter);
+    prototype.prop("filter", Accessor::new(get_filter, set_filter_binding))?;
     Ok(())
 }
 
@@ -345,6 +347,19 @@ fn canvas_id(object: &Object<'_>) -> Result<NodeId> {
     })
 }
 
+/// Rejects members that cannot run while a layer is open
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-beginlayer>).
+fn reject_open_layer(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<()> {
+    if with_canvas(ctx, object, |canvas| canvas.has_open_layer())? {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "InvalidStateError",
+            "a layer is open",
+        ));
+    }
+    Ok(())
+}
+
 fn with_canvas<R>(
     ctx: &Ctx<'_>,
     object: &Object<'_>,
@@ -445,7 +460,53 @@ fn save(this: This<Object<'_>>) -> Result<()> {
 }
 
 fn restore(this: This<Object<'_>>) -> Result<()> {
-    with_canvas(this.0.ctx(), &this.0, state::Canvas2D::restore)
+    let restored = with_canvas(this.0.ctx(), &this.0, state::Canvas2D::restore)?;
+    if restored {
+        Ok(())
+    } else {
+        Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "InvalidStateError",
+            "restore() cannot cross a layer boundary",
+        ))
+    }
+}
+
+fn begin_layer<'js>(this: This<Object<'js>>, options: Opt<Value<'js>>) -> Result<()> {
+    let ctx = this.0.ctx();
+    if let Some(value) = options.0 {
+        if value.is_null() || value.is_undefined() {
+            return with_canvas(ctx, &this.0, state::Canvas2D::begin_layer);
+        }
+        if !value.is_object() {
+            return Err(Exception::throw_type(
+                ctx,
+                "beginLayer options must be an object",
+            ));
+        }
+        if let Some(object) = value.as_object()
+            && let Ok(filter) = object.get::<_, Value>("filter")
+            && filter.is_object()
+            && !filter.is_null()
+            && let Ok(validate) = ctx.globals().get::<_, Function>("__tbValidateFilter")
+        {
+            validate.call::<_, ()>((filter,))?;
+        }
+    }
+    with_canvas(ctx, &this.0, state::Canvas2D::begin_layer)
+}
+
+fn end_layer(this: This<Object<'_>>) -> Result<()> {
+    let closed = with_canvas(this.0.ctx(), &this.0, state::Canvas2D::end_layer)?;
+    if closed {
+        Ok(())
+    } else {
+        Err(crate::js::bindings::throw_dom(
+            this.0.ctx(),
+            "InvalidStateError",
+            "endLayer() without a matching beginLayer()",
+        ))
+    }
 }
 
 fn reset(this: This<Object<'_>>) -> Result<()> {
@@ -1137,6 +1198,7 @@ fn create_pattern<'js>(
     source: Value<'js>,
     repetition: Opt<Value<'js>>,
 ) -> Result<Value<'js>> {
+    reject_open_layer(this.0.ctx(), &this.0)?;
     let repetition = match repetition.0 {
         None => "repeat".to_owned(),
         Some(value) if value.is_null() => "repeat".to_owned(),
@@ -1502,6 +1564,7 @@ fn get_image_data(
     sw: Coerced<f64>,
     sh: Coerced<f64>,
 ) -> Result<Value<'_>> {
+    reject_open_layer(this.0.ctx(), &this.0)?;
     // The IDL marks every argument `[EnforceRange] long`.
     let (mut sx, mut sy, mut sw, mut sh) = (
         f64::from(enforce_long(this.0.ctx(), *sx)?),
@@ -1563,6 +1626,7 @@ fn put_image_data<'js>(
     args: rquickjs::function::Rest<Coerced<f64>>,
 ) -> Result<()> {
     let ctx = this.0.ctx();
+    reject_open_layer(ctx, &this.0)?;
     let number = |index: usize| -> Result<f64> {
         let value = args
             .0
@@ -2006,6 +2070,7 @@ fn draw_image<'js>(
     source: Value<'js>,
     args: rquickjs::function::Rest<Coerced<f64>>,
 ) -> Result<()> {
+    reject_open_layer(this.0.ctx(), &this.0)?;
     let image = match source_image(this.0.ctx(), source)? {
         ImageLookup::Decoded(image) => image,
         ImageLookup::NotReady => return Ok(()),
@@ -2083,6 +2148,10 @@ enum ImageLookup {
 /// Decodes a `drawImage`/`createPattern` source: a canvas element, an
 /// `ImageData`/`ImageBitmap`, or an `<img>` with decoded pixels
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match per source kind keeps the usability outcomes in one place"
+)]
 fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     if let Some(id) = crate::js::bindings::host_node_id(ctx, &value) {
         let world = world(ctx)?;
@@ -2099,12 +2168,19 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
         if broken {
             return Ok(ImageLookup::Invalid);
         }
-        if let Some(snapshot) = world.borrow().registry().borrow().canvas_snapshot(id) {
-            return Ok(if snapshot.width == 0 || snapshot.height == 0 {
-                ImageLookup::Invalid
-            } else {
-                ImageLookup::Decoded(snapshot)
-            });
+        {
+            let registry = world.borrow().registry();
+            let registry = registry.borrow();
+            if registry.canvas_has_open_layer(id) {
+                return Ok(ImageLookup::Invalid);
+            }
+            if let Some(snapshot) = registry.canvas_snapshot(id) {
+                return Ok(if snapshot.width == 0 || snapshot.height == 0 {
+                    ImageLookup::Invalid
+                } else {
+                    ImageLookup::Decoded(snapshot)
+                });
+            }
         }
         let mut lookup = world
             .borrow()
@@ -2298,6 +2374,128 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     object.set("alphabeticBaseline", 0.0)?;
     object.set("ideographicBaseline", -shaped.descent * 0.2)?;
     Ok(object)
+}
+
+fn get_filter(this: This<Object<'_>>) -> Result<Value<'_>> {
+    if let Ok(value) = this.0.get::<_, Value>("__tbFilterObject")
+        && !value.is_undefined()
+        && !value.is_null()
+    {
+        return Ok(value);
+    }
+    let filter = with_canvas(this.0.ctx(), &this.0, |canvas| canvas.filter().to_owned())?;
+    Ok(rquickjs::String::from_str(this.0.ctx().clone(), &filter)?.into_value())
+}
+
+fn set_filter_binding<'js>(this: This<Object<'js>>, value: Value<'js>) -> Result<()> {
+    let ctx = this.0.ctx();
+    let is_canvas_filter = value.as_object().is_some_and(|object| {
+        ctx.globals()
+            .get::<_, Function>("CanvasFilter")
+            .is_ok_and(|ctor| object.is_instance_of(&ctor))
+    });
+    if is_canvas_filter {
+        this.0.set("__tbFilterObject", value)?;
+        return Ok(());
+    }
+    let text = DomString::from_js(ctx, value)?.to_string();
+    if !valid_filter(&text) {
+        return Ok(());
+    }
+    this.0
+        .set("__tbFilterObject", Value::new_undefined(ctx.clone()))?;
+    with_canvas(ctx, &this.0, |canvas| canvas.set_filter(&text))
+}
+
+/// Index of the `)` matching the opening `(` that was already consumed,
+/// skipping quoted strings and nested function calls.
+fn matching_paren(text: &str) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(index),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A CSS filter list with each function's argument shape checked. The canvas
+/// stores the serialized string; invalid values leave the previous filter
+/// (<https://drafts.fxtf.org/filter-effects/#filter-property>).
+fn valid_filter(text: &str) -> bool {
+    let mut rest = text.trim();
+    if rest.eq_ignore_ascii_case("none") {
+        return true;
+    }
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let name_length = rest
+            .find(|ch: char| !(ch.is_ascii_alphabetic() || ch == '-'))
+            .unwrap_or(rest.len());
+        let (name, after_name) = rest.split_at(name_length);
+        if name.is_empty() {
+            return false;
+        }
+        let after_name = after_name.trim_start();
+        let Some(after_open) = after_name.strip_prefix('(') else {
+            return false;
+        };
+        let Some(close) = matching_paren(after_open) else {
+            return false;
+        };
+        let argument = after_open[..close].trim();
+        let name = name.to_ascii_lowercase();
+        let valid = match name.as_str() {
+            "blur" => argument
+                .strip_suffix("px")
+                .or_else(|| (argument == "0").then_some(""))
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .is_some_and(|value| value.is_finite() && value >= 0.0),
+            "brightness" | "contrast" | "grayscale" | "invert" | "opacity" | "saturate"
+            | "sepia" => percentage_or_number(argument),
+            "hue-rotate" => angle(argument),
+            "drop-shadow" | "url" => !argument.is_empty(),
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+        rest = after_open[close + 1..].trim_start();
+    }
+    true
+}
+
+fn percentage_or_number(text: &str) -> bool {
+    let text = text.strip_suffix('%').unwrap_or(text).trim();
+    text.parse::<f32>()
+        .is_ok_and(|value| value.is_finite() && value >= 0.0)
+}
+
+fn angle(text: &str) -> bool {
+    let number = ["deg", "rad", "turn", "grad"]
+        .iter()
+        .find_map(|unit| text.strip_suffix(unit))
+        .unwrap_or(text)
+        .trim();
+    number.parse::<f32>().is_ok_and(f32::is_finite)
 }
 
 /// The document's Parley font context. It includes `@font-face` fonts, which

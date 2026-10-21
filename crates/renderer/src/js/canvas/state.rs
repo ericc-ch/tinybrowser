@@ -39,6 +39,9 @@ pub(crate) struct Canvas2D {
     /// `SecurityError`
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element>).
     origin_clean: bool,
+    /// Save-stack depths where each open layer started
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-beginlayer>).
+    layers: Vec<usize>,
 }
 
 impl<'js> rquickjs::class::Trace<'js> for Canvas2D {
@@ -200,11 +203,16 @@ impl Canvas2D {
             patterns: HashMap::new(),
             next_resource: 1,
             origin_clean: true,
+            layers: Vec::new(),
         }
     }
 
     pub(crate) fn origin_clean(&self) -> bool {
         self.origin_clean
+    }
+
+    pub(crate) fn has_open_layer(&self) -> bool {
+        !self.layers.is_empty()
     }
 
     fn taint(&mut self) {
@@ -228,6 +236,7 @@ impl Canvas2D {
         self.subpath_start = Point::zero();
         // Gradients and patterns are independent objects: resetting the
         // context must not invalidate ids a script still holds.
+        self.layers.clear();
     }
 
     // ---- state -----------------------------------------------------------
@@ -236,10 +245,60 @@ impl Canvas2D {
         self.stack.push(self.state.clone());
     }
 
-    pub(crate) fn restore(&mut self) {
+    /// `restore()` cannot pop a layer's saved state; that is an
+    /// `InvalidStateError` while the layer is open
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-restore>).
+    pub(crate) fn restore(&mut self) -> bool {
+        if self
+            .layers
+            .last()
+            .is_some_and(|base| self.stack.len() <= base + 1)
+        {
+            return false;
+        }
         if let Some(state) = self.stack.pop() {
             self.state = state;
         }
+        true
+    }
+
+    /// Opens a layer: the rendering state resets inside it, and `endLayer`
+    /// restores the state captured here.
+    pub(crate) fn begin_layer(&mut self) {
+        let base = self.stack.len();
+        self.stack.push(self.state.clone());
+        self.layers.push(base);
+        self.state.alpha = 1.0;
+        self.state.blend = BlendMode::SourceOver;
+        self.state.shadow_color = [0, 0, 0, 0];
+        self.state.shadow_blur = 0.0;
+        self.state.shadow_x = 0.0;
+        self.state.shadow_y = 0.0;
+        "none".clone_into(&mut self.state.filter);
+    }
+
+    /// Closes the innermost layer, unless a `save()` opened after it is still
+    /// unbalanced.
+    pub(crate) fn end_layer(&mut self) -> bool {
+        let Some(base) = self.layers.last().copied() else {
+            return false;
+        };
+        if self.stack.len() != base + 1 {
+            return false;
+        }
+        self.layers.pop();
+        if let Some(state) = self.stack.pop() {
+            self.state = state;
+        }
+        true
+    }
+
+    pub(crate) fn filter(&self) -> &str {
+        &self.state.filter
+    }
+
+    pub(crate) fn set_filter(&mut self, value: &str) {
+        value.clone_into(&mut self.state.filter);
     }
 
     pub(crate) fn transform(&mut self, m11: f32, m12: f32, m21: f32, m22: f32, dx: f32, dy: f32) {
@@ -690,14 +749,6 @@ impl Canvas2D {
         if value == "low" || value == "medium" || value == "high" {
             value.clone_into(&mut self.state.smoothing_quality);
         }
-    }
-
-    pub(crate) fn filter(&self) -> &str {
-        &self.state.filter
-    }
-
-    pub(crate) fn set_filter(&mut self, value: &str) {
-        value.clone_into(&mut self.state.filter);
     }
 
     // ---- paths -----------------------------------------------------------
