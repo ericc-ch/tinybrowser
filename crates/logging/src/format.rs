@@ -9,19 +9,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Level;
 
-/// Renders one record, ending in `\n`.
-pub(crate) fn record(level: Level, target: &str, args: fmt::Arguments<'_>) -> String {
-    let mut line = timestamp(SystemTime::now());
+/// Renders one record at `time`, ending in `\n`.
+pub(crate) fn record(
+    time: SystemTime,
+    level: Level,
+    target: &str,
+    args: fmt::Arguments<'_>,
+) -> String {
+    let mut line = timestamp(time);
     line.push(' ');
     line.push_str(level.as_str());
     line.push(' ');
-    push_escaped(&mut line, target);
+    let _ = write!(Escaped(&mut line), "{target}");
     line.push(' ');
-    let mut message = String::new();
-    let _ = write!(message, "{args}");
-    push_escaped(&mut line, &message);
+    let _ = write!(Escaped(&mut line), "{args}");
     line.push('\n');
     line
+}
+
+/// Renders one forwarded line, ending in `\n`, with its terminator trimmed and
+/// its line breaks escaped.
+pub(crate) fn forwarded(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 1);
+    let _ = write!(
+        Escaped(&mut out),
+        "{}",
+        line.trim_end_matches(['\r', '\n'])
+    );
+    out.push('\n');
+    out
 }
 
 /// RFC 3339 UTC with milliseconds, for example `2026-09-12T00:00:00.123Z`.
@@ -31,7 +47,7 @@ pub(crate) fn timestamp(time: SystemTime) -> String {
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = since_epoch.as_secs();
     let millis = since_epoch.subsec_millis();
-    let days = i64::try_from(seconds / 86_400).unwrap_or(0);
+    let days = seconds / 86_400;
     let day_seconds = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
     let hour = day_seconds / 3_600;
@@ -43,9 +59,9 @@ pub(crate) fn timestamp(time: SystemTime) -> String {
 /// Days since the Unix epoch to a proleptic Gregorian date.
 ///
 /// Howard Hinnant's `civil_from_days`, shifted for the Unix epoch.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let era = z / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let year = yoe + era * 400;
@@ -56,14 +72,20 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// Appends `value`, escaping line breaks so one record stays one line.
-fn push_escaped(out: &mut String, value: &str) {
-    for c in value.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
+/// Escapes line breaks as they are formatted, so one record stays one line
+/// without a second buffer.
+struct Escaped<'a>(&'a mut String);
+
+impl fmt::Write for Escaped<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        for c in value.chars() {
+            match c {
+                '\n' => self.0.push_str("\\n"),
+                '\r' => self.0.push_str("\\r"),
+                _ => self.0.push(c),
+            }
         }
+        Ok(())
     }
 }
 
@@ -83,29 +105,47 @@ mod tests {
     }
 
     #[test]
-    fn records_are_one_plain_line() {
-        let line = record(Level::Info, "browser::tab", format_args!("created tab"));
-        assert_eq!(line.lines().count(), 1, "{line}");
-        let line = line.trim_end_matches('\n');
-        let mut fields = line.splitn(4, ' ');
-        let timestamp = fields.next().expect("timestamp");
-        assert!(timestamp.ends_with('Z'), "{timestamp}");
-        assert_eq!(fields.next(), Some("INFO"));
-        assert_eq!(fields.next(), Some("browser::tab"));
-        assert_eq!(fields.next(), Some("created tab"));
+    fn records_render_one_exact_line() {
+        assert_eq!(
+            record(
+                SystemTime::UNIX_EPOCH,
+                Level::Info,
+                "browser::tab",
+                format_args!("created tab")
+            ),
+            "1970-01-01T00:00:00.000Z INFO browser::tab created tab\n"
+        );
     }
 
     #[test]
-    fn newlines_in_messages_stay_on_one_line() {
-        let line = record(Level::Error, "cli", format_args!("bad \"value\" a=b\nnext"));
-        assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.contains("bad \"value\" a=b\\nnext"), "{line}");
+    fn line_breaks_in_messages_are_escaped() {
+        assert_eq!(
+            record(
+                SystemTime::UNIX_EPOCH,
+                Level::Error,
+                "cli",
+                format_args!("bad \"value\" a=b\nnext\rline")
+            ),
+            "1970-01-01T00:00:00.000Z ERROR cli bad \"value\" a=b\\nnext\\rline\n"
+        );
     }
 
     #[test]
-    fn newlines_in_targets_stay_on_one_line() {
-        let line = record(Level::Info, "a\nb", format_args!("m"));
-        assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.contains(" a\\nb m"), "{line}");
+    fn line_breaks_in_targets_are_escaped() {
+        assert_eq!(
+            record(
+                SystemTime::UNIX_EPOCH,
+                Level::Info,
+                "a\nb",
+                format_args!("m")
+            ),
+            "1970-01-01T00:00:00.000Z INFO a\\nb m\n"
+        );
+    }
+
+    #[test]
+    fn forwarded_lines_trim_the_terminator_and_escape_cr() {
+        assert_eq!(forwarded("child stderr\r\n"), "child stderr\n");
+        assert_eq!(forwarded("one\rline\n"), "one\\rline\n");
     }
 }
