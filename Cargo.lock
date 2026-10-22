@@ -2607,7 +2607,6 @@ dependencies = [
 name = "renderer"
 version = "0.1.0"
 dependencies = [
- "anyrender",
  "anyrender_svg",
  "anyrender_tiny_skia",
  "base64",

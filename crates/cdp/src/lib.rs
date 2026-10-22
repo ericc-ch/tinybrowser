@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
-    BrowserHandle, ExecuteScriptInOptions, FrameId, RemoteValue, RunUntilJsTrueInOptions, TabEvent,
+    BrowserHandle, ExecuteScriptOptions, FrameId, RemoteValue, RunUntilJsTrueOptions, TabEvent,
     TabHandle, TabId,
 };
 use bytes::Bytes;
@@ -1251,7 +1251,7 @@ impl Conn {
             .replace("__ID__", &id)
             .replace("__SOURCE__", source);
         if let Err(error) = tab
-            .execute_script_in(ExecuteScriptInOptions {
+            .execute_script(ExecuteScriptOptions {
                 frame,
                 source: browser::ScriptSource::Browser(&schedule),
                 timeout: None,
@@ -1269,7 +1269,7 @@ impl Conn {
         // back the tab events the socket loop is waiting to deliver
         // (<https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-callFunctionOn>).
         let mut events = tab.subscribe().ok();
-        let run = tab.run_until_js_true_in(RunUntilJsTrueInOptions {
+        let run = tab.run_until_js_true(RunUntilJsTrueOptions {
             frame,
             source: browser::ScriptSource::Browser(&ready),
             timeout,
@@ -1293,7 +1293,7 @@ impl Conn {
                 // Drop the slot so a late settle cannot pile up results; the
                 // promise closure keeps its own reference to the slot.
                 let _ = tab
-                    .execute_script_in(ExecuteScriptInOptions {
+                    .execute_script(ExecuteScriptOptions {
                         frame,
                         source: browser::ScriptSource::Browser(&format!(
                             "(() => {{ if (host.__tb_async_handles) delete host.__tb_async_handles[{id}]; }})()"
@@ -1307,7 +1307,7 @@ impl Conn {
         }
         let read = RUNTIME_HANDLE_READ.replace("__ID__", &id);
         let value = match tab
-            .execute_script_in(ExecuteScriptInOptions {
+            .execute_script(ExecuteScriptOptions {
                 frame,
                 source: browser::ScriptSource::Browser(&read),
                 timeout: None,
@@ -1337,7 +1337,7 @@ impl Conn {
             .replace("__ID__", &json_string(&handle.to_string()))
             .replace("__SOURCE__", source);
         let value = match tab
-            .execute_script_in(ExecuteScriptInOptions {
+            .execute_script(ExecuteScriptOptions {
                 frame,
                 source: browser::ScriptSource::Browser(&script),
                 timeout: None,
@@ -1369,7 +1369,7 @@ impl Conn {
             .replace("__ID__", &id)
             .replace("__SOURCE__", source);
         if let Err(error) = tab
-            .execute_script_in(ExecuteScriptInOptions {
+            .execute_script(ExecuteScriptOptions {
                 frame,
                 source: browser::ScriptSource::Browser(&schedule),
                 timeout: None,
@@ -1382,7 +1382,7 @@ impl Conn {
             "Boolean(host.__tb_async && host.__tb_async[{id}] && host.__tb_async[{id}].done)"
         );
         match tab
-            .run_until_js_true_in(RunUntilJsTrueInOptions {
+            .run_until_js_true(RunUntilJsTrueOptions {
                 frame,
                 source: browser::ScriptSource::Browser(&ready),
                 timeout,
@@ -1394,7 +1394,7 @@ impl Conn {
                 // Drop the slot so a late settle cannot pile up results; the
                 // promise closure keeps its own reference to the slot.
                 let _ = tab
-                    .execute_script_in(ExecuteScriptInOptions {
+                    .execute_script(ExecuteScriptOptions {
                         frame,
                         source: browser::ScriptSource::Browser(&format!(
                             "(() => {{ if (host.__tb_async) delete host.__tb_async[{id}]; }})()"
@@ -1407,7 +1407,7 @@ impl Conn {
             Err(error) => return exception_reply(&error),
         }
         let value = match tab
-            .execute_script_in(ExecuteScriptInOptions {
+            .execute_script(ExecuteScriptOptions {
                 frame,
                 source: browser::ScriptSource::Browser(&RUNTIME_READ.replace("__ID__", &id)),
                 timeout: None,
