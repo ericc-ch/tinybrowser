@@ -515,6 +515,11 @@ pub struct DialOutcome {
     pub headers: Vec<(String, String)>,
     /// Response body, when [`DialRequest::read_body`].
     pub body: Vec<u8>,
+    /// The body could not be decoded for its `Content-Encoding`; consuming it
+    /// rejects instead of returning bytes
+    /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+    #[serde(default)]
+    pub body_error: bool,
     /// How the response was filtered
     /// (<https://fetch.spec.whatwg.org/#concept-response-type>); `basic` for
     /// same-origin and subresource responses.
@@ -539,6 +544,7 @@ impl DialOutcome {
             content_type,
             headers,
             body,
+            body_error: false,
             response_type: net::cors::ResponseType::Basic,
         }
     }

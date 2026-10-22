@@ -3,6 +3,7 @@
 //! Tab coordinators receive [`TabNetworkHandle`]. They do not expose or own
 //! [`net::Agent`].
 
+use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -249,6 +250,7 @@ impl TabNetworkHandle {
             let status = response.status();
             let final_url = response.final_url().to_string();
             let content_type = content_type_header(response.headers());
+            let content_encoding = content_encoding_header(response.headers());
             let headers = response
                 .headers()
                 .iter()
@@ -261,14 +263,21 @@ impl TabNetworkHandle {
                 .collect();
             // An opaque response hides its body as well as its status and
             // headers (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
-            let body = if request.read_body && !response_type.is_opaque() {
-                response
+            let (body, body_error) = if request.read_body && !response_type.is_opaque() {
+                let raw = response
                     .into_body()
                     .bytes(CONTROL_BODY_LIMIT)
                     .await
-                    .map_err(|error| dial_failure(&error))?
+                    .map_err(|error| dial_failure(&error))?;
+                match content_encoding {
+                    Some(encoding) => match decode_content_encoding(&raw, &encoding) {
+                        Some(decoded) => (decoded, false),
+                        None => (raw, true),
+                    },
+                    None => (raw, false),
+                }
             } else {
-                Vec::new()
+                (Vec::new(), false)
             };
             Ok(DialOutcome {
                 status: if response_type.is_opaque() { 0 } else { status },
@@ -283,6 +292,7 @@ impl TabNetworkHandle {
                 content_type,
                 headers,
                 body,
+                body_error,
                 response_type,
             })
         };
@@ -449,6 +459,15 @@ fn outbound_request(
             .insert(name, value.as_bytes())
             .map_err(|_| DialFailure::Connect)?;
     }
+    if request.kind == DialKind::JsFetch
+        && request.body.is_empty()
+        && matches!(
+            outbound.method.as_str().to_ascii_uppercase().as_str(),
+            "POST" | "PUT"
+        )
+    {
+        let _ = outbound.headers.insert("content-length", b"0");
+    }
     if let Some(referrer) = &request.referrer
         // Defense in depth: the renderer computes this per `referrer_for_policy`,
         // but the network boundary re-validates so a compromised renderer cannot
@@ -505,6 +524,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         content_type: None,
         headers: Vec::new(),
         body: Vec::new(),
+        body_error: false,
         response_type: net::cors::ResponseType::Basic,
     })
 }
@@ -598,6 +618,54 @@ fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
         .map(isomorphic_decode)
         .collect();
     (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// Every `Content-Encoding` value from the response as one string, in wire
+/// order. The codings apply in order, so decoding walks them in reverse
+/// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+fn content_encoding_header(headers: &net::HeaderMap) -> Option<String> {
+    let values: Vec<String> = headers
+        .get_all("content-encoding")
+        .map(isomorphic_decode)
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// Decodes a response body for the `Content-Encoding` list. `None` is a
+/// network error, the same result a browser gives for a coding it cannot
+/// decode. `zstd` stays unsupported: it is not in the dependency tree yet.
+fn decode_content_encoding(body: &[u8], encoding: &str) -> Option<Vec<u8>> {
+    let codings: Vec<String> = encoding
+        .split(',')
+        .map(|coding| coding.trim().to_ascii_lowercase())
+        .collect();
+    let mut data = body.to_vec();
+    for coding in codings.iter().rev() {
+        data = match coding.as_str() {
+            "identity" => data,
+            "gzip" | "x-gzip" => {
+                let mut decoded = Vec::new();
+                flate2::read::GzDecoder::new(&data[..])
+                    .read_to_end(&mut decoded)
+                    .ok()?;
+                decoded
+            }
+            "deflate" => {
+                let mut decoded = Vec::new();
+                flate2::read::ZlibDecoder::new(&data[..])
+                    .read_to_end(&mut decoded)
+                    .ok()?;
+                decoded
+            }
+            "br" => {
+                let mut decoded = Vec::new();
+                brotli_decompressor::BrotliDecompress(&mut &data[..], &mut decoded).ok()?;
+                decoded
+            }
+            _ => return None,
+        };
+    }
+    Some(data)
 }
 
 /// Network-boundary `Referer` check: rejects only a true downgrade (https

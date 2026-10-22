@@ -152,6 +152,7 @@ impl Document {
                                 // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
                                 headers: vec![("content-type".to_owned(), content_type)],
                                 body,
+                                body_error: false,
                                 response_type: net::cors::ResponseType::Basic,
                             },
                         });

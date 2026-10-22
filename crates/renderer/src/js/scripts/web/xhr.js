@@ -273,7 +273,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   setRequestHeader(name, value) {
     const data = __tbBrand(this, __tbXhrData);
     if (data.state !== 1 || data.sent) throw new DOMException('Request not open', 'InvalidStateError');
-    __tbApply(__tbHeadersAppend, data.headers, [name, value]);
+    // An invalid header name or value is a SyntaxError, not the TypeError the
+    // Headers class throws (<https://xhr.spec.whatwg.org/#dom-xmlhttprequest-setrequestheader>).
+    try {
+      __tbApply(__tbHeadersAppend, data.headers, [name, value]);
+    } catch (error) {
+      throw new DOMException('Invalid header', 'SyntaxError');
+    }
   }
   // https://xhr.spec.whatwg.org/#the-send()-method
   send(body = null) {
@@ -326,11 +332,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       __tbXhrFinish(this, data, generation, result[0], result[1], result[2], result[3], true);
       return;
     }
+    const referrer = host.__tbReferrer(data.url);
     data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, {
       mode: 'cors',
       credentials: data.withCredentials ? 'include' : 'same-origin',
       redirect: 'follow',
-    }, (status, bytes, url, _type, fields) => {
+    }, referrer, (status, bytes, url, _type, fields) => {
       __tbXhrFinish(this, data, generation, status, bytes, url, fields, false);
     });
     __tbXhrTimeout(this, data);
@@ -353,7 +360,14 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   getResponseHeader(name) {
     const data = __tbBrand(this, __tbXhrData);
     if (data.state < 2 || /^set-cookie2?$/i.test(String(name))) return null;
-    return __tbApply(__tbHeadersGet, data.responseHeaders, [name]);
+    // An invalid header name yields null, not the TypeError the Headers class
+    // throws for a page-supplied name
+    // (<https://xhr.spec.whatwg.org/#dom-xmlhttprequest-getresponseheader>).
+    try {
+      return __tbApply(__tbHeadersGet, data.responseHeaders, [name]);
+    } catch (error) {
+      return null;
+    }
   }
   getAllResponseHeaders() {
     const data = __tbBrand(this, __tbXhrData);

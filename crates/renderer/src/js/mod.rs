@@ -444,35 +444,44 @@ impl JsRealm {
                 // document parser, it never adds a field to a `fetch`
                 // Response, and `blob().type` reads the header list
                 // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-                let (status, body, url, content_type, headers, response_type) = match outcome {
-                    Some(outcome) => (
-                        i32::from(outcome.status),
-                        outcome.body,
-                        outcome.final_url,
-                        outcome.content_type.unwrap_or_default(),
-                        outcome
-                            .headers
-                            .into_iter()
-                            .map(|(name, value)| vec![name, value])
-                            .collect::<Vec<_>>(),
-                        outcome.response_type.as_str().to_owned(),
-                    ),
-                    // A failed dial is a network error: the renderer rejects
-                    // and `Response.type` never becomes observable
-                    // (<https://fetch.spec.whatwg.org/#concept-network-error>).
-                    None => (
-                        0,
-                        Vec::new(),
-                        String::new(),
-                        String::new(),
-                        Vec::new(),
-                        "error".to_owned(),
-                    ),
-                };
+                let (status, body, url, content_type, headers, response_type, body_error) =
+                    match outcome {
+                        Some(outcome) => (
+                            i32::from(outcome.status),
+                            outcome.body,
+                            outcome.final_url,
+                            outcome.content_type.unwrap_or_default(),
+                            outcome
+                                .headers
+                                .into_iter()
+                                .map(|(name, value)| vec![name, value])
+                                .collect::<Vec<_>>(),
+                            outcome.response_type.as_str().to_owned(),
+                            outcome.body_error,
+                        ),
+                        // A failed dial is a network error: the renderer rejects
+                        // and `Response.type` never becomes observable
+                        // (<https://fetch.spec.whatwg.org/#concept-network-error>).
+                        None => (
+                            0,
+                            Vec::new(),
+                            String::new(),
+                            String::new(),
+                            Vec::new(),
+                            "error".to_owned(),
+                            false,
+                        ),
+                    };
                 let bytes = TypedArray::new(ctx.clone(), body)?;
-                if let Err(error) =
-                    func.call::<_, ()>((status, bytes, url, content_type, headers, response_type))
-                {
+                if let Err(error) = func.call::<_, ()>((
+                    status,
+                    bytes,
+                    url,
+                    content_type,
+                    headers,
+                    response_type,
+                    body_error,
+                )) {
                     bindings::host::report_callback_error(&ctx, &error);
                 }
                 Ok(())
