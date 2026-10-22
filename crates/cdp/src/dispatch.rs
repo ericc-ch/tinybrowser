@@ -25,9 +25,6 @@ pub(crate) async fn session_method(
     params: &Value,
     tab: &TabHandle,
 ) -> Result<Value, DispatchError> {
-    if noop_method(method) {
-        return Ok(json!({}));
-    }
     match method {
         "Page.getFrameTree" => {
             let url = tab
@@ -106,13 +103,11 @@ pub(crate) async fn session_method(
                 "mimeType": "text/html",
             }}}))
         }
-        "Runtime.getProperties" => Ok(json!({"result": [], "internalProperties": []})),
+        "Runtime.getProperties" => runtime_get_properties(tab, params).await,
+        "Page.getNavigationHistory" => navigation_history(tab).await,
         "Storage.getStorageKey" => storage_key(tab).await,
         _ => {
-            if let Some(reply) = static_reply(method) {
-                return Ok(reply);
-            }
-            if stubbed_domain(method) {
+            if accepted_noop(method, params) {
                 return Ok(json!({}));
             }
             Err(DispatchError::MethodNotFound)
@@ -120,29 +115,156 @@ pub(crate) async fn session_method(
     }
 }
 
-/// Replies with a fixed shape for methods whose client reads specific fields.
-pub(crate) fn static_reply(method: &str) -> Option<Value> {
-    Some(match method {
-        "CSS.getMatchedStylesForNode" => json!({
-            "matchedCSSRules": [], "pseudoElements": [], "inherited": [],
-            "inlineStyle": null, "attributesStyle": null,
-        }),
-        "CSS.getInlineStylesForNode" => json!({"inlineStyle": null, "attributesStyle": null}),
-        "CSS.getMediaQueries" => json!({"medias": []}),
-        "CSS.getBackgroundColors" => json!({
-            "backgroundColors": [], "computedFontSize": "16px", "computedFontWeight": "400",
-        }),
-        "CSS.takeCoverageDelta" => json!({"coverage": [], "timestamp": 0}),
-        "DOMSnapshot.getSnapshot" | "DOMSnapshot.captureSnapshot" => {
-            json!({"documents": [], "strings": []})
+/// `Page.getNavigationHistory`: the tab's committed session-history entries in
+/// traversal order and the active index.
+/// <https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-getNavigationHistory>
+async fn navigation_history(tab: &TabHandle) -> Result<Value, DispatchError> {
+    let (entries, current_index) = tab
+        .history()
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let entries: Vec<Value> = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "url": entry.url,
+                "userTypedURL": entry.url,
+                "title": "",
+                // The engine does not record how a navigation was initiated.
+                // "other" is the protocol's explicit unknown value.
+                "transitionType": "other",
+            })
+        })
+        .collect();
+    Ok(json!({"currentIndex": current_index, "entries": entries}))
+}
+
+/// `Runtime.getProperties`: own and inherited properties of a page-side handle,
+/// plus its `[[Prototype]]` internal property. Accessors are
+/// reported as `get`/`set` pairs; getters never run. `privateProperties` is
+/// absent because JavaScript has no reflection API for private names.
+/// <https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-getProperties>
+async fn runtime_get_properties(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+    let object_id = params
+        .get("objectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DispatchError::Failed("Runtime.getProperties requires objectId".into()))?;
+    let own = params
+        .get("ownProperties")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let accessors_only = params
+        .get("accessorPropertiesOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let generate_preview = params
+        .get("generatePreview")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let script = RUNTIME_GET_PROPERTIES
+        .replace("__ID__", &json_string(object_id))
+        .replace("__OWN__", if own { "true" } else { "false" })
+        .replace(
+            "__ACCESSORS__",
+            if accessors_only { "true" } else { "false" },
+        )
+        .replace(
+            "__PREVIEW__",
+            if generate_preview { "true" } else { "false" },
+        );
+    let value = tab
+        .execute_browser_script(&script)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let RemoteValue::String(text) = value else {
+        return Err(DispatchError::Failed(
+            "Runtime.getProperties did not return JSON".into(),
+        ));
+    };
+    let parsed: Value =
+        serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))?;
+    if parsed.get("missing").and_then(Value::as_bool) == Some(true) {
+        return Err(DispatchError::Failed(
+            "Could not find object with given id".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Commands this engine accepts as no-ops, consulted only after every real
+/// handler in both routing paths. An entry is honest only when the command's
+/// effect is already the engine's fixed behavior, or when it is an event
+/// subscription for a domain that never emits events.
+///
+/// State-changing commands are deliberately absent: script disabling, extra
+/// headers, CSP bypass, permissions, interception, and cache toggles return
+/// `MethodNotFound` instead of reporting an effect that did not happen.
+pub(crate) fn accepted_noop(method: &str, params: &Value) -> bool {
+    const UNCONDITIONAL: [&str; 12] = [
+        // Playwright sends this while initializing every page session. The
+        // engine never pauses a script, so there is no waiter to release.
+        "Runtime.runIfWaitingForDebugger",
+        // Subscription toggles for domains with no events to deliver.
+        "Log.enable",
+        "Network.enable",
+        // Focus is not an engine state: there is no focused/unfocused
+        // document distinction, so the request changes nothing.
+        "Emulation.setFocusEmulationEnabled",
+        // A page target has no child targets. The browser session's
+        // `Target.setAutoAttach` is a real handler.
+        "Target.setAutoAttach",
+        // The renderer owns its font stack; there is no font configuration.
+        "Page.setFontFamilies",
+        // There is no window or window manager, so bounds have no effect.
+        "Browser.setWindowBounds",
+        "Browser.getWindowBounds",
+        // The engine has no download pipeline, so no download can start and
+        // there is no behavior to configure. Playwright's connectOverCDP
+        // always sends this for its default context; refusing it aborts the
+        // connection before any page command runs.
+        "Browser.setDownloadBehavior",
+        // The engine has no HTTP cache: clearing it is already true.
+        "Network.clearBrowserCache",
+        // Pure subscription toggles for domains with no events.
+        "Overlay.enable",
+        "Overlay.disable",
+    ];
+    match method {
+        // Playwright's initial call is media "" with every feature empty,
+        // which selects the engine's existing defaults. A real override
+        // needs media-query state and returns `MethodNotFound`.
+        "Emulation.setEmulatedMedia" => emulated_media_is_default(params),
+        // With no cache there is nothing to disable; claiming caching could
+        // be turned back on would be false.
+        "Network.setCacheDisabled" => {
+            params.get("cacheDisabled").and_then(Value::as_bool) == Some(true)
         }
-        "Network.getResponseBody" => json!({"body": "", "base64Encoded": false}),
-        "Debugger.getScriptSource" => json!({"scriptSource": ""}),
-        "DOM.getContentQuads" => json!({"quads": []}),
-        "Page.getNavigationHistory" => json!({"currentIndex": 0, "entries": []}),
-        "Target.attachToBrowserTarget" => json!({"sessionId": "browser"}),
-        _ => return None,
-    })
+        _ => UNCONDITIONAL.contains(&method),
+    }
+}
+
+/// True when `Emulation.setEmulatedMedia` selects the engine defaults: empty
+/// media and every feature value empty.
+fn emulated_media_is_default(params: &Value) -> bool {
+    if params
+        .get("media")
+        .and_then(Value::as_str)
+        .is_some_and(|media| !media.is_empty())
+    {
+        return false;
+    }
+    match params.get("features") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(features)) => features.iter().all(|feature| {
+            feature
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+        }),
+        Some(_) => false,
+    }
 }
 
 /// `Page.addScriptToEvaluateOnNewDocument`: register `source` page-wide and
@@ -259,7 +381,7 @@ fn capture_side(extent: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_side, required_metric};
+    use super::{accepted_noop, capture_side, required_metric};
     use serde_json::json;
 
     #[test]
@@ -279,131 +401,63 @@ mod tests {
         assert_eq!(capture_side(1500.0), 1500);
         assert_eq!(capture_side(10_000.0), 4096);
     }
-}
 
-/// Domains whose remaining methods answer an empty result until their real
-/// behavior lands. The corpus then classifies those tests as protocol
-/// failures or timeouts instead of `UNSUPPORTED_METHOD`, which keeps the
-/// remaining work visible as behavior rather than as missing plumbing.
-pub(crate) fn stubbed_domain(method: &str) -> bool {
-    const DOMAINS: [&str; 44] = [
-        "CSS",
-        "DOM",
-        "DOMDebugger",
-        "DOMSnapshot",
-        "DOMStorage",
-        "Emulation",
-        "Page",
-        "Target",
-        "Network",
-        "Debugger",
-        "Overlay",
-        "BluetoothEmulation",
-        "DeviceOrientation",
-        "Memory",
-        "WebAuthn",
-        "WebMCP",
-        "Storage",
-        "BackgroundService",
-        "IndexedDB",
-        "ServiceWorker",
-        "Fetch",
-        "Audits",
-        "Animation",
-        "Profiler",
-        "Preload",
-        "Log",
-        "Security",
-        "Accessibility",
-        "Tracing",
-        "Input",
-        "Browser",
-        "Runtime",
-        "DeviceAccess",
-        "WebAudio",
-        "Performance",
-        "PerformanceTimeline",
-        "LayerTree",
-        "IO",
-        "HeapProfiler",
-        "Timeline",
-        "Media",
-        "EventBreakpoints",
-        "SystemInfo",
-        "CrashReportContext",
-    ];
-    DOMAINS.iter().any(|domain| {
-        method
-            .strip_prefix(domain)
-            .is_some_and(|suffix| suffix.starts_with('.'))
-    })
-}
+    #[test]
+    fn default_emulated_media_is_the_only_accepted_shape() {
+        assert!(accepted_noop(
+            "Emulation.setEmulatedMedia",
+            &json!({"media": "", "features": [
+                {"name": "prefers-color-scheme", "value": ""},
+                {"name": "prefers-reduced-motion", "value": ""},
+            ]})
+        ));
+        assert!(accepted_noop(
+            "Emulation.setEmulatedMedia",
+            &json!({"media": ""})
+        ));
+        assert!(!accepted_noop(
+            "Emulation.setEmulatedMedia",
+            &json!({"media": "print"})
+        ));
+        assert!(!accepted_noop(
+            "Emulation.setEmulatedMedia",
+            &json!({"media": "", "features": [
+                {"name": "prefers-color-scheme", "value": "dark"},
+            ]})
+        ));
+    }
 
-/// Methods the protocol surface accepts without a behavior change: domains the
-/// engine does not implement yet. Accepting them keeps the corpus classifying
-/// tests as protocol failures or timeouts instead of `UNSUPPORTED_METHOD`.
-fn noop_method(method: &str) -> bool {
-    matches!(
-        method,
-        "Runtime.disable"
-            | "Target.setAutoAttach"
-            | "Runtime.runIfWaitingForDebugger"
-            | "Log.enable"
-            | "Network.enable"
-            | "Emulation.setFocusEmulationEnabled"
-            | "Emulation.setTouchEmulationEnabled"
-            | "Emulation.setEmulatedMedia"
-            | "Emulation.setScriptExecutionDisabled"
-            | "Emulation.setPressureSourceOverrideEnabled"
-            | "Emulation.setPressureStateOverride"
-            | "Runtime.addBinding"
-            | "Security.setIgnoreCertificateErrors"
-            | "Page.setBypassCSP"
-            | "Page.startScreenRecording"
-            | "DOM.enable"
-            | "DOM.disable"
-            | "DOMSnapshot.enable"
-            | "Debugger.enable"
-            | "Debugger.disable"
-            | "Fetch.enable"
-            | "Fetch.disable"
-            | "Audits.enable"
-            | "Audits.disable"
-            | "Animation.enable"
-            | "Animation.disable"
-            | "BluetoothEmulation.enable"
-            | "BluetoothEmulation.disable"
-            | "IndexedDB.enable"
-            | "WebMCP.enable"
-            | "Accessibility.enable"
-            | "ServiceWorker.enable"
-            | "Tracing.start"
-            | "Network.clearBrowserCookies"
-            | "Network.clearBrowserCache"
-            | "Network.setCacheDisabled"
-            | "Network.setExtraHTTPHeaders"
-            | "Network.emulateNetworkConditionsByRule"
-            | "CSS.disable"
-            | "Emulation.setSensorOverrideEnabled"
-            | "Emulation.setDevicePostureOverride"
-            | "Memory.startSampling"
-            | "BackgroundService.startObserving"
-            | "Storage.setStorageBucketTracking"
-            | "DOMStorage.enable"
-            | "Debugger.setAsyncCallStackDepth"
-            | "DOMDebugger.setInstrumentationBreakpoint"
-            | "Target.activateTarget"
-            | "Page.stopScreenRecording"
-            | "Overlay.enable"
-            | "Overlay.disable"
-            | "DOMDebugger.enable"
-            | "Profiler.enable"
-            | "Profiler.disable"
-            | "Preload.enable"
-            | "Target.setDiscoverTargets"
-            | "Browser.grantPermissions"
-            | "Browser.resetPermissions"
-    )
+    #[test]
+    fn state_changing_commands_are_not_accepted() {
+        for method in [
+            "Emulation.setScriptExecutionDisabled",
+            "Network.setExtraHTTPHeaders",
+            "Network.clearBrowserCookies",
+            "Page.setBypassCSP",
+            "Fetch.enable",
+            "Fetch.disable",
+            "Runtime.addBinding",
+            "Security.setIgnoreCertificateErrors",
+            "Page.startScreenRecording",
+            "Page.stopScreenRecording",
+            "Browser.grantPermissions",
+            "Browser.resetPermissions",
+            "Page.setInterceptFileChooserDialog",
+        ] {
+            assert!(
+                !accepted_noop(method, &json!({})),
+                "{method} must go through a real handler or fail"
+            );
+        }
+        assert!(!accepted_noop(
+            "Network.setCacheDisabled",
+            &json!({"cacheDisabled": false})
+        ));
+        assert!(accepted_noop(
+            "Network.setCacheDisabled",
+            &json!({"cacheDisabled": true})
+        ));
+    }
 }
 
 /// `Storage.getStorageKey`: the tab's origin.
@@ -1093,6 +1147,125 @@ pub(crate) const RUNTIME_HANDLE_READ: &str = r#"(() => {
   if (t === "object" && typeof v.nodeType === "number" && typeof v.nodeName === "string")
     return host.stringify({__proto__: null, type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
   return host.stringify({__proto__: null, type: t === "function" ? "function" : "object", objectId: __ID__ });
+})()"#;
+
+/// Enumerates a page-side handle's own and inherited properties as CDP
+/// `PropertyDescriptor` JSON. Accessor descriptors expose `get`/`set`
+/// `RemoteObject`s instead of invoking them. Property values that are not
+/// primitives become handles with a per-call unique `objectId` prefix.
+pub(crate) const RUNTIME_GET_PROPERTIES: &str = r#"(() => {
+  const objectId = __ID__;
+  if (!Object.prototype.hasOwnProperty.call(host.__tb_handles, objectId))
+    return host.stringify({__proto__: null, missing: true});
+  const target = host.__tb_handles[objectId];
+  const ownProperties = __OWN__;
+  const accessorsOnly = __ACCESSORS__;
+  const generatePreview = __PREVIEW__;
+  host.__tb_prop_next = (host.__tb_prop_next || 0) + 1;
+  const prefix = "prop-" + host.__tb_prop_next + "-";
+  let next = 0;
+  const remote = (value, preview) => {
+    if (value === null) return {__proto__: null, type: "object", subtype: "null", value: null};
+    const kind = typeof value;
+    if (value === undefined) return {__proto__: null, type: "undefined"};
+    if (kind === "number") {
+      if (Number.isFinite(value)) return {__proto__: null, type: "number", value: value};
+      return {__proto__: null, type: "number", unserializableValue: Number.isNaN(value) ? "NaN" : (value > 0 ? "Infinity" : "-Infinity")};
+    }
+    if (kind === "string" || kind === "boolean") return {__proto__: null, type: kind, value: value};
+    if (kind === "symbol") return {__proto__: null, type: "symbol", description: Symbol.prototype.toString.call(value)};
+    if (kind === "bigint") return {__proto__: null, type: "bigint", unserializableValue: String(value)};
+    const handle = prefix + (++next);
+    host.__tb_handles[handle] = value;
+    const out = {__proto__: null, type: kind === "function" ? "function" : "object", objectId: handle};
+    if (kind === "function") {
+      out.className = "Function";
+    } else if (Array.isArray(value)) {
+      out.subtype = "array";
+      out.className = "Array";
+    } else if (typeof globalThis.Node === "function" && value instanceof globalThis.Node) {
+      out.subtype = "node";
+      out.className = "Node";
+      out.description = value.nodeName;
+    } else {
+      out.className = "Object";
+    }
+    if (preview) {
+      const properties = host.array();
+      let count = 0;
+      let overflow = false;
+      for (const name of Object.getOwnPropertyNames(value)) {
+        if (count === 5) { overflow = true; break; }
+        const descriptor = Object.getOwnPropertyDescriptor(value, name);
+        if (!descriptor) continue;
+        if (Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+          const entry = {__proto__: null, name: name, type: typeof descriptor.value};
+          if (descriptor.value === null) {
+            entry.type = "object";
+            entry.subtype = "null";
+            entry.value = "null";
+          } else if (entry.type !== "object" && entry.type !== "function") {
+            entry.value = String(descriptor.value);
+          }
+          host.push(properties, entry);
+        } else {
+          host.push(properties, {__proto__: null, name: name, type: "accessor"});
+        }
+        count++;
+      }
+      out.preview = {__proto__: null, type: out.type, overflow: overflow, properties: properties};
+      if (out.subtype) out.preview.subtype = out.subtype;
+    }
+    return out;
+  };
+  const result = host.array();
+  const seenNames = {__proto__: null};
+  const seenSymbols = host.array();
+  for (let object = target; object !== null && object !== undefined; object = Object.getPrototypeOf(object)) {
+    const isOwn = object === target;
+    const pushDescriptor = (name, descriptor, symbol) => {
+      const accessor = !Object.prototype.hasOwnProperty.call(descriptor, "value");
+      if (accessorsOnly && !accessor) return;
+      const entry = {__proto__: null,
+        name: name,
+        configurable: !!descriptor.configurable,
+        enumerable: !!descriptor.enumerable,
+      };
+      if (symbol) entry.symbol = remote(symbol, false);
+      if (accessor) {
+        if (descriptor.get) entry.get = remote(descriptor.get, false);
+        if (descriptor.set) entry.set = remote(descriptor.set, false);
+      } else {
+        entry.value = remote(descriptor.value, generatePreview);
+        entry.writable = !!descriptor.writable;
+      }
+      if (!ownProperties) entry.isOwn = isOwn;
+      host.push(result, entry);
+    };
+    for (const name of Object.getOwnPropertyNames(object)) {
+      if (seenNames[name]) continue;
+      seenNames[name] = true;
+      const descriptor = Object.getOwnPropertyDescriptor(object, name);
+      if (descriptor) pushDescriptor(name, descriptor, null);
+    }
+    for (const symbol of Object.getOwnPropertySymbols(object)) {
+      let seen = false;
+      for (let index = 0; index < seenSymbols.length; index++) {
+        if (seenSymbols[index] === symbol) { seen = true; break; }
+      }
+      if (seen) continue;
+      host.push(seenSymbols, symbol);
+      const descriptor = Object.getOwnPropertyDescriptor(object, symbol);
+      if (descriptor) pushDescriptor(String(symbol), descriptor, symbol);
+    }
+    if (ownProperties) break;
+  }
+  const internal = host.array();
+  host.push(internal, {__proto__: null,
+    name: "[[Prototype]]",
+    value: remote(Object.getPrototypeOf(target), false),
+  });
+  return host.stringify({__proto__: null, result: result, internalProperties: internal});
 })()"#;
 
 /// Reads the captured async result and serializes it as a CDP `RemoteObject`.

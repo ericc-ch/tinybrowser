@@ -6,6 +6,17 @@ use url::Url;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EntryId(u64);
 
+/// One committed session-history entry, for protocol adapters that expose the
+/// tab's real history (`Page.getNavigationHistory`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    /// Stable identity that survives list shifts
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history>).
+    pub id: u64,
+    /// URL committed for this entry.
+    pub url: String,
+}
+
 #[derive(Clone)]
 struct Entry {
     id: EntryId,
@@ -45,6 +56,21 @@ impl SessionHistory {
             index: self.current,
             state: self.entries[self.current].state.clone(),
         }
+    }
+
+    /// Committed entries in traversal order, with the active index.
+    pub(crate) fn entries(&self) -> Vec<HistoryEntry> {
+        self.entries
+            .iter()
+            .map(|entry| HistoryEntry {
+                id: entry.id.0,
+                url: entry.url.to_string(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn current_index(&self) -> usize {
+        self.current
     }
 
     /// Commits a navigation, or returns false if its traversal entry was removed
@@ -117,5 +143,51 @@ impl SessionHistory {
     /// The active entry, for reloads that keep their history position.
     pub(crate) fn current_entry(&self) -> EntryId {
         self.entries[self.current].id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HistoryEntry, SessionHistory};
+    use url::Url;
+
+    #[test]
+    fn entries_follow_committed_history_and_active_index() {
+        let mut history = SessionHistory::new(Url::parse("about:blank").expect("blank"));
+        assert_eq!(
+            history.entries(),
+            vec![HistoryEntry {
+                id: 0,
+                url: "about:blank".into(),
+            }]
+        );
+        assert_eq!(history.current_index(), 0);
+
+        history.navigate(Url::parse("https://example.com/").expect("url"), None);
+        history.update(
+            Url::parse("https://example.com/#state").expect("url"),
+            "{}".into(),
+            true,
+        );
+        history.navigate(Url::parse("https://example.com/next").expect("url"), None);
+
+        assert_eq!(
+            history.entries(),
+            vec![
+                HistoryEntry {
+                    id: 0,
+                    url: "about:blank".into(),
+                },
+                HistoryEntry {
+                    id: 1,
+                    url: "https://example.com/#state".into(),
+                },
+                HistoryEntry {
+                    id: 2,
+                    url: "https://example.com/next".into(),
+                },
+            ]
+        );
+        assert_eq!(history.current_index(), 2);
     }
 }

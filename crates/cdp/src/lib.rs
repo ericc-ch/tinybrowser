@@ -40,13 +40,12 @@ use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 mod dispatch;
 use dispatch::{
     DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
-    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, css_computed_style,
-    css_stylesheets, dom_box_model, dom_content_quads, dom_describe_node, dom_get_document,
-    dom_node_for_location, dom_node_string, dom_query_selector, dom_resolve_node, exception_reply,
-    exception_text_reply, input_emulate_touch_from_mouse, input_insert_text, input_key_event,
-    input_mouse_event, input_touch_event, json_io, json_string, open_url, requested_frame,
-    session_method, static_reply, stubbed_domain, target_id, target_info, wait_for_navigation,
-    ws_io,
+    RUNTIME_SCHEDULE, accepted_noop, arguments_expression, attach_session, capture_screenshot,
+    css_computed_style, css_stylesheets, dom_box_model, dom_content_quads, dom_describe_node,
+    dom_get_document, dom_node_for_location, dom_node_string, dom_query_selector, dom_resolve_node,
+    exception_reply, exception_text_reply, input_emulate_touch_from_mouse, input_insert_text,
+    input_key_event, input_mouse_event, input_touch_event, json_io, json_string, open_url,
+    requested_frame, session_method, target_id, target_info, wait_for_navigation, ws_io,
 };
 
 const PRODUCT: &str = "Chrome/152.0.7977.82";
@@ -443,10 +442,19 @@ fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
     })
 }
 
+/// One flattened session's routing target. A browser session carries no tab:
+/// its commands go through browser dispatch, exactly as the root browser
+/// socket does.
+#[derive(Clone)]
+enum Session {
+    Tab(TabHandle),
+    Browser,
+}
+
 /// Per-WebSocket async protocol state.
 struct Conn {
     browser: BrowserHandle,
-    sessions: HashMap<String, TabHandle>,
+    sessions: HashMap<String, Session>,
     next_session: u64,
     tab: Option<TabHandle>,
     stop: Shutdown,
@@ -690,11 +698,21 @@ impl Conn {
         json!({})
     }
 
-    /// Registers a new flattened session for `tab`.
+    /// Registers a new flattened page session for `tab`.
     fn mint_session(&mut self, tab: &TabHandle) -> String {
         let session_id = format!("s{}", self.next_session);
         self.next_session = self.next_session.saturating_add(1);
-        self.sessions.insert(session_id.clone(), tab.clone());
+        self.sessions
+            .insert(session_id.clone(), Session::Tab(tab.clone()));
+        session_id
+    }
+
+    /// Registers a flattened browser session. Follow-up commands on this id
+    /// route through [`Conn::dispatch_browser`].
+    fn mint_browser_session(&mut self) -> String {
+        let session_id = format!("s{}", self.next_session);
+        self.next_session = self.next_session.saturating_add(1);
+        self.sessions.insert(session_id.clone(), Session::Browser);
         session_id
     }
 
@@ -787,19 +805,33 @@ impl Conn {
             return Err(DispatchError::Failed("browser closed".into()));
         }
         if let Some(session) = session {
-            let tab = self
+            let target = self
                 .sessions
                 .get(session)
                 .cloned()
                 .ok_or_else(|| DispatchError::Failed("unknown session".into()))?;
-            return self
-                .dispatch_tab_method(method, params, &tab, Some(session))
-                .await;
+            return match target {
+                Session::Tab(tab) => {
+                    self.dispatch_tab_method(method, params, &tab, Some(session))
+                        .await
+                }
+                Session::Browser => self.dispatch_browser(method, params).await,
+            };
         }
         if let Some(tab) = self.tab.clone() {
             return self.dispatch_tab_method(method, params, &tab, None).await;
         }
         self.dispatch_browser(method, params).await
+    }
+
+    /// `Network.clearBrowserCookies`: the live profile's jar is the only
+    /// cookie state, so clearing it is a complete implementation.
+    async fn clear_cookies(&self) -> Result<Value, DispatchError> {
+        self.browser
+            .clear_cookies()
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+        Ok(json!({}))
     }
 
     async fn dispatch_browser(
@@ -815,30 +847,7 @@ impl Conn {
                 "userAgent": browser::USER_AGENT,
                 "jsVersion": "QuickJS",
             })),
-            "Browser.setDownloadBehavior"
-            | "Browser.grantPermissions"
-            | "Browser.resetPermissions"
-            | "Target.setDiscoverTargets"
-            | "Target.activateTarget"
-            | "BluetoothEmulation.enable"
-            | "BluetoothEmulation.disable"
-            | "Storage.setStorageBucketTracking"
-            | "BackgroundService.startObserving"
-            | "Memory.startSampling"
-            | "Emulation.setSensorOverrideEnabled"
-            | "Emulation.setDevicePostureOverride"
-            | "Debugger.setAsyncCallStackDepth"
-            | "DOMDebugger.setInstrumentationBreakpoint"
-            | "DOMStorage.enable"
-            | "Page.stopScreenRecording"
-            | "Fetch.enable"
-            | "Fetch.disable"
-            | "CSS.enable"
-            | "CSS.disable" => Ok(json!({})),
-            "Browser.getWindowForTarget" => Ok(json!({
-                "windowId": 1,
-                "bounds": {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"},
-            })),
+            "Network.clearBrowserCookies" => self.clear_cookies().await,
             "Browser.close" => {
                 let result = self.browser.close().await;
                 self.sessions.clear();
@@ -887,7 +896,10 @@ impl Conn {
                     let detached: Vec<String> = self
                         .sessions
                         .iter()
-                        .filter(|(_, tab)| tab.id() == id)
+                        .filter(|(_, session)| match session {
+                            Session::Tab(tab) => tab.id() == id,
+                            Session::Browser => false,
+                        })
                         .map(|(session, _)| session.clone())
                         .collect();
                     for session_id in detached {
@@ -904,7 +916,10 @@ impl Conn {
                     .close_tab(id)
                     .await
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                self.sessions.retain(|_, tab| tab.id() != id);
+                self.sessions.retain(|_, session| match session {
+                    Session::Tab(tab) => tab.id() != id,
+                    Session::Browser => true,
+                });
                 self.unsubscribe_tab_id(id);
                 self.loader_ids.remove(&id);
                 self.isolated_worlds.remove(&id);
@@ -929,10 +944,12 @@ impl Conn {
                     .tab(id)
                     .await
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                let session_id = format!("s{}", self.next_session);
-                self.next_session = self.next_session.saturating_add(1);
-                self.sessions.insert(session_id.clone(), tab);
-                Ok(json!({ "sessionId": session_id }))
+                Ok(json!({ "sessionId": self.mint_session(&tab) }))
+            }
+            // The browser target is a real attachable session: later commands
+            // on its id route through browser dispatch.
+            "Target.attachToBrowserTarget" => {
+                Ok(json!({ "sessionId": self.mint_browser_session() }))
             }
             "Target.detachFromTarget" => {
                 if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
@@ -941,7 +958,13 @@ impl Conn {
                 }
                 Ok(json!({}))
             }
-            _ => Self::unknown_target_method(method),
+            _ => {
+                if accepted_noop(method, params) {
+                    Ok(json!({}))
+                } else {
+                    Err(DispatchError::MethodNotFound)
+                }
+            }
         }
     }
 
@@ -959,18 +982,6 @@ impl Conn {
         Ok(json!({ "targetInfos": target_infos }))
     }
 
-    /// Target methods outside the implemented set: fixed-shape replies and
-    /// domain stubs keep the corpus moving past the method table.
-    fn unknown_target_method(method: &str) -> Result<Value, DispatchError> {
-        if let Some(reply) = static_reply(method) {
-            return Ok(reply);
-        }
-        if stubbed_domain(method) {
-            return Ok(json!({}));
-        }
-        Err(DispatchError::MethodNotFound)
-    }
-
     async fn dispatch_tab_method(
         &mut self,
         method: &str,
@@ -985,6 +996,7 @@ impl Conn {
             return Ok(value);
         }
         match method {
+            "Network.clearBrowserCookies" => self.clear_cookies().await,
             "Page.enable" => {
                 self.subscribe_tab(tab, session)?;
                 Ok(json!({}))

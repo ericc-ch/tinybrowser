@@ -21,7 +21,7 @@ use url::Url;
 
 use crate::assignment::Assignment;
 use crate::exchange::{self, RequestId, ServerInput};
-use crate::history::SessionHistory;
+use crate::history::{HistoryEntry, SessionHistory};
 use crate::manager::RendererProcessManager;
 use crate::network::{NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
@@ -144,6 +144,9 @@ enum Command {
     },
     DocumentUrl {
         reply: ReplySender<String>,
+    },
+    History {
+        reply: ReplySender<(Vec<HistoryEntry>, usize)>,
     },
     LastNavigationFailed {
         reply: ReplySender<bool>,
@@ -435,6 +438,16 @@ impl TabHandle {
     /// [`TabError::ActorStopped`].
     pub async fn document_url(&self) -> Result<String, TabError> {
         self.ask(|reply| Command::DocumentUrl { reply }).await
+    }
+
+    /// Committed session-history entries in traversal order, plus the active
+    /// entry's index.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn history(&self) -> Result<(Vec<HistoryEntry>, usize), TabError> {
+        self.ask(|reply| Command::History { reply }).await
     }
 
     /// Subscribes to tab events emitted after this call.
@@ -1308,6 +1321,7 @@ impl Command {
                 reply.is_closed()
             }
             Command::DocumentUrl { reply } => reply.is_closed(),
+            Command::History { reply } => reply.is_closed(),
             Command::LastNavigationFailed { reply } => reply.is_closed(),
         }
     }
@@ -1389,6 +1403,9 @@ impl Command {
             }
             Command::DocumentUrl { reply } => {
                 let _result = reply.send(Ok(tab.document_url.to_string()));
+            }
+            Command::History { reply } => {
+                let _result = reply.send(Ok((tab.history.entries(), tab.history.current_index())));
             }
             Command::LastNavigationFailed { reply } => {
                 let _result = reply.send(Ok(tab.navigation_failed));
