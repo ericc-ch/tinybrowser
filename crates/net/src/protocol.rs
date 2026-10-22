@@ -14,6 +14,15 @@ pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<Stri
     }
 }
 
+/// A field value built by the browser, from text whose grammar excludes every
+/// byte [`hyper::header::HeaderValue`] rejects (a serialized origin, a method
+/// token, a header name), or from bytes already validated by
+/// [`HeaderMap::insert`].
+pub(crate) fn field_value(bytes: impl AsRef<[u8]>) -> hyper::header::HeaderValue {
+    hyper::header::HeaderValue::from_bytes(bytes.as_ref())
+        .expect("browser-built HTTP text and stored field values contain no CTL bytes")
+}
+
 pub(crate) fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -90,6 +99,16 @@ impl HeaderMap {
             value,
         });
         Ok(())
+    }
+
+    /// Appends a field the browser built itself, from an already-parsed
+    /// [`hyper::header::HeaderValue`]. There is nothing left to reject: the
+    /// fallible [`HeaderMap::insert`] is for caller-provided values only.
+    pub(crate) fn append_parsed(&mut self, name: &'static str, value: &hyper::header::HeaderValue) {
+        self.entries.push(Entry {
+            name: name.to_owned(),
+            value: value.as_bytes().to_vec(),
+        });
     }
 
     /// Appends a field that came off the network. A response field value is

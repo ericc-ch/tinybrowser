@@ -101,10 +101,6 @@ impl Connection {
         self.stream.flush()
     }
 
-    pub fn stream_mut(&mut self) -> &mut TcpStream {
-        &mut self.stream
-    }
-
     #[must_use]
     pub fn await_peer_close(&mut self) -> bool {
         let deadline = Instant::now() + PEER_CLOSE_TIMEOUT;
@@ -211,11 +207,6 @@ impl TestServer {
     #[must_use]
     pub fn url(&self, path: &str) -> url::Url {
         url::Url::parse(&format!("http://{}{path}", self.addr)).expect("server URL is absolute")
-    }
-
-    #[must_use]
-    pub fn ws_url(&self, path: &str) -> url::Url {
-        url::Url::parse(&format!("ws://{}{path}", self.addr)).expect("server URL is absolute")
     }
 
     #[must_use]

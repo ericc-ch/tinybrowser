@@ -28,10 +28,10 @@ use tower_service::Service;
 use url::Url;
 
 use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
-use crate::protocol::{HeaderMap, Method};
+use crate::protocol::{HeaderMap, Method, field_value};
 use crate::resolve::{HostMap, ResolveFailure, Target};
 
-/// Absolute deadlines for one `send` / `upgrade` call.
+/// Absolute deadlines for one `send` call.
 ///
 /// `global` is fixed at the start of the call and covers every redirect hop.
 /// `hop` is `timeout_per_call` measured from the current hop.
@@ -129,34 +129,62 @@ impl Service<Name> for HostResolver {
 
 type RequestBody = BoxBody<Bytes, Infallible>;
 
-/// Any agent-dialed stream: plain TCP, a CONNECT tunnel, or TLS over either.
-pub(crate) trait TransportStream:
-    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
-{
+/// An HTTP CONNECT proxy parsed once from [`crate::AgentOptions::proxy`].
+///
+/// The basic-auth credential lives in a sensitive field value, never in the
+/// raw configuration string.
+pub(crate) struct Proxy {
+    destination: hyper::Uri,
+    auth: Option<hyper::header::HeaderValue>,
 }
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TransportStream for T {}
 
-/// Boxed [`TransportStream`] for WebSocket handshakes, whose stream types
-/// differ per scheme and proxy path.
-pub(crate) type BoxedStream = Box<dyn TransportStream>;
+impl Proxy {
+    /// Parses `proxy` into a CONNECT destination and optional credentials.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidProxy`] unless `proxy` is an `http://` URI with
+    /// a host.
+    pub(crate) fn parse(proxy: &str) -> Result<Self, NetError> {
+        let url = Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
+        if url.scheme() != "http" {
+            return Err(NetError::Protocol(ProtocolError::InvalidProxy));
+        }
+        let host = url
+            .host_str()
+            .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
+        let port = url.port_or_known_default().unwrap_or(80);
+        let destination = format!("http://{host}:{port}")
+            .parse::<hyper::Uri>()
+            .map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
+        let auth = if url.username().is_empty() {
+            None
+        } else {
+            let mut value = field_value(basic_authorization(
+                url.username(),
+                url.password().unwrap_or(""),
+            ));
+            value.set_sensitive(true);
+            Some(value)
+        };
+        Ok(Self { destination, auth })
+    }
 
-async fn connect_service<C>(connector: &mut C, uri: hyper::Uri) -> Result<C::Response, C::Error>
-where
-    C: tower_service::Service<hyper::Uri>,
-{
-    std::future::poll_fn(|cx| connector.poll_ready(cx)).await?;
-    connector.call(uri).await
+    fn tunnel(&self, http: HttpConnector<HostResolver>) -> Tunnel<HttpConnector<HostResolver>> {
+        let mut tunnel = Tunnel::new(self.destination.clone(), http);
+        if let Some(auth) = &self.auth {
+            tunnel = tunnel.with_auth(auth.clone());
+        }
+        tunnel
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct HttpEngine {
     client: Client<HttpsConnector<HttpConnector<HostResolver>>, RequestBody>,
-    pub(crate) proxy: Option<String>,
     pub(crate) timeout_global: Option<Duration>,
     pub(crate) timeout_per_call: Option<Duration>,
     proxied: Option<ProxiedClient>,
-    http: HttpConnector<HostResolver>,
-    ws_tls: tokio_native_tls::TlsConnector,
 }
 
 type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
@@ -186,7 +214,7 @@ impl HttpEngine {
     pub(crate) fn new(
         timeout_global: Option<Duration>,
         timeout_per_call: Option<Duration>,
-        proxy: Option<String>,
+        proxy: Option<Proxy>,
         host_map: HostMap,
         tls_cas: &[native_tls::Certificate],
     ) -> Self {
@@ -201,88 +229,21 @@ impl HttpEngine {
         let tls = tls_connector(tls_cas, &["h2", "http/1.1"]);
         let connector = HttpsConnector::from((http.clone(), tls.clone()));
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        let proxied = proxy.as_deref().and_then(|proxy| {
-            let (destination, auth) = proxy_destination(proxy).ok()?;
-            let mut tunnel = Tunnel::new(destination, http.clone());
-            if let Some(auth) = auth {
-                tunnel = tunnel.with_auth(auth);
-            }
-            let connector = HttpsConnector::from((tunnel, tls.clone()));
-            Some(Client::builder(TokioExecutor::new()).build(connector))
+        let proxied = proxy.map(|proxy| {
+            let connector = HttpsConnector::from((proxy.tunnel(http.clone()), tls.clone()));
+            Client::builder(TokioExecutor::new()).build(connector)
         });
-        // WebSocket upgrades are HTTP/1.1 only: asking for h2 here would let a
-        // server negotiate a protocol tungstenite cannot speak.
-        let ws_tls = tls_connector(tls_cas, &["http/1.1"]);
         Self {
             client,
-            proxy,
             timeout_global,
             timeout_per_call,
             proxied,
-            http,
-            ws_tls,
         }
     }
 
-    /// Dials a WebSocket origin through the agent transport: `--resolve`, a
-    /// configured CONNECT proxy, and for `wss` the same TLS backend with
-    /// `http/1.1` ALPN.
-    pub(crate) async fn dial_websocket(&self, url: &Url) -> Result<BoxedStream, NetError> {
-        let secure = match url.scheme() {
-            "ws" => false,
-            "wss" => true,
-            _ => {
-                return Err(NetError::Protocol(ProtocolError::Other(
-                    "unsupported websocket scheme".into(),
-                )));
-            }
-        };
-        let host = url
-            .host_str()
-            .ok_or_else(|| NetError::Protocol(ProtocolError::Other("missing host".into())))?;
-        let authority = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
-        };
-        let mut target = format!(
-            "{}://{authority}{}",
-            if secure { "https" } else { "http" },
-            url.path()
-        );
-        if let Some(query) = url.query() {
-            target.push('?');
-            target.push_str(query);
-        }
-        let uri: hyper::Uri = target
-            .parse()
-            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
-
-        let stream: BoxedStream = if let Some(proxy) = self.proxy.as_deref() {
-            let (destination, auth) = proxy_destination(proxy).map_err(|_| {
-                NetError::Transport(TransportError::Connect("invalid proxy".into()))
-            })?;
-            let mut tunnel = Tunnel::new(destination, self.http.clone());
-            if let Some(auth) = auth {
-                tunnel = tunnel.with_auth(auth);
-            }
-            let connected = connect_service(&mut tunnel, uri)
-                .await
-                .map_err(connect_failure)?;
-            Box::new(connected.into_inner())
-        } else {
-            let connected = connect_service(&mut self.http.clone(), uri)
-                .await
-                .map_err(connect_failure)?;
-            Box::new(connected.into_inner())
-        };
-        if secure {
-            let tls = self.ws_tls.connect(host, stream).await.map_err(|error| {
-                NetError::Transport(TransportError::Tls(error.to_string().into()))
-            })?;
-            Ok(Box::new(tls))
-        } else {
-            Ok(stream)
-        }
+    /// Whether a CONNECT proxy is configured.
+    pub(crate) fn has_proxy(&self) -> bool {
+        self.proxied.is_some()
     }
 
     pub(crate) fn budget_at(&self, start: Instant) -> CallBudget {
@@ -378,10 +339,6 @@ fn timed_out(kind: TimeoutKind) -> NetError {
     NetError::Transport(TransportError::Timeout(kind))
 }
 
-fn connect_failure(error: impl std::fmt::Display) -> NetError {
-    NetError::Transport(TransportError::Connect(error.to_string().into()))
-}
-
 fn map_client_error(error: hyper_util::client::legacy::Error, host: &str) -> NetError {
     if error.is_connect() {
         let mut source = std::error::Error::source(&error);
@@ -425,29 +382,6 @@ fn map_client_error(error: hyper_util::client::legacy::Error, host: &str) -> Net
         return NetError::Transport(TransportError::Connect(error.to_string().into()));
     }
     NetError::Transport(TransportError::Io(std::io::Error::other(error)))
-}
-
-fn proxy_destination(
-    proxy: &str,
-) -> Result<(hyper::Uri, Option<hyper::header::HeaderValue>), NetError> {
-    let url = Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
-    let host = url
-        .host_str()
-        .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
-    let port = url.port_or_known_default().unwrap_or(80);
-    let destination = format!("http://{host}:{port}")
-        .parse::<hyper::Uri>()
-        .map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
-    let auth = if url.username().is_empty() {
-        None
-    } else {
-        Some(
-            basic_authorization(url.username(), url.password().unwrap_or(""))
-                .parse::<hyper::header::HeaderValue>()
-                .map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?,
-        )
-    };
-    Ok((destination, auth))
 }
 
 pub(crate) fn basic_authorization(username: &str, password: &str) -> String {

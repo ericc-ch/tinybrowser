@@ -1,8 +1,7 @@
-//! Blocking HTTP and WebSocket client for the page engine.
+//! Blocking HTTP client for the page engine.
 //!
 //! Types in this crate are the public network surface. Behavior follows
-//! [Fetch](https://fetch.spec.whatwg.org/) for HTTP and the WebSocket protocol
-//! for `ws`/`wss`.
+//! [Fetch](https://fetch.spec.whatwg.org/).
 
 mod client;
 pub mod cors;
@@ -10,10 +9,8 @@ mod error;
 mod protocol;
 mod resolve;
 mod transport;
-mod websocket;
 
 pub use client::{Agent, AgentOptions, Body, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method, combined_header};
-pub use websocket::{WebSocket, WsEvent, WsMessage};

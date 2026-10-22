@@ -468,23 +468,27 @@ fn outbound_request(
 /// (<https://fetch.spec.whatwg.org/#concept-request-origin>). It can still
 /// name a different origin *within* that site, which shares the renderer
 /// process; deriving the origin from a per-frame record the browser owns is a
-/// known gap. A dial with no CORS parameters keeps the same-origin-only
-/// enforcement.
+/// known gap. A dial with no CORS parameters gets same-origin-only enforcement
+/// from `RequestMode::SameOrigin`, the same mode the fetch algorithm uses.
 fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
     if request.kind != DialKind::JsFetch {
         return;
     }
-    match request.cors {
-        Some(cors) => {
-            outbound.cors = Some(net::cors::CorsSettings {
-                mode: cors.mode,
-                credentials: cors.credentials,
-                redirect: cors.redirect,
-                origin: initiator.origin().ascii_serialization(),
-            });
-        }
-        None => outbound.same_origin = Some(initiator.origin()),
-    }
+    let origin = initiator.origin();
+    outbound.cors = Some(match request.cors {
+        Some(cors) => net::cors::CorsSettings {
+            mode: cors.mode,
+            credentials: cors.credentials,
+            redirect: cors.redirect,
+            origin,
+        },
+        None => net::cors::CorsSettings {
+            mode: net::cors::RequestMode::SameOrigin,
+            credentials: net::cors::CredentialsMode::SameOrigin,
+            redirect: net::cors::RedirectMode::Follow,
+            origin,
+        },
+    });
 }
 
 fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutcome> {

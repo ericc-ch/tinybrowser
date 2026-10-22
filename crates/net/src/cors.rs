@@ -8,7 +8,7 @@
 //! browser enforces this module's verdicts, so a compromised renderer cannot
 //! widen its own access.
 
-use crate::protocol::{HeaderMap, Method};
+use crate::protocol::{HeaderMap, Method, field_value};
 
 /// A request's CORS mode
 /// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
@@ -63,9 +63,9 @@ pub enum RedirectMode {
     Manual,
 }
 
-/// The CORS parameters of one request. `origin` is the serialized request
-/// origin, so an opaque origin is the string `null`.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The CORS parameters of one request. `origin` is the request origin, kept
+/// typed so comparisons never re-serialize; an opaque origin stays opaque.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CorsSettings {
     /// CORS mode.
     pub mode: RequestMode,
@@ -73,8 +73,10 @@ pub struct CorsSettings {
     pub credentials: CredentialsMode,
     /// Redirect mode.
     pub redirect: RedirectMode,
-    /// Serialized request origin (`https://example.com`, or `null`).
-    pub origin: String,
+    /// Request origin. `SameOrigin` settings gate every hop against it, and a
+    /// `cors` hop compares it with the response's
+    /// `Access-Control-Allow-Origin` after serialization.
+    pub origin: url::Origin,
 }
 
 /// A response's filtering type
@@ -447,13 +449,16 @@ pub fn preflight_ok(
 #[must_use]
 pub fn preflight_headers(method: &Method, unsafe_names: &[String], origin: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    let _ = headers.insert("Accept", b"*/*");
-    let _ = headers.insert("Origin", origin.as_bytes());
-    let _ = headers.insert("Access-Control-Request-Method", method.as_str().as_bytes());
+    headers.append_parsed("Accept", &hyper::header::HeaderValue::from_static("*/*"));
+    headers.append_parsed("Origin", &field_value(origin));
+    headers.append_parsed(
+        "Access-Control-Request-Method",
+        &field_value(method.as_str()),
+    );
     if !unsafe_names.is_empty() {
-        let _ = headers.insert(
+        headers.append_parsed(
             "Access-Control-Request-Headers",
-            unsafe_names.join(",").as_bytes(),
+            &field_value(unsafe_names.join(",")),
         );
     }
     headers

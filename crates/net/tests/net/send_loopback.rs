@@ -475,6 +475,9 @@ async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
     };
     let debug = format!("{options:?}");
     assert!(!debug.contains("secret"));
+    let agent = Agent::new(options).expect("proxy options");
+    let debug = format!("{agent:?}");
+    assert!(!debug.contains("secret"));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("TLS listener");
     let addr = listener.local_addr().expect("address");
@@ -532,6 +535,19 @@ async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
     }
 }
 
+/// A `User-Agent` with a control byte is invalid configuration, not a header
+/// that silently disappears from every request.
+#[test]
+fn invalid_user_agent_is_rejected_at_construction() {
+    assert!(matches!(
+        Agent::new(AgentOptions {
+            user_agent: Some("tinybrowser\r\nInjected: yes".to_owned()),
+            ..AgentOptions::default()
+        }),
+        Err(NetError::Protocol(ProtocolError::InvalidUserAgent))
+    ));
+}
+
 #[tokio::test]
 async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
     let server = TestServer::start_v6(|connection| {
@@ -547,25 +563,6 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
         .expect("ipv6 send");
     assert_eq!(response.into_body().bytes(8).await.expect("body"), b"v6");
     server.assert_clean();
-
-    let wss = std::net::TcpListener::bind("127.0.0.1:0").expect("wss listener");
-    let wss_addr = wss.local_addr().expect("address");
-    let worker = std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = wss.accept() {
-            use std::io::Write as _;
-            let _ = stream.write_all(b"NOT-TLS");
-        }
-    });
-    assert!(matches!(
-        default_agent()
-            .upgrade(Request::new(
-                Method::GET,
-                url::Url::parse(&format!("wss://{wss_addr}/")).expect("wss"),
-            ))
-            .await,
-        Err(NetError::Transport(TransportError::Tls(_)) | NetError::Protocol(_))
-    ));
-    worker.join().expect("wss worker");
 }
 
 #[tokio::test]
