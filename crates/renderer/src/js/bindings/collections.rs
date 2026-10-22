@@ -10,7 +10,7 @@ use rquickjs::{
 };
 
 use crate::documents::JournalEntry;
-use crate::dom::forms::{option_effective_selected, select_options};
+use crate::dom::forms::{effective_selected_options, select_options};
 use crate::dom::insertion::siblings_around;
 use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace, is_element};
 use crate::js::world::Handle;
@@ -150,10 +150,7 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         ),
         CollectionKind::ElementsByName(name) => collect_by_name(base, document, scope.node, name),
         CollectionKind::SelectOptions => select_options(base, document, scope.node),
-        CollectionKind::SelectedOptions => select_options(base, document, scope.node)
-            .into_iter()
-            .filter(|option| option_effective_selected(base, document, option.node))
-            .collect(),
+        CollectionKind::SelectedOptions => effective_selected_options(base, document, scope.node),
         CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
         CollectionKind::HtmlScripts => collect_html_scripts(&parsed.document, document, scope.node),
         CollectionKind::TableBodies => table_bodies(base, document, scope.node),
@@ -265,9 +262,15 @@ fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
 /// The index of the first selected option, or `-1`
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
 fn select_selected_index(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> i32 {
+    let Some(selected) = effective_selected_options(base, document, select)
+        .into_iter()
+        .next()
+    else {
+        return -1;
+    };
     select_options(base, document, select)
         .iter()
-        .position(|option| option_effective_selected(base, document, option.node))
+        .position(|option| *option == selected)
         .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
 }
 

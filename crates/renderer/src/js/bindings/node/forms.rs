@@ -1220,15 +1220,18 @@ impl JsNode {
         let world = world.borrow();
         Ok(world.document(self.handle.0).map_or(-1, |parsed| {
             let base = &parsed.document.base;
+            let Some(selected) = crate::dom::forms::effective_selected_options(
+                base,
+                self.handle.0.document,
+                self.handle.0.node,
+            )
+            .into_iter()
+            .next() else {
+                return -1;
+            };
             crate::dom::forms::select_options(base, self.handle.0.document, self.handle.0.node)
                 .iter()
-                .position(|option| {
-                    crate::dom::forms::option_effective_selected(
-                        base,
-                        self.handle.0.document,
-                        option.node,
-                    )
-                })
+                .position(|option| *option == selected)
                 .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
         }))
     }

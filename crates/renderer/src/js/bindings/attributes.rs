@@ -1677,13 +1677,7 @@ fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
         .insert(element, crate::js::CreatorInfo { url, line, column });
 }
 
-/// Runs the input element's type-change steps
-/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-///
-/// A change between keywords of the same state leaves the value alone. Across
-/// value-mode states the current value becomes the default, across other
-/// modes the current value is reloaded from the default, and the state's
-/// sanitization algorithm runs last.
+/// What a type change does with the current value slot.
 enum InputValueStore {
     /// Record the value as user-set; later `value` attribute changes do not
     /// override it.
@@ -1694,6 +1688,13 @@ enum InputValueStore {
     Keep,
 }
 
+/// Runs the input element's type-change steps
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+///
+/// A change between keywords of the same state leaves the value alone.
+/// Leaving value mode for a button state makes the current value the new
+/// default, entering value mode reloads the default and clears the dirty
+/// flag, and the state's sanitization algorithm runs last.
 fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId, previous: Option<&str>) -> Result<()> {
     let old = crate::dom::input::InputType::from_attribute(previous);
     let world_rc = world_for_node(ctx, element)?;
@@ -1748,12 +1749,24 @@ fn input_type_store(
     };
     let old_mode = old.value_mode();
     let new_mode = new.value_mode();
+    // Leaving value mode for a button state makes the current value the new
+    // default; the dirty flag stays so a later return to value mode reloads
+    // the same string (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+    if old_mode == crate::dom::input::ValueMode::Current
+        && matches!(
+            new_mode,
+            crate::dom::input::ValueMode::Default | crate::dom::input::ValueMode::DefaultOn
+        )
+    {
+        let value = sanitize_current(world, element, old, current);
+        if !value.is_empty() {
+            set_attribute_sync(ctx, element, "value", &value)?;
+        }
+        return Ok((InputValueStore::Keep, false));
+    }
     if old_mode == crate::dom::input::ValueMode::Current
         && new_mode == crate::dom::input::ValueMode::Current
     {
-        if !current.is_empty() {
-            set_attribute_sync(ctx, element, "value", current)?;
-        }
         let sanitized = sanitize_current(world, element, new, current);
         let changed = sanitized != current;
         // A pristine current value stays tied to the content attribute;
@@ -1769,14 +1782,11 @@ fn input_type_store(
     if old_mode != crate::dom::input::ValueMode::Current
         && new_mode == crate::dom::input::ValueMode::Current
     {
+        // Entering value mode reloads the default and clears the dirty flag;
+        // sanitization happens on read
+        // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
         let raw = attribute.unwrap_or_default();
-        let sanitized = sanitize_current(world, element, new, &raw);
-        let store = if sanitized == raw {
-            InputValueStore::Pristine(raw)
-        } else {
-            InputValueStore::Dirty(sanitized)
-        };
-        return Ok((store, false));
+        return Ok((InputValueStore::Pristine(raw), false));
     }
     Ok((InputValueStore::Keep, false))
 }

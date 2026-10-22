@@ -468,7 +468,9 @@ fn weeks_in_year(year: u32) -> u32 {
 fn iso_week(year: u32, month: u32, day: u32) -> u32 {
     let ordinal = ordinal_day(year, month, day);
     let weekday = weekday_from_days(days_from_civil(year, month, day));
-    (ordinal - weekday + 10) / 7
+    // `weekday_from_days` starts at Monday = 0 while the ISO formula expects
+    // Monday = 1, so subtract 1 from the constant term.
+    (ordinal - weekday + 9) / 7
 }
 
 fn ordinal_day(year: u32, month: u32, day: u32) -> u32 {
@@ -515,12 +517,21 @@ pub(crate) fn valid_time(value: &str) -> Option<Time> {
     let hour = parse_two_digits(parts.next()?)?;
     let minute = parse_two_digits(parts.next()?)?;
     let second = match parts.next() {
-        Some(second) => parse_two_digits(second)?,
-        None => 0,
+        Some(second) => Some(parse_two_digits(second)?),
+        None => None,
     };
-    if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+    if parts.next().is_some()
+        || hour > 23
+        || minute > 59
+        || second.is_some_and(|second| second > 59)
+    {
         return None;
     }
+    // A fractional part needs a seconds component to attach to.
+    if fraction.is_some() && second.is_none() {
+        return None;
+    }
+    let second = second.unwrap_or(0);
     let millis = match fraction {
         Some(fraction) => {
             if fraction.is_empty()
@@ -637,6 +648,7 @@ mod tests {
         assert!(valid_month("2019-12"));
         assert!(!valid_month("0000-12"));
         assert!(valid_week("2020-W53"));
+        assert!(!valid_week("2021-W53"));
         assert!(!valid_week("2019-W53"));
         assert!(!valid_week("2019-w01"));
         assert_eq!(
@@ -650,6 +662,8 @@ mod tests {
         );
         assert_eq!(valid_time("24:00"), None);
         assert_eq!(valid_time("00:60"), None);
+        assert_eq!(valid_time("12:30.5"), None);
+        assert!(valid_time("12:30:00.5").is_some());
         assert_eq!(normalized_time(valid_time("12:30").unwrap()), "12:30");
         assert_eq!(
             normalized_time(valid_time("12:30:01.500").unwrap()),

@@ -255,10 +255,17 @@ fn parse_hsl(args: &Args) -> Option<[u8; 4]> {
     let (components, alpha_text) = legacy_alpha(args)?;
     let hue = hue(&components[0])? / 360.0;
     // The modern syntax accepts a bare number for saturation and lightness,
-    // where 100 means 100%
+    // where 100 means 100%; the legacy comma syntax requires percentages
     // (<https://drafts.csswg.org/css-color-4/#the-hsl-notation>).
-    let saturation = percentage_or_number(&components[1])?.clamp(0.0, 1.0);
-    let lightness = percentage_or_number(&components[2])?.clamp(0.0, 1.0);
+    let percentage_channel = |text: &str| {
+        if args.comma {
+            percentage(text)
+        } else {
+            percentage_or_number(text)
+        }
+    };
+    let saturation = percentage_channel(&components[1])?.clamp(0.0, 1.0);
+    let lightness = percentage_channel(&components[2])?.clamp(0.0, 1.0);
     let alpha = alpha(alpha_text)?;
     let (red, green, blue) = hsl_to_rgb(hue, saturation, lightness);
     Some([channel(red), channel(green), channel(blue), alpha])
@@ -679,21 +686,23 @@ fn parse_color_function(inner: &str) -> Option<ParsedColor> {
     };
     // sRGB is the only space the bitmap stores directly. Other spaces keep
     // their serialization and paint with a best-effort sRGB approximation.
-    let value = [
+    let channels = [
         components[0].value().clamp(0.0, 1.0),
         components[1].value().clamp(0.0, 1.0),
         components[2].value().clamp(0.0, 1.0),
         alpha_value.clamp(0.0, 1.0),
     ];
     let bytes = if space == "display-p3" {
-        let [red, green, blue] = display_p3_to_srgb([value[0], value[1], value[2]]);
-        to_bytes([red, green, blue, value[3]])
+        let [red, green, blue] = display_p3_to_srgb([channels[0], channels[1], channels[2]]);
+        to_bytes([red, green, blue, channels[3]])
     } else {
-        to_bytes(value)
+        to_bytes(channels)
     };
     Some(ParsedColor {
         bytes,
-        value,
+        // Relative colors consume the source in sRGB; Display P3 keeps its
+        // own serialization but exposes the converted components here.
+        value: from_bytes(bytes),
         serialized: Some(serialize_color_function(space, &components, alpha_value)),
     })
 }

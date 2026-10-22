@@ -220,12 +220,9 @@ pub(crate) fn pending_entry(
         }
         "select" => {
             if attr(base, node, "multiple").is_some() {
-                select_options(base, document, node)
+                effective_selected_options(base, document, node)
                     .into_iter()
-                    .filter(|option| {
-                        option_effective_selected(base, document, option.node)
-                            && !is_disabled(base, option.node)
-                    })
+                    .filter(|option| !is_disabled(base, option.node))
                     .map(|option| {
                         PendingEntry::Text(control_name.to_owned(), option_value(base, option.node))
                     })
@@ -326,7 +323,7 @@ pub(crate) fn select_reset_target(
     document: u32,
     select: BlitzId,
 ) -> Option<BlitzId> {
-    if select_display_size(base, select) != 1 {
+    if attr(base, select, "multiple").is_some() || select_display_size(base, select) != 1 {
         return None;
     }
     let options = select_options(base, document, select);
@@ -342,6 +339,50 @@ pub(crate) fn select_reset_target(
         .map(|option| option.node)
 }
 
+/// The options a select effectively has selected, in tree order.
+///
+/// A single-select exposes at most one: the last option selected explicitly,
+/// or the reset default when nothing is selected. The caller reads this once
+/// instead of rescanning the option list per candidate
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
+pub(crate) fn effective_selected_options(
+    base: &BaseDocument,
+    document: u32,
+    select: BlitzId,
+) -> Vec<NodeId> {
+    let options = select_options(base, document, select);
+    if attr(base, select, "multiple").is_some() || select_display_size(base, select) != 1 {
+        return options
+            .into_iter()
+            .filter(|option| option_selected(base, option.node))
+            .collect();
+    }
+    // A single-select keeps only the last explicitly selected option.
+    if let Some(last) = options
+        .iter()
+        .rev()
+        .find(|option| option_selected(base, option.node))
+    {
+        return vec![NodeId {
+            document,
+            node: last.node,
+        }];
+    }
+    // `selectedIndex = -1` and a value that matches nothing set selectedness
+    // on every option; that explicit empty selection must survive a read.
+    if options
+        .iter()
+        .all(|option| option_dirty_selectedness(base, option.node))
+    {
+        return Vec::new();
+    }
+    options
+        .into_iter()
+        .find(|option| !is_disabled(base, option.node))
+        .into_iter()
+        .collect()
+}
+
 /// An option's displayed selectedness, including the reset behavior that
 /// selects the first non-disabled option in a single-select with no selection
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
@@ -350,35 +391,12 @@ pub(crate) fn option_effective_selected(
     document: u32,
     option: BlitzId,
 ) -> bool {
-    if option_selected(base, option) {
-        return true;
-    }
     let Some(select) = option_select_owner(base, option) else {
-        return false;
+        return option_selected(base, option);
     };
-    if select_display_size(base, select) != 1 {
-        return false;
-    }
-    let options = select_options(base, document, select);
-    // Another option's explicit selectedness wins over the default.
-    if options
+    effective_selected_options(base, document, select)
         .iter()
-        .any(|candidate| option_selected(base, candidate.node))
-    {
-        return false;
-    }
-    // `selectedIndex = -1` and a value that matches nothing set selectedness
-    // on every option; that explicit empty selection must survive a read.
-    if options
-        .iter()
-        .all(|candidate| option_dirty_selectedness(base, candidate.node))
-    {
-        return false;
-    }
-    options
-        .iter()
-        .find(|candidate| !is_disabled(base, candidate.node))
-        .is_some_and(|first| first.node == option)
+        .any(|selected| selected.node == option)
 }
 
 /// An `option`'s value: its `value` attribute, else its text
@@ -422,12 +440,9 @@ pub(crate) fn option_text(base: &BaseDocument, option: BlitzId) -> String {
 /// selected) is a known gap; without stored selectedness nothing selects it
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
 pub(crate) fn select_value(base: &BaseDocument, document: u32, select: BlitzId) -> String {
-    for option in select_options(base, document, select) {
-        if option_effective_selected(base, document, option.node) {
-            return option_value(base, option.node);
-        }
-    }
-    String::new()
+    effective_selected_options(base, document, select)
+        .first()
+        .map_or_else(String::new, |option| option_value(base, option.node))
 }
 
 /// Strips and collapses ASCII whitespace runs to single spaces, dropping
