@@ -56,7 +56,7 @@ pub(crate) enum Outcome {
     /// Print the version and exit successfully.
     Version,
     /// Run with this command line.
-    Run(Cli),
+    Run(Box<Cli>),
 }
 
 /// Full help text, also printed when no subcommand is given.
@@ -414,11 +414,11 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 })
             }
         };
-        Ok(Outcome::Run(Cli {
+        Ok(Outcome::Run(Box::new(Cli {
             log_level: self.log_level,
             log_file: self.log_file,
             verbose: self.verbose,
             command,
-        }))
+        })))
     }
 }
