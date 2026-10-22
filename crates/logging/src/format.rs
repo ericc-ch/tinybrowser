@@ -85,7 +85,8 @@ mod tests {
     #[test]
     fn records_are_one_plain_line() {
         let line = record(Level::Info, "browser::tab", format_args!("created tab"));
-        assert_eq!(line.lines().count(), 1, "{line}");
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+        assert!(line.ends_with('\n'), "{line}");
         let line = line.trim_end_matches('\n');
         let mut fields = line.splitn(4, ' ');
         let timestamp = fields.next().expect("timestamp");
@@ -97,9 +98,16 @@ mod tests {
 
     #[test]
     fn newlines_in_messages_stay_on_one_line() {
-        let line = record(Level::Error, "cli", format_args!("bad \"value\" a=b\nnext"));
+        let line = record(
+            Level::Error,
+            "cli",
+            format_args!("bad \"value\" a=b\nnext\rline"),
+        );
         assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.contains("bad \"value\" a=b\\nnext"), "{line}");
+        assert!(
+            line.contains("bad \"value\" a=b\\nnext\\rline"),
+            "{line}"
+        );
     }
 
     #[test]

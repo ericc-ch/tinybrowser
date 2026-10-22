@@ -72,7 +72,7 @@ fn append(path: &std::path::Path, line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{append, format_line};
+    use super::append;
 
     #[test]
     fn installed_hook_records_a_panic_in_the_log_file() {
@@ -97,22 +97,6 @@ mod tests {
         assert!(contents.contains("hook probe 7"), "{contents}");
         assert!(contents.contains("crash.rs:"), "{contents}");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn renders_location_and_message_as_one_record() {
-        let line = format_line("crates/x/src/y.rs:42:7", "index out of bounds");
-        assert!(line.contains(" ERROR panic "));
-        assert!(line.contains("crates/x/src/y.rs:42:7 index out of bounds"));
-        assert_eq!(line.matches('\n').count(), 1);
-        assert!(line.ends_with('\n'));
-    }
-
-    #[test]
-    fn escapes_line_breaks_in_a_message() {
-        let line = format_line("a.rs:1:1", "first\nsecond");
-        assert_eq!(line.matches('\n').count(), 1);
-        assert!(!line.contains('\r'));
     }
 
     #[test]
