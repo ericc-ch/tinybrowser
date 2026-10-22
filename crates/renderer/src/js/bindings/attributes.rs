@@ -1754,9 +1754,20 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     if is_img || is_script {
         note_src_creator(ctx, element);
     }
+    // An `<img>` loads from its `src` even while detached (`new Image()`
+    // never enters a document), but only when its node document is fully
+    // active. `template.content`, `createHTMLDocument`, and `DOMParser`
+    // documents are inert and must not fetch.
+    if is_img {
+        // Only `src` selects image data; `srcdoc` is not an `<img>` attribute
+        // and must not mark an otherwise settled image as loading.
+        if local == "src" && world.borrow().is_active_document(element) {
+            world.borrow_mut().queue_image_update(element);
+        }
+        return Ok(());
+    }
     // A detached `iframe` has no browsing context yet; insertion reads the
-    // current attribute, so queueing here would navigate it twice. The same
-    // is true of `<img>`: connection starts the fetch.
+    // current attribute, so queueing here would navigate it twice.
     let connected = world
         .borrow()
         .document(element)
@@ -1779,8 +1790,6 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
                     spec,
                 )),
         }
-    } else if is_img {
-        world.borrow_mut().queue_image_update(element);
     } else {
         // `src` set on a connected classic script runs the prepare steps,
         // including the fetch when the element is not already started.

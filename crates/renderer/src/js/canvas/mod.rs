@@ -17,11 +17,12 @@ mod path2d;
 mod state;
 mod text;
 
-pub(crate) use state::{Canvas2D, Gradient, Pattern, SourceImage, StyleValue};
+pub(crate) use state::{Canvas2D, ColorMatrix, Gradient, Pattern, Rect, SourceImage, StyleValue};
 
+use base64::Engine as _;
 use rquickjs::function::This;
 use rquickjs::object::Accessor;
-use rquickjs::prelude::{Func, Opt};
+use rquickjs::prelude::{Func, Opt, Rest};
 use rquickjs::{
     Array, Class, Coerced, Ctx, Exception, FromJs, Function, Object, Result, TypedArray, Value,
 };
@@ -30,7 +31,6 @@ use crate::dom::tree::NodeId;
 use crate::js::bindings::{attribute_value, world, wrap_node};
 use path2d::JsPath2D;
 use state::serialize_color;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// A `WebIDL` `DOMString` argument: coerces like `ToString`, then owns the
 /// UTF-8 bytes for the duration of the call.
@@ -52,12 +52,236 @@ impl<'js> FromJs<'js> for DomString {
     }
 }
 
+/// Resolves the canvas element backing a serialization request. A plain
+/// `HTMLCanvasElement` is used directly; an `OffscreenCanvas` wrapper points at
+/// its hidden element through `__tbCanvas`. The resolved node must belong to
+/// this realm and be a real `<canvas>`, the same guard `with_canvas` applies.
+fn canvas_host_node<'js>(ctx: &Ctx<'js>, source: &Value<'js>) -> Result<Option<NodeId>> {
+    let node = if crate::js::bindings::host_node_id(ctx, source).is_some() {
+        source.clone()
+    } else {
+        let Some(object) = source.as_object() else {
+            return Ok(None);
+        };
+        let hidden: Value = object.get("__tbCanvas")?;
+        if hidden.is_undefined() || hidden.is_null() {
+            return Ok(None);
+        }
+        hidden
+    };
+    let Some(id) = crate::js::bindings::host_node_id(ctx, &node) else {
+        return Ok(None);
+    };
+    let world = world(ctx)?;
+    let owner = world.borrow();
+    let is_canvas = owner
+        .with_document(id, |parsed| {
+            parsed
+                .document
+                .base
+                .get_node(id.node)
+                .is_some_and(|node| crate::dom::tree::is_html_tag(Some(&node.data), "canvas"))
+        })
+        .unwrap_or(false);
+    Ok((owner.owns_node(id) && is_canvas).then_some(id))
+}
+
+#[derive(Clone, Copy)]
+enum CanvasImageFormat {
+    Png,
+    Jpeg,
+}
+
+impl CanvasImageFormat {
+    fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+        }
+    }
+}
+
+struct CanvasImage {
+    bytes: Vec<u8>,
+    format: CanvasImageFormat,
+}
+
+/// The `type` argument of `toDataURL`/`toBlob`/`convertToBlob`, converted with
+/// `ToString` and compared ASCII case-insensitively. An unsupported type falls
+/// back to PNG
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
+fn canvas_mime<'js>(ctx: &Ctx<'js>, mime: Option<&Value<'js>>) -> Result<String> {
+    let Some(mime) = mime else {
+        return Ok("image/png".to_owned());
+    };
+    if mime.is_undefined() {
+        return Ok("image/png".to_owned());
+    }
+    Ok(DomString::from_js(ctx, mime.clone())?
+        .0
+        .to_ascii_lowercase())
+}
+
+fn canvas_format(mime: &str) -> CanvasImageFormat {
+    if mime == "image/jpeg" {
+        CanvasImageFormat::Jpeg
+    } else {
+        CanvasImageFormat::Png
+    }
+}
+
+/// JPEG `quality` is in `0..=1`; anything else uses the 0.92 default
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
+fn canvas_quality<'js>(ctx: &Ctx<'js>, quality: Option<&Value<'js>>) -> Result<f32> {
+    let Some(quality) = quality else {
+        return Ok(0.92);
+    };
+    if quality.is_undefined() || quality.is_null() {
+        return Ok(0.92);
+    }
+    let quality = Coerced::<f64>::from_js(ctx, quality.clone())?.0;
+    if quality.is_finite() && (0.0..=1.0).contains(&quality) {
+        Ok(f32_of(quality))
+    } else {
+        Ok(0.92)
+    }
+}
+
+/// Encodes a canvas bitmap. `None` means a zero-sized canvas or a canvas that
+/// never had a context and could not be encoded, which serializes as `data:,`
+/// or an empty blob.
+fn canvas_image<'js>(
+    ctx: &Ctx<'js>,
+    source: &Value<'js>,
+    format: CanvasImageFormat,
+    quality: f32,
+) -> Result<Option<CanvasImage>> {
+    let Some(id) = canvas_host_node(ctx, source)? else {
+        return Ok(None);
+    };
+    let width = canvas_dimension(ctx, id, "width", 300);
+    let height = canvas_dimension(ctx, id, "height", 150);
+    if width == 0 || height == 0 {
+        return Ok(None);
+    }
+    let world = world(ctx)?;
+    let registry = world.borrow().registry();
+    let registry = registry.borrow();
+    if registry.canvas_has_open_layer(id) {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "InvalidStateError",
+            "a layer is open",
+        ));
+    }
+    if registry.canvas_origin_clean(id) == Some(false) {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "SecurityError",
+            "the canvas is not origin-clean",
+        ));
+    }
+    let bytes = match (format, registry.canvas_origin_clean(id)) {
+        (CanvasImageFormat::Png, Some(_)) => registry.canvas_png(id),
+        (CanvasImageFormat::Jpeg, Some(_)) => registry.canvas_jpeg(id, quality),
+        (CanvasImageFormat::Png, None) => Canvas2D::blank_png(width, height),
+        (CanvasImageFormat::Jpeg, None) => Canvas2D::blank_jpeg(width, height, quality),
+    };
+    Ok(bytes.map(|bytes| CanvasImage { bytes, format }))
+}
+
+fn canvas_to_data_url<'js>(
+    ctx: Ctx<'js>,
+    source: Value<'js>,
+    mime: Opt<Value<'js>>,
+    quality: Opt<Value<'js>>,
+) -> Result<String> {
+    let format = canvas_format(&canvas_mime(&ctx, mime.0.as_ref())?);
+    let quality = canvas_quality(&ctx, quality.0.as_ref())?;
+    let Some(image) = canvas_image(&ctx, &source, format, quality)? else {
+        return Ok("data:,".to_owned());
+    };
+    Ok(format!(
+        "data:{};base64,{}",
+        image.format.mime(),
+        base64::engine::general_purpose::STANDARD.encode(image.bytes)
+    ))
+}
+
+fn canvas_to_blob_bytes<'js>(
+    ctx: Ctx<'js>,
+    source: Value<'js>,
+    mime: Opt<Value<'js>>,
+    quality: Opt<Value<'js>>,
+) -> Result<Vec<u8>> {
+    let format = canvas_format(&canvas_mime(&ctx, mime.0.as_ref())?);
+    let quality = canvas_quality(&ctx, quality.0.as_ref())?;
+    Ok(canvas_image(&ctx, &source, format, quality)?
+        .map(|image| image.bytes)
+        .unwrap_or_default())
+}
+
+/// `OffscreenCanvas.transferToImageBitmap()`: snapshot the bitmap, clear the
+/// canvas to transparent black, and wrap the pixels in an `ImageBitmap`
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-transfertoimagebitmap>).
+fn canvas_transfer_to_image_bitmap<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Value<'js>> {
+    let Some(id) = canvas_host_node(&ctx, &source)? else {
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "InvalidStateError",
+            "the canvas is not usable",
+        ));
+    };
+    let width = canvas_dimension(&ctx, id, "width", 300);
+    let height = canvas_dimension(&ctx, id, "height", 150);
+    let image = {
+        let world = world(&ctx)?;
+        let registry = world.borrow().registry();
+        let mut registry = registry.borrow_mut();
+        // A context exists once `getContext` returned it, even before the
+        // first draw; create the bitmap so the first transfer returns a
+        // transparent image instead of "no 2D context".
+        registry.canvas(id, width, height);
+        if registry.canvas_has_open_layer(id) {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "a layer is open",
+            ));
+        }
+        let Some(image) = registry.canvas_snapshot(id) else {
+            return Err(crate::js::bindings::throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "the canvas has no 2D context",
+            ));
+        };
+        registry.clear_canvas_bitmap(id);
+        image
+    };
+    image_bitmap_object(
+        &ctx,
+        image.width,
+        image.height,
+        image.pixels,
+        image.origin_clean,
+    )
+}
+
 /// Builds the `CanvasRenderingContext2D` constructor and its prototype.
 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
+    ctx.globals()
+        .set("__tbCanvasToDataURL", Func::from(canvas_to_data_url))?;
+    ctx.globals()
+        .set("__tbCanvasToBlobBytes", Func::from(canvas_to_blob_bytes))?;
+    ctx.globals().set(
+        "__tbCanvasTransferToImageBitmap",
+        Func::from(canvas_transfer_to_image_bitmap),
+    )?;
     let ctor = Function::new(ctx.clone(), || {})?;
     let prototype = Object::new(ctx.clone())?;
     install_members(ctx, &prototype)?;
-    ctor.set("prototype", prototype)?;
+    ctor.prop("prototype", prototype)?;
     ctx.globals().set("CanvasRenderingContext2D", ctor)?;
     install_gradient_objects(ctx)?;
     install_path2d(ctx)?;
@@ -168,7 +392,6 @@ fn install_methods<'js>(ctx: &Ctx<'js>, prototype: &Object<'js>) -> Result<()> {
     method!("strokeText", 3, stroke_text);
     method!("measureText", 1, measure_text);
     method!("drawFocusIfNeeded", 1, noop);
-    method!("scrollPathIntoView", 0, noop);
 
     Ok(())
 }
@@ -262,14 +485,17 @@ fn install_paint_accessors(prototype: &Object<'_>) -> Result<()> {
         Accessor::new(
             |this: This<Object<'_>>| {
                 with_canvas(this.0.ctx(), &this.0, |canvas| {
-                    serialize_color(canvas.shadow_color())
+                    match canvas.shadow_serialized() {
+                        Some(text) => text.to_owned(),
+                        None => serialize_color(canvas.shadow_color()),
+                    }
                 })
             },
             |this: This<Object<'_>>, value: DomString| {
-                let color = css_color(this.0.ctx(), &this.0, &value)?;
+                let color = css_color_exact(this.0.ctx(), &this.0, &value)?;
                 with_canvas(this.0.ctx(), &this.0, |canvas| {
-                    if let Some(color) = color {
-                        canvas.set_shadow_color(color);
+                    if let Some((color, text)) = color {
+                        canvas.set_shadow_color_exact(color, text);
                     }
                 })
             },
@@ -386,17 +612,14 @@ fn with_canvas<R>(
     let world = world(ctx)?;
     {
         let owner = world.borrow();
-        let is_canvas = owner
-            .with_document(id, |parsed| {
-                parsed
-                    .document
-                    .base
-                    .get_node(id.node)
-                    .is_some_and(|node| {
+        let is_canvas =
+            owner
+                .with_document(id, |parsed| {
+                    parsed.document.base.get_node(id.node).is_some_and(|node| {
                         crate::dom::tree::is_html_tag(Some(&node.data), "canvas")
                     })
-            })
-            .unwrap_or(false);
+                })
+                .unwrap_or(false);
         if !owner.owns_node(id) || !is_canvas {
             return Err(crate::js::bindings::throw_dom(
                 ctx,
@@ -445,7 +668,10 @@ fn enforce_long(ctx: &Ctx<'_>, value: f64) -> Result<i32> {
     }
     let value = value.trunc();
     if value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
-        return Err(Exception::throw_type(ctx, "value is outside the long range"));
+        return Err(Exception::throw_type(
+            ctx,
+            "value is outside the long range",
+        ));
     }
     #[expect(
         clippy::cast_possible_truncation,
@@ -487,6 +713,7 @@ fn restore(this: This<Object<'_>>) -> Result<()> {
 
 fn begin_layer<'js>(this: This<Object<'js>>, options: Opt<Value<'js>>) -> Result<()> {
     let ctx = this.0.ctx();
+    let mut matrix = None;
     if let Some(value) = options.0 {
         if value.is_null() || value.is_undefined() {
             return with_canvas(ctx, &this.0, state::Canvas2D::begin_layer);
@@ -501,12 +728,18 @@ fn begin_layer<'js>(this: This<Object<'js>>, options: Opt<Value<'js>>) -> Result
             && let Ok(filter) = object.get::<_, Value>("filter")
             && filter.is_object()
             && !filter.is_null()
-            && let Ok(validate) = ctx.globals().get::<_, Function>("__tbValidateFilter")
         {
-            validate.call::<_, ()>((filter,))?;
+            // Validate before reading `name`/`type`/`values`, so an invalid
+            // filter throws before any page getter runs.
+            if let Ok(validate) = ctx.globals().get::<_, Function>("__tbValidateFilter") {
+                validate.call::<_, ()>((filter.clone(),))?;
+            }
+            matrix = color_matrix_from_filter(&filter);
         }
     }
-    with_canvas(ctx, &this.0, state::Canvas2D::begin_layer)
+    with_canvas(ctx, &this.0, |canvas| {
+        canvas.begin_layer_filtered(matrix);
+    })
 }
 
 fn end_layer(this: This<Object<'_>>) -> Result<()> {
@@ -565,40 +798,140 @@ fn transform(
     })
 }
 
-fn set_transform(
-    this: This<Object<'_>>,
-    m11: Opt<Coerced<f64>>,
-    m12: Opt<Coerced<f64>>,
-    m21: Opt<Coerced<f64>>,
-    m22: Opt<Coerced<f64>>,
-    dx: Opt<Coerced<f64>>,
-    dy: Opt<Coerced<f64>>,
-) -> Result<()> {
-    let args = (
-        m11.0.as_ref(),
-        m12.0.as_ref(),
-        m21.0.as_ref(),
-        m22.0.as_ref(),
-        dx.0.as_ref(),
-        dy.0.as_ref(),
-    );
-    let (Some(m11), Some(m12), Some(m21), Some(m22), Some(dx), Some(dy)) = args else {
-        // The one-argument overload takes a dictionary; with no members the
-        // transform resets to the identity
-        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-settransform>).
-        if args == (None, None, None, None, None, None) {
-            return with_canvas(this.0.ctx(), &this.0, state::Canvas2D::reset_transform);
+/// Reads a `DOMMatrix2DInit` dictionary. Each member is read once, in
+/// lexicographic order, `undefined` falls back to the default, and the
+/// `m11`/`m12`/... aliases override `a`/`b`/...
+/// (<https://drafts.fxtf.org/geometry/#dictdef-dommatrix2dinit>).
+#[expect(
+    clippy::many_single_char_names,
+    reason = "the names are the DOMMatrix2DInit members a through f"
+)]
+fn matrix_2d_init<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Option<tiny_skia::Transform>> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(Some(tiny_skia::Transform::identity()));
+    }
+    let Some(object) = value.as_object() else {
+        return Err(Exception::throw_type(
+            ctx,
+            "DOMMatrix2DInit must be an object",
+        ));
+    };
+    let read = |name: &str| -> Result<Option<f64>> {
+        let value: Value<'js> = object.get(name)?;
+        if value.is_undefined() {
+            return Ok(None);
         }
+        Ok(Some(Coerced::<f64>::from_js(ctx, value)?.0))
+    };
+    let a = read("a")?;
+    let b = read("b")?;
+    let c = read("c")?;
+    let d = read("d")?;
+    let e = read("e")?;
+    let f = read("f")?;
+    let m11 = read("m11")?;
+    let m12 = read("m12")?;
+    let m21 = read("m21")?;
+    let m22 = read("m22")?;
+    let m41 = read("m41")?;
+    let m42 = read("m42")?;
+    // The two spellings may both appear only when each alias agrees
+    // (<https://drafts.csswg.org/geometry/#matrix-validate-and-fixup-2d>).
+    // SameValueZero compares NaN equal and +0 equal to -0
+    // (<https://tc39.es/ecma262/#sec-samevaluezero>).
+    let same_value_zero = |left: f64, right: f64| {
+        let canonical = |value: f64| {
+            if value.is_nan() {
+                f64::NAN.to_bits()
+            } else if value.abs().to_bits() == 0 {
+                0
+            } else {
+                value.to_bits()
+            }
+        };
+        canonical(left) == canonical(right)
+    };
+    if [(a, m11), (b, m12), (c, m21), (d, m22), (e, m41), (f, m42)]
+        .into_iter()
+        .any(|(short, long)| match (short, long) {
+            (Some(short), Some(long)) => !same_value_zero(short, long),
+            _ => false,
+        })
+    {
+        return Err(Exception::throw_type(
+            ctx,
+            "DOMMatrix2DInit a..f and m11..m42 disagree",
+        ));
+    }
+    let values = [
+        m11.or(a).unwrap_or(1.0),
+        m12.or(b).unwrap_or(0.0),
+        m21.or(c).unwrap_or(0.0),
+        m22.or(d).unwrap_or(1.0),
+        m41.or(e).unwrap_or(0.0),
+        m42.or(f).unwrap_or(0.0),
+    ];
+    if values.iter().any(|value| !value.is_finite()) {
+        return Ok(None);
+    }
+    Ok(Some(tiny_skia::Transform::from_row(
+        f32_of(values[0]),
+        f32_of(values[1]),
+        f32_of(values[2]),
+        f32_of(values[3]),
+        f32_of(values[4]),
+        f32_of(values[5]),
+    )))
+}
+
+#[expect(
+    clippy::many_single_char_names,
+    reason = "the arguments are the six DOMMatrix2DInit components"
+)]
+fn set_transform<'js>(this: This<Object<'js>>, args: Rest<Value<'js>>) -> Result<()> {
+    let ctx = this.0.ctx();
+    let transform = match args.0.as_slice() {
+        [] => Some(tiny_skia::Transform::identity()),
+        [dictionary] => matrix_2d_init(ctx, dictionary)?,
+        [a, b, c, d, e, f] => {
+            let numbers = [
+                Coerced::<f64>::from_js(ctx, a.clone())?.0,
+                Coerced::<f64>::from_js(ctx, b.clone())?.0,
+                Coerced::<f64>::from_js(ctx, c.clone())?.0,
+                Coerced::<f64>::from_js(ctx, d.clone())?.0,
+                Coerced::<f64>::from_js(ctx, e.clone())?.0,
+                Coerced::<f64>::from_js(ctx, f.clone())?.0,
+            ];
+            if numbers.iter().any(|value| !value.is_finite()) {
+                return Ok(());
+            }
+            Some(tiny_skia::Transform::from_row(
+                f32_of(numbers[0]),
+                f32_of(numbers[1]),
+                f32_of(numbers[2]),
+                f32_of(numbers[3]),
+                f32_of(numbers[4]),
+                f32_of(numbers[5]),
+            ))
+        }
+        _ => {
+            return Err(Exception::throw_type(
+                ctx,
+                "setTransform needs six numbers or one dictionary",
+            ));
+        }
+    };
+    let Some(transform) = transform else {
         return Ok(());
     };
-    with_canvas(this.0.ctx(), &this.0, |canvas| {
+    with_canvas(ctx, &this.0, |canvas| {
         canvas.set_transform(
-            f32_of(**m11),
-            f32_of(**m12),
-            f32_of(**m21),
-            f32_of(**m22),
-            f32_of(**dx),
-            f32_of(**dy),
+            transform.sx,
+            transform.ky,
+            transform.kx,
+            transform.sy,
+            transform.tx,
+            transform.ty,
         );
     })
 }
@@ -617,22 +950,7 @@ fn get_transform(this: This<Object<'_>>) -> Result<Object<'_>> {
         object.set_prototype(Some(&prototype))?;
         let init = Array::new(ctx.clone())?;
         for value in [
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ] {
             init.set(init.len(), value)?;
         }
@@ -1248,13 +1566,17 @@ fn create_pattern<'js>(
     repetition: Opt<Value<'js>>,
 ) -> Result<Value<'js>> {
     reject_open_layer(this.0.ctx(), &this.0)?;
-    let repetition = match repetition.0 {
-        None => "repeat".to_owned(),
-        Some(value) if value.is_null() => "repeat".to_owned(),
-        Some(value) => {
-            let ctx = value.ctx().clone();
-            DomString::from_js(&ctx, value)?.to_string()
-        }
+    let Some(repetition) = repetition.0 else {
+        return Err(Exception::throw_type(
+            this.0.ctx(),
+            "createPattern needs a repetition",
+        ));
+    };
+    let repetition = if repetition.is_null() {
+        "repeat".to_owned()
+    } else {
+        let ctx = repetition.ctx().clone();
+        DomString::from_js(&ctx, repetition)?.to_string()
     };
     if !matches!(
         repetition.as_str(),
@@ -1309,9 +1631,7 @@ fn resource_object<'js>(this: &Object<'js>, kind: &str, id: u32) -> Result<Value
     };
     // Use the intrinsic prototype captured at install time. The global is
     // page-writable, the intrinsic is not.
-    let prototype: Object = if let Some(prototype) =
-        world(this.ctx())?.borrow().brand(ctor_name)
-    {
+    let prototype: Object = if let Some(prototype) = world(this.ctx())?.borrow().brand(ctor_name) {
         prototype.restore(this.ctx())?
     } else {
         let ctor: Function = this.ctx().globals().get(ctor_name)?;
@@ -1348,7 +1668,7 @@ fn add_color_stop(this: This<Object<'_>>, offset: Coerced<f64>, color: DomString
     // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvasgradient-addcolorstop>).
     let color = if color.trim().eq_ignore_ascii_case("currentColor") {
         [0, 0, 0, 255]
-    } else if let Some(color) = css_color(this.0.ctx(), &this.0, &color)? {
+    } else if let Some((color, _)) = css_color_exact(this.0.ctx(), &this.0, &color)? {
         color
     } else {
         return Err(crate::js::bindings::throw_dom(
@@ -1370,46 +1690,17 @@ fn resource_id(object: &Object<'_>, kind: &str) -> Option<u32> {
     object.get::<_, u32>(format!("__tb{kind}")).ok()
 }
 
-fn set_pattern_transform(this: This<Object<'_>>, matrix: Value<'_>) -> Result<()> {
+fn set_pattern_transform<'js>(this: This<Object<'js>>, matrix: Value<'js>) -> Result<()> {
     let ctx = this.0.ctx();
-    let Some(matrix) = matrix.as_object() else {
-        return Err(Exception::throw_type(ctx, "setTransform expects an object"));
+    let Some(transform) = matrix_2d_init(ctx, &matrix)? else {
+        return Ok(());
     };
-    let member = |key: &str| -> Option<f64> {
-        matrix
-            .get::<_, Coerced<f64>>(key)
-            .ok()
-            .map(|value| *value)
+    let Some(id) = resource_id(&this.0, "Pattern") else {
+        return Ok(());
     };
-    // A DOMMatrix2DInit accepts a/b/c/d/e/f and their m11/m12/... aliases.
-    // Unknown members are ignored. Any non-finite value leaves the pattern's
-    // previous transform in place rather than invalidating it.
-    for key in ["a", "b", "c", "d", "e", "f", "m11", "m12", "m21", "m22", "m41", "m42"] {
-        if member(key).is_some_and(|value| !value.is_finite()) {
-            return Ok(());
-        }
-    }
-    for (short, long) in [
-        ("a", "m11"),
-        ("b", "m12"),
-        ("c", "m21"),
-        ("d", "m22"),
-        ("e", "m41"),
-        ("f", "m42"),
-    ] {
-        if let (Some(short), Some(long)) = (member(short), member(long))
-            && (short - long).abs() > f64::EPSILON
-        {
-            return Err(Exception::throw_type(
-                ctx,
-                "conflicting DOMMatrix2DInit aliases",
-            ));
-        }
-    }
-    // The pattern shader currently paints without a user transform; the
-    // finite matrix is accepted but not applied yet.
-    let _ = resource_id(&this.0, "Pattern");
-    Ok(())
+    with_canvas(ctx, &this.0, |canvas| {
+        canvas.set_pattern_transform(id, transform);
+    })
 }
 
 // ---- image data ----------------------------------------------------------
@@ -1434,7 +1725,7 @@ fn install_image_data(ctx: &Ctx<'_>) -> Result<()> {
         Accessor::new(image_data_pixel_format, image_data_read_only),
     )?;
     let ctor =
-        rquickjs::function::Constructor::new_prototype(ctx, prototype, image_data_construct)?;
+        rquickjs::function::Constructor::new_prototype(ctx, prototype, ImageDataConstructor)?;
     ctx.globals().set("ImageData", ctor)?;
     Ok(())
 }
@@ -1467,107 +1758,139 @@ fn image_data_read_only(_this: This<Object<'_>>, _value: Value<'_>) -> Result<()
     Ok(())
 }
 
-/// `ImageData` constructor, both overloads
+/// Runs the `ImageData` constructor as a native callback so it can inspect
+/// `new.target`; signature-derived callbacks cannot see `Params`.
+struct ImageDataConstructor;
+
+impl<'js> rquickjs::function::IntoJsFunc<'js, ()> for ImageDataConstructor {
+    fn param_requirements() -> rquickjs::function::ParamRequirement {
+        rquickjs::function::ParamRequirement::any()
+    }
+
+    fn call(&self, params: rquickjs::function::Params<'_, 'js>) -> Result<Value<'js>> {
+        image_data_construct(&params)
+    }
+}
+
+/// Both `ImageData` constructor overloads
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-imagedata-imagedata>).
-fn image_data_construct<'js>(
-    ctx: Ctx<'js>,
-    args: rquickjs::function::Rest<Value<'js>>,
-) -> Result<Object<'js>> {
-    let object = Object::new(ctx.clone())?;
+fn image_data_construct<'js>(params: &rquickjs::function::Params<'_, 'js>) -> Result<Value<'js>> {
+    let ctx = params.ctx().clone();
+    if !params.is_constructor() {
+        return Err(Exception::throw_type(
+            &ctx,
+            "ImageData must be called with new",
+        ));
+    }
     let ctx = &ctx;
-    let Some(first) = args.0.first() else {
+    let args: Vec<Value<'js>> = (0..params.len())
+        .filter_map(|index| params.arg(index))
+        .collect();
+    let object = Object::new(ctx.clone())?;
+    let Some(first) = args.first() else {
         return Err(Exception::throw_type(ctx, "ImageData needs arguments"));
     };
-    let Some(data) = first
+    if let Some(data) = first
         .as_object()
         .and_then(|object| object.as_typed_array::<rquickjs::U8Clamped>())
-    else {
-        if first.as_object().is_some() {
+    {
+        if image_data_buffer_is_shared(first) {
             return Err(Exception::throw_type(
                 ctx,
-                "ImageData data must be a Uint8ClampedArray",
+                "ImageData does not accept shared buffers",
             ));
         }
-        let width = *Coerced::<f64>::from_js(ctx, first.clone())?;
-        let height = args
-            .0
-            .get(1)
+        let Some(sw) = args.get(1) else {
+            return Err(Exception::throw_type(ctx, "ImageData needs a width"));
+        };
+        let sw = *Coerced::<f64>::from_js(ctx, sw.clone())?;
+        let sh = args
+            .get(2)
             .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
-            .transpose()?
-            .ok_or_else(|| Exception::throw_type(ctx, "ImageData needs a height"))?;
-        new_blank_image_data(ctx, &object, width, height, args.0.get(2))?;
-        return Ok(object);
-    };
-    let byte_length = data.len();
-    let width = args
-        .0
+            .transpose()?;
+        let settings = args.get(3);
+        validate_image_data_settings(ctx, settings)?;
+        initialize_image_data_from_data(ctx, &object, data.len(), first, sw, sh, settings)?;
+        return Ok(object.into_value());
+    }
+    // The other data-overload member is Float16Array, which this engine does
+    // not implement. Any other value selects the numeric overload, where
+    // `null`/`{}` go through ToNumber to 0 and fail with IndexSizeError.
+    let width = *Coerced::<f64>::from_js(ctx, first.clone())?;
+    let height = args
         .get(1)
         .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
-        .transpose()?;
-    let height = args
-        .0
-        .get(2)
-        .map(|value| Coerced::<f64>::from_js(ctx, value.clone()).map(|value| *value))
-        .transpose()?;
-    let explicit_dimensions = width.is_some() && height.is_some();
-    let (width, height) = match (width, height) {
-        (None, _) => (u32::try_from(byte_length / 4).unwrap_or(u32::MAX), 1),
-        (Some(width), None) => {
-            let width = canvas_u32(width);
-            if width == 0 {
-                return Err(crate::js::bindings::throw_dom(
-                    ctx,
-                    "IndexSizeError",
-                    "ImageData width must be nonzero",
-                ));
-            }
-            let height = byte_length / 4 / width as usize;
-            (width, u32::try_from(height).unwrap_or(u32::MAX))
-        }
-        (Some(width), Some(height)) => {
-            if !width.is_finite() || !height.is_finite() {
-                return Err(Exception::throw_type(
-                    ctx,
-                    "ImageData dimensions must be finite",
-                ));
-            }
-            (canvas_u32(width), canvas_u32(height))
-        }
+        .transpose()?
+        .ok_or_else(|| Exception::throw_type(ctx, "ImageData needs a height"))?;
+    let settings = args.get(2);
+    validate_image_data_settings(ctx, settings)?;
+    new_blank_image_data(ctx, &object, width, height, settings)?;
+    Ok(object.into_value())
+}
+
+/// A `Uint8ClampedArray`'s buffer is shared when the engine does not classify
+/// it as an ordinary `ArrayBuffer`. Class checks survive cross-realm buffers;
+/// a page cannot fake the internal class with a constructor name.
+fn image_data_buffer_is_shared(value: &Value<'_>) -> bool {
+    let Some(buffer) = value
+        .as_object()
+        .and_then(|object| object.get::<_, Value>("buffer").ok())
+        .filter(Value::is_object)
+    else {
+        return false;
     };
-    if width == 0 || (explicit_dimensions && height == 0) {
+    rquickjs::ArrayBuffer::from_value(buffer).is_none()
+}
+
+/// The data overload of the `ImageData` constructor
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-imagedata-with-data>).
+fn initialize_image_data_from_data<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    byte_length: usize,
+    data: &Value<'js>,
+    sw: f64,
+    sh: Option<f64>,
+    settings: Option<&Value<'js>>,
+) -> Result<()> {
+    if byte_length == 0 || !byte_length.is_multiple_of(4) {
+        return Err(crate::js::bindings::throw_dom(
+            ctx,
+            "InvalidStateError",
+            "ImageData data length must be a nonzero multiple of four",
+        ));
+    }
+    let length = byte_length / 4;
+    let width = canvas_u32(sw);
+    let width_usize = usize::try_from(width).unwrap_or(usize::MAX);
+    if width == 0 || !length.is_multiple_of(width_usize) {
         return Err(crate::js::bindings::throw_dom(
             ctx,
             "IndexSizeError",
-            "ImageData dimensions must be nonzero",
+            "ImageData data length does not match its width",
         ));
     }
-    let expected = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|bytes| bytes.checked_mul(4));
-    if height == 0 || expected != Some(byte_length as u64) {
-        let name = if explicit_dimensions {
-            "IndexSizeError"
-        } else {
-            "InvalidStateError"
-        };
+    let height = length / width_usize;
+    let height = u32::try_from(height).unwrap_or(u32::MAX);
+    if let Some(sh) = sh
+        && canvas_u32(sh) != height
+    {
         return Err(crate::js::bindings::throw_dom(
             ctx,
-            name,
-            "ImageData data length does not match its dimensions",
+            "IndexSizeError",
+            "ImageData data length does not match its height",
         ));
     }
-    let settings = args.0.get(if args.0.len() > 3 { 3 } else { 2 });
-    let (color_space, pixel_format) = image_data_settings(settings);
+    let (color_space, pixel_format) = image_data_settings(ctx, settings)?;
     set_image_data(
         ctx,
-        &object,
+        object,
         width,
         height,
-        first.clone(),
+        data.clone(),
         color_space,
         pixel_format,
-    )?;
-    Ok(object)
+    )
 }
 
 fn new_blank_image_data<'js>(
@@ -1577,12 +1900,6 @@ fn new_blank_image_data<'js>(
     height: f64,
     settings: Option<&Value<'js>>,
 ) -> Result<()> {
-    if !width.is_finite() || !height.is_finite() {
-        return Err(Exception::throw_type(
-            ctx,
-            "ImageData dimensions must be finite",
-        ));
-    }
     let width = canvas_u32(width);
     let height = canvas_u32(height);
     if width == 0 || height == 0 {
@@ -1600,21 +1917,61 @@ fn new_blank_image_data<'js>(
         ));
     };
     let data = data_array(ctx, vec![0; bytes])?.into_value();
-    let (color_space, pixel_format) = image_data_settings(settings);
+    let (color_space, pixel_format) = image_data_settings(ctx, settings)?;
     set_image_data(ctx, object, width, height, data, color_space, pixel_format)
 }
 
-fn image_data_settings(settings: Option<&Value<'_>>) -> (String, String) {
-    let read = |name: &str, default: &str| {
-        settings
-            .and_then(|value| value.as_object())
-            .and_then(|object| object.get::<_, DomString>(name).ok())
-            .map_or_else(|| default.to_owned(), |value| value.to_string())
+/// A dictionary argument must be an object (or null/undefined). Other
+/// primitives cannot convert to `ImageDataSettings` and throw `TypeError`
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>).
+fn validate_image_data_settings(ctx: &Ctx<'_>, settings: Option<&Value<'_>>) -> Result<()> {
+    if let Some(value) = settings
+        && !value.is_null()
+        && !value.is_undefined()
+        && value.as_object().is_none()
+    {
+        return Err(Exception::throw_type(
+            ctx,
+            "ImageData settings must be an object",
+        ));
+    }
+    Ok(())
+}
+
+fn image_data_settings<'js>(
+    ctx: &Ctx<'js>,
+    settings: Option<&Value<'js>>,
+) -> Result<(String, String)> {
+    let Some(object) = settings.and_then(Value::as_object) else {
+        return Ok(("srgb".to_owned(), "rgba-unorm8".to_owned()));
     };
-    (
-        read("colorSpace", "srgb"),
-        read("pixelFormat", "rgba-unorm8"),
-    )
+    let read = |name: &str| -> Result<Option<String>> {
+        let value: Value = object.get(name)?;
+        if value.is_undefined() {
+            return Ok(None);
+        }
+        Ok(Some(
+            Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?,
+        ))
+    };
+    let color_space = read("colorSpace")?.unwrap_or_else(|| "srgb".to_owned());
+    if !matches!(
+        color_space.as_str(),
+        "srgb" | "srgb-linear" | "display-p3" | "display-p3-linear"
+    ) {
+        return Err(Exception::throw_type(
+            ctx,
+            "unknown PredefinedColorSpace value",
+        ));
+    }
+    let pixel_format = read("pixelFormat")?.unwrap_or_else(|| "rgba-unorm8".to_owned());
+    if !matches!(pixel_format.as_str(), "rgba-unorm8" | "rgba-float16") {
+        return Err(Exception::throw_type(
+            ctx,
+            "unknown ImageDataPixelFormat value",
+        ));
+    }
+    Ok((color_space, pixel_format))
 }
 
 fn set_image_data<'js>(
@@ -1692,7 +2049,10 @@ fn get_image_data(
     let x = i32_of(sx);
     let y = i32_of(sy);
     let (pixels, origin_clean) = with_canvas(this.0.ctx(), &this.0, |canvas| {
-        (canvas.read_pixels(x, y, width, height), canvas.origin_clean())
+        (
+            canvas.read_pixels(x, y, width, height),
+            canvas.origin_clean(),
+        )
     })?;
     if !origin_clean {
         return Err(crate::js::bindings::throw_dom(
@@ -2031,11 +2391,12 @@ fn image_bitmap_object<'js>(
     let prototype: Object = ctor.get("prototype")?;
     let image = Object::new(ctx.clone())?;
     image.set_prototype(Some(&prototype))?;
-    let bitmap_id = world(ctx)?
-        .borrow()
-        .registry()
-        .borrow_mut()
-        .insert_bitmap(width, height, pixels, origin_clean);
+    let bitmap_id = world(ctx)?.borrow().registry().borrow_mut().insert_bitmap(
+        width,
+        height,
+        pixels,
+        origin_clean,
+    );
     image.set("__tbBitmap", bitmap_id)?;
     image.set("__tbWidth", width)?;
     image.set("__tbHeight", height)?;
@@ -2222,14 +2583,8 @@ fn draw_image<'js>(
     with_canvas(this.0.ctx(), &this.0, |canvas| {
         canvas.draw_image(
             &image,
-            f32_of(sx),
-            f32_of(sy),
-            f32_of(sw),
-            f32_of(sh),
-            f32_of(dx),
-            f32_of(dy),
-            f32_of(dw),
-            f32_of(dh),
+            Rect::new(f32_of(sx), f32_of(sy), f32_of(sw), f32_of(sh)),
+            Rect::new(f32_of(dx), f32_of(dy), f32_of(dw), f32_of(dh)),
         );
     })
 }
@@ -2250,7 +2605,13 @@ enum ImageLookup {
 /// `ImageData`/`ImageBitmap`, or an `<img>` with decoded pixels
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>).
 fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
-    if let Some(id) = crate::js::bindings::host_node_id(ctx, &value) {
+    // OffscreenCanvas forwards to a hidden canvas element. Transferring that
+    // canvas zeroes its bitmap, so the ordinary zero-size check makes it an
+    // invalid source without a page-writable flag. `canvas_host_node` verifies
+    // that the backing node is this realm's canvas before trusting the wrapper.
+    let node_id =
+        canvas_host_node(ctx, &value)?.or_else(|| crate::js::bindings::host_node_id(ctx, &value));
+    if let Some(id) = node_id {
         let world = world(ctx)?;
         let (loading, broken, size) = {
             let world = world.borrow();
@@ -2301,11 +2662,7 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     if let Some(object) = value.as_object()
         && let Ok(id) = object.get::<_, u64>("__tbBitmap")
     {
-        let image = world(ctx)?
-            .borrow()
-            .registry()
-            .borrow()
-            .bitmap(id);
+        let image = world(ctx)?.borrow().registry().borrow().bitmap(id);
         return Ok(image.map_or(ImageLookup::Invalid, ImageLookup::Decoded));
     }
     let Some((width, height, pixels)) = read_image_data(&value)? else {
@@ -2395,8 +2752,25 @@ fn source_element(
             None => ImageLookup::NotReady,
         });
     }
-    if !(data.name.ns == crate::dom::tree::html_namespace() && data.name.local.as_str() == "img") {
+    if data.name.ns != crate::dom::tree::html_namespace() {
         return Some(ImageLookup::Unsupported);
+    }
+    match data.name.local.as_str() {
+        "video" => {
+            // Video decoding is not implemented, so a video element never has
+            // a frame to draw. It is a valid source type, not an unsupported
+            // one
+            // (<https://html.spec.whatwg.org/multipage/canvas.html#canvasimagesource>).
+            return Some(ImageLookup::NotReady);
+        }
+        "img" => {}
+        _ => return Some(ImageLookup::Unsupported),
+    }
+    if let Some(blitz_dom::node::ImageData::Svg(svg)) = data.image_data() {
+        if zero_size {
+            return Some(ImageLookup::NotReady);
+        }
+        return Some(svg_source_image(svg).map_or(ImageLookup::NotReady, ImageLookup::Decoded));
     }
     let has_source = data.attrs().iter().any(|attribute| {
         attribute.name.local.as_str() == "src" && !attribute.value.trim().is_empty()
@@ -2414,6 +2788,48 @@ fn source_element(
         None if has_source && connected && !zero_size => Some(ImageLookup::Invalid),
         None => Some(ImageLookup::NotReady),
     }
+}
+
+/// Rasterizes an SVG `<img>` at its intrinsic size into straight RGBA pixels
+/// for `drawImage` / `createPattern`.
+fn svg_source_image(svg: &blitz_dom::node::SvgImageData) -> Option<SourceImage> {
+    let (width, height) = crate::render::svg_natural_size(svg);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // The declared viewport is page-controlled. Refuse anything above the
+    // canvas pixmap budget instead of letting a huge SVG allocate gigabytes.
+    let bytes = crate::js::world::canvas_bytes(width, height)?;
+    let mut painter = anyrender_tiny_skia::TinySkiaScenePainter::new(width, height);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "SVG raster sizes are bounded by the pixmap budget"
+    )]
+    let viewport = svg.viewport_transform(width as f32, height as f32);
+    anyrender_svg::render_svg_tree(
+        &mut painter,
+        &svg.tree,
+        kurbo::Affine::new([
+            f64::from(viewport.sx),
+            f64::from(viewport.ky),
+            f64::from(viewport.kx),
+            f64::from(viewport.sy),
+            f64::from(viewport.tx),
+            f64::from(viewport.ty),
+        ]),
+    );
+    let pixmap = painter.pixmap();
+    let mut pixels = Vec::with_capacity(bytes);
+    for pixel in pixmap.pixels() {
+        let color = pixel.demultiply();
+        pixels.extend_from_slice(&[color.red(), color.green(), color.blue(), color.alpha()]);
+    }
+    Some(SourceImage {
+        width,
+        height,
+        pixels,
+        origin_clean: true,
+    })
 }
 
 // ---- text ----------------------------------------------------------------
@@ -2474,6 +2890,8 @@ fn draw_text_cluster<'js>(
         ));
     };
     let text: String = cluster.get("text")?;
+    let cluster_x: f32 = cluster.get("x")?;
+    let cluster_y: f32 = cluster.get("y")?;
     let mut align = None;
     let mut baseline = None;
     let mut dx = 0.0;
@@ -2481,22 +2899,29 @@ fn draw_text_cluster<'js>(
     if let Some(options) = options.0.as_ref().and_then(Value::as_object) {
         align = options.get::<_, String>("align").ok();
         baseline = options.get::<_, String>("baseline").ok();
+        // A missing member is absent, not `undefined` converted to NaN.
         dx = options
-            .get::<_, Coerced<f64>>("x")
-            .map_or(0.0, |value| *value);
+            .get::<_, Option<f64>>("x")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
         dy = options
-            .get::<_, Coerced<f64>>("y")
-            .map_or(0.0, |value| *value);
+            .get::<_, Option<f64>>("y")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0);
     }
     draw_text_with(
         this,
         &text,
-        x + dx,
-        y + dy,
+        x + dx - f64::from(cluster_x),
+        y + dy - f64::from(cluster_y),
         None,
         stroke,
-        align.as_deref(),
-        baseline.as_deref(),
+        // The cluster's stored x/y already include the context alignment and
+        // baseline; only an explicit option changes them here.
+        align.as_deref().or(Some("left")),
+        baseline.as_deref().or(Some("top")),
     )
 }
 
@@ -2509,6 +2934,30 @@ fn draw_text(
     stroke: bool,
 ) -> Result<()> {
     draw_text_with(this, text, x, y, max_width, stroke, None, None)
+}
+
+/// Horizontal shift from the text anchor to the alignment point. Negative
+/// shifts move the string left for `center` and `right`.
+fn alignment_offset(shaped: &text::ShapedText, resolved: &str) -> f32 {
+    let width = shaped.width * shaped.scale_x;
+    match resolved {
+        "center" => -width / 2.0,
+        "right" | "end" => -width,
+        _ => 0.0,
+    }
+}
+
+/// Vertical shift from the top of the line box to the requested baseline.
+/// All five text operations share this to keep the signs consistent.
+fn baseline_offset(shaped: &text::ShapedText, baseline: &str) -> f32 {
+    match baseline {
+        "top" => 0.0,
+        "hanging" => shaped.hanging_baseline - shaped.ascent,
+        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
+        "bottom" => -(shaped.ascent + shaped.descent),
+        "ideographic" => shaped.ideographic_baseline - shaped.ascent,
+        _ => -shaped.ascent,
+    }
 }
 
 #[expect(
@@ -2564,29 +3013,18 @@ fn draw_text_with(
         language.as_deref(),
         &kerning,
         &mut font_ctx,
+        false,
     );
     let Some(path) = shaped.path.as_ref() else {
         return Ok(());
     };
-    let width = shaped.width * shaped.scale_x;
     let direction = with_canvas(ctx, &this.0, |canvas| canvas.direction().to_owned())?;
     let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
-    let dx = match resolved {
-        "center" => -width / 2.0,
-        "right" | "end" => -width,
-        _ => 0.0,
-    };
+    let dx = alignment_offset(&shaped, resolved);
     // The shaped layout's origin is the top of the line, so shift it up by
     // the distance from the top to the chosen baseline
     // (<https://html.spec.whatwg.org/multipage/canvas.html#text-baselines>).
-    let dy = match baseline.as_str() {
-        "top" => 0.0,
-        "hanging" => shaped.hanging_baseline - shaped.ascent,
-        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
-        "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
-        _ => -shaped.ascent,
-    };
+    let dy = baseline_offset(&shaped, &baseline);
     let (x, y) = (f32_of(x) + dx, f32_of(y) + dy);
     with_canvas(ctx, &this.0, |canvas| {
         if stroke {
@@ -2611,21 +3049,18 @@ fn text_range<'js>(
     text: &str,
     args: &[Value<'js>],
     default_full: bool,
+    options_first: bool,
+    allow_reversed: bool,
 ) -> Result<(usize, usize)> {
     let length = text.encode_utf16().count();
-    let mut index = 0;
-    let mut options = None;
-    if let Some(value) = args.first()
+    if options_first
+        && let Some(value) = args.first()
         && value.is_object()
         && !value.is_null()
     {
-        options = Some(value.clone());
-        index = 1;
-    }
-    if options.is_some() {
         return Ok((0, length));
     }
-    if args.len() <= index {
+    if args.is_empty() {
         if default_full {
             return Ok((0, length));
         }
@@ -2634,8 +3069,8 @@ fn text_range<'js>(
             "a start and end index are required",
         ));
     }
-    let start = *Coerced::<f64>::from_js(ctx, args[index].clone())?;
-    let end = match args.get(index + 1) {
+    let start = *Coerced::<f64>::from_js(ctx, args[0].clone())?;
+    let end = match args.get(1) {
         Some(value) => Some(*Coerced::<f64>::from_js(ctx, value.clone())?),
         None if default_full => Some(length as f64),
         None => None,
@@ -2647,7 +3082,7 @@ fn text_range<'js>(
         return Err(Exception::throw_type(ctx, "an end index is required"));
     };
     let (start, end) = (start as usize, end as usize);
-    if start > length || end > length || start > end {
+    if start > length || end > length || (!allow_reversed && start > end) {
         return Err(crate::js::bindings::throw_dom(
             ctx,
             "IndexSizeError",
@@ -2667,14 +3102,33 @@ fn get_text_clusters<'js>(
 ) -> Result<Array<'js>> {
     let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
-    let (start, end) = text_range(ctx, &text, &args.0, true)?;
-    let align: String = this.0.get("__tbAlign")?;
-    let baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
-    let width: f32 = this.0.get("width").unwrap_or(0.0);
-    let ascent: f32 = this.0.get("emHeightAscent").unwrap_or(0.0);
-    let descent: f32 = this.0.get("emHeightDescent").unwrap_or(0.0);
-    let mut align = align;
-    let mut baseline = baseline;
+    let (start, end) = text_range(ctx, &text, &args.0, true, true, false)?;
+    let font: String = this.0.get("__tbFont")?;
+    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
+    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
+    let lang: String = this
+        .0
+        .get("__tbLang")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let kerning: String = this
+        .0
+        .get("__tbKerning")
+        .unwrap_or_else(|_| "auto".to_owned());
+    let language = resolved_language(ctx, &this.0, &lang);
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(
+        &text,
+        &font,
+        None,
+        letter,
+        word,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+        true,
+    );
+    let mut align: String = this.0.get("__tbAlign")?;
+    let mut baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
     if let Some(options) = args.0.first().and_then(Value::as_object) {
         if let Ok(value) = options.get::<_, String>("align") {
             align = value;
@@ -2683,36 +3137,28 @@ fn get_text_clusters<'js>(
             baseline = value;
         }
     }
-    let x = match align.as_str() {
-        "center" => width / 2.0,
-        "right" | "end" => width,
-        _ => 0.0,
-    };
-    let y = match baseline.as_str() {
-        "top" | "hanging" => 0.0,
-        "middle" => f32::midpoint(ascent, descent),
-        "bottom" | "ideographic" => ascent + descent,
-        _ => ascent,
-    };
+    let direction: String = this
+        .0
+        .get("__tbDirection")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let x = alignment_offset(&shaped, resolved);
+    let y = baseline_offset(&shaped, &baseline);
     let array = Array::new(ctx.clone())?;
-    let mut utf16 = 0usize;
-    for (byte_index, grapheme) in text.grapheme_indices(true) {
-        let cluster_start = text[..byte_index].encode_utf16().count();
-        let cluster_end = cluster_start + grapheme.encode_utf16().count();
-        utf16 = cluster_end;
-        if cluster_start < start || cluster_end > end {
+    for cluster in &shaped.clusters {
+        if cluster.utf16_start < start || cluster.utf16_end > end {
             continue;
         }
-        let cluster = Object::new(ctx.clone())?;
-        cluster.set("start", cluster_start as u32)?;
-        cluster.set("end", cluster_end as u32)?;
-        cluster.set("x", x)?;
-        cluster.set("y", y)?;
-        cluster.set("text", grapheme)?;
-        array.set(array.len(), cluster)?;
-    }
-    if utf16 < end {
-        let _ = utf16;
+        let object = Object::new(ctx.clone())?;
+        object.set("start", cluster.utf16_start as u32)?;
+        object.set("end", cluster.utf16_end as u32)?;
+        // The cluster position is measured from the alignment point back to
+        // the cluster, so `fillTextCluster` can subtract it
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-textmetrics-gettextclusters>).
+        object.set("x", -(x + cluster.offset * shaped.scale_x))?;
+        object.set("y", -y)?;
+        object.set("text", &text[cluster.byte_start..cluster.byte_end])?;
+        array.set(array.len(), object)?;
     }
     Ok(array)
 }
@@ -2723,7 +3169,7 @@ fn get_actual_bounding_box<'js>(
 ) -> Result<Object<'js>> {
     let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
-    let (start, end) = text_range(ctx, &text, &args.0, false)?;
+    let (start, end) = text_range(ctx, &text, &args.0, false, false, false)?;
     let padded: String = {
         let mut padded = String::with_capacity(text.len());
         let mut offset = 0usize;
@@ -2762,6 +3208,7 @@ fn get_actual_bounding_box<'js>(
         language.as_deref(),
         &kerning,
         &mut font_ctx,
+        false,
     );
     let align: String = this
         .0
@@ -2787,14 +3234,7 @@ fn get_actual_bounding_box<'js>(
         .0
         .get("__tbBaseline")
         .unwrap_or_else(|_| "alphabetic".to_owned());
-    let dy = match baseline.as_str() {
-        "top" => 0.0,
-        "hanging" => shaped.hanging_baseline - shaped.ascent,
-        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
-        "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
-        _ => -shaped.ascent,
-    };
+    let dy = baseline_offset(&shaped, &baseline);
     let shift = -shaped.ascent - dy;
     let ascent = shaped.actual_ascent + shift;
     let descent = shaped.actual_descent - shift;
@@ -2812,37 +3252,141 @@ fn get_selection_rects<'js>(
 ) -> Result<Array<'js>> {
     let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
-    let (start, end) = text_range(ctx, &text, &args.0, false)?;
-    // Selection rectangles are empty for a reversed or empty range. The
-    // shaped cluster advances are not exposed yet; returning an empty list is
-    // deliberate, but the arguments are still validated.
-    let _ = (start, end);
-    Array::new(ctx.clone())
+    let (start, end) = text_range(ctx, &text, &args.0, false, false, true)?;
+    // A reversed or empty range has no selection.
+    if start >= end {
+        return Array::new(ctx.clone());
+    }
+    let font: String = this.0.get("__tbFont")?;
+    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
+    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
+    let lang: String = this
+        .0
+        .get("__tbLang")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let kerning: String = this
+        .0
+        .get("__tbKerning")
+        .unwrap_or_else(|_| "auto".to_owned());
+    let language = resolved_language(ctx, &this.0, &lang);
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(
+        &text,
+        &font,
+        None,
+        letter,
+        word,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+        true,
+    );
+    let align: String = this.0.get("__tbAlign")?;
+    let baseline: String = this.0.get("__tbBaseline").unwrap_or_default();
+    let direction: String = this
+        .0
+        .get("__tbDirection")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let align_dx = alignment_offset(&shaped, resolved);
+    let baseline_dy = baseline_offset(&shaped, &baseline);
+    let mut selected: Vec<(f32, f32)> = shaped
+        .clusters
+        .iter()
+        .filter(|cluster| cluster.utf16_start >= start && cluster.utf16_end <= end)
+        .map(|cluster| {
+            (
+                cluster.offset * shaped.scale_x,
+                (cluster.offset + cluster.advance) * shaped.scale_x,
+            )
+        })
+        .collect();
+    selected.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut runs: Vec<(f32, f32)> = Vec::new();
+    for (left, right) in selected {
+        if let Some(last) = runs.last_mut()
+            && (left - last.1).abs() <= 0.01
+        {
+            last.1 = last.1.max(right);
+        } else {
+            runs.push((left, right));
+        }
+    }
+    let shift = -shaped.ascent - baseline_dy;
+    let top = -shaped.font_ascent - shift;
+    let bottom = shaped.font_descent - shift;
+    let array = Array::new(ctx.clone())?;
+    for (left, right) in runs {
+        let x = align_dx + left;
+        let width = right - left;
+        let rect = crate::js::bindings::geometry::dom_rect(
+            ctx,
+            f64::from(x),
+            f64::from(top),
+            f64::from(width),
+            f64::from(bottom - top),
+        )?;
+        array.set(array.len(), rect)?;
+    }
+    Ok(array)
 }
 
-/// Nearest cluster boundary to a horizontal offset. Cluster starts delimit
-/// the text, so this returns the closest UTF-16 start index.
+/// Nearest cluster boundary to a horizontal offset.
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "the offset is clamped to the text width and indices fit in unsigned long"
+    reason = "cluster indices are UTF-16 offsets in an unsigned long"
 )]
 fn get_index_from_offset(this: This<Object<'_>>, offset: Coerced<f64>) -> Result<u32> {
+    let ctx = this.0.ctx();
     let text: String = this.0.get("__tbText")?;
-    let width: f32 = this.0.get("width").unwrap_or(0.0);
+    let font: String = this.0.get("__tbFont")?;
+    let letter: f32 = this.0.get("__tbLetterSpacing").unwrap_or(0.0);
+    let word: f32 = this.0.get("__tbWordSpacing").unwrap_or(0.0);
+    let lang: String = this
+        .0
+        .get("__tbLang")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let kerning: String = this
+        .0
+        .get("__tbKerning")
+        .unwrap_or_else(|_| "auto".to_owned());
+    let language = resolved_language(ctx, &this.0, &lang);
+    let mut font_ctx = document_font_context(ctx, &this.0)?;
+    let shaped = text::shape(
+        &text,
+        &font,
+        None,
+        letter,
+        word,
+        language.as_deref(),
+        &kerning,
+        &mut font_ctx,
+        true,
+    );
+    let align: String = this.0.get("__tbAlign")?;
+    let direction: String = this
+        .0
+        .get("__tbDirection")
+        .unwrap_or_else(|_| "inherit".to_owned());
+    let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
+    let width = shaped.width * shaped.scale_x;
     if width <= 0.0 {
         return Ok(0);
     }
-    let ratio = (f32_of(*offset) / width).clamp(0.0, 1.0);
-    let target = ratio * text.encode_utf16().count() as f32;
-    let mut best = 0u32;
+    // The offset is measured from the alignment point, so undo the alignment
+    // shift before comparing against left-to-right cluster positions.
+    let target = (f32_of(*offset) - alignment_offset(&shaped, resolved)).clamp(0.0, width);
+    let mut best = 0_u32;
     let mut best_distance = f32::MAX;
-    for (byte_index, _) in text.grapheme_indices(true) {
-        let start = text[..byte_index].encode_utf16().count();
-        let distance = (start as f32 - target).abs();
-        if distance < best_distance {
-            best_distance = distance;
-            best = start as u32;
+    for cluster in &shaped.clusters {
+        let start = cluster.offset * shaped.scale_x;
+        let end = start + cluster.advance * shaped.scale_x;
+        for (boundary, position) in [(cluster.utf16_start, start), (cluster.utf16_end, end)] {
+            let distance = (position - target).abs();
+            if distance < best_distance {
+                best_distance = distance;
+                best = boundary as u32;
+            }
         }
     }
     Ok(best)
@@ -2877,7 +3421,36 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
         language.as_deref(),
         &kerning,
         &mut font_ctx,
+        true,
     );
+    // Canvas `width` is a double, and `word-spacing` is a double of layout
+    // units. Parley accumulates spacing in f32, which rounds the total before
+    // the caller adds the same spacing in f64 (WPT's wordSpacing.change.font
+    // compares exactly). Shape once without spacing and add it in f64.
+    let width = if word_spacing == 0.0 {
+        f64::from(shaped.width)
+    } else {
+        let unspaced = text::shape(
+            &text,
+            &font,
+            None,
+            letter_spacing,
+            0.0,
+            language.as_deref(),
+            &kerning,
+            &mut font_ctx,
+            false,
+        );
+        let spaces = text.chars().filter(char::is_ascii_whitespace).count();
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a string with more than 2^53 spaces cannot fit in memory"
+        )]
+        let spacing = f64::from(word_spacing) * spaces as f64;
+        f64::from(unspaced.width) + spacing
+    };
+    // Keep positive zero so `TextMetrics` does not expose `-0`.
+    let width = if width == 0.0 { 0.0 } else { width };
     let resolved = resolved_alignment(ctx, &this.0, &align, &direction);
     let (actual_left, actual_right) = match resolved {
         "right" | "end" => (
@@ -2893,14 +3466,7 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     // Every y metric is measured from the selected text baseline. `shift` is
     // the distance from the alphabetic baseline to that baseline (negative
     // above it).
-    let dy = match baseline.as_str() {
-        "top" => 0.0,
-        "hanging" => shaped.hanging_baseline - shaped.ascent,
-        "middle" => -(shaped.ascent + shaped.descent) / 2.0,
-        "bottom" => -(shaped.ascent + shaped.descent),
-        "ideographic" => -shaped.ideographic_baseline - shaped.ascent,
-        _ => -shaped.ascent,
-    };
+    let dy = baseline_offset(&shaped, &baseline);
     let shift = -shaped.ascent - dy;
     let object = Object::new(ctx.clone())?;
     object.set("__tbText", text.to_string())?;
@@ -2918,7 +3484,7 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
     object.set("getActualBoundingBox", Func::from(get_actual_bounding_box))?;
     object.set("getSelectionRects", Func::from(get_selection_rects))?;
     object.set("getIndexFromOffset", Func::from(get_index_from_offset))?;
-    object.set("width", shaped.width)?;
+    object.set("width", width)?;
     object.set("actualBoundingBoxLeft", actual_left)?;
     object.set("actualBoundingBoxRight", actual_right)?;
     object.set("actualBoundingBoxAscent", shaped.actual_ascent + shift)?;
@@ -2934,14 +3500,14 @@ fn measure_text(this: This<Object<'_>>, text: DomString) -> Result<Object<'_>> {
 }
 
 fn get_filter(this: This<Object<'_>>) -> Result<Value<'_>> {
-    if let Ok(value) = this.0.get::<_, Value>("__tbFilterObject")
-        && !value.is_undefined()
-        && !value.is_null()
-    {
-        return Ok(value);
+    let ctx = this.0.ctx().clone();
+    // The filter object is drawing state. `save()` clones it with the rest of
+    // `State`, so `restore()` brings back both the object and its matrix.
+    if let Some(object) = with_canvas(&ctx, &this.0, |canvas| canvas.filter_object())? {
+        return object.restore(&ctx);
     }
-    let filter = with_canvas(this.0.ctx(), &this.0, |canvas| canvas.filter().to_owned())?;
-    Ok(rquickjs::String::from_str(this.0.ctx().clone(), &filter)?.into_value())
+    let filter = with_canvas(&ctx, &this.0, |canvas| canvas.filter().to_owned())?;
+    Ok(rquickjs::String::from_str(ctx, &filter)?.into_value())
 }
 
 fn set_filter_binding<'js>(this: This<Object<'js>>, value: Value<'js>) -> Result<()> {
@@ -2952,16 +3518,84 @@ fn set_filter_binding<'js>(this: This<Object<'js>>, value: Value<'js>) -> Result
             .is_ok_and(|ctor| object.is_instance_of(&ctor))
     });
     if is_canvas_filter {
-        this.0.set("__tbFilterObject", value)?;
-        return Ok(());
+        let matrix = color_matrix_from_filter(&value);
+        let object = rquickjs::Persistent::save(ctx, value);
+        return with_canvas(ctx, &this.0, move |canvas| {
+            canvas.set_filter_object(Some(object));
+            canvas.set_filter_matrix(matrix);
+        });
     }
     let text = DomString::from_js(ctx, value)?.to_string();
     if !valid_filter(&text) {
         return Ok(());
     }
-    this.0
-        .set("__tbFilterObject", Value::new_undefined(ctx.clone()))?;
-    with_canvas(ctx, &this.0, |canvas| canvas.set_filter(&text))
+    with_canvas(ctx, &this.0, move |canvas| {
+        canvas.set_filter_object(None);
+        canvas.set_filter(&text);
+        canvas.set_filter_matrix(None);
+    })
+}
+
+/// Reads a `colorMatrix` filter init dictionary (or a list of them) into one
+/// matrix. Returns `None` for filters this engine cannot represent as a color
+/// matrix, so the drawing path stays unfiltered instead of wrong.
+fn color_matrix_from_filter(value: &Value<'_>) -> Option<ColorMatrix> {
+    let object = value.as_object()?;
+    let init = object
+        .get::<_, Value>("__tbInit")
+        .ok()
+        .filter(|value| !value.is_undefined())
+        .unwrap_or_else(|| value.clone());
+    if let Some(array) = init.as_array() {
+        let mut matrix = ColorMatrix::IDENTITY;
+        for index in 0..array.len() {
+            let item = array.get::<Value>(index).ok()?;
+            matrix = matrix.then(color_matrix_from_single(&item)?);
+        }
+        return Some(matrix);
+    }
+    color_matrix_from_single(&init)
+}
+
+fn color_matrix_from_single(value: &Value<'_>) -> Option<ColorMatrix> {
+    let object = value.as_object()?;
+    let name: String = object.get("name").ok()?;
+    if name != "colorMatrix" {
+        return None;
+    }
+    let kind: Option<String> = object.get("type").ok();
+    match kind.as_deref() {
+        // `feColorMatrix` defaults: hueRotate 0 degrees, saturate 1.
+        Some("hueRotate") => {
+            let degrees = object
+                .get::<_, Coerced<f64>>("values")
+                .ok()
+                .map_or(0.0, |value| *value);
+            Some(ColorMatrix::hue_rotate(f32_of(degrees)))
+        }
+        Some("saturate") => {
+            let amount = object
+                .get::<_, Coerced<f64>>("values")
+                .ok()
+                .map_or(1.0, |value| *value);
+            Some(ColorMatrix::saturate(f32_of(amount)))
+        }
+        Some("luminanceToAlpha") => Some(ColorMatrix::luminance_to_alpha()),
+        Some("matrix") | None => {
+            let values = object.get::<_, Array>("values").ok()?;
+            if values.len() != 20 {
+                return None;
+            }
+            let mut matrix = [0.0; 20];
+            for (index, slot) in matrix.iter_mut().enumerate() {
+                let value: Coerced<f64> = values.get(index).ok()?;
+                *slot = f32_of(*value);
+            }
+            Some(ColorMatrix::from_values(matrix))
+        }
+        // An unknown `type` is not a color matrix this engine can apply.
+        Some(_) => None,
+    }
 }
 
 /// Index of the `)` matching the opening `(` that was already consumed,
@@ -3113,6 +3747,9 @@ fn style_value<'js>(
         StyleValue::Color(color) => {
             Ok(rquickjs::String::from_str(ctx.clone(), &serialize_color(color))?.into_value())
         }
+        StyleValue::ColorExact(_, text) => {
+            Ok(rquickjs::String::from_str(ctx.clone(), &text)?.into_value())
+        }
         StyleValue::Gradient(id) | StyleValue::Pattern(id) => {
             let resources: Object = object.get("__tbRes")?;
             if let Ok(value) = resources.get::<_, Value>(id.to_string()) {
@@ -3170,7 +3807,7 @@ fn import_resource(
                 canvas.insert_pattern(definition)
             })?))
         }
-        StyleValue::Color(_) => Ok(style),
+        StyleValue::Color(_) | StyleValue::ColorExact(..) => Ok(style),
     }
 }
 
@@ -3183,8 +3820,11 @@ fn set_style_value<'js>(
     let resource = value.as_object().cloned();
     let style = if let Some(string) = value.as_string() {
         let text = string.to_string()?;
-        match css_color(ctx, object, &text)? {
-            Some(color) => Some(StyleValue::Color(color)),
+        match css_color_exact(ctx, object, &text)? {
+            Some((color, serialized)) => Some(match serialized {
+                Some(serialized) => StyleValue::ColorExact(color, serialized),
+                None => StyleValue::Color(color),
+            }),
             None => return Ok(()),
         }
     } else if let Some(gradient) = value
@@ -3201,8 +3841,11 @@ fn set_style_value<'js>(
         Some(StyleValue::Color(color))
     } else {
         let text = Coerced::<rquickjs::String<'_>>::from_js(ctx, value)?.to_string()?;
-        match css_color(ctx, object, &text)? {
-            Some(color) => Some(StyleValue::Color(color)),
+        match css_color_exact(ctx, object, &text)? {
+            Some((color, serialized)) => Some(match serialized {
+                Some(serialized) => StyleValue::ColorExact(color, serialized),
+                None => StyleValue::Color(color),
+            }),
             None => return Ok(()),
         }
     };
@@ -3298,10 +3941,26 @@ fn resolved_language(ctx: &Ctx<'_>, object: &Object<'_>, lang: &str) -> Option<S
     if lang != "inherit" && !lang.is_empty() {
         return Some(lang.to_owned());
     }
-    canvas_id(object)
-        .ok()
-        .and_then(|id| attribute_value(ctx, id, "lang").ok())
-        .filter(|lang| !lang.trim().is_empty())
+    let id = canvas_id(object).ok()?;
+    let owner = crate::js::bindings::world_for_node(ctx, id).ok()?;
+    let owner = owner.borrow();
+    let parsed = owner.document(id)?;
+    // `lang` inherits from the nearest ancestor that declares it, and an empty
+    // declaration stops the search
+    // (<https://html.spec.whatwg.org/multipage/dom.html#attr-lang>). An
+    // OffscreenCanvas has no element of its own, so it reads the document root,
+    // which is where `documentElement.lang` lives.
+    for ancestor in crate::dom::tree::ancestor_chain(&parsed.document.base, id.document, id.node) {
+        if let Some(value) = crate::dom::tree::attr(&parsed.document.base, ancestor.node, "lang") {
+            return (!value.trim().is_empty()).then(|| value.to_owned());
+        }
+    }
+    // A detached canvas (the OffscreenCanvas backing element) has no ancestor
+    // chain into the document, so read the document root explicitly.
+    let root = parsed.document.base.root_element().id;
+    crate::dom::tree::attr(&parsed.document.base, root, "lang")
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Resolves `start`/`end` using the context direction, then the canvas
@@ -3353,17 +4012,35 @@ fn canvas_object(this: This<Object<'_>>) -> Result<Value<'_>> {
     wrap_node(ctx, id)
 }
 
-/// Parses a canvas color. `currentColor` resolves against the canvas
-/// element's computed `color` at assignment time, not at paint time
+/// Parses a canvas color, preserving the `color(srgb …)` serialization that
+/// `fillStyle`/`strokeStyle`/`shadowColor` must report for color functions and
+/// `color-mix`. `currentColor` resolves against the canvas element's computed
+/// `color` at assignment time, not at paint time
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>).
-fn css_color(ctx: &Ctx<'_>, object: &Object<'_>, text: &str) -> Result<Option<[u8; 4]>> {
-    if let Some(color) = color::parse(text) {
-        return Ok(Some(color));
+fn css_color_exact(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    text: &str,
+) -> Result<Option<([u8; 4], Option<String>)>> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("currentColor") {
+        return Ok(Some((current_color(ctx, object)?, None)));
     }
-    if text.trim().eq_ignore_ascii_case("currentColor") {
-        return Ok(Some(current_color(ctx, object)?));
-    }
-    Ok(None)
+    let lower = trimmed.to_ascii_lowercase();
+    let source = if lower.contains("currentcolor") {
+        let [r, g, b, alpha] = current_color(ctx, object)?;
+        // Keep the alpha: dropping it turns `color: rgb(0 0 255 / 0.5)`
+        // into opaque blue when `currentcolor` is mixed or reused.
+        let replacement = if alpha == 255 {
+            format!("rgb({r} {g} {b})")
+        } else {
+            format!("rgb({r} {g} {b} / {})", f32::from(alpha) / 255.0)
+        };
+        lower.replace("currentcolor", &replacement)
+    } else {
+        lower
+    };
+    Ok(color::parse_exact(&source).map(|parsed| (parsed.bytes, parsed.serialized)))
 }
 
 /// The canvas element's computed `color`, or black when it has no computed

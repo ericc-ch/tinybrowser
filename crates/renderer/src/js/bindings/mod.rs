@@ -14,7 +14,7 @@ mod document;
 mod exceptions;
 mod focus;
 pub(crate) mod forms;
-mod geometry;
+pub(crate) mod geometry;
 pub(crate) mod host;
 mod inner_text;
 mod messaging;
@@ -1092,7 +1092,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
 /// interface: an audio or video element implements `HTMLMediaElement`
 /// between its own interface and `HTMLElement`
 /// (<https://html.spec.whatwg.org/multipage/dom.html#htmlmediaelement>). Child
-/// first, parent second; [`node_interface_matches`](super::host) derives the
+/// first, parent second; `node_interface_matches` derives the
 /// media receiver check from these pairs instead of re-listing the tags.
 pub(super) const ELEMENT_INTERFACE_PARENTS: &[(&str, &str)] = &[
     ("HTMLAudioElement", "HTMLMediaElement"),

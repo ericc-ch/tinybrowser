@@ -12,10 +12,27 @@ use parley::{
 };
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::raw::types::Tag;
+use skrifa::raw::{FontRead as _, TableProvider as _};
 use skrifa::{FontRef, GlyphId, MetadataProvider};
 use tiny_skia::{Path, PathBuilder, Transform};
 
-/// One shaped string, in glyph-local coordinates (baseline at y = 0).
+/// One shaping cluster in text space. This follows Parley's shaping
+/// boundaries, so a ligature such as `fi` is one cluster spanning two
+/// graphemes; `getTextClusters` exposes these positions, not grapheme split
+/// points.
+pub(crate) struct TextCluster {
+    pub(crate) byte_start: usize,
+    pub(crate) byte_end: usize,
+    pub(crate) utf16_start: usize,
+    pub(crate) utf16_end: usize,
+    pub(crate) offset: f32,
+    pub(crate) advance: f32,
+}
+
+/// One shaped string. `glyph_path` shifts the outlines so the top of the em
+/// box is at `y = 0` and the alphabetic baseline is at `y = ascent`; callers
+/// subtract that to anchor at the requested baseline.
 pub(crate) struct ShapedText {
     pub(crate) path: Option<Path>,
     pub(crate) width: f32,
@@ -23,6 +40,9 @@ pub(crate) struct ShapedText {
     pub(crate) descent: f32,
     /// Horizontal squeeze applied by `fillText`'s `maxWidth`.
     pub(crate) scale_x: f32,
+    /// Shaped clusters, in visual order. These follow shaping boundaries, so a
+    /// ligature such as `fi` is one cluster even though it spans two graphemes.
+    pub(crate) clusters: Vec<TextCluster>,
     /// Glyph ink bounds relative to the alignment point and baseline
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#textmetrics>).
     pub(crate) ink_min_x: f32,
@@ -55,6 +75,7 @@ pub(crate) fn shape(
     language: Option<&str>,
     kerning: &str,
     font_ctx: &mut FontContext,
+    want_clusters: bool,
 ) -> ShapedText {
     // Canvas text preparation replaces ASCII whitespace with U+0020 and
     // shapes one line; newlines are not mandatory breaks
@@ -72,15 +93,27 @@ pub(crate) fn shape(
     let parsed = parse_font(font);
     // Canvas replaces every collapsible whitespace with U+0020 and does not
     // collapse runs (<https://html.spec.whatwg.org/multipage/canvas.html#text-preparation-algorithm>).
-    // U+0000 has zero advance.
-    let prepared: String = text
-        .chars()
-        .filter(|ch| *ch != '\0')
-        .map(|ch| match ch {
+    // U+0000 has zero advance, so it never reaches the shaper. Keep a byte map
+    // back to the original string: cluster ranges stay valid for
+    // `fillTextCluster`/`getSelectionRects`, which slice the original text.
+    let mut prepared = String::with_capacity(text.len());
+    let mut byte_map = want_clusters.then(|| Vec::with_capacity(text.len() + 1));
+    for (byte, ch) in text.char_indices() {
+        if ch == '\0' {
+            continue;
+        }
+        let start = prepared.len();
+        prepared.push(match ch {
             '\t' | '\n' | '\u{c}' | '\r' => ' ',
             _ => ch,
-        })
-        .collect();
+        });
+        if let Some(map) = byte_map.as_mut() {
+            map.extend(std::iter::repeat_n(byte, prepared.len() - start));
+        }
+    }
+    if let Some(map) = byte_map.as_mut() {
+        map.push(text.len());
+    }
     if prepared.is_empty() {
         return ShapedText {
             path: None,
@@ -88,6 +121,7 @@ pub(crate) fn shape(
             ascent: parsed.size,
             descent: parsed.size * 0.25,
             scale_x: 1.0,
+            clusters: Vec::new(),
             ink_min_x: 0.0,
             ink_max_x: 0.0,
             actual_ascent: 0.0,
@@ -96,13 +130,13 @@ pub(crate) fn shape(
             em_descent: 0.0,
             font_ascent: parsed.size,
             font_descent: 0.0,
-            hanging_baseline: parsed.size * 0.5,
-            ideographic_baseline: parsed.size * 0.125,
+            hanging_baseline: parsed.size * 0.8,
+            ideographic_baseline: -parsed.size * 0.2,
         };
     }
-    let text = prepared.as_str();
+    let shaped_text = prepared.as_str();
     let mut layout_ctx = LayoutContext::<[u8; 4]>::new();
-    let mut builder = layout_ctx.ranged_builder(font_ctx, text, 1.0, true);
+    let mut builder = layout_ctx.ranged_builder(font_ctx, shaped_text, 1.0, true);
     builder.push_default(StyleProperty::FontSize(parsed.size));
     if let Some(family) = parsed.family {
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family.into())));
@@ -125,7 +159,8 @@ pub(crate) fn shape(
     // One FontFeatures range: a second push would overwrite the first.
     let mut features = Vec::new();
     if parsed.small_caps {
-        features.push("smcp");
+        // `parse_css_list` requires quoted tags: `"smcp" on`.
+        features.push("\"smcp\" 1");
     }
     if kerning == "none" {
         features.push("\"kern\" 0");
@@ -135,7 +170,7 @@ pub(crate) fn shape(
             features.join(", ").as_str(),
         )));
     }
-    let mut layout = builder.build(text);
+    let mut layout = builder.build(shaped_text);
     layout.break_all_lines(None);
     let metrics = layout.root_span_metrics();
     let (ascent, descent) = metrics.map_or((parsed.size, parsed.size * 0.25), |metrics| {
@@ -146,6 +181,34 @@ pub(crate) fn shape(
     let scale_x = max_width
         .filter(|max| *max > 0.0 && width > *max)
         .map_or(1.0, |max| max / width);
+    let utf16_offsets = if want_clusters {
+        cluster_utf16_offsets(&text)
+    } else {
+        Vec::new()
+    };
+    let mut clusters = Vec::new();
+    if let Some(byte_map) = byte_map.as_ref() {
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                for cluster in run.run().clusters() {
+                    let range = cluster.text_range();
+                    let byte_start = byte_map[range.start];
+                    let byte_end = byte_map[range.end];
+                    clusters.push(TextCluster {
+                        byte_start,
+                        byte_end,
+                        utf16_start: utf16_offsets[byte_start],
+                        utf16_end: utf16_offsets[byte_end],
+                        offset: cluster.visual_offset().unwrap_or(0.0),
+                        advance: cluster.advance(),
+                    });
+                }
+            }
+        }
+    }
     let font_metrics = layout_font_metrics(&layout, parsed.size);
     // The glyph path stays in text space; the drawing transform applies the
     // maxWidth squeeze. Metrics need their own squeezed copy.
@@ -173,6 +236,7 @@ pub(crate) fn shape(
         ascent,
         descent,
         scale_x,
+        clusters,
         ink_min_x,
         ink_max_x,
         actual_ascent,
@@ -186,6 +250,20 @@ pub(crate) fn shape(
     }
 }
 
+/// Maps every byte boundary in `text` to its UTF-16 offset.
+fn cluster_utf16_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0; text.len() + 1];
+    let mut utf16 = 0;
+    for (byte, ch) in text.char_indices() {
+        for slot in &mut offsets[byte..byte + ch.len_utf8()] {
+            *slot = utf16;
+        }
+        utf16 += ch.len_utf16();
+    }
+    offsets[text.len()] = utf16;
+    offsets
+}
+
 struct FontMetrics {
     em_ascent: f32,
     em_descent: f32,
@@ -193,6 +271,37 @@ struct FontMetrics {
     font_descent: f32,
     hanging: f32,
     ideographic: f32,
+}
+
+/// Reads the horizontal `hang` and `ideo` coordinates from the OpenType BASE
+/// table. The returned distances are CSS pixels, positive above the alphabetic
+/// baseline.
+fn base_baselines(font: &FontRef<'_>, size: f32) -> Option<(f32, f32)> {
+    let data = font.table_data(Tag::new(b"BASE"))?;
+    let base = skrifa::raw::tables::base::Base::read(data).ok()?;
+    let axis = base.horiz_axis()?.ok()?;
+    let tags = axis.base_tag_list()?.ok()?.baseline_tags();
+    let script_list = axis.base_script_list().ok()?;
+    let records = script_list.base_script_records();
+    let script = records
+        .first()?
+        .base_script(script_list.offset_data())
+        .ok()?;
+    let values = script.base_values()?.ok()?;
+    let units_per_em = font.head().ok()?.units_per_em();
+    let mut hanging = None;
+    let mut ideographic = None;
+    for (tag, coordinate) in tags.iter().zip(values.base_coords().iter()) {
+        let coordinate = coordinate.ok()?.coordinate();
+        let coordinate = f32::from(coordinate) * size / f32::from(units_per_em);
+        let tag = tag.get();
+        if tag == Tag::new(b"hang") {
+            hanging = Some(coordinate);
+        } else if tag == Tag::new(b"ideo") {
+            ideographic = Some(coordinate);
+        }
+    }
+    Some((hanging?, ideographic?))
 }
 
 /// Canvas separates em-height metrics (win ascent/descent) from font bounding
@@ -210,13 +319,36 @@ fn layout_font_metrics(layout: &parley::Layout<[u8; 4]>, size: f32) -> FontMetri
                 continue;
             };
             let metrics = font_ref.metrics(Size::new(run.font_size()), LocationRef::default());
+            // The em square is the font size. A font whose typo metrics do
+            // not add up to the em size (the CanvasTest-ascent256 fixture is
+            // 256/-256 over 1024 units) is scaled to fill it
+            // (<https://html.spec.whatwg.org/multipage/canvas.html#textmetrics>).
+            let raw_ascent = metrics.ascent.max(0.0);
+            let raw_descent = (-metrics.descent).max(0.0);
+            let em_sum = raw_ascent + raw_descent;
+            let em_scale = if em_sum > 0.0 {
+                run.font_size() / em_sum
+            } else {
+                1.0
+            };
+            // The OpenType BASE table carries the real hanging and
+            // ideographic baselines when the font has one. Distances are
+            // positive above the alphabetic baseline, matching how
+            // `baseline_offset` places them
+            // (<https://learn.microsoft.com/en-us/typography/opentype/spec/base>).
+            let (hanging, ideographic) = base_baselines(&font_ref, run.font_size()).unwrap_or((
+                raw_ascent * 0.8,
+                // Without BASE, put the ideographic baseline near the
+                // descent, below alphabetic.
+                -raw_descent,
+            ));
             return FontMetrics {
-                em_ascent: metrics.ascent.max(0.0),
-                em_descent: (-metrics.descent).max(0.0),
-                font_ascent: metrics.ascent.max(0.0),
-                font_descent: (-metrics.descent).max(0.0),
-                hanging: size * 0.5,
-                ideographic: size * 0.125,
+                em_ascent: raw_ascent * em_scale,
+                em_descent: raw_descent * em_scale,
+                font_ascent: raw_ascent,
+                font_descent: raw_descent,
+                hanging,
+                ideographic,
             };
         }
     }
@@ -225,15 +357,21 @@ fn layout_font_metrics(layout: &parley::Layout<[u8; 4]>, size: f32) -> FontMetri
         em_descent: 0.0,
         font_ascent: size,
         font_descent: 0.0,
-        hanging: size * 0.5,
-        ideographic: size * 0.125,
+        hanging: size * 0.8,
+        ideographic: 0.0,
     }
 }
 
 fn glyph_path(layout: &parley::Layout<[u8; 4]>) -> Option<Path> {
     let mut builder = PathBuilder::new();
     let mut placed_any = false;
+    let root_ascent = layout
+        .root_span_metrics()
+        .map_or(0.0, |metrics| metrics.ascent);
     for line in layout.lines() {
+        // Parley places glyphs on the CSS line box; canvas text baselines are
+        // defined by the font's em metrics, so drop the half-leading.
+        let leading = line.metrics().baseline - root_ascent;
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(run) = item else {
                 continue;
@@ -259,7 +397,7 @@ fn glyph_path(layout: &parley::Layout<[u8; 4]>) -> Option<Path> {
                 let Some(path) = pen.finish() else {
                     continue;
                 };
-                let placement = Transform::from_translate(glyph.x, glyph.y);
+                let placement = Transform::from_translate(glyph.x, glyph.y - leading);
                 let Some(path) = path.transform(placement) else {
                     continue;
                 };

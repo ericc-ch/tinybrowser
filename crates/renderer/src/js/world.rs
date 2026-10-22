@@ -253,9 +253,31 @@ impl RealmRegistry {
     }
 
     pub(crate) fn canvas_has_open_layer(&self, id: NodeId) -> bool {
-        self.canvases
-            .get(&id)
-            .is_some_and(Canvas2D::has_open_layer)
+        self.canvases.get(&id).is_some_and(Canvas2D::has_open_layer)
+    }
+
+    /// The origin-clean flag of a live canvas, or `None` when it has no
+    /// context yet.
+    pub(crate) fn canvas_origin_clean(&self, id: NodeId) -> Option<bool> {
+        self.canvases.get(&id).map(Canvas2D::origin_clean)
+    }
+
+    pub(crate) fn canvas_png(&self, id: NodeId) -> Option<Vec<u8>> {
+        self.canvases.get(&id)?.to_png()
+    }
+
+    pub(crate) fn canvas_jpeg(&self, id: NodeId, quality: f32) -> Option<Vec<u8>> {
+        self.canvases.get(&id)?.to_jpeg(quality)
+    }
+
+    /// Replaces the bitmap with a fresh transparent one without touching the
+    /// drawing state.
+    pub(crate) fn clear_canvas_bitmap(&mut self, id: NodeId) -> bool {
+        let Some(canvas) = self.canvases.get_mut(&id) else {
+            return false;
+        };
+        canvas.clear_bitmap();
+        true
     }
 
     /// A straight-RGBA copy of a canvas bitmap, for `drawImage` and patterns.
@@ -809,6 +831,23 @@ pub(crate) struct WeakReferences {
 /// naming a document type.
 pub(crate) type FrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, NodeId)>;
 
+/// One face's width, style, and weight, as fontique identifies it.
+pub(crate) type FontFaceKey = (
+    parley::fontique::FontWidth,
+    parley::fontique::FontStyle,
+    parley::fontique::FontWeight,
+);
+
+/// Every face added for one family.
+pub(crate) type FontFamilyEntry = (parley::fontique::FamilyId, Vec<FontFaceKey>);
+
+/// One call to `__tbRegisterFont`, with the exact faces added to each
+/// collection so `__tbUnregisterFont` can remove only those faces.
+pub(crate) struct FontRegistration {
+    pub(crate) document: Option<u32>,
+    pub(crate) fonts: Vec<FontFamilyEntry>,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -856,6 +895,10 @@ pub(crate) struct World {
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
     input_files: HashMap<NodeId, Vec<Persistent<Value<'static>>>>,
+    /// Fonts registered by `FontFaceSet.add`, keyed by the token returned to
+    /// the shim. `delete`/`clear` unregister exactly these faces.
+    pub(crate) font_registrations: HashMap<u32, FontRegistration>,
+    pub(crate) next_font_registration: u32,
     budget: Rc<RefCell<ResourceBudget>>,
     pub parser_active: bool,
     /// The realm's event-target graph: window object, listener registries,
@@ -1253,6 +1296,8 @@ impl World {
             pending_fetch_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             input_files: HashMap::new(),
+            font_registrations: HashMap::new(),
+            next_font_registration: 1,
             budget: runtime.registry.borrow().budget(),
             parser_active: false,
             events: EventTargetState::default(),
@@ -1420,6 +1465,15 @@ impl World {
     ) -> Option<R> {
         let store = self.runtime.documents.borrow();
         store.get(id.document_id()).map(reader)
+    }
+
+    /// Whether `id` belongs to this realm's active document. Inert documents
+    /// (`template.content`, `createHTMLDocument`, `DOMParser`) are owned by the
+    /// realm but are not fully active, so image loads and similar side effects
+    /// must wait until a node is adopted into the active document
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#fully-active>).
+    pub(crate) fn is_active_document(&self, id: NodeId) -> bool {
+        self.document == Some(id.document_id())
     }
 
     /// Runs `reader` against the frame's active document.

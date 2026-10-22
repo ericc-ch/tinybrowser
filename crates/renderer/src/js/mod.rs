@@ -10,6 +10,7 @@ mod bridge;
 mod canvas;
 mod encoding;
 mod events;
+mod fonts;
 mod intl;
 mod modules;
 mod runtime;
@@ -852,6 +853,7 @@ impl JsRealm {
         bridge::prepare(&self.runtime, &world)?;
         self.context.with(|ctx| {
             bindings::install(&ctx, &world)?;
+            fonts::install(&ctx)?;
             intl::install(&ctx)?;
             self.install_task_host_functions(&ctx, &world)?;
             Self::install_document_host_functions(&ctx, &world)?;

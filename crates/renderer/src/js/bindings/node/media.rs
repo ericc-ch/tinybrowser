@@ -3,7 +3,7 @@
 
 use super::super::{attribute_value, host, set_attribute_sync, world, world_for_node};
 
-use rquickjs::{Ctx, Result, Value};
+use rquickjs::{Coerced, Ctx, Exception, FromJs, Result, Value};
 
 use crate::dom::tree::{NodeId, attr, html_namespace, is_connected};
 
@@ -202,7 +202,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
         &self,
         ctx: Ctx<'js>,
         context_id: rquickjs::String<'js>,
-        _options: Value<'js>,
+        options: Value<'js>,
     ) -> Result<Option<RenderingContext<'js>>> {
         // Context names are ASCII case-sensitive; "2D" is unrecognised
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
@@ -229,6 +229,7 @@ impl<'js> html_canvas_element_generated::HTMLCanvasElement<'js> for JsNode {
             // (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-context-mode>).
             return Ok(None);
         }
+        read_context_options(&ctx, &options)?;
         let value = match member {
             crate::js::world::SameObject::Canvas2d => {
                 crate::js::canvas::context_object(&ctx, self.handle.0)?
@@ -686,6 +687,60 @@ fn context_variant(member: crate::js::world::SameObject, value: Value<'_>) -> Re
     } else {
         RenderingContext::CanvasRenderingContext2D(value)
     }
+}
+
+/// Converts `getContext` options to `CanvasRenderingContext2DSettings` in
+/// `WebIDL` dictionary member order (lexicographic by member name). The settings
+/// are not stored yet, but conversion order is observable through getters and
+/// must match
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>).
+fn read_context_options<'js>(ctx: &Ctx<'js>, options: &Value<'js>) -> Result<()> {
+    if options.is_undefined() || options.is_null() {
+        return Ok(());
+    }
+    // `getContext` takes `any` for options: primitives are ignored rather than
+    // converted as a dictionary
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
+    let Some(object) = options.as_object() else {
+        return Ok(());
+    };
+    for name in [
+        "alpha",
+        "colorSpace",
+        "colorType",
+        "desynchronized",
+        "willReadFrequently",
+    ] {
+        let value: Value = object.get(name)?;
+        if value.is_undefined() {
+            continue;
+        }
+        match name {
+            "alpha" | "desynchronized" | "willReadFrequently" => {
+                let _ = Coerced::<bool>::from_js(ctx, value)?;
+            }
+            "colorSpace" => {
+                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
+                if !matches!(
+                    text.as_str(),
+                    "srgb" | "srgb-linear" | "display-p3" | "display-p3-linear"
+                ) {
+                    return Err(Exception::throw_type(
+                        ctx,
+                        "unknown PredefinedColorSpace value",
+                    ));
+                }
+            }
+            "colorType" => {
+                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
+                if !matches!(text.as_str(), "unorm8" | "float16") {
+                    return Err(Exception::throw_type(ctx, "unknown CanvasColorType value"));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// `getContext("bitmaprenderer")`: the object exists but transfers nothing
