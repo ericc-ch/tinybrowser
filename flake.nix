@@ -34,9 +34,14 @@
       # on the loader path at runtime. Prepend so the NixOS session path
       # (gcc, GL) stays behind this shell.
       # mise rust=1 shims must not shadow the overlay toolchain.
+      # One target dir per checkout, on the SSD. Cargo holds an exclusive lock
+      # on the target dir for the whole build, so a machine-wide one serialized
+      # every worktree behind the same lock; and path dependencies change their
+      # package id per checkout path, so the artifacts were never reused anyway.
       shellHook = ''
         export LD_LIBRARY_PATH="${runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         export MISE_DISABLE_TOOLS="rust''${MISE_DISABLE_TOOLS:+,$MISE_DISABLE_TOOLS}"
+        export CARGO_TARGET_DIR="/mnt/ssd/rust-targets/$(basename "$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")")"
       '';
     in
     {
