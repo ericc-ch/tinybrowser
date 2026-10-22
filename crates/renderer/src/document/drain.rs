@@ -80,19 +80,14 @@ impl Document {
     }
 
     pub(crate) fn release(&mut self) {
-        self.dials.discard_queued();
+        self.dials.terminate();
         self.decoder = None;
-        self.frame_load_in_flight = false;
         self.shared.borrow_mut().close_frame_ports(self.frame);
         self.world.borrow_mut().forget_owned_documents();
     }
 
     pub(crate) fn waiting_for_load(&self) -> bool {
-        self.dials
-            .waiting_for_load(self.js_epoch, self.frame_load_sequence)
-            || self.parser_blocked_script.is_some()
-            || self.frame_load_in_flight
-            || self.active_buffer.is_some()
+        self.load_delay.is_pending()
             || self.world.borrow().main_ready_state() != crate::ReadyState::Complete
     }
 
@@ -124,7 +119,9 @@ impl Document {
                                 req,
                                 ancestors,
                                 integrity,
+                                delay,
                             } = dial;
+                            drop(delay);
                             let final_url = req.url.clone();
                             self.finish_dial(super::CompletedDial {
                                 context,
@@ -270,7 +267,7 @@ impl Document {
             std::mem::take(&mut self.world.borrow_mut().pending_fetch_cancels)
                 .into_iter()
                 .collect();
-        self.dials.cancel_fetches(self.js_epoch, &fetch_cancels);
+        self.dials.cancel_fetches(&fetch_cancels);
         self.queue_js_fetches(fetches, &fetch_cancels);
         let images = self.world.borrow_mut().take_image_updates();
         for element in images {
@@ -330,7 +327,6 @@ impl Document {
             let mut dial = QueuedDial::new(
                 DialContext::ClassicScript {
                     element,
-                    epoch: self.js_epoch,
                 },
                 &url,
                 &self.url,
@@ -339,6 +335,11 @@ impl Document {
                 self.redirect_gate(crate::csp::Destination::Script),
             ));
             dial.integrity = self.script_integrity(element);
+            // A script-inserted `src` script is async, but it still belongs to
+            // the set of scripts that will execute as soon as possible, and
+            // `load` waits for that set to drain
+            // (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
+            dial.delay = Some(self.load_delay.guard());
             self.dials.queue(dial);
         }
     }
@@ -377,7 +378,6 @@ impl Document {
                 let mut dial = QueuedDial::new(
                     DialContext::JsFetch {
                         id: fetch.js_id,
-                        epoch: self.js_epoch,
                     },
                     &url,
                     &self.url,
