@@ -109,6 +109,161 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
 }
 
 #[test]
+fn browser_session_routes_commands_and_events() {
+    let (_fixture, mut client) = start();
+
+    let attached = client
+        .call("Target.attachToBrowserTarget", &json!({}), None)
+        .expect("attach to browser target");
+    let session = attached["sessionId"]
+        .as_str()
+        .expect("browser session")
+        .to_owned();
+
+    let version = client
+        .call("Browser.getVersion", &json!({}), Some(&session))
+        .expect("browser session command");
+    assert_eq!(version["product"], json!("Chrome/152.0.7977.82"));
+
+    client
+        .call(
+            "Target.setAutoAttach",
+            &json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true,
+            }),
+            Some(&session),
+        )
+        .expect("auto attach from browser session");
+
+    let attached_event = loop {
+        let event = client
+            .read_event(Duration::from_secs(2))
+            .expect("read event")
+            .expect("attached event");
+        if event["method"] == json!("Target.attachedToTarget") {
+            break event;
+        }
+    };
+    assert_eq!(
+        attached_event["sessionId"],
+        json!(session),
+        "browser-session events must carry the browser session id"
+    );
+}
+
+#[test]
+fn get_properties_reports_descriptors_and_releases_groups() {
+    let (_fixture, mut client) = start();
+    let created = client
+        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
+        .expect("create");
+    let target_id = created["targetId"].as_str().expect("id").to_owned();
+    let attached = client
+        .call(
+            "Target.attachToTarget",
+            &json!({"targetId": target_id, "flatten": true}),
+            None,
+        )
+        .expect("attach");
+    let session = attached["sessionId"].as_str().expect("session").to_owned();
+
+    let object = client
+        .call(
+            "Runtime.evaluate",
+            &json!({
+                "expression": "({ a: 1, get b() { throw new Error('getter ran'); }, [Symbol.for('s')]: 2 })",
+                "objectGroup": "props",
+            }),
+            Some(&session),
+        )
+        .expect("evaluate object");
+    let object_id = object["result"]["objectId"]
+        .as_str()
+        .expect("object handle")
+        .to_owned();
+
+    let properties = client
+        .call(
+            "Runtime.getProperties",
+            &json!({
+                "objectId": object_id,
+                "ownProperties": true,
+                "generatePreview": true,
+                "objectGroup": "props",
+            }),
+            Some(&session),
+        )
+        .expect("getProperties");
+    let descriptors = properties["result"].as_array().expect("descriptors");
+    let a = descriptors
+        .iter()
+        .find(|entry| entry["name"] == json!("a"))
+        .expect("a descriptor");
+    assert_eq!(a["value"]["value"], json!(1));
+    let b = descriptors
+        .iter()
+        .find(|entry| entry["name"] == json!("b"))
+        .expect("b accessor");
+    assert!(b["get"]["objectId"].is_string());
+    assert!(
+        b.get("value").is_none(),
+        "accessor must not invoke its getter"
+    );
+    assert_eq!(
+        properties["internalProperties"][0]["name"],
+        json!("[[Prototype]]")
+    );
+
+    client
+        .call(
+            "Runtime.releaseObjectGroup",
+            &json!({"objectGroup": "props"}),
+            Some(&session),
+        )
+        .expect("release group");
+    let missing = client
+        .call(
+            "Runtime.getProperties",
+            &json!({"objectId": object_id, "ownProperties": true}),
+            Some(&session),
+        )
+        .expect_err("released handle");
+    assert!(
+        missing
+            .to_string()
+            .contains("Could not find object with given id"),
+        "{missing}"
+    );
+}
+
+#[test]
+fn clear_browser_cookies_is_available_on_both_target_kinds() {
+    let (_fixture, mut client) = start();
+
+    client
+        .call("Network.clearBrowserCookies", &json!({}), None)
+        .expect("clear cookies from the root browser target");
+
+    let created = client
+        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
+        .expect("create");
+    let target_id = created["targetId"].as_str().expect("id").to_owned();
+    let attached = client
+        .call(
+            "Target.attachToTarget",
+            &json!({"targetId": target_id, "flatten": true}),
+            None,
+        )
+        .expect("attach");
+    let session = attached["sessionId"].as_str().expect("session").to_owned();
+    client
+        .call("Network.clearBrowserCookies", &json!({}), Some(&session))
+        .expect("clear cookies from a page session");
+}
+
+#[test]
 fn page_navigate_loads_http_document() {
     fn read_target(stream: &mut TcpStream) -> String {
         stream

@@ -39,13 +39,12 @@ use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 
 mod dispatch;
 use dispatch::{
-    DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
-    RUNTIME_SCHEDULE, accepted_noop, arguments_expression, attach_session, capture_screenshot,
-    css_computed_style, css_stylesheets, dom_box_model, dom_content_quads, dom_describe_node,
-    dom_get_document, dom_node_for_location, dom_node_string, dom_query_selector, dom_resolve_node,
-    exception_reply, exception_text_reply, input_emulate_touch_from_mouse, input_insert_text,
-    input_key_event, input_mouse_event, input_touch_event, json_io, json_string, open_url,
-    requested_frame, session_method, target_id, target_info, wait_for_navigation, ws_io,
+    BrowserHandler, DispatchError, Handler, PageHandler, RUNTIME_CLEAR_HANDLES, RUNTIME_HANDLE,
+    RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ, RUNTIME_SCHEDULE, TargetKind,
+    accept, arguments_expression, attach_session, capture_screenshot, css_stylesheets,
+    exception_reply, exception_text_reply, json_io, json_string, open_url, requested_frame, route,
+    run_script, runtime_release_object, runtime_release_object_group, target_id, target_info,
+    wait_for_navigation, ws_io,
 };
 
 const PRODUCT: &str = "Chrome/152.0.7977.82";
@@ -475,7 +474,7 @@ struct Conn {
     isolated_worlds: HashMap<TabId, Vec<String>>,
     next_loader: u64,
     next_context: u64,
-    next_handle: u64,
+    next_evaluation: u64,
 }
 
 struct TabSubscription {
@@ -634,6 +633,10 @@ impl Conn {
         });
         attach_session(&mut cleared, session);
         messages.push(cleared);
+        // The outgoing realm's object handles die with it; clear the new
+        // realm's table too so a handle minted before the event cannot outlive
+        // the context it belongs to.
+        let _ = tab.execute_browser_script(RUNTIME_CLEAR_HANDLES).await;
         let mut worlds = vec![String::new()];
         if let Some(isolated) = self.isolated_worlds.get(&tab_id) {
             worlds.extend(isolated.iter().cloned());
@@ -681,7 +684,7 @@ impl Conn {
     }
 
     /// Enables or disables auto-attach and announces existing targets.
-    async fn set_auto_attach(&mut self, params: &Value) -> Value {
+    async fn set_auto_attach(&mut self, params: &Value, session: Option<&str>) -> Value {
         let auto_attach = params
             .get("autoAttach")
             .and_then(Value::as_bool)
@@ -690,46 +693,38 @@ impl Conn {
         if auto_attach {
             for id in self.browser.tabs().await.unwrap_or_default() {
                 if let Ok(tab) = self.browser.tab(id).await {
-                    let session_id = self.mint_session(&tab);
-                    self.push_attached(&session_id, &tab).await;
+                    let session_id = self.mint(Session::Tab(tab.clone()));
+                    self.push_attached(session, &session_id, &tab).await;
                 }
             }
         }
         json!({})
     }
 
-    /// Registers a new flattened page session for `tab`.
-    fn mint_session(&mut self, tab: &TabHandle) -> String {
+    /// Registers a flattened session and returns its id.
+    fn mint(&mut self, session: Session) -> String {
         let session_id = format!("s{}", self.next_session);
         self.next_session = self.next_session.saturating_add(1);
-        self.sessions
-            .insert(session_id.clone(), Session::Tab(tab.clone()));
+        self.sessions.insert(session_id.clone(), session);
         session_id
     }
 
-    /// Registers a flattened browser session. Follow-up commands on this id
-    /// route through [`Conn::dispatch_browser`].
-    fn mint_browser_session(&mut self) -> String {
-        let session_id = format!("s{}", self.next_session);
-        self.next_session = self.next_session.saturating_add(1);
-        self.sessions.insert(session_id.clone(), Session::Browser);
-        session_id
-    }
-
-    /// Queues `Target.attachedToTarget` for auto-attach clients.
-    async fn push_attached(&mut self, session_id: &str, tab: &TabHandle) {
+    /// Queues `Target.attachedToTarget` for auto-attach clients, on the session
+    /// that asked for auto-attach.
+    async fn push_attached(&mut self, session: Option<&str>, session_id: &str, tab: &TabHandle) {
         let mut info = target_info(&self.browser, tab.id()).await;
         if let Some(object) = info.as_object_mut() {
             object.insert("attached".into(), json!(true));
         }
-        self.events.push(json!({
-            "method": "Target.attachedToTarget",
-            "params": {
+        self.push_session_event(
+            session,
+            "Target.attachedToTarget",
+            &json!({
                 "sessionId": session_id,
                 "targetInfo": info,
                 "waitingForDebugger": false,
-            },
-        }));
+            }),
+        );
     }
 
     async fn dispatch_text(&mut self, text: &str) -> Outcome {
@@ -804,210 +799,100 @@ impl Conn {
         if method != "Browser.close" && self.browser.is_closed() {
             return Err(DispatchError::Failed("browser closed".into()));
         }
-        if let Some(session) = session {
-            let target = self
+        let (kind, tab) = match session {
+            Some(session) => match self
                 .sessions
                 .get(session)
                 .cloned()
-                .ok_or_else(|| DispatchError::Failed("unknown session".into()))?;
-            return match target {
-                Session::Tab(tab) => {
-                    self.dispatch_tab_method(method, params, &tab, Some(session))
-                        .await
-                }
-                Session::Browser => self.dispatch_browser(method, params).await,
-            };
-        }
-        if let Some(tab) = self.tab.clone() {
-            return self.dispatch_tab_method(method, params, &tab, None).await;
-        }
-        self.dispatch_browser(method, params).await
-    }
-
-    /// `Network.clearBrowserCookies`: the live profile's jar is the only
-    /// cookie state, so clearing it is a complete implementation.
-    async fn clear_cookies(&self) -> Result<Value, DispatchError> {
-        self.browser
-            .clear_cookies()
+                .ok_or_else(|| DispatchError::Failed("unknown session".into()))?
+            {
+                Session::Tab(tab) => (TargetKind::Page, Some(tab)),
+                Session::Browser => (TargetKind::Browser, None),
+            },
+            None => match self.tab.clone() {
+                Some(tab) => (TargetKind::Page, Some(tab)),
+                None => (TargetKind::Browser, None),
+            },
+        };
+        let handler = route(method, kind).ok_or(DispatchError::MethodNotFound)?;
+        self.dispatch_handler(handler, params, tab.as_ref(), session)
             .await
-            .map_err(|error| DispatchError::Failed(error.to_string()))?;
-        Ok(json!({}))
     }
 
-    async fn dispatch_browser(
+    async fn dispatch_handler(
         &mut self,
-        method: &str,
+        handler: Handler,
         params: &Value,
+        tab: Option<&TabHandle>,
+        session: Option<&str>,
     ) -> Result<Value, DispatchError> {
-        match method {
-            "Browser.getVersion" => Ok(json!({
-                "protocolVersion": "1.3",
-                "product": PRODUCT,
-                "revision": "0",
-                "userAgent": browser::USER_AGENT,
-                "jsVersion": "QuickJS",
-            })),
-            "Network.clearBrowserCookies" => self.clear_cookies().await,
-            "Browser.close" => {
-                let result = self.browser.close().await;
-                self.sessions.clear();
-                self.stop_subscriptions();
-                self.tab = None;
-                self.stop.request();
-                result.map_err(|error| DispatchError::Failed(error.to_string()))?;
-                Ok(json!({}))
-            }
-            _ => self.dispatch_target(method, params).await,
-        }
-    }
-
-    async fn dispatch_target(
-        &mut self,
-        method: &str,
-        params: &Value,
-    ) -> Result<Value, DispatchError> {
-        match method {
-            "Target.setAutoAttach" => Ok(self.set_auto_attach(params).await),
-            "Target.getTargetInfo" => self.target_info_for(params).await,
-            "Target.getTargets" => self.target_list().await,
-            "Target.createTarget" => {
-                let url = params
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("about:blank");
-                let tab = self
-                    .browser
-                    .create_tab()
-                    .await
-                    .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                if let Err(error) = open_url(&tab, url).await {
-                    let _result = self.browser.close_tab(tab.id()).await;
-                    return Err(error);
-                }
-                if self.auto_attach {
-                    let session_id = self.mint_session(&tab);
-                    self.push_attached(&session_id, &tab).await;
-                }
-                Ok(json!({ "targetId": tab.id().to_string() }))
-            }
-            "Target.closeTarget" => {
-                let id = target_id(params.get("targetId"))?;
-                if self.auto_attach {
-                    let detached: Vec<String> = self
-                        .sessions
-                        .iter()
-                        .filter(|(_, session)| match session {
-                            Session::Tab(tab) => tab.id() == id,
-                            Session::Browser => false,
-                        })
-                        .map(|(session, _)| session.clone())
-                        .collect();
-                    for session_id in detached {
-                        self.events.push(json!({
-                            "method": "Target.detachedFromTarget",
-                            "params": {
-                                "sessionId": session_id,
-                                "targetId": id.to_string(),
-                            },
-                        }));
-                    }
-                }
+        match handler {
+            Handler::Accept(reason) => accept(reason, params),
+            Handler::ClearBrowserCookies => {
                 self.browser
-                    .close_tab(id)
+                    .clear_cookies()
                     .await
-                    .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                self.sessions.retain(|_, session| match session {
-                    Session::Tab(tab) => tab.id() != id,
-                    Session::Browser => true,
-                });
-                self.unsubscribe_tab_id(id);
-                self.loader_ids.remove(&id);
-                self.isolated_worlds.remove(&id);
-                if self.tab.as_ref().is_some_and(|tab| tab.id() == id) {
-                    self.tab = None;
-                }
-                Ok(json!({ "success": true }))
-            }
-            "Target.attachToTarget" => {
-                let id = target_id(params.get("targetId"))?;
-                let flatten = params
-                    .get("flatten")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if !flatten {
-                    return Err(DispatchError::Failed(
-                        "attachToTarget requires flatten".into(),
-                    ));
-                }
-                let tab = self
-                    .browser
-                    .tab(id)
-                    .await
-                    .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                Ok(json!({ "sessionId": self.mint_session(&tab) }))
-            }
-            // The browser target is a real attachable session: later commands
-            // on its id route through browser dispatch.
-            "Target.attachToBrowserTarget" => {
-                Ok(json!({ "sessionId": self.mint_browser_session() }))
-            }
-            "Target.detachFromTarget" => {
-                if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
-                    self.sessions.remove(session);
-                    self.unsubscribe_session(session);
-                }
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
                 Ok(json!({}))
             }
-            _ => {
-                if accepted_noop(method, params) {
-                    Ok(json!({}))
-                } else {
-                    Err(DispatchError::MethodNotFound)
+            Handler::GetTargetInfo => match tab {
+                Some(tab) => {
+                    let mut info = target_info(&self.browser, tab.id()).await;
+                    if let Some(object) = info.as_object_mut() {
+                        object.insert("attached".into(), json!(true));
+                    }
+                    Ok(json!({"targetInfo": info}))
                 }
+                None => self.target_info_for(params).await,
+            },
+            Handler::Page(handler) => {
+                let tab = tab.ok_or(DispatchError::MethodNotFound)?;
+                self.dispatch_page(handler, params, tab, session).await
             }
+            Handler::Browser(handler) => self.dispatch_browser(handler, params, session).await,
         }
     }
 
-    /// Every open tab as a `Target.targetInfo` list.
-    async fn target_list(&self) -> Result<Value, DispatchError> {
-        let mut target_infos = Vec::new();
-        for id in self
-            .browser
-            .tabs()
-            .await
-            .map_err(|error| DispatchError::Failed(error.to_string()))?
-        {
-            target_infos.push(target_info(&self.browser, id).await);
-        }
-        Ok(json!({ "targetInfos": target_infos }))
-    }
-
-    async fn dispatch_tab_method(
+    async fn dispatch_page(
         &mut self,
-        method: &str,
+        handler: PageHandler,
         params: &Value,
         tab: &TabHandle,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
-        if let Some(value) = self
-            .dispatch_document_method(method, params, tab, session)
-            .await?
-        {
-            return Ok(value);
-        }
-        match method {
-            "Network.clearBrowserCookies" => self.clear_cookies().await,
-            "Page.enable" => {
+        match handler {
+            PageHandler::Enable => {
                 self.subscribe_tab(tab, session)?;
                 Ok(json!({}))
             }
-            "Page.disable" => {
+            PageHandler::Disable => {
                 self.unsubscribe_tab(tab.id(), session);
                 Ok(json!({}))
             }
-            "Page.navigate" => self.navigate_tab(params, tab).await,
-            "Page.captureScreenshot" => capture_screenshot(tab, params).await,
-            "Runtime.enable" => {
+            PageHandler::Navigate => self.navigate_tab(params, tab).await,
+            PageHandler::NavigateToHistoryEntry => {
+                self.navigate_to_history_entry(params, tab).await
+            }
+            PageHandler::CaptureScreenshot => capture_screenshot(tab, params).await,
+            PageHandler::CreateIsolatedWorld => {
+                Ok(self.create_isolated_world(params, tab, session))
+            }
+            PageHandler::SetLifecycleEventsEnabled => {
+                self.lifecycle_events = params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(json!({}))
+            }
+            PageHandler::RuntimeEvaluate | PageHandler::RuntimeCallFunctionOn => {
+                let method = if matches!(handler, PageHandler::RuntimeEvaluate) {
+                    "Runtime.evaluate"
+                } else {
+                    "Runtime.callFunctionOn"
+                };
+                self.dispatch_runtime(method, params, tab).await
+            }
+            PageHandler::RuntimeEnable => {
                 self.push_session_event(
                     session,
                     "Runtime.executionContextCreated",
@@ -1025,89 +910,12 @@ impl Conn {
                 );
                 Ok(json!({}))
             }
-            "Page.createIsolatedWorld" => {
-                let context_id = self.next_context;
-                self.next_context = self.next_context.saturating_add(1);
-                let frame_id = params
-                    .get("frameId")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| tab.id().to_string(), str::to_owned);
-                let name = params
-                    .get("worldName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if !name.is_empty() {
-                    let worlds = self.isolated_worlds.entry(tab.id()).or_default();
-                    if !worlds.iter().any(|existing| existing == name) {
-                        worlds.push(name.to_owned());
-                    }
-                }
-                self.push_session_event(
-                    session,
-                    "Runtime.executionContextCreated",
-                    &json!({"context": {
-                        "id": context_id,
-                        "origin": "://",
-                        "name": name,
-                        "uniqueId": format!("ctx-{context_id}"),
-                        "auxData": {
-                            "isDefault": false,
-                            "type": "isolated",
-                            "frameId": frame_id,
-                        },
-                    }}),
-                );
-                Ok(json!({"executionContextId": context_id}))
+            PageHandler::RuntimeDisable | PageHandler::CssDisable => Ok(json!({})),
+            PageHandler::RuntimeReleaseObject => runtime_release_object(tab, params).await,
+            PageHandler::RuntimeReleaseObjectGroup => {
+                runtime_release_object_group(tab, params).await
             }
-            "Target.getTargetInfo" => {
-                let mut info = target_info(&self.browser, tab.id()).await;
-                if let Some(object) = info.as_object_mut() {
-                    object.insert("attached".into(), json!(true));
-                }
-                Ok(json!({"targetInfo": info}))
-            }
-            "Runtime.evaluate" | "Runtime.callFunctionOn" => {
-                self.dispatch_runtime(method, params, tab).await
-            }
-            "Page.setLifecycleEventsEnabled" => {
-                self.lifecycle_events = params
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                Ok(json!({}))
-            }
-            _ => session_method(method, params, tab).await,
-        }
-    }
-
-    /// Document, input, CSS, and trace methods. Returns `None` when the method
-    /// belongs to another table.
-    async fn dispatch_document_method(
-        &mut self,
-        method: &str,
-        params: &Value,
-        tab: &TabHandle,
-        session: Option<&str>,
-    ) -> Result<Option<Value>, DispatchError> {
-        let value = match method {
-            "DOM.getDocument" => dom_get_document(tab).await?,
-            "DOM.querySelector" => dom_query_selector(tab, params, false).await?,
-            "DOM.querySelectorAll" => dom_query_selector(tab, params, true).await?,
-            "DOM.describeNode" => dom_describe_node(tab, params).await?,
-            "DOM.getOuterHTML" => dom_node_string(tab, params, "outerHTML").await?,
-            "DOM.getAttributes" => dom_node_string(tab, params, "attributes").await?,
-            "DOM.resolveNode" => dom_resolve_node(tab, params).await?,
-            "DOM.getNodeForLocation" => dom_node_for_location(tab, params).await?,
-            "DOM.getBoxModel" => dom_box_model(tab, params).await?,
-            "DOM.getContentQuads" => dom_content_quads(tab, params).await?,
-            "Input.dispatchMouseEvent" => input_mouse_event(tab, params).await?,
-            "Input.dispatchKeyEvent" => input_key_event(tab, params).await?,
-            "Input.insertText" => input_insert_text(tab, params).await?,
-            "Input.dispatchTouchEvent" => input_touch_event(tab, params).await?,
-            "Input.emulateTouchFromMouseEvent" => {
-                input_emulate_touch_from_mouse(tab, params).await?
-            }
-            "CSS.enable" => {
+            PageHandler::CssEnable => {
                 for mut header in css_stylesheets(tab).await? {
                     if let Some(object) = header.as_object_mut() {
                         object.insert("frameId".into(), json!(tab.id().to_string()));
@@ -1118,10 +926,9 @@ impl Conn {
                         &json!({"header": header}),
                     );
                 }
-                json!({})
+                Ok(json!({}))
             }
-            "CSS.getComputedStyleForNode" => css_computed_style(tab, params).await?,
-            "Tracing.end" => {
+            PageHandler::TracingEnd => {
                 self.push_session_event(
                     session,
                     "Tracing.dataCollected",
@@ -1135,11 +942,229 @@ impl Conn {
                     "Tracing.tracingComplete",
                     &json!({"dataLossOccurred": false}),
                 );
-                json!({})
+                Ok(json!({}))
             }
-            _ => return Ok(None),
-        };
-        Ok(Some(value))
+            PageHandler::Script(method) => run_script(method, params, tab).await,
+        }
+    }
+
+    /// `Page.createIsolatedWorld`: announce a new execution context for the
+    /// requested world name.
+    fn create_isolated_world(
+        &mut self,
+        params: &Value,
+        tab: &TabHandle,
+        session: Option<&str>,
+    ) -> Value {
+        let context_id = self.next_context;
+        self.next_context = self.next_context.saturating_add(1);
+        let frame_id = params
+            .get("frameId")
+            .and_then(Value::as_str)
+            .map_or_else(|| tab.id().to_string(), str::to_owned);
+        let name = params
+            .get("worldName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !name.is_empty() {
+            let worlds = self.isolated_worlds.entry(tab.id()).or_default();
+            if !worlds.iter().any(|existing| existing == name) {
+                worlds.push(name.to_owned());
+            }
+        }
+        self.push_session_event(
+            session,
+            "Runtime.executionContextCreated",
+            &json!({"context": {
+                "id": context_id,
+                "origin": "://",
+                "name": name,
+                "uniqueId": format!("ctx-{context_id}"),
+                "auxData": {
+                    "isDefault": false,
+                    "type": "isolated",
+                    "frameId": frame_id,
+                },
+            }}),
+        );
+        json!({"executionContextId": context_id})
+    }
+
+    /// `Page.navigateToHistoryEntry`: traversal by the entry's signed distance
+    /// from the active index, so Playwright's `goBack`/`goForward` use the
+    /// tab's real session history.
+    /// <https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-navigateToHistoryEntry>
+    async fn navigate_to_history_entry(
+        &mut self,
+        params: &Value,
+        tab: &TabHandle,
+    ) -> Result<Value, DispatchError> {
+        let entry_id = params
+            .get("entryId")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| DispatchError::Failed("missing entryId".into()))?;
+        let history = tab
+            .history()
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+        let target = history
+            .entries()
+            .iter()
+            .position(|entry| entry.id().get() == entry_id)
+            .ok_or_else(|| DispatchError::Failed("unknown history entry".into()))?;
+        let delta = i64::try_from(target).unwrap_or(i64::MAX)
+            - i64::try_from(history.current_index()).unwrap_or(0);
+        let delta = i32::try_from(delta)
+            .map_err(|_| DispatchError::Failed("history entry is out of range".into()))?;
+        tab.traverse_history(delta)
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+        Ok(json!({}))
+    }
+
+    async fn dispatch_browser(
+        &mut self,
+        handler: BrowserHandler,
+        params: &Value,
+        session: Option<&str>,
+    ) -> Result<Value, DispatchError> {
+        match handler {
+            BrowserHandler::GetVersion => Ok(json!({
+                "protocolVersion": "1.3",
+                "product": PRODUCT,
+                "revision": "0",
+                "userAgent": browser::USER_AGENT,
+                "jsVersion": "QuickJS",
+            })),
+            BrowserHandler::Close => {
+                let result = self.browser.close().await;
+                self.sessions.clear();
+                self.stop_subscriptions();
+                self.tab = None;
+                self.stop.request();
+                result.map_err(|error| DispatchError::Failed(error.to_string()))?;
+                Ok(json!({}))
+            }
+            BrowserHandler::SetAutoAttach => Ok(self.set_auto_attach(params, session).await),
+            BrowserHandler::GetTargets => self.target_list().await,
+            BrowserHandler::CreateTarget => self.create_target(params, session).await,
+            BrowserHandler::CloseTarget => self.close_target(params, session).await,
+            BrowserHandler::AttachToTarget => {
+                let id = target_id(params.get("targetId"))?;
+                let flatten = params
+                    .get("flatten")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !flatten {
+                    return Err(DispatchError::Failed(
+                        "attachToTarget requires flatten".into(),
+                    ));
+                }
+                let tab = self
+                    .browser
+                    .tab(id)
+                    .await
+                    .map_err(|err| DispatchError::Failed(err.to_string()))?;
+                Ok(json!({ "sessionId": self.mint(Session::Tab(tab)) }))
+            }
+            BrowserHandler::AttachToBrowserTarget => {
+                Ok(json!({ "sessionId": self.mint(Session::Browser) }))
+            }
+            BrowserHandler::DetachFromTarget => {
+                if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
+                    self.sessions.remove(session);
+                    self.unsubscribe_session(session);
+                }
+                Ok(json!({}))
+            }
+        }
+    }
+
+    /// `Target.createTarget`: open a tab, navigate it, and auto-attach when the
+    /// client asked for it.
+    async fn create_target(
+        &mut self,
+        params: &Value,
+        session: Option<&str>,
+    ) -> Result<Value, DispatchError> {
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("about:blank");
+        let tab = self
+            .browser
+            .create_tab()
+            .await
+            .map_err(|err| DispatchError::Failed(err.to_string()))?;
+        if let Err(error) = open_url(&tab, url).await {
+            let _result = self.browser.close_tab(tab.id()).await;
+            return Err(error);
+        }
+        if self.auto_attach {
+            let session_id = self.mint(Session::Tab(tab.clone()));
+            self.push_attached(session, &session_id, &tab).await;
+        }
+        Ok(json!({ "targetId": tab.id().to_string() }))
+    }
+
+    /// `Target.closeTarget`: announce auto-attached sessions before closing the
+    /// tab and dropping its per-target state.
+    async fn close_target(
+        &mut self,
+        params: &Value,
+        session: Option<&str>,
+    ) -> Result<Value, DispatchError> {
+        let id = target_id(params.get("targetId"))?;
+        if self.auto_attach {
+            let detached: Vec<String> = self
+                .sessions
+                .iter()
+                .filter(|(_, session)| match session {
+                    Session::Tab(tab) => tab.id() == id,
+                    Session::Browser => false,
+                })
+                .map(|(session, _)| session.clone())
+                .collect();
+            for session_id in detached {
+                self.push_session_event(
+                    session,
+                    "Target.detachedFromTarget",
+                    &json!({
+                        "sessionId": session_id,
+                        "targetId": id.to_string(),
+                    }),
+                );
+            }
+        }
+        self.browser
+            .close_tab(id)
+            .await
+            .map_err(|err| DispatchError::Failed(err.to_string()))?;
+        self.sessions.retain(|_, session| match session {
+            Session::Tab(tab) => tab.id() != id,
+            Session::Browser => true,
+        });
+        self.unsubscribe_tab_id(id);
+        self.loader_ids.remove(&id);
+        self.isolated_worlds.remove(&id);
+        if self.tab.as_ref().is_some_and(|tab| tab.id() == id) {
+            self.tab = None;
+        }
+        Ok(json!({ "success": true }))
+    }
+
+    /// Every open tab as a `Target.targetInfo` list.
+    async fn target_list(&self) -> Result<Value, DispatchError> {
+        let mut target_infos = Vec::new();
+        for id in self
+            .browser
+            .tabs()
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?
+        {
+            target_infos.push(target_info(&self.browser, id).await);
+        }
+        Ok(json!({ "targetInfos": target_infos }))
     }
 
     async fn navigate_tab(
@@ -1198,6 +1223,10 @@ impl Conn {
             .get("awaitPromise")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let object_group = params
+            .get("objectGroup")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         // `Runtime.evaluate` carries an optional `timeout` in milliseconds;
         // `Runtime.callFunctionOn` has none, so the fallback applies. An
         // out-of-range value is a CDP error, not a panic in the server task.
@@ -1234,15 +1263,15 @@ impl Conn {
             )
         };
         if return_by_value {
-            let id = self.next_handle;
-            self.next_handle = self.next_handle.saturating_add(1);
+            let id = self.next_evaluation;
+            self.next_evaluation = self.next_evaluation.saturating_add(1);
             Ok(Self::runtime_value(tab, frame, &source, await_timeout, id).await)
         } else if await_promise {
             Ok(self
-                .runtime_handle_awaited(tab, frame, &source, await_timeout)
+                .runtime_handle_awaited(tab, frame, &source, await_timeout, object_group)
                 .await)
         } else {
-            Ok(self.runtime_handle(tab, frame, &source).await)
+            Ok(self.runtime_handle(tab, frame, &source, object_group).await)
         }
     }
 
@@ -1255,10 +1284,11 @@ impl Conn {
         frame: FrameId,
         source: &str,
         timeout: Duration,
+        object_group: &str,
     ) -> Value {
-        let handle = self.next_handle;
-        self.next_handle = self.next_handle.saturating_add(1);
-        let id = json_string(&handle.to_string());
+        let evaluation = self.next_evaluation;
+        self.next_evaluation = self.next_evaluation.saturating_add(1);
+        let id = json_string(&evaluation.to_string());
         let schedule = RUNTIME_HANDLE_SCHEDULE
             .replace("__ID__", &id)
             .replace("__SOURCE__", source);
@@ -1317,7 +1347,9 @@ impl Conn {
             }
             Err(error) => return exception_reply(&error),
         }
-        let read = RUNTIME_HANDLE_READ.replace("__ID__", &id);
+        let read = RUNTIME_HANDLE_READ
+            .replace("__ID__", &id)
+            .replace("__GROUP__", &json_string(object_group));
         let value = match tab
             .execute_script(ExecuteScriptOptions {
                 frame,
@@ -1335,18 +1367,22 @@ impl Conn {
             if let Some(error) = parsed.get("error").and_then(Value::as_str) {
                 return exception_text_reply(error);
             }
-            return json!({"result": parsed});
+            return json!({"result": parsed.get("value").cloned().unwrap_or(Value::Null)});
         }
         exception_text_reply("unexpected script result")
     }
 
     /// Stores the result in a page-side handle and returns its `objectId`;
     /// primitives are serializable and returned inline.
-    async fn runtime_handle(&mut self, tab: &TabHandle, frame: FrameId, source: &str) -> Value {
-        let handle = self.next_handle;
-        self.next_handle = self.next_handle.saturating_add(1);
+    async fn runtime_handle(
+        &mut self,
+        tab: &TabHandle,
+        frame: FrameId,
+        source: &str,
+        object_group: &str,
+    ) -> Value {
         let script = RUNTIME_HANDLE
-            .replace("__ID__", &json_string(&handle.to_string()))
+            .replace("__GROUP__", &json_string(object_group))
             .replace("__SOURCE__", source);
         let value = match tab
             .execute_script(ExecuteScriptOptions {
@@ -1555,7 +1591,7 @@ async fn run_socket(
         isolated_worlds: HashMap::new(),
         next_loader: 1,
         next_context: 1000,
-        next_handle: 1,
+        next_evaluation: 1,
     };
     loop {
         let wake = tokio::select! {
@@ -1612,4 +1648,132 @@ async fn send_messages(
         socket.send(WsMessage::text(message.to_string())).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use browser::{Browser, BrowserOptions};
+
+    use super::*;
+
+    static TEST_DIR: AtomicU64 = AtomicU64::new(1);
+
+    fn test_browser() -> (Browser, std::path::PathBuf) {
+        let data_home = std::env::temp_dir().join(format!(
+            "tinybrowser-cdp-test-{}-{}",
+            std::process::id(),
+            TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let browser = Browser::new(BrowserOptions {
+            data_home: Some(data_home.clone()),
+            ..BrowserOptions::default()
+        })
+        .expect("test browser");
+        (browser, data_home)
+    }
+
+    fn test_conn(browser: &Browser) -> Conn {
+        let (tab_events_tx, tab_events_rx) = mpsc::channel(8);
+        Conn {
+            browser: browser.handle().clone(),
+            sessions: HashMap::new(),
+            next_session: 1,
+            tab: None,
+            stop: Shutdown::new(),
+            subscriptions: Vec::new(),
+            tab_events_tx,
+            tab_events_rx,
+            clock_origin: Instant::now(),
+            auto_attach: false,
+            events: Vec::new(),
+            loader_ids: HashMap::new(),
+            current_loaders: HashMap::new(),
+            lifecycle_events: false,
+            isolated_worlds: HashMap::new(),
+            next_loader: 1,
+            next_context: 1000,
+            next_evaluation: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_method_reports_exact_method_not_found() {
+        let (browser, data_home) = test_browser();
+        let mut conn = test_conn(&browser);
+
+        let outcome = conn
+            .dispatch_text(r#"{"id":7,"method":"Foo.bar","params":{}}"#)
+            .await;
+
+        assert_eq!(
+            outcome.reply,
+            json!({
+                "id": 7,
+                "error": {"code": -32601, "message": "'Foo.bar' wasn't found"},
+            })
+        );
+        assert!(!outcome.close);
+
+        browser.close().await.expect("close");
+        let _ = std::fs::remove_dir_all(data_home);
+    }
+
+    #[tokio::test]
+    async fn page_params_are_parsed_at_the_boundary() {
+        let (browser, data_home) = test_browser();
+        let mut conn = test_conn(&browser);
+        let tab = browser.handle().create_tab().await.expect("tab");
+        let session = conn.mint(Session::Tab(tab));
+
+        let default_media = json!({
+            "id": 1,
+            "method": "Emulation.setEmulatedMedia",
+            "params": {
+                "media": "",
+                "features": [
+                    {"name": "prefers-color-scheme", "value": ""},
+                    {"name": "prefers-reduced-motion", "value": ""},
+                ],
+            },
+            "sessionId": session,
+        });
+        let outcome = conn.dispatch_text(&default_media.to_string()).await;
+        assert_eq!(outcome.reply["result"], json!({}));
+
+        let print_media = json!({
+            "id": 2,
+            "method": "Emulation.setEmulatedMedia",
+            "params": {"media": "print"},
+            "sessionId": session,
+        });
+        let outcome = conn.dispatch_text(&print_media.to_string()).await;
+        assert_eq!(outcome.reply["error"]["code"], json!(-32601));
+
+        let cache_enabled = json!({
+            "id": 3,
+            "method": "Network.setCacheDisabled",
+            "params": {"cacheDisabled": false},
+            "sessionId": session,
+        });
+        let outcome = conn.dispatch_text(&cache_enabled.to_string()).await;
+        assert_eq!(outcome.reply["error"]["code"], json!(-32601));
+
+        let get_properties = json!({
+            "id": 4,
+            "method": "Runtime.getProperties",
+            "params": {"ownProperties": true},
+            "sessionId": session,
+        });
+        let outcome = conn.dispatch_text(&get_properties.to_string()).await;
+        assert_eq!(outcome.reply["error"]["code"], json!(-32000));
+        assert_eq!(
+            outcome.reply["error"]["message"],
+            json!("Runtime.getProperties requires objectId")
+        );
+
+        browser.close().await.expect("close");
+        let _ = std::fs::remove_dir_all(data_home);
+    }
 }

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rquickjs::{
     Context, Ctx, Exception, Function, Object, Persistent, Result, Runtime, Value,
@@ -55,11 +56,27 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         bridge.set(name, table)?;
     }
     bridge.set("evaluatePage", Func::from(evaluate_page))?;
+    bridge.set("__tb_mint", Func::from(mint_handle))?;
+    let install: Function = ctx.eval(format!(
+        "(function(host) {{ 'use strict';\n{}\n{}\n}})",
+        include_str!("scripts/primordials.js"),
+        include_str!("scripts/remote_object.js")
+    ))?;
+    install.call::<_, ()>((bridge.clone(),))?;
     if let Some(slots) = &mut registry.borrow_mut().private_slots {
         slots.realms.insert(ctx.as_raw().as_ptr() as usize);
     }
     world.borrow_mut().bridge = Some(Persistent::save(ctx, bridge));
     Ok(())
+}
+
+/// Next handle id handed to one page-side object. Rust owns the counter; the
+/// realm only stores the value under the id it receives.
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+fn mint_handle() -> String {
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    format!("h{id}")
 }
 
 pub(crate) fn release(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) {
