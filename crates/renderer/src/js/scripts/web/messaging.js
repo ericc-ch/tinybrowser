@@ -219,6 +219,13 @@ const __tbEncode = (value, transfer, sourcePort) => {
       canvases.set(input, index);
       return index;
     }
+    if (typeof globalThis.OffscreenCanvas === 'function'
+        && input instanceof globalThis.OffscreenCanvas) {
+      // OffscreenCanvas is transferable but not serializable, so a clone
+      // without a transfer entry must fail instead of becoming `{}`
+      // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
+      throw __tbCloneFailure();
+    }
     if (__tbBlobData.get(input) !== undefined) {
       const blob = __tbBlobData.get(input);
        const bytes = __tbBase64Encode(blob.bytes);

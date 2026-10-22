@@ -1759,8 +1759,9 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     // active. `template.content`, `createHTMLDocument`, and `DOMParser`
     // documents are inert and must not fetch.
     if is_img {
-        let active = world.borrow().is_active_document(element);
-        if active {
+        // Only `src` selects image data; `srcdoc` is not an `<img>` attribute
+        // and must not mark an otherwise settled image as loading.
+        if local == "src" && world.borrow().is_active_document(element) {
             world.borrow_mut().queue_image_update(element);
         }
         return Ok(());
