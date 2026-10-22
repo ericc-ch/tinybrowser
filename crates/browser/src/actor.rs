@@ -200,7 +200,7 @@ pub struct TabHandle {
 }
 
 /// One framed script evaluation requested through a [`TabHandle`].
-pub struct ExecuteScriptInOptions<'a> {
+pub struct ExecuteScriptOptions<'a> {
     /// Frame to evaluate in.
     pub frame: FrameId,
     /// Script source.
@@ -210,7 +210,7 @@ pub struct ExecuteScriptInOptions<'a> {
 }
 
 /// One framed JS-truth wait requested through a [`TabHandle`].
-pub struct RunUntilJsTrueInOptions<'a> {
+pub struct RunUntilJsTrueOptions<'a> {
     /// Frame to evaluate in.
     pub frame: FrameId,
     /// Predicate source; waits until it evaluates to JS `true`.
@@ -253,16 +253,27 @@ impl TabHandle {
         .await
     }
 
-    /// Evaluates `source` and returns a value-only script result.
+    /// Evaluates `source` in one frame, interrupting `QuickJS` if `timeout`
+    /// elapses.
     ///
     /// # Errors
     ///
-    /// [`TabError::Script`] or [`TabError::ActorStopped`].
-    pub async fn execute_script(&self, source: &str) -> Result<RemoteValue, TabError> {
-        self.execute_script_in(ExecuteScriptInOptions {
-            frame: FrameId::MAIN,
-            source: renderer::ScriptSource::Page(source),
-            timeout: None,
+    /// [`TabError::UnknownFrame`], [`TabError::Script`], or
+    /// [`TabError::ActorStopped`].
+    pub async fn execute_script(
+        &self,
+        options: ExecuteScriptOptions<'_>,
+    ) -> Result<RemoteValue, TabError> {
+        let ExecuteScriptOptions {
+            frame,
+            source,
+            timeout,
+        } = options;
+        self.ask(|reply| Command::Execute {
+            frame,
+            source: source.into_owned(),
+            timeout,
+            reply,
         })
         .await
     }
@@ -275,35 +286,10 @@ impl TabHandle {
     ///
     /// [`TabError::Script`] or [`TabError::ActorStopped`].
     pub async fn execute_browser_script(&self, source: &str) -> Result<RemoteValue, TabError> {
-        self.execute_script_in(ExecuteScriptInOptions {
+        self.execute_script(ExecuteScriptOptions {
             frame: FrameId::MAIN,
             source: renderer::ScriptSource::Browser(source),
             timeout: None,
-        })
-        .await
-    }
-
-    /// Evaluates `source` in one frame, interrupting `QuickJS` if `timeout`
-    /// elapses.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::UnknownFrame`], [`TabError::Script`], or
-    /// [`TabError::ActorStopped`].
-    pub async fn execute_script_in(
-        &self,
-        options: ExecuteScriptInOptions<'_>,
-    ) -> Result<RemoteValue, TabError> {
-        let ExecuteScriptInOptions {
-            frame,
-            source,
-            timeout,
-        } = options;
-        self.ask(|reply| Command::Execute {
-            frame,
-            source: source.into_owned(),
-            timeout,
-            reply,
         })
         .await
     }
@@ -424,11 +410,11 @@ impl TabHandle {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] or [`TabError::ActorStopped`].
-    pub async fn run_until_js_true_in(
+    pub async fn run_until_js_true(
         &self,
-        options: RunUntilJsTrueInOptions<'_>,
+        options: RunUntilJsTrueOptions<'_>,
     ) -> Result<bool, TabError> {
-        let RunUntilJsTrueInOptions {
+        let RunUntilJsTrueOptions {
             frame,
             source,
             timeout,

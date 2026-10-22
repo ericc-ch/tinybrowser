@@ -26,7 +26,7 @@ mod site;
 mod storage;
 mod wire;
 
-pub use actor::{ExecuteScriptInOptions, RunUntilJsTrueInOptions, TabEvent, TabHandle, TabId};
+pub use actor::{ExecuteScriptOptions, RunUntilJsTrueOptions, TabEvent, TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle, BrowserOpenError, BrowserOptions};
 pub use net::{Agent, AgentOptions, CookieRecord, CookieSameSite};
 pub use profile::{Profile, ProfileError, ProfileName, default_data_home};

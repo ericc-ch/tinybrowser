@@ -80,6 +80,7 @@ struct Sessions {
 struct Session {
     current: String,
     windows: HashMap<String, Window>,
+    implicit_timeout: Duration,
     script_timeout: Duration,
     page_load_timeout: Duration,
     /// Virtual window rectangle. The engine has no window system, so
@@ -119,6 +120,7 @@ impl Sessions {
             Session {
                 current: handle.clone(),
                 windows: HashMap::from([(handle, window)]),
+                implicit_timeout: Duration::ZERO,
                 script_timeout: DEFAULT_SCRIPT_TIMEOUT,
                 page_load_timeout: DEFAULT_PAGE_LOAD_TIMEOUT,
                 window_rect: [0.0, 0.0, 800.0, 600.0],
@@ -289,7 +291,7 @@ async fn execute(
     let wrapped = wrap_script(script, &args, asynchronous);
     match window
         .tab
-        .execute_script_in(browser::ExecuteScriptInOptions {
+        .execute_script(browser::ExecuteScriptOptions {
             frame: browser::FrameId::MAIN,
             source: browser::ScriptSource::Browser(&wrapped),
             timeout: Some(script_timeout),
@@ -321,7 +323,7 @@ fn remaining(started: Instant, budget: Duration) -> Duration {
 async fn wait_for_async(window: &Window, handle: &str, script_timeout: Duration) -> (u16, Value) {
     match window
         .tab
-        .run_until_js_true_in(browser::RunUntilJsTrueInOptions {
+        .run_until_js_true(browser::RunUntilJsTrueOptions {
             frame: browser::FrameId::MAIN,
             source: browser::ScriptSource::Browser("host.webDriver.done === true"),
             timeout: script_timeout,
@@ -480,12 +482,35 @@ async fn find_matches(
     let Some(window) = current(sessions, session) else {
         return Err(error(404, "invalid session id", session));
     };
+    // Element retrieval is bounded by the session's implicit-wait timeout; an
+    // unset implicit wait keeps the script execution bound instead of running
+    // page code without any deadline
+    // (<https://w3c.github.io/webdriver/#dfn-implicit-wait>).
+    let (implicit_timeout, script_timeout) = sessions
+        .open
+        .get(session)
+        .map_or((Duration::ZERO, DEFAULT_SCRIPT_TIMEOUT), |found| {
+            (found.implicit_timeout, found.script_timeout)
+        });
+    let timeout = if implicit_timeout.is_zero() {
+        script_timeout
+    } else {
+        implicit_timeout
+    };
     let script = format!(
         "(function(){{try{{return Array.from(document.querySelectorAll({}))}}\
          catch(e){{return 'invalid selector'}}}})()",
         json!(selector)
     );
-    match window.tab.execute_script(&script).await {
+    match window
+        .tab
+        .execute_script(browser::ExecuteScriptOptions {
+            frame: browser::FrameId::MAIN,
+            source: browser::ScriptSource::Page(&script),
+            timeout: Some(timeout),
+        })
+        .await
+    {
         Ok(RemoteValue::List(items)) => Ok(items
             .into_iter()
             .filter_map(|item| match item {
@@ -1017,7 +1042,7 @@ async fn element_rect(sessions: &Sessions, session: &str, element: &str) -> (u16
 fn get_timeouts(sessions: &Sessions, session: &str) -> (u16, Value) {
     match sessions.open.get(session) {
         Some(found) => ok(json!({
-            "implicit": 0,
+            "implicit": duration_millis(found.implicit_timeout),
             "pageLoad": duration_millis(found.page_load_timeout),
             "script": duration_millis(found.script_timeout),
         })),
@@ -1033,6 +1058,9 @@ fn set_timeouts(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Val
     let Some(found) = sessions.open.get_mut(session) else {
         return error(404, "invalid session id", session);
     };
+    if let Some(ms) = parsed.get("implicit").and_then(json_millis) {
+        found.implicit_timeout = Duration::from_millis(ms);
+    }
     if let Some(ms) = parsed.get("script").and_then(json_millis) {
         found.script_timeout = Duration::from_millis(ms);
     }
