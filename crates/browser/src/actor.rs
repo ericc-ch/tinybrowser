@@ -259,7 +259,12 @@ impl TabHandle {
     ///
     /// [`TabError::Script`] or [`TabError::ActorStopped`].
     pub async fn execute_script(&self, source: &str) -> Result<RemoteValue, TabError> {
-        self.execute_script_timeout(source, None).await
+        self.execute_script_in(ExecuteScriptInOptions {
+            frame: FrameId::MAIN,
+            source: renderer::ScriptSource::Page(source),
+            timeout: None,
+        })
+        .await
     }
 
     /// Evaluates a browser-owned expression with private realm capabilities.
@@ -274,24 +279,6 @@ impl TabHandle {
             frame: FrameId::MAIN,
             source: renderer::ScriptSource::Browser(source),
             timeout: None,
-        })
-        .await
-    }
-
-    /// Evaluates `source`, interrupting `QuickJS` if `timeout` elapses.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::Script`] or [`TabError::ActorStopped`].
-    pub async fn execute_script_timeout(
-        &self,
-        source: &str,
-        timeout: Option<Duration>,
-    ) -> Result<RemoteValue, TabError> {
-        self.execute_script_in(ExecuteScriptInOptions {
-            frame: FrameId::MAIN,
-            source: renderer::ScriptSource::Page(source),
-            timeout,
         })
         .await
     }
@@ -429,24 +416,6 @@ impl TabHandle {
     pub async fn run_until_load_timeout(&self, timeout: Duration) -> Result<bool, TabError> {
         self.ask(|reply| Command::RunUntilLoadTimeout { timeout, reply })
             .await
-    }
-
-    /// Waits until `source` evaluates to JS `true`, returning `false` on timeout.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`].
-    pub async fn run_until_js_true(
-        &self,
-        source: &str,
-        timeout: Duration,
-    ) -> Result<bool, TabError> {
-        self.run_until_js_true_in(RunUntilJsTrueInOptions {
-            frame: FrameId::MAIN,
-            source: renderer::ScriptSource::Page(source),
-            timeout,
-        })
-        .await
     }
 
     /// Waits until `source` evaluates to JS `true` in `frame`, returning
@@ -1222,9 +1191,8 @@ async fn coordinator_loop(
                 let navigated = matches!(event, RendererEvent::Navigated { .. });
                 tab.handle_renderer_event(frame, &event).await;
                 if navigated {
-                    // The frame's realm is gone, so its `run_until_js_true`
-                    // waiters cannot settle; resolve them instead of polling to
-                    // the deadline.
+                    // The frame's realm is gone, so its JS-truth waiters cannot
+                    // settle; resolve them instead of polling to the deadline.
                     resolve_frame_waiters(&server, &mut waiters, frame).await;
                 }
             }

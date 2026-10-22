@@ -63,7 +63,6 @@ style_traits = { package = "stylo_traits", version = "0.22.0" }
 blitz-dom = { version = "=0.3.0-beta.4", features = ["floats"] }
 blitz-html = "=0.3.0-beta.4"
 blitz-paint = "=0.3.0-beta.4"
-anyrender = "=0.14.0"
 anyrender_tiny_skia = { path = "../anyrender-tiny-skia" }
 # SVG <img> sources must be rasterized into pixels for drawImage; the SVG
 # renderer is already linked through blitz-paint, so this adds no new code.
