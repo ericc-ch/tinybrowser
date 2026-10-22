@@ -583,17 +583,24 @@ fn to_bytes([r, g, b, a]: [f32; 4]) -> [u8; 4] {
 }
 
 fn serialized_srgb([r, g, b, a]: [f32; 4]) -> String {
-    let alpha = if a < 1.0 {
-        format!(" / {}", format_number(a))
-    } else {
-        String::new()
-    };
+    let alpha = alpha_suffix(a);
     format!(
         "color(srgb {} {} {}{alpha})",
         format_number(r),
         format_number(g),
         format_number(b)
     )
+}
+
+/// Formats the `/ alpha` suffix for a serialized color. Every caller clamps
+/// first, so an opaque color is exactly `1.0`
+/// (<https://drafts.csswg.org/css-color-4/#serializing-color-values>).
+fn alpha_suffix(alpha: f32) -> String {
+    if alpha >= 1.0 {
+        String::new()
+    } else {
+        format!(" / {}", format_number(alpha))
+    }
 }
 
 /// A `color()` or `lab()` component: a number or the `none` keyword
@@ -636,11 +643,7 @@ fn serialize_color_function(space: &str, components: &[Component], alpha: f32) -
         Component::Number(value) => format_number(value),
     };
     let alpha = alpha.clamp(0.0, 1.0);
-    let alpha_text = if (alpha - 1.0).abs() < f32::EPSILON {
-        String::new()
-    } else {
-        format!(" / {}", format_number(alpha))
-    };
+    let alpha_text = alpha_suffix(alpha);
     format!(
         "color({space} {} {} {}{alpha_text})",
         component(components[0]),
@@ -653,7 +656,21 @@ fn parse_color_function(inner: &str) -> Option<ParsedColor> {
     let inner = inner.trim();
     let (space, rest) = inner.split_once(char::is_whitespace)?;
     let space = space.trim();
-    if space.is_empty() {
+    // `color()` accepts only the predefined color spaces; an unknown identifier
+    // makes the whole declaration invalid
+    // (<https://drafts.csswg.org/css-color-4/#color-function>).
+    if !matches!(
+        space,
+        "srgb"
+            | "srgb-linear"
+            | "display-p3"
+            | "a98-rgb"
+            | "prophoto-rgb"
+            | "rec2020"
+            | "xyz"
+            | "xyz-d50"
+            | "xyz-d65"
+    ) {
         return None;
     }
     let (channels, alpha) = rest
@@ -670,7 +687,7 @@ fn parse_color_function(inner: &str) -> Option<ParsedColor> {
     }
     let alpha_value = match alpha {
         None => 1.0,
-        Some(text) => Component::parse(text)?.number().unwrap_or(1.0),
+        Some(text) => Component::parse(text)?.number()?,
     };
     // sRGB is the only space the bitmap stores directly. Other spaces keep
     // their serialization and paint with a best-effort sRGB approximation.
@@ -710,11 +727,7 @@ fn lab_axis(text: &str) -> Option<f32> {
 
 fn serialize_lab(lightness: f32, a: f32, b: f32, alpha: f32) -> String {
     let alpha = alpha.clamp(0.0, 1.0);
-    let alpha_text = if (alpha - 1.0).abs() < f32::EPSILON {
-        String::new()
-    } else {
-        format!(" / {}", format_number(alpha))
-    };
+    let alpha_text = alpha_suffix(alpha);
     format!(
         "lab({} {} {}{alpha_text})",
         format_number(lightness),
@@ -733,17 +746,19 @@ fn parse_lab(inner: &str) -> Option<ParsedColor> {
     if parts.len() != 3 {
         return None;
     }
-    let lightness = lab_lightness(parts[0])?;
+    let lightness = lab_lightness(parts[0])?.clamp(0.0, 100.0);
     let a = lab_axis(parts[1])?;
     let b = lab_axis(parts[2])?;
-    let alpha_value = alpha.map_or(1.0, |text| {
-        Component::parse(text)
-            .and_then(Component::number)
-            .unwrap_or(1.0)
-    });
+    let alpha_value = match alpha {
+        None => 1.0,
+        Some(text) => Component::parse(text)?.number()?,
+    };
+    let bytes = lab_to_srgb(lightness, a, b, alpha_value);
     Some(ParsedColor {
-        bytes: lab_to_srgb(lightness, a, b, alpha_value),
-        value: [lightness, a, b, alpha_value],
+        bytes,
+        // `value` is sRGB 0..1 everywhere else, so store the converted color
+        // rather than raw Lab coordinates. `serialized` keeps the Lab syntax.
+        value: from_bytes(bytes),
         serialized: Some(serialize_lab(lightness, a, b, alpha_value)),
     })
 }
@@ -811,35 +826,52 @@ fn parse_relative(rest: &str, color_function: bool) -> Option<ParsedColor> {
         .map_or((channels, None), |(channels, alpha)| {
             (channels.trim(), Some(alpha.trim()))
         });
-    let evaluate = |token: &str, fallback: f32| -> f32 {
-        match token {
-            "r" => source[0],
-            "g" => source[1],
-            "b" => source[2],
-            "alpha" => source[3],
-            _ => token.parse::<f32>().unwrap_or(fallback).clamp(0.0, 1.0),
+    let evaluate = |token: &str| -> Option<f32> {
+        if token.eq_ignore_ascii_case("none") {
+            return Some(0.0);
         }
+        let channel = match token {
+            "r" => Some(source[0]),
+            "g" => Some(source[1]),
+            "b" => Some(source[2]),
+            "alpha" => Some(source[3]),
+            _ => None,
+        };
+        if channel.is_some() {
+            return channel;
+        }
+        let (number_text, percent) = token
+            .strip_suffix('%')
+            .map_or((token, false), |text| (text, true));
+        let number = number_text.parse::<f32>().ok()?;
+        let scaled = if percent {
+            number / 100.0
+        } else if color_function {
+            number
+        } else {
+            // `rgb(from …)` numbers are 0..255; `color(from …)` numbers are
+            // already 0..1 (<https://drafts.csswg.org/css-color-5/#relative-colors>).
+            number / 255.0
+        };
+        Some(scaled.clamp(0.0, 1.0))
     };
     if channels.contains(')') || channels.contains(',') {
         return None;
     }
     let tokens: Vec<&str> = channels.split_whitespace().collect();
-    let valid = |token: &str| {
-        matches!(token, "r" | "g" | "b" | "alpha")
-            || token.trim_end_matches('%').parse::<f32>().is_ok()
-    };
-    if tokens.len() > 3 || tokens.iter().any(|token| !valid(token)) {
+    if tokens.len() > 3 {
         return None;
     }
-    if alpha.is_some_and(|alpha| !valid(alpha) || alpha.contains(char::is_whitespace)) {
-        return None;
+    let mut value = [source[0], source[1], source[2], source[3]];
+    for (position, token) in tokens.iter().enumerate() {
+        value[position] = evaluate(token)?;
     }
-    let value = [
-        evaluate(tokens.first().copied().unwrap_or("r"), 0.0),
-        evaluate(tokens.get(1).copied().unwrap_or("g"), 0.0),
-        evaluate(tokens.get(2).copied().unwrap_or("b"), 0.0),
-        alpha.map_or(source[3], |alpha| evaluate(alpha, source[3])),
-    ];
+    if let Some(alpha) = alpha {
+        if alpha.contains(char::is_whitespace) {
+            return None;
+        }
+        value[3] = evaluate(alpha)?;
+    }
     Some(ParsedColor {
         bytes: to_bytes(value),
         value,
@@ -859,18 +891,16 @@ fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
     }
     let split = |part: &str| -> Option<(ParsedColor, Option<f32>)> {
         let part = part.trim();
-        let (color, percentage) =
-            part.rsplit_once(char::is_whitespace)
-                .map_or((part, None), |(color, percentage)| {
-                    if percentage.trim().ends_with('%') {
-                        (
-                            color.trim(),
-                            percentage.trim().trim_end_matches('%').parse::<f32>().ok(),
-                        )
-                    } else {
-                        (part, None)
-                    }
-                });
+        let mut color = part;
+        let mut percentage = None;
+        if let Some((head, tail)) = part.rsplit_once(char::is_whitespace) {
+            let tail = tail.trim();
+            if tail.ends_with('%') {
+                let value = tail.trim_end_matches('%').parse::<f32>().ok()?;
+                color = head.trim();
+                percentage = Some(value);
+            }
+        }
         let color = parse_exact(color).or_else(|| {
             parse(color).map(|bytes| ParsedColor {
                 bytes,
@@ -882,6 +912,12 @@ fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
     };
     let (first, first_weight) = split(parts[0])?;
     let (second, second_weight) = split(parts[1])?;
+    // Percentages are limited to 0..100; a missing one takes what is left.
+    if first_weight.is_some_and(|weight| !(0.0..=100.0).contains(&weight))
+        || second_weight.is_some_and(|weight| !(0.0..=100.0).contains(&weight))
+    {
+        return None;
+    }
     let (first_weight, second_weight) = match (first_weight, second_weight) {
         (None, None) => (50.0, 50.0),
         (Some(weight), None) => (weight, 100.0 - weight),
@@ -892,10 +928,30 @@ fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
     if total <= 0.0 {
         return None;
     }
+    // When the weights add up to less than 100%, the remaining percentage is
+    // transparent, so the result's alpha is multiplied by the sum
+    // (<https://drafts.csswg.org/css-color-5/#color-mix-result>).
+    let alpha_multiplier = if total < 100.0 { total / 100.0 } else { 1.0 };
     let (first, second) = (first.value, second.value);
     let weight = first_weight / total;
-    let mix = |index: usize| first[index] * weight + second[index] * (1.0 - weight);
-    let value = [mix(0), mix(1), mix(2), mix(3)];
+    let other = 1.0 - weight;
+    // Interpolation is on premultiplied components; mixing straight values
+    // turns `transparent` into a darkened color instead of a translucent one.
+    let alpha = first[3] * weight + second[3] * other;
+    let mix = |index: usize| {
+        let premultiplied = first[index] * first[3] * weight + second[index] * second[3] * other;
+        if alpha > 0.0 {
+            premultiplied / alpha
+        } else {
+            0.0
+        }
+    };
+    let value = [
+        mix(0),
+        mix(1),
+        mix(2),
+        (alpha * alpha_multiplier).clamp(0.0, 1.0),
+    ];
     Some(ParsedColor {
         bytes: to_bytes(value),
         value,
@@ -905,7 +961,7 @@ fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{parse, parse_exact};
 
     #[test]
     fn hex_lengths() {
@@ -929,5 +985,38 @@ mod tests {
         assert_eq!(parse("transparent"), Some([0, 0, 0, 0]));
         assert_eq!(parse("not-a-color"), None);
         assert_eq!(parse("#12"), None);
+    }
+
+    #[test]
+    fn color_function_rejects_unknown_spaces_and_bad_alpha() {
+        assert!(parse_exact("color(bogus 1 0 0)").is_none());
+        assert!(parse_exact("color(srgb 1 0 0 / garbage)").is_none());
+        assert!(parse_exact("lab(50 0 0 / garbage)").is_none());
+        assert!(parse_exact("lab(50 0 0)").is_some());
+    }
+
+    #[test]
+    fn color_mix_is_premultiplied_and_scales_partial_percentages() {
+        let transparent_red = parse_exact("color-mix(in srgb, transparent, red)").unwrap();
+        assert_eq!(transparent_red.bytes, [255, 0, 0, 128]);
+
+        let partial = parse_exact("color-mix(in srgb, red 25%, blue 25%)").unwrap();
+        assert_eq!(partial.bytes, [128, 0, 128, 128]);
+
+        assert!(parse_exact("color-mix(in srgb, red 150%, blue)").is_none());
+        assert!(parse_exact("color-mix(in srgb, red -1%, blue)").is_none());
+    }
+
+    #[test]
+    fn relative_rgb_numbers_are_zero_to_255() {
+        let mixed = parse_exact("rgb(from #000000 128 0 0)").unwrap();
+        assert_eq!(mixed.bytes, [128, 0, 0, 255]);
+    }
+
+    #[test]
+    fn lab_mixes_in_srgb_not_lab_coordinates() {
+        let lab = parse_exact("lab(50 0 0)").unwrap();
+        let same = parse_exact("color-mix(in srgb, lab(50 0 0), lab(50 0 0))").unwrap();
+        assert_eq!(same.bytes, lab.bytes);
     }
 }

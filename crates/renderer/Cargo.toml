@@ -67,8 +67,10 @@ anyrender = "=0.14.0"
 anyrender_tiny_skia = { path = "../anyrender-tiny-skia" }
 # SVG <img> sources must be rasterized into pixels for drawImage; the SVG
 # renderer is already linked through blitz-paint, so this adds no new code.
-anyrender_svg = "=0.15.0"
-kurbo = "=0.13.1"
+# Match the requirements blitz-paint declares so a Blitz bump cannot pull a
+# second copy of either crate into the graph.
+anyrender_svg = "0.15.0"
+kurbo = "0.13.1"
 # Canvas 2D rasterization. Already in the graph through anyrender_tiny_skia,
 # so the canvas context adds no new crate to the binary.
 tiny-skia = { version = "0.12", default-features = false, features = ["std"] }

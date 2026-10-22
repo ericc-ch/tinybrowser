@@ -3,7 +3,7 @@
 
 use super::super::{attribute_value, host, set_attribute_sync, world, world_for_node};
 
-use rquickjs::{Coerced, Ctx, FromJs, Result, Value};
+use rquickjs::{Coerced, Ctx, Exception, FromJs, Result, Value};
 
 use crate::dom::tree::{NodeId, attr, html_namespace, is_connected};
 
@@ -695,6 +695,12 @@ fn context_variant(member: crate::js::world::SameObject, value: Value<'_>) -> Re
 /// must match
 /// (<https://webidl.spec.whatwg.org/#es-dictionary>).
 fn read_context_options<'js>(ctx: &Ctx<'js>, options: &Value<'js>) -> Result<()> {
+    if options.is_undefined() || options.is_null() {
+        return Ok(());
+    }
+    // `getContext` takes `any` for options: primitives are ignored rather than
+    // converted as a dictionary
+    // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>).
     let Some(object) = options.as_object() else {
         return Ok(());
     };
@@ -705,19 +711,33 @@ fn read_context_options<'js>(ctx: &Ctx<'js>, options: &Value<'js>) -> Result<()>
         "desynchronized",
         "willReadFrequently",
     ] {
-        if !object.contains_key(name)? {
+        let value: Value = object.get(name)?;
+        if value.is_undefined() {
             continue;
         }
         match name {
             "alpha" | "desynchronized" | "willReadFrequently" => {
-                let _: bool = object.get(name)?;
+                let _ = Coerced::<bool>::from_js(ctx, value)?;
             }
-            _ => {
-                // `PredefinedColorSpace` and `CanvasColorType` are DOMStrings;
-                // WebIDL conversion calls ToString on the member value.
-                let value = object.get::<_, Value>(name)?;
-                let _ = Coerced::<rquickjs::String>::from_js(ctx, value)?;
+            "colorSpace" => {
+                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
+                if !matches!(
+                    text.as_str(),
+                    "srgb" | "srgb-linear" | "display-p3" | "display-p3-linear"
+                ) {
+                    return Err(Exception::throw_type(
+                        ctx,
+                        "unknown PredefinedColorSpace value",
+                    ));
+                }
             }
+            "colorType" => {
+                let text = Coerced::<rquickjs::String>::from_js(ctx, value)?.to_string()?;
+                if !matches!(text.as_str(), "unorm8" | "float16") {
+                    return Err(Exception::throw_type(ctx, "unknown CanvasColorType value"));
+                }
+            }
+            _ => {}
         }
     }
     Ok(())

@@ -162,8 +162,17 @@ const __tbEncode = (value, transfer, sourcePort) => {
       transferred.set(item, itemData.id);
     } else if (typeof globalThis.OffscreenCanvas === 'function'
                && item instanceof globalThis.OffscreenCanvas) {
-      if (canvases.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate canvases', 'DataCloneError');
-      if (item.__tbDetached) throw new globalThis.DOMException('Cannot transfer a detached OffscreenCanvas', 'DataCloneError');
+      if (canvases.has(item)) {
+        throw new globalThis.DOMException('Transfer list contains duplicate canvases', 'DataCloneError');
+      }
+      if (globalThis.__tbOffscreenDetached(item)) {
+        throw new globalThis.DOMException('Cannot transfer a detached OffscreenCanvas', 'DataCloneError');
+      }
+      // A canvas with a context cannot move its bitmap yet
+      // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
+      if (globalThis.__tbOffscreenHasContext(item)) {
+        throw new globalThis.DOMException('Cannot transfer an OffscreenCanvas with a context', 'InvalidStateError');
+      }
       canvases.set(item, -1);
     } else {
       throw new globalThis.DOMException('Value not transferable', 'DataCloneError');
@@ -325,8 +334,7 @@ const __tbEncode = (value, transfer, sourcePort) => {
     }
   }
   for (const [canvas] of canvases) {
-    canvas.__tbDetached = true;
-    if (canvas.__tbCanvas) canvas.__tbCanvas.__tbDetached = true;
+    globalThis.__tbOffscreenDetach(canvas);
   }
   const ports = __tbPrivateArray();
   for (const [port, id] of transferred) {

@@ -6,7 +6,7 @@
 //! (<https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-bitmap>).
 
 use std::collections::HashMap;
-use std::f32::consts::{FRAC_PI_4, TAU};
+use std::f32::consts::FRAC_PI_4;
 use std::sync::Arc;
 
 /// Shadows larger than this are skipped rather than allocating unbounded
@@ -83,10 +83,7 @@ struct State {
     transform: Transform,
     fill: Style,
     stroke: Style,
-    /// Exact CSS serialization for a color function such as `color(srgb …)`.
-    fill_text: Option<String>,
-    stroke_text: Option<String>,
-    shadow_text: Option<String>,
+    shadow: CanvasColor,
     alpha: f32,
     blend: BlendMode,
     line_width: f32,
@@ -95,7 +92,6 @@ struct State {
     miter_limit: f32,
     dash: Vec<f32>,
     dash_offset: f32,
-    shadow_color: [u8; 4],
     shadow_blur: f32,
     shadow_x: f32,
     shadow_y: f32,
@@ -116,7 +112,46 @@ struct State {
     /// Color matrix from the active `CanvasFilter` or layer filter. Filters
     /// that cannot be represented as a color matrix leave this `None`.
     filter_matrix: Option<ColorMatrix>,
+    /// The `CanvasFilter` object assigned to `filter`, so the getter can return
+    /// the same object after `save()`/`restore()`. It is part of the drawing
+    /// state and lives on the same stack as the matrix.
+    filter_object: Option<rquickjs::Persistent<rquickjs::Value<'static>>>,
     clip: Option<Arc<Mask>>,
+}
+
+/// A rectangle in canvas user space.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rect {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+}
+
+impl Rect {
+    pub(crate) const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A negative width or height means the rectangle starts at the opposite
+    /// corner, not that the image is mirrored.
+    fn normalized(self) -> Self {
+        let mut rect = self;
+        if rect.width < 0.0 {
+            rect.x += rect.width;
+            rect.width = -rect.width;
+        }
+        if rect.height < 0.0 {
+            rect.y += rect.height;
+            rect.height = -rect.height;
+        }
+        rect
+    }
 }
 
 /// A 4x5 row-major color matrix from a `colorMatrix` filter
@@ -159,21 +194,20 @@ impl ColorMatrix {
     }
 
     pub(crate) fn saturate(amount: f32) -> Self {
-        let saturate = amount;
         Self([
-            0.213 + 0.787 * saturate,
-            0.715 - 0.715 * saturate,
-            0.072 - 0.072 * saturate,
+            0.213 + 0.787 * amount,
+            0.715 - 0.715 * amount,
+            0.072 - 0.072 * amount,
             0.0,
             0.0,
-            0.213 - 0.213 * saturate,
-            0.715 + 0.285 * saturate,
-            0.072 - 0.072 * saturate,
+            0.213 - 0.213 * amount,
+            0.715 + 0.285 * amount,
+            0.072 - 0.072 * amount,
             0.0,
             0.0,
-            0.213 - 0.213 * saturate,
-            0.715 - 0.715 * saturate,
-            0.072 + 0.928 * saturate,
+            0.213 - 0.213 * amount,
+            0.715 - 0.715 * amount,
+            0.072 + 0.928 * amount,
             0.0,
             0.0,
             0.0,
@@ -189,7 +223,7 @@ impl ColorMatrix {
             0.0, 0.0, 0.0, 0.0, 0.0, //
             0.0, 0.0, 0.0, 0.0, 0.0, //
             0.0, 0.0, 0.0, 0.0, 0.0, //
-            0.2126, 0.7152, 0.0722, 0.0, 0.0,
+            0.2125, 0.7154, 0.0721, 0.0, 0.0,
         ])
     }
 
@@ -248,9 +282,34 @@ fn apply_color_matrix(pixmap: &mut Pixmap, matrix: &ColorMatrix) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+/// A color and, when the assigned syntax has no sRGB-byte serialization, the
+/// exact CSSOM string. Keeping both together means state never has to guess
+/// which representation to trust.
+#[derive(Clone, PartialEq)]
+struct CanvasColor {
+    rgba: [u8; 4],
+    serialized: Option<String>,
+}
+
+impl CanvasColor {
+    fn new(rgba: [u8; 4]) -> Self {
+        Self {
+            rgba,
+            serialized: None,
+        }
+    }
+
+    fn exact(rgba: [u8; 4], serialized: String) -> Self {
+        Self {
+            rgba,
+            serialized: Some(serialized),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 enum Style {
-    Color([u8; 4]),
+    Color(CanvasColor),
     Gradient(u32),
     Pattern(u32),
 }
@@ -321,7 +380,6 @@ enum GradientKind {
 struct Layer {
     base: usize,
     parent: Option<Pixmap>,
-    state: State,
     /// Filter applied to this layer's bitmap in `endLayer`, before compositing.
     filter_matrix: Option<ColorMatrix>,
 }
@@ -482,6 +540,15 @@ impl Canvas2D {
         self.reset_state();
     }
 
+    /// Replaces the bitmap with a fresh transparent one, leaving the drawing
+    /// state untouched. `transferToImageBitmap` does this, unlike `reset()`
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-offscreencanvas-transfertoimagebitmap>).
+    pub(crate) fn clear_bitmap(&mut self) {
+        if let Some(pixmap) = &mut self.pixmap {
+            pixmap.fill(Color::TRANSPARENT);
+        }
+    }
+
     fn reset_state(&mut self) {
         self.state = State::default();
         self.stack.clear();
@@ -535,18 +602,18 @@ impl Canvas2D {
         self.layers.push(Layer {
             base,
             parent,
-            state: captured.clone(),
             filter_matrix: filter,
         });
         self.stack.push(captured);
         self.state.alpha = 1.0;
         self.state.blend = BlendMode::SourceOver;
-        self.state.shadow_color = [0, 0, 0, 0];
+        self.state.shadow = CanvasColor::new([0, 0, 0, 0]);
         self.state.shadow_blur = 0.0;
         self.state.shadow_x = 0.0;
         self.state.shadow_y = 0.0;
         "none".clone_into(&mut self.state.filter);
         self.state.filter_matrix = None;
+        self.state.filter_object = None;
     }
 
     /// Closes the innermost layer, unless a `save()` opened after it is still
@@ -562,35 +629,118 @@ impl Canvas2D {
             return false;
         };
         let Layer {
-            mut parent,
-            state,
+            parent,
             filter_matrix,
             ..
         } = layer;
+        // `begin_layer_filtered` pushed the captured state onto `self.stack`
+        // immediately above the layer boundary, so it is the state to restore.
+        let Some(state) = self.stack.pop() else {
+            return false;
+        };
         let mut layer_pixmap = self.pixmap.take();
         if let (Some(pixmap), Some(matrix)) = (layer_pixmap.as_mut(), filter_matrix) {
             apply_color_matrix(pixmap, &matrix);
         }
-        if let (Some(mut parent_pixmap), Some(layer_pixmap)) = (parent.take(), layer_pixmap) {
+        // The layer's compositing state is the state captured by
+        // `beginLayer`, including its shadow. Draw the shadow from the
+        // filtered layer before the layer itself, then composite once
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#drawing-model>).
+        self.state = state;
+        self.pixmap = parent;
+        let Some(layer_pixmap) = layer_pixmap else {
+            return true;
+        };
+        self.paint_layer_shadow(&layer_pixmap);
+        if let Some(parent_pixmap) = self.pixmap.as_mut() {
             parent_pixmap.draw_pixmap(
                 0,
                 0,
                 layer_pixmap.as_ref(),
                 &PixmapPaint {
-                    opacity: state.alpha.clamp(0.0, 1.0),
-                    blend_mode: state.blend,
+                    opacity: self.state.alpha.clamp(0.0, 1.0),
+                    blend_mode: self.state.blend,
                     quality: FilterQuality::Nearest,
                 },
                 Transform::identity(),
-                state.clip.as_deref(),
+                self.state.clip.as_deref(),
             );
-            self.pixmap = Some(parent_pixmap);
-        } else {
-            self.pixmap = parent;
         }
-        self.state = state;
-        self.stack.pop();
         true
+    }
+
+    /// Paints the shadow of a finished layer. The layer bitmap is already
+    /// filtered, so its alpha is the shadow source; the captured state supplies
+    /// the shadow color, offset, blur, global alpha, blend, and clip.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "mask sides and offsets stay within the bounded canvas pixmap"
+    )]
+    fn paint_layer_shadow(&mut self, layer: &Pixmap) {
+        let [_, _, _, alpha] = self.state.shadow.rgba;
+        if alpha == 0
+            || self.pixmap.is_none()
+            || (self.state.shadow_blur == 0.0
+                && self.state.shadow_x == 0.0
+                && self.state.shadow_y == 0.0)
+        {
+            return;
+        }
+        // The layer pixmap spans the whole canvas. Crop the shadow mask to the
+        // painted pixels so the pattern's outside-the-mask padding is
+        // transparent instead of repeating the canvas edge.
+        let width = layer.width();
+        let mut bounds: Option<(u32, u32, u32, u32)> = None;
+        for (index, pixel) in layer.pixels().iter().enumerate() {
+            if pixel.alpha() == 0 {
+                continue;
+            }
+            let x = index as u32 % width;
+            let y = index as u32 / width;
+            bounds = Some(match bounds {
+                Some((left, top, right, bottom)) => {
+                    (left.min(x), top.min(y), right.max(x), bottom.max(y))
+                }
+                None => (x, y, x, y),
+            });
+        }
+        let Some((min_x, min_y, max_x, max_y)) = bounds else {
+            return;
+        };
+        let sigma = self.state.shadow_blur / 2.0;
+        let padding = (sigma * 3.0).ceil() as u32 + 1;
+        // `finish_shadow` fills the whole canvas with a padded pattern. The
+        // mask therefore needs a transparent border at least as large as the
+        // shadow offset, or the pattern's edge clamp repeats the painted
+        // pixels across the rest of the canvas.
+        let margin = padding
+            + self.state.shadow_x.abs().ceil() as u32
+            + self.state.shadow_y.abs().ceil() as u32
+            + 1;
+        let width = max_x - min_x + 1 + margin * 2;
+        let height = max_y - min_y + 1 + margin * 2;
+        let Some(mut mask) = Pixmap::new(width, height) else {
+            return;
+        };
+        let Ok(margin) = i32::try_from(margin) else {
+            return;
+        };
+        mask.draw_pixmap(
+            margin,
+            margin,
+            layer.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        self.finish_shadow(
+            mask,
+            sigma,
+            min_x as f32 - margin as f32,
+            min_y as f32 - margin as f32,
+        );
     }
 
     pub(crate) fn filter(&self) -> &str {
@@ -603,6 +753,18 @@ impl Canvas2D {
 
     pub(crate) fn set_filter_matrix(&mut self, matrix: Option<ColorMatrix>) {
         self.state.filter_matrix = matrix;
+    }
+
+    /// The `CanvasFilter` object currently assigned to `filter`.
+    pub(crate) fn filter_object(&self) -> Option<rquickjs::Persistent<rquickjs::Value<'static>>> {
+        self.state.filter_object.clone()
+    }
+
+    pub(crate) fn set_filter_object(
+        &mut self,
+        value: Option<rquickjs::Persistent<rquickjs::Value<'static>>>,
+    ) {
+        self.state.filter_object = value;
     }
 
     pub(crate) fn transform(&mut self, m11: f32, m12: f32, m21: f32, m22: f32, dx: f32, dy: f32) {
@@ -675,22 +837,13 @@ impl Canvas2D {
     // ---- properties ------------------------------------------------------
 
     pub(crate) fn fill_style(&self) -> StyleValue {
-        match &self.state.fill_text {
-            Some(text) => match self.state.fill {
-                Style::Color(color) => StyleValue::ColorExact(color, text.clone()),
-                _ => StyleValue::from_style(self.state.fill),
-            },
-            None => StyleValue::from_style(self.state.fill),
-        }
+        StyleValue::from_style(&self.state.fill)
     }
 
     pub(crate) fn set_fill_style(&mut self, value: StyleValue) {
-        self.state.fill_text = match &value {
-            StyleValue::ColorExact(_, text) => Some(text.clone()),
-            _ => None,
-        };
         let style = match value {
-            StyleValue::Color(color) | StyleValue::ColorExact(color, _) => Style::Color(color),
+            StyleValue::Color(color) => Style::Color(CanvasColor::new(color)),
+            StyleValue::ColorExact(color, text) => Style::Color(CanvasColor::exact(color, text)),
             StyleValue::Gradient(id) => Style::Gradient(id),
             StyleValue::Pattern(id) => {
                 if self
@@ -707,22 +860,13 @@ impl Canvas2D {
     }
 
     pub(crate) fn stroke_style(&self) -> StyleValue {
-        match &self.state.stroke_text {
-            Some(text) => match self.state.stroke {
-                Style::Color(color) => StyleValue::ColorExact(color, text.clone()),
-                _ => StyleValue::from_style(self.state.stroke),
-            },
-            None => StyleValue::from_style(self.state.stroke),
-        }
+        StyleValue::from_style(&self.state.stroke)
     }
 
     pub(crate) fn set_stroke_style(&mut self, value: StyleValue) {
-        self.state.stroke_text = match &value {
-            StyleValue::ColorExact(_, text) => Some(text.clone()),
-            _ => None,
-        };
         let style = match value {
-            StyleValue::Color(color) | StyleValue::ColorExact(color, _) => Style::Color(color),
+            StyleValue::Color(color) => Style::Color(CanvasColor::new(color)),
+            StyleValue::ColorExact(color, text) => Style::Color(CanvasColor::exact(color, text)),
             StyleValue::Gradient(id) => Style::Gradient(id),
             StyleValue::Pattern(id) => {
                 if self
@@ -841,18 +985,20 @@ impl Canvas2D {
     }
 
     pub(crate) fn shadow_color(&self) -> [u8; 4] {
-        self.state.shadow_color
+        self.state.shadow.rgba
     }
 
     /// The exact CSS serialization of `shadowColor`, when it was set from a
     /// color function such as `color(srgb …)` or `lab()`.
     pub(crate) fn shadow_serialized(&self) -> Option<&str> {
-        self.state.shadow_text.as_deref()
+        self.state.shadow.serialized.as_deref()
     }
 
     pub(crate) fn set_shadow_color_exact(&mut self, color: [u8; 4], text: Option<String>) {
-        self.state.shadow_color = color;
-        self.state.shadow_text = text;
+        self.state.shadow = text.map_or_else(
+            || CanvasColor::new(color),
+            |text| CanvasColor::exact(color, text),
+        );
     }
 
     pub(crate) fn shadow_blur(&self) -> f32 {
@@ -1237,7 +1383,7 @@ impl Canvas2D {
         self.ellipse_arc(cx, cy, radius, radius, 0.0, start, end, counterclockwise);
     }
 
-    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
+    #[expect(clippy::too_many_arguments, reason = "matches the IDL member")]
     pub(crate) fn ellipse(
         &mut self,
         x: f32,
@@ -1282,25 +1428,33 @@ impl Canvas2D {
         counterclockwise: bool,
     ) {
         // The arc runs from the start point to the end point in the requested
-        // direction, covering at most one full turn. A negative exact
-        // multiple of 2π is a full turn, not an empty arc
-        // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-ellipse>).
-        let raw = if counterclockwise {
+        // direction, covering at most one full turn. Compare in f64 with a
+        // tolerance: a multiple of 2π that went through f32 may round to a
+        // tiny remainder, and an exact `==` on that remainder would change
+        // between an empty arc and a full one.
+        let raw = f64::from(if counterclockwise {
             start - end
         } else {
             end - start
-        };
-        let sweep = if raw >= TAU {
-            TAU
+        });
+        let tau = std::f64::consts::TAU;
+        let tolerance = 1e-6;
+        let sweep = if raw >= tau {
+            tau
         } else {
-            let modulo = raw.rem_euclid(TAU);
-            if modulo == 0.0 && raw < 0.0 {
-                TAU
+            let modulo = raw.rem_euclid(tau);
+            if modulo <= tolerance {
+                // A direction-mismatched full turn is a full circle, not an
+                // empty arc. Shipped engines agree here even though the spec
+                // only spells out the `>= 2π` case.
+                if raw < 0.0 { tau } else { 0.0 }
             } else {
                 modulo
             }
         };
         let delta = if counterclockwise { -sweep } else { sweep };
+        #[expect(clippy::cast_possible_truncation, reason = "the sweep is at most 2π")]
+        let delta = delta as f32;
         let mut start_point = ellipse_point(cx, cy, rx, ry, rotation, start);
         self.state.transform.map_point(&mut start_point);
         match self.current {
@@ -1321,8 +1475,9 @@ impl Canvas2D {
         )]
         // A quarter-turn cubic approximates a circular arc to about 0.03% of
         // the radius; that error is visible once a non-uniform transform
-        // stretches the radius, so use eighth-turns
-        // (Skia's `SkPath::arcTo` uses a comparable angular step).
+        // stretches the radius, so use eighth-turns. tiny-skia has no conic
+        // segments, unlike Skia's quadrant conics, so the smaller step is the
+        // only way to reduce the approximation error.
         let segments = ((delta.abs() / FRAC_PI_4).ceil() as u32).max(1);
         #[expect(
             clippy::cast_precision_loss,
@@ -1893,7 +2048,13 @@ impl Canvas2D {
         };
         let parent = self.pixmap.take();
         self.pixmap = make_pixmap(self.width, self.height);
+        // The operation paints into a transparent layer, so its own compositing
+        // must be source-over. The state's blend mode applies once, when the
+        // filtered layer composites onto the parent
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#drawing-model>).
+        let blend = std::mem::replace(&mut self.state.blend, BlendMode::SourceOver);
         draw(self);
+        self.state.blend = blend;
         let mut layer = self.pixmap.take();
         if let Some(pixmap) = layer.as_mut() {
             apply_color_matrix(pixmap, &matrix);
@@ -1909,11 +2070,11 @@ impl Canvas2D {
                 layer_pixmap.as_ref(),
                 &PixmapPaint {
                     opacity: 1.0,
-                    blend_mode: self.state.blend,
+                    blend_mode: blend,
                     quality: FilterQuality::Nearest,
                 },
                 Transform::identity(),
-                None,
+                self.state.clip.as_deref(),
             );
         }
         self.pixmap = Some(parent_pixmap);
@@ -1931,30 +2092,31 @@ impl Canvas2D {
         };
         self.clear_uncovered(path, rule);
         self.paint_shadow(path, rule, None);
-        if let Style::Pattern(id) = self.state.fill
+        if let Style::Pattern(id) = &self.state.fill
             && self
                 .patterns
-                .get(&id)
+                .get(id)
                 .is_some_and(|entry| !entry.origin_clean)
         {
             self.taint();
         }
-        let style = self.state.fill;
+        let style = &self.state.fill;
         let alpha = self.state.alpha;
         let pattern = match style {
             Style::Pattern(id) => self
                 .patterns
-                .get(&id)
+                .get(id)
                 .map(|entry| (entry.image.clone(), entry.repetition)),
             _ => None,
         };
         let shader = match style {
-            Style::Color([r, g, b, a]) => {
+            Style::Color(color) => {
+                let [r, g, b, a] = color.rgba;
                 let alpha = f32::from(a) / 255.0 * alpha;
                 Shader::SolidColor(Color::from_rgba8(r, g, b, to_u8(alpha)))
             }
             Style::Gradient(id) => {
-                let Some(shader) = self.gradient_shader(id, alpha) else {
+                let Some(shader) = self.gradient_shader(*id, alpha) else {
                     return;
                 };
                 shader
@@ -1963,7 +2125,7 @@ impl Canvas2D {
                 let Some((image, _)) = &pattern else {
                     return;
                 };
-                let Some(entry) = self.patterns.get(&id) else {
+                let Some(entry) = self.patterns.get(id) else {
                     return;
                 };
                 tiny_skia::Pattern::new(
@@ -2085,30 +2247,32 @@ impl Canvas2D {
     fn stroke_path_inner(&mut self, path: &Path) {
         let stroke = self.stroke_options();
         self.paint_shadow(path, FillRule::Winding, Some(&stroke));
-        if let Style::Pattern(id) = self.state.stroke
+        if let Style::Pattern(id) = &self.state.stroke
             && self
                 .patterns
-                .get(&id)
+                .get(id)
                 .is_some_and(|entry| !entry.origin_clean)
         {
             self.taint();
         }
-        let style = self.state.stroke;
+        let style = &self.state.stroke;
         let alpha = self.state.alpha;
         let pattern = match style {
             Style::Pattern(id) => self
                 .patterns
-                .get(&id)
+                .get(id)
                 .map(|entry| (entry.image.clone(), entry.repetition)),
             _ => None,
         };
         let shader = match style {
-            Style::Color([r, g, b, a]) => {
+            Style::Color(color) => {
+                let [r, g, b, a] = color.rgba;
                 let alpha = f32::from(a) / 255.0 * alpha;
                 Shader::SolidColor(Color::from_rgba8(r, g, b, to_u8(alpha)))
             }
             Style::Gradient(id) => {
-                let Some(shader) = self.gradient_shader_at(id, alpha, Transform::identity()) else {
+                let Some(shader) = self.gradient_shader_at(*id, alpha, Transform::identity())
+                else {
                     return;
                 };
                 shader
@@ -2117,7 +2281,7 @@ impl Canvas2D {
                 let Some((image, _)) = &pattern else {
                     return;
                 };
-                let Some(entry) = self.patterns.get(&id) else {
+                let Some(entry) = self.patterns.get(id) else {
                     return;
                 };
                 tiny_skia::Pattern::new(
@@ -2372,9 +2536,6 @@ impl Canvas2D {
 
     // ---- pixels ----------------------------------------------------------
 
-    /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
-    /// transparent black
-    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
     /// Encodes the bitmap as PNG for `canvas.toDataURL`/`toBlob`.
     pub(crate) fn to_png(&self) -> Option<Vec<u8>> {
         let pixels = self.read_pixels(0, 0, self.width, self.height)?;
@@ -2390,6 +2551,76 @@ impl Canvas2D {
         Some(png)
     }
 
+    /// Encodes the bitmap as JPEG. `quality` is in `0..=1`; the caller applies
+    /// the spec's default when it is missing or invalid.
+    pub(crate) fn to_jpeg(&self, quality: f32) -> Option<Vec<u8>> {
+        let pixels = self.read_pixels(0, 0, self.width, self.height)?;
+        let mut jpeg = Vec::new();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "quality is clamped to 0..=1 and scaled to 1..=100"
+        )]
+        let quality = (quality.clamp(0.0, 1.0) * 100.0).round().clamp(1.0, 100.0) as u8;
+        image::ImageEncoder::write_image(
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
+            &pixels,
+            self.width,
+            self.height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .ok()?;
+        Some(jpeg)
+    }
+
+    /// A transparent PNG for a canvas that never had a context. Streams one
+    /// zero row at a time so a fresh 4096x4096 canvas does not allocate a
+    /// 64 MB pixmap just to serialize its blank bitmap.
+    pub(crate) fn blank_png(width: u32, height: u32) -> Option<Vec<u8>> {
+        let row_len = usize::try_from(width).ok()?.checked_mul(4)?;
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().ok()?;
+            {
+                let mut stream = writer.stream_writer().ok()?;
+                let row = vec![0; row_len];
+                for _ in 0..height {
+                    std::io::Write::write_all(&mut stream, &row).ok()?;
+                }
+                stream.finish().ok()?;
+            }
+        }
+        Some(out)
+    }
+
+    /// A black JPEG for a canvas that never had a context.
+    pub(crate) fn blank_jpeg(width: u32, height: u32, quality: f32) -> Option<Vec<u8>> {
+        let pixels = crate::js::world::canvas_bytes(width, height)?;
+        let pixels = pixels / 4 * 3;
+        let mut jpeg = Vec::new();
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "quality is clamped to 0..=1 and scaled to 1..=100"
+        )]
+        let quality = (quality.clamp(0.0, 1.0) * 100.0).round().clamp(1.0, 100.0) as u8;
+        image::ImageEncoder::write_image(
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
+            &vec![0; pixels],
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+        Some(jpeg)
+    }
+
+    /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
+    /// transparent black
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-getimagedata>).
     pub(crate) fn read_pixels(&self, x: i32, y: i32, width: u32, height: u32) -> Option<Vec<u8>> {
         let mut out = vec![0; crate::js::world::canvas_bytes(width, height)?];
         let Some(pixmap) = &self.pixmap else {
@@ -2522,45 +2753,21 @@ impl Canvas2D {
     }
 
     /// `drawImage`, with the source already decoded to straight RGBA.
-    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
-    pub(crate) fn draw_image(
-        &mut self,
-        source: &SourceImage,
-        sx: f32,
-        sy: f32,
-        sw: f32,
-        sh: f32,
-        dx: f32,
-        dy: f32,
-        dw: f32,
-        dh: f32,
-    ) {
+    pub(crate) fn draw_image(&mut self, source: &SourceImage, src: Rect, dst: Rect) {
         self.with_draw_filter(|canvas| {
-            canvas.draw_image_inner(source, sx, sy, sw, sh, dx, dy, dw, dh);
+            canvas.draw_image_inner(source, src, dst);
         });
     }
 
-    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
-    fn draw_image_inner(
-        &mut self,
-        source: &SourceImage,
-        sx: f32,
-        sy: f32,
-        sw: f32,
-        sh: f32,
-        dx: f32,
-        dy: f32,
-        dw: f32,
-        dh: f32,
-    ) {
-        if !(sx.is_finite()
-            && sy.is_finite()
-            && sw.is_finite()
-            && sh.is_finite()
-            && dx.is_finite()
-            && dy.is_finite()
-            && dw.is_finite()
-            && dh.is_finite())
+    fn draw_image_inner(&mut self, source: &SourceImage, src: Rect, dst: Rect) {
+        if !(src.x.is_finite()
+            && src.y.is_finite()
+            && src.width.is_finite()
+            && src.height.is_finite()
+            && dst.x.is_finite()
+            && dst.y.is_finite()
+            && dst.width.is_finite()
+            && dst.height.is_finite())
         {
             return;
         }
@@ -2569,16 +2776,26 @@ impl Canvas2D {
         if !source.origin_clean {
             self.taint();
         }
-        if sw == 0.0 || sh == 0.0 || dw == 0.0 || dh == 0.0 {
+        if src.width == 0.0 || src.height == 0.0 || dst.width == 0.0 || dst.height == 0.0 {
             return;
         }
         // A negative width or height describes the same rectangle from the
         // opposite corner; it does not reverse the image
         // (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-drawimage>).
-        let (sx, sw) = if sw < 0.0 { (sx + sw, -sw) } else { (sx, sw) };
-        let (sy, sh) = if sh < 0.0 { (sy + sh, -sh) } else { (sy, sh) };
-        let (dx, dw) = if dw < 0.0 { (dx + dw, -dw) } else { (dx, dw) };
-        let (dy, dh) = if dh < 0.0 { (dy + dh, -dh) } else { (dy, dh) };
+        let src = src.normalized();
+        let dst = dst.normalized();
+        let Rect {
+            x: sx,
+            y: sy,
+            width: sw,
+            height: sh,
+        } = src;
+        let Rect {
+            x: dx,
+            y: dy,
+            width: dw,
+            height: dh,
+        } = dst;
         let Some(pixmap) = Pixmap::from_vec(
             to_premultiplied(&source.pixels),
             tiny_skia::IntSize::from_wh(source.width, source.height)
@@ -2643,7 +2860,7 @@ impl Canvas2D {
         quality: FilterQuality,
         image_transform: Transform,
     ) {
-        let [_, _, _, alpha] = self.state.shadow_color;
+        let [_, _, _, alpha] = self.state.shadow.rgba;
         if alpha == 0
             || (self.state.shadow_blur == 0.0
                 && self.state.shadow_x == 0.0
@@ -2708,7 +2925,7 @@ impl Canvas2D {
     /// Paints the shadow pass for a shape before the shape itself
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#shadows>).
     fn paint_shadow(&mut self, path: &Path, rule: FillRule, stroke: Option<&Stroke>) {
-        let [_, _, _, alpha] = self.state.shadow_color;
+        let [_, _, _, alpha] = self.state.shadow.rgba;
         if alpha == 0
             || (self.state.shadow_blur == 0.0
                 && self.state.shadow_x == 0.0
@@ -2755,7 +2972,11 @@ impl Canvas2D {
             return;
         };
         let shift = Transform::from_translate(-left, -top);
-        let style = stroke.map_or(self.state.fill, |_| self.state.stroke);
+        let style = if stroke.is_some() {
+            &self.state.stroke
+        } else {
+            &self.state.fill
+        };
         let Some(paint) = self.shadow_mask_paint(style) else {
             return;
         };
@@ -2785,7 +3006,7 @@ impl Canvas2D {
     /// Tints, blurs, offsets, and composites a shadow mask. The mask covers
     /// the canvas region starting at `(left, top)`.
     fn finish_shadow(&mut self, mut mask: Pixmap, sigma: f32, left: f32, top: f32) {
-        Self::tint_shadow(&mut mask, self.state.shadow_color);
+        Self::tint_shadow(&mut mask, self.state.shadow.rgba);
         blur_pixmap(&mut mask, sigma);
         let offset =
             Transform::from_translate(self.state.shadow_x + left, self.state.shadow_y + top);
@@ -2824,19 +3045,19 @@ impl Canvas2D {
 
     /// The shape's own coverage, so a transparent fill casts no shadow. RGB
     /// is discarded after rasterizing; only alpha survives.
-    fn shadow_mask_paint(&self, style: Style) -> Option<Paint<'_>> {
+    fn shadow_mask_paint(&self, style: &Style) -> Option<Paint<'_>> {
         let mut paint = Paint {
             blend_mode: BlendMode::SourceOver,
             anti_alias: true,
             ..Paint::default()
         };
         paint.shader = match style {
-            Style::Color([_, _, _, alpha]) => {
-                Shader::SolidColor(Color::from_rgba8(255, 255, 255, alpha))
+            Style::Color(color) => {
+                Shader::SolidColor(Color::from_rgba8(255, 255, 255, color.rgba[3]))
             }
-            Style::Gradient(id) => self.gradient_shader_at(id, 1.0, Transform::identity())?,
+            Style::Gradient(id) => self.gradient_shader_at(*id, 1.0, Transform::identity())?,
             Style::Pattern(id) => {
-                let entry = self.patterns.get(&id)?;
+                let entry = self.patterns.get(id)?;
                 tiny_skia::Pattern::new(
                     entry.image.as_ref().as_ref(),
                     entry.spread,
@@ -2893,11 +3114,9 @@ impl Default for State {
     fn default() -> Self {
         Self {
             transform: Transform::identity(),
-            fill: Style::Color([0, 0, 0, 255]),
-            stroke: Style::Color([0, 0, 0, 255]),
-            fill_text: None,
-            stroke_text: None,
-            shadow_text: None,
+            fill: Style::Color(CanvasColor::new([0, 0, 0, 255])),
+            stroke: Style::Color(CanvasColor::new([0, 0, 0, 255])),
+            shadow: CanvasColor::new([0, 0, 0, 0]),
             alpha: 1.0,
             blend: BlendMode::SourceOver,
             line_width: 1.0,
@@ -2906,7 +3125,6 @@ impl Default for State {
             miter_limit: 10.0,
             dash: Vec::new(),
             dash_offset: 0.0,
-            shadow_color: [0, 0, 0, 0],
             shadow_blur: 0.0,
             shadow_x: 0.0,
             shadow_y: 0.0,
@@ -2925,6 +3143,7 @@ impl Default for State {
             smoothing_quality: "low".to_owned(),
             filter: "none".to_owned(),
             filter_matrix: None,
+            filter_object: None,
             clip: None,
         }
     }
@@ -2940,11 +3159,14 @@ pub(crate) enum StyleValue {
 }
 
 impl StyleValue {
-    fn from_style(style: Style) -> Self {
+    fn from_style(style: &Style) -> Self {
         match style {
-            Style::Color(color) => Self::Color(color),
-            Style::Gradient(id) => Self::Gradient(id),
-            Style::Pattern(id) => Self::Pattern(id),
+            Style::Color(color) => match &color.serialized {
+                Some(text) => Self::ColorExact(color.rgba, text.clone()),
+                None => Self::Color(color.rgba),
+            },
+            Style::Gradient(id) => Self::Gradient(*id),
+            Style::Pattern(id) => Self::Pattern(*id),
         }
     }
 }
@@ -3574,19 +3796,22 @@ mod tests {
                 .filter(|segment| matches!(segment, Segment::Cubic(..)))
                 .count()
         };
+        // Eighth-turns: a full circle is 8 cubics, not the 4 a quarter-turn
+        // approximation would use.
         let mut full = Canvas2D::new(4, 4);
         full.arc(2.0, 2.0, 1.0, 0.0, std::f32::consts::TAU, false);
-        assert_eq!(cubics(&full), 4);
+        assert_eq!(cubics(&full), 8);
 
         // A direction-mismatched 2π span is a full circle, not an empty arc.
         let mut reversed = Canvas2D::new(4, 4);
         reversed.arc(2.0, 2.0, 1.0, 0.0, std::f32::consts::TAU, true);
-        assert_eq!(cubics(&reversed), 4);
+        assert_eq!(cubics(&reversed), 8);
 
-        // A clockwise 2.5π span wraps to a 1.5π counterclockwise sweep.
+        // A clockwise 2.5π span wraps to a 1.5π counterclockwise sweep,
+        // which is six eighth-turns.
         let mut wrapped = Canvas2D::new(4, 4);
         wrapped.arc(2.0, 2.0, 1.0, 0.0, 2.5 * std::f32::consts::PI, true);
-        assert_eq!(cubics(&wrapped), 3);
+        assert_eq!(cubics(&wrapped), 6);
     }
 
     #[test]
@@ -3628,14 +3853,8 @@ mod tests {
                 pixels: vec![255, 0, 0, 255],
                 origin_clean: false,
             },
-            0.0,
-            0.0,
-            1.0,
-            1.0,
-            0.0,
-            0.0,
-            1.0,
-            1.0,
+            Rect::new(0.0, 0.0, 1.0, 1.0),
+            Rect::new(0.0, 0.0, 1.0, 1.0),
         );
         assert!(!canvas.origin_clean());
     }
@@ -3652,5 +3871,49 @@ mod tests {
         assert!(canvas.is_point_in_stroke(174.0, 284.2));
         assert!(canvas.is_point_in_stroke(82.0, 292.6));
         assert!(!canvas.is_point_in_stroke(74.8, 289.2));
+    }
+
+    #[test]
+    fn arc_to_takes_the_short_arc_between_tangent_points() {
+        let mut canvas = Canvas2D::new(30, 30);
+        canvas.set_stroke_style(StyleValue::Color([0, 255, 0, 255]));
+        canvas.set_line_width(2.0);
+        canvas.begin_path();
+        canvas.move_to(10.0, 0.0);
+        canvas.arc_to(20.0, 0.0, 20.0, 10.0, 10.0);
+        canvas.stroke();
+        let pixels = canvas.read_pixels(0, 0, 30, 30).unwrap();
+        let alpha = |x: usize, y: usize| pixels[(y * 30 + x) * 4 + 3];
+        // The short arc turns through (17, 3). The long way around would pass
+        // through (3, 17) instead.
+        assert!(alpha(17, 3) > 0, "short arc midpoint is empty");
+        assert_eq!(alpha(3, 17), 0, "arc took the long way around");
+    }
+
+    #[test]
+    fn blank_encoders_emit_their_containers() {
+        let png = Canvas2D::blank_png(2, 2).expect("blank PNG");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let jpeg = Canvas2D::blank_jpeg(2, 2, 0.92).expect("blank JPEG");
+        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+    }
+
+    #[test]
+    fn layer_composites_with_the_captured_alpha_and_shadow() {
+        let mut canvas = Canvas2D::new(8, 8);
+        canvas.set_global_alpha(0.5);
+        canvas.set_shadow_color_exact([0, 255, 0, 255], None);
+        canvas.set_shadow_offset_y(4.0);
+        canvas.begin_layer();
+        canvas.set_global_alpha(1.0);
+        canvas.set_fill_style(StyleValue::Color([255, 0, 0, 255]));
+        canvas.fill_rect(0.0, 0.0, 8.0, 2.0);
+        assert!(canvas.end_layer());
+        let pixels = canvas.read_pixels(0, 0, 8, 8).unwrap();
+        let pixel = |x: usize, y: usize| &pixels[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
+        assert_eq!(pixel(0, 0), &[255, 0, 0, 128]);
+        // The shadow uses the alpha captured at beginLayer and lands below the
+        // layer bitmap.
+        assert_eq!(pixel(0, 5), &[0, 255, 0, 128]);
     }
 }

@@ -20,10 +20,8 @@ forms.js
 form_data.js
 input.js
 fonts.js
-media.js
 canvas_filter.js
 css_color_api.js
 geometry.js
-image_data.js
 offscreen_canvas.js
 canvas_host.js

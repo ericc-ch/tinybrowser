@@ -1755,9 +1755,14 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         note_src_creator(ctx, element);
     }
     // An `<img>` loads from its `src` even while detached (`new Image()`
-    // never enters a document) (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    // never enters a document), but only when its node document is fully
+    // active. `template.content`, `createHTMLDocument`, and `DOMParser`
+    // documents are inert and must not fetch.
     if is_img {
-        world.borrow_mut().queue_image_update(element);
+        let active = world.borrow().is_active_document(element);
+        if active {
+            world.borrow_mut().queue_image_update(element);
+        }
         return Ok(());
     }
     // A detached `iframe` has no browsing context yet; insertion reads the

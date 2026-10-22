@@ -14,7 +14,7 @@ mod document;
 mod exceptions;
 mod focus;
 pub(crate) mod forms;
-mod geometry;
+pub(crate) mod geometry;
 pub(crate) mod host;
 mod inner_text;
 mod messaging;
