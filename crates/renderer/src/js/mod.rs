@@ -1404,11 +1404,30 @@ pub(crate) fn script_at(world: &World, id: crate::dom::tree::NodeId) -> Option<S
             line: 0,
         },
     };
+    // The script block's type string: the `type` attribute when present,
+    // otherwise `text/` plus the `language` attribute, otherwise
+    // `text/javascript`; an exactly empty `type` or `language` also means
+    // `text/javascript`
+    // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
     let typ = crate::dom::tree::attr(base, id.node, "type");
-    if typ.is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module")) {
+    let language = crate::dom::tree::attr(base, id.node, "language");
+    let type_string = match (typ, language) {
+        (Some(""), _) | (None, Some("") | None) => "text/javascript".to_owned(),
+        (Some(typ), _) => typ.to_owned(),
+        (None, Some(language)) => format!("text/{language}"),
+    };
+    if type_string.eq_ignore_ascii_case("module") {
         Some(Script::Module(source))
+    } else if javascript_mime_essence(&type_string)
+        || typ.is_some_and(|typ| {
+            javascript_mime_essence(
+                typ.trim_matches(|character: char| character.is_ascii_whitespace()),
+            )
+        })
+    {
+        Some(Script::Classic(source))
     } else {
-        javascript_mime(typ).then_some(Script::Classic(source))
+        None
     }
 }
 
@@ -1416,19 +1435,14 @@ pub(super) fn javascript_module_mime(typ: Option<&str>) -> bool {
     let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
         return false;
     };
-    javascript_mime(Some(typ))
+    javascript_mime(typ)
 }
 
-fn javascript_mime(typ: Option<&str>) -> bool {
-    let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
-        return true;
-    };
-    let essence = typ
-        .split(';')
-        .next()
-        .unwrap_or(typ)
-        .trim()
-        .to_ascii_lowercase();
+/// Whether `typ` is exactly a JavaScript MIME type essence string, with no
+/// parameters and no surrounding whitespace
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#javascript-mime-type-essence-match>).
+fn javascript_mime_essence(typ: &str) -> bool {
+    let essence = typ.to_ascii_lowercase();
     // https://mimesniff.spec.whatwg.org/#javascript-mime-type
     matches!(
         essence.as_str(),
@@ -1449,6 +1463,35 @@ fn javascript_mime(typ: Option<&str>) -> bool {
             | "text/x-ecmascript"
             | "text/x-javascript"
     )
+}
+
+/// Whether a response `Content-Type` parses to a JavaScript MIME type.
+/// Parameters and whitespace are part of a MIME type, so they are allowed
+/// here, unlike the element `type` attribute's essence match
+/// (<https://mimesniff.spec.whatwg.org/#javascript-mime-type>).
+fn javascript_mime(typ: &str) -> bool {
+    let essence = typ
+        .split(';')
+        .next()
+        .unwrap_or(typ)
+        .trim()
+        .to_ascii_lowercase();
+    javascript_mime_essence(&essence)
+}
+
+#[cfg(test)]
+mod script_mime_tests {
+    use super::javascript_mime_essence;
+
+    #[test]
+    fn essence_match_rejects_parameters_and_whitespace() {
+        assert!(javascript_mime_essence("text/javascript"));
+        assert!(javascript_mime_essence("TEXT/JAVASCRIPT1.2"));
+        assert!(!javascript_mime_essence("text/javascript "));
+        assert!(!javascript_mime_essence("text/javascript;charset=utf-8"));
+        assert!(!javascript_mime_essence("javascript"));
+        assert!(!javascript_mime_essence(""));
+    }
 }
 
 fn element_text(base: &blitz_dom::BaseDocument, id: crate::dom::tree::BlitzId) -> String {
