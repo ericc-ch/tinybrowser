@@ -11,7 +11,7 @@
 //! The ledger owns the completion channel and the `load`-event delay policy, so
 //! no other module sees a sender, receiver, or guard.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -172,10 +172,12 @@ impl DialLedger {
         self.js_fetches + self.queued_js_fetches
     }
 
-    pub(crate) fn cancel_fetches(&mut self, ids: &HashSet<i32>) {
-        self.cancel_where(|context| {
-            matches!(context, DialContext::JsFetch { id } if ids.contains(id))
-        });
+    /// Drops a queued or in-flight page fetch for one JS id, running its
+    /// cancellation handle.
+    pub(crate) fn cancel_fetch(&mut self, id: i32) {
+        self.cancel_where(
+            |context| matches!(context, DialContext::JsFetch { id: fetch_id } if *fetch_id == id),
+        );
     }
 
     /// Cancels a previous frame navigation: the newest load owns the frame.

@@ -27,9 +27,7 @@ use crate::js::Stop;
 pub const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
 
 use crate::documents::DocumentStore;
-use crate::js::{
-    DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime,
-};
+use crate::js::{FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError};
 use crate::storage::PendingStorageEvent;
@@ -585,9 +583,8 @@ impl Engine {
                         .into_iter()
                         .map(|navigation| (frame, navigation)),
                 );
-                let commands = document.take_document_stream();
-                if !commands.is_empty() {
-                    streams.push((frame, commands));
+                if let Some(closed) = document.take_stream_publish() {
+                    streams.push((frame, closed));
                 }
             }
             let deliveries = self.runtime.shared.borrow_mut().take_deliveries();
@@ -600,7 +597,7 @@ impl Engine {
             self.apply_iframe_lifecycle(iframe_lifecycle);
             self.apply_image_lifecycle(image_lifecycle);
             self.apply_navigations(navigations);
-            self.apply_streams(streams);
+            self.publish_streams(streams);
             self.apply_deliveries(deliveries);
             self.flush_embedder_csp();
             let fired_load = self.fire_ready_frame_loads();
@@ -1160,16 +1157,9 @@ impl Engine {
         }
     }
 
-    fn apply_streams(&mut self, streams: Vec<(FrameId, Vec<DocumentStreamCommand>)>) {
-        for (frame, commands) in streams {
+    fn publish_streams(&mut self, streams: Vec<(FrameId, bool)>) {
+        for (frame, closed) in streams {
             let container = self.runtime.shared.borrow().tree.container(frame);
-            let mut closed = false;
-            if let Some(document) = self.frames.get_mut(&frame) {
-                for command in commands {
-                    closed |= matches!(&command, DocumentStreamCommand::Close);
-                    document.apply_document_stream(command);
-                }
-            }
             if let Some(container) = container {
                 self.publish_frame_document(container, frame);
                 if closed {
