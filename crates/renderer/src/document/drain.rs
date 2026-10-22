@@ -3,8 +3,13 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{DialContext, Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
+use crate::dom::tree::NodeId;
 use crate::js::RealmRequest;
 use crate::protocol::RendererEvent;
+
+/// Upper bound on realm requests applied in one turn. Host callbacks can
+/// enqueue more work while a request runs, so a turn must not loop forever.
+const MAX_REALM_REQUESTS_PER_TURN: usize = 1024;
 
 impl Document {
     /// Runs one batch of ready work and reports whether more may follow.
@@ -28,9 +33,7 @@ impl Document {
             self.run_task(task);
             let fired = self.check_load();
             return !self.stop.is_set()
-                && (fired
-                    || self.has_pending_frame_loads()
-                    || self.has_ready_work());
+                && (fired || self.has_pending_frame_loads() || self.has_ready_work());
         }
         let fired = self.check_load();
         !self.stop.is_set() && (fired || self.has_pending_frame_loads())
@@ -41,9 +44,12 @@ impl Document {
         if !self.tasks.is_empty() || self.dials.has_queued() {
             return true;
         }
+        if self.world.borrow().has_outbox_work() {
+            return true;
+        }
         let now = Instant::now();
         self.timers
-            .iter()
+            .values()
             .any(|timer| !timer.fired && timer.when <= now)
     }
 
@@ -60,7 +66,7 @@ impl Document {
     #[must_use]
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.timers
-            .iter()
+            .values()
             .filter(|timer| !timer.fired)
             .map(|timer| timer.when)
             .min()
@@ -69,11 +75,14 @@ impl Document {
     fn schedule_timer(&mut self, delay: Duration) -> u32 {
         let id = self.next_timer_id;
         self.next_timer_id = self.next_timer_id.saturating_add(1);
-        self.timers.push(Timer {
+        self.timers.insert(
             id,
-            when: Instant::now() + delay,
-            fired: false,
-        });
+            Timer {
+                when: Instant::now() + delay,
+                fired: false,
+                js_id: None,
+            },
+        );
         id
     }
 
@@ -171,11 +180,12 @@ impl Document {
         match task {
             Task::Timer(id) => {
                 self.record_event(RendererEvent::Timer(id));
-                if let Some(js_id) = self.timer_js_ids.remove(&id) {
+                if let Some(timer) = self.timers.remove(&id)
+                    && let Some(js_id) = timer.js_id
+                {
                     self.js_timers.remove(&js_id);
                     self.fire_js(|js| js.fire_timer(js_id));
                 }
-                self.timers.retain(|timer| timer.id != id);
                 self.adopt_js_work();
             }
             Task::DialFinished(id, done) => {
@@ -215,18 +225,16 @@ impl Document {
         }
     }
 
-    /// Drains the realm's outbox. Requests are processed in program order,
-    /// including any they generate while they run, so one pass is the whole
-    /// handoff.
+    /// Drains the realm's outbox in enqueue order. Requests generated while
+    /// one runs go behind the requests already queued, and one turn stops at
+    /// `MAX_REALM_REQUESTS_PER_TURN` so a host callback cannot hold the
+    /// renderer forever.
     pub(in crate::document) fn adopt_js_work(&mut self) {
-        loop {
-            let requests = self.world.borrow_mut().take_outbox();
-            if requests.is_empty() {
+        for _ in 0..MAX_REALM_REQUESTS_PER_TURN {
+            let Some(request) = self.world.borrow().pop_outbox() else {
                 break;
-            }
-            for request in requests {
-                self.apply_realm_request(request);
-            }
+            };
+            self.apply_realm_request(request);
         }
     }
 
@@ -234,73 +242,75 @@ impl Document {
         match request {
             RealmRequest::Timer(timeout) => {
                 let page_id = self.schedule_timer(timeout.delay);
+                if let Some(timer) = self.timers.get_mut(&page_id) {
+                    timer.js_id = Some(timeout.js_id);
+                }
                 self.js_timers.insert(timeout.js_id, page_id);
-                self.timer_js_ids.insert(page_id, timeout.js_id);
             }
-            // Keyed by the script-visible id, so a cancel is a map remove
-            // instead of a scan over every live timer.
             RealmRequest::ClearTimer(js_id) => {
                 if let Some(page_id) = self.js_timers.remove(&js_id) {
-                    self.timer_js_ids.remove(&page_id);
-                    self.timers.retain(|timer| timer.id != page_id);
+                    self.timers.remove(&page_id);
                 }
             }
-            // The connect check runs here, the one place every page request
-            // leaves the renderer, instead of in each JS API
-            // (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
             RealmRequest::Fetch(fetch) => self.queue_js_fetch(fetch),
             RealmRequest::AbortFetch(js_id) => self.dials.cancel_fetch(js_id),
             RealmRequest::Script(element) => self.queue_dynamic_script(element),
-            RealmRequest::Image(element) => self.queue_image(element, true),
-            RealmRequest::History(event) => {
-                if let RendererEvent::HistoryUpdated { ref url, .. } = event {
-                    self.apply_document_url_same_origin(url);
-                }
-                self.record_event(event);
+            RealmRequest::Image(element) => {
+                self.world.borrow_mut().image_update_started(element);
+                self.queue_image(element, true);
+            }
+            RealmRequest::HistoryPush {
+                url,
+                state,
+                replace,
+            } => {
+                self.apply_document_url_same_origin(&url);
+                self.record_event(RendererEvent::HistoryUpdated {
+                    url,
+                    state,
+                    replace,
+                });
+            }
+            RealmRequest::HistoryTraverse { delta } => {
+                self.record_event(RendererEvent::HistoryTraversal { delta });
             }
             RealmRequest::CspViolation(target, violations) => {
                 self.fire_csp_violations(target, &violations);
             }
-            RealmRequest::HtmlWrite(html) => {
-                // The binding reserved these bytes before queueing the write.
-                self.world.borrow().release_stream_bytes(html.len());
-                self.write_text(&html);
+            RealmRequest::HtmlWrite(write) => {
+                self.write_text(&write.html);
+            }
+            RealmRequest::DocumentStream(command) => {
+                let closed = matches!(command, crate::js::DocumentStreamCommand::Close);
+                self.apply_document_stream(command);
+                self.stream_publish = Some(self.stream_publish.unwrap_or(false) || closed);
             }
         }
     }
 
     /// A connected `<script src>` element queued its prepare steps from
     /// script; the fetch starts here.
-    fn queue_dynamic_script(&mut self, element: crate::dom::tree::NodeId) {
-        let src = self
-            .world
-            .borrow()
-            .with_document(element, |parsed| {
+    fn queue_dynamic_script(&mut self, element: NodeId) {
+        let Some((src, started)) = self.world.borrow().with_document(element, |parsed| {
+            (
                 crate::dom::tree::attr(&parsed.document.base, element.node, "src")
-                    .map(str::to_owned)
-            })
-            .flatten();
+                    .map(str::to_owned),
+                parsed.document.script_already_started(element.node),
+            )
+        }) else {
+            return;
+        };
         let Some(src) = src else {
             return;
         };
-        let started = self
-            .world
-            .borrow()
-            .with_document(element, |parsed| {
-                parsed.document.script_already_started(element.node)
-            })
-            .unwrap_or(false);
         if started {
             return;
         }
-        // Mark at launch: prepare deliberately leaves the flag clear
-        // so this queue is the single owner of the fetch. A second
-        // prepare sees the flag and schedules nothing.
         if let Some(mut parsed) = self.world.borrow().document_mut(element) {
             parsed.document.mark_script_started(element.node);
         }
         let Ok(url) = self.resolve_dial_url(&src) else {
-            self.fire_js(|js| js.fire_node_error(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         };
         let violations = self.script_url_violations(&url, element);
@@ -308,14 +318,10 @@ impl Document {
             self.fire_csp_violations(element, &violations);
         }
         if crate::csp::blocks(&violations) {
-            self.fire_js(|js| js.fire_node_error(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         }
-        let mut dial = QueuedDial::new(
-            DialContext::ClassicScript { element },
-            &url,
-            &self.url,
-        );
+        let mut dial = QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.url);
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
@@ -324,62 +330,57 @@ impl Document {
         // the set of scripts that will execute as soon as possible, and
         // `load` waits for that set to drain
         // (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
-        dial.delay = Some(self.load_delay.guard());
-        self.dials.queue(dial);
+        self.dials.queue(dial, &self.load_delay);
+    }
+
+    fn fail_js_fetch(&mut self, js_id: i32) {
+        self.record_event(RendererEvent::FetchFailed);
+        self.settle_js_fetch(js_id, None);
     }
 
     /// Queues one page `fetch` / XHR dial. The connect check is here, where
     /// the request leaves the renderer
     /// (<https://w3c.github.io/webappsec-csp/#should-request-be-blocked-by-content-security-policy>).
-    fn queue_js_fetch(&mut self, fetch: crate::js::PendingJsFetch) {
-        let pending_js_fetches = self.dials.pending_js_fetches();
-        if pending_js_fetches >= MAX_PENDING_JS_FETCHES {
-            self.record_event(RendererEvent::FetchFailed);
-            self.settle_js_fetch(fetch.js_id, None);
+    fn queue_js_fetch(&mut self, fetch: crate::js::JsFetchRequest) {
+        if self.dials.pending_js_fetches() >= MAX_PENDING_JS_FETCHES {
+            self.fail_js_fetch(fetch.js_id);
             return;
         }
-        if let Ok(url) = self.resolve_dial_url(&fetch.url) {
-            let violations = self.subresource_violations(&url, crate::csp::Destination::Connect);
-            if !violations.is_empty()
-                && let Some(target) = self.document_node()
-            {
-                self.fire_csp_violations(target, &violations);
-            }
-            if crate::csp::blocks(&violations) {
-                self.record_event(RendererEvent::FetchFailed);
-                self.settle_js_fetch(fetch.js_id, None);
-                return;
-            }
-            let mut dial = QueuedDial::new(
-                DialContext::JsFetch { id: fetch.js_id },
-                &url,
-                &self.url,
-            );
-            dial.req.method = fetch.method;
-            dial.req.body = fetch.body;
-            dial.req.content_type = fetch.content_type;
-            dial.req.headers = fetch.headers;
-            dial.req.referrer = fetch.referrer;
-            dial.req.cors = fetch.cors;
-            dial.req.csp = Some(Box::new(
-                self.redirect_gate(crate::csp::Destination::Connect),
-            ));
-            self.dials.queue(dial, &self.load_delay);
-        } else {
-            self.record_event(RendererEvent::FetchFailed);
-            self.settle_js_fetch(fetch.js_id, None);
+        let Ok(url) = self.resolve_dial_url(&fetch.url) else {
+            self.fail_js_fetch(fetch.js_id);
+            return;
+        };
+        let violations = self.subresource_violations(&url, crate::csp::Destination::Connect);
+        if !violations.is_empty()
+            && let Some(target) = self.document_node()
+        {
+            self.fire_csp_violations(target, &violations);
         }
+        if crate::csp::blocks(&violations) {
+            self.fail_js_fetch(fetch.js_id);
+            return;
         }
+        let mut dial = QueuedDial::new(DialContext::JsFetch { id: fetch.js_id }, &url, &self.url);
+        dial.req.method = fetch.method;
+        dial.req.body = fetch.body;
+        dial.req.content_type = fetch.content_type;
+        dial.req.headers = fetch.headers;
+        dial.req.referrer = fetch.referrer;
+        dial.req.cors = fetch.cors;
+        dial.req.csp = Some(Box::new(
+            self.redirect_gate(crate::csp::Destination::Connect),
+        ));
+        self.dials.queue(dial, &self.load_delay);
     }
 
     fn due_timer(&mut self) -> Option<u32> {
         let now = Instant::now();
-        let timer = self
+        let (id, timer) = self
             .timers
             .iter_mut()
-            .filter(|timer| !timer.fired && timer.when <= now)
-            .min_by_key(|timer| timer.when)?;
+            .filter(|(_, timer)| !timer.fired && timer.when <= now)
+            .min_by_key(|(_, timer)| timer.when)?;
         timer.fired = true;
-        Some(timer.id)
+        Some(*id)
     }
 }

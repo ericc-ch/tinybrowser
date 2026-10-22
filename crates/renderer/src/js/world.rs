@@ -1,7 +1,7 @@
 //! Shared JS world for the renderer.
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
@@ -322,6 +322,25 @@ struct ResourceBudget {
     object_url_bytes: usize,
 }
 
+/// Releases the stream budget reserved for one queued `document.write`.
+pub(crate) struct StreamReservation {
+    budget: Rc<RefCell<ResourceBudget>>,
+    bytes: usize,
+}
+
+impl Drop for StreamReservation {
+    fn drop(&mut self) {
+        let mut budget = self.budget.borrow_mut();
+        budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(self.bytes);
+    }
+}
+
+/// One queued `document.write` body and the budget it reserved.
+pub(crate) struct HtmlWrite {
+    pub(crate) html: String,
+    _reservation: StreamReservation,
+}
+
 const MAX_PENDING_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OBJECT_URL_BYTES: usize = 8 * 1024 * 1024;
 
@@ -599,9 +618,9 @@ impl FrameNavigation {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum DocumentStreamCommand {
     Open,
-    Write(String),
     Close,
 }
 
@@ -889,6 +908,9 @@ pub(crate) struct World {
     pub(crate) history: crate::protocol::HistorySnapshot,
     /// The realm's outgoing work, drained once per turn by the document.
     pub(crate) outbox: Outbox,
+    /// Image elements already queued in `outbox`, so repeated `src` changes
+    /// do not scan the whole queue.
+    queued_images: RefCell<HashSet<NodeId>>,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
@@ -1045,27 +1067,35 @@ impl EventTargetState {
     }
 }
 
-/// One piece of work the realm hands to its document, in program order.
+/// One piece of realm work waiting for the document to apply it.
 ///
-/// The realm does not run document tasks itself. Everything it produces — timer
-/// changes, fetch submissions and aborts, script and image starts, history
-/// updates, CSP reports, and `document.write` text — lands here, and the
-/// document drains the queue once per turn. One queue means one ordering, and a
-/// new kind of work has one place to be added.
+/// The realm does not run document tasks itself. Timers, fetch submissions and
+/// aborts, script and image starts, history updates, CSP reports, and
+/// `document.write` text land here in enqueue order. The document drains the
+/// queue at the start of a turn. `document.open` and `document.close` stay on
+/// the engine's stream queue because applying them republishes the frame.
 pub(crate) enum RealmRequest {
-    Timer(super::PendingTimeout),
+    Timer(super::TimeoutRequest),
     ClearTimer(i32),
-    Fetch(super::PendingJsFetch),
+    Fetch(super::JsFetchRequest),
     AbortFetch(i32),
     Script(NodeId),
     Image(NodeId),
-    History(crate::protocol::RendererEvent),
+    HistoryPush {
+        url: String,
+        state: String,
+        replace: bool,
+    },
+    HistoryTraverse {
+        delta: i32,
+    },
     CspViolation(NodeId, Vec<crate::csp::Violation>),
-    HtmlWrite(String),
+    HtmlWrite(HtmlWrite),
+    DocumentStream(DocumentStreamCommand),
 }
 
 /// The realm's outgoing work, shared with the host functions that push into it.
-pub(crate) type Outbox = Rc<RefCell<Vec<RealmRequest>>>;
+pub(crate) type Outbox = Rc<RefCell<VecDeque<RealmRequest>>>;
 
 /// Realm state that belongs to the documents this realm owns.
 ///
@@ -1092,8 +1122,8 @@ pub(crate) struct DocumentState {
     /// the engine runs the callback
     /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
     pub(crate) decoders: HashMap<u64, DecoderSession>,
-    document_stream: Vec<DocumentStreamCommand>,
     pub current_script: Option<NodeId>,
+
     /// Existing elements being synchronously upgraded by a custom-element
     /// constructor. `HTMLElement()` consumes the top candidate.
     pub(crate) custom_construction: Vec<NodeId>,
@@ -1140,7 +1170,6 @@ impl DocumentState {
         self.frame_navigations.clear();
         self.parser_inserted.clear();
         self.decoders.clear();
-        self.document_stream.clear();
         self.current_script = None;
         self.custom_construction.clear();
         self.implementations.clear();
@@ -1252,21 +1281,7 @@ impl DecoderSession {
 impl Drop for World {
     fn drop(&mut self) {
         self.unload_object_urls_for_frame();
-        let mut budget = self.budget.borrow_mut();
-        let stream_bytes = self
-            .state
-            .document_stream
-            .iter()
-            .filter_map(|command| match command {
-                DocumentStreamCommand::Write(value) => Some(value.len()),
-                _ => None,
-            })
-            .chain(self.outbox.borrow().iter().filter_map(|request| match request {
-                RealmRequest::HtmlWrite(value) => Some(value.len()),
-                _ => None,
-            }))
-            .sum::<usize>();
-        budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(stream_bytes);
+        self.clear_outbox();
     }
 }
 
@@ -1291,7 +1306,8 @@ impl World {
             base_url: None,
             csp: crate::csp::List::default(),
             history: crate::protocol::HistorySnapshot::default(),
-            outbox: Rc::new(RefCell::new(Vec::new())),
+            outbox: Rc::new(RefCell::new(VecDeque::new())),
+            queued_images: RefCell::new(HashSet::new()),
             input_files: HashMap::new(),
             font_registrations: HashMap::new(),
             next_font_registration: 1,
@@ -1330,11 +1346,6 @@ impl World {
         let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
-        // `reset` drops the old document's queued stream commands. Drain them
-        // first so the bytes they reserved leave the shared budget; the
-        // stream methods own that accounting.
-        let pending_stream = self.take_document_stream();
-        drop(pending_stream);
         self.clear_outbox();
         self.state.reset();
         // Navigation keeps the realm's window object, so window-scoped
@@ -1965,24 +1976,23 @@ impl World {
         // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
         // <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
         self.images.loading.insert(element);
-        let mut outbox = self.outbox.borrow_mut();
-        if !outbox
-            .iter()
-            .any(|request| matches!(request, RealmRequest::Image(id) if *id == element))
-        {
-            outbox.push(RealmRequest::Image(element));
+        if self.queued_images.borrow_mut().insert(element) {
+            self.outbox
+                .borrow_mut()
+                .push_back(RealmRequest::Image(element));
         }
+    }
+
+    /// The image request is now owned by the document's task queue.
+    pub(crate) fn image_update_started(&mut self, element: NodeId) {
+        self.queued_images.borrow_mut().remove(&element);
     }
 
     /// Queues a connected `<script src>` element for its fetch prepare steps.
     pub(crate) fn queue_script(&mut self, element: NodeId) {
-        let mut outbox = self.outbox.borrow_mut();
-        if !outbox
-            .iter()
-            .any(|request| matches!(request, RealmRequest::Script(id) if *id == element))
-        {
-            outbox.push(RealmRequest::Script(element));
-        }
+        self.outbox
+            .borrow_mut()
+            .push_back(RealmRequest::Script(element));
     }
 
     /// Queues violations for targets the caller cannot dispatch into (the
@@ -1994,17 +2004,70 @@ impl World {
     ) {
         self.outbox
             .borrow_mut()
-            .push(RealmRequest::CspViolation(target, violations));
+            .push_back(RealmRequest::CspViolation(target, violations));
     }
 
-    /// Takes the realm's outgoing work for one drain pass.
-    pub(crate) fn take_outbox(&mut self) -> Vec<RealmRequest> {
-        std::mem::take(&mut *self.outbox.borrow_mut())
+    /// Queues one `document.write` body, reserving the shared stream budget
+    /// until the document consumes or drops it.
+    pub(crate) fn queue_write(&mut self, html: String) -> std::result::Result<(), ()> {
+        if !self.reserve_stream_bytes(html.len()) {
+            return Err(());
+        }
+        let reservation = StreamReservation {
+            budget: Rc::clone(&self.budget),
+            bytes: html.len(),
+        };
+        self.outbox
+            .borrow_mut()
+            .push_back(RealmRequest::HtmlWrite(HtmlWrite {
+                html,
+                _reservation: reservation,
+            }));
+        Ok(())
     }
 
-    /// Drops work the old realm queued; a navigation owns a new queue.
-    pub(crate) fn clear_outbox(&mut self) {
-        self.outbox.borrow_mut().clear();
+    /// Pops the oldest outgoing request, in enqueue order.
+    pub(crate) fn pop_outbox(&self) -> Option<RealmRequest> {
+        self.outbox.borrow_mut().pop_front()
+    }
+
+    pub(crate) fn has_outbox_work(&self) -> bool {
+        !self.outbox.borrow().is_empty()
+    }
+
+    /// Drops work the replaced document owns. Cancellations and history
+    /// updates still belong to the realm, so they survive the swap.
+    pub(crate) fn clear_outbox(&self) {
+        let mut outbox = self.outbox.borrow_mut();
+        outbox.retain(|request| {
+            matches!(
+                request,
+                RealmRequest::ClearTimer(_)
+                    | RealmRequest::AbortFetch(_)
+                    | RealmRequest::HistoryPush { .. }
+                    | RealmRequest::HistoryTraverse { .. }
+            )
+        });
+        self.queued_images.borrow_mut().clear();
+    }
+
+    /// Drops the old document's realm work before `document.open`, but keeps
+    /// writes the same script queued after the open control so they reach the
+    /// parser the open creates.
+    pub(crate) fn clear_outbox_for_open(&self) {
+        let mut outbox = self.outbox.borrow_mut();
+        outbox.retain(|request| {
+            matches!(
+                request,
+                RealmRequest::HtmlWrite(_)
+                    | RealmRequest::DocumentStream(_)
+                    | RealmRequest::ClearTimer(_)
+                    | RealmRequest::AbortFetch(_)
+                    | RealmRequest::HistoryPush { .. }
+                    | RealmRequest::HistoryTraverse { .. }
+            )
+        });
+        self.queued_images.borrow_mut().clear();
     }
 
     /// Appends one in-head `meta` policy the first time it is seen
@@ -2114,30 +2177,10 @@ impl World {
         self.images.clear();
     }
 
-    pub(crate) fn queue_document_stream(
-        &mut self,
-        command: DocumentStreamCommand,
-    ) -> std::result::Result<(), ()> {
-        if let DocumentStreamCommand::Write(value) = &command
-            && !self.reserve_stream_bytes(value.len())
-        {
-            return Err(());
-        }
-        self.state.document_stream.push(command);
-        Ok(())
-    }
-
-    pub(crate) fn take_document_stream(&mut self) -> Vec<DocumentStreamCommand> {
-        let commands = std::mem::take(&mut self.state.document_stream);
-        let bytes = commands
-            .iter()
-            .map(|command| match command {
-                DocumentStreamCommand::Write(value) => value.len(),
-                _ => 0,
-            })
-            .sum::<usize>();
-        self.release_stream_bytes(bytes);
-        commands
+    pub(crate) fn queue_document_stream(&mut self, command: DocumentStreamCommand) {
+        self.outbox
+            .borrow_mut()
+            .push_back(RealmRequest::DocumentStream(command));
     }
 
     pub(crate) fn reserve_stream_bytes(&self, bytes: usize) -> bool {
@@ -2150,11 +2193,6 @@ impl World {
         }
         budget.pending_stream_bytes = total;
         true
-    }
-
-    pub(crate) fn release_stream_bytes(&self, bytes: usize) {
-        let mut budget = self.budget.borrow_mut();
-        budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(bytes);
     }
 
     pub(crate) fn create_object_url(

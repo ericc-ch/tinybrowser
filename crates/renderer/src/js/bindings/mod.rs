@@ -2331,9 +2331,8 @@ mod realm_tests {
                 },
             )
             .expect("mount");
-        let _ = engine.drain_ready_until(
-            std::time::Instant::now() + std::time::Duration::from_secs(2),
-        );
+        let _ =
+            engine.drain_ready_until(std::time::Instant::now() + std::time::Duration::from_secs(2));
     }
 
     fn load_state(engine: &mut crate::engine::Engine) -> (String, String) {
@@ -2345,6 +2344,132 @@ mod realm_tests {
                 .eval_in(FrameId::MAIN, "String(globalThis.__loaded)")
                 .expect("load flag"),
         )
+    }
+
+    /// A timeout cancelled in the same script never reaches the document's
+    /// timer map, because both requests share the realm outbox order.
+    #[test]
+    fn timeout_cancelled_in_the_same_turn_does_not_fire() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let mut engine = crate::engine::Engine::new(
+            services,
+            Arc::new(Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        mount_html(
+            &mut engine,
+            "<script>globalThis.__fired = 0; \
+             const id = setTimeout(() => { globalThis.__fired = 1; }, 0); \
+             clearTimeout(id);</script>",
+        );
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "String(__fired)")
+                .expect("fired"),
+            "0"
+        );
+    }
+
+    /// A bad script's `error` handler may insert another bad script. The
+    /// replacement is a queued task, so the handler cannot recurse inside the
+    /// drain that is already running.
+    #[test]
+    fn script_error_handler_may_insert_another_bad_script() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let mut engine = crate::engine::Engine::new(
+            services,
+            Arc::new(Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        mount_html(
+            &mut engine,
+            "<script>globalThis.__errors = 0; \
+             function insertBad() { \
+                 const script = document.createElement('script'); \
+                 script.src = 'http://['; \
+                 script.onerror = () => { \
+                     globalThis.__errors += 1; \
+                     if (globalThis.__errors < 3) insertBad(); \
+                 }; \
+                 document.documentElement.appendChild(script); \
+             } \
+             insertBad();</script>",
+        );
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "String(__errors)")
+                .expect("errors"),
+            "3"
+        );
+    }
+
+    /// `document.open`, `document.write`, and `document.close` stay in one
+    /// queue, so the write after an open lands in the parser the open created.
+    #[test]
+    fn document_write_after_open_keeps_queue_order() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let mut engine = crate::engine::Engine::new(
+            services,
+            Arc::new(Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        mount_html(
+            &mut engine,
+            "<script>document.open(); \
+             document.write('<p id=\"written\">hello</p>'); \
+             document.close();</script>",
+        );
+        assert_eq!(
+            engine
+                .eval_in(
+                    FrameId::MAIN,
+                    "document.getElementById('written').textContent",
+                )
+                .expect("written element"),
+            "hello"
+        );
+    }
+
+    /// Replacing a document drops queued markup and releases its stream
+    /// budget, while a queued cancellation survives to stop the old timer.
+    #[test]
+    fn replace_document_releases_writes_and_keeps_cancellations() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p></p>",
+        );
+        world
+            .borrow_mut()
+            .outbox
+            .borrow_mut()
+            .push_back(crate::js::RealmRequest::ClearTimer(7));
+        world
+            .borrow_mut()
+            .queue_write("x".repeat(7 * 1024 * 1024))
+            .expect("reserve write");
+        world.borrow_mut().replace_document(crate::parse_html(
+            "<!doctype html><p>new</p>",
+            blitz_dom::DocumentConfig::default(),
+        ));
+        assert!(matches!(
+            world.borrow().pop_outbox(),
+            Some(crate::js::RealmRequest::ClearTimer(7))
+        ));
+        assert!(
+            world
+                .borrow_mut()
+                .queue_write("y".repeat(7 * 1024 * 1024))
+                .is_ok(),
+            "the replaced document's write must release its budget"
+        );
     }
 
     /// A child frame that settles after the parent's own subresources still
@@ -2364,10 +2489,7 @@ mod realm_tests {
              <script src=\"data:text/javascript,globalThis.__parentScript = 1\"></script>\
              <iframe src=\"data:text/html,<p>child</p>\"></iframe>",
         );
-        assert_eq!(
-            load_state(&mut engine),
-            ("complete".into(), "true".into())
-        );
+        assert_eq!(load_state(&mut engine), ("complete".into(), "true".into()));
     }
 
     /// A failed `data:` script that settles last releases its delay before the
@@ -2386,10 +2508,7 @@ mod realm_tests {
              addEventListener('load', () => { globalThis.__loaded = true; });</script>\
              <script src=\"data:text/javascript;base64,!!!!\"></script>",
         );
-        assert_eq!(
-            load_state(&mut engine),
-            ("complete".into(), "true".into())
-        );
+        assert_eq!(load_state(&mut engine), ("complete".into(), "true".into()));
     }
 
     /// A font requested while a stylesheet settles is made a delaying dial
@@ -2410,9 +2529,6 @@ mod realm_tests {
              <script>globalThis.__loaded = false; \
              addEventListener('load', () => { globalThis.__loaded = true; });</script>",
         );
-        assert_eq!(
-            load_state(&mut engine),
-            ("complete".into(), "true".into())
-        );
+        assert_eq!(load_state(&mut engine), ("complete".into(), "true".into()));
     }
 }

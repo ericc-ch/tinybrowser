@@ -16,9 +16,7 @@ use url::Url;
 
 use crate::Parsed;
 use crate::ReadyState;
-use crate::js::{
-    DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, RealmRequest, World,
-};
+use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
 use crate::messaging::SharedHandle;
 use crate::protocol::{
     BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent, ResponseHead,
@@ -227,9 +225,10 @@ pub(crate) enum ImageLifecycle {
 }
 
 struct Timer {
-    id: u32,
     when: Instant,
     fired: bool,
+    /// The script-visible id, when this timer belongs to a realm.
+    js_id: Option<i32>,
 }
 
 /// Builds and queues the initial `about:blank` document for one connected
@@ -319,7 +318,7 @@ pub(crate) struct Document {
     shared: SharedHandle,
     url: Url,
     tasks: VecDeque<Task>,
-    timers: Vec<Timer>,
+    timers: HashMap<u32, Timer>,
     next_timer_id: u32,
     /// Every queued, in-flight, and cancelled dial for this document.
     dials: DialLedger,
@@ -362,9 +361,8 @@ pub(crate) struct Document {
     events: Vec<RendererEvent>,
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
-    /// Live JS timers by the id script holds, and the reverse for firing.
+    /// Live JS timers by the id script holds. The timer owns the page id.
     js_timers: HashMap<i32, u32>,
-    timer_js_ids: HashMap<u32, i32>,
     /// One count for every operation delaying this document's `load` event.
     load_delay: LoadDelay,
     /// Whether init scripts were deferred because the realm was created while
@@ -376,6 +374,10 @@ pub(crate) struct Document {
     defer_js: bool,
     /// The current parse's markup and delay, or `None` when no parse is active.
     active_parse: Option<ActiveParse>,
+    /// Whether `document.open` or `document.close` ran and the engine still
+    /// needs to publish the frame's document. `Some(true)` also restarts the
+    /// parent's load wait for a closed stream.
+    stream_publish: Option<bool>,
     /// Scripts already executed for the current parse, so a walk resumed
     /// after a `src` fetch does not run them twice.
     executed_scripts: HashSet<crate::dom::tree::NodeId>,
@@ -483,7 +485,7 @@ impl Document {
             shared: Rc::clone(&runtime.shared),
             url: document_url,
             tasks: VecDeque::new(),
-            timers: Vec::new(),
+            timers: HashMap::new(),
             next_timer_id: 1,
             dials: DialLedger::new(Arc::clone(&runtime.stop), Arc::clone(&runtime.wake)),
             image_selected_src: HashMap::new(),
@@ -499,11 +501,11 @@ impl Document {
             events_overflowed: false,
             js: None,
             js_timers: HashMap::new(),
-            timer_js_ids: HashMap::new(),
             load_delay: LoadDelay::default(),
             init_scripts_deferred: false,
             defer_js: false,
             active_parse: None,
+            stream_publish: None,
             executed_scripts: HashSet::new(),
             parser_eof: true,
             parser_owner: ParserOwner::Carrier,
@@ -759,8 +761,8 @@ impl Document {
         navigations
     }
 
-    pub(crate) fn take_document_stream(&mut self) -> Vec<DocumentStreamCommand> {
-        self.world.borrow_mut().take_document_stream()
+    pub(crate) fn take_stream_publish(&mut self) -> Option<bool> {
+        self.stream_publish.take()
     }
 
     pub(crate) fn fire_node_load(&mut self, id: crate::dom::tree::NodeId) {
@@ -1267,7 +1269,7 @@ impl Document {
     /// parse leaves the document on its previous URL, as a streamed response
     /// with an unusable final URL does.
     pub(crate) fn install_head(&mut self, head: &ResponseHead, origin: Option<url::Origin>) {
-        self.reset_js_realm();
+        self.reset_js_realm(false);
         // A new response brings its own HTTP status: documents without one
         // (blank, data) report zero rather than a previous page's status.
         // Violation `status-code` reports it
@@ -1426,7 +1428,7 @@ impl Document {
     ///
     /// <https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-open-steps>
     pub(crate) fn reopen_document(&mut self) {
-        self.reset_js_realm();
+        self.reset_js_realm(true);
         // A script writes text, not bytes, and it takes the input stream away
         // from any live response: dropping the decoder ignores the rest of
         // that body instead of decoding it with the wrong charset.
@@ -1439,7 +1441,7 @@ impl Document {
     /// EOF with the markup in hand and no decoder, but the carrier owns this
     /// parser: `document.close()` must not end it.
     pub(crate) fn load_html(&mut self, input: &str) {
-        self.reset_js_realm();
+        self.reset_js_realm(false);
         self.start_parser(input, true, ParserOwner::Carrier, None);
         self.finish_parse();
     }
@@ -1531,7 +1533,7 @@ impl Document {
         }
     }
 
-    fn reset_js_realm(&mut self) {
+    fn reset_js_realm(&mut self, keep_stream_writes: bool) {
         let old = std::mem::replace(
             &mut self.dials,
             DialLedger::new(Arc::clone(&self.stop), Arc::clone(&self.wake)),
@@ -1541,10 +1543,7 @@ impl Document {
         // A pending `load` from the replaced document must not be reported as
         // the new document's readiness.
         self.events.retain(|event| {
-            !matches!(
-                event,
-                RendererEvent::Load | RendererEvent::DomContentLoaded
-            )
+            !matches!(event, RendererEvent::Load | RendererEvent::DomContentLoaded)
         });
         // The old realm's ports are gone with it; the peers fire `close`
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
@@ -1566,31 +1565,21 @@ impl Document {
         self.image_selected_src.clear();
         self.in_flight_images.clear();
         self.connected_images.clear();
-        let js_timer_pages: std::collections::HashSet<u32> =
-            self.js_timers.values().copied().collect();
-        self.timers
-            .retain(|timer| !js_timer_pages.contains(&timer.id));
+        self.timers.retain(|_, timer| timer.js_id.is_none());
         self.js_timers.clear();
-        self.timer_js_ids.clear();
         self.js = None;
         self.init_scripts_deferred = false;
         self.active_parse = None;
+        self.stream_publish = None;
         self.executed_scripts.clear();
         self.parser_eof = true;
         self.world.borrow_mut().parser_active = false;
         self.world.borrow_mut().state.current_script = None;
-        let mut world = self.world.borrow_mut();
-        let bytes = world
-            .outbox
-            .borrow()
-            .iter()
-            .filter_map(|request| match request {
-                RealmRequest::HtmlWrite(value) => Some(value.len()),
-                _ => None,
-            })
-            .sum::<usize>();
-        world.clear_outbox();
-        world.release_stream_bytes(bytes);
+        if keep_stream_writes {
+            self.world.borrow().clear_outbox_for_open();
+        } else {
+            self.world.borrow().clear_outbox();
+        }
         self.parser_blocked_script = None;
         self.deferred_modules.clear();
     }
@@ -1601,7 +1590,6 @@ impl Document {
     pub(crate) fn apply_document_stream(&mut self, command: DocumentStreamCommand) {
         match command {
             DocumentStreamCommand::Open => self.reopen_document(),
-            DocumentStreamCommand::Write(html) => self.write_text(&html),
             // Only a parser a script opened is a script's to close; a response
             // body ends when its exchange does.
             // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#closing-the-input-stream
@@ -1838,11 +1826,7 @@ impl Document {
             return;
         }
         self.adopt_js_work();
-        let Some(ActiveParse {
-            mut buffer,
-            delay,
-        }) = self.active_parse.take()
-        else {
+        let Some(ActiveParse { buffer, delay }) = self.active_parse.take() else {
             return;
         };
         drop(delay);
@@ -2354,11 +2338,7 @@ impl Document {
             return false;
         }
         self.parser_blocked_script = Some(id);
-        let mut dial = QueuedDial::new(
-            DialContext::ClassicScript { element: id },
-            &url,
-            &self.url,
-        );
+        let mut dial = QueuedDial::new(DialContext::ClassicScript { element: id }, &url, &self.url);
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
@@ -2469,9 +2449,9 @@ impl Document {
                 // SRI verification fails the load like a network error:
                 // no execution, no `load` event, and no CSP violation
                 // (<https://www.w3.org/TR/SRI/#verify-integrity>).
-                let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
-                    crate::csp::integrity_verifies(metadata, &outcome.body)
-                });
+                let integrity_ok = integrity
+                    .as_deref()
+                    .is_none_or(|metadata| crate::csp::integrity_verifies(metadata, &outcome.body));
                 if !blocked && integrity_ok && (200..300).contains(&outcome.status) {
                     let source = String::from_utf8_lossy(&outcome.body);
                     let filename = outcome.final_url.clone();

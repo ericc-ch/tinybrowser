@@ -981,8 +981,7 @@ impl JsNode {
     pub(super) fn open_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         world_for_node(&ctx, self.handle.0)?
             .borrow_mut()
-            .queue_document_stream(DocumentStreamCommand::Open)
-            .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))?;
+            .queue_document_stream(DocumentStreamCommand::Open);
         wrap_node(&ctx, self.handle.0)
     }
 
@@ -991,33 +990,18 @@ impl JsNode {
         // Every argument stringifies and concatenates in order
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write>).
         let html: String = text.iter().map(|part| part.0.as_str()).collect();
-        let world = world_for_node(&ctx, self.handle.0)?;
-        let mut world = world.borrow_mut();
-        if world.parser_active {
-            if !world.reserve_stream_bytes(html.len()) {
-                return Err(Exception::throw_range(
-                    &ctx,
-                    "document stream budget exceeded",
-                ));
-            }
-            world
-                .outbox
-                .borrow_mut()
-                .push(crate::js::RealmRequest::HtmlWrite(html));
-        } else {
-            world
-                .queue_document_stream(DocumentStreamCommand::Write(html))
-                .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))?;
-        }
-        Ok(())
+        world_for_node(&ctx, self.handle.0)?
+            .borrow_mut()
+            .queue_write(html)
+            .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-close
     pub(super) fn close_document(&self, ctx: Ctx<'_>) -> Result<()> {
         world_for_node(&ctx, self.handle.0)?
             .borrow_mut()
-            .queue_document_stream(DocumentStreamCommand::Close)
-            .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))
+            .queue_document_stream(DocumentStreamCommand::Close);
+        Ok(())
     }
 
     pub(super) fn get_element_by_id<'js>(
