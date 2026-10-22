@@ -1677,6 +1677,183 @@ fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
         .insert(element, crate::js::CreatorInfo { url, line, column });
 }
 
+/// Runs the input element's type-change steps
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+///
+/// A change between keywords of the same state leaves the value alone. Across
+/// value-mode states the current value becomes the default, across other
+/// modes the current value is reloaded from the default, and the state's
+/// sanitization algorithm runs last.
+enum InputValueStore {
+    /// Record the value as user-set; later `value` attribute changes do not
+    /// override it.
+    Dirty(String),
+    /// Record the value but leave the dirty value flag false, so the current
+    /// value mirrors the content attribute again.
+    Pristine(String),
+    Keep,
+}
+
+fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId, previous: Option<&str>) -> Result<()> {
+    let old = crate::dom::input::InputType::from_attribute(previous);
+    let world_rc = world_for_node(ctx, element)?;
+    let (new, current) = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.document(element) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let Some(new) = crate::dom::input::input_type(base, element.node) else {
+            return Ok(());
+        };
+        (new, crate::dom::input::raw_value(base, element.node))
+    };
+    if old == new {
+        return Ok(());
+    }
+    let (store, sanitized_changed) = input_type_store(ctx, &world_rc, element, old, new, &current)?;
+    {
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(element) else {
+            return Ok(());
+        };
+        apply_input_value_store(&mut parsed, element, store);
+    }
+    apply_input_selection(&world_rc, element, old, new, sanitized_changed);
+    Ok(())
+}
+
+/// Decides what the current value becomes across a type change
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+fn input_type_store(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+    element: NodeId,
+    old: crate::dom::input::InputType,
+    new: crate::dom::input::InputType,
+    current: &str,
+) -> Result<(InputValueStore, bool)> {
+    let (attribute, dirty) = {
+        let world = world.borrow();
+        let Some(parsed) = world.document(element) else {
+            return Ok((InputValueStore::Keep, false));
+        };
+        let base = &parsed.document.base;
+        (
+            crate::dom::tree::attr(base, element.node, "value").map(ToOwned::to_owned),
+            base.get_node(element.node)
+                .and_then(|node| node.data.downcast_element())
+                .is_some_and(|element| element.form_state.dirty_value),
+        )
+    };
+    let old_mode = old.value_mode();
+    let new_mode = new.value_mode();
+    if old_mode == crate::dom::input::ValueMode::Current
+        && new_mode == crate::dom::input::ValueMode::Current
+    {
+        if !current.is_empty() {
+            set_attribute_sync(ctx, element, "value", current)?;
+        }
+        let sanitized = sanitize_current(world, element, new, current);
+        let changed = sanitized != current;
+        // A pristine current value stays tied to the content attribute;
+        // states such as Color compute a default on read without storing it
+        // (<https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>).
+        let store = if dirty {
+            InputValueStore::Dirty(sanitized)
+        } else {
+            InputValueStore::Keep
+        };
+        return Ok((store, changed));
+    }
+    if old_mode != crate::dom::input::ValueMode::Current
+        && new_mode == crate::dom::input::ValueMode::Current
+    {
+        let raw = attribute.unwrap_or_default();
+        let sanitized = sanitize_current(world, element, new, &raw);
+        let store = if sanitized == raw {
+            InputValueStore::Pristine(raw)
+        } else {
+            InputValueStore::Dirty(sanitized)
+        };
+        return Ok((store, false));
+    }
+    Ok((InputValueStore::Keep, false))
+}
+
+fn apply_input_value_store(parsed: &mut crate::Parsed, element: NodeId, store: InputValueStore) {
+    match store {
+        InputValueStore::Dirty(value) => parsed
+            .document
+            .base
+            .mutate()
+            .set_dirty_value(element.node, value),
+        InputValueStore::Pristine(value) => {
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_dirty_value(element.node, value);
+            if let Some(node) = parsed.document.base.get_node_mut(element.node)
+                && let Some(element) = node.element_data_mut()
+            {
+                element.form_state.dirty_value = false;
+                element.sync_placeholder_shown(
+                    element
+                        .attr(markup5ever::LocalName::from("value"))
+                        .unwrap_or("")
+                        .is_empty(),
+                );
+            }
+        }
+        InputValueStore::Keep => {}
+    }
+}
+
+/// Moves the text entry cursor after a type change: a state that gains text
+/// entry starts at the beginning, and a sanitized rewrite moves it to the end
+/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
+fn apply_input_selection(
+    world: &Rc<RefCell<World>>,
+    element: NodeId,
+    old: crate::dom::input::InputType,
+    new: crate::dom::input::InputType,
+    sanitized_changed: bool,
+) {
+    let selection_applies = {
+        let world = world.borrow();
+        world.document(element).is_some_and(|parsed| {
+            crate::dom::forms::selection_applies(&parsed.document.base, element.node)
+        })
+    };
+    if !selection_applies {
+        return;
+    }
+    if !old.selection_applies() && new.selection_applies() {
+        world.borrow_mut().set_selection(element, 0, 0, 0);
+    } else if sanitized_changed {
+        let end = {
+            let world = world.borrow();
+            world.document(element).map_or(0, |parsed| {
+                crate::dom::forms::control_value_len(&parsed.document.base, element.node)
+            })
+        };
+        world.borrow_mut().set_selection(element, end, end, 0);
+    }
+}
+
+fn sanitize_current(
+    world: &Rc<RefCell<World>>,
+    element: NodeId,
+    kind: crate::dom::input::InputType,
+    value: &str,
+) -> String {
+    let world = world.borrow();
+    world.document(element).map_or_else(String::new, |parsed| {
+        crate::dom::input::sanitize(&parsed.document.base, element.node, kind, value)
+    })
+}
+
 /// After an attribute change, runs the element's attribute-change hooks: an
 /// `iframe`'s `src` drives its browsing context's navigation
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>),
@@ -1684,7 +1861,12 @@ fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
 /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>),
 /// and an event handler content attribute compiles into its handler property
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
-pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str) -> Result<()> {
+pub(crate) fn after_attribute_change(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    local: &str,
+    previous: Option<&str>,
+) -> Result<()> {
     if let Some(typ) = local.strip_prefix("on")
         && !typ.is_empty()
         && typ
@@ -1692,6 +1874,9 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
             .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
     {
         compile_handler_attribute(ctx, element, typ)?;
+    }
+    if local == "type" {
+        apply_input_type_change(ctx, element, previous)?;
     }
     if local != "src" && local != "srcdoc" {
         return Ok(());
@@ -1877,27 +2062,31 @@ pub(crate) fn remove_attribute_sync(
         }
         removed
     };
-    if let Some((name, value)) = removed {
-        let namespace = name.ns.as_str().to_owned();
-        let local = name.local.as_str().to_owned();
-        // The nonce attribute change steps reset the cryptographic nonce
-        // slot on removal (value `null`); only the null-namespace attribute
-        // participates
-        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
-        if local == "nonce" && namespace.is_empty() {
-            world_rc.borrow_mut().state.nonce_slots.remove(&element);
+    let (changed, previous) = match removed {
+        Some((name, value)) => {
+            let namespace = name.ns.as_str().to_owned();
+            let changed = name.local.as_str().to_owned();
+            // The nonce attribute change steps reset the cryptographic nonce
+            // slot on removal (value `null`); only the null-namespace attribute
+            // participates
+            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#nonce-attributes>).
+            if changed == "nonce" && namespace.is_empty() {
+                world_rc.borrow_mut().state.nonce_slots.remove(&element);
+            }
+            let registry = world_rc.borrow().registry();
+            registry
+                .borrow_mut()
+                .attributes
+                .touch(element, &namespace, &changed, value.clone());
+            registry
+                .borrow_mut()
+                .attributes
+                .detach(element, &namespace, &changed);
+            (changed, Some(value))
         }
-        let registry = world_rc.borrow().registry();
-        registry
-            .borrow_mut()
-            .attributes
-            .touch(element, &namespace, &local, value);
-        registry
-            .borrow_mut()
-            .attributes
-            .detach(element, &namespace, &local);
-    }
-    after_attribute_change(ctx, element, local)?;
+        None => (local.to_owned(), None),
+    };
+    after_attribute_change(ctx, element, &changed, previous.as_deref())?;
     schedule_mutation_delivery(ctx)
 }
 
@@ -2011,7 +2200,7 @@ pub(crate) fn set_attribute_sync(
         // https://dom.spec.whatwg.org/#handle-attribute-changes
         name: name.local.as_str().to_owned(),
         namespace: namespace.clone(),
-        old_value,
+        old_value: old_value.clone(),
     });
     drop(parsed);
     drop(world);
@@ -2031,7 +2220,7 @@ pub(crate) fn set_attribute_sync(
             .insert(element, value.to_owned());
     }
     touch_attr(ctx, element, &namespace, local, value)?;
-    after_attribute_change(ctx, element, local)?;
+    after_attribute_change(ctx, element, local, old_value.as_deref())?;
     schedule_mutation_delivery(ctx)
 }
 
@@ -2067,7 +2256,7 @@ pub(crate) fn set_attribute_node<'js>(
     if previous == Some(id) {
         return Ok(attr.clone());
     }
-    let previous = {
+    let (previous, old_value) = {
         let world_rc = world_for_node(ctx, element)?;
         let world = world_rc.borrow();
         let mut parsed = world
@@ -2106,11 +2295,11 @@ pub(crate) fn set_attribute_node<'js>(
             // https://dom.spec.whatwg.org/#handle-attribute-changes
             name: state.local.clone(),
             namespace: state.namespace.clone(),
-            old_value,
+            old_value: old_value.clone(),
         });
-        previous
+        (previous, old_value)
     };
-    after_attribute_change(ctx, element, &state.local)?;
+    after_attribute_change(ctx, element, &state.local, old_value.as_deref())?;
     schedule_mutation_delivery(ctx)?;
     match previous {
         Some(previous) => attr_wrapper(ctx, previous),

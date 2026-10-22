@@ -317,34 +317,67 @@
   };
   // Monday is 0 ... Sunday is 6; 1970-01-01 was a Thursday.
   const weekdayFromDays = days => (((days % 7) + 10) % 7);
+  const isLeapYear = year =>
+    year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = (year, month) => {
+    if (month === 2) return isLeapYear(year) ? 29 : 28;
+    return [4, 6, 9, 11].includes(month) ? 30 : 31;
+  };
+  // A valid date string requires year > 0, a month in 1..=12, and a day
+  // present in that month
+  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-date-string>).
   const parseDate = value => {
-    const match = /^(\d{4,6})-(\d{2})-(\d{2})$/.exec(value);
-    return match ? daysFromCivil(+match[1], +match[2], +match[3]) : null;
+    const match = /^(\d{4,})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return null;
+    const year = +match[1];
+    const month = +match[2];
+    const day = +match[3];
+    if (year === 0 || month < 1 || month > 12) return null;
+    if (day < 1 || day > daysInMonth(year, month)) return null;
+    return daysFromCivil(year, month, day);
   };
   const parseMonth = value => {
-    const match = /^(\d{4,6})-(\d{2})$/.exec(value);
-    return match ? (+match[1] - 1970) * 12 + (+match[2]) - 1 : null;
+    const match = /^(\d{4,})-(\d{2})$/.exec(value);
+    if (!match) return null;
+    const year = +match[1];
+    const month = +match[2];
+    if (year === 0 || month < 1 || month > 12) return null;
+    return (year - 1970) * 12 + month - 1;
   };
   const epochMonday = (() => {
     const januaryFirst = daysFromCivil(1970, 1, 1);
     return januaryFirst - weekdayFromDays(januaryFirst);
   })();
-  const parseWeek = value => {
-    const match = /^(\d{4,6})-W(\d{2})$/.exec(value);
-    if (!match) return null;
-    const januaryFourth = daysFromCivil(+match[1], 1, 4);
+  // The ISO week number of December 28, which is always in the last week.
+  const weeksInYear = year => {
+    const days = daysFromCivil(year, 12, 28);
+    const januaryFourth = daysFromCivil(year, 1, 4);
     const mondayOfWeekOne = januaryFourth - weekdayFromDays(januaryFourth);
-    return (mondayOfWeekOne - epochMonday) / 7 + (+match[2]) - 1;
+    return Math.floor((days - mondayOfWeekOne) / 7) + 1;
+  };
+  const parseWeek = value => {
+    const match = /^(\d{4,})-W(\d{2})$/.exec(value);
+    if (!match) return null;
+    const year = +match[1];
+    const week = +match[2];
+    if (year === 0 || week < 1 || week > weeksInYear(year)) return null;
+    const januaryFourth = daysFromCivil(year, 1, 4);
+    const mondayOfWeekOne = januaryFourth - weekdayFromDays(januaryFourth);
+    return (mondayOfWeekOne - epochMonday) / 7 + week - 1;
   };
   const parseTime = value => {
     const match = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(value);
     if (!match) return null;
+    const hour = +match[1];
+    const minute = +match[2];
+    const second = +(match[3] || 0);
+    if (hour > 23 || minute > 59 || second > 59) return null;
     const fraction = match[4] || '';
-    return (+match[1]) * 3600 + (+match[2]) * 60 + (+match[3] || 0)
+    return hour * 3600 + minute * 60 + second
       + (+fraction) / 10 ** fraction.length;
   };
   const parseLocalDateTime = value => {
-    const match = /^(\d{4,6}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?)$/.exec(value);
+    const match = /^(\d{4,}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?)$/.exec(value);
     if (!match) return null;
     const days = parseDate(match[1]);
     const seconds = parseTime(match[2]);

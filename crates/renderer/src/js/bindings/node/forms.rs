@@ -555,13 +555,14 @@ impl JsNode {
         }
         Ok(match element.name.local.as_str() {
             "textarea" => {
-                if element.form_state.dirty_value {
+                // The API value is the raw value with CRLF and CR normalized
+                // to LF (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-api-value>).
+                let raw = if element.form_state.dirty_value {
                     element.form_state.value.clone()
                 } else {
-                    crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node)
-                        .to_string_lossy()
-                        .into_owned()
-                }
+                    crate::dom::input::child_text_content(&parsed.document.base, self.handle.0.node)
+                };
+                crate::dom::input::normalize_newlines(&raw)
             }
             "select" => {
                 crate::dom::forms::select_value(base, self.handle.0.document, self.handle.0.node)
@@ -569,25 +570,9 @@ impl JsNode {
             "option" => crate::dom::forms::option_value(base, self.handle.0.node),
             "input" => {
                 // A dirty value wins in every state; the content attribute is
-                // only the default
+                // only the default. The value is sanitized for its state
                 // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-                if element.form_state.dirty_value {
-                    element.form_state.value.clone()
-                } else {
-                    match attr(base, self.handle.0.node, "value") {
-                        Some(value) => value.to_owned(),
-                        // Checkbox and radio default to "on"
-                        // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
-                        None if matches!(
-                            element_input_type(base, self.handle.0.node).as_str(),
-                            "checkbox" | "radio"
-                        ) =>
-                        {
-                            "on".to_owned()
-                        }
-                        None => String::new(),
-                    }
-                }
+                crate::dom::input::current_value(base, self.handle.0.node)
             }
             _ => element.control_value().to_owned(),
         })
@@ -607,17 +592,38 @@ impl JsNode {
             "textarea" => self.set_textarea_value(&ctx, value.0),
             "select" => self.set_select_value(&ctx, value.0),
             "input" => {
-                let reflected = {
-                    let world = world(&ctx)?;
-                    let world = world.borrow();
-                    world.document(self.handle.0).is_some_and(|parsed| {
-                        value_is_content_attribute(&parsed.document.base, self.handle.0.node)
-                    })
+                let world_rc = world(&ctx)?;
+                let (kind, sanitized) = {
+                    let world = world_rc.borrow();
+                    let Some(parsed) = world.document(self.handle.0) else {
+                        return Ok(());
+                    };
+                    let base = &parsed.document.base;
+                    let Some(kind) = crate::dom::input::input_type(base, self.handle.0.node) else {
+                        return Ok(());
+                    };
+                    let sanitized =
+                        crate::dom::input::sanitize(base, self.handle.0.node, kind, &value.0);
+                    (kind, sanitized)
                 };
-                if reflected {
-                    set_attribute_sync(&ctx, self.handle.0, "value", &value.0)
-                } else {
-                    self.set_dirty_control_value(&ctx, value.0)
+                match kind.value_mode() {
+                    crate::dom::input::ValueMode::Current => {
+                        self.set_dirty_control_value(&ctx, sanitized)
+                    }
+                    crate::dom::input::ValueMode::Default
+                    | crate::dom::input::ValueMode::DefaultOn => {
+                        set_attribute_sync(&ctx, self.handle.0, "value", &value.0)
+                    }
+                    crate::dom::input::ValueMode::Filename => {
+                        if !value.0.is_empty() {
+                            return Err(throw_dom(
+                                &ctx,
+                                "InvalidStateError",
+                                "a file input's value can only be set to the empty string",
+                            ));
+                        }
+                        Ok(())
+                    }
                 }
             }
             _ => set_attribute_sync(&ctx, self.handle.0, "value", &value.0),
@@ -730,11 +736,12 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(
-            crate::dom::text::descendant_text(&parsed.document.base, self.handle.0.node)
-                .to_string_lossy()
-                .into_owned(),
-        )
+        // The default value is the element's child text content
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue>).
+        Ok(crate::dom::input::child_text_content(
+            &parsed.document.base,
+            self.handle.0.node,
+        ))
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
@@ -1061,12 +1068,11 @@ impl JsNode {
         let world = world(&ctx)?;
         let world = world.borrow();
         Ok(world.document(self.handle.0).is_some_and(|parsed| {
-            parsed
-                .document
-                .base
-                .get_node(self.handle.0.node)
-                .and_then(|node| node.data.downcast_element())
-                .is_some_and(blitz_dom::ElementData::selectedness)
+            crate::dom::forms::option_effective_selected(
+                &parsed.document.base,
+                self.handle.0.document,
+                self.handle.0.node,
+            )
         }))
     }
 
@@ -1074,39 +1080,58 @@ impl JsNode {
         // Selecting an option in a single-select deselects the others. The
         // content attribute stays the default selectedness
         // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
-        let siblings = if value {
-            let world = world(&ctx)?;
-            let world = world.borrow();
+        let world_rc = world(&ctx)?;
+        let (owner, siblings) = {
+            let world = world_rc.borrow();
             let Some(parsed) = world.document(self.handle.0) else {
                 return Ok(());
             };
             let base = &parsed.document.base;
-            match crate::dom::forms::option_select_owner(base, self.handle.0.node).map(|node| {
-                NodeId {
-                    document: self.handle.0.document,
-                    node,
-                }
-            }) {
-                Some(owner) if attr(base, owner.node, "multiple").is_none() => {
+            let owner =
+                crate::dom::forms::option_select_owner(base, self.handle.0.node).map(|node| {
+                    NodeId {
+                        document: self.handle.0.document,
+                        node,
+                    }
+                });
+            let siblings = match owner {
+                Some(owner) if value && attr(base, owner.node, "multiple").is_none() => {
                     crate::dom::forms::select_options(base, self.handle.0.document, owner.node)
                 }
                 _ => Vec::new(),
+            };
+            (owner, siblings)
+        };
+        {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Ok(());
+            };
+            let mut mutator = parsed.document.base.mutate();
+            for option in siblings {
+                if option != self.handle.0 {
+                    mutator.set_selectedness(option.node, false);
+                }
             }
-        } else {
-            Vec::new()
-        };
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
-        };
-        let mut mutator = parsed.document.base.mutate();
-        for option in siblings {
-            if option != self.handle.0 {
-                mutator.set_selectedness(option.node, false);
+            mutator.set_selectedness(self.handle.0.node, value);
+        }
+        // Deselecting the only selected option in a single-select asks for a
+        // reset, which selects the first non-disabled option
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
+        if !value && let Some(owner) = owner {
+            let world = world_rc.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Ok(());
+            };
+            let target = crate::dom::forms::select_reset_target(
+                &parsed.document.base,
+                owner.document,
+                owner.node,
+            );
+            if let Some(target) = target {
+                parsed.document.base.mutate().set_selectedness(target, true);
             }
         }
-        mutator.set_selectedness(self.handle.0.node, value);
         Ok(())
     }
 
@@ -1198,9 +1223,11 @@ impl JsNode {
             crate::dom::forms::select_options(base, self.handle.0.document, self.handle.0.node)
                 .iter()
                 .position(|option| {
-                    base.get_node(option.node)
-                        .and_then(|node| node.data.downcast_element())
-                        .is_some_and(blitz_dom::ElementData::selectedness)
+                    crate::dom::forms::option_effective_selected(
+                        base,
+                        self.handle.0.document,
+                        option.node,
+                    )
                 })
                 .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
         }))
@@ -1352,35 +1379,6 @@ pub(super) fn direction_code(direction: &str) -> u8 {
         "backward" => 2,
         _ => 0,
     }
-}
-
-/// Checkbox, radio, and button-like inputs reflect `value` as a content
-/// attribute. Other inputs keep a dirty value apart from that attribute
-/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-fn value_is_content_attribute(
-    base: &blitz_dom::BaseDocument,
-    node: blitz_traits::node_id::NodeId,
-) -> bool {
-    matches!(
-        element_input_type(base, node).as_str(),
-        "checkbox" | "radio" | "file" | "submit" | "image" | "reset" | "button"
-    )
-}
-
-/// An input's current type state: a trimmed, ASCII-lowercased `type`
-/// attribute; missing or empty is the text state
-/// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
-fn element_input_type(
-    base: &blitz_dom::BaseDocument,
-    node: blitz_traits::node_id::NodeId,
-) -> String {
-    into_element_input_type(attr(base, node, "type"))
-}
-
-fn into_element_input_type(kind: Option<&str>) -> String {
-    kind.map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "text".to_owned())
 }
 
 /// Form-associated elements whose form owner is `form`.

@@ -12,8 +12,10 @@
 //! (<https://dom.spec.whatwg.org/#concept-node-adopt>).
 
 pub(crate) mod adoption;
+pub(crate) mod css_color;
 pub(crate) mod equality;
 pub(crate) mod forms;
+pub(crate) mod input;
 pub(crate) mod insertion;
 pub(crate) mod namespaces;
 pub(crate) mod parse;

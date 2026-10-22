@@ -9,7 +9,6 @@
 use blitz_dom::{BaseDocument, NodeData};
 
 use crate::Parsed;
-use crate::dom::text::descendant_text;
 use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_html_element};
 
 /// A control's contribution to the entry list, resolved inside one world
@@ -164,10 +163,10 @@ pub(crate) fn pending_entry(
                 .and_then(|target| target.data.downcast_element())
                 .filter(|element| element.form_state.dirty_value)
                 .map_or_else(
-                    || descendant_text(base, node).to_string_lossy().into_owned(),
+                    || crate::dom::input::child_text_content(base, node),
                     |element| element.form_state.value.clone(),
                 );
-            let mut value = normalize_newlines(&raw);
+            let mut value = crate::dom::input::normalize_newlines(&raw);
             if wrap_is_hard(attr(base, node, "wrap")) {
                 let cols = parse_positive(attr(base, node, "cols")).unwrap_or(20);
                 value = hard_wrap(&value, cols);
@@ -212,10 +211,10 @@ pub(crate) fn pending_entry(
             } else if typ == "file" {
                 vec![PendingEntry::Files(control_name.to_owned(), id)]
             } else {
-                let value = base
-                    .get_node(node)
-                    .and_then(|target| target.data.downcast_element())
-                    .map_or_else(value_attr, |element| element.control_value().to_owned());
+                // The entry list uses the current value, after the state's
+                // value sanitization algorithm
+                // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+                let value = crate::dom::input::current_value(base, node);
                 vec![PendingEntry::Text(control_name.to_owned(), value)]
             }
         }
@@ -224,7 +223,8 @@ pub(crate) fn pending_entry(
                 select_options(base, document, node)
                     .into_iter()
                     .filter(|option| {
-                        option_selected(base, option.node) && !is_disabled(base, option.node)
+                        option_effective_selected(base, document, option.node)
+                            && !is_disabled(base, option.node)
                     })
                     .map(|option| {
                         PendingEntry::Text(control_name.to_owned(), option_value(base, option.node))
@@ -295,6 +295,92 @@ pub(crate) fn option_selected(base: &BaseDocument, option: BlitzId) -> bool {
         .is_some_and(blitz_dom::ElementData::selectedness)
 }
 
+/// Whether selectedness was ever set explicitly on the option, including an
+/// explicit deselection. The default first option in a single-select must not
+/// come back after script selected nothing.
+fn option_dirty_selectedness(base: &BaseDocument, option: BlitzId) -> bool {
+    base.get_node(option)
+        .and_then(|node| node.data.downcast_element())
+        .is_some_and(|element| element.form_state.dirty_selectedness)
+}
+
+/// The select's display size: the `size` attribute when positive, otherwise
+/// four for a multiple select and one otherwise
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-size>).
+fn select_display_size(base: &BaseDocument, select: BlitzId) -> usize {
+    if let Some(size) = parse_positive(attr(base, select, "size")) {
+        return size;
+    }
+    if attr(base, select, "multiple").is_some() {
+        4
+    } else {
+        1
+    }
+}
+
+/// The option a reset would select in a single-select with no selection: the
+/// first non-disabled option
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
+pub(crate) fn select_reset_target(
+    base: &BaseDocument,
+    document: u32,
+    select: BlitzId,
+) -> Option<BlitzId> {
+    if select_display_size(base, select) != 1 {
+        return None;
+    }
+    let options = select_options(base, document, select);
+    if options
+        .iter()
+        .any(|option| option_selected(base, option.node))
+    {
+        return None;
+    }
+    options
+        .iter()
+        .find(|option| !is_disabled(base, option.node))
+        .map(|option| option.node)
+}
+
+/// An option's displayed selectedness, including the reset behavior that
+/// selects the first non-disabled option in a single-select with no selection
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
+pub(crate) fn option_effective_selected(
+    base: &BaseDocument,
+    document: u32,
+    option: BlitzId,
+) -> bool {
+    if option_selected(base, option) {
+        return true;
+    }
+    let Some(select) = option_select_owner(base, option) else {
+        return false;
+    };
+    if select_display_size(base, select) != 1 {
+        return false;
+    }
+    let options = select_options(base, document, select);
+    // Another option's explicit selectedness wins over the default.
+    if options
+        .iter()
+        .any(|candidate| option_selected(base, candidate.node))
+    {
+        return false;
+    }
+    // `selectedIndex = -1` and a value that matches nothing set selectedness
+    // on every option; that explicit empty selection must survive a read.
+    if options
+        .iter()
+        .all(|candidate| option_dirty_selectedness(base, candidate.node))
+    {
+        return false;
+    }
+    options
+        .iter()
+        .find(|candidate| !is_disabled(base, candidate.node))
+        .is_some_and(|first| first.node == option)
+}
+
 /// An `option`'s value: its `value` attribute, else its text
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
 pub(crate) fn option_value(base: &BaseDocument, option: BlitzId) -> String {
@@ -337,7 +423,7 @@ pub(crate) fn option_text(base: &BaseDocument, option: BlitzId) -> String {
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
 pub(crate) fn select_value(base: &BaseDocument, document: u32, select: BlitzId) -> String {
     for option in select_options(base, document, select) {
-        if option_selected(base, option.node) {
+        if option_effective_selected(base, document, option.node) {
             return option_value(base, option.node);
         }
     }
@@ -361,24 +447,6 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
         }
     }
     result
-}
-
-/// An API value with CRLF and CR newlines normalized to LF
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-fe-api-value>).
-pub(crate) fn normalize_newlines(value: &str) -> String {
-    let mut normalized = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            normalized.push('\n');
-        } else {
-            normalized.push(character);
-        }
-    }
-    normalized
 }
 
 /// The submission encoding for a resolved label: the same ASCII-trimmed,
@@ -509,32 +577,27 @@ pub(crate) fn control_value_len(base: &blitz_dom::BaseDocument, node: BlitzId) -
     else {
         return 0;
     };
-    if element.form_state.dirty_value {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "control values stay far below u32::MAX"
-        )]
-        let len = element.form_state.value.encode_utf16().count() as u32;
-        return len;
-    }
-    if element.name.ns == html_namespace() && element.name.local.as_str() == "textarea" {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "control values stay far below u32::MAX"
-        )]
-        let len = crate::dom::text::descendant_text(base, node).units().len() as u32;
-        return len;
-    }
-    let len = element
-        .attr(markup5ever::LocalName::from("value"))
-        .unwrap_or_default()
-        .encode_utf16()
-        .count();
+    let value = if element.name.ns == html_namespace() {
+        match element.name.local.as_str() {
+            "textarea" => {
+                let raw = if element.form_state.dirty_value {
+                    element.form_state.value.clone()
+                } else {
+                    crate::dom::input::child_text_content(base, node)
+                };
+                crate::dom::input::normalize_newlines(&raw)
+            }
+            "input" => crate::dom::input::current_value(base, node),
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
     #[expect(
         clippy::cast_possible_truncation,
         reason = "control values stay far below u32::MAX"
     )]
-    let len = len as u32;
+    let len = value.encode_utf16().count() as u32;
     len
 }
 
@@ -552,18 +615,8 @@ pub(crate) fn selection_applies(base: &blitz_dom::BaseDocument, node: BlitzId) -
     }
     match element.name.local.as_str() {
         "textarea" => true,
-        "input" => {
-            // Only the text-like states support the selection APIs
-            // (<https://html.spec.whatwg.org/multipage/input.html#do-not-apply>).
-            let typ = attr(base, node, "type")
-                .unwrap_or("text")
-                .trim()
-                .to_ascii_lowercase();
-            matches!(
-                typ.as_str(),
-                "" | "text" | "search" | "tel" | "url" | "password"
-            )
-        }
+        "input" => crate::dom::input::input_type(base, node)
+            .is_some_and(crate::dom::input::InputType::selection_applies),
         _ => false,
     }
 }

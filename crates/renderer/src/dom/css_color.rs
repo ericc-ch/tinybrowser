@@ -1,7 +1,8 @@
-//! CSS `<color>` parsing for canvas styles.
+//! CSS `<color>` parsing for canvas styles and the input color state.
 //!
-//! Canvas accepts any CSS color where it takes a color
-//! (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>),
+//! Both consumers accept any CSS color where they take a color
+//! (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>,
+//! <https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>),
 //! so the parser follows CSS Color 4 for the sRGB syntaxes. Wide-gamut
 //! functions (`lab()`, `oklch()`, `color()`) are not parsed yet and are
 //! treated as invalid assignments, leaving the previous value in place.
@@ -166,6 +167,10 @@ fn percentage(text: &str) -> Option<f32> {
     number(text.strip_suffix('%')?).map(|value| value / 100.0)
 }
 
+fn percentage_or_number(text: &str) -> Option<f32> {
+    percentage(text).or_else(|| number(text).map(|value| value / 100.0))
+}
+
 fn alpha(text: Option<&str>) -> Option<u8> {
     let Some(text) = text else { return Some(255) };
     let value = number(text).or_else(|| percentage(text))?;
@@ -249,8 +254,11 @@ fn parse_hsl(args: &Args) -> Option<[u8; 4]> {
     }
     let (components, alpha_text) = legacy_alpha(args)?;
     let hue = hue(&components[0])? / 360.0;
-    let saturation = percentage(&components[1])?.clamp(0.0, 1.0);
-    let lightness = percentage(&components[2])?.clamp(0.0, 1.0);
+    // The modern syntax accepts a bare number for saturation and lightness,
+    // where 100 means 100%
+    // (<https://drafts.csswg.org/css-color-4/#the-hsl-notation>).
+    let saturation = percentage_or_number(&components[1])?.clamp(0.0, 1.0);
+    let lightness = percentage_or_number(&components[2])?.clamp(0.0, 1.0);
     let alpha = alpha(alpha_text)?;
     let (red, green, blue) = hsl_to_rgb(hue, saturation, lightness);
     Some([channel(red), channel(green), channel(blue), alpha])
@@ -310,55 +318,35 @@ fn named(name: &str) -> Option<[u8; 4]> {
         let rgb = rgb.1.to_be_bytes();
         return Some([rgb[1], rgb[2], rgb[3], 255]);
     }
-    // CSS system colors resolve to the UA's palette. tinybrowser has no theme,
-    // so they resolve to black; the important part is that they parse
+    // CSS system colors resolve to the UA's palette. tinybrowser has no
+    // platform theme, so it uses a light palette
     // (<https://drafts.csswg.org/css-color-4/#css-system-colors>).
-    matches!(
-        name,
-        "accentcolor"
-            | "accentcolortext"
-            | "activetext"
-            | "buttonborder"
-            | "buttonface"
-            | "buttontext"
-            | "canvas"
-            | "canvastext"
-            | "field"
-            | "fieldtext"
-            | "graytext"
-            | "highlight"
-            | "highlighttext"
-            | "linktext"
-            | "mark"
-            | "marktext"
-            | "selecteditem"
-            | "selecteditemtext"
-            | "visitedtext"
-            | "activeborder"
-            | "activecaption"
-            | "appworkspace"
-            | "background"
-            | "buttonhighlight"
-            | "buttonshadow"
-            | "captiontext"
-            | "inactiveborder"
-            | "inactivecaption"
-            | "inactivecaptiontext"
-            | "infobackground"
-            | "infotext"
-            | "menu"
-            | "menutext"
-            | "scrollbar"
-            | "threeddarkshadow"
-            | "threedface"
-            | "threedhighlight"
-            | "threedlightshadow"
-            | "threedshadow"
-            | "window"
-            | "windowframe"
-            | "windowtext"
-    )
-    .then_some([0, 0, 0, 255])
+    let palette = match name {
+        "accentcolor" | "highlight" | "selecteditem" => [0x00, 0x78, 0xd7, 255],
+        "accentcolortext" | "highlighttext" | "selecteditemtext" | "canvas" | "field"
+        | "buttonface" | "window" | "background" | "infobackground" | "menu" | "mark"
+        | "threedface" => [0xff, 0xff, 0xff, 255],
+        "graytext" | "activeborder" | "buttonborder" | "inactiveborder" | "windowframe"
+        | "scrollbar" | "threeddarkshadow" | "threedhighlight" | "threedlightshadow"
+        | "threedshadow" | "buttonshadow" | "buttonhighlight" | "appworkspace" => {
+            [0x80, 0x80, 0x80, 255]
+        }
+        "activetext"
+        | "buttontext"
+        | "canvastext"
+        | "captiontext"
+        | "fieldtext"
+        | "infotext"
+        | "linktext"
+        | "marktext"
+        | "menutext"
+        | "visitedtext"
+        | "inactivecaption"
+        | "inactivecaptiontext"
+        | "windowtext" => [0, 0, 0, 255],
+        _ => return None,
+    };
+    Some(palette)
 }
 
 /// CSS named colors, `0xRRGGBB`.
@@ -697,11 +685,50 @@ fn parse_color_function(inner: &str) -> Option<ParsedColor> {
         components[2].value().clamp(0.0, 1.0),
         alpha_value.clamp(0.0, 1.0),
     ];
+    let bytes = if space == "display-p3" {
+        let [red, green, blue] = display_p3_to_srgb([value[0], value[1], value[2]]);
+        to_bytes([red, green, blue, value[3]])
+    } else {
+        to_bytes(value)
+    };
     Some(ParsedColor {
-        bytes: to_bytes(value),
+        bytes,
         value,
         serialized: Some(serialize_color_function(space, &components, alpha_value)),
     })
+}
+
+/// Converts non-linear Display P3 components to non-linear sRGB through the
+/// shared D65 connection space
+/// (<https://drafts.csswg.org/css-color-4/#color-conversion-code>).
+fn display_p3_to_srgb([red, green, blue]: [f32; 3]) -> [f32; 3] {
+    let linear = [linearize(red), linearize(green), linearize(blue)];
+    // Display P3 -> XYZ (D65).
+    let x = 0.486_570_95 * linear[0] + 0.265_667_7 * linear[1] + 0.198_217_28 * linear[2];
+    let y = 0.228_974_56 * linear[0] + 0.691_738_5 * linear[1] + 0.079_286_91 * linear[2];
+    let z = 0.045_113_38 * linear[1] + 1.043_944_4 * linear[2];
+    // XYZ (D65) -> linear sRGB.
+    [
+        gamma_encode(3.240_97 * x - 1.537_383_2 * y - 0.498_610_76 * z),
+        gamma_encode(-0.969_243_65 * x + 1.875_967_5 * y + 0.041_555_06 * z),
+        gamma_encode(0.055_630_08 * x - 0.203_976_96 * y + 1.056_971_5 * z),
+    ]
+}
+
+fn linearize(value: f32) -> f32 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn gamma_encode(value: f32) -> f32 {
+    if value <= 0.003_130_8 {
+        12.92 * value
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 /// A `lab()` lightness: a number, a percentage of 100, or `none`.

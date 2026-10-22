@@ -10,7 +10,7 @@ use rquickjs::{
 };
 
 use crate::documents::JournalEntry;
-use crate::dom::forms::{option_selected, select_options};
+use crate::dom::forms::{option_effective_selected, select_options};
 use crate::dom::insertion::siblings_around;
 use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace, is_element};
 use crate::js::world::Handle;
@@ -152,7 +152,7 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         CollectionKind::SelectOptions => select_options(base, document, scope.node),
         CollectionKind::SelectedOptions => select_options(base, document, scope.node)
             .into_iter()
-            .filter(|option| option_selected(base, option.node))
+            .filter(|option| option_effective_selected(base, document, option.node))
             .collect(),
         CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
         CollectionKind::HtmlScripts => collect_html_scripts(&parsed.document, document, scope.node),
@@ -267,65 +267,14 @@ fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
 fn select_selected_index(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> i32 {
     select_options(base, document, select)
         .iter()
-        .position(|option| option_selected(base, option.node))
+        .position(|option| option_effective_selected(base, document, option.node))
         .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
 }
 
-/// Sets an option's selectedness through its `selected` content attribute,
-/// reusing the stored qualified name so clearing removes the exact attribute
-/// the parser kept (see `forms.rs` for the same pattern).
-fn set_option_selected(parsed: &mut crate::Parsed, option: NodeId, selected: bool) {
-    let (name, old_value) = {
-        let base = &parsed.document.base;
-        let Some(node) = base.get_node(option.node) else {
-            return;
-        };
-        let Some(element) = node.data.downcast_element() else {
-            return;
-        };
-        let name = element
-            .attrs
-            .iter()
-            .find(|attribute| attribute.name.local.as_str() == "selected")
-            .map_or_else(
-                || {
-                    QualName::new(
-                        None,
-                        markup5ever::Namespace::from(""),
-                        LocalName::from("selected"),
-                    )
-                },
-                |attribute| attribute.name.clone(),
-            );
-        (name, attr(base, option.node, "selected").map(str::to_owned))
-    };
-    if selected == old_value.is_some() {
-        return;
-    }
-    if selected {
-        parsed
-            .document
-            .base
-            .mutate()
-            .set_attribute(option.node, name, "");
-    } else {
-        parsed
-            .document
-            .base
-            .mutate()
-            .clear_attribute(option.node, name);
-    }
-    parsed.document.record(JournalEntry::Attributes {
-        target: option,
-        name: "selected".to_owned(),
-        namespace: String::new(),
-        old_value,
-    });
-}
-
-/// Sets the select's selected option by index; a negative index clears every
-/// option. Blitz has no select value slot or dirtiness flag, so the
-/// attributes are the whole state.
+/// Sets the select's selected option by index; a negative or out-of-range
+/// index clears every option. Selectedness is a live flag, not the `selected`
+/// content attribute, so a later form reset restores the default
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
 fn set_select_selected_index(
     parsed: &mut crate::Parsed,
     document: u32,
@@ -336,15 +285,10 @@ fn set_select_selected_index(
         let base = &parsed.document.base;
         select_options(base, document, select)
     };
-    if value < 0 {
-        for option in options {
-            set_option_selected(parsed, option, false);
-        }
-        return;
-    }
-    let wanted = usize::try_from(value).unwrap_or(usize::MAX);
+    let wanted = usize::try_from(value).ok();
+    let mut mutator = parsed.document.base.mutate();
     for (index, option) in options.into_iter().enumerate() {
-        set_option_selected(parsed, option, index == wanted);
+        mutator.set_selectedness(option.node, Some(index) == wanted);
     }
 }
 

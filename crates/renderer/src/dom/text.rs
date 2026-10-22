@@ -1370,37 +1370,3 @@ pub(crate) fn is_mergeable_text_node(base: &blitz_dom::BaseDocument, id: BlitzId
         Some(NodeData::Text(_))
     )
 }
-
-/// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
-/// the data of all `Text` descendants in tree order.
-///
-/// Descends only into elements: a `Document` or other non-container child
-/// contributes nothing, so its subtree is not entered. Fragment backings are
-/// plain elements, so fragments are covered.
-pub(crate) fn descendant_text(
-    base: &blitz_dom::BaseDocument,
-    id: crate::dom::tree::BlitzId,
-) -> crate::dom_string::DomString {
-    let mut text = crate::dom_string::DomString::default();
-    let mut stack = base
-        .get_node(id)
-        .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        match &node.data {
-            NodeData::Text(data) => text.push_str(&data.content),
-            // CDATA sections contribute their data to ancestor text content
-            // exactly like text
-            // (<https://dom.spec.whatwg.org/#concept-descendant-text-content>).
-            NodeData::CDataSection { contents } => text.push_str(contents),
-            NodeData::Element(_) => {
-                stack.extend(node.children.iter().rev().copied());
-            }
-            _ => {}
-        }
-    }
-    text
-}
