@@ -24,11 +24,13 @@ use crate::protocol::{
 };
 
 use self::dials::DialLedger;
+use self::load::{LoadDelay, LoadDelayGuard};
 
 pub(crate) mod dial;
 mod dials;
 mod drain;
 mod intern;
+mod load;
 
 pub(crate) use crate::js::ScriptValue;
 
@@ -45,8 +47,8 @@ enum Task {
     Timer(u32),
     /// Boxed: a completed dial carries the request and response with it, and
     /// the variant otherwise dominates every other task's size.
-    DialFinished(Box<CompletedDial>),
-    DialFailed(DialContext),
+    DialFinished(u64, Box<CompletedDial>),
+    DialFailed(u64, DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
     /// One cross-tab `message` payload from another renderer.
@@ -90,17 +92,14 @@ pub(crate) struct WindowMessage {
 pub(crate) enum DialContext {
     JsFetch {
         id: i32,
-        epoch: u64,
     },
     ClassicScript {
         element: crate::dom::tree::NodeId,
-        epoch: u64,
     },
     /// A child frame's own navigation
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>);
-    /// a superseded load is dropped when it completes.
+    /// starting another navigation cancels this one through the ledger.
     FrameLoad {
-        sequence: u64,
         /// The embedding document, when this navigation is a nested browsing
         /// context. `None` for the top-level document.
         embedder: Option<FrameId>,
@@ -122,7 +121,6 @@ pub(crate) enum DialContext {
 
 /// One dial waiting to start: the wire request plus the dial-local context
 /// the backend keeps for the response.
-#[derive(Clone)]
 pub(crate) struct QueuedDial {
     pub(crate) context: DialContext,
     /// The request the dial starts as, built where the dial is queued: kind,
@@ -203,6 +201,13 @@ enum ParserOwner {
     /// A script's `document.open()`: it writes text, and `document.close()`
     /// ends the parser.
     Script,
+}
+
+/// The markup an active parser accumulates and the delay token that keeps
+/// `load` pending for that parse. Taking the value ends the parse.
+struct ActiveParse {
+    buffer: String,
+    delay: LoadDelayGuard,
 }
 
 /// A connection transition for one `iframe` container in this document.
@@ -322,7 +327,9 @@ pub(crate) struct Document {
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     image_selected_src: HashMap<crate::dom::tree::NodeId, String>,
     /// Elements with an unresolved image request for the current generation.
-    in_flight_images: HashSet<crate::dom::tree::NodeId>,
+    /// The value is the load-event delay token, released when the request
+    /// settles or the element goes away.
+    in_flight_images: HashMap<crate::dom::tree::NodeId, LoadDelayGuard>,
     /// Connected `<img>` elements the last lifecycle scan saw, so insertion
     /// starts a fetch and removal drops one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
@@ -334,12 +341,6 @@ pub(crate) struct Document {
     linked_sheets: HashMap<crate::dom::tree::NodeId, String>,
     /// Stylesheet generation observed at the last linked-stylesheet scan.
     stylesheet_generation: u64,
-    /// Identifies the frame's current navigation; completions from superseded
-    /// loads are dropped.
-    frame_load_sequence: u64,
-    /// Whether the frame's own navigation is still in flight, which is what
-    /// keeps the container's `load` event from firing early.
-    frame_load_in_flight: bool,
     /// Whether the frame is still on the `about:blank` document a browser
     /// creates at insertion. A URL comparison cannot answer this: a frame
     /// whose `src` resolves to the parent's own URL is still on that document
@@ -348,7 +349,8 @@ pub(crate) struct Document {
     /// The `iframe` containers awaiting their child's load event; this
     /// document's own `load` event is delayed until they all have
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-    pending_frame_loads: HashSet<crate::dom::tree::NodeId>,
+    /// Each value is that container's delay token.
+    pending_frame_loads: HashMap<crate::dom::tree::NodeId, LoadDelayGuard>,
     /// Child frame documents this document's realm created for the engine to
     /// adopt
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
@@ -359,7 +361,8 @@ pub(crate) struct Document {
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
     js_timer_slots: HashMap<u32, i32>,
-    js_epoch: u64,
+    /// One count for every operation delaying this document's `load` event.
+    load_delay: LoadDelay,
     /// Whether init scripts were deferred because the realm was created while
     /// a navigation response was still streaming.
     init_scripts_deferred: bool,
@@ -367,7 +370,8 @@ pub(crate) struct Document {
     /// iframe insertion runs inside an active realm, and `QuickJS` forbids
     /// entering another one until that script returns.
     defer_js: bool,
-    active_buffer: Option<String>,
+    /// The current parse's markup and delay, or `None` when no parse is active.
+    active_parse: Option<ActiveParse>,
     /// Scripts already executed for the current parse, so a walk resumed
     /// after a `src` fetch does not run them twice.
     executed_scripts: HashSet<crate::dom::tree::NodeId>,
@@ -479,24 +483,22 @@ impl Document {
             next_timer_id: 1,
             dials: DialLedger::new(Arc::clone(&runtime.stop), Arc::clone(&runtime.wake)),
             image_selected_src: HashMap::new(),
-            in_flight_images: HashSet::new(),
+            in_flight_images: HashMap::new(),
             connected_images: HashSet::new(),
             linked_sheets: HashMap::new(),
             stylesheet_generation: 0,
-            frame_load_sequence: 0,
-            frame_load_in_flight: false,
             initial_blank: true,
-            pending_frame_loads: HashSet::new(),
+            pending_frame_loads: HashMap::new(),
             new_frames,
             load_fired: false,
             events: Vec::new(),
             events_overflowed: false,
             js: None,
             js_timer_slots: HashMap::new(),
-            js_epoch: 0,
+            load_delay: LoadDelay::default(),
             init_scripts_deferred: false,
             defer_js: false,
-            active_buffer: None,
+            active_parse: None,
             executed_scripts: HashSet::new(),
             parser_eof: true,
             parser_owner: ParserOwner::Carrier,
@@ -784,9 +786,9 @@ impl Document {
     /// Starts one frame-load dial. `req` is the wire request, with the method,
     /// body, `Content-Type`, referrer, and the embedder's `frame-src` redirect
     /// gate already on it; `ancestors` are the ancestor URLs the child
-    /// response's `frame-ancestors` is checked against at commit. This stamps
-    /// the request kind and the frame-load sequence, and forces the response
-    /// body to be read: a load started later supersedes this one.
+    /// response's `frame-ancestors` is checked against at commit. It forces the
+    /// response body to be read and cancels an earlier navigation: the newest
+    /// load owns the frame.
     pub(crate) fn navigate(
         &mut self,
         embedder: Option<FrameId>,
@@ -795,18 +797,17 @@ impl Document {
     ) {
         req.kind = crate::protocol::DialKind::FrameLoad;
         req.read_body = true;
-        self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
-        self.frame_load_in_flight = true;
+        self.dials.cancel_frame_loads();
         self.initial_blank = false;
-        self.dials.queue(QueuedDial {
-            context: DialContext::FrameLoad {
-                sequence: self.frame_load_sequence,
-                embedder,
+        self.dials.queue(
+            QueuedDial {
+                context: DialContext::FrameLoad { embedder },
+                req,
+                ancestors,
+                integrity: None,
             },
-            req,
-            ancestors,
-            integrity: None,
-        });
+            &self.load_delay,
+        );
     }
 
     /// Loads the frame's initial `about:blank`, inheriting `inherited_url` as
@@ -1240,7 +1241,10 @@ impl Document {
         self.sniff_header.clear();
         self.apply_mime_sniff = false;
         self.mime_guard = crate::sniff::MimeGuard::default();
-        self.active_buffer = Some(input.to_owned());
+        self.active_parse = Some(ActiveParse {
+            buffer: input.to_owned(),
+            delay: self.load_delay.guard(),
+        });
         // A new parse starts undecided: without this an `about:blank` or
         // `document.open()` document inherits the previous response's
         // charset, and `document.characterSet` lies. The response decoder,
@@ -1383,8 +1387,8 @@ impl Document {
         if text.is_empty() {
             return;
         }
-        if let Some(buffer) = self.active_buffer.as_mut() {
-            buffer.push_str(text);
+        if let Some(parse) = self.active_parse.as_mut() {
+            parse.buffer.push_str(text);
         }
         // Known gap: without an incremental parser a write after the parse
         // finished has nowhere to go, so it is ignored instead of re-parsing.
@@ -1472,7 +1476,7 @@ impl Document {
                 )
                 .map_err(TabError::from)?,
             );
-            if self.decoder.is_some() && self.active_buffer.is_some() {
+            if self.decoder.is_some() && self.active_parse.is_some() {
                 // The realm exists before the new document installs; defer the
                 // init scripts until `bind_realm_document`.
                 self.init_scripts_deferred = true;
@@ -1523,10 +1527,20 @@ impl Document {
     }
 
     fn reset_js_realm(&mut self) {
-        // Every queued dial belongs to the old realm; the ledger drops them
-        // and cancels the old realm's page fetches. Other dials already in
-        // flight keep running and their completions are still adopted.
-        self.dials.discard_queued();
+        let old = std::mem::replace(
+            &mut self.dials,
+            DialLedger::new(Arc::clone(&self.stop), Arc::clone(&self.wake)),
+        );
+        old.terminate();
+        self.load_delay = LoadDelay::default();
+        // A pending `load` from the replaced document must not be reported as
+        // the new document's readiness.
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                RendererEvent::Load | RendererEvent::DomContentLoaded
+            )
+        });
         // The old realm's ports are gone with it; the peers fire `close`
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
         // A navigation also destroys this frame's own children.
@@ -1535,15 +1549,8 @@ impl Document {
             shared.close_frame_ports(self.frame);
             shared.detach_child_frames(self.frame);
         }
-        self.frame_load_in_flight = false;
         self.load_fired = false;
         self.pending_frame_loads.clear();
-        // Any frame load that completes after this point belongs to the
-        // replaced document, even when it was started through a synchronous
-        // path that never bumped the sequence
-        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
-        self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
-        self.js_epoch = self.js_epoch.saturating_add(1);
         for (_, handler) in self.blitz_handlers.drain() {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
         }
@@ -1561,7 +1568,7 @@ impl Document {
         self.js_timer_slots.clear();
         self.js = None;
         self.init_scripts_deferred = false;
-        self.active_buffer = None;
+        self.active_parse = None;
         self.executed_scripts.clear();
         self.parser_eof = true;
         self.world.borrow_mut().parser_active = false;
@@ -1820,9 +1827,14 @@ impl Document {
         if !self.parser_eof {
             return;
         }
-        let Some(mut buffer) = self.active_buffer.take() else {
+        let Some(ActiveParse {
+            mut buffer,
+            delay,
+        }) = self.active_parse.take()
+        else {
             return;
         };
+        drop(delay);
         // Writes queued while the parser was active join this parse; later
         // writes have no incremental parser to feed (see `write_text`).
         if self.apply_mime_sniff {
@@ -1905,6 +1917,7 @@ impl Document {
         // Deliver parser mutations before the document's events.
         self.deliver_mutations();
         self.fire_document_end();
+        let _ = self.check_load();
     }
 
     /// Appends one in-head `meta` policy the first time it is seen
@@ -2147,7 +2160,7 @@ impl Document {
         "POST".clone_into(&mut dial.req.method);
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
-        self.dials.queue(dial);
+        self.dials.queue(dial, &self.load_delay);
     }
 
     /// The Reporting API envelope for a violation, with the
@@ -2337,10 +2350,7 @@ impl Document {
         }
         self.parser_blocked_script = Some(id);
         let mut dial = QueuedDial::new(
-            DialContext::ClassicScript {
-                element: id,
-                epoch: self.js_epoch,
-            },
+            DialContext::ClassicScript { element: id },
             &url,
             &self.url,
         );
@@ -2348,7 +2358,7 @@ impl Document {
             self.redirect_gate(crate::csp::Destination::Script),
         ));
         dial.integrity = self.script_integrity(id);
-        self.dials.queue(dial);
+        self.dials.queue(dial, &self.load_delay);
         true
     }
 
@@ -2407,79 +2417,69 @@ impl Document {
         } = done;
         let redirected = outcome.final_url != req.url;
         match context {
-            DialContext::JsFetch { id, epoch } => {
+            DialContext::JsFetch { id } => {
                 self.record_event(RendererEvent::Fetch {
                     status: outcome.status,
                 });
-                if epoch == self.js_epoch {
-                    // Post-request check: a redirect may have landed on a URL
-                    // the source list does not allow
-                    // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
-                    let blocked = redirected
-                        && self.response_url_blocked(
-                            &outcome.final_url,
-                            &req.url,
-                            crate::csp::Destination::Connect,
-                            None,
-                        );
-                    if blocked {
-                        self.settle_js_fetch(id, None);
-                    } else {
-                        self.settle_js_fetch(id, Some(outcome));
-                    }
+                // Post-request check: a redirect may have landed on a URL
+                // the source list does not allow
+                // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+                let blocked = redirected
+                    && self.response_url_blocked(
+                        &outcome.final_url,
+                        &req.url,
+                        crate::csp::Destination::Connect,
+                        None,
+                    );
+                if blocked {
+                    self.settle_js_fetch(id, None);
+                } else {
+                    self.settle_js_fetch(id, Some(outcome));
                 }
             }
-            DialContext::ClassicScript { element, epoch } => {
+            DialContext::ClassicScript { element } => {
                 self.record_event(RendererEvent::Fetch {
                     status: outcome.status,
                 });
-                if epoch == self.js_epoch {
-                    // Only the script the parser waits for resumes the walk.
-                    // Any other completion still runs its load steps, but the
-                    // walk stays paused until the blocking fetch settles.
-                    let unblocks_parser = self
-                        .parser_blocked_script
-                        .is_none_or(|waiting| waiting == element);
-                    if unblocks_parser {
-                        self.parser_blocked_script = None;
-                    }
-                    // A redirect may have landed outside `script-src`. The
-                    // network refuses that hop; this is the report, and the
-                    // check for a host that already followed.
-                    // <https://w3c.github.io/webappsec-csp/#should-block-response>
-                    let blocked = redirected
-                        && self.response_url_blocked(
-                            &outcome.final_url,
-                            &req.url,
-                            crate::csp::Destination::Script,
-                            Some(element),
-                        );
-                    // SRI verification fails the load like a network error:
-                    // no execution, no `load` event, and no CSP violation
-                    // (<https://www.w3.org/TR/SRI/#verify-integrity>).
-                    let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
-                        crate::csp::integrity_verifies(metadata, &outcome.body)
-                    });
-                    if !blocked && integrity_ok && (200..300).contains(&outcome.status) {
-                        let source = String::from_utf8_lossy(&outcome.body);
-                        let filename = outcome.final_url.clone();
-                        self.eval_classic(&source, Some(element), 1, &filename);
-                        self.fire_js(|js| js.fire_node_load(element));
-                    } else {
-                        self.fire_js(|js| js.fire_node_error(element));
-                    }
-                    if unblocks_parser {
-                        self.resume_scripts();
-                    }
+                // Only the script the parser waits for resumes the walk.
+                // Any other completion still runs its load steps, but the
+                // walk stays paused until the blocking fetch settles.
+                let unblocks_parser = self
+                    .parser_blocked_script
+                    .is_none_or(|waiting| waiting == element);
+                if unblocks_parser {
+                    self.parser_blocked_script = None;
+                }
+                // A redirect may have landed outside `script-src`. The
+                // network refuses that hop; this is the report, and the
+                // check for a host that already followed.
+                // <https://w3c.github.io/webappsec-csp/#should-block-response>
+                let blocked = redirected
+                    && self.response_url_blocked(
+                        &outcome.final_url,
+                        &req.url,
+                        crate::csp::Destination::Script,
+                        Some(element),
+                    );
+                // SRI verification fails the load like a network error:
+                // no execution, no `load` event, and no CSP violation
+                // (<https://www.w3.org/TR/SRI/#verify-integrity>).
+                let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
+                    crate::csp::integrity_verifies(metadata, &outcome.body)
+                });
+                if !blocked && integrity_ok && (200..300).contains(&outcome.status) {
+                    let source = String::from_utf8_lossy(&outcome.body);
+                    let filename = outcome.final_url.clone();
+                    self.eval_classic(&source, Some(element), 1, &filename);
+                    self.fire_js(|js| js.fire_node_load(element));
+                } else {
+                    self.fire_js(|js| js.fire_node_error(element));
+                }
+                if unblocks_parser {
+                    self.resume_scripts();
                 }
             }
-            DialContext::FrameLoad { sequence, embedder } => {
-                // The superseded-load early return deliberately skips the
-                // trailing `adopt_js_work()` below.
-                if sequence != self.frame_load_sequence {
-                    return;
-                }
-                self.frame_load_in_flight = false;
+            DialContext::FrameLoad { embedder } => {
                 // A redirect the embedder's `frame-src` refuses is not loaded.
                 // Report-only still reports and then loads.
                 // <https://w3c.github.io/webappsec-csp/#should-block-response>
@@ -2598,33 +2598,25 @@ impl Document {
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
         self.record_event(RendererEvent::FetchFailed);
         match fail {
-            DialContext::JsFetch { id, epoch } => {
-                if epoch == self.js_epoch {
-                    self.settle_js_fetch(id, None);
+            DialContext::JsFetch { id } => {
+                self.settle_js_fetch(id, None);
+            }
+            DialContext::ClassicScript { element } => {
+                let unblocks_parser = self
+                    .parser_blocked_script
+                    .is_none_or(|waiting| waiting == element);
+                if unblocks_parser {
+                    self.parser_blocked_script = None;
+                }
+                self.fire_js(|js| js.fire_node_error(element));
+                if unblocks_parser {
+                    self.resume_scripts();
                 }
             }
-            DialContext::ClassicScript { element, epoch } => {
-                if epoch == self.js_epoch {
-                    let unblocks_parser = self
-                        .parser_blocked_script
-                        .is_none_or(|waiting| waiting == element);
-                    if unblocks_parser {
-                        self.parser_blocked_script = None;
-                    }
-                    self.fire_js(|js| js.fire_node_error(element));
-                    if unblocks_parser {
-                        self.resume_scripts();
-                    }
-                }
-            }
-            DialContext::FrameLoad { sequence, .. } => {
-                if sequence == self.frame_load_sequence {
-                    // Keep the frame's current (about:blank) document; the
-                    // container's load event still fires because the frame is
-                    // no longer waiting.
-                    self.frame_load_in_flight = false;
-                }
-            }
+            // Keep the frame's current (about:blank) document; the
+            // container's load event still fires because the frame is no
+            // longer waiting. A lost report is invisible by design.
+            DialContext::FrameLoad { .. } | DialContext::CspReport => {}
             DialContext::BlitzResource { id, destination: _ } => {
                 // Deliver empty bytes so Blitz releases the resource as
                 // failed instead of holding it pending forever.
@@ -2660,8 +2652,6 @@ impl Document {
                     self.settle_image_waiters(&request_url);
                 }
             }
-            // Fire-and-forget: a lost report is invisible by design.
-            DialContext::CspReport => {}
         }
         self.adopt_js_work();
     }
@@ -2679,7 +2669,6 @@ impl Document {
         drop(parsed);
         drop(world);
         self.note_linked_stylesheets();
-        self.fire_document_load();
     }
 
     /// Fires `load` on connected `<link rel=stylesheet>` elements whose sheet
@@ -2764,7 +2753,6 @@ impl Document {
         // load must delay this document's own load event
         // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
         self.adopt_pending_frames();
-        self.fire_document_load();
     }
 
     fn run_deferred_modules(&mut self) {
@@ -2811,31 +2799,41 @@ impl Document {
         }
     }
 
-    fn fire_document_load(&mut self) {
-        // `load` only follows `DOMContentLoaded`, which `fire_document_end`
-        // dispatches before calling here.
-        if self.world.borrow().main_ready_state() != ReadyState::Interactive {
-            return;
+    /// The single `load` check. Readiness must have reached `interactive`, the
+    /// delay count must be zero, and any Blitz request that a completion just
+    /// produced is made a dial first, so its guard exists before the count is
+    /// consulted
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
+    pub(crate) fn check_load(&mut self) -> bool {
+        if self.load_fired {
+            return false;
         }
-        if !self.in_flight_images.is_empty() {
-            return;
+        if self.world.borrow().main_ready_state() == ReadyState::Loading {
+            return false;
         }
-        // Blitz's critical resources (head stylesheets, fonts) delay the load
-        // event too
-        // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-        let pending_critical = self
-            .world
-            .borrow()
-            .main_document()
-            .is_some_and(|parsed| parsed.document.base.has_pending_critical_resources());
-        if pending_critical {
+        self.drain_blitz_fetches();
+        if self.load_delay.is_pending() {
+            return false;
+        }
+        self.complete_ready_state();
+        self.load_fired = true;
+        self.record_event(RendererEvent::Load);
+        self.fire_js(crate::js::JsRealm::fire_load);
+        self.adopt_js_work();
+        true
+    }
+
+    /// Moves readiness to `complete` and dispatches its change event once. A
+    /// child frame can be the last thing delaying `load` after the parser
+    /// already reached `interactive`.
+    fn complete_ready_state(&mut self) {
+        if self.world.borrow().main_ready_state() == ReadyState::Complete {
             return;
         }
         self.world
             .borrow_mut()
             .set_main_ready_state(ReadyState::Complete);
         self.fire_js(crate::js::JsRealm::fire_ready_state_change);
-        self.maybe_fire_load();
     }
 
     /// Registers the current document's `<img src>` requests as Blitz image
@@ -2929,7 +2927,7 @@ impl Document {
                 &self.url,
             );
             dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
-            self.dials.queue(dial);
+            self.dials.queue(dial, &self.load_delay);
         }
     }
 
@@ -3111,7 +3109,7 @@ impl Document {
         force: bool,
     ) {
         if !force
-            && (self.in_flight_images.contains(&element)
+            && (self.in_flight_images.contains_key(&element)
                 || self.world.borrow().images.sizes.contains_key(&element))
         {
             return;
@@ -3163,7 +3161,8 @@ impl Document {
             self.tasks.push_back(Task::NodeLoad(element));
             return;
         }
-        self.in_flight_images.insert(element);
+        self.in_flight_images
+            .insert(element, self.load_delay.guard());
     }
 
     /// Decoded dimensions Blitz holds for `element`'s current request, if it
@@ -3185,13 +3184,13 @@ impl Document {
     fn settle_image_waiters(&mut self, url: &str) {
         let waiting: Vec<crate::dom::tree::NodeId> = self
             .in_flight_images
-            .iter()
+            .keys()
+            .copied()
             .filter(|element| {
                 self.image_selected_src
                     .get(element)
                     .is_some_and(|selected| selected == url)
             })
-            .copied()
             .collect();
         for element in &waiting {
             self.in_flight_images.remove(element);
@@ -3209,42 +3208,24 @@ impl Document {
             }
             self.adopt_js_work();
         }
-        if !waiting.is_empty() {
-            self.fire_document_load();
-        }
-    }
-
-    /// Fires this document's `load` event once it and every child browsing
-    /// context have finished loading
-    /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-    pub(crate) fn maybe_fire_load(&mut self) {
-        if self.load_fired
-            || !self.pending_frame_loads.is_empty()
-            || self.world.borrow().main_ready_state() != ReadyState::Complete
-        {
-            return;
-        }
-        self.load_fired = true;
-        self.record_event(RendererEvent::Load);
-        self.fire_js(crate::js::JsRealm::fire_load);
-        self.adopt_js_work();
     }
 
     /// A child browsing context started loading; this document's `load` event
     /// waits for it, and the container is remembered until it finishes.
     pub(crate) fn mark_frame_load_pending(&mut self, container: crate::dom::tree::NodeId) {
-        self.pending_frame_loads.insert(container);
+        self.pending_frame_loads
+            .insert(container, self.load_delay.guard());
     }
 
     /// The containers whose child frames have not finished loading.
     pub(crate) fn pending_frame_loads(&self) -> Vec<crate::dom::tree::NodeId> {
-        self.pending_frame_loads.iter().copied().collect()
+        self.pending_frame_loads.keys().copied().collect()
     }
 
     /// Fires one container's `load` event and lets this document's own `load`
     /// event proceed once no child is left loading.
     pub(crate) fn finish_frame_load(&mut self, container: crate::dom::tree::NodeId) -> bool {
-        if !self.pending_frame_loads.remove(&container) {
+        if self.pending_frame_loads.remove(&container).is_none() {
             return false;
         }
         // A src-less iframe already fired `load` from its insertion steps;
@@ -3259,7 +3240,6 @@ impl Document {
         if !already_fired {
             self.fire_node_load(container);
         }
-        self.maybe_fire_load();
         true
     }
 
@@ -3270,9 +3250,7 @@ impl Document {
             .borrow_mut()
             .insertion_load_fired
             .remove(&container);
-        if self.pending_frame_loads.remove(&container) {
-            self.maybe_fire_load();
-        }
+        self.pending_frame_loads.remove(&container);
     }
 
     pub(in crate::document) fn record_event(&mut self, event: RendererEvent) {

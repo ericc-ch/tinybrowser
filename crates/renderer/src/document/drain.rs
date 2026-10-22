@@ -26,14 +26,19 @@ impl Document {
             // its deadline. A task outside a drain still opens its own turn.
             let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
             self.run_task(task);
-            return !self.stop.is_set();
+            let fired = self.check_load();
+            return !self.stop.is_set()
+                && (fired
+                    || self.has_pending_frame_loads()
+                    || self.has_ready_work());
         }
-        false
+        let fired = self.check_load();
+        !self.stop.is_set() && (fired || self.has_pending_frame_loads())
     }
 
     /// Whether a task is queued or a timer is already due.
     pub(crate) fn has_ready_work(&self) -> bool {
-        if !self.tasks.is_empty() {
+        if !self.tasks.is_empty() || self.dials.has_queued() {
             return true;
         }
         let now = Instant::now();
@@ -43,10 +48,10 @@ impl Document {
     }
 
     fn adopt_dial_completions(&mut self) {
-        for completed in self.dials.adopt() {
+        for (id, completed) in self.dials.adopt() {
             match completed {
-                Ok(done) => self.tasks.push_back(Task::DialFinished(Box::new(done))),
-                Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
+                Ok(done) => self.tasks.push_back(Task::DialFinished(id, Box::new(done))),
+                Err(fail) => self.tasks.push_back(Task::DialFailed(id, fail)),
             }
         }
     }
@@ -80,76 +85,75 @@ impl Document {
     }
 
     pub(crate) fn release(&mut self) {
-        self.dials.discard_queued();
+        let old = std::mem::replace(
+            &mut self.dials,
+            super::DialLedger::new(
+                std::sync::Arc::clone(&self.stop),
+                std::sync::Arc::clone(&self.wake),
+            ),
+        );
+        old.terminate();
         self.decoder = None;
-        self.frame_load_in_flight = false;
         self.shared.borrow_mut().close_frame_ports(self.frame);
         self.world.borrow_mut().forget_owned_documents();
     }
 
     pub(crate) fn waiting_for_load(&self) -> bool {
-        self.dials
-            .waiting_for_load(self.js_epoch, self.frame_load_sequence)
-            || self.parser_blocked_script.is_some()
-            || self.frame_load_in_flight
-            || self.active_buffer.is_some()
-            || self.world.borrow().main_ready_state() != crate::ReadyState::Complete
+        self.world.borrow().main_ready_state() != crate::ReadyState::Complete
+    }
+
+    fn has_pending_frame_loads(&self) -> bool {
+        !self.pending_frame_loads.is_empty()
     }
 
     pub(in crate::document) fn launch_queued_dials(&mut self) {
         // A `data:` response can itself request more `data:` images. Keep
         // decoding those before returning so paint does not run with the
-        // fetches still sitting on the channel. Network dials stay async.
-        // Eight passes is the bound for one drain step, so a `data:` cycle
-        // cannot spin inside this call. A chain longer than that stays
-        // queued; the wake below asks the session for another step instead
-        // of waiting for unrelated work.
+        // fetches still sitting on the queue. Eight passes is the bound for one
+        // drain step, so a `data:` cycle cannot spin inside this call.
         for _ in 0..8 {
-            let queued = self.dials.take_queued();
-            if queued.is_empty() {
-                break;
-            }
             let mut completed_data = false;
-            for dial in queued {
+            // One at a time: a `data:` frame load can commit a new document
+            // and replace the ledger, and the rest of the old queue must not
+            // start on the new one.
+            while let Some(entry) = self.dials.pop_queued() {
+                let super::dials::QueuedEntry { dial, delay } = entry;
                 // The queue holds the parsed URL's serialization, so the
                 // prefix test is the scheme test (see `DialRequest::url`).
                 if dial.req.url.starts_with("data:") {
                     completed_data = true;
                     // Same ceiling as a streamed navigation body. Decoding an
                     // unbounded `data:` URL would sit entirely in this process.
-                    match crate::engine::decode_data_url_bounded(&dial.req.url) {
-                        Some((content_type, body)) => {
-                            let QueuedDial {
-                                context,
-                                req,
-                                ancestors,
-                                integrity,
-                            } = dial;
-                            let final_url = req.url.clone();
-                            self.finish_dial(super::CompletedDial {
-                                context,
-                                req,
-                                ancestors,
-                                integrity,
-                                outcome: crate::protocol::DialOutcome {
-                                    status: 200,
-                                    final_url,
-                                    content_type: Some(content_type.clone()),
-                                    // Scheme fetch serves the data: MIME type
-                                    // as the response's `Content-Type` header
-                                    // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
-                                    headers: vec![("content-type".to_owned(), content_type)],
-                                    body,
-                                    response_type: net::cors::ResponseType::Basic,
-                                },
-                            });
-                        }
-                        None => self.fail_dial(dial.context),
+                    if let Some((content_type, body)) =
+                        crate::engine::decode_data_url_bounded(&dial.req.url)
+                    {
+                        drop(delay);
+                        let final_url = dial.req.url.clone();
+                        self.finish_dial(super::CompletedDial {
+                            context: dial.context,
+                            req: dial.req,
+                            ancestors: dial.ancestors,
+                            integrity: dial.integrity,
+                            outcome: crate::protocol::DialOutcome {
+                                status: 200,
+                                final_url,
+                                content_type: Some(content_type.clone()),
+                                // Scheme fetch serves the data: MIME type
+                                // as the response's `Content-Type` header
+                                // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
+                                headers: vec![("content-type".to_owned(), content_type)],
+                                body,
+                                response_type: net::cors::ResponseType::Basic,
+                            },
+                        });
+                    } else {
+                        drop(delay);
+                        self.fail_dial(dial.context);
                     }
                     continue;
                 }
                 let services = &*self.services;
-                self.dials.start(dial, &|request, completion| {
+                self.dials.start(dial, delay, &|request, completion| {
                     services.start_dial(request, completion)
                 });
             }
@@ -173,8 +177,18 @@ impl Document {
                 self.timers.retain(|timer| timer.id != id);
                 self.adopt_js_work();
             }
-            Task::DialFinished(done) => self.finish_dial(*done),
-            Task::DialFailed(fail) => self.fail_dial(fail),
+            Task::DialFinished(id, done) => {
+                if let Some(dial) = self.dials.take_finished(id) {
+                    dial.settle();
+                    self.finish_dial(*done);
+                }
+            }
+            Task::DialFailed(id, fail) => {
+                if let Some(dial) = self.dials.take_finished(id) {
+                    dial.settle();
+                    self.fail_dial(fail);
+                }
+            }
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
             Task::RemoteMessage(payload) => self.deliver_remote_message(&payload),
@@ -192,12 +206,10 @@ impl Document {
             Task::PortClosed { endpoint } => self.deliver_port_close(endpoint),
             Task::NodeLoad(element) => {
                 self.fire_node_load(element);
-                self.fire_document_load();
             }
             Task::NodeError(element) => {
                 self.fire_js(|js| js.fire_node_error(element));
                 self.adopt_js_work();
-                self.fire_document_load();
             }
         }
     }
@@ -270,7 +282,7 @@ impl Document {
             std::mem::take(&mut self.world.borrow_mut().pending_fetch_cancels)
                 .into_iter()
                 .collect();
-        self.dials.cancel_fetches(self.js_epoch, &fetch_cancels);
+        self.dials.cancel_fetches(&fetch_cancels);
         self.queue_js_fetches(fetches, &fetch_cancels);
         let images = self.world.borrow_mut().take_image_updates();
         for element in images {
@@ -330,7 +342,6 @@ impl Document {
             let mut dial = QueuedDial::new(
                 DialContext::ClassicScript {
                     element,
-                    epoch: self.js_epoch,
                 },
                 &url,
                 &self.url,
@@ -339,7 +350,11 @@ impl Document {
                 self.redirect_gate(crate::csp::Destination::Script),
             ));
             dial.integrity = self.script_integrity(element);
-            self.dials.queue(dial);
+            // A script-inserted `src` script is async, but it still belongs to
+            // the set of scripts that will execute as soon as possible, and
+            // `load` waits for that set to drain
+            // (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
+            self.dials.queue(dial, &self.load_delay);
         }
     }
 
@@ -377,7 +392,6 @@ impl Document {
                 let mut dial = QueuedDial::new(
                     DialContext::JsFetch {
                         id: fetch.js_id,
-                        epoch: self.js_epoch,
                     },
                     &url,
                     &self.url,
@@ -391,7 +405,7 @@ impl Document {
                 dial.req.csp = Some(Box::new(
                     self.redirect_gate(crate::csp::Destination::Connect),
                 ));
-                self.dials.queue(dial);
+                self.dials.queue(dial, &self.load_delay);
             } else {
                 self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, None);

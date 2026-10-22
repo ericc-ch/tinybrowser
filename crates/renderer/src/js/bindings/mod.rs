@@ -2316,4 +2316,103 @@ mod realm_tests {
         first.borrow_mut().revoke_object_url(&url);
         assert!(first.borrow().object_url_contents(&url).is_none());
     }
+
+    fn mount_html(engine: &mut crate::engine::Engine, html: &str) {
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &crate::protocol::Mount {
+                    head: crate::protocol::ResponseHead {
+                        url: "https://example.test/".into(),
+                        content_type: Some("text/html".into()),
+                        ..crate::protocol::ResponseHead::default()
+                    },
+                    body: html.as_bytes().to_vec(),
+                },
+            )
+            .expect("mount");
+        let _ = engine.drain_ready_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+    }
+
+    fn load_state(engine: &mut crate::engine::Engine) -> (String, String) {
+        (
+            engine
+                .eval_in(FrameId::MAIN, "document.readyState")
+                .expect("readyState"),
+            engine
+                .eval_in(FrameId::MAIN, "String(globalThis.__loaded)")
+                .expect("load flag"),
+        )
+    }
+
+    /// A child frame that settles after the parent's own subresources still
+    /// lets the parent reach `complete` and fire `load`.
+    #[test]
+    fn iframe_finishing_last_fires_parent_load() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let mut engine = crate::engine::Engine::new(
+            services,
+            Arc::new(Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        mount_html(
+            &mut engine,
+            "<script>globalThis.__loaded = false; \
+             addEventListener('load', () => { globalThis.__loaded = true; });</script>\
+             <script src=\"data:text/javascript,globalThis.__parentScript = 1\"></script>\
+             <iframe src=\"data:text/html,<p>child</p>\"></iframe>",
+        );
+        assert_eq!(
+            load_state(&mut engine),
+            ("complete".into(), "true".into())
+        );
+    }
+
+    /// A failed `data:` script that settles last releases its delay before the
+    /// failure is handled, so `load` still fires.
+    #[test]
+    fn failed_data_script_finishing_last_fires_load() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let mut engine = crate::engine::Engine::new(
+            services,
+            Arc::new(Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        mount_html(
+            &mut engine,
+            "<script>globalThis.__loaded = false; \
+             addEventListener('load', () => { globalThis.__loaded = true; });</script>\
+             <script src=\"data:text/javascript;base64,!!!!\"></script>",
+        );
+        assert_eq!(
+            load_state(&mut engine),
+            ("complete".into(), "true".into())
+        );
+    }
+
+    /// A font requested while a stylesheet settles is made a delaying dial
+    /// before the load check, so `load` cannot fire in the gap.
+    #[test]
+    fn font_requested_by_a_stylesheet_delays_load() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let mut engine = crate::engine::Engine::new(
+            services,
+            Arc::new(Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        mount_html(
+            &mut engine,
+            "<style>@font-face { font-family: X; \
+             src: url(data:font/woff2;base64,AAAA) format('woff2'); }</style>\
+             <p style=\"font-family: X\">x</p>\
+             <script>globalThis.__loaded = false; \
+             addEventListener('load', () => { globalThis.__loaded = true; });</script>",
+        );
+        assert_eq!(
+            load_state(&mut engine),
+            ("complete".into(), "true".into())
+        );
+    }
 }
