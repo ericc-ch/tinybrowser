@@ -61,3 +61,23 @@ test("failed navigation reports an error", async ({ daemon }) => {
 
   await browser.close();
 });
+
+test("history traversal drives goBack and goForward", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const page = browser.contexts()[0].pages()[0];
+
+  await page.goto(daemon.pageUrl);
+  expect(await page.title()).toBe("tiny");
+  await page.goto(`${daemon.pageUrl}?second`);
+  expect(await page.title()).toBe("tiny");
+
+  await page.goBack();
+  expect(page.url()).toBe(daemon.pageUrl);
+  expect(await page.title()).toBe("tiny");
+
+  await page.goForward();
+  expect(page.url()).toBe(`${daemon.pageUrl}?second`);
+  expect(await page.title()).toBe("tiny");
+
+  await browser.close();
+});

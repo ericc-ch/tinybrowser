@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
 use renderer::{
-    DialFailure, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue,
-    RendererEvent, ResourceLimit, ResponseHead, ScriptSource, TabError,
+    DialFailure, FrameId, HistorySnapshot as RendererHistorySnapshot, MAX_RESPONSE_BODY_BYTES,
+    Mount, RemoteValue, RendererEvent, ResourceLimit, ResponseHead, ScriptSource, TabError,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -21,7 +21,7 @@ use url::Url;
 
 use crate::assignment::Assignment;
 use crate::exchange::{self, RequestId, ServerInput};
-use crate::history::SessionHistory;
+use crate::history::{HistorySnapshot, SessionHistory};
 use crate::manager::RendererProcessManager;
 use crate::network::{NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
@@ -144,6 +144,16 @@ enum Command {
     },
     DocumentUrl {
         reply: ReplySender<String>,
+    },
+    DocumentTitle {
+        reply: ReplySender<String>,
+    },
+    History {
+        reply: ReplySender<HistorySnapshot>,
+    },
+    TraverseHistory {
+        delta: i32,
+        reply: ReplySender<()>,
     },
     LastNavigationFailed {
         reply: ReplySender<bool>,
@@ -437,6 +447,35 @@ impl TabHandle {
         self.ask(|reply| Command::DocumentUrl { reply }).await
     }
 
+    /// Document title after navigation. Empty when the tab has no renderer.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn document_title(&self) -> Result<String, TabError> {
+        self.ask(|reply| Command::DocumentTitle { reply }).await
+    }
+
+    /// Committed session-history entries in traversal order and the active
+    /// entry's index.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn history(&self) -> Result<HistorySnapshot, TabError> {
+        self.ask(|reply| Command::History { reply }).await
+    }
+
+    /// Traverses `delta` entries through the tab's session history.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`].
+    pub async fn traverse_history(&self, delta: i32) -> Result<(), TabError> {
+        self.ask(|reply| Command::TraverseHistory { delta, reply })
+            .await
+    }
+
     /// Subscribes to tab events emitted after this call.
     ///
     /// # Errors
@@ -617,7 +656,7 @@ impl Tab {
             .unwrap_or_else(|| Site::opaque(self.id));
         let mount = Mount {
             head: ResponseHead {
-                history: self.history.snapshot(),
+                history: self.history.renderer_snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
                 ..ResponseHead::non_http(
@@ -634,9 +673,32 @@ impl Tab {
             // readiness events happen before `load`.
             self.record_event(TabEvent::DomContentLoaded).await;
             self.record_event(TabEvent::Load).await;
+            self.history.set_current_title(String::new());
             return Ok(());
         }
-        self.mount(&site, mount).await
+        self.mount(&site, mount).await?;
+        let title = self.document_title().await;
+        self.history.set_current_title(title);
+        Ok(())
+    }
+
+    /// The mounted document's title, recorded on its history entry. A tab
+    /// without a renderer has no document title.
+    async fn document_title(&mut self) -> String {
+        if self.renderer.is_none() {
+            return String::new();
+        }
+        match execute_script(
+            self,
+            FrameId::MAIN,
+            renderer::ScriptSource::Browser("String(document.title)".to_owned()),
+            None,
+        )
+        .await
+        {
+            Ok(RemoteValue::String(title)) => title,
+            _ => String::new(),
+        }
     }
 
     fn goto(&mut self, spec: &str) -> Result<(), TabError> {
@@ -886,7 +948,7 @@ impl Tab {
         }
         let mount = Mount {
             head: ResponseHead {
-                history: history.snapshot(),
+                history: history.renderer_snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
                 ..ResponseHead::non_http(url.to_string(), Some(content_type))
@@ -905,6 +967,8 @@ impl Tab {
         self.history = history;
         self.document_url = url;
         self.navigation_failed = false;
+        let title = self.document_title().await;
+        self.history.set_current_title(title);
         true
     }
 
@@ -994,7 +1058,7 @@ impl Tab {
             return false;
         }
         let head = ResponseHead {
-            history: history.snapshot(),
+            history: history.renderer_snapshot(),
             viewport: Some(self.viewport),
             init_scripts: self.init_scripts.clone(),
             ..outcome.head
@@ -1020,6 +1084,8 @@ impl Tab {
         }
         self.history = history;
         self.document_url = final_url;
+        let title = self.document_title().await;
+        self.history.set_current_title(title);
         true
     }
 
@@ -1100,10 +1166,10 @@ impl Tab {
             let result = self
                 .renderer_request(RendererCommand::HistoryTraverse {
                     url: url.clone(),
-                    history: HistorySnapshot {
+                    history: RendererHistorySnapshot {
                         state,
                         index,
-                        length: self.history.snapshot().length,
+                        length: self.history.renderer_snapshot().length,
                     },
                 })
                 .await;
@@ -1295,7 +1361,9 @@ impl Command {
     fn abandoned(&self) -> bool {
         match self {
             Command::Shutdown { .. } => false,
-            Command::LoadHtml { reply, .. } | Command::Goto { reply, .. } => reply.is_closed(),
+            Command::LoadHtml { reply, .. }
+            | Command::Goto { reply, .. }
+            | Command::TraverseHistory { reply, .. } => reply.is_closed(),
             Command::Execute { reply, .. } => reply.is_closed(),
             Command::AddInitScript { reply, .. } => reply.is_closed(),
             Command::RemoveInitScript { reply, .. } | Command::SetViewport { reply, .. } => {
@@ -1307,7 +1375,8 @@ impl Command {
             Command::RunUntilLoadTimeout { reply, .. } | Command::RunUntilJsTrue { reply, .. } => {
                 reply.is_closed()
             }
-            Command::DocumentUrl { reply } => reply.is_closed(),
+            Command::DocumentUrl { reply } | Command::DocumentTitle { reply } => reply.is_closed(),
+            Command::History { reply } => reply.is_closed(),
             Command::LastNavigationFailed { reply } => reply.is_closed(),
         }
     }
@@ -1389,6 +1458,17 @@ impl Command {
             }
             Command::DocumentUrl { reply } => {
                 let _result = reply.send(Ok(tab.document_url.to_string()));
+            }
+            Command::DocumentTitle { reply } => {
+                let title = tab.document_title().await;
+                let _result = reply.send(Ok(title));
+            }
+            Command::History { reply } => {
+                let _result = reply.send(Ok(tab.history.snapshot()));
+            }
+            Command::TraverseHistory { delta, reply } => {
+                tab.traverse_history(delta).await;
+                let _result = reply.send(Ok(()));
             }
             Command::LastNavigationFailed { reply } => {
                 let _result = reply.send(Ok(tab.navigation_failed));

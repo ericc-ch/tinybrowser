@@ -28,6 +28,7 @@ mod wire;
 
 pub use actor::{ExecuteScriptOptions, RunUntilJsTrueOptions, TabEvent, TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle, BrowserOpenError, BrowserOptions};
+pub use history::{EntryId, HistoryEntry, HistorySnapshot};
 pub use net::{Agent, AgentOptions, CookieRecord, CookieSameSite, Proxy};
 pub use profile::{Profile, ProfileError, ProfileName, default_data_home};
 pub use renderer::{

@@ -12,6 +12,7 @@ use browser::{
     BrowserHandle, DEFAULT_VIEWPORT, FrameId, RemoteValue, ScreenshotClip, ScreenshotRequest,
     TabError, TabEvent, TabHandle, TabId,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -20,73 +21,509 @@ use crate::DEFAULT_BROWSER_CONTEXT_ID;
 /// Largest capture or emulated dimension the renderer accepts.
 const MAX_SCREENSHOT_DIM: f64 = 4096.0;
 
-pub(crate) async fn session_method(
-    method: &str,
+/// The target a command arrived on. A page session addresses one tab; a
+/// browser session addresses browser-wide state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetKind {
+    Page,
+    Browser,
+}
+
+const PAGE: u8 = 1;
+const BROWSER: u8 = 2;
+
+/// What one protocol method does on one target kind.
+#[derive(Clone, Copy)]
+pub(crate) enum Handler {
+    /// The requested effect is already the engine's fixed behavior.
+    Accept(Accepted),
+    ClearBrowserCookies,
+    GetTargetInfo,
+    Page(PageHandler),
+    Browser(BrowserHandler),
+}
+
+/// Page-session handlers that need connection state.
+#[derive(Clone, Copy)]
+pub(crate) enum PageHandler {
+    Enable,
+    Disable,
+    Navigate,
+    NavigateToHistoryEntry,
+    CaptureScreenshot,
+    CreateIsolatedWorld,
+    SetLifecycleEventsEnabled,
+    RuntimeEvaluate,
+    RuntimeCallFunctionOn,
+    RuntimeEnable,
+    RuntimeDisable,
+    RuntimeReleaseObject,
+    RuntimeReleaseObjectGroup,
+    CssEnable,
+    CssDisable,
+    TracingEnd,
+    Script(ScriptMethod),
+}
+
+/// Browser-session handlers.
+#[derive(Clone, Copy)]
+pub(crate) enum BrowserHandler {
+    GetVersion,
+    Close,
+    SetAutoAttach,
+    GetTargets,
+    CreateTarget,
+    CloseTarget,
+    AttachToTarget,
+    AttachToBrowserTarget,
+    DetachFromTarget,
+}
+
+/// Page handlers that run one page-side helper and return its JSON reply.
+#[derive(Clone, Copy)]
+pub(crate) enum ScriptMethod {
+    GetFrameTree,
+    GetLayoutMetrics,
+    GetResourceTree,
+    Reload,
+    AddScriptToEvaluateOnNewDocument,
+    RemoveScriptToEvaluateOnNewDocument,
+    GetNavigationHistory,
+    GetProperties,
+    SetDeviceMetricsOverride,
+    ClearDeviceMetricsOverride,
+    GetStorageKey,
+    DomGetDocument,
+    DomQuerySelector,
+    DomQuerySelectorAll,
+    DomDescribeNode,
+    DomGetOuterHtml,
+    DomGetAttributes,
+    DomResolveNode,
+    DomGetNodeForLocation,
+    DomGetBoxModel,
+    DomGetContentQuads,
+    InputMouseEvent,
+    InputKeyEvent,
+    InputInsertText,
+    InputTouchEvent,
+    InputEmulateTouchFromMouse,
+    CssGetComputedStyleForNode,
+}
+
+/// Why a command is an accepted no-op. The reason is data so the registry
+/// states the justification instead of a comment beside a string list.
+#[derive(Clone, Copy)]
+pub(crate) enum Accepted {
+    /// Nothing waits for a debugger, so there is no waiter to release.
+    WaitingForDebugger,
+    /// The domain emits no events, so its subscription toggles change nothing.
+    DomainWithoutEvents,
+    /// Focus is not engine state.
+    FocusIsNotEngineState,
+    /// A page target has no child targets.
+    PageHasNoChildTargets,
+    /// The renderer owns its font stack; there is no font configuration.
+    RendererOwnsFonts,
+    /// The engine has no download pipeline, so no download can start.
+    NoDownloadPipeline,
+    /// The engine has no HTTP cache, so clearing it is already true.
+    NoHttpCache,
+    /// The request selects the engine's existing media defaults.
+    DefaultEmulatedMedia,
+    /// The engine has no HTTP cache, so caching is already disabled.
+    CacheAlreadyDisabled,
+}
+
+struct Route {
+    method: &'static str,
+    kinds: u8,
+    handler: Handler,
+}
+
+const ROUTES: &[Route] = &[
+    Route {
+        method: "Browser.getVersion",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::GetVersion),
+    },
+    Route {
+        method: "Browser.close",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::Close),
+    },
+    Route {
+        method: "Browser.setDownloadBehavior",
+        kinds: BROWSER,
+        handler: Handler::Accept(Accepted::NoDownloadPipeline),
+    },
+    Route {
+        method: "Target.setAutoAttach",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::SetAutoAttach),
+    },
+    Route {
+        method: "Target.setAutoAttach",
+        kinds: PAGE,
+        handler: Handler::Accept(Accepted::PageHasNoChildTargets),
+    },
+    Route {
+        method: "Target.getTargetInfo",
+        kinds: PAGE | BROWSER,
+        handler: Handler::GetTargetInfo,
+    },
+    Route {
+        method: "Target.getTargets",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::GetTargets),
+    },
+    Route {
+        method: "Target.createTarget",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::CreateTarget),
+    },
+    Route {
+        method: "Target.closeTarget",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::CloseTarget),
+    },
+    Route {
+        method: "Target.attachToTarget",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::AttachToTarget),
+    },
+    Route {
+        method: "Target.attachToBrowserTarget",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::AttachToBrowserTarget),
+    },
+    Route {
+        method: "Target.detachFromTarget",
+        kinds: BROWSER,
+        handler: Handler::Browser(BrowserHandler::DetachFromTarget),
+    },
+    Route {
+        method: "Network.clearBrowserCookies",
+        kinds: PAGE | BROWSER,
+        handler: Handler::ClearBrowserCookies,
+    },
+    Route {
+        method: "Page.enable",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Enable),
+    },
+    Route {
+        method: "Page.disable",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Disable),
+    },
+    Route {
+        method: "Page.navigate",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Navigate),
+    },
+    Route {
+        method: "Page.navigateToHistoryEntry",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::NavigateToHistoryEntry),
+    },
+    Route {
+        method: "Page.captureScreenshot",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::CaptureScreenshot),
+    },
+    Route {
+        method: "Page.createIsolatedWorld",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::CreateIsolatedWorld),
+    },
+    Route {
+        method: "Page.setLifecycleEventsEnabled",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::SetLifecycleEventsEnabled),
+    },
+    Route {
+        method: "Page.getFrameTree",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::GetFrameTree)),
+    },
+    Route {
+        method: "Page.getLayoutMetrics",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::GetLayoutMetrics)),
+    },
+    Route {
+        method: "Page.getResourceTree",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::GetResourceTree)),
+    },
+    Route {
+        method: "Page.reload",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::Reload)),
+    },
+    Route {
+        method: "Page.addScriptToEvaluateOnNewDocument",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(
+            ScriptMethod::AddScriptToEvaluateOnNewDocument,
+        )),
+    },
+    Route {
+        method: "Page.removeScriptToEvaluateOnNewDocument",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(
+            ScriptMethod::RemoveScriptToEvaluateOnNewDocument,
+        )),
+    },
+    Route {
+        method: "Page.getNavigationHistory",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::GetNavigationHistory)),
+    },
+    Route {
+        method: "Page.setFontFamilies",
+        kinds: PAGE,
+        handler: Handler::Accept(Accepted::RendererOwnsFonts),
+    },
+    Route {
+        method: "Runtime.enable",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::RuntimeEnable),
+    },
+    Route {
+        method: "Runtime.disable",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::RuntimeDisable),
+    },
+    Route {
+        method: "Runtime.evaluate",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::RuntimeEvaluate),
+    },
+    Route {
+        method: "Runtime.callFunctionOn",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::RuntimeCallFunctionOn),
+    },
+    Route {
+        method: "Runtime.getProperties",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::GetProperties)),
+    },
+    Route {
+        method: "Runtime.releaseObject",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::RuntimeReleaseObject),
+    },
+    Route {
+        method: "Runtime.releaseObjectGroup",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::RuntimeReleaseObjectGroup),
+    },
+    Route {
+        method: "Runtime.runIfWaitingForDebugger",
+        kinds: PAGE,
+        handler: Handler::Accept(Accepted::WaitingForDebugger),
+    },
+    Route {
+        method: "DOM.getDocument",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetDocument)),
+    },
+    Route {
+        method: "DOM.querySelector",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomQuerySelector)),
+    },
+    Route {
+        method: "DOM.querySelectorAll",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomQuerySelectorAll)),
+    },
+    Route {
+        method: "DOM.describeNode",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomDescribeNode)),
+    },
+    Route {
+        method: "DOM.getOuterHTML",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetOuterHtml)),
+    },
+    Route {
+        method: "DOM.getAttributes",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetAttributes)),
+    },
+    Route {
+        method: "DOM.resolveNode",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomResolveNode)),
+    },
+    Route {
+        method: "DOM.getNodeForLocation",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetNodeForLocation)),
+    },
+    Route {
+        method: "DOM.getBoxModel",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetBoxModel)),
+    },
+    Route {
+        method: "DOM.getContentQuads",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::DomGetContentQuads)),
+    },
+    Route {
+        method: "Input.dispatchMouseEvent",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::InputMouseEvent)),
+    },
+    Route {
+        method: "Input.dispatchKeyEvent",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::InputKeyEvent)),
+    },
+    Route {
+        method: "Input.insertText",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::InputInsertText)),
+    },
+    Route {
+        method: "Input.dispatchTouchEvent",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::InputTouchEvent)),
+    },
+    Route {
+        method: "Input.emulateTouchFromMouseEvent",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(
+            ScriptMethod::InputEmulateTouchFromMouse,
+        )),
+    },
+    Route {
+        method: "CSS.enable",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::CssEnable),
+    },
+    Route {
+        method: "CSS.disable",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::CssDisable),
+    },
+    Route {
+        method: "CSS.getComputedStyleForNode",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(
+            ScriptMethod::CssGetComputedStyleForNode,
+        )),
+    },
+    Route {
+        method: "Tracing.end",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::TracingEnd),
+    },
+    Route {
+        method: "Storage.getStorageKey",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::GetStorageKey)),
+    },
+    Route {
+        method: "Log.enable",
+        kinds: PAGE | BROWSER,
+        handler: Handler::Accept(Accepted::DomainWithoutEvents),
+    },
+    Route {
+        method: "Network.enable",
+        kinds: PAGE | BROWSER,
+        handler: Handler::Accept(Accepted::DomainWithoutEvents),
+    },
+    Route {
+        method: "Network.clearBrowserCache",
+        kinds: PAGE | BROWSER,
+        handler: Handler::Accept(Accepted::NoHttpCache),
+    },
+    Route {
+        method: "Network.setCacheDisabled",
+        kinds: PAGE | BROWSER,
+        handler: Handler::Accept(Accepted::CacheAlreadyDisabled),
+    },
+    Route {
+        method: "Emulation.setFocusEmulationEnabled",
+        kinds: PAGE | BROWSER,
+        handler: Handler::Accept(Accepted::FocusIsNotEngineState),
+    },
+    Route {
+        method: "Emulation.setEmulatedMedia",
+        kinds: PAGE,
+        handler: Handler::Accept(Accepted::DefaultEmulatedMedia),
+    },
+    Route {
+        method: "Emulation.setDeviceMetricsOverride",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(ScriptMethod::SetDeviceMetricsOverride)),
+    },
+    Route {
+        method: "Emulation.clearDeviceMetricsOverride",
+        kinds: PAGE,
+        handler: Handler::Page(PageHandler::Script(
+            ScriptMethod::ClearDeviceMetricsOverride,
+        )),
+    },
+    Route {
+        method: "Overlay.enable",
+        kinds: PAGE | BROWSER,
+        handler: Handler::Accept(Accepted::DomainWithoutEvents),
+    },
+    Route {
+        method: "Overlay.disable",
+        kinds: PAGE | BROWSER,
+        handler: Handler::Accept(Accepted::DomainWithoutEvents),
+    },
+];
+
+/// Looks up the handler for `method` on `kind`. An unregistered pair is
+/// `MethodNotFound`; there is no fallback table.
+pub(crate) fn route(method: &str, kind: TargetKind) -> Option<Handler> {
+    let flag = match kind {
+        TargetKind::Page => PAGE,
+        TargetKind::Browser => BROWSER,
+    };
+    ROUTES
+        .iter()
+        .find(|route| route.method == method && route.kinds & flag != 0)
+        .map(|route| route.handler)
+}
+
+/// Answers an accepted no-op. Conditional entries prove their premise from the
+/// params and otherwise report `MethodNotFound`, exactly like a real handler
+/// that cannot honor the request.
+pub(crate) fn accept(reason: Accepted, params: &Value) -> Result<Value, DispatchError> {
+    match reason {
+        Accepted::DefaultEmulatedMedia if !emulated_media_is_default(params) => {
+            Err(DispatchError::MethodNotFound)
+        }
+        Accepted::CacheAlreadyDisabled
+            if params.get("cacheDisabled").and_then(Value::as_bool) != Some(true) =>
+        {
+            Err(DispatchError::MethodNotFound)
+        }
+        _ => Ok(json!({})),
+    }
+}
+
+/// Runs one stateless page handler and returns its protocol reply.
+pub(crate) async fn run_script(
+    method: ScriptMethod,
     params: &Value,
     tab: &TabHandle,
 ) -> Result<Value, DispatchError> {
-    if noop_method(method) {
-        return Ok(json!({}));
-    }
     match method {
-        "Page.getFrameTree" => {
-            let url = tab
-                .document_url()
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            Ok(json!({"frameTree": {"frame": {
-                "id": tab.id().to_string(),
-                "loaderId": "",
-                "url": url,
-                "mimeType": "text/html",
-            }}}))
-        }
-        // Playwright dereferences `visualViewport.pageX/pageY/scale` before
-        // every screenshot, so all three viewports are present, sized to the
-        // tab's emulated viewport.
-        "Page.getLayoutMetrics" => {
-            let (width, height) = tab
-                .viewport_size()
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            let (content_width, content_height) = tab
-                .content_size()
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            let width = f64::from(width);
-            let height = f64::from(height);
-            let content_width = f64::from(content_width);
-            let content_height = f64::from(content_height);
-            Ok(json!({
-                "layoutViewport": viewport_rect(width, height),
-                "visualViewport": {
-                    "offsetX": 0,
-                    "offsetY": 0,
-                    "pageX": 0,
-                    "pageY": 0,
-                    "clientWidth": width,
-                    "clientHeight": height,
-                    "scale": 1,
-                },
-                "contentSize": {"x": 0, "y": 0, "width": content_width, "height": content_height},
-                "cssLayoutViewport": viewport_rect(width, height),
-                "cssVisualViewport": {
-                    "offsetX": 0,
-                    "offsetY": 0,
-                    "pageX": 0,
-                    "pageY": 0,
-                    "clientWidth": width,
-                    "clientHeight": height,
-                    "scale": 1,
-                },
-                "cssContentSize": {"x": 0, "y": 0, "width": content_width, "height": content_height},
-            }))
-        }
-        "Page.addScriptToEvaluateOnNewDocument" => add_init_script(params, tab).await,
-        "Page.removeScriptToEvaluateOnNewDocument" => remove_init_script(params, tab).await,
-        "Emulation.setDeviceMetricsOverride" => set_device_metrics(params, tab).await,
-        "Emulation.clearDeviceMetricsOverride" => clear_device_metrics(tab).await,
-        "Page.reload" => {
+        ScriptMethod::GetFrameTree | ScriptMethod::GetResourceTree => frame_tree(tab).await,
+        ScriptMethod::GetLayoutMetrics => layout_metrics(tab).await,
+        ScriptMethod::Reload => {
             let url = tab
                 .document_url()
                 .await
@@ -94,55 +531,244 @@ pub(crate) async fn session_method(
             open_url(tab, &url).await?;
             Ok(json!({}))
         }
-        "Page.getResourceTree" => {
-            let url = tab
-                .document_url()
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            Ok(json!({"frameTree": {"frame": {
-                "id": tab.id().to_string(),
-                "loaderId": "",
-                "url": url,
-                "mimeType": "text/html",
-            }}}))
+        ScriptMethod::AddScriptToEvaluateOnNewDocument => add_init_script(params, tab).await,
+        ScriptMethod::RemoveScriptToEvaluateOnNewDocument => remove_init_script(params, tab).await,
+        ScriptMethod::GetNavigationHistory => navigation_history(tab).await,
+        ScriptMethod::GetProperties => runtime_get_properties(tab, params).await,
+        ScriptMethod::SetDeviceMetricsOverride => set_device_metrics(params, tab).await,
+        ScriptMethod::ClearDeviceMetricsOverride => clear_device_metrics(tab).await,
+        ScriptMethod::GetStorageKey => storage_key(tab).await,
+        ScriptMethod::DomGetDocument => dom_get_document(tab).await,
+        ScriptMethod::DomQuerySelector => dom_query_selector(tab, params, false).await,
+        ScriptMethod::DomQuerySelectorAll => dom_query_selector(tab, params, true).await,
+        ScriptMethod::DomDescribeNode => dom_describe_node(tab, params).await,
+        ScriptMethod::DomGetOuterHtml => dom_node_string(tab, params, "outerHTML").await,
+        ScriptMethod::DomGetAttributes => dom_node_string(tab, params, "attributes").await,
+        ScriptMethod::DomResolveNode => dom_resolve_node(tab, params).await,
+        ScriptMethod::DomGetNodeForLocation => dom_node_for_location(tab, params).await,
+        ScriptMethod::DomGetBoxModel => dom_box_model(tab, params).await,
+        ScriptMethod::DomGetContentQuads => dom_content_quads(tab, params).await,
+        ScriptMethod::InputMouseEvent => input_mouse_event(tab, params).await,
+        ScriptMethod::InputKeyEvent => input_key_event(tab, params).await,
+        ScriptMethod::InputInsertText => input_insert_text(tab, params).await,
+        ScriptMethod::InputTouchEvent => input_touch_event(tab, params).await,
+        ScriptMethod::InputEmulateTouchFromMouse => {
+            input_emulate_touch_from_mouse(tab, params).await
         }
-        "Runtime.getProperties" => Ok(json!({"result": [], "internalProperties": []})),
-        "Storage.getStorageKey" => storage_key(tab).await,
-        _ => {
-            if let Some(reply) = static_reply(method) {
-                return Ok(reply);
-            }
-            if stubbed_domain(method) {
-                return Ok(json!({}));
-            }
-            Err(DispatchError::MethodNotFound)
-        }
+        ScriptMethod::CssGetComputedStyleForNode => css_computed_style(tab, params).await,
     }
 }
 
-/// Replies with a fixed shape for methods whose client reads specific fields.
-pub(crate) fn static_reply(method: &str) -> Option<Value> {
-    Some(match method {
-        "CSS.getMatchedStylesForNode" => json!({
-            "matchedCSSRules": [], "pseudoElements": [], "inherited": [],
-            "inlineStyle": null, "attributesStyle": null,
+async fn frame_tree(tab: &TabHandle) -> Result<Value, DispatchError> {
+    let url = tab
+        .document_url()
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({"frameTree": {"frame": {
+        "id": tab.id().to_string(),
+        "loaderId": "",
+        "url": url,
+        "mimeType": "text/html",
+    }}}))
+}
+
+async fn layout_metrics(tab: &TabHandle) -> Result<Value, DispatchError> {
+    let (width, height) = tab
+        .viewport_size()
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let (content_width, content_height) = tab
+        .content_size()
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let width = f64::from(width);
+    let height = f64::from(height);
+    let content_width = f64::from(content_width);
+    let content_height = f64::from(content_height);
+    Ok(json!({
+        "layoutViewport": viewport_rect(width, height),
+        "visualViewport": {
+            "offsetX": 0,
+            "offsetY": 0,
+            "pageX": 0,
+            "pageY": 0,
+            "clientWidth": width,
+            "clientHeight": height,
+            "scale": 1,
+        },
+        "contentSize": {"x": 0, "y": 0, "width": content_width, "height": content_height},
+        "cssLayoutViewport": viewport_rect(width, height),
+        "cssVisualViewport": {
+            "offsetX": 0,
+            "offsetY": 0,
+            "pageX": 0,
+            "pageY": 0,
+            "clientWidth": width,
+            "clientHeight": height,
+            "scale": 1,
+        },
+        "cssContentSize": {"x": 0, "y": 0, "width": content_width, "height": content_height},
+    }))
+}
+
+/// `Page.getNavigationHistory`: the tab's committed session-history entries in
+/// traversal order and the active index.
+/// <https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-getNavigationHistory>
+async fn navigation_history(tab: &TabHandle) -> Result<Value, DispatchError> {
+    let history = tab
+        .history()
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let entries: Vec<Value> = history
+        .entries()
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id().get(),
+                "url": entry.url().as_str(),
+                "userTypedURL": entry.url().as_str(),
+                "title": entry.title(),
+                "transitionType": "other",
+            })
+        })
+        .collect();
+    Ok(json!({"currentIndex": history.current_index(), "entries": entries}))
+}
+
+/// Which properties a `Runtime.getProperties` request wants.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+struct PropertyFilter {
+    own_properties: bool,
+    non_indexed_properties_only: bool,
+}
+
+/// How a `Runtime.getProperties` request wants them rendered.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+struct PropertyRender {
+    accessor_properties_only: bool,
+    generate_preview: bool,
+}
+
+/// `Runtime.getProperties` params, parsed once at the protocol boundary.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct GetPropertiesParams {
+    pub(crate) object_id: String,
+    pub(crate) object_group: String,
+    #[serde(flatten)]
+    filter: PropertyFilter,
+    #[serde(flatten)]
+    render: PropertyRender,
+}
+
+fn get_properties_script(params: &GetPropertiesParams) -> String {
+    let arguments = serde_json::to_string(params).unwrap_or_else(|_| "{}".to_owned());
+    RUNTIME_GET_PROPERTIES.replace("__ARGS__", &arguments)
+}
+
+/// `Runtime.getProperties`: own and inherited properties of a page-side handle,
+/// plus its `[[Prototype]]` internal property. Accessors are reported as
+/// `get`/`set` pairs; getters never run. `privateProperties` is absent because
+/// JavaScript has no reflection API for private names.
+/// <https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-getProperties>
+async fn runtime_get_properties(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+    let params: GetPropertiesParams = serde_json::from_value(params.clone())
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    if params.object_id.is_empty() {
+        return Err(DispatchError::Failed(
+            "Runtime.getProperties requires objectId".into(),
+        ));
+    }
+    let reply = execute_json(tab, &get_properties_script(&params)).await?;
+    match reply.get("ok").and_then(Value::as_bool) {
+        Some(true) => Ok(reply.get("value").cloned().unwrap_or(Value::Null)),
+        Some(false) => Err(DispatchError::Failed(
+            reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Runtime.getProperties failed")
+                .to_owned(),
+        )),
+        None => Err(DispatchError::Failed(
+            "Runtime.getProperties returned a malformed reply".into(),
+        )),
+    }
+}
+
+/// `Runtime.releaseObject`: forget one page-side handle.
+pub(crate) async fn runtime_release_object(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let object_id = params
+        .get("objectId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| DispatchError::Failed("Runtime.releaseObject requires objectId".into()))?;
+    let script = RUNTIME_RELEASE.replace("__ARGS__", &json!({"objectId": object_id}).to_string());
+    tab.execute_browser_script(&script)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({}))
+}
+
+/// `Runtime.releaseObjectGroup`: forget every handle in one object group.
+pub(crate) async fn runtime_release_object_group(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let object_group = params
+        .get("objectGroup")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DispatchError::Failed("Runtime.releaseObjectGroup requires objectGroup".into())
+        })?;
+    let script = RUNTIME_RELEASE.replace(
+        "__ARGS__",
+        &json!({"objectGroup": object_group}).to_string(),
+    );
+    tab.execute_browser_script(&script)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({}))
+}
+
+/// Runs a browser helper that returns a JSON string and parses it.
+async fn execute_json(tab: &TabHandle, script: &str) -> Result<Value, DispatchError> {
+    let value = tab
+        .execute_browser_script(script)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let RemoteValue::String(text) = value else {
+        return Err(DispatchError::Failed(
+            "the browser helper did not return JSON".into(),
+        ));
+    };
+    serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))
+}
+
+/// True when `Emulation.setEmulatedMedia` selects the engine defaults: empty
+/// media and every feature value empty.
+fn emulated_media_is_default(params: &Value) -> bool {
+    if params
+        .get("media")
+        .and_then(Value::as_str)
+        .is_some_and(|media| !media.is_empty())
+    {
+        return false;
+    }
+    match params.get("features") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(features)) => features.iter().all(|feature| {
+            feature
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
         }),
-        "CSS.getInlineStylesForNode" => json!({"inlineStyle": null, "attributesStyle": null}),
-        "CSS.getMediaQueries" => json!({"medias": []}),
-        "CSS.getBackgroundColors" => json!({
-            "backgroundColors": [], "computedFontSize": "16px", "computedFontWeight": "400",
-        }),
-        "CSS.takeCoverageDelta" => json!({"coverage": [], "timestamp": 0}),
-        "DOMSnapshot.getSnapshot" | "DOMSnapshot.captureSnapshot" => {
-            json!({"documents": [], "strings": []})
-        }
-        "Network.getResponseBody" => json!({"body": "", "base64Encoded": false}),
-        "Debugger.getScriptSource" => json!({"scriptSource": ""}),
-        "DOM.getContentQuads" => json!({"quads": []}),
-        "Page.getNavigationHistory" => json!({"currentIndex": 0, "entries": []}),
-        "Target.attachToBrowserTarget" => json!({"sessionId": "browser"}),
-        _ => return None,
-    })
+        Some(_) => false,
+    }
 }
 
 /// `Page.addScriptToEvaluateOnNewDocument`: register `source` page-wide and
@@ -259,7 +885,10 @@ fn capture_side(extent: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_side, required_metric};
+    use super::{
+        BROWSER, GetPropertiesParams, PAGE, ROUTES, capture_side, get_properties_script,
+        required_metric,
+    };
     use serde_json::json;
 
     #[test]
@@ -279,131 +908,39 @@ mod tests {
         assert_eq!(capture_side(1500.0), 1500);
         assert_eq!(capture_side(10_000.0), 4096);
     }
-}
 
-/// Domains whose remaining methods answer an empty result until their real
-/// behavior lands. The corpus then classifies those tests as protocol
-/// failures or timeouts instead of `UNSUPPORTED_METHOD`, which keeps the
-/// remaining work visible as behavior rather than as missing plumbing.
-pub(crate) fn stubbed_domain(method: &str) -> bool {
-    const DOMAINS: [&str; 44] = [
-        "CSS",
-        "DOM",
-        "DOMDebugger",
-        "DOMSnapshot",
-        "DOMStorage",
-        "Emulation",
-        "Page",
-        "Target",
-        "Network",
-        "Debugger",
-        "Overlay",
-        "BluetoothEmulation",
-        "DeviceOrientation",
-        "Memory",
-        "WebAuthn",
-        "WebMCP",
-        "Storage",
-        "BackgroundService",
-        "IndexedDB",
-        "ServiceWorker",
-        "Fetch",
-        "Audits",
-        "Animation",
-        "Profiler",
-        "Preload",
-        "Log",
-        "Security",
-        "Accessibility",
-        "Tracing",
-        "Input",
-        "Browser",
-        "Runtime",
-        "DeviceAccess",
-        "WebAudio",
-        "Performance",
-        "PerformanceTimeline",
-        "LayerTree",
-        "IO",
-        "HeapProfiler",
-        "Timeline",
-        "Media",
-        "EventBreakpoints",
-        "SystemInfo",
-        "CrashReportContext",
-    ];
-    DOMAINS.iter().any(|domain| {
-        method
-            .strip_prefix(domain)
-            .is_some_and(|suffix| suffix.starts_with('.'))
-    })
-}
+    #[test]
+    fn every_registered_pair_has_one_handler() {
+        for (index, route) in ROUTES.iter().enumerate() {
+            assert!(route.kinds & (PAGE | BROWSER) != 0);
+            for other in &ROUTES[index + 1..] {
+                assert!(
+                    route.method != other.method || route.kinds & other.kinds == 0,
+                    "{} has overlapping handlers for the same target kind",
+                    route.method
+                );
+            }
+        }
+    }
 
-/// Methods the protocol surface accepts without a behavior change: domains the
-/// engine does not implement yet. Accepting them keeps the corpus classifying
-/// tests as protocol failures or timeouts instead of `UNSUPPORTED_METHOD`.
-fn noop_method(method: &str) -> bool {
-    matches!(
-        method,
-        "Runtime.disable"
-            | "Target.setAutoAttach"
-            | "Runtime.runIfWaitingForDebugger"
-            | "Log.enable"
-            | "Network.enable"
-            | "Emulation.setFocusEmulationEnabled"
-            | "Emulation.setTouchEmulationEnabled"
-            | "Emulation.setEmulatedMedia"
-            | "Emulation.setScriptExecutionDisabled"
-            | "Emulation.setPressureSourceOverrideEnabled"
-            | "Emulation.setPressureStateOverride"
-            | "Runtime.addBinding"
-            | "Security.setIgnoreCertificateErrors"
-            | "Page.setBypassCSP"
-            | "Page.startScreenRecording"
-            | "DOM.enable"
-            | "DOM.disable"
-            | "DOMSnapshot.enable"
-            | "Debugger.enable"
-            | "Debugger.disable"
-            | "Fetch.enable"
-            | "Fetch.disable"
-            | "Audits.enable"
-            | "Audits.disable"
-            | "Animation.enable"
-            | "Animation.disable"
-            | "BluetoothEmulation.enable"
-            | "BluetoothEmulation.disable"
-            | "IndexedDB.enable"
-            | "WebMCP.enable"
-            | "Accessibility.enable"
-            | "ServiceWorker.enable"
-            | "Tracing.start"
-            | "Network.clearBrowserCookies"
-            | "Network.clearBrowserCache"
-            | "Network.setCacheDisabled"
-            | "Network.setExtraHTTPHeaders"
-            | "Network.emulateNetworkConditionsByRule"
-            | "CSS.disable"
-            | "Emulation.setSensorOverrideEnabled"
-            | "Emulation.setDevicePostureOverride"
-            | "Memory.startSampling"
-            | "BackgroundService.startObserving"
-            | "Storage.setStorageBucketTracking"
-            | "DOMStorage.enable"
-            | "Debugger.setAsyncCallStackDepth"
-            | "DOMDebugger.setInstrumentationBreakpoint"
-            | "Target.activateTarget"
-            | "Page.stopScreenRecording"
-            | "Overlay.enable"
-            | "Overlay.disable"
-            | "DOMDebugger.enable"
-            | "Profiler.enable"
-            | "Profiler.disable"
-            | "Preload.enable"
-            | "Target.setDiscoverTargets"
-            | "Browser.grantPermissions"
-            | "Browser.resetPermissions"
-    )
+    #[test]
+    fn get_properties_params_are_one_json_blob() {
+        let params: GetPropertiesParams = serde_json::from_value(json!({
+            "objectId": "a__OWN__",
+            "ownProperties": true,
+            "accessorPropertiesOnly": false,
+            "generatePreview": true,
+            "objectGroup": "playwright",
+        }))
+        .expect("typed params");
+        let blob = serde_json::to_string(&params).expect("json");
+        let script = get_properties_script(&params);
+
+        assert!(script.contains(&format!("const args = {blob};")));
+        assert!(script.contains(r#""objectId":"a__OWN__""#));
+        assert!(!script.contains("__ARGS__"));
+        assert!(!script.contains("afalse"));
+    }
 }
 
 /// `Storage.getStorageKey`: the tab's origin.
@@ -1038,25 +1575,12 @@ pub(crate) const RUNTIME_SCHEDULE: &str = r#"(() => {
   return "scheduled";
 })()"#;
 
-/// Evaluates `__SOURCE__`, stores a non-primitive in `__ID__`, and returns the
-/// CDP `RemoteObject` JSON (primitives inline, per protocol).
-pub(crate) const RUNTIME_HANDLE: &str = r#"(() => {
+/// Evaluates `__SOURCE__` and serializes the value with the bridge's one
+/// `RemoteObject` serializer. Handles join `__GROUP__`.
+pub(crate) const RUNTIME_HANDLE: &str = r"(() => {
   const v = (__SOURCE__);
-  if (v === null) return host.stringify({__proto__: null, type: "object", subtype: "null", value: null });
-  const t = typeof v;
-  if (t === "undefined") return host.stringify({__proto__: null, type: "undefined" });
-  if (t === "number") {
-    if (Number.isFinite(v)) return host.stringify({__proto__: null, type: "number", value: v });
-    return host.stringify({__proto__: null, type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
-  }
-  if (t === "string" || t === "boolean") return host.stringify({__proto__: null, type: t, value: v });
-  host.__tb_handles[__ID__] = v;
-  // A DOM node is an `ElementHandle` only when the remote object says
-  // `subtype: "node"` (CDP `Runtime.RemoteObject`).
-  if (t === "object" && typeof v.nodeType === "number" && typeof v.nodeName === "string")
-    return host.stringify({__proto__: null, type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
-  return host.stringify({__proto__: null, type: t === "function" ? "function" : "object", objectId: __ID__ });
-})()"#;
+  return host.stringify(host.remoteObject(v, { __proto__: null, objectGroup: __GROUP__ }));
+})()";
 
 /// Schedules an awaited evaluate whose result becomes a handle (or an inline
 /// primitive), the `evaluateHandle` shape: `awaitPromise` with
@@ -1072,60 +1596,133 @@ pub(crate) const RUNTIME_HANDLE_SCHEDULE: &str = r#"(() => {
   return "scheduled";
 })()"#;
 
-/// Reads the awaited handle result and serializes it as a CDP `RemoteObject`.
-pub(crate) const RUNTIME_HANDLE_READ: &str = r#"(() => {
+/// Reads the awaited handle result and serializes it with the bridge's one
+/// `RemoteObject` serializer.
+pub(crate) const RUNTIME_HANDLE_READ: &str = r"(() => {
   const slot = host.__tb_async_handles && host.__tb_async_handles[__ID__];
-  if (!slot || !slot.done) return host.stringify({__proto__: null, pending: true });
+  if (!slot || !slot.done) return host.stringify({ __proto__: null, pending: true });
   delete host.__tb_async_handles[__ID__];
-  if (slot.error !== undefined) return host.stringify({__proto__: null, error: slot.error });
-  const v = slot.value;
-  if (v === null) return host.stringify({__proto__: null, type: "object", subtype: "null", value: null });
-  const t = typeof v;
-  if (t === "undefined") return host.stringify({__proto__: null, type: "undefined" });
-  if (t === "number") {
-    if (Number.isFinite(v)) return host.stringify({__proto__: null, type: "number", value: v });
-    return host.stringify({__proto__: null, type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
-  }
-  if (t === "string" || t === "boolean") return host.stringify({__proto__: null, type: t, value: v });
-  host.__tb_handles[__ID__] = v;
-  // A DOM node is an `ElementHandle` only when the remote object says
-  // `subtype: "node"` (CDP `Runtime.RemoteObject`).
-  if (t === "object" && typeof v.nodeType === "number" && typeof v.nodeName === "string")
-    return host.stringify({__proto__: null, type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
-  return host.stringify({__proto__: null, type: t === "function" ? "function" : "object", objectId: __ID__ });
+  if (slot.error !== undefined) return host.stringify({ __proto__: null, error: slot.error });
+  return host.stringify({ __proto__: null, value: host.remoteObject(slot.value, { __proto__: null, objectGroup: __GROUP__ }) });
+})()";
+
+/// Releases one handle or every handle in one object group.
+pub(crate) const RUNTIME_RELEASE: &str = r#"(() => {
+  const args = __ARGS__;
+  if (args.objectGroup !== undefined) host.__tb_release_group(args.objectGroup);
+  else host.__tb_release_handle(args.objectId);
+  return "released";
 })()"#;
 
-/// Reads the captured async result and serializes it as a CDP `RemoteObject`.
+/// Drops every handle owned by the outgoing execution context.
+pub(crate) const RUNTIME_CLEAR_HANDLES: &str = "host.__tb_clear_handles()";
+
+/// Enumerates a page-side handle's own and inherited properties as CDP
+/// `PropertyDescriptor` JSON. Accessor descriptors expose `get`/`set`
+/// `RemoteObject`s instead of invoking them. Values that are not primitives
+/// become handles in the request's object group.
+pub(crate) const RUNTIME_GET_PROPERTIES: &str = r#"(() => {
+  const args = __ARGS__;
+  const objectId = args.objectId;
+  if (!(objectId in host.__tb_handles))
+    return host.stringify({ __proto__: null, ok: false, error: "Could not find object with given id" });
+  const target = host.__tb_handles[objectId];
+  const ownProperties = args.ownProperties;
+  const accessorsOnly = args.accessorPropertiesOnly;
+  const generatePreview = args.generatePreview;
+  const remote = (value, preview) => host.remoteObject(value, {
+    __proto__: null,
+    objectGroup: args.objectGroup,
+    generatePreview: preview,
+  });
+  const result = [];
+  const pushDescriptor = (name, descriptor, symbol, isOwn) => {
+    const accessor = !('value' in descriptor);
+    if (accessorsOnly && !accessor) return;
+    const entry = { __proto__: null,
+      name: name,
+      configurable: !!descriptor.configurable,
+      enumerable: !!descriptor.enumerable,
+    };
+    if (symbol) entry.symbol = remote(symbol, false);
+    if (accessor) {
+      if (descriptor.get) entry.get = remote(descriptor.get, false);
+      if (descriptor.set) entry.set = remote(descriptor.set, false);
+    } else {
+      entry.value = remote(descriptor.value, generatePreview);
+      entry.writable = !!descriptor.writable;
+    }
+    if (!ownProperties) entry.isOwn = isOwn;
+    result[result.length] = entry;
+  };
+  const seenNames = { __proto__: null };
+  const seenSymbols = new host.__tb_set();
+  for (let object = target; object !== null && object !== undefined;
+       object = host.__tb_getPrototypeOf(object)) {
+    const isOwn = object === target;
+    const names = host.__tb_getOwnPropertyNames(object);
+    for (let index = 0; index < names.length; index++) {
+      const name = names[index];
+      if (seenNames[name]) continue;
+      seenNames[name] = true;
+      const descriptor = host.__tb_getOwnPropertyDescriptor(object, name);
+      if (descriptor) pushDescriptor(name, descriptor, null, isOwn);
+    }
+    const symbols = host.__tb_getOwnPropertySymbols(object);
+    for (let index = 0; index < symbols.length; index++) {
+      const symbol = symbols[index];
+      if (host.apply(host.__tb_set_has, seenSymbols, [symbol])) continue;
+      host.apply(host.__tb_set_add, seenSymbols, [symbol]);
+      const descriptor = host.__tb_getOwnPropertyDescriptor(object, symbol);
+      if (descriptor) {
+        const name = host.apply(host.__tb_symbolToString, symbol, []);
+        pushDescriptor(name, descriptor, symbol, isOwn);
+      }
+    }
+    if (ownProperties) break;
+  }
+  const internal = [];
+  if (!accessorsOnly) {
+    internal[internal.length] = { __proto__: null,
+      name: "[[Prototype]]",
+      value: remote(host.__tb_getPrototypeOf(target), false),
+    };
+  }
+  return host.stringify({ __proto__: null, ok: true, value: {
+    __proto__: null,
+    result: result,
+    internalProperties: internal,
+  }});
+})()"#;
+
+/// Reads the captured async result and serializes it with the bridge's one
+/// `RemoteObject` serializer, asking for a by-value reply.
 pub(crate) const RUNTIME_READ: &str = r#"(() => {
   const s = host.__tb_async && host.__tb_async[__ID__];
   if (!s || !s.done) return host.stringify({__proto__: null, pending: true });
   delete host.__tb_async[__ID__];
   if (s.error !== undefined) return host.stringify({__proto__: null, error: s.error });
-  const v = s.value;
-  if (v === null) return host.stringify({__proto__: null, type: "object", subtype: "null", value: null });
-  const t = typeof v;
-  if (t === "undefined") return host.stringify({__proto__: null, type: "undefined" });
-  if (t === "number") {
-    if (Number.isFinite(v)) return host.stringify({__proto__: null, type: "number", value: v });
-    return host.stringify({__proto__: null, type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
-  }
-  if (t === "string" || t === "boolean") return host.stringify({__proto__: null, type: t, value: v });
-  try { return host.stringify({__proto__: null, type: "object", value: v }); }
-  catch (e) { return host.stringify({__proto__: null, type: "object" }); }
+  const remote = host.remoteObject(s.value, { __proto__: null, returnByValue: true });
+  try { return host.stringify(remote); }
+  catch (e) { return host.stringify({__proto__: null, type: "object"}); }
 })()"#;
 
 pub(crate) async fn target_info(browser: &BrowserHandle, id: TabId) -> Value {
-    let url = match browser.tab(id).await {
-        Ok(tab) => tab
-            .document_url()
-            .await
-            .unwrap_or_else(|_| "about:blank".into()),
-        Err(_) => "about:blank".into(),
+    let (url, title) = match browser.tab(id).await {
+        Ok(tab) => {
+            let url = tab
+                .document_url()
+                .await
+                .unwrap_or_else(|_| "about:blank".into());
+            let title = tab.document_title().await.unwrap_or_default();
+            (url, title)
+        }
+        Err(_) => ("about:blank".into(), String::new()),
     };
     json!({
         "targetId": id.to_string(),
         "type": "page",
-        "title": "",
+        "title": title,
         "url": url,
         "attached": false,
         "canAccessOpener": false,
