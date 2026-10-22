@@ -2809,7 +2809,7 @@ impl Document {
     fn fire_document_load(&mut self) {
         // `load` only follows `DOMContentLoaded`, which `fire_document_end`
         // dispatches before calling here.
-        if self.world.borrow().main_ready_state() != ReadyState::Interactive {
+        if self.world.borrow().main_ready_state() == ReadyState::Loading {
             return;
         }
         // Every fetch, image, child frame, and the parser hold a guard until
@@ -2818,11 +2818,22 @@ impl Document {
         if self.load_delay.is_pending() {
             return;
         }
+        self.complete_ready_state();
+        self.maybe_fire_load();
+    }
+
+    /// Moves readiness to `complete` and dispatches its change event once.
+    /// A child frame can be the last thing delaying `load` after the parser
+    /// already reached `interactive`, so `maybe_fire_load` may own this
+    /// transition too.
+    fn complete_ready_state(&mut self) {
+        if self.world.borrow().main_ready_state() == ReadyState::Complete {
+            return;
+        }
         self.world
             .borrow_mut()
             .set_main_ready_state(ReadyState::Complete);
         self.fire_js(crate::js::JsRealm::fire_ready_state_change);
-        self.maybe_fire_load();
     }
 
     /// Registers the current document's `<img src>` requests as Blitz image
@@ -3207,12 +3218,13 @@ impl Document {
     /// context have finished loading
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
     pub(crate) fn maybe_fire_load(&mut self) {
-        if self.load_fired
-            || self.load_delay.is_pending()
-            || self.world.borrow().main_ready_state() != ReadyState::Complete
-        {
+        if self.load_fired || self.load_delay.is_pending() {
             return;
         }
+        if self.world.borrow().main_ready_state() == ReadyState::Loading {
+            return;
+        }
+        self.complete_ready_state();
         self.load_fired = true;
         self.record_event(RendererEvent::Load);
         self.fire_js(crate::js::JsRealm::fire_load);
