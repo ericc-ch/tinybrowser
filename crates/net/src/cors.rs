@@ -8,13 +8,19 @@
 //! browser enforces this module's verdicts, so a compromised renderer cannot
 //! widen its own access.
 
-use crate::protocol::{HeaderMap, Method, field_value};
+use hyper::header::{self, HeaderValue};
+
+use crate::error::ProtocolError;
+use crate::protocol::{HeaderMap, Method};
 
 /// A request's CORS mode
 /// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RequestMode {
+    /// A document, frame, or other non-fetch-resource navigation. The response
+    /// is never CORS-filtered.
+    Navigate,
     /// No CORS: same-origin reads, opaque cross-origin reads (`<img>`,
     /// classic scripts, `no-cors`).
     #[default]
@@ -63,8 +69,8 @@ pub enum RedirectMode {
     Manual,
 }
 
-/// The CORS parameters of one request. `origin` is the request origin, kept
-/// typed so comparisons never re-serialize; an opaque origin stays opaque.
+/// The fetch parameters of one request. `origin` is the request origin; an
+/// opaque origin never equals another origin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CorsSettings {
     /// CORS mode.
@@ -446,22 +452,28 @@ pub fn preflight_ok(
 /// The outbound headers of a preflight request
 /// (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>). The spec fixes
 /// `Accept: */*` on the preflight, independent of the original request.
-#[must_use]
-pub fn preflight_headers(method: &Method, unsafe_names: &[String], origin: &str) -> HeaderMap {
+///
+/// # Errors
+///
+/// [`ProtocolError::RejectedRequest`] when the method or header names cannot
+/// be represented as a field value.
+pub(crate) fn preflight_headers(
+    method: &Method,
+    unsafe_names: &[String],
+    origin: &HeaderValue,
+) -> Result<HeaderMap, ProtocolError> {
     let mut headers = HeaderMap::new();
-    headers.append_parsed("Accept", &hyper::header::HeaderValue::from_static("*/*"));
-    headers.append_parsed("Origin", &field_value(origin));
-    headers.append_parsed(
-        "Access-Control-Request-Method",
-        &field_value(method.as_str()),
-    );
+    headers.append(header::ACCEPT, HeaderValue::from_static("*/*"));
+    headers.append(header::ORIGIN, origin.clone());
+    let method =
+        HeaderValue::from_str(method.as_str()).map_err(|_| ProtocolError::RejectedRequest)?;
+    headers.append(header::ACCESS_CONTROL_REQUEST_METHOD, method);
     if !unsafe_names.is_empty() {
-        headers.append_parsed(
-            "Access-Control-Request-Headers",
-            &field_value(unsafe_names.join(",")),
-        );
+        let names = HeaderValue::from_str(&unsafe_names.join(","))
+            .map_err(|_| ProtocolError::RejectedRequest)?;
+        headers.append(header::ACCESS_CONTROL_REQUEST_HEADERS, names);
     }
-    headers
+    Ok(headers)
 }
 
 fn is_forbidden_response_header(name: &str) -> bool {
@@ -489,15 +501,17 @@ pub fn exposed_response_headers(headers: &HeaderMap, credentials_include: bool) 
     let expose = list_values(headers, "access-control-expose-headers");
     let expose_all = !credentials_include && expose.iter().any(|value| value == "*");
     let mut exposed = HeaderMap::new();
-    for (name, value) in headers.iter() {
-        if is_forbidden_response_header(name) {
+    for (name, value) in headers.typed_iter() {
+        if is_forbidden_response_header(name.as_str()) {
             continue;
         }
-        let keep = is_cors_safelisted_response_header(name)
+        let keep = is_cors_safelisted_response_header(name.as_str())
             || expose_all
-            || expose.iter().any(|item| item.eq_ignore_ascii_case(name));
+            || expose
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(name.as_str()));
         if keep {
-            exposed.insert_wire(name, value.to_vec());
+            exposed.insert_wire(name.clone(), value.clone());
         }
     }
     exposed
@@ -750,7 +764,12 @@ mod tests {
 
     #[test]
     fn preflight_request_carries_accept() {
-        let request = preflight_headers(&Method::PUT, &["x-custom".to_owned()], "https://a.test");
+        let request = preflight_headers(
+            &Method::PUT,
+            &["x-custom".to_owned()],
+            &HeaderValue::from_static("https://a.test"),
+        )
+        .expect("valid preflight fields");
         assert_eq!(request.get("accept"), Some(b"*/*".as_slice()));
         assert_eq!(request.get("origin"), Some(b"https://a.test".as_slice()));
         assert_eq!(

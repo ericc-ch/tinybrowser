@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use net::{
-    Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Request, TimeoutKind,
-    TransportError,
+    Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Proxy, Request,
+    TimeoutKind, TransportError,
 };
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -401,16 +401,19 @@ async fn connect_proxy_routes_https_and_reports_denials() {
         assert_eq!(request.target, "origin.test:443");
         assert_eq!(
             request.header("proxy-authorization"),
-            Some("Basic dXNlcjpzZWNyZXQ=")
+            Some("Basic dXNlcjpwQHNz")
         );
         connection
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nNOT-TLS")
             .expect("connect 200");
         std::thread::sleep(Duration::from_millis(300));
     });
-    let proxy_uri = format!("http://user:secret@{}", proxy.local_addr());
+    let proxy_uri = format!("http://user:p%40ss@{}", proxy.local_addr());
+    let proxy_config = proxy_uri
+        .parse::<Proxy>()
+        .expect("percent-encoded credentials");
     let err = Agent::new(AgentOptions {
-        proxy: Some(proxy_uri),
+        proxy: Some(proxy_config),
         ..AgentOptions::default()
     })
     .expect("proxy")
@@ -437,7 +440,11 @@ async fn connect_proxy_routes_https_and_reports_denials() {
     });
     assert!(matches!(
         Agent::new(AgentOptions {
-            proxy: Some(format!("http://{}", denied.local_addr())),
+            proxy: Some(
+                format!("http://{}", denied.local_addr())
+                    .parse::<Proxy>()
+                    .expect("proxy authority")
+            ),
             ..AgentOptions::default()
         })
         .expect("proxy")
@@ -451,34 +458,40 @@ async fn connect_proxy_routes_https_and_reports_denials() {
     denied.assert_clean();
 }
 
-#[tokio::test]
-async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
+#[test]
+fn proxy_parser_rejects_unsupported_or_ambiguous_authorities() {
     for invalid in [
         "",
         "not a uri",
         "socks5://127.0.0.1:1080",
         "ftp://127.0.0.1:8080",
         "http://",
+        "http://proxy.test:8080/some/path",
+        "http://proxy.test:8080/?x=1",
+        "http://proxy.test:8080/#fragment",
+        "http://:secret@proxy.test:8080",
     ] {
-        assert!(matches!(
-            Agent::new(AgentOptions {
-                proxy: Some(invalid.to_owned()),
-                ..AgentOptions::default()
-            }),
-            Err(NetError::Protocol(ProtocolError::InvalidProxy))
-        ));
+        assert_eq!(
+            invalid.parse::<Proxy>().expect_err("invalid proxy"),
+            ProtocolError::InvalidProxy,
+            "{invalid:?}"
+        );
     }
+}
 
-    let options = AgentOptions {
-        proxy: Some("http://user:secret@localhost:8080".to_owned()),
-        ..AgentOptions::default()
-    };
-    let debug = format!("{options:?}");
-    assert!(!debug.contains("secret"));
-    let agent = Agent::new(options).expect("proxy options");
-    let debug = format!("{agent:?}");
-    assert!(!debug.contains("secret"));
+#[test]
+fn proxy_debug_redacts_credentials() {
+    let proxy = "http://user:p%40ss@localhost:8080"
+        .parse::<Proxy>()
+        .expect("proxy");
+    let debug = format!("{proxy:?}");
+    assert!(!debug.contains("user"), "{debug}");
+    assert!(!debug.contains("p@ss"), "{debug}");
+    assert!(!debug.contains("p%40ss"), "{debug}");
+}
 
+#[tokio::test]
+async fn tls_handshake_failure_is_a_transport_tls_error() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("TLS listener");
     let addr = listener.local_addr().expect("address");
     let worker = std::thread::spawn(move || {
@@ -497,7 +510,10 @@ async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
         Err(NetError::Transport(TransportError::Tls(reason))) if !reason.is_empty()
     ));
     worker.join().expect("TLS worker");
+}
 
+#[tokio::test]
+async fn environment_proxy_variables_are_ignored() {
     if std::env::var(PROXY_PROBE_FLAG).ok().as_deref() == Some("1") {
         let server = TestServer::start(|connection| {
             connection.read_request();
@@ -516,7 +532,7 @@ async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
         let status = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
-                "send_loopback::proxy_tls_environment_and_debug_boundaries_stay_explicit",
+                "send_loopback::environment_proxy_variables_are_ignored",
             ])
             .env(PROXY_PROBE_FLAG, "1")
             .env("HTTP_PROXY", &proxy_uri)
@@ -569,14 +585,15 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
 async fn url_credentials_and_scheme_rejections_are_wire_visible() {
     let server = TestServer::start(|connection| {
         let request = connection.read_request();
-        assert_eq!(request.header("authorization"), Some("Basic dXNlcjpwYXNz"));
+        assert_eq!(request.header("authorization"), Some("Basic dXNlcjpwQHNz"));
         connection
             .write_all(&canned_ok(&[], b"ok"))
             .expect("auth response");
     });
     let mut url = server.url("/");
     url.set_username("user").expect("username");
-    url.set_password(Some("pass")).expect("password");
+    url.set_password(Some("p@ss")).expect("password");
+    assert_eq!(url.password(), Some("p%40ss"));
     default_agent()
         .send(Request::new(Method::GET, url))
         .await
@@ -592,6 +609,195 @@ async fn url_credentials_and_scheme_rejections_are_wire_visible() {
             .await,
         Err(NetError::Protocol(ProtocolError::RejectedRequest))
     ));
+}
+
+fn cors_settings(
+    mode: net::cors::RequestMode,
+    credentials: net::cors::CredentialsMode,
+    origin: url::Origin,
+) -> net::cors::CorsSettings {
+    net::cors::CorsSettings {
+        mode,
+        credentials,
+        redirect: net::cors::RedirectMode::Follow,
+        origin,
+    }
+}
+
+#[tokio::test]
+async fn same_origin_mode_rejects_a_cross_origin_request_before_sending() {
+    let server = scripted([canned_ok(&[], b"must not arrive")]);
+    let origin = url::Url::parse("https://a.test/")
+        .expect("origin URL")
+        .origin();
+    let mut request = Request::new(Method::GET, server.url("/"));
+    request.cors = cors_settings(
+        net::cors::RequestMode::SameOrigin,
+        net::cors::CredentialsMode::Omit,
+        origin,
+    );
+    assert!(matches!(
+        default_agent().send(request).await,
+        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+    ));
+    assert_eq!(server.requests().len(), 0);
+    server.assert_clean();
+}
+
+#[tokio::test]
+async fn same_origin_mode_rejects_a_redirect_that_crosses_origins() {
+    let landing = scripted([canned_ok(&[], b"must not arrive")]);
+    let location = landing.url("/landed").to_string();
+    let first = TestServer::start(move |connection| {
+        connection.read_request();
+        connection
+            .write_all(&canned_redirect(302, &location))
+            .expect("redirect response");
+    });
+    let origin = first.url("/").origin();
+    let mut request = Request::new(Method::GET, first.url("/start"));
+    request.cors = cors_settings(
+        net::cors::RequestMode::SameOrigin,
+        net::cors::CredentialsMode::Omit,
+        origin,
+    );
+    assert!(matches!(
+        default_agent().send(request).await,
+        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+    ));
+    assert_eq!(first.requests().len(), 1);
+    assert_eq!(landing.requests().len(), 0);
+    first.assert_clean();
+    landing.assert_clean();
+}
+
+#[tokio::test]
+async fn same_origin_post_carries_the_origin_header() {
+    let server = scripted([canned_ok(&[], b"ok")]);
+    let origin = server.url("/").origin();
+    let mut request = Request::new(Method::POST, server.url("/submit"));
+    request.cors = cors_settings(
+        net::cors::RequestMode::SameOrigin,
+        net::cors::CredentialsMode::Include,
+        origin.clone(),
+    );
+    request.body = Some(b"field=1".to_vec());
+    default_agent()
+        .send(request)
+        .await
+        .expect("same-origin POST");
+    assert_eq!(
+        server.requests()[0].header("origin"),
+        Some(origin.ascii_serialization().as_str())
+    );
+    server.assert_clean();
+}
+
+#[tokio::test]
+async fn opaque_origin_serializes_null_and_taints_the_hop() {
+    let server = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.header("origin"), Some("null"));
+        connection
+            .write_all(&canned_ok(
+                &[("Access-Control-Allow-Origin", "null")],
+                b"opaque",
+            ))
+            .expect("cors response");
+    });
+    let origin = url::Url::parse("data:text/plain,opaque")
+        .expect("opaque URL")
+        .origin();
+    let mut request = Request::new(Method::GET, server.url("/"));
+    request.cors = cors_settings(
+        net::cors::RequestMode::Cors,
+        net::cors::CredentialsMode::Omit,
+        origin,
+    );
+    let response = default_agent()
+        .send(request)
+        .await
+        .expect("null passes the CORS check");
+    assert_eq!(response.response_type(), net::cors::ResponseType::Cors);
+    assert_eq!(server.requests().len(), 1);
+    server.assert_clean();
+}
+
+#[tokio::test]
+async fn redirect_taint_serializes_null_and_null_passes_the_cors_check() {
+    let origin = url::Url::parse("https://a.test/")
+        .expect("origin URL")
+        .origin();
+    let landing = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.header("origin"), Some("null"));
+        connection
+            .write_all(&canned_ok(
+                &[("Access-Control-Allow-Origin", "null")],
+                b"tainted",
+            ))
+            .expect("tainted landing response");
+    });
+    let location = landing.url("/landed").to_string();
+    let redirect = TestServer::start(move |connection| {
+        connection.read_request();
+        connection
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nAccess-Control-Allow-Origin: https://a.test\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("tainted redirect response");
+    });
+    let mut request = Request::new(Method::GET, redirect.url("/start"));
+    request.cors = cors_settings(
+        net::cors::RequestMode::Cors,
+        net::cors::CredentialsMode::Omit,
+        origin.clone(),
+    );
+    let response = default_agent()
+        .send(request)
+        .await
+        .expect("null origin passes the CORS check");
+    assert_eq!(response.response_type(), net::cors::ResponseType::Cors);
+    redirect.assert_clean();
+    landing.assert_clean();
+
+    let echoing = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(&canned_ok(
+                &[("Access-Control-Allow-Origin", "https://a.test")],
+                b"unreadable",
+            ))
+            .expect("echoing response");
+    });
+    let location = echoing.url("/landed").to_string();
+    let redirect = TestServer::start(move |connection| {
+        connection.read_request();
+        connection
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nAccess-Control-Allow-Origin: https://a.test\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("redirect response");
+    });
+    let mut request = Request::new(Method::GET, redirect.url("/start"));
+    request.cors = cors_settings(
+        net::cors::RequestMode::Cors,
+        net::cors::CredentialsMode::Omit,
+        origin,
+    );
+    assert!(matches!(
+        default_agent().send(request).await,
+        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+    ));
+    assert_eq!(echoing.requests().len(), 1);
+    redirect.assert_clean();
+    echoing.assert_clean();
 }
 
 #[tokio::test]

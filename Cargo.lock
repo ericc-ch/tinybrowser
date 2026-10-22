@@ -1854,6 +1854,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "native-tls",
+ "percent-encoding",
  "serde",
  "thiserror",
  "tokio",

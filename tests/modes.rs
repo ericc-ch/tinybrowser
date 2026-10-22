@@ -133,6 +133,18 @@ fn webdriver_requires_port() {
 }
 
 #[test]
+fn webdriver_rejects_an_invalid_proxy_before_starting() {
+    let fixture = Fixture::new("tinybrowser-webdriver-proxy");
+    let output = run(
+        &fixture,
+        &["webdriver", "--port=0", "--proxy=http://proxy.test/path"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("proxy URI"), "{err}");
+}
+
+#[test]
 fn profile_and_resolve_stay_on_their_commands() {
     let fixture = Fixture::new("tinybrowser-flag-placement");
     for args in [
@@ -141,8 +153,11 @@ fn profile_and_resolve_stay_on_their_commands() {
         &["renderer", "--profile=default"],
         &["renderer", "--resolve=*.test=127.0.0.1"],
         &["--resolve=*.test=127.0.0.1"],
+        &["--proxy=http://127.0.0.1:1"],
+        &["renderer", "--proxy=http://127.0.0.1:1"],
         &["daemon", "--webdriver=9"],
         &["daemon", "--resolve=*.test=127.0.0.1"],
+        &["daemon", "--proxy=http://127.0.0.1:1"],
         &["daemon", "--port=9"],
     ] {
         let output = run(&fixture, args);

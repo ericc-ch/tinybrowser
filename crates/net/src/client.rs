@@ -4,19 +4,66 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-use crate::protocol::{HeaderMap, Method, field_value};
+use crate::protocol::{HeaderMap, Method};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, Proxy, basic_authorization, within};
 use cookies::{CookieJar, CookieOp, RetrievalKind};
 use http_body_util::BodyExt as _;
+use hyper::header::{self, HeaderValue};
+use percent_encoding::percent_decode_str;
 use url::Url;
 
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
 
-/// Constructor inputs for [`Agent::new`]. Every field is raw and validated at
-/// construction: `user_agent` must be a valid field value, `proxy` must be an
-/// `http://` URI with a host, each `resolve` entry must be `PATTERN=ADDR`, and
-/// each `tls_cas` entry must be PEM.
+/// Wall and monotonic clock reads used by one [`Agent`].
+///
+/// The default reads the system clocks. Embedders and tests pass their own
+/// functions so cookie expiry and every timeout path stay deterministic.
+#[derive(Clone, Copy)]
+pub struct Clock {
+    wall: fn() -> SystemTime,
+    monotonic: fn() -> Instant,
+}
+
+impl Clock {
+    /// Builds a clock from a wall-clock read and a monotonic read.
+    #[must_use]
+    pub fn new(wall: fn() -> SystemTime, monotonic: fn() -> Instant) -> Self {
+        Self { wall, monotonic }
+    }
+
+    /// Current wall-clock time.
+    #[must_use]
+    pub fn now(self) -> SystemTime {
+        (self.wall)()
+    }
+
+    /// Current monotonic instant.
+    #[must_use]
+    pub fn monotonic(self) -> Instant {
+        (self.monotonic)()
+    }
+}
+
+impl Default for Clock {
+    fn default() -> Self {
+        Self {
+            wall: SystemTime::now,
+            monotonic: Instant::now,
+        }
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Clock")
+    }
+}
+
+/// Constructor inputs for [`Agent::new`]. `user_agent` must be a valid field
+/// value, each `resolve` entry must be `PATTERN=ADDR`, and each `tls_cas`
+/// entry must be PEM. `proxy` is already parsed, so credentials never exist as
+/// a plain configuration string here.
 ///
 /// Debug output records whether a proxy is configured, not its URI or credentials.
 #[derive(Clone)]
@@ -31,8 +78,10 @@ pub struct AgentOptions {
     pub timeout_per_call: Option<Duration>,
     /// Maximum redirect hops. `0` returns the redirect response without following.
     pub max_redirects: u32,
-    /// HTTP CONNECT proxy authority: an `http://` URI with a host.
-    pub proxy: Option<String>,
+    /// HTTP CONNECT proxy, parsed at the CLI or embedding boundary.
+    pub proxy: Option<Proxy>,
+    /// Wall and monotonic clock reads.
+    pub clock: Clock,
     /// `--resolve=PATTERN=ADDR` rewrites, first match wins. `PATTERN` is an
     /// exact host or a `*` glob; `ADDR` is an IPv4 literal or `fail`.
     pub resolve: Vec<String>,
@@ -63,6 +112,7 @@ impl Default for AgentOptions {
             timeout_per_call: None,
             max_redirects: DEFAULT_MAX_REDIRECTS,
             proxy: None,
+            clock: Clock::default(),
             resolve: Vec::new(),
             tls_cas: Vec::new(),
         }
@@ -75,16 +125,17 @@ impl Default for AgentOptions {
 #[derive(Clone)]
 pub struct Agent {
     pub(crate) engine: HttpEngine,
-    ua: Option<hyper::header::HeaderValue>,
+    ua: Option<HeaderValue>,
     max_redirects: u32,
     jar: Arc<Mutex<CookieJar>>,
+    clock: Clock,
 }
 
 impl std::fmt::Debug for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agent")
+            .field("engine", &self.engine)
             .field("max_redirects", &self.max_redirects)
-            .field("has_proxy", &self.engine.has_proxy())
             .field("jar", &self.jar)
             .finish_non_exhaustive()
     }
@@ -96,11 +147,10 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`ProtocolError::InvalidProxy`] when `proxy` is not an `http://` URI with
-    /// a host, [`ProtocolError::InvalidUserAgent`] when `user_agent` is not a
-    /// valid field value, [`ProtocolError::InvalidResolve`] when a `resolve`
-    /// entry is not `PATTERN=ADDR`, or [`NetError::Transport`] when a `tls_cas`
-    /// entry is not a PEM certificate.
+    /// [`ProtocolError::InvalidUserAgent`] when `user_agent` is not a valid
+    /// field value, [`ProtocolError::InvalidResolve`] when a `resolve` entry is
+    /// not `PATTERN=ADDR`, or [`NetError::Transport`] when a `tls_cas` entry is
+    /// not a PEM certificate.
     pub fn new(options: AgentOptions) -> Result<Agent, NetError> {
         let AgentOptions {
             user_agent,
@@ -108,20 +158,17 @@ impl Agent {
             timeout_per_call,
             max_redirects,
             proxy,
+            clock,
             resolve,
             tls_cas,
         } = options;
-        // `hyper`'s field-value parser is the same gate the wire write applies,
-        // so a `User-Agent` carrying a control byte fails here instead of being
-        // dropped from every request.
         let ua = user_agent
             .as_deref()
             .map(|raw| {
-                hyper::header::HeaderValue::from_str(raw)
+                HeaderValue::from_str(raw)
                     .map_err(|_| NetError::Protocol(ProtocolError::InvalidUserAgent))
             })
             .transpose()?;
-        let proxy = proxy.as_deref().map(Proxy::parse).transpose()?;
         let mut host_map = HostMap::default();
         for spec in &resolve {
             host_map = host_map.with_spec(spec)?;
@@ -141,12 +188,14 @@ impl Agent {
                 timeout_global,
                 timeout_per_call,
                 proxy,
+                clock,
                 host_map,
                 &parsed_cas,
             ),
             ua,
             max_redirects,
             jar: Arc::new(Mutex::new(CookieJar::default())),
+            clock,
         })
     }
 
@@ -156,10 +205,10 @@ impl Agent {
     }
 
     /// Operation for a `document.cookie` or `WebDriver` view of `url`.
-    fn fetch_op(url: &Url, kind: RetrievalKind) -> CookieOp<'_> {
+    fn fetch_op<'a>(&self, url: &'a Url, kind: RetrievalKind) -> CookieOp<'a> {
         CookieOp {
             url,
-            now: SystemTime::now(),
+            now: self.clock.now(),
             kind,
             initiator_kind: InitiatorKind::Fetch,
             method_is_safe: true,
@@ -172,13 +221,13 @@ impl Agent {
     #[must_use]
     pub fn cookies_for(&self, uri: &Url) -> String {
         self.jar()
-            .cookie_string(Self::fetch_op(uri, RetrievalKind::NonHttp))
+            .cookie_string(self.fetch_op(uri, RetrievalKind::NonHttp))
     }
 
     /// `document.cookie` setter for `uri`. Invalid `Set-Cookie` lines are ignored.
     pub fn set_cookie(&self, value: &str, uri: &Url) {
         self.jar()
-            .store(value, Self::fetch_op(uri, RetrievalKind::NonHttp));
+            .store(value, self.fetch_op(uri, RetrievalKind::NonHttp));
     }
 
     /// Stores one `Set-Cookie` line with HTTP-level rules, so an `HttpOnly`
@@ -187,7 +236,7 @@ impl Agent {
     /// (<https://w3c.github.io/webdriver/#add-cookie>).
     pub fn store_cookie_http(&self, value: &str, uri: &Url) -> bool {
         self.jar()
-            .store(value, Self::fetch_op(uri, RetrievalKind::Http))
+            .store(value, self.fetch_op(uri, RetrievalKind::Http))
     }
 
     /// Cookies visible to `uri`, including session and `HttpOnly` cookies.
@@ -196,7 +245,7 @@ impl Agent {
     #[must_use]
     pub fn cookie_records(&self, uri: &Url) -> Vec<crate::CookieRecord> {
         self.jar()
-            .records_for(Self::fetch_op(uri, RetrievalKind::Http))
+            .records_for(self.fetch_op(uri, RetrievalKind::Http))
     }
 
     /// Drops every cookie from the live jar
@@ -213,30 +262,31 @@ impl Agent {
 
     /// Loads `records` into the live jar, replacing matching identities.
     pub fn import_cookies(&self, records: Vec<crate::CookieRecord>) {
-        self.jar().restore(records, SystemTime::now());
+        self.jar().restore(records, self.clock.now());
     }
 
     /// Adds the `Cookie` header and the default `User-Agent` for one hop.
     fn prepare_outbound(
         &self,
         headers: &mut HeaderMap,
-        cookies: &CookieContext<'_>,
+        operation: CookieOp<'_>,
     ) -> Result<(), NetError> {
-        let cookie = self.jar().cookie_string(cookies.http_op(SystemTime::now()));
+        let cookie = self.jar().cookie_string(operation);
         if !cookie.is_empty() {
-            let value = match headers.get("cookie") {
-                Some(existing) => format!("{}; {cookie}", String::from_utf8_lossy(existing)),
+            let value = match headers.value("cookie") {
+                Some(existing) => {
+                    format!("{}; {cookie}", String::from_utf8_lossy(existing.as_bytes()))
+                }
                 None => cookie,
             };
-            headers.remove("cookie");
-            headers
-                .insert("Cookie", value)
+            let value = HeaderValue::from_str(&value)
                 .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+            headers.set(header::COOKIE, value);
         }
-        if headers.get("user-agent").is_none()
+        if headers.value("user-agent").is_none()
             && let Some(ua) = &self.ua
         {
-            headers.append_parsed("User-Agent", ua);
+            headers.append(header::USER_AGENT, ua.clone());
         }
         Ok(())
     }
@@ -244,27 +294,32 @@ impl Agent {
     /// Runs the preflight for a non-safelisted cross-origin `cors` request
     /// (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>). The preflight
     /// carries the same `Referer` and `User-Agent` as the request it gates.
-    /// `origin` is the request's byte-serialized origin: the document origin,
+    /// `origin_header` is the request's serialized origin: the document origin,
     /// or `null` once a redirect has tainted it.
     async fn cors_preflight(
         &self,
         settings: &crate::cors::CorsSettings,
-        origin: &str,
-        method: &Method,
+        origin_header: &HeaderValue,
+        hop: &Hop,
         headers: &HeaderMap,
         wire: &Url,
         budget: CallBudget,
     ) -> Result<(), NetError> {
+        let method = &hop.method;
         let unsafe_names = crate::cors::unsafe_request_header_names(headers);
         if !crate::cors::needs_preflight(method, &unsafe_names) {
             return Ok(());
         }
-        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin);
-        if let Some(referrer) = headers.get("referer") {
-            preflight.append_parsed("Referer", &field_value(referrer));
+        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin_header)
+            .map_err(NetError::Protocol)?;
+        let origin = origin_header
+            .to_str()
+            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+        if let Some(referrer) = headers.value("referer") {
+            preflight.append(header::REFERER, referrer.clone());
         }
         if let Some(ua) = &self.ua {
-            preflight.append_parsed("User-Agent", ua);
+            preflight.append(header::USER_AGENT, ua.clone());
         }
         let (status, preflight_headers, body) = self
             .engine
@@ -290,29 +345,21 @@ impl Agent {
     /// <https://fetch.spec.whatwg.org/#append-a-request-origin-header>).
     async fn apply_cors_request(
         &self,
-        settings: Option<&crate::cors::CorsSettings>,
+        settings: &crate::cors::CorsSettings,
         hop: &Hop,
         wire: &Url,
         headers: &mut HeaderMap,
         budget: CallBudget,
     ) -> Result<(), NetError> {
-        let Some(settings) = settings else {
-            return Ok(());
-        };
         let serialized_origin = hop.serialized_origin(settings);
+        let origin_header = HeaderValue::from_str(&serialized_origin)
+            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
         // Case 2 of main fetch sends same-origin, still-`basic` requests
         // straight to scheme fetch, so only a `cors`-tainted hop can need a
         // preflight (<https://fetch.spec.whatwg.org/#main-fetch>).
         if hop.response_type == crate::cors::ResponseType::Cors {
-            self.cors_preflight(
-                settings,
-                &serialized_origin,
-                &hop.method,
-                headers,
-                wire,
-                budget,
-            )
-            .await?;
+            self.cors_preflight(settings, &origin_header, hop, headers, wire, budget)
+                .await?;
         }
         // `Origin` rides on every hop whose response tainting is `cors`, and
         // on every other request whose method is neither GET nor HEAD
@@ -324,21 +371,20 @@ impl Agent {
         if hop.response_type == crate::cors::ResponseType::Cors
             || !matches!(hop.method.as_str(), "GET" | "HEAD")
         {
-            headers.remove("origin");
-            headers.append_parsed("Origin", &field_value(serialized_origin.as_bytes()));
+            headers.set(header::ORIGIN, origin_header);
         }
         Ok(())
     }
 
     fn store_set_cookie_lines(
         &self,
-        cookies: &CookieContext<'_>,
+        operation: CookieOp<'_>,
         lines: impl IntoIterator<Item = impl AsRef<str>>,
     ) {
         let mut jar = self.jar();
-        let now = SystemTime::now();
+        let now = self.clock.now();
         for line in lines {
-            jar.store(line.as_ref(), cookies.http_op(now));
+            jar.store(line.as_ref(), CookieOp { now, ..operation });
         }
     }
 
@@ -359,7 +405,7 @@ impl Agent {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
         let dial = Dial {
-            cors: request.cors.as_ref(),
+            cors: &request.cors,
             initiator_kind: request.initiator_kind,
             initiator: request.initiator.as_ref(),
             on_redirect: request.on_redirect.as_ref(),
@@ -378,7 +424,7 @@ impl Agent {
         let mut url = request.url;
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
-        let mut budget = self.engine.budget_at(Instant::now());
+        let mut budget = self.engine.budget_at();
         if let Some(deadline) = request.deadline {
             budget.global = Some(deadline);
         }
@@ -436,9 +482,9 @@ impl Agent {
         // the previous URL's nor the request's own, the serialized origin
         // becomes `null` for this and every later hop
         // (<https://fetch.spec.whatwg.org/#concept-request-tainted-origin>).
-        if let (Some(settings), Some(previous)) = (dial.cors, hop.previous_url.as_ref())
+        if let Some(previous) = hop.previous_url.as_ref()
             && previous.origin() != url.origin()
-            && settings.origin != previous.origin()
+            && dial.cors.origin != previous.origin()
         {
             hop.origin_tainted = true;
         }
@@ -448,16 +494,14 @@ impl Agent {
                 budget.timeout_kind(TimeoutKind::Global),
             )));
         }
-        let budget = budget.with_hop_start(self.engine.timeout_per_call, Instant::now());
+        let budget = budget.with_hop_start(self.engine.timeout_per_call);
         let mut wire = url.clone();
         wire.set_fragment(None);
-        let cross_origin = dial
-            .cors
-            .is_some_and(|settings| settings.origin != wire.origin());
-        // One cookie context per hop, shared by the request `Cookie` header and
-        // the response `Set-Cookie` lines.
-        let cookies = CookieContext {
+        let cross_origin = dial.cors.origin != wire.origin();
+        let operation = CookieOp {
             url,
+            now: self.clock.now(),
+            kind: RetrievalKind::Http,
             initiator_kind: dial.initiator_kind,
             method_is_safe: hop.method.is_safe(),
             initiator: dial.initiator,
@@ -466,16 +510,14 @@ impl Agent {
         let mut hop_headers = hop.headers.clone();
         self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget)
             .await?;
-        self.prepare_outbound(&mut hop_headers, &cookies)?;
+        self.prepare_outbound(&mut hop_headers, operation)?;
         // Credentials mode gates both the `Cookie` header and the
         // URL-credentials `Authorization` header
         // (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>,
         // <https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>).
-        let send_credentials = dial
-            .cors
-            .is_none_or(|settings| credentials_admitted(settings.credentials, cross_origin));
+        let send_credentials = credentials_admitted(dial.cors.credentials, cross_origin);
         if send_credentials {
-            apply_url_credentials(&mut hop_headers, url);
+            apply_url_credentials(&mut hop_headers, url)?;
         } else {
             hop_headers.remove("cookie");
         }
@@ -503,7 +545,7 @@ impl Agent {
         // when credentials mode admits them for this origin.
         if send_credentials {
             self.store_set_cookie_lines(
-                &cookies,
+                operation,
                 response
                     .headers()
                     .get_all("set-cookie")
@@ -539,11 +581,10 @@ pub struct Request {
     /// Overrides [`AgentOptions::timeout_global`]; the per-call timeout still
     /// applies hop by hop.
     pub deadline: Option<Instant>,
-    /// CORS protocol parameters. The caller fills `origin` from the document it
-    /// is fetching for, so a compromised renderer cannot claim another origin.
-    /// `None` leaves the request unfiltered; a same-origin-only dial sets
-    /// [`crate::cors::RequestMode::SameOrigin`] instead of a mode of its own.
-    pub cors: Option<crate::cors::CorsSettings>,
+    /// Fetch parameters: mode, credentials, redirect handling, and origin. The
+    /// caller fills `origin` from the document it is fetching for, so a
+    /// compromised renderer cannot claim another origin.
+    pub cors: crate::cors::CorsSettings,
     /// Called with the next URL and the redirect count that hop will carry
     /// (`1` for the first redirect) before the hop is followed. `false`
     /// rejects the dial. Unset follows every redirect the cap allows.
@@ -561,17 +602,24 @@ impl std::fmt::Debug for Request {
             .field("initiator", &self.initiator)
             .field("body", &self.body)
             .field("deadline", &self.deadline)
-            .field("has_cors", &self.cors.is_some())
+            .field("cors", &self.cors)
             .field("on_redirect", &self.on_redirect.is_some())
             .finish()
     }
 }
 
 impl Request {
-    /// A request for `method` and absolute `url` with no headers, body,
-    /// initiator, or deadline.
+    /// A navigation request for `method` and absolute `url` with no headers,
+    /// body, initiator, or deadline. Its origin starts as the target URL's
+    /// origin; callers that know the initiator replace it.
     #[must_use]
     pub fn new(method: Method, url: Url) -> Self {
+        let cors = crate::cors::CorsSettings {
+            mode: crate::cors::RequestMode::Navigate,
+            credentials: crate::cors::CredentialsMode::Include,
+            redirect: crate::cors::RedirectMode::Follow,
+            origin: url.origin(),
+        };
         Self {
             method,
             url,
@@ -580,7 +628,7 @@ impl Request {
             initiator: None,
             body: None,
             deadline: None,
-            cors: None,
+            cors,
             on_redirect: None,
         }
     }
@@ -663,7 +711,7 @@ enum HopOutcome {
 
 /// Request-scoped values shared by every hop of one `send` call.
 struct Dial<'a> {
-    cors: Option<&'a crate::cors::CorsSettings>,
+    cors: &'a crate::cors::CorsSettings,
     initiator_kind: InitiatorKind,
     initiator: Option<&'a Url>,
     on_redirect: Option<&'a RedirectGate>,
@@ -674,8 +722,7 @@ impl Dial<'_> {
     /// and response filtering
     /// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
     fn credentials_include(&self) -> bool {
-        self.cors
-            .is_some_and(|settings| settings.credentials.includes())
+        self.cors.credentials.includes()
     }
 }
 
@@ -699,8 +746,7 @@ impl Hop {
     /// The byte-serialized request origin CORS compares, `null` once a redirect
     /// has tainted the request
     /// (<https://fetch.spec.whatwg.org/#serializing-a-request-origin>). The
-    /// request `Origin` header and the response CORS check both read it here,
-    /// so the `null` rule has one home.
+    /// request `Origin` header and the response CORS check both read it here.
     fn serialized_origin<'a>(&self, settings: &'a crate::cors::CorsSettings) -> Cow<'a, str> {
         if self.origin_tainted {
             Cow::Borrowed("null")
@@ -710,45 +756,18 @@ impl Hop {
     }
 }
 
-/// The per-hop inputs both cookie paths share: the `Cookie` request header and
-/// the `Set-Cookie` response lines.
-struct CookieContext<'a> {
-    url: &'a Url,
-    initiator_kind: InitiatorKind,
-    method_is_safe: bool,
-    initiator: Option<&'a Url>,
-    cross_site_redirect: bool,
-}
-
-impl CookieContext<'_> {
-    /// The [`CookieOp`] for one jar call at wall-clock `now`.
-    fn http_op(&self, now: SystemTime) -> CookieOp<'_> {
-        CookieOp {
-            url: self.url,
-            now,
-            kind: RetrievalKind::Http,
-            initiator_kind: self.initiator_kind,
-            method_is_safe: self.method_is_safe,
-            initiator: self.initiator,
-            cross_site_redirect: self.cross_site_redirect,
-        }
-    }
-}
-
 /// The response tainting a hop acquires
 /// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>). A
 /// `same-origin` request across an origin boundary is a network error.
 fn hop_taint(
-    cors: Option<&crate::cors::CorsSettings>,
+    settings: &crate::cors::CorsSettings,
     url: &Url,
 ) -> Result<crate::cors::ResponseType, NetError> {
-    let Some(settings) = cors else {
-        return Ok(crate::cors::ResponseType::Basic);
-    };
     if settings.origin == url.origin() {
         return Ok(crate::cors::ResponseType::Basic);
     }
     match settings.mode {
+        crate::cors::RequestMode::Navigate => Ok(crate::cors::ResponseType::Basic),
         crate::cors::RequestMode::SameOrigin => {
             Err(NetError::Protocol(ProtocolError::RejectedRequest))
         }
@@ -784,10 +803,7 @@ fn cors_gate(response: &Response, dial: &Dial<'_>, hop: &Hop) -> Result<(), NetE
     if hop.response_type != crate::cors::ResponseType::Cors {
         return Ok(());
     }
-    let Some(settings) = dial.cors else {
-        return Err(NetError::Protocol(ProtocolError::RejectedRequest));
-    };
-    let origin = hop.serialized_origin(settings);
+    let origin = hop.serialized_origin(dial.cors);
     if !crate::cors::cors_check(response.headers(), &origin, dial.credentials_include()) {
         return Err(NetError::Protocol(ProtocolError::RejectedRequest));
     }
@@ -816,31 +832,30 @@ fn classify_response(
         )));
     };
     let next = resolve_location(current_url, &location)?;
-    if let Some(settings) = dial.cors {
-        // A redirect to a URL that includes credentials is a network error
-        // once the request is `cors`-tainted or would cross an origin
-        // (<https://fetch.spec.whatwg.org/#http-redirect-fetch>, steps 9-10).
-        let redirects_with_credentials = !next.username().is_empty() || next.password().is_some();
-        if redirects_with_credentials
-            && (hop.response_type == crate::cors::ResponseType::Cors
-                || (settings.mode == crate::cors::RequestMode::Cors
-                    && settings.origin != next.origin()))
-        {
+    let settings = dial.cors;
+    // A redirect to a URL that includes credentials is a network error
+    // once the request is `cors`-tainted or would cross an origin
+    // (<https://fetch.spec.whatwg.org/#http-redirect-fetch>, steps 9-10).
+    let redirects_with_credentials = !next.username().is_empty() || next.password().is_some();
+    if redirects_with_credentials
+        && (hop.response_type == crate::cors::ResponseType::Cors
+            || (settings.mode == crate::cors::RequestMode::Cors
+                && settings.origin != next.origin()))
+    {
+        return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+    }
+    match settings.redirect {
+        crate::cors::RedirectMode::Error => {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
-        match settings.redirect {
-            crate::cors::RedirectMode::Error => {
-                return Err(NetError::Protocol(ProtocolError::RejectedRequest));
-            }
-            crate::cors::RedirectMode::Manual => {
-                return Ok(HopOutcome::Final(finalize(
-                    response,
-                    crate::cors::ResponseType::OpaqueRedirect,
-                    dial.credentials_include(),
-                )));
-            }
-            crate::cors::RedirectMode::Follow => {}
+        crate::cors::RedirectMode::Manual => {
+            return Ok(HopOutcome::Final(finalize(
+                response,
+                crate::cors::ResponseType::OpaqueRedirect,
+                dial.credentials_include(),
+            )));
         }
+        crate::cors::RedirectMode::Follow => {}
     }
     Ok(HopOutcome::Redirect { next })
 }
@@ -867,14 +882,21 @@ fn finalize(
     response
 }
 
-fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) {
+fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) -> Result<(), NetError> {
     // https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
-    if headers.get("authorization").is_some() || url.username().is_empty() {
-        return;
+    if headers.value("authorization").is_some() || url.username().is_empty() {
+        return Ok(());
     }
-    let value = basic_authorization(url.username(), url.password().unwrap_or(""));
-    headers.remove("authorization");
-    headers.append_parsed("Authorization", &field_value(value));
+    let username = percent_decode_str(url.username()).decode_utf8_lossy();
+    let password = url
+        .password()
+        .map(|password| percent_decode_str(password).decode_utf8_lossy())
+        .unwrap_or_default();
+    let value = basic_authorization(&username, &password);
+    let value = HeaderValue::from_str(&value)
+        .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+    headers.set(header::AUTHORIZATION, value);
+    Ok(())
 }
 
 /// Streaming response body. Dropping it closes the socket.

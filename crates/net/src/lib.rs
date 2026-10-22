@@ -10,7 +10,8 @@ mod protocol;
 mod resolve;
 mod transport;
 
-pub use client::{Agent, AgentOptions, Body, Request, Response};
+pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method, combined_header};
+pub use transport::Proxy;

@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use hyper::header::{HeaderName, HeaderValue};
+
 #[must_use]
 /// Joins every occurrence of a list header's values with `", "`, the way a
 /// list header is extracted
@@ -12,15 +14,6 @@ pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<Stri
     } else {
         Some(values.join(", "))
     }
-}
-
-/// A field value built by the browser, from text whose grammar excludes every
-/// byte [`hyper::header::HeaderValue`] rejects (a serialized origin, a method
-/// token, a header name), or from bytes already validated by
-/// [`HeaderMap::insert`].
-pub(crate) fn field_value(bytes: impl AsRef<[u8]>) -> hyper::header::HeaderValue {
-    hyper::header::HeaderValue::from_bytes(bytes.as_ref())
-        .expect("browser-built HTTP text and stored field values contain no CTL bytes")
 }
 
 pub(crate) fn is_token_char(c: char) -> bool {
@@ -53,18 +46,13 @@ pub enum HeaderError {
     InvalidValue(Box<str>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Entry {
-    name: String,
-    value: Vec<u8>,
-}
-
-/// Ordered HTTP fields. Names are compared case-insensitively; values are bytes.
+/// Ordered HTTP fields. Names are compared case-insensitively; values are
+/// typed [`HeaderValue`]s.
 ///
 /// `insert` appends. It does not replace earlier values of the same name.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct HeaderMap {
-    entries: Vec<Entry>,
+    entries: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl HeaderMap {
@@ -85,47 +73,54 @@ impl HeaderMap {
     /// checks already applied when the map is written to the wire
     /// (<https://httpwg.org/specs/rfc9110.html#field.names>).
     pub fn insert(&mut self, name: &str, value: impl Into<Vec<u8>>) -> Result<(), HeaderError> {
-        if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-            return Err(HeaderError::InvalidName(name.into()));
-        }
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| HeaderError::InvalidName(name.into()))?;
         let value = value.into();
-        if hyper::header::HeaderValue::from_bytes(&value).is_err() {
-            return Err(HeaderError::InvalidValue(
-                String::from_utf8_lossy(&value).into_owned().into(),
-            ));
-        }
-        self.entries.push(Entry {
-            name: name.to_owned(),
-            value,
-        });
+        let value = HeaderValue::from_bytes(&value).map_err(|_| {
+            HeaderError::InvalidValue(String::from_utf8_lossy(&value).into_owned().into())
+        })?;
+        self.entries.push((name, value));
         Ok(())
     }
 
-    /// Appends a field the browser built itself, from an already-parsed
-    /// [`hyper::header::HeaderValue`]. There is nothing left to reject: the
-    /// fallible [`HeaderMap::insert`] is for caller-provided values only.
-    pub(crate) fn append_parsed(&mut self, name: &'static str, value: &hyper::header::HeaderValue) {
-        self.entries.push(Entry {
-            name: name.to_owned(),
-            value: value.as_bytes().to_vec(),
-        });
+    /// Appends an already-parsed field. Cannot fail because both halves came
+    /// from `hyper`'s parsers.
+    pub(crate) fn append(&mut self, name: HeaderName, value: HeaderValue) {
+        self.entries.push((name, value));
     }
 
-    /// Appends a field that came off the network. A response field value is
-    /// any byte sequence; the strict value checks on [`HeaderMap::insert`]
-    /// belong to author-provided values, not to bytes a server sent
-    /// (<https://fetch.spec.whatwg.org/#concept-header-list-extract>).
-    pub(crate) fn insert_wire(&mut self, name: &str, value: impl Into<Vec<u8>>) {
-        self.entries.push(Entry {
-            name: name.to_owned(),
-            value: value.into(),
+    /// Replaces every field named `name` with `value`, keeping the position of
+    /// the first match. Appends when the name is absent.
+    pub(crate) fn set(&mut self, name: HeaderName, value: HeaderValue) {
+        let mut replacement = Some(value);
+        self.entries.retain_mut(|(existing_name, existing_value)| {
+            if existing_name != &name {
+                return true;
+            }
+            match replacement.take() {
+                Some(value) => {
+                    *existing_name = name.clone();
+                    *existing_value = value;
+                    true
+                }
+                None => false,
+            }
         });
+        if let Some(value) = replacement {
+            self.entries.push((name, value));
+        }
+    }
+
+    /// Appends a field that came off the network. `hyper` parsed both halves
+    /// while reading the response.
+    pub(crate) fn insert_wire(&mut self, name: HeaderName, value: HeaderValue) {
+        self.entries.push((name, value));
     }
 
     /// Removes every field whose name matches `name`, case-insensitively.
     pub fn remove(&mut self, name: &str) {
         self.entries
-            .retain(|entry| !entry.name.eq_ignore_ascii_case(name));
+            .retain(|(field, _)| !field.as_str().eq_ignore_ascii_case(name));
     }
 
     /// First value whose name matches `name`, case-insensitively.
@@ -134,19 +129,32 @@ impl HeaderMap {
         self.get_all(name).next()
     }
 
+    /// First typed value whose name matches `name`, case-insensitively.
+    pub(crate) fn value(&self, name: &str) -> Option<&HeaderValue> {
+        self.entries
+            .iter()
+            .find(|(field, _)| field.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+    }
+
     /// Every value whose name matches `name`, in insertion order.
     pub fn get_all<'s>(&'s self, name: &str) -> impl Iterator<Item = &'s [u8]> {
         self.entries
             .iter()
-            .filter(move |entry| entry.name.eq_ignore_ascii_case(name))
-            .map(|entry| entry.value.as_slice())
+            .filter(move |(field, _)| field.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_bytes())
     }
 
-    /// All fields in insertion order. Names are the casing that was inserted.
+    /// All fields in insertion order, with typed names and values.
+    pub(crate) fn typed_iter(&self) -> impl Iterator<Item = (&HeaderName, &HeaderValue)> {
+        self.entries.iter().map(|(name, value)| (name, value))
+    }
+
+    /// All fields in insertion order. Names are serialized lowercase.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
         self.entries
             .iter()
-            .map(|entry| (entry.name.as_str(), entry.value.as_slice()))
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
     }
 
     /// Number of stored fields, counting duplicates.
@@ -238,17 +246,36 @@ impl fmt::Display for Method {
 
 #[cfg(test)]
 mod tests {
+    use hyper::header::{HeaderName, HeaderValue};
+
     use super::HeaderMap;
 
     #[test]
-    fn wire_values_keep_control_bytes_author_values_do_not() {
-        let value = b"text/html;charset=\x0bgbk".to_vec();
+    fn insert_appends_and_set_replaces_in_place() {
         let mut map = HeaderMap::new();
-        assert!(map.insert("content-type", value.clone()).is_err());
-        map.insert_wire("content-type", value);
+        map.insert("x-one", "a").expect("valid field");
+        map.insert("X-Two", "b").expect("valid field");
+        map.insert("x-one", "c").expect("valid field");
         assert_eq!(
-            map.get("content-type"),
-            Some(&b"text/html;charset=\x0bgbk"[..])
+            map.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            ["x-one", "x-two", "x-one"]
         );
+        map.set(
+            HeaderName::from_static("x-one"),
+            HeaderValue::from_static("d"),
+        );
+        assert_eq!(
+            map.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            ["x-one", "x-two"]
+        );
+        assert_eq!(map.get_all("x-one").collect::<Vec<_>>(), [b"d"]);
+    }
+
+    #[test]
+    fn insert_rejects_invalid_names_and_values() {
+        let mut map = HeaderMap::new();
+        assert!(map.insert("bad name", "v").is_err());
+        assert!(map.insert("x", "bad\nvalue").is_err());
+        assert!(map.is_empty());
     }
 }

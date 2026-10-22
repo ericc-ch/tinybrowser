@@ -43,7 +43,8 @@ impl NetworkContext {
     ///
     /// # Errors
     ///
-    /// [`Agent::new`] rejects a proxy, resolve spec, or TLS CA value.
+    /// [`Agent::new`] rejects an invalid user agent, resolve spec, or TLS CA
+    /// value.
     pub(crate) fn new(mut options: AgentOptions) -> Result<Self, net::NetError> {
         if options.user_agent.is_none() {
             options.user_agent = Some(crate::USER_AGENT.to_string());
@@ -165,6 +166,12 @@ impl TabNetworkHandle {
         chrome_navigation_request(&mut request, url);
         request.initiator_kind = InitiatorKind::Navigation;
         request.initiator = Some(initiator.clone());
+        request.cors = net::cors::CorsSettings {
+            mode: net::cors::RequestMode::Navigate,
+            credentials: net::cors::CredentialsMode::Include,
+            redirect: net::cors::RedirectMode::Follow,
+            origin: initiator.origin(),
+        };
         request.deadline = Some(deadline);
         let response = match self.agent.send(request).await {
             Ok(response) => response,
@@ -462,20 +469,16 @@ fn outbound_request(
     Ok(outbound)
 }
 
-/// Copies a page dial's CORS parameters onto the `net` request. The origin
+/// Copies a page dial's fetch parameters onto the `net` request. The origin
 /// comes from the site-authorized initiator, so a compromised renderer cannot
 /// claim an origin outside its renderer's site lock
 /// (<https://fetch.spec.whatwg.org/#concept-request-origin>). It can still
 /// name a different origin *within* that site, which shares the renderer
 /// process; deriving the origin from a per-frame record the browser owns is a
-/// known gap. A dial with no CORS parameters gets same-origin-only enforcement
-/// from `RequestMode::SameOrigin`, the same mode the fetch algorithm uses.
+/// known gap.
 fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
-    if request.kind != DialKind::JsFetch {
-        return;
-    }
     let origin = initiator.origin();
-    outbound.cors = Some(match request.cors {
+    outbound.cors = match request.cors {
         Some(cors) => net::cors::CorsSettings {
             mode: cors.mode,
             credentials: cors.credentials,
@@ -483,12 +486,12 @@ fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
             origin,
         },
         None => net::cors::CorsSettings {
-            mode: net::cors::RequestMode::SameOrigin,
-            credentials: net::cors::CredentialsMode::SameOrigin,
+            mode: net::cors::RequestMode::Navigate,
+            credentials: net::cors::CredentialsMode::Include,
             redirect: net::cors::RedirectMode::Follow,
             origin,
         },
-    });
+    };
 }
 
 fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutcome> {
