@@ -1,9 +1,9 @@
-//! Form-control state read from the tree.
+//! Form-control state stored alongside the tree.
 //!
-//! Blitz keeps no form-control value store (no dirty value flag, checkedness
-//! or selectedness slots), so every value here is read from content
-//! attributes and descendant text. Option and select helpers live here once:
-//! the IDL getters, the collections, and the insertion fixups share them
+//! Inputs keep the sanitized current value in Blitz's dirty-value slot with a
+//! pristine marker, and options keep selectedness plus dirtiness in
+//! `BlitzDocument`. The IDL getters, collections, submission, and insertion
+//! fixups all read those slots through the helpers here
 //! (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html>).
 
 use blitz_dom::{BaseDocument, NodeData};
@@ -18,12 +18,77 @@ pub(crate) enum PendingEntry {
     Files(String, NodeId),
 }
 
+/// Form controls in a subtree, in tree order, for insertion fixups after a
+/// whole-subtree replacement such as `innerHTML`
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+pub(crate) fn descendant_controls(
+    base: &BaseDocument,
+    document: u32,
+    root: BlitzId,
+) -> Vec<NodeId> {
+    let mut controls = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let Some(target) = base.get_node(node) else {
+            continue;
+        };
+        stack.extend(target.children.iter().rev().copied());
+        let Some(element) = target.data.downcast_element() else {
+            continue;
+        };
+        if element.name.ns == html_namespace()
+            && matches!(element.name.local.as_str(), "option" | "input")
+        {
+            controls.push(NodeId { document, node });
+        }
+    }
+    controls
+}
+
+/// Materializes each input's sanitized value and each select's selectedness
+/// once after parsing, so layout and `:checked` see the same state as the IDL
+/// getters before any script runs
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>,
+/// <https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
+pub(crate) fn initialize_controls(parsed: &mut Parsed) {
+    let Some(root) = parsed.document.base.try_root_element() else {
+        return;
+    };
+    let mut inputs = Vec::new();
+    let mut selects = Vec::new();
+    let mut stack = vec![root.id];
+    while let Some(node) = stack.pop() {
+        let Some(target) = parsed.document.base.get_node(node) else {
+            continue;
+        };
+        stack.extend(target.children.iter().rev().copied());
+        let Some(element) = target.data.downcast_element() else {
+            continue;
+        };
+        if element.name.ns != html_namespace() {
+            continue;
+        }
+        match element.name.local.as_str() {
+            "input" => inputs.push(node),
+            "select" => selects.push(node),
+            _ => {}
+        }
+    }
+    for node in inputs {
+        crate::dom::input::sync_sanitized_value(parsed, node);
+    }
+    for select in selects {
+        parsed.document.invalidate_selectedness(select);
+        run_selectedness_setting(parsed, select);
+    }
+}
+
 /// Collects a form's entry list: every submittable control whose form owner is
 /// the form, in tree order, that carries a name and is not disabled or inside a
 /// `datalist`
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 pub(crate) fn collect_pending_entries(
-    parsed: &Parsed,
+    parsed: &mut Parsed,
     form: NodeId,
     submitter: Option<NodeId>,
 ) -> Vec<PendingEntry> {
@@ -36,6 +101,7 @@ pub(crate) fn collect_pending_entries(
     }
     // A pre-order walk visits nodes in tree order.
     let mut pending = Vec::new();
+    let mut controls = Vec::new();
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
         let Some(node) = base.get_node(current) else {
@@ -52,10 +118,6 @@ pub(crate) fn collect_pending_entries(
         if !matches!(local, "input" | "textarea" | "select" | "button") {
             continue;
         }
-        let id = NodeId {
-            document,
-            node: current,
-        };
         if form_owner_of(base, document, current) != Some(form) {
             continue;
         }
@@ -71,8 +133,8 @@ pub(crate) fn collect_pending_entries(
         // A hidden input named `_charset_` carries the encoding name
         // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
         if local == "input"
-            && attr(base, current, "type")
-                .is_some_and(|typ| typ.trim().eq_ignore_ascii_case("hidden"))
+            && crate::dom::input::input_type(base, current)
+                == Some(crate::dom::input::InputType::Hidden)
             && control_name.eq_ignore_ascii_case("_charset_")
         {
             pending.push(PendingEntry::Text(
@@ -81,13 +143,20 @@ pub(crate) fn collect_pending_entries(
             ));
             continue;
         }
-        let is_submitter = submitter == Some(id);
+        controls.push((current, local.to_owned(), control_name.to_owned()));
+    }
+    for (current, local, control_name) in controls {
+        let is_submitter = submitter
+            == Some(NodeId {
+                document,
+                node: current,
+            });
         pending.extend(pending_entry(
-            base,
+            parsed,
             document,
             current,
-            local,
-            control_name,
+            &local,
+            &control_name,
             is_submitter,
         ));
     }
@@ -145,7 +214,7 @@ pub(crate) fn has_datalist_ancestor(base: &BaseDocument, node: BlitzId) -> bool 
 /// multiple `select`) several
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 pub(crate) fn pending_entry(
-    base: &BaseDocument,
+    parsed: &mut Parsed,
     document: u32,
     node: BlitzId,
     local: &str,
@@ -153,20 +222,13 @@ pub(crate) fn pending_entry(
     is_submitter: bool,
 ) -> Vec<PendingEntry> {
     let id = NodeId { document, node };
+    let base = &parsed.document.base;
     // A dirty value wins. Otherwise the submission value is the `value`
     // content attribute (the default value), or empty when absent.
     let value_attr = || attr(base, node, "value").unwrap_or_default().to_owned();
     match local {
         "textarea" => {
-            let raw = base
-                .get_node(node)
-                .and_then(|target| target.data.downcast_element())
-                .filter(|element| element.form_state.dirty_value)
-                .map_or_else(
-                    || crate::dom::input::child_text_content(base, node),
-                    |element| element.form_state.value.clone(),
-                );
-            let mut value = crate::dom::input::normalize_newlines(&raw);
+            let mut value = textarea_api_value(base, node);
             if wrap_is_hard(attr(base, node, "wrap")) {
                 let cols = parse_positive(attr(base, node, "cols")).unwrap_or(20);
                 value = hard_wrap(&value, cols);
@@ -182,45 +244,41 @@ pub(crate) fn pending_entry(
             vec![PendingEntry::Text(control_name.to_owned(), value_attr())]
         }
         "input" => {
-            let typ = attr(base, node, "type").unwrap_or("text");
-            let typ = typ.trim().to_ascii_lowercase();
-            if matches!(typ.as_str(), "reset" | "button") {
-                return Vec::new();
-            }
-            if matches!(typ.as_str(), "submit" | "image") {
-                // A submit or image button contributes only when it is the
-                // submitter.
-                if !is_submitter {
-                    return Vec::new();
+            use crate::dom::input::{InputType, current_value, input_type};
+            let kind = input_type(base, node).unwrap_or(InputType::Text);
+            match kind {
+                InputType::Reset | InputType::Button => Vec::new(),
+                InputType::Submit | InputType::Image if !is_submitter => Vec::new(),
+                InputType::File => vec![PendingEntry::Files(control_name.to_owned(), id)],
+                InputType::Checkbox | InputType::Radio => {
+                    // Checkable controls contribute only when checked; their
+                    // current value is the attribute or "on"
+                    // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
+                    let checked = base
+                        .get_node(node)
+                        .and_then(|target| target.data.downcast_element())
+                        .is_some_and(blitz_dom::ElementData::checkedness);
+                    if checked {
+                        vec![PendingEntry::Text(
+                            control_name.to_owned(),
+                            current_value(parsed, node),
+                        )]
+                    } else {
+                        Vec::new()
+                    }
                 }
-                return vec![PendingEntry::Text(control_name.to_owned(), value_attr())];
-            }
-            if typ == "checkbox" || typ == "radio" {
-                // A checkbox or radio contributes only when checked. Its
-                // value defaults to "on"
-                // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
-                let checked = base
-                    .get_node(node)
-                    .and_then(|target| target.data.downcast_element())
-                    .is_some_and(blitz_dom::ElementData::checkedness);
-                if !checked {
-                    return Vec::new();
-                }
-                let value = attr(base, node, "value").unwrap_or("on").to_owned();
-                vec![PendingEntry::Text(control_name.to_owned(), value)]
-            } else if typ == "file" {
-                vec![PendingEntry::Files(control_name.to_owned(), id)]
-            } else {
-                // The entry list uses the current value, after the state's
-                // value sanitization algorithm
-                // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-                let value = crate::dom::input::current_value(base, node);
-                vec![PendingEntry::Text(control_name.to_owned(), value)]
+                _ => vec![PendingEntry::Text(
+                    control_name.to_owned(),
+                    current_value(parsed, node),
+                )],
             }
         }
         "select" => {
-            if attr(base, node, "multiple").is_some() {
-                effective_selected_options(base, document, node)
+            let multiple = attr(base, node, "multiple").is_some();
+            if multiple {
+                let selected = effective_selected_options(parsed, node);
+                let base = &parsed.document.base;
+                selected
                     .into_iter()
                     .filter(|option| !is_disabled(base, option.node))
                     .map(|option| {
@@ -228,10 +286,8 @@ pub(crate) fn pending_entry(
                     })
                     .collect()
             } else {
-                vec![PendingEntry::Text(
-                    control_name.to_owned(),
-                    select_value(base, document, node),
-                )]
+                let value = select_value(parsed, node);
+                vec![PendingEntry::Text(control_name.to_owned(), value)]
             }
         }
         _ => Vec::new(),
@@ -284,28 +340,33 @@ pub(crate) fn option_select_owner(base: &BaseDocument, node: BlitzId) -> Option<
     None
 }
 
-/// An `option`'s selectedness
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
-pub(crate) fn option_selected(base: &BaseDocument, option: BlitzId) -> bool {
-    base.get_node(option)
-        .and_then(|node| node.data.downcast_element())
-        .is_some_and(blitz_dom::ElementData::selectedness)
+/// Whether an option is disabled: the option itself or its parent optgroup.
+/// A disabled select does not disable its options
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-disabled>).
+fn option_disabled(base: &BaseDocument, option: BlitzId) -> bool {
+    if attr(base, option, "disabled").is_some() {
+        return true;
+    }
+    let mut cursor = base.get_node(option).and_then(|node| node.parent);
+    while let Some(current) = cursor {
+        if is_html_element(base, current, "select") {
+            return false;
+        }
+        if is_html_element(base, current, "optgroup") && attr(base, current, "disabled").is_some() {
+            return true;
+        }
+        cursor = base.get_node(current).and_then(|node| node.parent);
+    }
+    false
 }
 
-/// Whether selectedness was ever set explicitly on the option, including an
-/// explicit deselection. The default first option in a single-select must not
-/// come back after script selected nothing.
-fn option_dirty_selectedness(base: &BaseDocument, option: BlitzId) -> bool {
-    base.get_node(option)
-        .and_then(|node| node.data.downcast_element())
-        .is_some_and(|element| element.form_state.dirty_selectedness)
-}
-
-/// The select's display size: the `size` attribute when positive, otherwise
-/// four for a multiple select and one otherwise
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-size>).
-fn select_display_size(base: &BaseDocument, select: BlitzId) -> usize {
-    if let Some(size) = parse_positive(attr(base, select, "size")) {
+/// The select's display size. The `size` attribute wins even when it parses
+/// to zero; otherwise a multiple select shows four rows and a single select
+/// one (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-size>).
+fn select_display_size(base: &BaseDocument, select: BlitzId) -> u32 {
+    if let Some(size) =
+        attr(base, select, "size").and_then(crate::dom::parse::parse_non_negative_integer)
+    {
         return size;
     }
     if attr(base, select, "multiple").is_some() {
@@ -315,88 +376,152 @@ fn select_display_size(base: &BaseDocument, select: BlitzId) -> usize {
     }
 }
 
-/// The option a reset would select in a single-select with no selection: the
-/// first non-disabled option
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
-pub(crate) fn select_reset_target(
-    base: &BaseDocument,
-    document: u32,
-    select: BlitzId,
-) -> Option<BlitzId> {
-    if attr(base, select, "multiple").is_some() || select_display_size(base, select) != 1 {
-        return None;
+/// Reads an option's selectedness slot, initializing it from the `selected`
+/// attribute the first time the option is observed. Dirtiness stays false, so
+/// a later attribute change applies.
+fn option_selectedness(parsed: &mut Parsed, option: BlitzId) -> bool {
+    if let Some(selected) = parsed.document.option_selectedness(option) {
+        return selected;
     }
-    let options = select_options(base, document, select);
-    if options
-        .iter()
-        .any(|option| option_selected(base, option.node))
-    {
-        return None;
-    }
-    options
-        .iter()
-        .find(|option| !is_disabled(base, option.node))
-        .map(|option| option.node)
+    let selected = attr(&parsed.document.base, option, "selected").is_some();
+    parsed.document.set_option_selectedness(option, selected);
+    selected
 }
 
-/// The options a select effectively has selected, in tree order.
-///
-/// A single-select exposes at most one: the last option selected explicitly,
-/// or the reset default when nothing is selected. The caller reads this once
-/// instead of rescanning the option list per candidate
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
-pub(crate) fn effective_selected_options(
-    base: &BaseDocument,
-    document: u32,
-    select: BlitzId,
-) -> Vec<NodeId> {
-    let options = select_options(base, document, select);
-    if attr(base, select, "multiple").is_some() || select_display_size(base, select) != 1 {
-        return options
-            .into_iter()
-            .filter(|option| option_selected(base, option.node))
-            .collect();
+fn set_option_selectedness(parsed: &mut Parsed, option: BlitzId, selected: bool) {
+    parsed.document.set_option_selectedness(option, selected);
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_selectedness(option, selected);
+}
+
+/// Clears selectedness on every option except `keep`. Setting an option's
+/// selectedness to true in a single select deselects the previous option
+/// before the selectedness setting algorithm runs
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
+fn clear_other_options(parsed: &mut Parsed, select: BlitzId, keep: BlitzId) {
+    for option in select_options(&parsed.document.base, parsed.id, select) {
+        if option.node != keep
+            && parsed
+                .document
+                .option_selectedness(option.node)
+                .unwrap_or(false)
+        {
+            set_option_selectedness(parsed, option.node, false);
+        }
     }
-    // A single-select keeps only the last explicitly selected option.
-    if let Some(last) = options
+}
+
+/// Prepares an option that was just inserted: selectedness from its attribute
+/// is materialized, and a selected option in a single select replaces the
+/// previous selection
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+pub(crate) fn option_inserted(parsed: &mut Parsed, option: BlitzId) {
+    let Some(select) = option_select_owner(&parsed.document.base, option) else {
+        return;
+    };
+    // An option's selected attribute is the default selectedness while its
+    // dirtiness is false. Read the attribute here because an earlier option in
+    // the same insertion batch may have cleared the stored slot already
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-dirtiness>).
+    let selected = if parsed.document.option_dirty(option) {
+        option_selectedness(parsed, option)
+    } else {
+        // A parsed selected attribute or a slot kept from an earlier tree
+        // position both select the inserted option. An earlier option in the
+        // same batch may have cleared the slot, so the attribute still wins.
+        attr(&parsed.document.base, option, "selected").is_some()
+            || parsed.document.option_selectedness(option).unwrap_or(false)
+    };
+    parsed.document.set_option_selectedness(option, selected);
+    if selected && attr(&parsed.document.base, select, "multiple").is_none() {
+        clear_other_options(parsed, select, option);
+    }
+    parsed.document.invalidate_selectedness(select);
+    run_selectedness_setting(parsed, select);
+}
+
+/// Sets an option's selectedness from the `Option()` constructor. The
+/// constructor overrides the initial selectedness even when the third argument
+/// set the `selected` attribute, and never sets dirtiness
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-option>).
+pub(crate) fn initialize_option_selectedness(parsed: &mut Parsed, option: BlitzId, selected: bool) {
+    set_option_selectedness(parsed, option, selected);
+    parsed.document.clear_option_dirty(option);
+}
+
+/// The selectedness setting algorithm
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
+/// Materializes every option's selectedness and returns whether anything
+/// changed. A select is normalized once; DOM mutations invalidate the cache.
+pub(crate) fn run_selectedness_setting(parsed: &mut Parsed, select: BlitzId) -> bool {
+    if parsed.document.selectedness_normalized(select) {
+        return false;
+    }
+    let options = select_options(&parsed.document.base, parsed.id, select);
+    if attr(&parsed.document.base, select, "multiple").is_some() {
+        for option in &options {
+            option_selectedness(parsed, option.node);
+        }
+        parsed.document.mark_selectedness_normalized(select);
+        return false;
+    }
+    let current: Vec<bool> = options
         .iter()
-        .rev()
-        .find(|option| option_selected(base, option.node))
-    {
-        return vec![NodeId {
-            document,
-            node: last.node,
-        }];
-    }
-    // `selectedIndex = -1` and a value that matches nothing set selectedness
-    // on every option; that explicit empty selection must survive a read.
-    if options
+        .map(|option| option_selectedness(parsed, option.node))
+        .collect();
+    let last_selected = current.iter().rposition(|selected| *selected);
+    let first_enabled = options
         .iter()
-        .all(|option| option_dirty_selectedness(base, option.node))
+        .position(|option| !option_disabled(&parsed.document.base, option.node));
+    let mut desired = vec![false; options.len()];
+    if let Some(index) = last_selected {
+        desired[index] = true;
+    } else if select_display_size(&parsed.document.base, select) == 1
+        && let Some(index) = first_enabled
     {
-        return Vec::new();
+        desired[index] = true;
     }
-    options
+    let changed = desired
+        .iter()
+        .zip(&current)
+        .any(|(desired, current)| desired != current);
+    for (option, selected) in options.iter().zip(desired) {
+        set_option_selectedness(parsed, option.node, selected);
+    }
+    parsed.document.mark_selectedness_normalized(select);
+    changed
+}
+
+/// The options a select has selected, in tree order, after materializing the
+/// selectedness setting algorithm.
+pub(crate) fn effective_selected_options(parsed: &mut Parsed, select: BlitzId) -> Vec<NodeId> {
+    run_selectedness_setting(parsed, select);
+    let base = &parsed.document.base;
+    select_options(base, parsed.id, select)
         .into_iter()
-        .find(|option| !is_disabled(base, option.node))
-        .into_iter()
+        .filter(|option| {
+            parsed
+                .document
+                .option_selectedness(option.node)
+                .unwrap_or_else(|| option_selectedness(parsed, option.node))
+        })
         .collect()
 }
 
-/// An option's displayed selectedness, including the reset behavior that
-/// selects the first non-disabled option in a single-select with no selection
+/// An option's selectedness, including the reset behavior for a single select
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
-pub(crate) fn option_effective_selected(
-    base: &BaseDocument,
-    document: u32,
-    option: BlitzId,
-) -> bool {
-    let Some(select) = option_select_owner(base, option) else {
-        return option_selected(base, option);
+pub(crate) fn option_effective_selected(parsed: &mut Parsed, option: BlitzId) -> bool {
+    let Some(select) = option_select_owner(&parsed.document.base, option) else {
+        return option_selectedness(parsed, option);
     };
-    effective_selected_options(base, document, select)
-        .iter()
-        .any(|selected| selected.node == option)
+    run_selectedness_setting(parsed, select);
+    parsed
+        .document
+        .option_selectedness(option)
+        .unwrap_or_else(|| option_selectedness(parsed, option))
 }
 
 /// An `option`'s value: its `value` attribute, else its text
@@ -436,13 +561,41 @@ pub(crate) fn option_text(base: &BaseDocument, option: BlitzId) -> String {
 }
 
 /// A `select`'s value: the first selected option's value, else the empty
-/// string. The parser-time ask (selecting the first option when none is
-/// selected) is a known gap; without stored selectedness nothing selects it
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
-pub(crate) fn select_value(base: &BaseDocument, document: u32, select: BlitzId) -> String {
-    effective_selected_options(base, document, select)
+/// string (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
+pub(crate) fn select_value(parsed: &mut Parsed, select: BlitzId) -> String {
+    effective_selected_options(parsed, select)
         .first()
-        .map_or_else(String::new, |option| option_value(base, option.node))
+        .map_or_else(String::new, |option| {
+            option_value(&parsed.document.base, option.node)
+        })
+}
+
+/// The select's selected index: the first selected option, or `-1`
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
+pub(crate) fn selected_index_of(parsed: &mut Parsed, select: BlitzId) -> i32 {
+    let Some(selected) = effective_selected_options(parsed, select)
+        .into_iter()
+        .next()
+    else {
+        return -1;
+    };
+    select_options(&parsed.document.base, parsed.id, select)
+        .iter()
+        .position(|option| *option == selected)
+        .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
+}
+
+/// The select reset algorithm: restore selectedness from the `selected`
+/// attributes, clear dirtiness, then run the selectedness setting algorithm
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+pub(crate) fn reset_select_selectedness(parsed: &mut Parsed, select: BlitzId) {
+    for option in select_options(&parsed.document.base, parsed.id, select) {
+        let selected = attr(&parsed.document.base, option.node, "selected").is_some();
+        parsed.document.clear_option_dirty(option.node);
+        set_option_selectedness(parsed, option.node, selected);
+    }
+    parsed.document.invalidate_selectedness(select);
+    run_selectedness_setting(parsed, select);
 }
 
 /// Strips and collapses ASCII whitespace runs to single spaces, dropping
@@ -585,35 +738,39 @@ pub(crate) fn radio_group_members(
 /// A control's value length in UTF-16 code units, the basis selection
 /// offsets clamp against: the `value` attribute for inputs, descendant text
 /// for textareas.
-pub(crate) fn control_value_len(base: &blitz_dom::BaseDocument, node: BlitzId) -> u32 {
+pub(crate) fn control_value_len(parsed: &Parsed, node: BlitzId) -> usize {
+    let base = &parsed.document.base;
     let Some(element) = base
         .get_node(node)
         .and_then(|target| target.data.downcast_element())
     else {
         return 0;
     };
-    let value = if element.name.ns == html_namespace() {
-        match element.name.local.as_str() {
-            "textarea" => {
-                let raw = if element.form_state.dirty_value {
-                    element.form_state.value.clone()
-                } else {
-                    crate::dom::input::child_text_content(base, node)
-                };
-                crate::dom::input::normalize_newlines(&raw)
-            }
-            "input" => crate::dom::input::current_value(base, node),
-            _ => String::new(),
-        }
-    } else {
-        String::new()
-    };
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "control values stay far below u32::MAX"
-    )]
-    let len = value.encode_utf16().count() as u32;
-    len
+    if element.name.ns != html_namespace() {
+        return 0;
+    }
+    match element.name.local.as_str() {
+        "textarea" => textarea_api_value(base, node).encode_utf16().count(),
+        "input" => crate::dom::input::current_value(parsed, node)
+            .encode_utf16()
+            .count(),
+        _ => 0,
+    }
+}
+
+/// The textarea API value: the raw value (dirty slot or child text content)
+/// with newlines normalized to LF
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-api-value>).
+pub(crate) fn textarea_api_value(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
+    let raw = base
+        .get_node(node)
+        .and_then(|target| target.data.downcast_element())
+        .filter(|element| element.form_state.dirty_value)
+        .map_or_else(
+            || crate::dom::text::child_text_content(base, node),
+            |element| element.form_state.value.clone(),
+        );
+    crate::dom::text::normalize_newlines(&raw)
 }
 
 /// Whether text selection applies to a control: textareas always, text-like
@@ -634,47 +791,6 @@ pub(crate) fn selection_applies(base: &blitz_dom::BaseDocument, node: BlitzId) -
             .is_some_and(crate::dom::input::InputType::selection_applies),
         _ => false,
     }
-}
-
-/// Options to deselect when selected `option` joins a single-select: the
-/// owner's other selected options. Returns empty when the option is not
-/// selected, has no owner, or the owner allows multiple
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
-pub(crate) fn options_to_deselect(
-    base: &BaseDocument,
-    document: u32,
-    option: BlitzId,
-) -> Vec<NodeId> {
-    let Some(element) = base
-        .get_node(option)
-        .and_then(|node| node.data.downcast_element())
-    else {
-        return Vec::new();
-    };
-    if element.name.ns != html_namespace() || element.name.local.as_str() != "option" {
-        return Vec::new();
-    }
-    if attr(base, option, "selected").is_none() {
-        return Vec::new();
-    }
-    let id = NodeId {
-        document,
-        node: option,
-    };
-    let Some(owner) = option_select_owner(base, option) else {
-        return Vec::new();
-    };
-    let owner = NodeId {
-        document,
-        node: owner,
-    };
-    if attr(base, owner.node, "multiple").is_some() {
-        return Vec::new();
-    }
-    select_options(base, document, owner.node)
-        .into_iter()
-        .filter(|other| *other != id && attr(base, other.node, "selected").is_some())
-        .collect()
 }
 
 /// Radios to uncheck when checked `input` joins a named group: the other
@@ -700,4 +816,103 @@ pub(crate) fn radios_to_uncheck(base: &BaseDocument, document: u32, input: Blitz
     } else {
         Vec::new()
     }
+}
+
+/// The `option.selected` setter: set selectedness and dirtiness, then ask the
+/// owning select for a reset
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
+pub(crate) fn set_option_selected(parsed: &mut Parsed, option: BlitzId, selected: bool) {
+    if let Some(select) = option_select_owner(&parsed.document.base, option)
+        && selected
+        && attr(&parsed.document.base, select, "multiple").is_none()
+    {
+        clear_other_options(parsed, select, option);
+    }
+    set_option_selectedness(parsed, option, selected);
+    parsed.document.mark_option_dirty(option);
+    if let Some(select) = option_select_owner(&parsed.document.base, option) {
+        parsed.document.invalidate_selectedness(select);
+        run_selectedness_setting(parsed, select);
+    }
+}
+
+/// The `select.selectedIndex` setter: clear every selectedness, then select
+/// the requested index and mark it dirty. No default is applied afterwards
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
+pub(crate) fn set_select_selected_index_value(parsed: &mut Parsed, select: BlitzId, value: i32) {
+    let options = select_options(&parsed.document.base, parsed.id, select);
+    let wanted = usize::try_from(value).ok();
+    for (index, option) in options.into_iter().enumerate() {
+        let selected = Some(index) == wanted;
+        set_option_selectedness(parsed, option.node, selected);
+        if selected {
+            parsed.document.mark_option_dirty(option.node);
+        }
+    }
+    parsed.document.mark_selectedness_normalized(select);
+}
+
+/// The `select.value` setter: clear every selectedness, select the first
+/// matching option, and mark it dirty. No default is applied when nothing
+/// matches (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
+pub(crate) fn set_select_value_selectedness(parsed: &mut Parsed, select: BlitzId, value: &str) {
+    let options = select_options(&parsed.document.base, parsed.id, select);
+    let mut first_matching = None;
+    for option in &options {
+        if first_matching.is_none() && option_value(&parsed.document.base, option.node) == value {
+            first_matching = Some(option.node);
+        }
+    }
+    for option in options {
+        let selected = first_matching == Some(option.node);
+        set_option_selectedness(parsed, option.node, selected);
+        if selected {
+            parsed.document.mark_option_dirty(option.node);
+        }
+    }
+    parsed.document.mark_selectedness_normalized(select);
+}
+
+/// Handles a change to an option's `selected` attribute: with dirtiness false
+/// the attribute drives selectedness, then the owning select resets
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-option-selected>).
+pub(crate) fn option_selected_attribute_changed(
+    parsed: &mut Parsed,
+    option: BlitzId,
+    selected: bool,
+) {
+    if parsed.document.option_dirty(option) {
+        return;
+    }
+    if let Some(select) = option_select_owner(&parsed.document.base, option)
+        && selected
+        && attr(&parsed.document.base, select, "multiple").is_none()
+    {
+        clear_other_options(parsed, select, option);
+    }
+    set_option_selectedness(parsed, option, selected);
+    if let Some(select) = option_select_owner(&parsed.document.base, option) {
+        parsed.document.invalidate_selectedness(select);
+        run_selectedness_setting(parsed, select);
+    }
+}
+
+/// Runs the selectedness rules after a select's `multiple`, `size`, or an
+/// option's `disabled` attribute changed
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+pub(crate) fn select_attribute_changed(parsed: &mut Parsed, select: BlitzId, attribute: &str) {
+    if attribute == "multiple" && attr(&parsed.document.base, select, "multiple").is_none() {
+        let mut seen = false;
+        for option in select_options(&parsed.document.base, parsed.id, select) {
+            if option_selectedness(parsed, option.node) {
+                if seen {
+                    set_option_selectedness(parsed, option.node, false);
+                } else {
+                    seen = true;
+                }
+            }
+        }
+    }
+    parsed.document.invalidate_selectedness(select);
+    run_selectedness_setting(parsed, select);
 }

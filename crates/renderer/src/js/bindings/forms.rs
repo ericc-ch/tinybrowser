@@ -15,11 +15,9 @@
 //! into the tree.
 
 use super::{focus, host_node_id, owning_world, world, world_for_node};
-use crate::documents::JournalEntry;
 use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
-use crate::dom::tree::{NodeId, attr, is_html_element};
+use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
-use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::prelude::Opt;
 use rquickjs::{Array, Ctx, Object, Persistent, Result, Value};
 use std::cell::RefCell;
@@ -89,49 +87,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    let (name, old_value) = {
-        let base = &parsed.document.base;
-        let Some(target) = base.get_node(node.node) else {
-            return Ok(());
-        };
-        let Some(element) = target.data.downcast_element() else {
-            return Ok(());
-        };
-        // Reuse the stored qualified name so clearing removes the exact
-        // attribute the parser kept; a fresh `selected` falls back to the
-        // empty namespace plain HTML attributes parse into.
-        let name = element
-            .attrs
-            .iter()
-            .find(|attribute| attribute.name.local.as_str() == "selected")
-            .map_or_else(
-                || QualName::new(None, Namespace::from(""), LocalName::from("selected")),
-                |attribute| attribute.name.clone(),
-            );
-        (name, attr(base, node.node, "selected").map(str::to_owned))
-    };
-    if selected == old_value.is_some() {
-        return Ok(());
-    }
-    if selected {
-        parsed
-            .document
-            .base
-            .mutate()
-            .set_attribute(node.node, name, "");
-    } else {
-        parsed
-            .document
-            .base
-            .mutate()
-            .clear_attribute(node.node, name);
-    }
-    parsed.document.record(JournalEntry::Attributes {
-        target: node,
-        name: "selected".to_owned(),
-        namespace: String::new(),
-        old_value,
-    });
+    crate::dom::forms::initialize_option_selectedness(&mut parsed, node.node, selected);
     Ok(())
 }
 
@@ -160,10 +116,10 @@ pub(super) fn form_entries<'js>(
     let submitter = submitter.0.and_then(|value| host_node_id(&ctx, &value));
     let pending = {
         let world = world_rc.borrow();
-        let Some(parsed) = world.document(id) else {
+        let Some(mut parsed) = world.document_mut(id) else {
             return Ok(entries);
         };
-        crate::dom::forms::collect_pending_entries(&parsed, id, submitter)
+        crate::dom::forms::collect_pending_entries(&mut parsed, id, submitter)
     };
     for entry in pending {
         match entry {

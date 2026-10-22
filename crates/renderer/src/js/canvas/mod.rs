@@ -4039,7 +4039,7 @@ fn css_color_exact(
     } else {
         lower
     };
-    Ok(crate::dom::css_color::parse_exact(&source).map(|parsed| (parsed.bytes, parsed.serialized)))
+    Ok(crate::css::color::parse_exact(&source).map(|parsed| (parsed.bytes, parsed.serialized)))
 }
 
 /// The canvas element's computed `color`, or black when it has no computed
@@ -4060,22 +4060,19 @@ fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<[u8; 4]> {
     };
     let base = &mut parsed.document.base;
     base.resolve(0.0);
-    let text = base.resolved_style_value(id.node, "color");
-    Ok(crate::dom::css_color::parse(&text).unwrap_or(BLACK))
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parses_basic_colors() {
-        assert_eq!(crate::dom::css_color::parse("red"), Some([255, 0, 0, 255]));
-        assert_eq!(
-            crate::dom::css_color::parse("#00ff0080"),
-            Some([0, 255, 0, 128])
-        );
-        assert_eq!(
-            crate::dom::css_color::parse("rgb(0 0 0 / 50%)"),
-            Some([0, 0, 0, 128])
-        );
-    }
+    let Some(styles) = base
+        .get_node(id.node)
+        .and_then(|node| node.primary_styles())
+    else {
+        return Ok(BLACK);
+    };
+    let computed = styles.get_inherited_text().clone_color();
+    let absolute = computed.to_color_space(style::color::ColorSpace::Srgb);
+    let components = absolute.components;
+    Ok(crate::css::color::to_bytes([
+        components.0,
+        components.1,
+        components.2,
+        absolute.alpha,
+    ]))
 }

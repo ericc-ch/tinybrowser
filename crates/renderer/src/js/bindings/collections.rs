@@ -123,6 +123,18 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         return Ok(Vec::new());
     };
     let owner = owner.borrow();
+    if matches!(kind, CollectionKind::SelectedOptions) {
+        let Some(mut parsed) = owner.document_mut(scope) else {
+            return Ok(Vec::new());
+        };
+        return Ok(effective_selected_options(&mut parsed, scope.node)
+            .into_iter()
+            .map(|option| NodeId {
+                document: scope.document,
+                node: option.node,
+            })
+            .collect());
+    }
     let Some(parsed) = owner.document(scope) else {
         return Ok(Vec::new());
     };
@@ -150,7 +162,7 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         ),
         CollectionKind::ElementsByName(name) => collect_by_name(base, document, scope.node, name),
         CollectionKind::SelectOptions => select_options(base, document, scope.node),
-        CollectionKind::SelectedOptions => effective_selected_options(base, document, scope.node),
+        CollectionKind::SelectedOptions => Vec::new(),
         CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
         CollectionKind::HtmlScripts => collect_html_scripts(&parsed.document, document, scope.node),
         CollectionKind::TableBodies => table_bodies(base, document, scope.node),
@@ -257,42 +269,6 @@ fn element_name(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&QualName
 fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     element_name(base, id)
         .is_some_and(|name| name.ns == html_namespace() && name.local.as_str() == "option")
-}
-
-/// The index of the first selected option, or `-1`
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
-fn select_selected_index(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> i32 {
-    let Some(selected) = effective_selected_options(base, document, select)
-        .into_iter()
-        .next()
-    else {
-        return -1;
-    };
-    select_options(base, document, select)
-        .iter()
-        .position(|option| *option == selected)
-        .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
-}
-
-/// Sets the select's selected option by index; a negative or out-of-range
-/// index clears every option. Selectedness is a live flag, not the `selected`
-/// content attribute, so a later form reset restores the default
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
-fn set_select_selected_index(
-    parsed: &mut crate::Parsed,
-    document: u32,
-    select: BlitzId,
-    value: i32,
-) {
-    let options = {
-        let base = &parsed.document.base;
-        select_options(base, document, select)
-    };
-    let wanted = usize::try_from(value).ok();
-    let mut mutator = parsed.document.base.mutate();
-    for (index, option) in options.into_iter().enumerate() {
-        mutator.set_selectedness(option.node, Some(index) == wanted);
-    }
 }
 
 fn collect_by_tag(
@@ -939,10 +915,13 @@ impl JsOptionsCollection {
             return Ok(-1);
         };
         let owner = owner.borrow();
-        Ok(owner.document(select).map_or(-1, |parsed| {
-            let base = &parsed.document.base;
-            select_selected_index(base, select.document, select.node)
-        }))
+        let Some(mut parsed) = owner.document_mut(select) else {
+            return Ok(-1);
+        };
+        Ok(crate::dom::forms::selected_index_of(
+            &mut parsed,
+            select.node,
+        ))
     }
 
     fn set_selected_index(&self, ctx: &Ctx<'_>, value: i32) -> Result<()> {
@@ -955,7 +934,7 @@ impl JsOptionsCollection {
         let Some(mut parsed) = owner.document_mut(select) else {
             return Ok(());
         };
-        set_select_selected_index(&mut parsed, select.document, select.node, value);
+        crate::dom::forms::set_select_selected_index_value(&mut parsed, select.node, value);
         Ok(())
     }
 }

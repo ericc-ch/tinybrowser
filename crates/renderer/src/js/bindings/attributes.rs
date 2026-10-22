@@ -1688,6 +1688,51 @@ enum InputValueStore {
     Keep,
 }
 
+/// Recomputes an input's sanitized stored value after one of the content
+/// attributes that feeds its value sanitization changed
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+fn apply_input_value_attribute_change(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, element)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(element) else {
+        return Ok(());
+    };
+    if !crate::dom::tree::is_html_element(&parsed.document.base, element.node, "input") {
+        return Ok(());
+    }
+    crate::dom::input::sync_sanitized_value(&mut parsed, element.node);
+    Ok(())
+}
+
+/// Runs the select selectedness rules after an attribute that changes the
+/// available or default selection
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+fn apply_select_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str) -> Result<()> {
+    let world = world_for_node(ctx, element)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(element) else {
+        return Ok(());
+    };
+    let base = &parsed.document.base;
+    let is_option = crate::dom::tree::is_html_element(base, element.node, "option");
+    let is_select = crate::dom::tree::is_html_element(base, element.node, "select");
+    if local == "selected" && is_option {
+        let selected = crate::dom::tree::attr(base, element.node, "selected").is_some();
+        crate::dom::forms::option_selected_attribute_changed(&mut parsed, element.node, selected);
+        return Ok(());
+    }
+    if (local == "multiple" || local == "size") && is_select {
+        crate::dom::forms::select_attribute_changed(&mut parsed, element.node, local);
+        return Ok(());
+    }
+    if local == "disabled"
+        && let Some(select) = crate::dom::forms::option_select_owner(base, element.node)
+    {
+        crate::dom::forms::select_attribute_changed(&mut parsed, select, "disabled");
+    }
+    Ok(())
+}
+
 /// Runs the input element's type-change steps
 /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
 ///
@@ -1707,12 +1752,15 @@ fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId, previous: Option<&str
         let Some(new) = crate::dom::input::input_type(base, element.node) else {
             return Ok(());
         };
-        (new, crate::dom::input::raw_value(base, element.node))
+        (
+            new,
+            crate::dom::input::raw_value(&parsed, element.node, old),
+        )
     };
     if old == new {
         return Ok(());
     }
-    let (store, sanitized_changed) = input_type_store(ctx, &world_rc, element, old, new, &current)?;
+    let store = input_type_store(ctx, &world_rc, element, old, new, &current)?;
     {
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(element) else {
@@ -1720,7 +1768,7 @@ fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId, previous: Option<&str
         };
         apply_input_value_store(&mut parsed, element, store);
     }
-    apply_input_selection(&world_rc, element, old, new, sanitized_changed);
+    apply_input_selection(&world_rc, element, old, new);
     Ok(())
 }
 
@@ -1733,11 +1781,11 @@ fn input_type_store(
     old: crate::dom::input::InputType,
     new: crate::dom::input::InputType,
     current: &str,
-) -> Result<(InputValueStore, bool)> {
-    let (attribute, dirty) = {
+) -> Result<InputValueStore> {
+    let (attribute, dirty, pristine) = {
         let world = world.borrow();
         let Some(parsed) = world.document(element) else {
-            return Ok((InputValueStore::Keep, false));
+            return Ok(InputValueStore::Keep);
         };
         let base = &parsed.document.base;
         (
@@ -1745,6 +1793,7 @@ fn input_type_store(
             base.get_node(element.node)
                 .and_then(|node| node.data.downcast_element())
                 .is_some_and(|element| element.form_state.dirty_value),
+            parsed.document.pristine_value(element.node),
         )
     };
     let old_mode = old.value_mode();
@@ -1762,93 +1811,68 @@ fn input_type_store(
         if !value.is_empty() {
             set_attribute_sync(ctx, element, "value", &value)?;
         }
-        return Ok((InputValueStore::Keep, false));
+        return Ok(InputValueStore::Keep);
     }
     if old_mode == crate::dom::input::ValueMode::Current
         && new_mode == crate::dom::input::ValueMode::Current
     {
         let sanitized = sanitize_current(world, element, new, current);
-        let changed = sanitized != current;
-        // A pristine current value stays tied to the content attribute;
-        // states such as Color compute a default on read without storing it
-        // (<https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>).
-        let store = if dirty {
+        // A user-written value stays dirty; a pristine value is stored with a
+        // marker so the next `value` attribute change still applies
+        // (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
+        return Ok(if dirty && !pristine {
             InputValueStore::Dirty(sanitized)
         } else {
-            InputValueStore::Keep
-        };
-        return Ok((store, changed));
+            InputValueStore::Pristine(sanitized)
+        });
     }
     if old_mode != crate::dom::input::ValueMode::Current
         && new_mode == crate::dom::input::ValueMode::Current
     {
-        // Entering value mode reloads the default and clears the dirty flag;
-        // sanitization happens on read
+        // Entering value mode reloads the default, clears the dirty flag, and
+        // sanitizes the stored value
         // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
         let raw = attribute.unwrap_or_default();
-        return Ok((InputValueStore::Pristine(raw), false));
+        let sanitized = sanitize_current(world, element, new, &raw);
+        return Ok(InputValueStore::Pristine(sanitized));
     }
-    Ok((InputValueStore::Keep, false))
+    Ok(InputValueStore::Keep)
 }
 
 fn apply_input_value_store(parsed: &mut crate::Parsed, element: NodeId, store: InputValueStore) {
     match store {
-        InputValueStore::Dirty(value) => parsed
-            .document
-            .base
-            .mutate()
-            .set_dirty_value(element.node, value),
+        InputValueStore::Dirty(value) => {
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_dirty_value(element.node, value);
+            parsed.document.clear_pristine_value(element.node);
+        }
         InputValueStore::Pristine(value) => {
             parsed
                 .document
                 .base
                 .mutate()
                 .set_dirty_value(element.node, value);
-            if let Some(node) = parsed.document.base.get_node_mut(element.node)
-                && let Some(element) = node.element_data_mut()
-            {
-                element.form_state.dirty_value = false;
-                element.sync_placeholder_shown(
-                    element
-                        .attr(markup5ever::LocalName::from("value"))
-                        .unwrap_or("")
-                        .is_empty(),
-                );
-            }
+            parsed.document.mark_pristine_value(element.node);
         }
         InputValueStore::Keep => {}
     }
 }
 
-/// Moves the text entry cursor after a type change: a state that gains text
-/// entry starts at the beginning, and a sanitized rewrite moves it to the end
-/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
+/// Moves the text entry cursor after a type change. A state that gains text
+/// entry starts at the beginning; the type-change steps do not collapse the
+/// cursor to the end
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
 fn apply_input_selection(
     world: &Rc<RefCell<World>>,
     element: NodeId,
     old: crate::dom::input::InputType,
     new: crate::dom::input::InputType,
-    sanitized_changed: bool,
 ) {
-    let selection_applies = {
-        let world = world.borrow();
-        world.document(element).is_some_and(|parsed| {
-            crate::dom::forms::selection_applies(&parsed.document.base, element.node)
-        })
-    };
-    if !selection_applies {
-        return;
-    }
     if !old.selection_applies() && new.selection_applies() {
         world.borrow_mut().set_selection(element, 0, 0, 0);
-    } else if sanitized_changed {
-        let end = {
-            let world = world.borrow();
-            world.document(element).map_or(0, |parsed| {
-                crate::dom::forms::control_value_len(&parsed.document.base, element.node)
-            })
-        };
-        world.borrow_mut().set_selection(element, end, end, 0);
     }
 }
 
@@ -1887,6 +1911,15 @@ pub(crate) fn after_attribute_change(
     }
     if local == "type" {
         apply_input_type_change(ctx, element, previous)?;
+    }
+    if matches!(local, "selected" | "multiple" | "size" | "disabled") {
+        apply_select_attribute_change(ctx, element, local)?;
+    }
+    if matches!(
+        local,
+        "value" | "min" | "max" | "step" | "multiple" | "colorspace" | "alpha"
+    ) {
+        apply_input_value_attribute_change(ctx, element)?;
     }
     if local != "src" && local != "srcdoc" {
         return Ok(());

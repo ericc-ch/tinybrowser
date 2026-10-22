@@ -540,41 +540,39 @@ impl JsNode {
     pub(super) fn value(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
+        let local = world.document(self.handle.0).and_then(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.data.downcast_element())
+                .filter(|element| element.name.ns == html_namespace())
+                .map(|element| element.name.local.to_string())
+        });
+        let Some(local) = local else {
+            return Ok(String::new());
+        };
+        if local == "select" {
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            return Ok(crate::dom::forms::select_value(
+                &mut parsed,
+                self.handle.0.node,
+            ));
+        }
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let base = &parsed.document.base;
-        let Some(element) = base
-            .get_node(self.handle.0.node)
-            .and_then(|node| node.data.downcast_element())
-        else {
-            return Ok(String::new());
-        };
-        if element.name.ns != html_namespace() {
-            return Ok(String::new());
-        }
-        Ok(match element.name.local.as_str() {
-            "textarea" => {
-                // The API value is the raw value with CRLF and CR normalized
-                // to LF (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-api-value>).
-                let raw = if element.form_state.dirty_value {
-                    element.form_state.value.clone()
-                } else {
-                    crate::dom::input::child_text_content(&parsed.document.base, self.handle.0.node)
-                };
-                crate::dom::input::normalize_newlines(&raw)
-            }
-            "select" => {
-                crate::dom::forms::select_value(base, self.handle.0.document, self.handle.0.node)
-            }
+        Ok(match local.as_str() {
+            "textarea" => crate::dom::forms::textarea_api_value(base, self.handle.0.node),
             "option" => crate::dom::forms::option_value(base, self.handle.0.node),
-            "input" => {
-                // A dirty value wins in every state; the content attribute is
-                // only the default. The value is sanitized for its state
-                // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-                crate::dom::input::current_value(base, self.handle.0.node)
-            }
-            _ => element.control_value().to_owned(),
+            "input" => crate::dom::input::current_value(&parsed, self.handle.0.node),
+            _ => base
+                .get_node(self.handle.0.node)
+                .and_then(|node| node.data.downcast_element())
+                .map_or_else(String::new, |element| element.control_value().to_owned()),
         })
     }
 
@@ -593,7 +591,7 @@ impl JsNode {
             "select" => self.set_select_value(&ctx, value.0),
             "input" => {
                 let world_rc = world(&ctx)?;
-                let (kind, sanitized) = {
+                let (kind, sanitized, previous) = {
                     let world = world_rc.borrow();
                     let Some(parsed) = world.document(self.handle.0) else {
                         return Ok(());
@@ -602,14 +600,22 @@ impl JsNode {
                     let Some(kind) = crate::dom::input::input_type(base, self.handle.0.node) else {
                         return Ok(());
                     };
-                    let sanitized =
-                        crate::dom::input::sanitize(base, self.handle.0.node, kind, &value.0);
-                    (kind, sanitized)
+                    if kind.value_mode() == crate::dom::input::ValueMode::Current {
+                        let sanitized =
+                            crate::dom::input::sanitize(base, self.handle.0.node, kind, &value.0);
+                        let previous =
+                            crate::dom::input::current_value(&parsed, self.handle.0.node);
+                        (kind, Some(sanitized), Some(previous))
+                    } else {
+                        (kind, None, None)
+                    }
                 };
                 match kind.value_mode() {
-                    crate::dom::input::ValueMode::Current => {
-                        self.set_dirty_control_value(&ctx, sanitized)
-                    }
+                    crate::dom::input::ValueMode::Current => self.set_dirty_control_value(
+                        &ctx,
+                        sanitized.unwrap_or_default(),
+                        previous.unwrap_or_default(),
+                    ),
                     crate::dom::input::ValueMode::Default
                     | crate::dom::input::ValueMode::DefaultOn => {
                         set_attribute_sync(&ctx, self.handle.0, "value", &value.0)
@@ -633,14 +639,19 @@ impl JsNode {
     /// Sets a textarea's dirty value. The children stay the default value
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value>).
     pub(super) fn set_textarea_value(&self, ctx: &Ctx<'_>, value: String) -> Result<()> {
-        self.set_dirty_control_value(ctx, value)
+        let previous = self.value(ctx.clone())?;
+        self.set_dirty_control_value(ctx, value, previous)
     }
 
     /// Stores a text control's dirty value and collapses the caret to the end
     /// when the value actually changes
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
-    fn set_dirty_control_value(&self, ctx: &Ctx<'_>, value: String) -> Result<()> {
-        let previous = self.value(ctx.clone())?;
+    fn set_dirty_control_value(
+        &self,
+        ctx: &Ctx<'_>,
+        value: String,
+        previous: String,
+    ) -> Result<()> {
         let changed = previous != value;
         let collapsed = u32::try_from(value.encode_utf16().count()).unwrap_or(u32::MAX);
         let world_rc = world(ctx)?;
@@ -660,6 +671,7 @@ impl JsNode {
                 .base
                 .mutate()
                 .set_dirty_value(self.handle.0.node, value);
+            parsed.document.clear_pristine_value(self.handle.0.node);
         }
         if changed && applies {
             world_rc
@@ -695,37 +707,12 @@ impl JsNode {
     /// Selects the first option whose value is `value`, deselecting the rest;
     /// with no match every option is deselected.
     pub(super) fn set_select_value(&self, ctx: &Ctx<'_>, value: String) -> Result<()> {
-        let world_rc = world(ctx)?;
-        let options = {
-            let world = world_rc.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
-                return Err(Exception::throw_type(ctx, "no document"));
-            };
-            let base = &parsed.document.base;
-            crate::dom::forms::select_options(base, self.handle.0.document, self.handle.0.node)
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(ctx, "no document"));
         };
-        let mut matched = false;
-        for option in options {
-            let selected = !matched && {
-                let world = world_rc.borrow();
-                let Some(parsed) = world.document(option) else {
-                    continue;
-                };
-                crate::dom::forms::option_value(&parsed.document.base, option.node) == value
-            };
-            if selected {
-                matched = true;
-            }
-            let world = world_rc.borrow();
-            let Some(mut parsed) = world.document_mut(option) else {
-                continue;
-            };
-            parsed
-                .document
-                .base
-                .mutate()
-                .set_selectedness(option.node, selected);
-        }
+        crate::dom::forms::set_select_value_selectedness(&mut parsed, self.handle.0.node, &value);
         Ok(())
     }
 
@@ -738,7 +725,7 @@ impl JsNode {
         };
         // The default value is the element's child text content
         // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue>).
-        Ok(crate::dom::input::child_text_content(
+        Ok(crate::dom::text::child_text_content(
             &parsed.document.base,
             self.handle.0.node,
         ))
@@ -759,10 +746,11 @@ impl JsNode {
         // The control's value (dirty value when set, otherwise the attribute
         // or descendant text), in UTF-16 code units
         // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-textlength>).
-        Ok(crate::dom::forms::control_value_len(
-            &parsed.document.base,
+        Ok(u32::try_from(crate::dom::forms::control_value_len(
+            &parsed,
             self.handle.0.node,
         ))
+        .unwrap_or(u32::MAX))
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
@@ -779,7 +767,11 @@ impl JsNode {
             };
             (
                 crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node),
-                crate::dom::forms::control_value_len(&parsed.document.base, self.handle.0.node),
+                u32::try_from(crate::dom::forms::control_value_len(
+                    &parsed,
+                    self.handle.0.node,
+                ))
+                .unwrap_or(u32::MAX),
                 world.selection_of(self.handle.0),
             )
         };
@@ -808,7 +800,11 @@ impl JsNode {
             };
             (
                 crate::dom::forms::selection_applies(&parsed.document.base, self.handle.0.node),
-                crate::dom::forms::control_value_len(&parsed.document.base, self.handle.0.node),
+                u32::try_from(crate::dom::forms::control_value_len(
+                    &parsed,
+                    self.handle.0.node,
+                ))
+                .unwrap_or(u32::MAX),
                 world.selection_of(self.handle.0),
             )
         };
@@ -876,9 +872,19 @@ impl JsNode {
             return Ok(());
         };
         let controls = form_controls(&parsed.document.base, parsed.id, self.handle.0.node);
-        let mut mutator = parsed.document.base.mutate();
+        {
+            let mut mutator = parsed.document.base.mutate();
+            for control in &controls {
+                mutator.reset_control(*control);
+            }
+        }
         for control in controls {
-            mutator.reset_control(control);
+            parsed.document.clear_pristine_value(control);
+            if crate::dom::tree::is_html_element(&parsed.document.base, control, "input") {
+                crate::dom::input::sync_sanitized_value(&mut parsed, control);
+            } else if crate::dom::tree::is_html_element(&parsed.document.base, control, "select") {
+                crate::dom::forms::reset_select_selectedness(&mut parsed, control);
+            }
         }
         Ok(())
     }
@@ -1067,71 +1073,22 @@ impl JsNode {
     pub(super) fn selected(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world.document(self.handle.0).is_some_and(|parsed| {
-            crate::dom::forms::option_effective_selected(
-                &parsed.document.base,
-                self.handle.0.document,
-                self.handle.0.node,
-            )
-        }))
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(false);
+        };
+        Ok(crate::dom::forms::option_effective_selected(
+            &mut parsed,
+            self.handle.0.node,
+        ))
     }
 
     pub(super) fn set_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        // Selecting an option in a single-select deselects the others. The
-        // content attribute stays the default selectedness
-        // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
-        let world_rc = world(&ctx)?;
-        let (owner, siblings) = {
-            let world = world_rc.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
-                return Ok(());
-            };
-            let base = &parsed.document.base;
-            let owner =
-                crate::dom::forms::option_select_owner(base, self.handle.0.node).map(|node| {
-                    NodeId {
-                        document: self.handle.0.document,
-                        node,
-                    }
-                });
-            let siblings = match owner {
-                Some(owner) if value && attr(base, owner.node, "multiple").is_none() => {
-                    crate::dom::forms::select_options(base, self.handle.0.document, owner.node)
-                }
-                _ => Vec::new(),
-            };
-            (owner, siblings)
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
         };
-        {
-            let world = world_rc.borrow();
-            let Some(mut parsed) = world.document_mut(self.handle.0) else {
-                return Ok(());
-            };
-            let mut mutator = parsed.document.base.mutate();
-            for option in siblings {
-                if option != self.handle.0 {
-                    mutator.set_selectedness(option.node, false);
-                }
-            }
-            mutator.set_selectedness(self.handle.0.node, value);
-        }
-        // Deselecting the only selected option in a single-select asks for a
-        // reset, which selects the first non-disabled option
-        // (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
-        if !value && let Some(owner) = owner {
-            let world = world_rc.borrow();
-            let Some(mut parsed) = world.document_mut(self.handle.0) else {
-                return Ok(());
-            };
-            let target = crate::dom::forms::select_reset_target(
-                &parsed.document.base,
-                owner.document,
-                owner.node,
-            );
-            if let Some(target) = target {
-                parsed.document.base.mutate().set_selectedness(target, true);
-            }
-        }
+        crate::dom::forms::set_option_selected(&mut parsed, self.handle.0.node, value);
         Ok(())
     }
 
@@ -1218,53 +1175,22 @@ impl JsNode {
     pub(super) fn selected_index(&self, ctx: Ctx<'_>) -> Result<i32> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world.document(self.handle.0).map_or(-1, |parsed| {
-            let base = &parsed.document.base;
-            let Some(selected) = crate::dom::forms::effective_selected_options(
-                base,
-                self.handle.0.document,
-                self.handle.0.node,
-            )
-            .into_iter()
-            .next() else {
-                return -1;
-            };
-            crate::dom::forms::select_options(base, self.handle.0.document, self.handle.0.node)
-                .iter()
-                .position(|option| *option == selected)
-                .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
-        }))
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(-1);
+        };
+        Ok(crate::dom::forms::selected_index_of(
+            &mut parsed,
+            self.handle.0.node,
+        ))
     }
 
     pub(super) fn set_selected_index(&self, ctx: Ctx<'_>, value: i32) -> Result<()> {
-        let world_rc = world(&ctx)?;
-        let options = {
-            let world = world_rc.borrow();
-            let Some(parsed) = world.document(self.handle.0) else {
-                return Ok(());
-            };
-            crate::dom::forms::select_options(
-                &parsed.document.base,
-                self.handle.0.document,
-                self.handle.0.node,
-            )
-        };
-        // A negative index clears every option; otherwise the indexed option
-        // selects and the rest deselect
-        // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
-        let wanted = if value < 0 {
-            None
-        } else {
-            usize::try_from(value).ok()
-        };
-        let world = world_rc.borrow();
+        let world = world(&ctx)?;
+        let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let mut mutator = parsed.document.base.mutate();
-        for (index, option) in options.into_iter().enumerate() {
-            mutator.set_selectedness(option.node, Some(index) == wanted);
-        }
+        crate::dom::forms::set_select_selected_index_value(&mut parsed, self.handle.0.node, value);
         Ok(())
     }
 
@@ -1287,22 +1213,16 @@ impl JsNode {
         )
     }
 }
-/// An inserted selected option clears a single-select owner's other options
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected>).
-/// Blitz keeps selectedness as the `selected` content attribute, so the rule
-/// rewrites attributes instead of slots.
+/// An inserted option invalidates its select's materialized selectedness and
+/// runs the selectedness setting algorithm
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
 pub(super) fn fixup_option_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
-    let world_rc = world(ctx)?;
-    let siblings = {
-        let world = world_rc.borrow();
-        let Some(parsed) = world.document(id) else {
-            return Ok(());
-        };
-        crate::dom::forms::options_to_deselect(&parsed.document.base, id.document, id.node)
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
+        return Ok(());
     };
-    for option in siblings {
-        remove_attribute_sync(ctx, option, "", "selected", false)?;
-    }
+    crate::dom::forms::option_inserted(&mut parsed, id.node);
     Ok(())
 }
 
@@ -1331,10 +1251,9 @@ pub(super) fn selection_start_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickj
         return Ok(0);
     };
     let (start, _, _) = world.selection_of(id);
-    Ok(start.min(crate::dom::forms::control_value_len(
-        &parsed.document.base,
-        id.node,
-    )))
+    Ok(start.min(
+        u32::try_from(crate::dom::forms::control_value_len(&parsed, id.node)).unwrap_or(u32::MAX),
+    ))
 }
 
 /// A control's stored selection end clamped to its value length.
@@ -1345,10 +1264,9 @@ pub(super) fn selection_end_of(ctx: &rquickjs::Ctx<'_>, id: NodeId) -> rquickjs:
         return Ok(0);
     };
     let (_, end, _) = world.selection_of(id);
-    Ok(end.min(crate::dom::forms::control_value_len(
-        &parsed.document.base,
-        id.node,
-    )))
+    Ok(end.min(
+        u32::try_from(crate::dom::forms::control_value_len(&parsed, id.node)).unwrap_or(u32::MAX),
+    ))
 }
 
 /// A control's stored selection direction code.

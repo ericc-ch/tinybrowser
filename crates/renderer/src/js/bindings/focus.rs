@@ -693,13 +693,41 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
     {
         return Err(Exception::throw_type(&ctx, "argument is not an element"));
     }
-    // Same write the IDL setter performs, minus the author-visible entry
-    // point (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-    // Blitz keeps no control value store (see `forms.rs`), so the `value`
-    // content attribute carries it; the dirty-value flag is a known cutover
-    // gap. Going through the tree mutator also keeps Blitz's text-input
-    // state in sync.
-    write_attr(&mut parsed, node, "value", Some(&value.0));
+    let local = parsed
+        .document
+        .base
+        .get_node(node.node)
+        .and_then(|tree| tree.data.downcast_element())
+        .filter(|element| element.name.ns == crate::dom::tree::html_namespace())
+        .map(|element| element.name.local.to_string());
+    match local.as_deref() {
+        Some("input") => {
+            let Some(kind) = crate::dom::input::input_type(&parsed.document.base, node.node) else {
+                return Ok(());
+            };
+            if kind.value_mode() == crate::dom::input::ValueMode::Current {
+                let sanitized =
+                    crate::dom::input::sanitize(&parsed.document.base, node.node, kind, &value.0);
+                parsed
+                    .document
+                    .base
+                    .mutate()
+                    .set_dirty_value(node.node, sanitized);
+                parsed.document.clear_pristine_value(node.node);
+            } else {
+                write_attr(&mut parsed, node, "value", Some(&value.0));
+            }
+        }
+        Some("textarea") => {
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_dirty_value(node.node, value.0);
+            parsed.document.clear_pristine_value(node.node);
+        }
+        _ => write_attr(&mut parsed, node, "value", Some(&value.0)),
+    }
     Ok(())
 }
 

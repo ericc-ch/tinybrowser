@@ -634,9 +634,18 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let iframes = replace_all_with_node(&mut parsed, parent, node);
+        let controls = crate::dom::forms::descendant_controls(
+            &parsed.document.base,
+            parent.document,
+            parent.node,
+        );
         drop(parsed);
         world.destroy_child_navigables(&iframes);
         drop(world);
+        for id in controls {
+            fixup_option_on_insert(&ctx, id)?;
+            fixup_radio_on_insert(&ctx, id)?;
+        }
         schedule_mutation_delivery(&ctx)
     }
 
@@ -2300,9 +2309,18 @@ pub(super) fn apply_inserted(
     moved: &[NodeId],
     deliver: bool,
 ) -> Result<()> {
-    for id in moved {
-        fixup_option_on_insert(ctx, *id)?;
-        fixup_radio_on_insert(ctx, *id)?;
+    let mut ordered = moved.to_vec();
+    {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        if let Some(parsed) = world.document(parent) {
+            ordered
+                .sort_by(|a, b| tree_order(&parsed.document.base, parent.document, a.node, b.node));
+        }
+    }
+    for id in ordered {
+        fixup_option_on_insert(ctx, id)?;
+        fixup_radio_on_insert(ctx, id)?;
     }
     // Insertion steps run while parent is connected. Queue mutation records
     // first so an inserted script can `takeRecords` its own addition

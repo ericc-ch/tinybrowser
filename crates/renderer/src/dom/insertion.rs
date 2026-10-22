@@ -259,6 +259,10 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
     let Some(parent) = parent else {
         return;
     };
+    if let Some(select) = crate::dom::forms::option_select_owner(&parsed.document.base, target.node)
+    {
+        parsed.document.invalidate_selectedness(select);
+    }
     parsed.document.base.mutate().remove_node(target.node);
     if let Some((parent, index)) = index {
         let base = &parsed.document.base;

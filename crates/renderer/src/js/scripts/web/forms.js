@@ -51,6 +51,35 @@
     return Math.trunc(number) | 0;
   };
 
+  // The color state's `alpha` and `colorSpace` IDL attributes reflect their
+  // content attributes. The comparison for `colorSpace` is ASCII
+  // case-insensitive, and the setter stores the string as authored
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-colorspace>).
+  Object.defineProperties(globalThis.HTMLInputElement.prototype, {
+    alpha: {
+      configurable: true,
+      get() {
+        return this.hasAttribute('alpha');
+      },
+      set(value) {
+        if (value) this.setAttribute('alpha', '');
+        else this.removeAttribute('alpha');
+      },
+    },
+    colorSpace: {
+      configurable: true,
+      get() {
+        const value = this.getAttribute('colorspace');
+        return value !== null && value.toLowerCase() === 'display-p3'
+          ? 'display-p3'
+          : 'limited-srgb';
+      },
+      set(value) {
+        this.setAttribute('colorspace', String(value));
+      },
+    },
+  });
+
   // Content attributes whose absence is `-1` and whose setter rejects a
   // negative value (<https://html.spec.whatwg.org/multipage/input.html#dom-input-maxlength>).
   const lengthProperty = name => ({
@@ -1246,17 +1275,27 @@
     return { year: year + (month <= 2 ? 1 : 0), month, day };
   };
   const pad = (number, width) => String(number).padStart(width, '0');
+  // Date objects stop at 275760-09-13; a valueAsNumber outside that range
+  // serializes to the empty string
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber>).
+  const representableYear = year => year >= 1 && year <= 275760;
   const formatDate = days => {
     const { year, month, day } = civilFromDays(days);
-    return `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`;
+    return representableYear(year)
+      ? `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`
+      : '';
   };
   const formatMonth = index => {
     const months = index + 1970 * 12;
-    return `${pad(Math.floor(months / 12), 4)}-${pad((months % 12) + 1, 2)}`;
+    const year = Math.floor(months / 12);
+    return representableYear(year)
+      ? `${pad(year, 4)}-${pad((months % 12) + 1, 2)}`
+      : '';
   };
   const formatWeek = weeks => {
     const days = epochMonday + weeks * 7;
     const { year } = civilFromDays(days + 3);
+    if (!representableYear(year)) return '';
     const januaryFourth = daysFromCivil(year, 1, 4);
     const mondayOfWeekOne = januaryFourth - weekdayFromDays(januaryFourth);
     return `${pad(year, 4)}-W${pad(Math.round((days - mondayOfWeekOne) / 7) + 1, 2)}`;

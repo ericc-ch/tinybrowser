@@ -1370,3 +1370,38 @@ pub(crate) fn is_mergeable_text_node(base: &blitz_dom::BaseDocument, id: BlitzId
         Some(NodeData::Text(_))
     )
 }
+
+/// A node's child text content: the data of its Text children in tree order
+/// (<https://dom.spec.whatwg.org/#concept-child-text-content>).
+pub(crate) fn child_text_content(base: &blitz_dom::BaseDocument, id: BlitzId) -> String {
+    let mut text = String::new();
+    let Some(target) = base.get_node(id) else {
+        return text;
+    };
+    for child in &target.children {
+        match base.get_node(*child).map(|child| &child.data) {
+            Some(NodeData::Text(data)) => text.push_str(&data.content),
+            Some(NodeData::CDataSection { contents }) => text.push_str(contents),
+            _ => {}
+        }
+    }
+    text
+}
+
+/// The API value of a text control: the raw value with CRLF and CR normalized
+/// to LF (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-api-value>).
+pub(crate) fn normalize_newlines(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
+}
