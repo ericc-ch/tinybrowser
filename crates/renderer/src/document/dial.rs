@@ -100,11 +100,7 @@ pub(in crate::document) fn complete(
         req,
         ancestors,
         integrity,
-        delay,
     } = dial;
-    // A cancelled dial settles here too, so the load-event delay is released
-    // before the completion is handled.
-    drop(delay);
     let outcome = outcome.map_err(|_| context)?;
     Ok(CompletedDial {
         context,

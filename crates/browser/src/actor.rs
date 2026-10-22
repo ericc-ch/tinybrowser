@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::wire::{Command as RendererCommand, Reply};
 use renderer::{
     DialFailure, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue,
-    RendererEvent, ResourceLimit, ResponseHead, TabError,
+    RendererEvent, ResourceLimit, ResponseHead, ScriptSource, TabError,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -805,6 +805,24 @@ impl Tab {
         result
     }
 
+    /// The readiness and URL of the renderer document that produced the
+    /// latest event.
+    async fn renderer_document_state(&mut self) -> Option<(String, String)> {
+        self.renderer.as_ref()?;
+        let reply = self
+            .renderer_request(RendererCommand::ExecuteScript {
+                frame: FrameId::MAIN,
+                source: ScriptSource::Page("document.readyState + '\\n' + document.URL".to_owned()),
+                timeout_ms: Some(1_000),
+            })
+            .await;
+        let Ok(Reply::Value(Ok(RemoteValue::String(state)))) = reply else {
+            return None;
+        };
+        let (ready, url) = state.split_once('\n')?;
+        Some((ready.to_owned(), url.to_owned()))
+    }
+
     /// One streamed byte request (screenshots) against the tab's renderer,
     /// mounting the virtual blank document when the tab has none.
     async fn renderer_request_bytes(
@@ -931,6 +949,10 @@ impl Tab {
         self.dial_cancel = None;
         self.dial_guard = None;
         self.nav = None;
+        // The document being replaced may have left `document_loaded` set.
+        // The new mount clears it too, but a navigation that never reaches
+        // `mount_stream` must not appear loaded.
+        self.document_loaded = false;
         match result {
             Ok(outcome) => {
                 let mounted = self.commit_navigation(outcome).await;
@@ -1020,6 +1042,19 @@ impl Tab {
                 self.record_event(TabEvent::Navigated).await;
             }
             RendererEvent::Load => {
+                // A `load` for the document a navigation replaced can arrive
+                // after the carrier committed the new response. Only the
+                // document the tab is navigating to may settle the wait.
+                let expected = self
+                    .nav
+                    .as_ref()
+                    .map_or_else(|| self.document_url.clone(), |nav| nav.url.clone());
+                let Some((ready, current)) = self.renderer_document_state().await else {
+                    return;
+                };
+                if ready != "complete" || current != expected.as_str() {
+                    return;
+                }
                 self.document_loaded = true;
                 self.record_event(TabEvent::Load).await;
             }
@@ -1457,6 +1492,8 @@ fn retain_load_waiter(
         Waiter {
             id,
             deadline: Instant::now() + timeout,
+            // Completing is driven by `document_loaded`: a `load` from the
+            // document a navigation is replacing is filtered by URL.
             source: None,
             reply,
         },
