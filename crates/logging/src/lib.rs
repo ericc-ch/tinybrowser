@@ -136,15 +136,18 @@ impl Logger {
     /// Writes one record when `level` is enabled.
     fn log(&self, level: Level, target: &str, args: fmt::Arguments<'_>) {
         if self.enabled(level) {
-            self.emit(format::record(level, target, args));
+            self.emit(format::record(
+                std::time::SystemTime::now(),
+                level,
+                target,
+                args,
+            ));
         }
     }
 
     /// Forwards one already-formatted line (a renderer child's stderr).
     fn log_forwarded(&self, line: &str) {
-        let mut line = line.trim_end_matches(['\r', '\n']).to_owned();
-        line.push('\n');
-        self.emit(line);
+        self.emit(format::forwarded(line));
     }
 
     /// Writes one full line to the console and queues it for the file.
