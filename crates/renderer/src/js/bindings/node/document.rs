@@ -1000,7 +1000,10 @@ impl JsNode {
                     "document stream budget exceeded",
                 ));
             }
-            world.pending_html_writes.push(html);
+            world
+                .outbox
+                .borrow_mut()
+                .push(crate::js::RealmRequest::HtmlWrite(html));
         } else {
             world
                 .queue_document_stream(DocumentStreamCommand::Write(html))

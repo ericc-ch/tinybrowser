@@ -36,7 +36,7 @@ use rquickjs::{
 };
 use url::Url;
 
-pub(crate) use world::{CreatorInfo, World};
+pub(crate) use world::{CreatorInfo, RealmRequest, World};
 
 /// Shared `QuickJS` heap cap. Forty live subframe realms need more than
 /// 32MB (measured: `Document-createElement-namespace.html`, 40 parallel
@@ -255,8 +255,8 @@ pub(crate) struct JsRealm {
     context: Context,
     world: Rc<RefCell<World>>,
     stop: Arc<Stop>,
-    pending_timeouts: Rc<RefCell<Vec<PendingTimeout>>>,
-    pending_fetches: Rc<RefCell<Vec<PendingJsFetch>>>,
+    /// One outbox holds all work this realm hands to its document.
+    outbox: crate::js::world::Outbox,
     /// Nesting depth of [`JsRealm::with_budget`]; reentrant evaluations run
     /// under the outer frame instead of installing their own budget.
     budget_depth: Cell<usize>,
@@ -279,13 +279,13 @@ impl JsRealm {
         // Every realm in the renderer process shares the engine's cell, so
         // one drain deadline covers tasks that run in frames created later.
         let turn_deadline = Rc::clone(&world.borrow().runtime.turn_deadline);
+        let outbox = Rc::clone(&world.borrow().outbox);
         let host = Self {
             runtime,
             context,
             world,
             stop,
-            pending_timeouts: Rc::new(RefCell::new(Vec::new())),
-            pending_fetches: Rc::new(RefCell::new(Vec::new())),
+            outbox,
             budget_depth: Cell::new(0),
             turn_deadline,
         };
@@ -382,18 +382,6 @@ impl JsRealm {
                 decode_value(&ctx, value)
             })
         })
-    }
-
-    pub(crate) fn take_pending_timeouts(&self) -> Vec<PendingTimeout> {
-        std::mem::take(&mut *self.pending_timeouts.borrow_mut())
-    }
-
-    pub(crate) fn take_pending_fetches(&self) -> Vec<PendingJsFetch> {
-        std::mem::take(&mut *self.pending_fetches.borrow_mut())
-    }
-
-    pub(crate) fn take_pending_cancels(&self) -> Vec<i32> {
-        std::mem::take(&mut self.world.borrow_mut().pending_cancels)
     }
 
     pub(crate) fn fire_timer(&self, js_id: i32) -> Result<(), JsError> {
@@ -909,43 +897,53 @@ impl JsRealm {
         Ok(())
     }
 
+    /// Timer scheduling and cancellation hooks the JS shim calls.
+    fn install_timer_host_functions(
+        ctx: &Ctx<'_>,
+        outbox: &crate::js::world::Outbox,
+    ) -> Result<(), JsError> {
+        let schedule_outbox = Rc::clone(outbox);
+        bridge::object(ctx)?.set(
+            "__scheduleTimeout",
+            Func::from(move |js_id: i32, delay: f64| {
+                schedule_outbox
+                    .borrow_mut()
+                    .push(RealmRequest::Timer(PendingTimeout {
+                        delay: Duration::from_millis(u64::from(millis(delay))),
+                        js_id,
+                    }));
+            }),
+        )?;
+
+        let cancel_outbox = Rc::clone(outbox);
+        bridge::object(ctx)?.set(
+            "__cancelTimeout",
+            Func::from(move |js_id: i32| {
+                cancel_outbox
+                    .borrow_mut()
+                    .push(RealmRequest::ClearTimer(js_id));
+            }),
+        )?;
+
+        let cancel_fetch_outbox = Rc::clone(outbox);
+        bridge::object(ctx)?.set(
+            "__cancelFetch",
+            Func::from(move |js_id: i32| {
+                cancel_fetch_outbox
+                    .borrow_mut()
+                    .push(RealmRequest::AbortFetch(js_id));
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Timer and fetch submission hooks the JS shim calls.
     fn install_task_host_functions(
         &self,
         ctx: &Ctx<'_>,
         world: &Rc<RefCell<World>>,
     ) -> Result<(), JsError> {
-        let timeouts = self.pending_timeouts.clone();
-        let fetches = self.pending_fetches.clone();
-        let cancel_world = world.clone();
-        let cancel_fetch_world = world.clone();
-
-        bridge::object(ctx)?.set(
-            "__scheduleTimeout",
-            Func::from(move |js_id: i32, delay: f64| {
-                timeouts.borrow_mut().push(PendingTimeout {
-                    delay: Duration::from_millis(u64::from(millis(delay))),
-                    js_id,
-                });
-            }),
-        )?;
-
-        bridge::object(ctx)?.set(
-            "__cancelTimeout",
-            Func::from(move |js_id: i32| {
-                cancel_world.borrow_mut().pending_cancels.push(js_id);
-            }),
-        )?;
-
-        bridge::object(ctx)?.set(
-            "__cancelFetch",
-            Func::from(move |js_id: i32| {
-                cancel_fetch_world
-                    .borrow_mut()
-                    .pending_fetch_cancels
-                    .push(js_id);
-            }),
-        )?;
+        Self::install_timer_host_functions(ctx, &self.outbox)?;
         let referrer_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbReferrer",
@@ -975,6 +973,7 @@ impl JsRealm {
         )?;
         install_sync_fetch(ctx, world)?;
         Self::install_csp_host_functions(ctx, world)?;
+        let fetch_outbox = Rc::clone(&self.outbox);
         bridge::object(ctx)?.set(
             "__queueFetch",
             Func::from(
@@ -1011,7 +1010,9 @@ impl JsRealm {
                         credentials,
                         redirect,
                     });
-                    fetches.borrow_mut().push(PendingJsFetch {
+                    fetch_outbox
+                        .borrow_mut()
+                        .push(RealmRequest::Fetch(PendingJsFetch {
                         url,
                         js_id,
                         method,
@@ -1020,7 +1021,7 @@ impl JsRealm {
                         headers,
                         referrer,
                         cors,
-                    });
+                    }));
                     Ok::<(), rquickjs::Error>(())
                 },
             ),
@@ -1056,7 +1057,7 @@ impl JsRealm {
                 let Ok(url) = url::Url::parse(&url) else {
                     return false;
                 };
-                let mut world = csp_world.borrow_mut();
+                let world = csp_world.borrow();
                 let violations = world.csp.check_request(
                     &world.origin,
                     &world.document_url,
@@ -1072,9 +1073,9 @@ impl JsRealm {
                     });
                     if let Some(target) = target {
                         world
-                            .state
-                            .pending_csp_violations
-                            .push((target, violations));
+                            .outbox
+                            .borrow_mut()
+                            .push(RealmRequest::CspViolation(target, violations));
                     }
                 }
                 !blocked
@@ -1201,12 +1202,11 @@ fn install_history_host_functions(
                     world.history.length = world.history.index.saturating_add(1);
                 }
                 world
-                    .pending_history
-                    .push(crate::protocol::RendererEvent::HistoryUpdated {
-                        url,
-                        state,
-                        replace,
-                    });
+                    .outbox
+                    .borrow_mut()
+                    .push(RealmRequest::History(
+                        crate::protocol::RendererEvent::HistoryUpdated { url, state, replace },
+                    ));
                 Ok::<usize, rquickjs::Error>(world.history.length)
             },
         ),
@@ -1217,8 +1217,11 @@ fn install_history_host_functions(
         Func::from(move |delta: i32| {
             traverse_world
                 .borrow_mut()
-                .pending_history
-                .push(crate::protocol::RendererEvent::HistoryTraversal { delta });
+                .outbox
+                .borrow_mut()
+                .push(RealmRequest::History(
+                    crate::protocol::RendererEvent::HistoryTraversal { delta },
+                ));
         }),
     )?;
     Ok(())

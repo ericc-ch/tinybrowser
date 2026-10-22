@@ -887,10 +887,8 @@ pub(crate) struct World {
     /// Active Content Security Policy list for this document.
     pub(crate) csp: crate::csp::List,
     pub(crate) history: crate::protocol::HistorySnapshot,
-    pub(crate) pending_history: Vec<crate::protocol::RendererEvent>,
-    pub pending_cancels: Vec<i32>,
-    pub pending_fetch_cancels: Vec<i32>,
-    pub pending_html_writes: Vec<String>,
+    /// The realm's outgoing work, drained once per turn by the document.
+    pub(crate) outbox: Outbox,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
@@ -973,23 +971,9 @@ pub(crate) struct ImageState {
     /// Elements whose current request already dispatched its `error` event,
     /// so a later scan does not repeat it.
     pub(crate) error_reported: HashSet<NodeId>,
-    /// Connected elements whose `src` changed inside script, awaiting the
-    /// drain's update step.
-    updates: Vec<NodeId>,
 }
 
 impl ImageState {
-    /// Queues `element` for the drain, at most once.
-    fn queue_update(&mut self, element: NodeId) {
-        if !self.updates.contains(&element) {
-            self.updates.push(element);
-        }
-    }
-
-    fn take_updates(&mut self) -> Vec<NodeId> {
-        std::mem::take(&mut self.updates)
-    }
-
     /// Drops every element's state; called when the document that owned the
     /// elements is replaced or forgotten.
     fn clear(&mut self) {
@@ -998,7 +982,6 @@ impl ImageState {
         self.current_src.clear();
         self.broken.clear();
         self.error_reported.clear();
-        self.updates.clear();
     }
 }
 
@@ -1062,6 +1045,28 @@ impl EventTargetState {
     }
 }
 
+/// One piece of work the realm hands to its document, in program order.
+///
+/// The realm does not run document tasks itself. Everything it produces — timer
+/// changes, fetch submissions and aborts, script and image starts, history
+/// updates, CSP reports, and `document.write` text — lands here, and the
+/// document drains the queue once per turn. One queue means one ordering, and a
+/// new kind of work has one place to be added.
+pub(crate) enum RealmRequest {
+    Timer(super::PendingTimeout),
+    ClearTimer(i32),
+    Fetch(super::PendingJsFetch),
+    AbortFetch(i32),
+    Script(NodeId),
+    Image(NodeId),
+    History(crate::protocol::RendererEvent),
+    CspViolation(NodeId, Vec<crate::csp::Violation>),
+    HtmlWrite(String),
+}
+
+/// The realm's outgoing work, shared with the host functions that push into it.
+pub(crate) type Outbox = Rc<RefCell<Vec<RealmRequest>>>;
+
 /// Realm state that belongs to the documents this realm owns.
 ///
 /// A navigation installs a fresh document and a forgotten document takes its
@@ -1077,12 +1082,6 @@ pub(crate) struct DocumentState {
     /// `meta` elements whose policy was already appended.
     pub(crate) applied_csp_metas: HashSet<NodeId>,
     frame_navigations: Vec<FrameNavigation>,
-    /// Connected `<script src>` elements whose fetch prepare steps queued a
-    /// load (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
-    pending_scripts: Vec<NodeId>,
-    /// Violations produced where dispatching is unsafe (inside the module
-    /// loader), flushed by the drain.
-    pub(crate) pending_csp_violations: Vec<(NodeId, Vec<crate::csp::Violation>)>,
     /// Script elements the HTML parser inserted; script insertion clears the
     /// bit (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
     pub(crate) parser_inserted: HashSet<NodeId>,
@@ -1139,8 +1138,6 @@ impl DocumentState {
         self.referrer_policy.clear();
         self.applied_csp_metas.clear();
         self.frame_navigations.clear();
-        self.pending_scripts.clear();
-        self.pending_csp_violations.clear();
         self.parser_inserted.clear();
         self.decoders.clear();
         self.document_stream.clear();
@@ -1264,7 +1261,10 @@ impl Drop for World {
                 DocumentStreamCommand::Write(value) => Some(value.len()),
                 _ => None,
             })
-            .chain(self.pending_html_writes.iter().map(String::len))
+            .chain(self.outbox.borrow().iter().filter_map(|request| match request {
+                RealmRequest::HtmlWrite(value) => Some(value.len()),
+                _ => None,
+            }))
             .sum::<usize>();
         budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(stream_bytes);
     }
@@ -1291,10 +1291,7 @@ impl World {
             base_url: None,
             csp: crate::csp::List::default(),
             history: crate::protocol::HistorySnapshot::default(),
-            pending_history: Vec::new(),
-            pending_cancels: Vec::new(),
-            pending_fetch_cancels: Vec::new(),
-            pending_html_writes: Vec::new(),
+            outbox: Rc::new(RefCell::new(Vec::new())),
             input_files: HashMap::new(),
             font_registrations: HashMap::new(),
             next_font_registration: 1,
@@ -1338,6 +1335,7 @@ impl World {
         // stream methods own that accounting.
         let pending_stream = self.take_document_stream();
         drop(pending_stream);
+        self.clear_outbox();
         self.state.reset();
         // Navigation keeps the realm's window object, so window-scoped
         // handlers survive; the old document's listeners and element handlers
@@ -1967,22 +1965,24 @@ impl World {
         // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
         // <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
         self.images.loading.insert(element);
-        self.images.queue_update(element);
-    }
-
-    pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
-        self.images.take_updates()
+        let mut outbox = self.outbox.borrow_mut();
+        if !outbox
+            .iter()
+            .any(|request| matches!(request, RealmRequest::Image(id) if *id == element))
+        {
+            outbox.push(RealmRequest::Image(element));
+        }
     }
 
     /// Queues a connected `<script src>` element for its fetch prepare steps.
     pub(crate) fn queue_script(&mut self, element: NodeId) {
-        if !self.state.pending_scripts.contains(&element) {
-            self.state.pending_scripts.push(element);
+        let mut outbox = self.outbox.borrow_mut();
+        if !outbox
+            .iter()
+            .any(|request| matches!(request, RealmRequest::Script(id) if *id == element))
+        {
+            outbox.push(RealmRequest::Script(element));
         }
-    }
-
-    pub(crate) fn take_pending_scripts(&mut self) -> Vec<NodeId> {
-        std::mem::take(&mut self.state.pending_scripts)
     }
 
     /// Queues violations for targets the caller cannot dispatch into (the
@@ -1992,7 +1992,19 @@ impl World {
         target: NodeId,
         violations: Vec<crate::csp::Violation>,
     ) {
-        self.state.pending_csp_violations.push((target, violations));
+        self.outbox
+            .borrow_mut()
+            .push(RealmRequest::CspViolation(target, violations));
+    }
+
+    /// Takes the realm's outgoing work for one drain pass.
+    pub(crate) fn take_outbox(&mut self) -> Vec<RealmRequest> {
+        std::mem::take(&mut *self.outbox.borrow_mut())
+    }
+
+    /// Drops work the old realm queued; a navigation owns a new queue.
+    pub(crate) fn clear_outbox(&mut self) {
+        self.outbox.borrow_mut().clear();
     }
 
     /// Appends one in-head `meta` policy the first time it is seen

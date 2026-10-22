@@ -16,7 +16,9 @@ use url::Url;
 
 use crate::Parsed;
 use crate::ReadyState;
-use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
+use crate::js::{
+    DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, RealmRequest, World,
+};
 use crate::messaging::SharedHandle;
 use crate::protocol::{
     BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent, ResponseHead,
@@ -360,7 +362,9 @@ pub(crate) struct Document {
     events: Vec<RendererEvent>,
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
-    js_timer_slots: HashMap<u32, i32>,
+    /// Live JS timers by the id script holds, and the reverse for firing.
+    js_timers: HashMap<i32, u32>,
+    timer_js_ids: HashMap<u32, i32>,
     /// One count for every operation delaying this document's `load` event.
     load_delay: LoadDelay,
     /// Whether init scripts were deferred because the realm was created while
@@ -494,7 +498,8 @@ impl Document {
             events: Vec::new(),
             events_overflowed: false,
             js: None,
-            js_timer_slots: HashMap::new(),
+            js_timers: HashMap::new(),
+            timer_js_ids: HashMap::new(),
             load_delay: LoadDelay::default(),
             init_scripts_deferred: false,
             defer_js: false,
@@ -1561,11 +1566,12 @@ impl Document {
         self.image_selected_src.clear();
         self.in_flight_images.clear();
         self.connected_images.clear();
-        let js_timer_ids: std::collections::HashSet<u32> =
-            self.js_timer_slots.keys().copied().collect();
+        let js_timer_pages: std::collections::HashSet<u32> =
+            self.js_timers.values().copied().collect();
         self.timers
-            .retain(|timer| !js_timer_ids.contains(&timer.id));
-        self.js_timer_slots.clear();
+            .retain(|timer| !js_timer_pages.contains(&timer.id));
+        self.js_timers.clear();
+        self.timer_js_ids.clear();
         self.js = None;
         self.init_scripts_deferred = false;
         self.active_parse = None;
@@ -1575,11 +1581,15 @@ impl Document {
         self.world.borrow_mut().state.current_script = None;
         let mut world = self.world.borrow_mut();
         let bytes = world
-            .pending_html_writes
+            .outbox
+            .borrow()
             .iter()
-            .map(String::len)
+            .filter_map(|request| match request {
+                RealmRequest::HtmlWrite(value) => Some(value.len()),
+                _ => None,
+            })
             .sum::<usize>();
-        world.pending_html_writes.clear();
+        world.clear_outbox();
         world.release_stream_bytes(bytes);
         self.parser_blocked_script = None;
         self.deferred_modules.clear();
@@ -1827,6 +1837,7 @@ impl Document {
         if !self.parser_eof {
             return;
         }
+        self.adopt_js_work();
         let Some(ActiveParse {
             mut buffer,
             delay,
@@ -1856,12 +1867,6 @@ impl Document {
                 self.mime_guard.no_sniff,
                 apache,
             ));
-        }
-        let pending = std::mem::take(&mut self.world.borrow_mut().pending_html_writes);
-        let pending_bytes = pending.iter().map(String::len).sum::<usize>();
-        self.world.borrow().release_stream_bytes(pending_bytes);
-        for chunk in pending {
-            buffer.push_str(&chunk);
         }
         // XML MIME types use the XML parser. HTML, and a script's
         // `document.open()`, do not

@@ -172,9 +172,11 @@ impl DialLedger {
         self.js_fetches + self.queued_js_fetches
     }
 
-    pub(crate) fn cancel_fetches(&mut self, ids: &HashSet<i32>) {
+    /// Drops a queued or in-flight page fetch for one JS id, running its
+    /// cancellation handle.
+    pub(crate) fn cancel_fetch(&mut self, id: i32) {
         self.cancel_where(|context| {
-            matches!(context, DialContext::JsFetch { id } if ids.contains(id))
+            matches!(context, DialContext::JsFetch { id: queued } if *queued == id)
         });
     }
 
