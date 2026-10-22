@@ -63,10 +63,11 @@ fn run(cli: &Cli) -> ExitCode {
         Some(Command::Webdriver {
             port,
             profile,
+            proxy,
             resolve,
             tls_ca,
         }) => {
-            let options = match resolve_config(resolve, tls_ca) {
+            let options = match network_config(proxy.as_ref(), resolve, tls_ca) {
                 Ok(options) => options,
                 Err(error) => return usage_error(&error),
             };
@@ -113,10 +114,16 @@ fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
     )
 }
 
-/// Raw `--resolve` specs and `--tls-ca` PEM bytes for [`browser::Agent::new`], which
-/// validates them when the browser opens. Only file-read errors fail here.
-fn resolve_config(specs: &[String], tls_ca: &[PathBuf]) -> Result<AgentOptions, String> {
+/// Parsed `--proxy` plus raw `--resolve` specs and `--tls-ca` PEM bytes for
+/// [`browser::Agent::new`], which validates them when the browser opens. Only
+/// file-read errors fail here.
+fn network_config(
+    proxy: Option<&browser::Proxy>,
+    specs: &[String],
+    tls_ca: &[PathBuf],
+) -> Result<AgentOptions, String> {
     let mut options = AgentOptions {
+        proxy: proxy.cloned(),
         resolve: specs.to_vec(),
         ..AgentOptions::default()
     };

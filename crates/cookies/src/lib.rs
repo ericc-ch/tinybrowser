@@ -33,8 +33,6 @@ pub enum InitiatorKind {
     Navigation,
     /// Scripted `fetch()`.
     Fetch,
-    /// WebSocket handshake.
-    WsHandshake,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -792,9 +790,8 @@ impl CookieOp<'_> {
 ///
 /// Follows the `SameSite` definition in
 /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site>.
-/// The `ws` and `wss` schemes name the `http` and `https` sites, because a
-/// WebSocket handshake is an HTTP request. Opaque URLs, and schemes outside
-/// that family, are never same-site with anything.
+/// The `ws` and `wss` schemes name the `http` and `https` sites. Opaque URLs,
+/// and schemes outside that family, are never same-site with anything.
 #[must_use]
 pub fn schemeful_same_site(a: &Url, b: &Url) -> bool {
     match (site_tuple(a), site_tuple(b)) {
@@ -815,8 +812,7 @@ pub fn site(url: &Url) -> Option<String> {
 }
 
 fn site_tuple(url: &Url) -> Option<(String, String)> {
-    // A WebSocket handshake is an HTTP request: `ws` and `wss` name the http
-    // and https sites, which is how a page and its socket compare same-site.
+    // `ws` and `wss` name the http and https sites.
     let scheme = match url.scheme() {
         "http" | "ws" => "http",
         "https" | "wss" => "https",

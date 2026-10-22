@@ -1849,19 +1849,17 @@ dependencies = [
  "base64",
  "bytes",
  "cookies",
- "futures-util",
  "http-body-util",
  "hyper",
  "hyper-tls",
  "hyper-util",
  "native-tls",
+ "percent-encoding",
  "serde",
  "thiserror",
  "tokio",
  "tokio-native-tls",
- "tokio-tungstenite",
  "tower-service",
- "tungstenite",
  "url",
 ]
 
@@ -3506,9 +3504,7 @@ checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
- "native-tls",
  "tokio",
- "tokio-native-tls",
  "tungstenite",
 ]
 
@@ -3619,7 +3615,6 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "native-tls",
  "rand",
  "sha1",
  "thiserror",
