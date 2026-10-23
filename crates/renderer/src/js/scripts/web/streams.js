@@ -22,7 +22,11 @@ const __tbWritableBrand = value => __tbBrand(value, __tbWritableData);
 globalThis.ReadableStream = class ReadableStream {
   constructor(source, strategy) {
     const sourceObject = source === undefined ? {} : Object(source);
-    const type = sourceObject.type === 'bytes' ? 'bytes' : 'default';
+    // Read source fields only when they are own properties, so a throwing
+    // `Object.prototype.start` (or `type`) cannot affect stream creation
+    // (<https://streams.spec.whatwg.org/#readable-stream-initialize>).
+    const own = key => __tbGetOwnPropertyDescriptor(sourceObject, key) !== undefined;
+    const type = own('type') && sourceObject.type === 'bytes' ? 'bytes' : 'default';
     let resolveClosed;
     let rejectClosed;
     const closedPromise = new Promise((resolve, reject) => {
@@ -38,8 +42,8 @@ globalThis.ReadableStream = class ReadableStream {
       disturbed: false, cancelWaiters: [], readWaiters: [],
       closedPromise, resolveClosed, rejectClosed,
       type,
-      pull: typeof sourceObject.pull === 'function' ? sourceObject.pull : null,
-      cancel: typeof sourceObject.cancel === 'function' ? sourceObject.cancel : null,
+      pull: own('pull') && typeof sourceObject.pull === 'function' ? sourceObject.pull : null,
+      cancel: own('cancel') && typeof sourceObject.cancel === 'function' ? sourceObject.cancel : null,
       controller: null,
       source: sourceObject,
     };
@@ -64,7 +68,7 @@ globalThis.ReadableStream = class ReadableStream {
       },
       get desiredSize() { return data.closed ? null : 1; },
     };
-    if (typeof sourceObject.start === 'function') {
+    if (own('start') && typeof sourceObject.start === 'function') {
       try {
         sourceObject.start(data.controller);
       } catch (error) {
@@ -307,7 +311,8 @@ globalThis.WritableStream = class WritableStream {
       get desiredSize() { return data.closed ? 0 : 1; },
     };
     __tbWritableData.set(this, data);
-    if (typeof sinkObject.start === 'function') {
+    if (__tbGetOwnPropertyDescriptor(sinkObject, 'start') !== undefined
+        && typeof sinkObject.start === 'function') {
       try {
         const result = sinkObject.start(data.controller);
         if (result !== undefined && result !== null && typeof result.then === 'function') {
