@@ -46,6 +46,10 @@ blitz-dom = { path = "third_party/blitz/packages/blitz-dom" }
 blitz-html = { path = "third_party/blitz/packages/blitz-html" }
 blitz-paint = { path = "third_party/blitz/packages/blitz-paint" }
 blitz-traits = { path = "third_party/blitz/packages/blitz-traits" }
+# The published 0.3.0-beta.4 predates the CopyStyleGetters trait the Stylo
+# bump introduced; the vendored copy in the blitz fork has it, and renderer
+# needs the trait to keep its direct clone_* calls compiling.
+stylo_taffy = { path = "third_party/blitz/packages/stylo_taffy" }
 # The xml5ever parser fork. It builds against registry markup5ever so the
 # whole graph shares one atom/tendril/TreeSink type family.
 xml5ever = { path = "third_party/html5ever/xml5ever" }

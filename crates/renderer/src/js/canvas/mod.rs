@@ -4066,7 +4066,7 @@ fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<[u8; 4]> {
     else {
         return Ok(BLACK);
     };
-    let computed = styles.get_inherited_text().clone_color();
+    let computed = styles.get_inherited_text().color.clone();
     let absolute = computed.to_color_space(style::color::ColorSpace::Srgb);
     let components = absolute.components;
     Ok(crate::css::color::to_bytes([

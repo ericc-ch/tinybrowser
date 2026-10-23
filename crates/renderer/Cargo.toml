@@ -52,8 +52,11 @@ parley = { version = "0.12", default-features = false, features = ["libm"] }
 png = "0.18"
 # SVG `naturalWidth`/`naturalHeight` read Blitz's parsed intrinsic lengths.
 svgtypes = "0.16"
-style = { package = "stylo", version = "0.22.0" }
-style_traits = { package = "stylo_traits", version = "0.22.0" }
+# Stylo is a `links` crate: one copy per graph. The blitz fork pins a
+# DioxusLabs/stylo rev; the renderer's direct stylo use must pin the same
+# rev or the resolver builds a second servo_style_crate and fails.
+style = { package = "stylo", version = "0.22.0", git = "https://github.com/DioxusLabs/stylo", rev = "d6502e0002e9c40c43a0a4776f9e7eb93be360e3" }
+style_traits = { package = "stylo_traits", version = "0.22.0", git = "https://github.com/DioxusLabs/stylo", rev = "d6502e0002e9c40c43a0a4776f9e7eb93be360e3" }
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
 # Pinned exact: beta drift is fast, and Cargo.lock pins the rest. The pin
 # must track `version.workspace` in third_party/blitz/Cargo.toml, or
@@ -63,6 +66,9 @@ style_traits = { package = "stylo_traits", version = "0.22.0" }
 blitz-dom = { version = "=0.3.0-beta.4", features = ["floats"] }
 blitz-html = "=0.3.0-beta.4"
 blitz-paint = "=0.3.0-beta.4"
+# Patched to the blitz fork's vendored copy: the published 0.3.0-beta.4 lacks
+# CopyStyleGetters, which keeps the renderer's clone_* calls compiling.
+stylo_taffy = "=0.3.0-beta.4"
 anyrender_tiny_skia = { path = "../anyrender-tiny-skia" }
 # SVG <img> sources must be rasterized into pixels for drawImage; the SVG
 # renderer is already linked through blitz-paint, so this adds no new code.

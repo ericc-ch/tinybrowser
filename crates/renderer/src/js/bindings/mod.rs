@@ -47,6 +47,7 @@ use std::rc::{Rc, Weak};
 
 use blitz_dom::NodeData;
 use markup5ever::{LocalName, Namespace, Prefix, QualName};
+use stylo_taffy::CopyStyleGetters;
 
 use crate::dom::TreeError;
 use crate::dom::tree::{NodeId, is_real_element, sibling};
