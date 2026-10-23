@@ -1320,7 +1320,8 @@ globalThis.fetch = function(input, init) {
       if (responseType !== 'error') {
         // A redirect in manual mode is an opaque-redirect filtered response
         // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque-redirect>).
-        if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
+        if (responseType === 'opaqueredirect'
+            || (redirect === 'manual' && (status === 301 || status === 302 || status === 303 || status === 307 || status === 308))) {
           finish(resolve, __tbMakeResponse(null, 0, '', url, '', [], 'opaqueredirect', false, false));
           return;
         }

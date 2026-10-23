@@ -983,6 +983,19 @@ fn classify_response(
     hop: &Hop,
 ) -> Result<HopOutcome, NetError> {
     cors_gate(&response, dial, hop)?;
+    let settings = dial.cors;
+    // Manual mode never validates or follows Location; the response is an
+    // opaque-redirect filtered response
+    // (<https://fetch.spec.whatwg.org/#http-redirect-fetch>).
+    if settings.redirect == crate::cors::RedirectMode::Manual
+        && matches!(response.status(), 301 | 302 | 303 | 307 | 308)
+    {
+        return Ok(HopOutcome::Final(Box::new(finalize(
+            response,
+            crate::cors::ResponseType::OpaqueRedirect,
+            dial.credentials_include(),
+        ))));
+    }
     let Some(location) = followable_location(response.status(), response.headers()) else {
         return Ok(HopOutcome::Final(Box::new(finalize(
             response,
@@ -991,7 +1004,6 @@ fn classify_response(
         ))));
     };
     let next = resolve_location(current_url, &location)?;
-    let settings = dial.cors;
     // A redirect to a URL that includes credentials is a network error
     // once the request is `cors`-tainted or would cross an origin
     // (<https://fetch.spec.whatwg.org/#http-redirect-fetch>, steps 9-10).
@@ -1007,14 +1019,8 @@ fn classify_response(
         crate::cors::RedirectMode::Error => {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
-        crate::cors::RedirectMode::Manual => {
-            return Ok(HopOutcome::Final(Box::new(finalize(
-                response,
-                crate::cors::ResponseType::OpaqueRedirect,
-                dial.credentials_include(),
-            ))));
-        }
-        crate::cors::RedirectMode::Follow => {}
+        // Manual returned above; unreachable here.
+        crate::cors::RedirectMode::Manual | crate::cors::RedirectMode::Follow => {}
     }
     Ok(HopOutcome::Redirect { next })
 }
