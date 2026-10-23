@@ -38,6 +38,10 @@ which clones each submodule's object store again.
 - Update: pull upstream in the submodule, push the fork branch, bump
   the pointer here. Check pins with git submodule status. Fresh clones
   (canonical checkout): git submodule update --init --recursive.
+- Conflicts: upstream wins. Take upstream's shape and re-apply the fork
+  patch on top of it, even where the fork had fixed the code the change
+  rewrites. The fork carries fixes upstream has not taken yet; it is not
+  a competing design.
 
 ## Vendored crates (ship in binary)
 
