@@ -90,7 +90,8 @@ pub(crate) fn is_iframe_element(base: &blitz_dom::BaseDocument, id: BlitzNodeId)
             return false;
         };
         element.name.ns == html_namespace()
-            && element.name.local == markup5ever::local_name!("iframe")
+            && (element.name.local == markup5ever::local_name!("iframe")
+                || element.name.local == markup5ever::local_name!("frame"))
     })
 }
 
@@ -259,9 +260,11 @@ pub(crate) fn first_element_with_id(
             continue;
         };
         if node.data.downcast_element().is_some_and(|element| {
-            element
-                .attr(markup5ever::LocalName::from("id"))
-                .is_some_and(|value| value == id)
+            element.attrs().iter().any(|attribute| {
+                attribute.name.local.as_str() == "id"
+                    && attribute.name.ns == markup5ever::ns!()
+                    && attribute.value == id
+            })
         }) {
             return Some(NodeId {
                 document,

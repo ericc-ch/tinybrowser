@@ -238,9 +238,24 @@
         }
       case 'TEXTAREA':
         return isMutable(element) && element.value === '';
-      case 'SELECT':
-        // The select clause does not require mutability.
-        return element.value === '';
+      case 'SELECT': {
+        // A required select is missing when no option is selected, or when
+        // the first option is its placeholder label option: the first option
+        // element child of the select with an empty value. A listbox
+        // (`multiple` or `size` greater than one) has no placeholder
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:attr-select-required-4>).
+        const options = Array.from(element.options);
+        if (element.multiple || element.size > 1) {
+          return !options.some(option => option.selected);
+        }
+        if (options.length === 0) return true;
+        const first = options[0];
+        // A wrapper element does not stop the first option from being the
+        // placeholder; an `optgroup` does
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#placeholder-label-option>).
+        const grouped = first.closest('optgroup') !== null;
+        return first.selected && !grouped && first.value === '';
+      }
       default:
         return false;
     }
@@ -532,6 +547,7 @@
   const FLAGS = {
     valueMissing,
     typeMismatch,
+    badInput: element => host.slots('tinybrowser.number.badinput').has(element),
     patternMismatch,
     tooLong,
     tooShort,
@@ -630,7 +646,9 @@
     },
     setCustomValidity: {
       value: function(message) {
-        customErrors.set(this, String(message));
+        // The message is normalized to LF line breaks
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-cva-setcustomvalidity>).
+        customErrors.set(this, String(message).replace(/\r\n|\r/g, '\n'));
       },
       writable: true,
       enumerable: true,
@@ -958,6 +976,70 @@
     }
     return out;
   };
+  // The DOM side stores UTF-8, so a lone surrogate must become U+FFFD
+  // before it crosses the JS boundary; the form data set conversion and the
+  // attribute setters both apply the same replacement
+  // (<https://infra.spec.whatwg.org/#javascript-string-convert>).
+  const wellFormedSetter = (prototype, property, nullToEmpty = false) => {
+    if (!prototype) return;
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+    if (descriptor === undefined || descriptor.set === undefined) return;
+    Object.defineProperty(prototype, property, {
+      get: descriptor.get,
+      set(value) {
+        const text = nullToEmpty && value === null ? '' : String(value);
+        descriptor.set.call(this, toWellFormed(text));
+      },
+      enumerable: descriptor.enumerable,
+      configurable: true,
+    });
+  };
+  wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'name');
+  wellFormedSetter(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype, 'value', true);
+  wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'name');
+  wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'value', true);
+  wellFormedSetter(globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype, 'value', true);
+  wellFormedSetter(globalThis.HTMLOptionElement && globalThis.HTMLOptionElement.prototype, 'value');
+  // Convert the domain of each address to ASCII for the email state's value
+  // sanitization
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-email-state-(type=email)>).
+  const emailValue = text => text.split(',').map(address => {
+    const at = address.lastIndexOf('@');
+    if (at < 0) return address;
+    const domain = address.slice(at + 1);
+    if (domain === '') return address;
+    try {
+      return address.slice(0, at + 1) + new globalThis.URL('http://' + domain + '/').hostname;
+    } catch (error) {
+      return address;
+    }
+  }).join(',');
+  // The tentative `switch` attribute on a checkbox is a reflected boolean;
+  // the stable IDL has no member for it yet
+  // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-switch>).
+  if (globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype) {
+    Object.defineProperty(globalThis.HTMLInputElement.prototype, 'switch', {
+      get() { return this.hasAttribute('switch'); },
+      set(value) {
+        if (value) this.setAttribute('switch', '');
+        else this.removeAttribute('switch');
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  const inputValueDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis.HTMLInputElement.prototype, 'value');
+  Object.defineProperty(globalThis.HTMLInputElement.prototype, 'value', {
+    get() {
+      const value = inputValueDescriptor.get.call(this);
+      return this.type === 'email' ? emailValue(value) : value;
+    },
+    set(value) { inputValueDescriptor.set.call(this, toWellFormed(String(value))); },
+    enumerable: inputValueDescriptor.enumerable,
+    configurable: true,
+  });
+
   // A `File`/`Blob` entry serializes as its file name
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
   const entryValueString = value =>
@@ -1146,6 +1228,10 @@
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>
   Object.defineProperty(globalThis.HTMLFormElement.prototype, 'submit', {
     value: function() {
+      // A form that is not connected (or whose document navigated away) has
+      // no browsing context to submit to
+      // (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>).
+      if (!host.__tbFormCanSubmit(this)) return;
       runSubmission(this);
     },
     writable: true,
@@ -1173,9 +1259,16 @@
     },
   });
 
+  // The form's "firing submission events" flag: a nested submission attempt
+  // while validation or the `submit` event runs returns without firing again
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm>).
+  const formsFiringSubmission = host.slots('tb-form-firing-submission');
+
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-requestsubmit>
   Object.defineProperty(globalThis.HTMLFormElement.prototype, 'requestSubmit', {
     value: function(submitter) {
+      if (!host.__tbFormCanSubmit(this)) return;
+      if (formsFiringSubmission.has(this)) return;
       if (submitter !== undefined && submitter !== null) {
         const tag = submitter.tagName;
         const isSubmit = tag === 'BUTTON'
@@ -1193,14 +1286,19 @@
       // (<https://html.spec.whatwg.org/multipage/forms.html#interactively-validate-the-constraints>).
       const noValidate = this.noValidate
         || (submitter !== undefined && submitter !== null && submitter.formNoValidate);
-      if (!noValidate && !this.checkValidity()) return;
-      const event = new SubmitEvent('submit', {
-        submitter: submitter === undefined ? null : submitter,
-        bubbles: true,
-        cancelable: true,
-      });
-      if (!this.dispatchEvent(event)) return;
-      runSubmission(this, submitter);
+      formsFiringSubmission.add(this);
+      try {
+        if (!noValidate && !this.checkValidity()) return;
+        const event = new SubmitEvent('submit', {
+          submitter: submitter === undefined ? null : submitter,
+          bubbles: true,
+          cancelable: true,
+        });
+        if (!this.dispatchEvent(event)) return;
+        runSubmission(this, submitter);
+      } finally {
+        formsFiringSubmission.delete(this);
+      }
     },
     writable: true,
     enumerable: true,
@@ -1543,6 +1641,17 @@
       if (direction < 0 && value > valueBefore) return;
       if (direction > 0 && value < valueBefore) return;
     }
+    if (type === 'number' || type === 'range') {
+      // Round binary floating-point noise back to the step's decimal scale,
+      // so 1.2 - 0.3 serializes as 0.9
+      // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-stepdown>).
+      const text = raw === null ? String(fallback) : asciiTrim(raw);
+      const match = /^[+-]?(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text);
+      const fraction = match === null ? 0 : (match[2] || '').length;
+      const exponent = match === null ? 0 : Number(match[3] || 0);
+      const scale = Math.max(0, fraction - exponent);
+      if (scale <= 20) value = Number(value.toFixed(scale));
+    }
     element.value = formatValueInUnit(type, value);
   };
 
@@ -1644,6 +1753,10 @@
   };
   // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-showpicker>
   const showPicker = element => {
+    if (!host.__tbSameOriginWithTop()) {
+      throw new DOMException(
+        'showPicker() requires same-origin with the top-level window', 'SecurityError');
+    }
     if (!controlIsMutable(element)) {
       throw new DOMException('The element is not mutable', 'InvalidStateError');
     }

@@ -2511,10 +2511,12 @@ pub(super) fn run_html_insertion_steps(
                     })
                     .unwrap_or(false);
                 World::materialize_iframe(&world(ctx)?, id);
-                if fire_load {
-                    super::super::window::fire_node_load(ctx, id)?;
-                    let _ = world(ctx)?.borrow_mut().insertion_load_fired.insert(id);
-                }
+                // The initial `load` is an element task, not part of the
+                // insertion steps: the engine fires it after the child frame's
+                // realm exists, so `contentWindow.location` is readable in the
+                // handler
+                // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+                let _ = fire_load;
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
             InsertionStep::Meta(id) => {

@@ -45,29 +45,32 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    let base = &parsed.document.base;
-    let Some(tree) = base.get_node(node.node) else {
-        return Ok(false);
+    Ok(is_focusable_in(&parsed.document.base, node.node))
+}
+
+fn is_focusable_in(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    let Some(tree) = base.get_node(node) else {
+        return false;
     };
     let Some(element) = tree.data.downcast_element() else {
-        return Ok(false);
+        return false;
     };
-    if !is_connected(base, node.node) || is_actually_disabled(base, node.node) {
-        return Ok(false);
+    if !is_connected(base, node) || is_actually_disabled(base, node) {
+        return false;
     }
     // `tabindex` applies to SVG elements too.
-    if attr(base, node.node, "tabindex").is_some() {
-        return Ok(true);
+    if attr(base, node, "tabindex").is_some() {
+        return true;
     }
     if element.name.ns != html_namespace() {
-        return Ok(false);
+        return false;
     }
-    Ok(match element.name.local.as_str() {
-        "input" => !is_hidden_input(base, node.node),
-        "a" => attr(base, node.node, "href").is_some(),
+    match element.name.local.as_str() {
+        "input" => !is_hidden_input(base, node),
+        "a" => attr(base, node, "href").is_some(),
         "button" | "select" | "textarea" => true,
         _ => false,
-    })
+    }
 }
 
 /// The HTML "actually disabled" check for the form controls the engine
@@ -281,7 +284,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         event.borrow().initialize("click".to_owned(), true, true);
         let not_canceled = events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
         if not_canceled {
-            complete_activation(ctx, node)?;
+            complete_activation(ctx, node, &previous)?;
         } else {
             legacy_canceled_activation(ctx, node, &previous)?;
         }
@@ -292,7 +295,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
 }
 
 /// The checkedness state a canceled click restores.
-enum PreActivation {
+pub(crate) enum PreActivation {
     None,
     Checkbox { checked: bool },
     Radio(Option<NodeId>),
@@ -301,7 +304,7 @@ enum PreActivation {
 /// The legacy-pre-activation behavior: a checkbox toggles, a radio becomes
 /// checked and remembers the group's previous checked radio. Blitz keeps no
 /// checkedness slot, so the `checked` attribute is the whole state.
-fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
+pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(node) else {
@@ -333,28 +336,39 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
             previous
         }
         "radio" => {
-            let previous = radio_group_checked(&parsed.document.base, node.document, node.node);
-            let name = attr(&parsed.document.base, node.node, "name").unwrap_or_default();
-            let members = crate::dom::forms::radio_group_members(
-                &parsed.document.base,
-                node.document,
-                name,
-                node.node,
-            );
-            let mut mutator = parsed.document.base.mutate();
-            for member in members {
-                mutator.set_checkedness(member.node, false);
+            // An already checked radio has no pre-activation change; the
+            // click fires no `input` or `change`
+            // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio):activation-behavior>).
+            if checkedness(&parsed.document.base, node.node) {
+                PreActivation::None
+            } else {
+                let previous = radio_group_checked(&parsed.document.base, node.document, node.node);
+                let name = attr(&parsed.document.base, node.node, "name").unwrap_or_default();
+                let members = crate::dom::forms::radio_group_members(
+                    &parsed.document.base,
+                    node.document,
+                    name,
+                    node.node,
+                );
+                let mut mutator = parsed.document.base.mutate();
+                for member in members {
+                    mutator.set_checkedness(member.node, false);
+                }
+                mutator.set_checkedness(node.node, true);
+                mutator.set_indeterminate(node.node, false);
+                PreActivation::Radio(previous)
             }
-            mutator.set_checkedness(node.node, true);
-            mutator.set_indeterminate(node.node, false);
-            PreActivation::Radio(previous)
         }
         _ => PreActivation::None,
     })
 }
 
 /// The legacy-canceled-activation behavior: undo the pre-activation change.
-fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivation) -> Result<()> {
+pub(crate) fn legacy_canceled_activation(
+    ctx: &Ctx<'_>,
+    node: NodeId,
+    previous: &PreActivation,
+) -> Result<()> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(node) else {
@@ -390,22 +404,31 @@ fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivat
 /// The post-click activation for a non-canceled click. A checkbox or radio
 /// already changed checkedness in pre-activation, so only its events fire;
 /// other controls run their activation behavior.
-fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
-    let world = world_for_node(ctx, node)?;
-    let checkable = {
+pub(crate) fn complete_activation(
+    ctx: &Ctx<'_>,
+    node: NodeId,
+    previous: &PreActivation,
+) -> Result<()> {
+    // Checkbox and radio checkedness already moved in pre-activation. Only a
+    // click that stays a checkbox or radio fires `input` and `change`; a
+    // handler that changes the type to submit must still run the new default
+    // action. An already checked radio returns no pre-activation change, so
+    // the ordinary activation behavior observes no change
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:activation-behavior>).
+    let still_checkable = {
+        let world = world_for_node(ctx, node)?;
         let world = world.borrow();
         world.document(node).is_some_and(|parsed| {
             let base = &parsed.document.base;
-            base.get_node(node.node)
-                .and_then(|tree| tree.data.downcast_element())
-                .is_some_and(|element| {
-                    element.name.ns == html_namespace()
-                        && element.name.local.as_str() == "input"
-                        && matches!(input_type(base, node.node).as_str(), "checkbox" | "radio")
-                })
+            matches!(input_type(base, node.node).as_str(), "checkbox" | "radio")
         })
     };
-    if checkable {
+    if still_checkable
+        && matches!(
+            previous,
+            PreActivation::Checkbox { .. } | PreActivation::Radio(_)
+        )
+    {
         fire_checkable_events(ctx, node)
     } else {
         run_activation(ctx, node)
@@ -681,7 +704,10 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                     "color" | "date" | "datetime-local" | "file" | "month" | "time" | "week"
                 );
                 match kind.as_str() {
-                    "submit" => Activation::Submit,
+                    // An image button submits with its coordinates; the
+                    // submission shim decides whether to add them
+                    // (<https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):activation-behavior>).
+                    "submit" | "image" => Activation::Submit,
                     "reset" => Activation::Reset,
                     "checkbox" | "radio" => Activation::ToggleCheckedness,
                     _ => Activation::None,
@@ -819,6 +845,138 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>) -> Result<()> {
         "__tbConsumeUserActivation",
         rquickjs::prelude::Func::from(consume_user_activation),
     )?;
+    globals.set("__tbSetActive", rquickjs::prelude::Func::from(set_active))?;
+    globals.set("__tbFocusNext", rquickjs::prelude::Func::from(focus_next))?;
+    Ok(())
+}
+
+/// Moves sequential focus to the next or previous focusable area. A radio
+/// button group is one focusable area: its checked member, else its first
+/// member, represents the group
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
+    let world_rc = super::world(&ctx)?;
+    let (focusables, representative_of, current) = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.main_document() else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let document = parsed.id;
+        let mut order = Vec::new();
+        let mut stack = vec![base.root_node().id];
+        while let Some(id) = stack.pop() {
+            order.push(NodeId { document, node: id });
+            if let Some(node) = base.get_node(id) {
+                stack.extend(node.children.iter().rev().copied());
+            }
+        }
+        let mut positions = std::collections::HashMap::new();
+        for (index, node) in order.iter().enumerate() {
+            positions.insert(*node, index);
+        }
+        let mut focusables = Vec::new();
+        let mut representative_of = std::collections::HashMap::new();
+        for node in order {
+            if !is_focusable_in(base, node.node) {
+                continue;
+            }
+            if input_type(base, node.node) == "radio" {
+                let name = attr(base, node.node, "name").unwrap_or_default();
+                let mut group =
+                    crate::dom::forms::radio_group_members(base, document, name, node.node);
+                group.push(node);
+                group.sort_by_key(|member| positions.get(member).copied().unwrap_or(usize::MAX));
+                let checked = group
+                    .iter()
+                    .find(|member| checkedness(base, member.node))
+                    .copied();
+                let representative = checked
+                    .filter(|member| is_focusable_in(base, member.node))
+                    .or_else(|| {
+                        group
+                            .iter()
+                            .copied()
+                            .find(|member| is_focusable_in(base, member.node))
+                    });
+                if let Some(representative) = representative {
+                    for member in &group {
+                        representative_of.insert(*member, representative);
+                    }
+                    // The group's one tab stop sits at the checked member's
+                    // position; an unchecked group uses its first member
+                    // (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation>).
+                    if representative == node {
+                        focusables.push(node);
+                    }
+                }
+                continue;
+            }
+            focusables.push(node);
+        }
+        (
+            focusables,
+            representative_of,
+            world.active_element(document),
+        )
+    };
+    if focusables.is_empty() {
+        return Ok(());
+    }
+    let index = current.and_then(|active| focusables.iter().position(|node| *node == active));
+    // A focused radio can stop being the group's tab stop when another member
+    // becomes checked. Forward navigation then moves to the new representative
+    // instead of restarting at the document's first control.
+    if index.is_none()
+        && !backward
+        && let Some(representative) = current.and_then(|active| representative_of.get(&active))
+        && focusables.contains(representative)
+    {
+        return focus_node(&ctx, *representative);
+    }
+    let next = if backward {
+        index.map_or(focusables.len() - 1, |at| {
+            if at == 0 {
+                focusables.len() - 1
+            } else {
+                at - 1
+            }
+        })
+    } else {
+        index.map_or(0, |at| (at + 1) % focusables.len())
+    };
+    focus_node(&ctx, focusables[next])
+}
+
+/// Sets or clears the `:active` state on one element. The input paths call
+/// this for pointer presses, space presses, and the label's associated
+/// control, and clear it when focus moves away
+/// (<https://drafts.csswg.org/selectors/#the-active-pseudo>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn set_active<'js>(ctx: Ctx<'js>, element: Value<'js>, active: bool) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(());
+    };
+    let world_rc = world_for_node(&ctx, node)?;
+    let world = world_rc.borrow_mut();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(());
+    };
+    let Some(tree) = parsed.document.base.get_node_mut(node.node) else {
+        return Ok(());
+    };
+    if active {
+        tree.active();
+    } else {
+        tree.unactive();
+    }
     Ok(())
 }
 
@@ -971,8 +1129,7 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
     if is_focusable(&ctx, node)? {
         focus_node(&ctx, node)?;
     }
-    if events::fire_trusted_click(&ctx, EventTargetKey::Node(node))? {
-        run_activation(&ctx, node)?;
-    }
+    // The dispatch runs the activation behavior for a non-canceled click.
+    events::fire_trusted_click(&ctx, EventTargetKey::Node(node))?;
     Ok(())
 }

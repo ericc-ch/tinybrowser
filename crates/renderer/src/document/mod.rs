@@ -817,19 +817,34 @@ impl Document {
         );
     }
 
-    /// Loads the frame's initial `about:blank`, inheriting `inherited_url` as
-    /// the document URL and `inherited_origin` as the captured origin when the
-    /// parent supplies them
+    /// Gives a blank document the URL `about:blank` and the creator's base
+    /// URL for relative resolution.
+    fn apply_blank_url(
+        &mut self,
+        inherited_url: Option<&str>,
+        inherited_origin: Option<url::Origin>,
+    ) {
+        let Some(base) = inherited_url.and_then(|url| Url::parse(url).ok()) else {
+            return;
+        };
+        let blank = Url::parse("about:blank").expect("about:blank is a valid URL");
+        self.set_document_url(blank, inherited_origin);
+        self.world.borrow_mut().base_url = Some(base);
+    }
+
+    /// Loads the frame's initial `about:blank`, with `inherited_url` as its
+    /// fallback base URL and `inherited_origin` as the captured origin. The
+    /// document URL stays `about:blank`: it is what `location.href` reports,
+    /// while relative URLs still resolve against the creator's base URL
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>,
-    /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>,
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
     pub(crate) fn load_about_blank(
         &mut self,
         inherited_url: Option<&str>,
         inherited_origin: Option<url::Origin>,
     ) {
-        if let Some(url) = inherited_url {
-            self.apply_document_url(url, inherited_origin);
-        }
+        self.apply_blank_url(inherited_url, inherited_origin);
         // No HTTP response stands behind a blank document.
         self.http_status = 0;
         self.load_html("");
@@ -876,9 +891,7 @@ impl Document {
         inherited_url: Option<&str>,
         inherited_origin: Option<url::Origin>,
     ) {
-        if let Some(url) = inherited_url {
-            self.apply_document_url(url, inherited_origin);
-        }
+        self.apply_blank_url(inherited_url, inherited_origin);
         self.defer_js = true;
         self.load_html("");
         self.defer_js = false;
@@ -955,12 +968,6 @@ impl Document {
         }
         drop(world);
         self.url = url;
-    }
-
-    fn apply_document_url(&mut self, url: &str, origin: Option<url::Origin>) {
-        if let Ok(url) = Url::parse(url) {
-            self.set_document_url(url, origin);
-        }
     }
 
     fn apply_document_url_same_origin(&mut self, url: &str) {
@@ -1871,7 +1878,27 @@ impl Document {
             }
             parsed
         } else {
-            let mut parsed = crate::parse_html(&buffer, self.blitz_config());
+            // `text/plain` is not parsed as markup: the response bytes become
+            // the document's text verbatim, so character references such as
+            // `&#601;` stay literal. Wrapping the escaped text in `pre` keeps
+            // whitespace and gives the frame a body with that text
+            // (<https://mimesniff.spec.whatwg.org/#sniffing-a-mime-type>,
+            // <https://html.spec.whatwg.org/multipage/rendering.html#the-pre-element>).
+            let plain = self
+                .response_content_type
+                .as_deref()
+                .and_then(crate::sniff::extract_mime_type)
+                .is_some_and(|mime| mime.eq_ignore_ascii_case("text/plain"));
+            let markup = if plain {
+                let escaped = buffer
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+                format!("<pre>\n{escaped}</pre>")
+            } else {
+                buffer
+            };
+            let mut parsed = crate::parse_html(&markup, self.blitz_config());
             parsed.character_set = self.character_set;
             // A non-XML response still records its MIME type on the
             // document. Images, style sheets, and plain text in a frame

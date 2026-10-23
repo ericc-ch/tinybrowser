@@ -40,6 +40,23 @@
     });
   };
   const fire = (node, event) => node ? host.__tbDispatchTargetTrusted(node, event) : false;
+  let activeNode = null;
+  const clearActive = () => {
+    if (activeNode !== null) {
+      try { host.__tbSetActive(activeNode, false); } catch (error) {}
+      activeNode = null;
+    }
+  };
+  const setActive = node => {
+    clearActive();
+    if (!node || typeof host.__tbSetActive !== 'function') return;
+    let target = node;
+    if (node.localName === 'label') target = node.control || node;
+    try {
+      host.__tbSetActive(target, true);
+      activeNode = target;
+    } catch (error) {}
+  };
   const pointerItem = (state, item) => {
     if (item.type === 'pointerMove') {
       const center = centerOf(item.origin);
@@ -71,6 +88,7 @@
       const node = at(state.x, state.y);
       state.target = node;
       if (node && typeof node.focus === 'function') { try { node.focus(); } catch (error) {} }
+      setActive(node);
       fire(node, new PointerEvent('pointerdown', pointerInit(state, state.x, state.y, state.buttons, { button: button })));
       fire(node, new MouseEvent('mousedown', mouseInit(state.x, state.y, state.buttons, { button: button })));
     } else if (item.type === 'pointerUp') {
@@ -79,13 +97,14 @@
       // `pointerup` report the buttons still held
       // (<https://w3c.github.io/uievents/#dom-mouseevent-buttons>).
       state.buttons &= ~(1 << button);
+      clearActive();
       const node = at(state.x, state.y);
       fire(node, new PointerEvent('pointerup', pointerInit(state, state.x, state.y, state.buttons, { button: button })));
       fire(node, new MouseEvent('mouseup', mouseInit(state.x, state.y, state.buttons, { button: button })));
-      if (button === 0 && fire(node, new MouseEvent('click', mouseInit(state.x, state.y, 0, { button: 0 })))) {
-        // A non-canceled click runs the activation behavior
-        // (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
-        if (typeof host.__tbActivate === 'function') host.__tbActivate(node);
+      if (button === 0) {
+        // Events dispatch runs the activation behavior for a non-canceled
+        // click (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
+        fire(node, new MouseEvent('click', mouseInit(state.x, state.y, 0, { button: 0 })));
       }
     } else if (item.type === 'pointerCancel') {
       fire(at(state.x, state.y), new PointerEvent('pointercancel', pointerInit(state, state.x, state.y, state.buttons)));
@@ -137,6 +156,63 @@
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#do-not-apply>).
   const supportsSelection = element =>
     element.tagName === 'TEXTAREA' || element.selectionStart !== null;
+  // The number and date-like states reject the selection APIs, but typing
+  // still needs a caret. Keep one per element for those controls; it starts
+  // at the end and follows edits.
+  const internalCaret = new WeakMap();
+  // A number control's exposed value is sanitized to empty while the user has
+  // typed only a partial number (`1e`), but the editor must remember that
+  // partial text so the next keystroke can complete it
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-number-state-(type=number)>).
+  const numberBuffer = new WeakMap();
+  const badInputs = host.slots('tinybrowser.number.badinput');
+  const editText = element =>
+    element.tagName === 'INPUT' && element.type === 'number'
+      ? (numberBuffer.get(element) ?? element.value)
+      : element.value;
+  const caretStart = element => {
+    const text = editText(element);
+    if (supportsSelection(element)) {
+      return element.selectionStart === null || element.selectionStart === undefined
+        ? text.length : element.selectionStart;
+    }
+    const position = internalCaret.get(element);
+    return position === undefined ? text.length : Math.min(position, text.length);
+  };
+  const caretEnd = element => {
+    const text = editText(element);
+    if (supportsSelection(element)) {
+      return element.selectionEnd === null || element.selectionEnd === undefined
+        ? text.length : element.selectionEnd;
+    }
+    const position = internalCaret.get(element);
+    return position === undefined ? text.length : Math.min(position, text.length);
+  };
+  const setCaret = (element, position) => {
+    if (supportsSelection(element)) element.setSelectionRange(position, position);
+    else internalCaret.set(element, position);
+  };
+  // A number control may hold a partial number while the user types
+  // (`-`, `1.`, `1e+`). Anything else is rejected instead of corrupting the
+  // value into something `valueAsNumber` cannot read
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-number-state-(type=number)>).
+  const numberPrefix = /^[+-]?(?:\d+\.?\d*|\.\d+)?(?:[eE][+-]?\d*)?$/;
+  const completeNumber = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+  // A programmatic value assignment starts a fresh edit at the new end.
+  const inputValue = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement.prototype, 'value');
+  Object.defineProperty(globalThis.HTMLInputElement.prototype, 'value', {
+    get: inputValue.get,
+    set(value) {
+      internalCaret.delete(this);
+      numberBuffer.delete(this);
+      badInputs.delete(this);
+      // `[LegacyNullToEmptyString]` maps null to the empty string before the
+      // DOMString conversion (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
+      inputValue.set.call(this, value === null ? '' : value);
+    },
+    enumerable: inputValue.enumerable,
+    configurable: true,
+  });
   const fireInput = (element, inputType, data) => {
     fire(element, new InputEvent('input', {
       bubbles: true, composed: true, inputType: inputType, data: data,
@@ -151,35 +227,56 @@
     });
     if (!fire(element, before)) return;
     if (typeof host.__tbMarkUserEdited === 'function') host.__tbMarkUserEdited(element);
+    if (element.tagName === 'INPUT' && element.type === 'number') {
+      const buffer = editText(element);
+      const value = buffer.slice(0, start) + text + buffer.slice(end);
+      if (value !== '' && !numberPrefix.test(value)) return;
+      numberBuffer.set(element, value);
+      // A trailing dot parses as the integer before it, so `1.` exposes `1`
+      // rather than bad input. Other incomplete buffers expose the empty
+      // string and set `badInput`. A leading `+` stays in the edit buffer but
+      // is dropped from the sanitized value, which the number state does not
+      // accept
+      // (<https://html.spec.whatwg.org/multipage/input.html#the-number-state-(type=number)>).
+      let exposed = '';
+      if (completeNumber.test(value)) {
+        exposed = value.startsWith('+') ? value.slice(1) : value;
+        badInputs.delete(element);
+      } else if (/^[+-]?\d+\.$/.test(value)) {
+        exposed = value.startsWith('+') ? value.slice(1, -1) : value.slice(0, -1);
+        badInputs.delete(element);
+      } else if (value === '') {
+        badInputs.delete(element);
+      } else {
+        badInputs.add(element);
+      }
+      host.__tbSetNativeValue(element, exposed);
+      setCaret(element, start + text.length);
+      fireInput(element, inputType, data);
+      return;
+    }
     const value = element.value.slice(0, start) + text + element.value.slice(end);
     // Native user editing changes the control's internal value without
     // invoking an author-defined own `value` setter. React observes the
     // subsequent input event against its previous tracked value.
     // <https://html.spec.whatwg.org/multipage/interaction.html#input-events>
     host.__tbSetNativeValue(element, value);
-    if (supportsSelection(element)) {
-      const position = start + text.length;
-      element.setSelectionRange(position, position);
-    }
+    setCaret(element, start + text.length);
     fireInput(element, inputType, data);
   };
   const insertText = text => {
     const element = textControl();
     if (!element) return;
-    const start = element.selectionStart === undefined || element.selectionStart === null
-      ? element.value.length : element.selectionStart;
-    const end = element.selectionEnd === undefined || element.selectionEnd === null
-      ? start : element.selectionEnd;
+    const start = caretStart(element);
+    const end = Math.max(start, caretEnd(element));
     replaceRange(element, text, start, end, 'insertText', text);
   };
   const deleteText = backwards => {
     const element = textControl();
     if (!element) return;
-    const length = element.value.length;
-    const start = element.selectionStart === null || element.selectionStart === undefined
-      ? length : element.selectionStart;
-    const end = element.selectionEnd === null || element.selectionEnd === undefined
-      ? length : element.selectionEnd;
+    const length = editText(element).length;
+    const start = caretStart(element);
+    const end = Math.max(start, caretEnd(element));
     if (start === end) {
       if (backwards && start === 0) return;
       if (!backwards && end === length) return;
@@ -192,16 +289,32 @@
   };
   const moveCaret = to => {
     const element = textControl();
-    if (!element || !supportsSelection(element)) return;
-    const length = element.value.length;
-    const start = element.selectionStart;
-    const end = element.selectionEnd;
+    if (!element) return;
+    const length = editText(element).length;
+    const start = caretStart(element);
+    const end = Math.max(start, caretEnd(element));
     let position;
     if (to === 'home') position = 0;
     else if (to === 'end') position = length;
     else if (to === 'left') position = start === end ? Math.max(0, start - 1) : start;
     else position = start === end ? Math.min(length, end + 1) : end;
-    element.setSelectionRange(position, position);
+    setCaret(element, position);
+  };
+  let shiftDown = false;
+  // Arrow keys inside a radio group move focus and checkedness together,
+  // skipping other controls between the radios
+  // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-input-element:radio-button-group>).
+  const radioArrow = direction => {
+    const current = document.activeElement;
+    if (!current || current.localName !== 'input' || current.type !== 'radio') return false;
+    const radios = Array.from(document.querySelectorAll('input[type=radio]')).filter(radio =>
+      radio.name === current.name && radio.form === current.form && !radio.disabled);
+    const index = radios.indexOf(current);
+    if (index < 0 || radios.length === 0) return true;
+    const next = radios[(index + direction + radios.length) % radios.length];
+    next.focus();
+    next.click();
+    return true;
   };
   const keyItem = (item, down) => {
     const value = item.value === undefined ? '' : String(item.value);
@@ -212,8 +325,23 @@
         bubbles: true, cancelable: true, key: info.key, code: info.code,
       }));
       if (accepted) {
-        if (value.length === 1) insertText(value);
-        else if (value === '\uE00D') insertText(' ');
+        if (value === '\uE008') shiftDown = true;
+        else if (value === '\uE00D') {
+          const focused = document.activeElement;
+          if (focused && focused.localName === 'input'
+              && (focused.type === 'checkbox' || focused.type === 'radio')
+              && !focused.disabled) {
+            setActive(focused);
+          }
+          insertText(' ');
+        } else if (value === '\uE004') {
+          clearActive();
+          if (typeof host.__tbFocusNext === 'function') host.__tbFocusNext(shiftDown);
+        } else if (value === '\uE015') {
+          if (!radioArrow(1)) { /* not a radio group */ }
+        } else if (value === '\uE013') {
+          if (!radioArrow(-1)) { /* not a radio group */ }
+        } else if (value.length === 1) insertText(value);
         else if (value === '\uE003') deleteText(true);
         else if (value === '\uE017') deleteText(false);
         else if (value === '\uE011') moveCaret('home');
@@ -221,8 +349,12 @@
         else if (value === '\uE012') moveCaret('left');
         else if (value === '\uE014') moveCaret('right');
       }
-      if (value.length === 1) fire(node, new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key: info.key, code: info.code }));
+      if (value.length === 1 && value.charCodeAt(0) < 0xE000) {
+        fire(node, new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key: info.key, code: info.code }));
+      }
     } else {
+      if (value === '\uE00D') clearActive();
+      if (value === '\uE008') shiftDown = false;
       fire(node, new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: info.key, code: info.code }));
     }
   };
@@ -266,6 +398,10 @@
         else if (character === '\uE012') moveCaret('left');
         else if (character === '\uE014') moveCaret('right');
         else if (character === '\uE00D') insertText(' ');
+        else if (character === '\uE004') {
+          clearActive();
+          if (typeof host.__tbFocusNext === 'function') host.__tbFocusNext(false);
+        }
       } else {
         insertText(character);
       }

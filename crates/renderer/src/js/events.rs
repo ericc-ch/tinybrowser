@@ -1164,6 +1164,27 @@ fn dispatch<'js>(
     // https://html.spec.whatwg.org/multipage/webappapis.html#set-the-current-event
     let previous: Value<'js> = window.get("event")?;
     window.set("event", Class::into_value(event.clone()))?;
+    // A click event runs the element's legacy-pre-activation behavior before
+    // its listeners and completes or rolls it back after dispatch. `click()`
+    // owns that sequence itself, so it marks the dispatch to skip this path
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior>).
+    let click_activation = if typ == "click"
+        && let EventTargetKey::Node(node) = target
+    {
+        let running = super::bindings::world_for_node(ctx, node)?
+            .borrow()
+            .click_in_progress(node);
+        if running {
+            None
+        } else {
+            Some((
+                node,
+                super::bindings::focus::legacy_pre_activation(ctx, node)?,
+            ))
+        }
+    } else {
+        None
+    };
     let result = run_invocations(ctx, event, &path, target, bubbles);
     // Handler attributes (`onreadystatechange`, `onload`, …) act as listeners;
     // the engine runs them after the listener list until it models the
@@ -1202,6 +1223,13 @@ fn dispatch<'js>(
     // A click event runs the activation behavior of a label ancestor after
     // dispatch, including for events the page dispatched itself
     // (<https://html.spec.whatwg.org/multipage/forms.html#the-label-element:activation-behavior>).
+    if let Some((node, previous)) = click_activation {
+        if canceled {
+            super::bindings::focus::legacy_canceled_activation(ctx, node, &previous)?;
+        } else {
+            super::bindings::focus::complete_activation(ctx, node, &previous)?;
+        }
+    }
     if typ == "click"
         && !canceled
         && let EventTargetKey::Node(node) = target

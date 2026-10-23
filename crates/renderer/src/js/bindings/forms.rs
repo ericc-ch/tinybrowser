@@ -53,7 +53,59 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbSetOptionSelectedness",
         rquickjs::prelude::Func::from(set_option_selectedness),
     )?;
+    globals.set(
+        "__tbFormCanSubmit",
+        rquickjs::prelude::Func::from(form_can_submit),
+    )?;
+    globals.set(
+        "__tbSameOriginWithTop",
+        rquickjs::prelude::Func::from(same_origin_with_top),
+    )?;
     Ok(())
+}
+
+/// Whether the calling realm is same origin with its top-level traversable.
+/// `showPicker()` requires it, and `document.domain` does not widen it
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-showpicker>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn same_origin_with_top(ctx: Ctx<'_>) -> Result<bool> {
+    let current = world(&ctx)?;
+    let frame = current.borrow().frame();
+    let top = current
+        .borrow()
+        .runtime
+        .shared
+        .borrow()
+        .tree
+        .top_level(frame);
+    if top == frame {
+        return Ok(true);
+    }
+    let Some(top_world) = current.borrow().frame_world(top) else {
+        return Ok(false);
+    };
+    let same = current.borrow().origin == top_world.borrow().origin;
+    Ok(same)
+}
+
+/// Whether `form` can start a submission: a stale wrapper or a form outside
+/// the main document has no browsing context to navigate
+/// (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn form_can_submit<'js>(ctx: Ctx<'js>, form: Value<'js>) -> bool {
+    let Some(node) = host_node_id(&ctx, &form) else {
+        return false;
+    };
+    let Some(owner) = owning_world(&ctx, node) else {
+        return false;
+    };
+    !focus::cannot_navigate(&owner.borrow(), node)
 }
 
 /// Resolves an encoding label to its canonical name, or `null`
