@@ -497,6 +497,12 @@ pub struct DialRequest {
     /// Ask the browser to return headers first and stream the decoded body.
     #[serde(default)]
     pub stream_body: bool,
+    /// Source document URL for recomputing the referrer on redirects.
+    #[serde(default)]
+    pub referrer_source: Option<String>,
+    /// Referrer policy attached to the request.
+    #[serde(default)]
+    pub referrer_policy: Option<String>,
 }
 
 /// The CORS parameters a page `fetch`/XHR sends over the wire. The browser

@@ -176,6 +176,8 @@ pub(crate) struct JsFetchRequest {
     pub integrity: Option<String>,
     pub cache: String,
     pub stream_body: bool,
+    pub referrer_source: Option<String>,
+    pub referrer_policy: Option<String>,
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -1023,6 +1025,8 @@ impl JsRealm {
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "default".to_owned());
                     let stream_body = parts.next().is_some_and(|value| value == "1");
+                    let referrer_source = parts.next().filter(|value| !value.is_empty());
+                    let referrer_policy = parts.next().filter(|value| !value.is_empty());
                     let cors = mode.map(|mode| crate::protocol::CorsRequest {
                         mode,
                         credentials,
@@ -1030,7 +1034,7 @@ impl JsRealm {
                     });
                     fetch_outbox
                         .borrow_mut()
-                        .push_back(RealmRequest::Fetch(JsFetchRequest {
+                        .push_back(RealmRequest::Fetch(Box::new(JsFetchRequest {
                             url,
                             js_id,
                             method,
@@ -1044,7 +1048,9 @@ impl JsRealm {
                             integrity,
                             cache,
                             stream_body,
-                        }));
+                            referrer_source,
+                            referrer_policy,
+                        })));
                     Ok::<(), rquickjs::Error>(())
                 },
             ),
@@ -1774,6 +1780,8 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             integrity: None,
             cache: None,
             stream_body: false,
+            referrer_source: None,
+            referrer_policy: None,
         });
     match outcome {
         // The header list stays as served; nothing is sniffed into it

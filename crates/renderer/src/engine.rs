@@ -987,6 +987,8 @@ impl Engine {
                             integrity: None,
                             cache: None,
                             stream_body: false,
+                            referrer_source: None,
+                            referrer_policy: None,
                         },
                         ancestors,
                     );

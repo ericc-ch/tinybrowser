@@ -45,6 +45,40 @@ impl Loader for WebModuleLoader {
     }
 }
 
+fn module_request_blocked(
+    world_rc: &std::rc::Rc<std::cell::RefCell<super::World>>,
+    ctx: &Ctx<'_>,
+    name: &str,
+) -> Result<()> {
+    let Ok(url) = url::Url::parse(name) else {
+        return Ok(());
+    };
+    let violations = {
+        let world = world_rc.borrow();
+        world.csp.check_request(
+            &world.origin,
+            &world.document_url,
+            &url,
+            crate::csp::Destination::Script,
+            None,
+        )
+    };
+    if violations.is_empty() {
+        return Ok(());
+    }
+    let blocked = crate::csp::blocks(&violations);
+    if let Ok(target) = super::bindings::main_document(ctx) {
+        // The module loader runs inside QuickJS; dispatch later.
+        world_rc
+            .borrow_mut()
+            .queue_csp_violations(target, violations);
+    }
+    if blocked {
+        return Err(Error::new_loading(name));
+    }
+    Ok(())
+}
+
 pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js, Declared>> {
     // A JavaScript module graph is fetched before evaluation
     // (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-a-single-module-script>).
@@ -66,30 +100,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     // A module graph fetch is a script request; check it before the renderer
     // waits on the dial
     // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
-    if let Ok(url) = url::Url::parse(name) {
-        let violations = {
-            let world = world_rc.borrow();
-            world.csp.check_request(
-                &world.origin,
-                &world.document_url,
-                &url,
-                crate::csp::Destination::Script,
-                None,
-            )
-        };
-        if !violations.is_empty() {
-            let blocked = crate::csp::blocks(&violations);
-            if let Ok(target) = super::bindings::main_document(ctx) {
-                // The module loader runs inside QuickJS; dispatch later.
-                world_rc
-                    .borrow_mut()
-                    .queue_csp_violations(target, violations);
-            }
-            if blocked {
-                return Err(Error::new_loading(name));
-            }
-        }
-    }
+    module_request_blocked(&world_rc, ctx, name)?;
 
     let (send, receive) = mpsc::sync_channel(1);
     let cancel = services.start_dial(
@@ -111,6 +122,8 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             integrity: None,
             cache: None,
             stream_body: false,
+            referrer_source: None,
+            referrer_policy: None,
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);

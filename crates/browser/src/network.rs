@@ -71,7 +71,13 @@ struct CacheKey {
 
 /// A whole buffered response. The fetch body is already bounded by
 /// `MAX_RESPONSE_BODY_BYTES`, so the cache holds at most that much per entry.
-type ResponseCache = Arc<Mutex<HashMap<CacheKey, DialOutcome>>>;
+#[derive(Clone)]
+struct CachedResponse {
+    outcome: DialOutcome,
+    stored_at: Instant,
+}
+
+type ResponseCache = Arc<Mutex<HashMap<CacheKey, CachedResponse>>>;
 
 enum StreamMessage {
     Chunk(Vec<u8>),
@@ -105,6 +111,24 @@ fn response_forbids_storage(outcome: &DialOutcome) -> bool {
         name.eq_ignore_ascii_case("cache-control")
             && value.to_ascii_lowercase().contains("no-store")
     })
+}
+
+fn fresh(entry: &CachedResponse) -> bool {
+    let age = entry.stored_at.elapsed().as_secs();
+    entry
+        .outcome
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        .flat_map(|(_, value)| value.split(','))
+        .filter_map(|directive| directive.trim().split_once('='))
+        .any(|(name, value)| {
+            name.eq_ignore_ascii_case("max-age")
+                && value
+                    .trim()
+                    .parse::<u64>()
+                    .is_ok_and(|max_age| age <= max_age)
+        })
 }
 
 fn etag(outcome: &DialOutcome) -> Option<String> {
@@ -374,7 +398,7 @@ impl TabNetworkHandle {
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"));
         let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
-            .then(|| cached.as_ref().and_then(etag))
+            .then(|| cached.as_ref().and_then(|entry| etag(&entry.outcome)))
             .flatten();
         logging::trace!(
             target: "browser::net",
@@ -416,7 +440,7 @@ impl TabNetworkHandle {
                 && !explicit_validator
                 && let Some(cached) = cached.as_ref()
             {
-                return Ok(merge_not_modified(cached, &response));
+                return Ok(merge_not_modified(&cached.outcome, &response));
             }
             let redirect_count = response.redirect_count();
             let final_url = response.final_url().to_string();
@@ -479,7 +503,7 @@ impl TabNetworkHandle {
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"));
         let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
-            .then(|| cached.as_ref().and_then(etag))
+            .then(|| cached.as_ref().and_then(|entry| etag(&entry.outcome)))
             .flatten();
         let cache_key = cache_key(request);
         let budget = if request.timeout_ms == 0 {
@@ -509,7 +533,7 @@ impl TabNetworkHandle {
             && !explicit_validator
             && let Some(cached) = cached.as_ref()
         {
-            return Ok(merge_not_modified(cached, &response));
+            return Ok(merge_not_modified(&cached.outcome, &response));
         }
         let status_text = response.status_text().to_owned();
         let final_url = response.final_url().to_string();
@@ -595,7 +619,7 @@ impl TabNetworkHandle {
             .remove(&id);
     }
 
-    fn cached_hit(&self, request: &DialRequest) -> Option<DialOutcome> {
+    fn cached_hit(&self, request: &DialRequest) -> Option<CachedResponse> {
         if request.kind != DialKind::JsFetch {
             return None;
         }
@@ -609,15 +633,31 @@ impl TabNetworkHandle {
     fn cached_response(
         request: &DialRequest,
         mode: &str,
-        cached: Option<&DialOutcome>,
+        cached: Option<&CachedResponse>,
     ) -> Result<Option<DialOutcome>, DialFailure> {
-        if request.kind != DialKind::JsFetch || !matches!(mode, "force-cache" | "only-if-cached") {
+        if request.kind != DialKind::JsFetch {
             return Ok(None);
         }
-        if cached.is_none() && mode == "only-if-cached" {
-            return Err(DialFailure::Connect);
+        if mode == "only-if-cached" {
+            let Some(cached) = cached else {
+                return Err(DialFailure::Connect);
+            };
+            if let (Ok(request_url), Ok(final_url)) = (
+                Url::parse(&request.url),
+                Url::parse(&cached.outcome.final_url),
+            ) && request_url.origin() != final_url.origin()
+            {
+                return Err(DialFailure::Connect);
+            }
+            return Ok(Some(cached.outcome.clone()));
         }
-        Ok(cached.cloned())
+        if mode == "force-cache" {
+            return Ok(cached.map(|entry| entry.outcome.clone()));
+        }
+        if mode == "default" && cached.is_some_and(fresh) {
+            return Ok(cached.map(|entry| entry.outcome.clone()));
+        }
+        Ok(None)
     }
 
     fn remember_response(
@@ -635,7 +675,13 @@ impl TabNetworkHandle {
         self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(cache_key(request), outcome.clone());
+            .insert(
+                cache_key(request),
+                CachedResponse {
+                    outcome: outcome.clone(),
+                    stored_at: Instant::now(),
+                },
+            );
     }
 
     async fn acquire(
@@ -786,6 +832,30 @@ fn outbound_request(
             .insert(name, value)
             .map_err(|_| DialFailure::Connect)?;
     }
+    let destination = match request.kind {
+        DialKind::JsFetch => "empty",
+        DialKind::ClassicScript | DialKind::ModuleScript => "script",
+        DialKind::Stylesheet => "style",
+        DialKind::Image => "image",
+        DialKind::FrameLoad => "iframe",
+        DialKind::CspReport => "report",
+    };
+    let _ = outbound
+        .headers
+        .insert("Sec-Fetch-Dest", destination.as_bytes().to_vec());
+    if request.kind == DialKind::JsFetch {
+        let mode = request
+            .cors
+            .as_ref()
+            .map_or("cors", |cors| match cors.mode {
+                net::cors::RequestMode::NoCors => "no-cors",
+                net::cors::RequestMode::SameOrigin => "same-origin",
+                _ => "cors",
+            });
+        let _ = outbound
+            .headers
+            .insert("Sec-Fetch-Mode", mode.as_bytes().to_vec());
+    }
     if let Some(referrer) = &request.referrer
         // Defense in depth: the renderer computes this per `referrer_for_policy`,
         // but the network boundary re-validates so a compromised renderer cannot
@@ -803,6 +873,12 @@ fn outbound_request(
     outbound.initiator_kind = InitiatorKind::Fetch;
     outbound.initiator = Some(initiator.clone());
     outbound.deadline = Some(deadline);
+    outbound
+        .referrer_source
+        .clone_from(&request.referrer_source);
+    outbound
+        .referrer_policy
+        .clone_from(&request.referrer_policy);
     Ok(outbound)
 }
 
@@ -872,7 +948,13 @@ fn spawn_stream_body(
                             cache
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(cache_key, stored);
+                                .insert(
+                                    cache_key,
+                                    CachedResponse {
+                                        outcome: stored,
+                                        stored_at: Instant::now(),
+                                    },
+                                );
                         }
                         let _ = tx.send(StreamMessage::End);
                     }

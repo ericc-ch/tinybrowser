@@ -256,7 +256,7 @@ pub enum ServiceCall {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NetworkCall {
     /// HTTP request submitted to the browser-owned network executor.
-    Dial(DialRequest),
+    Dial(Box<DialRequest>),
     /// Cancels a dial submitted by this assignment.
     CancelDial { id: RequestId },
     /// Reads the next decoded body chunk for a streamed dial.

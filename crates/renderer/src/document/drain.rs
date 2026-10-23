@@ -255,7 +255,7 @@ impl Document {
                     self.timers.remove(&page_id);
                 }
             }
-            RealmRequest::Fetch(fetch) => self.queue_js_fetch(fetch),
+            RealmRequest::Fetch(fetch) => self.queue_js_fetch(*fetch),
             RealmRequest::AbortFetch(js_id) => self.dials.cancel_fetch(js_id),
             RealmRequest::Script(element) => self.queue_dynamic_script(element),
             RealmRequest::Image(element) => {
@@ -375,6 +375,8 @@ impl Document {
         dial.req.integrity = fetch.integrity;
         dial.req.cache = Some(fetch.cache);
         dial.req.stream_body = fetch.stream_body;
+        dial.req.referrer_source = fetch.referrer_source;
+        dial.req.referrer_policy = fetch.referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

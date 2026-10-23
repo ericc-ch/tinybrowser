@@ -771,6 +771,9 @@ const __tbRequestDuplex = value => {
 globalThis.Request = class Request {
   constructor(input, init) {
     const options = init === undefined ? {} : Object(init);
+    if (options.window !== undefined && options.window !== null) {
+      throw new TypeError('RequestInit.window must be null');
+    }
     const source = input instanceof globalThis.Request ? __tbBrand(input, __tbRequestData) : null;
     let url;
     if (source === null) {
@@ -795,6 +798,12 @@ globalThis.Request = class Request {
       throw new TypeError('only-if-cached requires same-origin mode');
     }
     const integrity = options.integrity !== undefined ? String(options.integrity) : source === null ? '' : source.integrity;
+    if (options.priority !== undefined
+        && options.priority !== 'high'
+        && options.priority !== 'low'
+        && options.priority !== 'auto') {
+      throw new TypeError('Invalid request priority');
+    }
     const keepalive = options.keepalive !== undefined ? Boolean(options.keepalive) : source === null ? false : source.keepalive;
     const duplex = options.duplex !== undefined ? __tbRequestDuplex(options.duplex) : source === null ? 'half' : source.duplex;
     const referrerPolicy = options.referrerPolicy !== undefined ? __tbReferrerPolicy(options.referrerPolicy) : source === null ? '' : source.referrerPolicy;
@@ -847,7 +856,9 @@ globalThis.Request = class Request {
     }
     let stream;
     let bodySize = 0;
+    let bodySourceIsStream;
     if (inheritedBody) {
+      bodySourceIsStream = source.bodySourceIsStream === true;
       if (source.stream === null) {
         stream = null;
       } else {
@@ -864,6 +875,7 @@ globalThis.Request = class Request {
         bodySize = source.bodySize === undefined ? 0 : source.bodySize;
       }
     } else {
+      bodySourceIsStream = options.body instanceof ReadableStream;
       if (source !== null && source.stream !== null && !__tbBodyUsed(source) && !source.stream.locked) {
         // Replacing the body still consumes the source request in the
         // vendored WPT revision this tree pins.
@@ -877,17 +889,17 @@ globalThis.Request = class Request {
       stream = __tbBodyStream(extracted);
       bodySize = extracted.bytes === null ? 0 : extracted.bytes.length;
     }
-    if (keepalive && stream !== null) {
+    if (keepalive && bodySourceIsStream) {
       throw new TypeError('A keepalive request cannot have a stream body');
     }
-    if (stream !== null && mode !== 'same-origin' && mode !== 'cors') {
+    if (bodySourceIsStream && mode !== 'same-origin' && mode !== 'cors') {
       throw new TypeError('A stream body requires same-origin or cors mode');
     }
     // A Request keeps a blob URL's data alive, so fetching it still works
     // after revokeObjectURL (<https://w3c.github.io/FileAPI/#lifeTime>).
     const blob = source !== null ? source.blob : url.indexOf('blob:') === 0 ? __tbLookupObjectUrl(url) : null;
     __tbRequestData.set(this, {
-      url, method, blob, headers, stream, bodyUsed: false, bodySize, mode, credentials, redirect,
+      url, method, blob, headers, stream, bodySourceIsStream, bodyUsed: false, bodySize, mode, credentials, redirect,
       referrer, referrerPolicy, cache, integrity, keepalive, duplex, signal,
       destination: source === null ? '' : source.destination,
       isReloadNavigation: false,
@@ -1018,6 +1030,8 @@ const __tbQueuePageRequest = (url, method, body, headers, cors, referrer, callba
       cors.integrity === undefined ? '' : String(cors.integrity),
       cors.cache === undefined ? '' : String(cors.cache),
       cors.stream === true ? '1' : '0',
+      cors.referrerSource === undefined || cors.referrerSource === null ? '' : String(cors.referrerSource),
+      cors.referrerPolicy === undefined ? '' : String(cors.referrerPolicy),
     ]);
   }).catch(() => {
     const done = host.__tb_fetchCbs[id];
@@ -1197,6 +1211,10 @@ globalThis.fetch = function(input, init) {
       cache: data.cache,
       // HEAD has no body, and SRI has to see the whole body before exposure.
       stream: method !== 'HEAD' && data.integrity === '',
+      referrerSource: data.referrer === 'about:client'
+        ? host.__tbResolveUrl('', undefined)
+        : data.referrer,
+      referrerPolicy: data.referrerPolicy,
     }, referrer, outcome => {
       const status = outcome.status;
       const statusText = outcome.statusText;

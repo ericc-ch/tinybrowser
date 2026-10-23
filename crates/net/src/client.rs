@@ -450,6 +450,13 @@ impl Agent {
                 .append(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
         }
         let mut url = request.url;
+        let initial_referrer = hop
+            .headers
+            .value("referer")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let referrer_source = request.referrer_source.clone().or(initial_referrer);
+        let referrer_policy = request.referrer_policy.clone();
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
         let mut budget = self.engine.budget_at();
@@ -487,6 +494,16 @@ impl Agent {
             }
             cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
             apply_redirect_policy(hop_status, &url, &next, &mut hop);
+            if let Some(source) = referrer_source.as_deref() {
+                let policy = referrer_policy.as_deref().unwrap_or("");
+                match referrer_for(source, &next, policy) {
+                    Some(referrer) => {
+                        hop.headers.remove("referer");
+                        let _ = hop.headers.insert("referer", referrer.into_bytes());
+                    }
+                    None => hop.headers.remove("referer"),
+                }
+            }
             url = next;
             followed += 1;
         }
@@ -641,6 +658,12 @@ pub struct Request {
     /// (`1` for the first redirect) before the hop is followed. `false`
     /// rejects the dial. Unset follows every redirect the cap allows.
     pub on_redirect: Option<RedirectGate>,
+    /// Source document URL used to recompute `Referer` on every redirect
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    pub referrer_source: Option<String>,
+    /// Referrer policy for redirect recomputation. Empty means the default
+    /// `strict-origin-when-cross-origin`.
+    pub referrer_policy: Option<String>,
 }
 
 impl std::fmt::Debug for Request {
@@ -656,6 +679,8 @@ impl std::fmt::Debug for Request {
             .field("deadline", &self.deadline)
             .field("cors", &self.cors)
             .field("on_redirect", &self.on_redirect.is_some())
+            .field("referrer_source", &self.referrer_source)
+            .field("referrer_policy", &self.referrer_policy)
             .finish()
     }
 }
@@ -682,6 +707,8 @@ impl Request {
             deadline: None,
             cors,
             on_redirect: None,
+            referrer_source: None,
+            referrer_policy: None,
         }
     }
 }
@@ -712,6 +739,61 @@ fn resolve_location(current: &Url, location: &str) -> Result<Url, NetError> {
         next.set_fragment(Some(fragment));
     }
     Ok(next)
+}
+
+/// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>
+fn referrer_for(source: &str, target: &Url, policy: &str) -> Option<String> {
+    let mut source = Url::parse(source).ok()?;
+    if !matches!(source.scheme(), "http" | "https") {
+        return None;
+    }
+    source.set_username("").ok()?;
+    source.set_password(None).ok()?;
+    source.set_fragment(None);
+    let same_origin = source.origin() == target.origin();
+    let downgrade = source.scheme() == "https" && target.scheme() != "https";
+    let origin = format!("{}/", source.origin().ascii_serialization());
+    let policy = if policy.is_empty() {
+        "strict-origin-when-cross-origin"
+    } else {
+        policy
+    };
+    let referrer = match policy {
+        "no-referrer" => return None,
+        "same-origin" => same_origin.then(|| source.to_string())?,
+        "origin" => origin,
+        "strict-origin" => {
+            if downgrade {
+                return None;
+            }
+            origin
+        }
+        "origin-when-cross-origin" => {
+            if same_origin {
+                source.to_string()
+            } else {
+                origin
+            }
+        }
+        "no-referrer-when-downgrade" => {
+            if downgrade {
+                return None;
+            }
+            source.to_string()
+        }
+        "unsafe-url" => source.to_string(),
+        _ => {
+            if downgrade {
+                return None;
+            }
+            if same_origin {
+                source.to_string()
+            } else {
+                origin
+            }
+        }
+    };
+    Some(referrer)
 }
 
 // https://fetch.spec.whatwg.org/#http-redirect-fetch

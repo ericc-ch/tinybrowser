@@ -252,7 +252,6 @@ pub fn is_forbidden_request_header(name: &str) -> bool {
             | "origin"
             | "referer"
             | "set-cookie"
-            | "set-cookie2"
             | "te"
             | "trailer"
             | "transfer-encoding"
