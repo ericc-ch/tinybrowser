@@ -84,7 +84,10 @@ pub(crate) fn is_connected(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> b
 }
 
 /// Whether `node` is an HTML `iframe` element.
-pub(crate) fn is_iframe_element(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
+pub(crate) fn is_child_navigable_container(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+) -> bool {
     base.get_node(id).is_some_and(|node| {
         let blitz_dom::NodeData::Element(element) = &node.data else {
             return false;

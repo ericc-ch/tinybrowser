@@ -224,7 +224,6 @@ pub(crate) fn pending_entry(
     is_submitter: bool,
 ) -> Vec<PendingEntry> {
     let id = NodeId { document, node };
-    let dirname = dirname_entry(parsed, node, local);
     let base = &parsed.document.base;
     // A dirty value wins. Otherwise the submission value is the `value`
     // content attribute (the default value), or empty when absent.
@@ -295,7 +294,10 @@ pub(crate) fn pending_entry(
         }
         _ => Vec::new(),
     };
-    if let Some(entry) = dirname {
+    if entries.is_empty() {
+        return entries;
+    }
+    if let Some(entry) = dirname_entry(parsed, node, local) {
         entries.push(entry);
     }
     entries

@@ -696,7 +696,7 @@ impl Document {
                 let mut stack = vec![base.root_node().id];
                 while let Some(id) = stack.pop() {
                     if crate::dom::tree::is_connected(base, id) {
-                        if crate::dom::tree::is_iframe_element(base, id) {
+                        if crate::dom::tree::is_child_navigable_container(base, id) {
                             containers.push(crate::dom::tree::NodeId { document, node: id });
                         }
                         if crate::dom::tree::is_html_element(base, id, "img") {
@@ -1888,7 +1888,11 @@ impl Document {
                 .response_content_type
                 .as_deref()
                 .and_then(crate::sniff::extract_mime_type)
-                .is_some_and(|mime| mime.eq_ignore_ascii_case("text/plain"));
+                .is_some_and(|mime| {
+                    mime.split(';').next().is_some_and(|essence| {
+                        essence.trim_ascii().eq_ignore_ascii_case("text/plain")
+                    })
+                });
             let markup = if plain {
                 let escaped = buffer
                     .replace('&', "&amp;")

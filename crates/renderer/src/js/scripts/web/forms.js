@@ -1000,20 +1000,6 @@
   wellFormedSetter(globalThis.HTMLSelectElement && globalThis.HTMLSelectElement.prototype, 'value', true);
   wellFormedSetter(globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype, 'value', true);
   wellFormedSetter(globalThis.HTMLOptionElement && globalThis.HTMLOptionElement.prototype, 'value');
-  // Convert the domain of each address to ASCII for the email state's value
-  // sanitization
-  // (<https://html.spec.whatwg.org/multipage/input.html#the-email-state-(type=email)>).
-  const emailValue = text => text.split(',').map(address => {
-    const at = address.lastIndexOf('@');
-    if (at < 0) return address;
-    const domain = address.slice(at + 1);
-    if (domain === '') return address;
-    try {
-      return address.slice(0, at + 1) + new globalThis.URL('http://' + domain + '/').hostname;
-    } catch (error) {
-      return address;
-    }
-  }).join(',');
   // The tentative `switch` attribute on a checkbox is a reflected boolean;
   // the stable IDL has no member for it yet
   // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-switch>).
@@ -1028,18 +1014,6 @@
       configurable: true,
     });
   }
-  const inputValueDescriptor = Object.getOwnPropertyDescriptor(
-    globalThis.HTMLInputElement.prototype, 'value');
-  Object.defineProperty(globalThis.HTMLInputElement.prototype, 'value', {
-    get() {
-      const value = inputValueDescriptor.get.call(this);
-      return this.type === 'email' ? emailValue(value) : value;
-    },
-    set(value) { inputValueDescriptor.set.call(this, toWellFormed(String(value))); },
-    enumerable: inputValueDescriptor.enumerable,
-    configurable: true,
-  });
-
   // A `File`/`Blob` entry serializes as its file name
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
   const entryValueString = value =>
@@ -1876,11 +1850,11 @@
     Object.defineProperty(globalThis.HTMLProgressElement.prototype, 'position', {
       get() {
         if (!this.hasAttribute('value')) return -1;
-        const value = Number(this.getAttribute('value'));
-        let max = Number(this.getAttribute('max'));
-        if (!Number.isFinite(max) || max <= 0) max = 1;
-        const position = value / max;
-        return Number.isFinite(position) ? Math.min(Math.max(position, 0), 1) : 0;
+        const value = parseDecimal(asciiTrim(this.getAttribute('value')));
+        const maximum = parseDecimal(asciiTrim(this.getAttribute('max')));
+        if (value === null) return 0;
+        const max = maximum === null || maximum.number <= 0 ? 1 : maximum.number;
+        return Math.min(Math.max(value.number / max, 0), 1);
       },
       configurable: true,
     });

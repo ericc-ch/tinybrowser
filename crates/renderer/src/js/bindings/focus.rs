@@ -7,6 +7,7 @@ use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
 use crate::documents::JournalEntry;
+use crate::dom::input::InputType;
 use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected};
 use crate::js::world::EventTargetKey;
 use crate::js::{FrameNavigation, NavigationTarget, World};
@@ -174,14 +175,6 @@ fn write_attr(parsed: &mut crate::Parsed, node: NodeId, local: &str, value: Opti
     });
 }
 
-/// The `type` of an `input`, lowercased and trimmed; missing means `text`.
-fn input_type(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
-    attr(base, node, "type")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-}
-
 /// The group's currently checked radio, if any. An empty or missing `name`
 /// forms no group, so a nameless radio is only its own group member
 /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
@@ -205,6 +198,71 @@ fn checkedness(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
     base.get_node(node)
         .and_then(|target| target.data.downcast_element())
         .is_some_and(blitz_dom::ElementData::checkedness)
+}
+
+/// The indeterminate IDL flag is stored on the element and has no attribute
+/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate>).
+fn indeterminate(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    base.get_node(node)
+        .and_then(|target| target.data.downcast_element())
+        .is_some_and(|element| element.form_state.indeterminate)
+}
+
+/// The activation target for a click: the first node in the event path with an
+/// activation behavior, starting at the event target
+/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
+pub(crate) fn activation_target(ctx: &Ctx<'_>, target: NodeId) -> Result<Option<NodeId>> {
+    let world = world_for_node(ctx, target)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(target) else {
+        return Ok(None);
+    };
+    let base = &parsed.document.base;
+    let mut cursor = Some(target.node);
+    while let Some(current) = cursor {
+        if has_activation(base, current) {
+            return Ok(Some(NodeId {
+                document: target.document,
+                node: current,
+            }));
+        }
+        cursor = base.get_node(current).and_then(|node| node.parent);
+    }
+    Ok(None)
+}
+
+fn has_activation(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    let Some(tree) = base.get_node(node) else {
+        return false;
+    };
+    let Some(element) = tree.data.downcast_element() else {
+        return false;
+    };
+    if element.name.ns != html_namespace() {
+        return false;
+    }
+    match element.name.local.as_str() {
+        "input" => matches!(
+            crate::dom::input::input_type(base, node),
+            Some(
+                InputType::Submit
+                    | InputType::Image
+                    | InputType::Reset
+                    | InputType::Checkbox
+                    | InputType::Radio
+                    | InputType::Color
+                    | InputType::Date
+                    | InputType::DatetimeLocal
+                    | InputType::File
+                    | InputType::Month
+                    | InputType::Time
+                    | InputType::Week
+            )
+        ),
+        "button" | "label" => true,
+        "a" | "area" => attr(base, node, "href").is_some(),
+        _ => false,
+    }
 }
 
 /// Moves focus to `node`. The previously focused area is cleared before the
@@ -297,7 +355,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
 /// The checkedness state a canceled click restores.
 pub(crate) enum PreActivation {
     None,
-    Checkbox { checked: bool },
+    Checkbox { checked: bool, indeterminate: bool },
     Radio(Option<NodeId>),
 }
 
@@ -322,12 +380,16 @@ pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreAc
         if element.name.ns != html_namespace() || element.name.local.as_str() != "input" {
             return Ok(PreActivation::None);
         }
-        input_type(base, node.node)
+        crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text)
     };
-    Ok(match type_attr.as_str() {
-        "checkbox" => {
+    Ok(match type_attr {
+        InputType::Checkbox => {
             let checked = checkedness(&parsed.document.base, node.node);
-            let previous = PreActivation::Checkbox { checked };
+            let indeterminate = indeterminate(&parsed.document.base, node.node);
+            let previous = PreActivation::Checkbox {
+                checked,
+                indeterminate,
+            };
             let mut mutator = parsed.document.base.mutate();
             mutator.set_checkedness(node.node, !checked);
             // Activation clears indeterminateness
@@ -335,7 +397,7 @@ pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreAc
             mutator.set_indeterminate(node.node, false);
             previous
         }
-        "radio" => {
+        InputType::Radio => {
             // An already checked radio has no pre-activation change; the
             // click fires no `input` or `change`
             // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio):activation-behavior>).
@@ -375,14 +437,17 @@ pub(crate) fn legacy_canceled_activation(
         return Ok(());
     };
     match previous {
-        PreActivation::Checkbox { checked } => {
+        PreActivation::Checkbox {
+            checked,
+            indeterminate,
+        } => {
             let mut mutator = parsed.document.base.mutate();
             mutator.set_checkedness(node.node, *checked);
             // A canceled activation restores the pre-click state, including
             // indeterminateness; a handler that set it during the click must
             // not leak that change
             // (<https://html.spec.whatwg.org/multipage/input.html#canceled-activation-steps>).
-            mutator.set_indeterminate(node.node, false);
+            mutator.set_indeterminate(node.node, *indeterminate);
         }
         PreActivation::Radio(Some(other)) => {
             let mut mutator = parsed.document.base.mutate();
@@ -419,8 +484,10 @@ pub(crate) fn complete_activation(
         let world = world_for_node(ctx, node)?;
         let world = world.borrow();
         world.document(node).is_some_and(|parsed| {
-            let base = &parsed.document.base;
-            matches!(input_type(base, node.node).as_str(), "checkbox" | "radio")
+            matches!(
+                crate::dom::input::input_type(&parsed.document.base, node.node),
+                Some(InputType::Checkbox | InputType::Radio)
+            )
         })
     };
     if still_checkable
@@ -475,17 +542,17 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             if element.name.ns != html_namespace() || element.name.local.as_str() != "input" {
                 return Ok(());
             }
-            input_type(base, node.node)
+            crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text)
         };
-        match type_attr.as_str() {
-            "checkbox" => {
+        match type_attr {
+            InputType::Checkbox => {
                 let checked = checkedness(&parsed.document.base, node.node);
                 let mut mutator = parsed.document.base.mutate();
                 mutator.set_checkedness(node.node, !checked);
                 mutator.set_indeterminate(node.node, false);
                 true
             }
-            "radio" => {
+            InputType::Radio => {
                 // A checked radio cannot be unchecked by clicking.
                 if checkedness(&parsed.document.base, node.node) {
                     false
@@ -695,21 +762,28 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let mut consumes_activation = false;
         let activation = match element.name.local.as_str() {
             "input" => {
-                let kind = input_type(base, node.node);
+                let kind =
+                    crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text);
                 // The input activation behavior shows the picker for these
                 // states, which consumes the transient activation
                 // (<https://html.spec.whatwg.org/multipage/input.html#input-activation-behavior>).
                 consumes_activation = matches!(
-                    kind.as_str(),
-                    "color" | "date" | "datetime-local" | "file" | "month" | "time" | "week"
+                    kind,
+                    InputType::Color
+                        | InputType::Date
+                        | InputType::DatetimeLocal
+                        | InputType::File
+                        | InputType::Month
+                        | InputType::Time
+                        | InputType::Week
                 );
-                match kind.as_str() {
+                match kind {
                     // An image button submits with its coordinates; the
                     // submission shim decides whether to add them
                     // (<https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):activation-behavior>).
-                    "submit" | "image" => Activation::Submit,
-                    "reset" => Activation::Reset,
-                    "checkbox" | "radio" => Activation::ToggleCheckedness,
+                    InputType::Submit | InputType::Image => Activation::Submit,
+                    InputType::Reset => Activation::Reset,
+                    InputType::Checkbox | InputType::Radio => Activation::ToggleCheckedness,
                     _ => Activation::None,
                 }
             }
@@ -723,11 +797,13 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 if explicit.is_none() && has_command {
                     Activation::None
                 } else {
-                    match input_type(base, node.node).as_str() {
-                        // The missing and invalid value defaults are both Auto
-                        // (submit); `input_type` of a button reads its own
-                        // `type` attribute the same way.
-                        "reset" => Activation::Reset,
+                    // `type` is an enumerated attribute: no trimming. The
+                    // missing and invalid defaults are Auto (submit); button
+                    // has an activation behavior that does nothing
+                    // (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-button-type>).
+                    match explicit {
+                        Some(value) if value.eq_ignore_ascii_case("reset") => Activation::Reset,
+                        Some(value) if value.eq_ignore_ascii_case("button") => Activation::None,
                         _ => Activation::Submit,
                     }
                 }
@@ -850,6 +926,21 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The element's tabindex for sequential navigation, or `None` when it is
+/// focusable but not sequentially focusable. A negative tabindex is
+/// programmatically focusable only
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#the-tabindex-attribute>).
+fn sequential_tabindex(base: &blitz_dom::BaseDocument, node: BlitzId) -> Option<i64> {
+    if !is_focusable_in(base, node) {
+        return None;
+    }
+    let Some(raw) = attr(base, node, "tabindex") else {
+        return Some(0);
+    };
+    let value = raw.trim_ascii().parse::<i64>().ok()?;
+    (value >= 0).then_some(value)
+}
+
 /// Moves sequential focus to the next or previous focusable area. A radio
 /// button group is one focusable area: its checked member, else its first
 /// member, represents the group
@@ -879,13 +970,13 @@ fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
         for (index, node) in order.iter().enumerate() {
             positions.insert(*node, index);
         }
-        let mut focusables = Vec::new();
+        let mut tab_stops = Vec::new();
         let mut representative_of = std::collections::HashMap::new();
-        for node in order {
-            if !is_focusable_in(base, node.node) {
+        for (order_index, node) in order.into_iter().enumerate() {
+            let Some(tabindex) = sequential_tabindex(base, node.node) else {
                 continue;
-            }
-            if input_type(base, node.node) == "radio" {
+            };
+            if crate::dom::input::input_type(base, node.node) == Some(InputType::Radio) {
                 let name = attr(base, node.node, "name").unwrap_or_default();
                 let mut group =
                     crate::dom::forms::radio_group_members(base, document, name, node.node);
@@ -896,12 +987,12 @@ fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
                     .find(|member| checkedness(base, member.node))
                     .copied();
                 let representative = checked
-                    .filter(|member| is_focusable_in(base, member.node))
+                    .filter(|member| sequential_tabindex(base, member.node).is_some())
                     .or_else(|| {
                         group
                             .iter()
                             .copied()
-                            .find(|member| is_focusable_in(base, member.node))
+                            .find(|member| sequential_tabindex(base, member.node).is_some())
                     });
                 if let Some(representative) = representative {
                     for member in &group {
@@ -911,13 +1002,25 @@ fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
                     // position; an unchecked group uses its first member
                     // (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation>).
                     if representative == node {
-                        focusables.push(node);
+                        tab_stops.push((tabindex, order_index, node));
                     }
                 }
                 continue;
             }
-            focusables.push(node);
+            tab_stops.push((tabindex, order_index, node));
         }
+        tab_stops.sort_by_key(|(tabindex, order_index, _)| {
+            // Positive tabindex values come first in ascending order; zero
+            // and missing values follow in tree order
+            // (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation-starting-point>).
+            let positive = *tabindex > 0;
+            (
+                i32::from(!positive),
+                if positive { *tabindex } else { 0 },
+                *order_index,
+            )
+        });
+        let focusables: Vec<NodeId> = tab_stops.into_iter().map(|(_, _, node)| node).collect();
         (
             focusables,
             representative_of,

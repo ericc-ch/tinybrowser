@@ -49,7 +49,7 @@
   };
   const setActive = node => {
     clearActive();
-    if (!node || typeof host.__tbSetActive !== 'function') return;
+    if (!node) return;
     let target = node;
     if (node.localName === 'label') target = node.control || node;
     try {
@@ -307,10 +307,11 @@
   const radioArrow = direction => {
     const current = document.activeElement;
     if (!current || current.localName !== 'input' || current.type !== 'radio') return false;
+    if (current.name === '') return true;
     const radios = Array.from(document.querySelectorAll('input[type=radio]')).filter(radio =>
       radio.name === current.name && radio.form === current.form && !radio.disabled);
     const index = radios.indexOf(current);
-    if (index < 0 || radios.length === 0) return true;
+    if (index < 0) return true;
     const next = radios[(index + direction + radios.length) % radios.length];
     next.focus();
     next.click();
@@ -336,11 +337,11 @@
           insertText(' ');
         } else if (value === '\uE004') {
           clearActive();
-          if (typeof host.__tbFocusNext === 'function') host.__tbFocusNext(shiftDown);
+          host.__tbFocusNext(shiftDown);
         } else if (value === '\uE015') {
-          if (!radioArrow(1)) { /* not a radio group */ }
+          radioArrow(1);
         } else if (value === '\uE013') {
-          if (!radioArrow(-1)) { /* not a radio group */ }
+          radioArrow(-1);
         } else if (value.length === 1) insertText(value);
         else if (value === '\uE003') deleteText(true);
         else if (value === '\uE017') deleteText(false);
@@ -400,7 +401,7 @@
         else if (character === '\uE00D') insertText(' ');
         else if (character === '\uE004') {
           clearActive();
-          if (typeof host.__tbFocusNext === 'function') host.__tbFocusNext(false);
+          host.__tbFocusNext(false);
         }
       } else {
         insertText(character);

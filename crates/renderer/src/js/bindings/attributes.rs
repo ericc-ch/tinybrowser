@@ -2129,7 +2129,9 @@ pub(crate) fn remove_attribute_sync(
         }
         None => (local.to_owned(), None),
     };
-    after_attribute_change(ctx, element, &changed, previous.as_deref())?;
+    if namespace.is_empty() {
+        after_attribute_change(ctx, element, &changed, previous.as_deref())?;
+    }
     schedule_mutation_delivery(ctx)
 }
 
@@ -2263,7 +2265,9 @@ pub(crate) fn set_attribute_sync(
             .insert(element, value.to_owned());
     }
     touch_attr(ctx, element, &namespace, local, value)?;
-    after_attribute_change(ctx, element, local, old_value.as_deref())?;
+    if namespace.is_empty() {
+        after_attribute_change(ctx, element, local, old_value.as_deref())?;
+    }
     schedule_mutation_delivery(ctx)
 }
 
@@ -2342,7 +2346,9 @@ pub(crate) fn set_attribute_node<'js>(
         });
         (previous, old_value)
     };
-    after_attribute_change(ctx, element, &state.local, old_value.as_deref())?;
+    if state.namespace.is_empty() {
+        after_attribute_change(ctx, element, &state.local, old_value.as_deref())?;
+    }
     schedule_mutation_delivery(ctx)?;
     match previous {
         Some(previous) => attr_wrapper(ctx, previous),

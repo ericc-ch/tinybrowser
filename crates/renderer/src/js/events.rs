@@ -1171,16 +1171,19 @@ fn dispatch<'js>(
     let click_activation = if typ == "click"
         && let EventTargetKey::Node(node) = target
     {
-        let running = super::bindings::world_for_node(ctx, node)?
-            .borrow()
-            .click_in_progress(node);
-        if running {
-            None
-        } else {
-            Some((
-                node,
-                super::bindings::focus::legacy_pre_activation(ctx, node)?,
-            ))
+        let activation = super::bindings::focus::activation_target(ctx, node)?;
+        match activation {
+            Some(activation)
+                if !super::bindings::world_for_node(ctx, activation)?
+                    .borrow()
+                    .click_in_progress(activation) =>
+            {
+                Some((
+                    activation,
+                    super::bindings::focus::legacy_pre_activation(ctx, activation)?,
+                ))
+            }
+            _ => None,
         }
     } else {
         None
@@ -1196,12 +1199,29 @@ fn dispatch<'js>(
     };
     let handler = if result.is_ok() && !stopped {
         let event_value = Class::into_value(event.clone());
-        call_handler_attribute(
-            ctx,
-            path.first().map(|item| &item.target),
-            &typ,
-            &event_value,
-        )
+        // Event handler content attributes are bubble-phase listeners on
+        // their element. The engine does not interleave them with the listener
+        // list yet, but they still run at every node the event reaches, so an
+        // ancestor's `onclick` can cancel the event before activation
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
+        let mut outcome = Ok(());
+        for (index, item) in path.iter().enumerate() {
+            if index > 0 && !bubbles {
+                break;
+            }
+            if index > 0 {
+                let state = event.borrow();
+                let state = state.state();
+                if state.stop_propagation || state.stop_immediate {
+                    break;
+                }
+            }
+            outcome = call_handler_attribute(ctx, Some(&item.target), &typ, &event_value);
+            if outcome.is_err() {
+                break;
+            }
+        }
+        outcome
     } else {
         Ok(())
     };

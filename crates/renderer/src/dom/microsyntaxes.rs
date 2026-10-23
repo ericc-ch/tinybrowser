@@ -441,14 +441,30 @@ pub(crate) fn parse_decimal(input: &str) -> Option<Decimal> {
                 .saturating_add(i64::from(bytes[cursor] - b'0'));
             cursor += 1;
         }
-        if cursor > start {
-            if exponent_negative {
-                exponent = -exponent;
-            }
-            position = cursor;
+        if cursor > start && exponent_negative {
+            exponent = -exponent;
         }
     }
-    let _ = position;
+    // A value that rounds to infinity is a parse error, and one that rounds
+    // to zero is zero. Bound the exponent before expanding it, so an
+    // attribute such as `min="1e99999999999999999999"` cannot allocate an
+    // enormous digit string or abort the renderer
+    // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-floating-point-number-values>).
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Some(Decimal::zero());
+    }
+    let significant_len = i64::try_from(significant.len()).unwrap_or(i64::MAX);
+    let magnitude = significant_len
+        .saturating_sub(1)
+        .saturating_add(exponent)
+        .saturating_sub(i64::from(fraction_digits));
+    if magnitude > 309 {
+        return None;
+    }
+    if magnitude < -324 {
+        return Some(Decimal::zero());
+    }
     let mut scale = i64::from(fraction_digits) - exponent;
     if scale < 0 {
         let zeros = usize::try_from(-scale).ok()?;
@@ -461,6 +477,16 @@ pub(crate) fn parse_decimal(input: &str) -> Option<Decimal> {
         scale: u32::try_from(scale).ok()?,
     };
     decimal.normalize();
+    // The parsing rules reject a value that rounds to infinity and return zero
+    // for one that rounds to zero
+    // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-floating-point-number-values>).
+    let number = decimal.to_f64();
+    if !number.is_finite() {
+        return None;
+    }
+    if number == 0.0 {
+        return Some(Decimal::zero());
+    }
     Some(decimal)
 }
 
@@ -517,7 +543,13 @@ pub(crate) fn align_range(
         aligned = aligned.checked_add(steps.checked_mul(step_at)?)?;
     }
     if aligned < minimum_at || aligned > maximum_at {
-        return Some(Decimal::from_mantissa(value_at, scale));
+        // No grid point is inside the interval. The value still clamps to the
+        // interval, as the overflow and underflow steps run before stepping
+        // (<https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range)>).
+        return Some(Decimal::from_mantissa(
+            value_at.clamp(minimum_at, maximum_at),
+            scale,
+        ));
     }
     Some(Decimal::from_mantissa(aligned, scale))
 }

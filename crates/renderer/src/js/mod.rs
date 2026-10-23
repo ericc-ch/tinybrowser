@@ -1409,7 +1409,7 @@ pub(crate) fn script_at(world: &World, id: crate::dom::tree::NodeId) -> Option<S
     // `text/javascript`; an exactly empty `type` or `language` also means
     // `text/javascript`
     // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
-    let typ = crate::dom::tree::attr(base, id.node, "type");
+    let typ = crate::dom::tree::attr(base, id.node, "type").map(str::trim_ascii);
     let language = crate::dom::tree::attr(base, id.node, "language");
     let type_string = match (typ, language) {
         (Some(""), _) | (None, Some("") | None) => "text/javascript".to_owned(),
@@ -1418,13 +1418,7 @@ pub(crate) fn script_at(world: &World, id: crate::dom::tree::NodeId) -> Option<S
     };
     if type_string.eq_ignore_ascii_case("module") {
         Some(Script::Module(source))
-    } else if javascript_mime_essence(&type_string)
-        || typ.is_some_and(|typ| {
-            javascript_mime_essence(
-                typ.trim_matches(|character: char| character.is_ascii_whitespace()),
-            )
-        })
-    {
+    } else if javascript_mime_essence(&type_string) {
         Some(Script::Classic(source))
     } else {
         None

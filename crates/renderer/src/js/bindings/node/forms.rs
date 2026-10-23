@@ -627,6 +627,9 @@ impl JsNode {
                                 "a file input's value can only be set to the empty string",
                             ));
                         }
+                        world_rc
+                            .borrow_mut()
+                            .set_input_files(self.handle.0, Vec::new());
                         Ok(())
                     }
                 }

@@ -25,8 +25,8 @@ use crate::dom::equality;
 use crate::dom::insertion::{
     InsertedNode, InsertionStep, MoveTarget, classify_inserted, collect_html_insertion_steps,
     ensure_can_move, ensure_document_content_model, ensure_no_cycle, ensure_parented,
-    iframe_containers_in_subtrees, iframe_fires_initial_load, insert_parsed, move_parsed,
-    replace_all_journaled, replace_all_with_node, replace_parsed, unlink_journaled,
+    iframe_containers_in_subtrees, insert_parsed, move_parsed, replace_all_journaled,
+    replace_all_with_node, replace_parsed, unlink_journaled,
 };
 use crate::dom::tree::{
     BlitzId, NodeId, ancestor_chain, child_ids, element_node_name, is_connected, is_element,
@@ -2504,19 +2504,12 @@ pub(super) fn run_html_insertion_steps(
     for step in steps {
         match step {
             InsertionStep::Iframe(id) => {
-                let fire_load = world(ctx)?
-                    .borrow()
-                    .with_document(id, |parsed| {
-                        iframe_fires_initial_load(&parsed.document.base, id.node)
-                    })
-                    .unwrap_or(false);
                 World::materialize_iframe(&world(ctx)?, id);
                 // The initial `load` is an element task, not part of the
                 // insertion steps: the engine fires it after the child frame's
                 // realm exists, so `contentWindow.location` is readable in the
                 // handler
                 // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-                let _ = fire_load;
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
             InsertionStep::Meta(id) => {

@@ -754,9 +754,10 @@ fn parse_color_function(inner: &str) -> Option<ParsedColor> {
     let bytes = to_bytes([srgb[0], srgb[1], srgb[2], alpha_value.clamp(0.0, 1.0)]);
     Some(ParsedColor {
         bytes,
-        // Relative colors consume the source in sRGB; other spaces keep
-        // their own serialization but expose the converted components here.
-        value: from_bytes(bytes),
+        // Keep the converted float components, so a color input's value is
+        // not quantized to 8-bit sRGB before it serializes again
+        // (<https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>).
+        value: [srgb[0], srgb[1], srgb[2], alpha_value.clamp(0.0, 1.0)],
         serialized: Some(serialize_color_function(space, &components, alpha_value)),
     })
 }

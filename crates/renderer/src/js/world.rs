@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::documents::DocumentStore;
 use crate::documents::JournalEntry;
-use crate::dom::tree::{NodeId, attr, is_connected, is_iframe_element};
+use crate::dom::tree::{NodeId, attr, is_child_navigable_container, is_connected};
 use crate::dom_string::DomString;
 
 use crate::js::FrameRuntime;
@@ -1614,7 +1614,8 @@ impl World {
         let eligible = self
             .with_document(container, |parsed| {
                 let base = &parsed.document.base;
-                is_iframe_element(base, container.node) && is_connected(base, container.node)
+                is_child_navigable_container(base, container.node)
+                    && is_connected(base, container.node)
             })
             .unwrap_or(false);
         if !eligible || self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
@@ -1660,7 +1661,7 @@ impl World {
                 if id == container.node {
                     seen = true;
                 } else if seen
-                    && is_iframe_element(base, id)
+                    && is_child_navigable_container(base, id)
                     && is_connected(base, id)
                     && let Some(frame) = self.frame_for_container(NodeId {
                         document: container.document,
@@ -1745,7 +1746,7 @@ impl World {
                 if stop == Some(id) {
                     break;
                 }
-                if is_iframe_element(base, id) && is_connected(base, id) {
+                if is_child_navigable_container(base, id) && is_connected(base, id) {
                     containers.push(NodeId { document, node: id });
                 }
                 if let Some(node) = base.get_node(id) {

@@ -11,8 +11,8 @@ use blitz_dom::NodeData;
 use crate::documents::JournalEntry;
 use crate::dom::TreeError;
 use crate::dom::tree::{
-    BlitzId, NodeId, attr, html_namespace, is_html_element, is_iframe_element, is_real_element,
-    mathml_namespace, sibling, svg_namespace,
+    BlitzId, NodeId, attr, html_namespace, is_child_navigable_container, is_html_element,
+    is_real_element, mathml_namespace, sibling, svg_namespace,
 };
 
 /// The inserted node's side of ensure pre-insert validity.
@@ -210,7 +210,7 @@ pub(crate) fn iframe_containers_in_subtrees(
     for root in roots {
         let mut stack = vec![root.node];
         while let Some(id) = stack.pop() {
-            if is_iframe_element(&parsed.document.base, id) {
+            if is_child_navigable_container(&parsed.document.base, id) {
                 containers.push(NodeId {
                     document: root.document,
                     node: id,
@@ -668,13 +668,6 @@ pub(crate) enum InsertionStep {
     Meta(NodeId),
 }
 
-/// Initial about:blank iframes fire `load` from insertion steps. An iframe
-/// with `src` or `srcdoc` navigates instead, and that navigation fires `load`
-/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
-pub(crate) fn iframe_fires_initial_load(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
-    attr(base, node, "src").is_none() && attr(base, node, "srcdoc").is_none()
-}
-
 /// The insertion steps an inserted subtree owes, in tree order: iframe
 /// contexts, classic scripts, and referrer-policy updates.
 pub(crate) fn collect_html_insertion_steps(
@@ -684,7 +677,7 @@ pub(crate) fn collect_html_insertion_steps(
 ) {
     if is_html_element(base, id.node, "script") {
         out.push(InsertionStep::Script(id));
-    } else if is_iframe_element(base, id.node) {
+    } else if is_child_navigable_container(base, id.node) {
         out.push(InsertionStep::Iframe(id));
     } else if is_html_element(base, id.node, "meta") {
         out.push(InsertionStep::Meta(id));

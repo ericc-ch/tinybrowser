@@ -227,14 +227,15 @@ pub(crate) fn sanitize(base: &BaseDocument, node: BlitzId, kind: InputType, raw:
             // newline for both; the spec's multiple-value algorithm has no
             // such step, so this follows the spec.
             // (<https://html.spec.whatwg.org/multipage/input.html#email-state-(type=email)>)
-            if attr(base, node, "multiple").is_some() {
+            let value = if attr(base, node, "multiple").is_some() {
                 raw.split(',')
                     .map(str::trim_ascii)
                     .collect::<Vec<_>>()
                     .join(",")
             } else {
                 strip_newlines(raw).trim_ascii().to_owned()
-            }
+            };
+            email_domains_to_ascii(&value)
         }
         InputType::Date => {
             if valid_date(raw) {
@@ -278,6 +279,25 @@ pub(crate) fn sanitize(base: &BaseDocument, node: BlitzId, kind: InputType, raw:
         | InputType::Reset
         | InputType::Button => raw.to_owned(),
     }
+}
+
+/// Converts each address's domain to its ASCII (IDNA) form, leaving addresses
+/// that do not parse as a host unchanged
+/// (<https://html.spec.whatwg.org/multipage/input.html#e-mail-state-(type=email)>).
+fn email_domains_to_ascii(value: &str) -> String {
+    value
+        .split(',')
+        .map(|address| {
+            let Some((local, domain)) = address.rsplit_once('@') else {
+                return address.to_owned();
+            };
+            match url::Host::parse(domain) {
+                Ok(host) => format!("{local}@{host}"),
+                Err(_) => address.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn strip_newlines(value: &str) -> String {
