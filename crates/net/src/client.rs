@@ -328,7 +328,7 @@ impl Agent {
         if let Some(ua) = &self.ua {
             preflight.append(header::USER_AGENT, ua.clone());
         }
-        let (status, preflight_headers, body) = self
+        let (status, preflight_headers, body, _http2) = self
             .engine
             .send(&Method::OPTIONS, wire, &preflight, None, budget)
             .await?;
@@ -550,7 +550,7 @@ impl Agent {
         } else {
             hop_headers.remove("cookie");
         }
-        let (status, response_headers, reader) = self
+        let (status, response_headers, reader, http2) = self
             .engine
             .send(
                 &hop.method,
@@ -569,11 +569,15 @@ impl Agent {
             .collect();
         let response = Response {
             status,
-            status_text: hyper::StatusCode::from_u16(status)
-                .ok()
-                .and_then(|status| status.canonical_reason())
-                .unwrap_or("")
-                .to_owned(),
+            status_text: if http2 {
+                String::new()
+            } else {
+                hyper::StatusCode::from_u16(status)
+                    .ok()
+                    .and_then(|status| status.canonical_reason())
+                    .unwrap_or("")
+                    .to_owned()
+            },
             headers: response_headers,
             final_url: url.clone(),
             body: RawBody {

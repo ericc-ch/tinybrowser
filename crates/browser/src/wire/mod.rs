@@ -259,6 +259,10 @@ pub enum NetworkCall {
     Dial(DialRequest),
     /// Cancels a dial submitted by this assignment.
     CancelDial { id: RequestId },
+    /// Reads the next decoded body chunk for a streamed dial.
+    DialRead { id: u64 },
+    /// Cancels a streamed response body.
+    CancelStream { id: u64 },
     /// `document.cookie` getter.
     CookieGet {
         /// Document URL.
@@ -391,6 +395,8 @@ pub enum MessagingCall {
 pub enum ServiceReply {
     /// Dial result, with a typed failure.
     Dial(Result<DialOutcome, DialFailure>),
+    /// Next streamed body chunk, or `None` at the end.
+    StreamChunk(Result<Option<Vec<u8>>, DialFailure>),
     /// Cookie getter result.
     Cookie(String),
     /// Local storage getter result.
@@ -416,11 +422,16 @@ impl ServiceReply {
             ServiceCall::Network(NetworkCall::Dial(_)) => {
                 ServiceReply::Dial(Err(DialFailure::Connect))
             }
+            ServiceCall::Network(NetworkCall::DialRead { .. }) => {
+                ServiceReply::StreamChunk(Err(DialFailure::Connect))
+            }
             ServiceCall::Network(NetworkCall::CookieGet { .. }) => {
                 ServiceReply::Cookie(String::new())
             }
             ServiceCall::Network(
-                NetworkCall::CancelDial { .. } | NetworkCall::CookieSet { .. },
+                NetworkCall::CancelDial { .. }
+                | NetworkCall::CancelStream { .. }
+                | NetworkCall::CookieSet { .. },
             )
             | ServiceCall::Messaging(MessagingCall::BroadcastPost { .. })
             | ServiceCall::BrowsingContext(

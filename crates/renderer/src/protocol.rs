@@ -494,6 +494,9 @@ pub struct DialRequest {
     /// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>).
     #[serde(default)]
     pub cache: Option<String>,
+    /// Ask the browser to return headers first and stream the decoded body.
+    #[serde(default)]
+    pub stream_body: bool,
 }
 
 /// The CORS parameters a page `fetch`/XHR sends over the wire. The browser
@@ -548,6 +551,10 @@ pub struct DialOutcome {
     /// Redirect hops followed before this response.
     #[serde(default)]
     pub redirect_count: u32,
+    /// Browser-side stream handle for a progressive body. The body is empty
+    /// in the head outcome and chunks arrive through the network host.
+    #[serde(default)]
+    pub stream: Option<u64>,
 }
 
 impl DialOutcome {
@@ -570,6 +577,7 @@ impl DialOutcome {
             body: Ok(body),
             response_type: net::cors::ResponseType::Basic,
             redirect_count: 0,
+            stream: None,
         }
     }
 }
@@ -590,6 +598,19 @@ pub trait NetworkHost: Send + Sync + 'static {
     /// Implementations must invoke it exactly once, including when submission
     /// is rejected.
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> DialCancellation;
+
+    /// Reads the next chunk of a streamed response body. `None` is the end of
+    /// the body. Hosts without progressive bodies return a connect failure.
+    ///
+    /// # Errors
+    ///
+    /// The carrier's network failure or cancellation.
+    fn dial_read(&self, _stream: u64) -> Result<Option<Vec<u8>>, DialFailure> {
+        Err(DialFailure::Connect)
+    }
+
+    /// Cancels a streamed response body.
+    fn cancel_stream(&self, _stream: u64) {}
 
     /// Performs `request` on the calling thread and returns when the response
     /// arrives. The browser process answers on the reader thread, so this does

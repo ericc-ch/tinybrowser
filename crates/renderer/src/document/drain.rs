@@ -155,6 +155,7 @@ impl Document {
                                 body: Ok(body),
                                 response_type: net::cors::ResponseType::Basic,
                                 redirect_count: 0,
+                                stream: None,
                             },
                         });
                     } else {
@@ -373,6 +374,7 @@ impl Document {
         dial.req.body_len = fetch.body_len;
         dial.req.integrity = fetch.integrity;
         dial.req.cache = Some(fetch.cache);
+        dial.req.stream_body = fetch.stream_body;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

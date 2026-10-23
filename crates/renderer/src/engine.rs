@@ -986,6 +986,7 @@ impl Engine {
                             body_len: 0,
                             integrity: None,
                             cache: None,
+                            stream_body: false,
                         },
                         ancestors,
                     );

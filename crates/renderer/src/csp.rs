@@ -884,6 +884,16 @@ fn parse_integrity_metadata(metadata: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// SRI accepts base64url and may omit trailing padding
+/// (<https://www.w3.org/TR/SRI/#parse-metadata>).
+fn normalize_base64(value: &str) -> String {
+    let mut normalized = value.replace('-', "+").replace('_', "/");
+    while !normalized.len().is_multiple_of(4) {
+        normalized.push('=');
+    }
+    normalized
+}
+
 /// Whether `bytes` satisfy SRI `integrity` metadata: the strongest supported
 /// algorithm present must have at least one entry matching the content.
 /// Empty metadata enforces nothing, and so does metadata with no supported
@@ -916,7 +926,7 @@ pub fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
                 "sha384" => base64::engine::general_purpose::STANDARD.encode(Sha384::digest(bytes)),
                 _ => base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)),
             };
-            digest.as_str() == *expected
+            digest == normalize_base64(expected)
         }
     })
 }

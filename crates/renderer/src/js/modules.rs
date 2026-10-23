@@ -110,6 +110,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             body_len: 0,
             integrity: None,
             cache: None,
+            stream_body: false,
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);

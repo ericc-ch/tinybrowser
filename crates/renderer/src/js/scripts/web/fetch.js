@@ -157,6 +157,10 @@ const __tbHeadersDeleteRaw = (headers, name) => {
   const record = __tbHeadersRecord(headers);
   if (record.guard === 'immutable') throw new TypeError('Headers are immutable');
   const normalized = __tbHeaderName(name);
+  if ((record.guard === 'request' || record.guard === 'request-no-cors')
+      && __tbForbiddenRequestHeader(normalized)) {
+    return;
+  }
   for (let index = record.list.length - 1; index >= 0; index--) {
     if (record.list[index][0] === normalized) __tbArray.remove(record.list, index);
   }
@@ -930,21 +934,56 @@ __tbInstallBody(globalThis.Response.prototype, __tbResponseData);
 __tbInstallBody(globalThis.Request.prototype, __tbRequestData);
 const __tbRequestConstructor = globalThis.Request;
 const __tbMakeResponse = (body, status, statusText, url, type, fields, responseType, redirected, bodyError) => {
-  const headers = __tbMakeHeaders(fields, 'response');
-  if (type && __tbHeadersLookupRaw(headers, 'content-type') === null) {
+  // An opaque filtered response exposes no status, headers, or body
+  // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+  const opaque = responseType === 'opaque';
+  const headers = __tbMakeHeaders(opaque ? [] : fields, 'response');
+  if (!opaque && type && __tbHeadersLookupRaw(headers, 'content-type') === null) {
     __tbHeadersAppendRaw(headers, 'content-type', type);
   }
   __tbHeadersRecord(headers).guard = 'immutable';
-  const extracted = __tbExtractBody(bodyError ? null : body);
-  const stream = bodyError ? __tbErroredStream() : __tbBodyStream(extracted);
+  const nullBody = opaque || status === 204 || status === 205 || status === 304;
+  const extracted = __tbExtractBody(bodyError || nullBody ? null : body);
+  const stream = bodyError ? __tbErroredStream() : nullBody ? null : __tbBodyStream(extracted);
   return __tbCreateResponse({
     stream,
     bodyUsed: false,
-    status,
-    statusText: statusText === undefined ? '' : String(statusText),
+    status: opaque ? 0 : status,
+    statusText: opaque ? '' : statusText === undefined ? '' : String(statusText),
     url: url === undefined ? '' : String(url),
     type: responseType,
     redirected: redirected === true,
+    headers,
+  });
+};
+
+const __tbMakeStreamingResponse = outcome => {
+  const headers = __tbMakeHeaders(outcome.headers, 'response');
+  __tbHeadersRecord(headers).guard = 'immutable';
+  const id = outcome.stream;
+  const stream = new ReadableStream({
+    type: 'bytes',
+    pull(controller) {
+      let chunk;
+      try {
+        chunk = host.__tbFetchRead(id);
+      } catch (error) {
+        controller.error(error);
+        return;
+      }
+      if (chunk === null || chunk === undefined) controller.close();
+      else controller.enqueue(new Uint8Array(chunk));
+    },
+    cancel() { host.__tbFetchCancel(id); },
+  });
+  return __tbCreateResponse({
+    stream,
+    bodyUsed: false,
+    status: outcome.status,
+    statusText: outcome.statusText === undefined ? '' : String(outcome.statusText),
+    url: outcome.url === undefined ? '' : String(outcome.url),
+    type: outcome.responseType,
+    redirected: outcome.redirectCount > 0,
     headers,
   });
 };
@@ -978,6 +1017,7 @@ const __tbQueuePageRequest = (url, method, body, headers, cors, referrer, callba
       String(cors.bodySize === undefined ? 0 : cors.bodySize),
       cors.integrity === undefined ? '' : String(cors.integrity),
       cors.cache === undefined ? '' : String(cors.cache),
+      cors.stream === true ? '1' : '0',
     ]);
   }).catch(() => {
     const done = host.__tb_fetchCbs[id];
@@ -1020,6 +1060,11 @@ const __tbReferrerForPolicy = (source, target, policy) => {
   } catch (error) {
     return '';
   }
+  // Credentials and fragments never appear in a referrer
+  // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+  sourceURL.username = '';
+  sourceURL.password = '';
+  sourceURL.hash = '';
   const sameOrigin = sourceURL.origin === targetURL.origin;
   const downgrade = sourceURL.protocol === 'https:' && targetURL.protocol !== 'https:';
   const origin = sourceURL.origin + '/';
@@ -1085,10 +1130,12 @@ globalThis.fetch = function(input, init) {
       return;
     }
     let requestID = null;
+    let streamID = null;
     let settled = false;
     const onAbort = () => {
       if (settled) return;
       settled = true;
+      if (streamID !== null) host.__tbFetchCancel(streamID);
       if (requestID !== null) __tbCancelPageRequest(requestID);
       reject(signal.reason);
     };
@@ -1109,12 +1156,17 @@ globalThis.fetch = function(input, init) {
         finish(reject, new TypeError('Failed to fetch'));
         return;
       }
+      const contents = typeof entry.contents === 'string' ? __tbUtf8Encode(entry.contents) : entry.contents;
       const range = __tbHeadersLookupRaw(headers, 'range');
       if (range === null) {
-        finish(resolve, __tbMakeResponse(entry.contents, 200, 'OK', url, entry.type, [], 'basic', false, false));
+        const blobType = entry.type === null || entry.type === undefined ? '' : entry.type;
+        const fields = [
+          ['content-length', String(contents.length)],
+          ['content-type', host.__tbExtractMimeType(blobType) === '' ? '' : blobType],
+        ];
+        finish(resolve, __tbMakeResponse(contents, 200, 'OK', url, null, fields, 'basic', false, false));
         return;
       }
-      const contents = typeof entry.contents === 'string' ? __tbUtf8Encode(entry.contents) : entry.contents;
       const parsed = __tbParseRange(range, contents.length);
       if (parsed === null) {
         finish(reject, new TypeError('Failed to fetch'));
@@ -1131,7 +1183,11 @@ globalThis.fetch = function(input, init) {
       ));
       return;
     }
-    requestID = __tbQueuePageRequest(url, method, body, headers, {
+    // A fragment is not part of the HTTP request or the response URL
+    // (<https://fetch.spec.whatwg.org/#concept-request-url>).
+    const hash = url.indexOf('#');
+    const networkUrl = hash === -1 ? url : url.slice(0, hash);
+    requestID = __tbQueuePageRequest(networkUrl, method, body, headers, {
       mode,
       credentials,
       redirect,
@@ -1139,6 +1195,8 @@ globalThis.fetch = function(input, init) {
       bodySize: data.bodySize,
       integrity: data.integrity,
       cache: data.cache,
+      // HEAD has no body, and SRI has to see the whole body before exposure.
+      stream: method !== 'HEAD' && data.integrity === '',
     }, referrer, outcome => {
       const status = outcome.status;
       const statusText = outcome.statusText;
@@ -1153,6 +1211,17 @@ globalThis.fetch = function(input, init) {
         // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque-redirect>).
         if (redirect === 'manual' && (status === 301 || status === 302 || status === 303 || status === 307 || status === 308)) {
           finish(resolve, __tbMakeResponse(null, 0, '', url, '', [], 'opaqueredirect', false, false));
+          return;
+        }
+        if (status === 204 || status === 205 || status === 304) {
+          if (outcome.stream !== null && outcome.stream !== undefined) host.__tbFetchCancel(outcome.stream);
+          finish(resolve, __tbMakeResponse(null, status, statusText, finalUrl, type, fields, responseType, outcome.redirectCount > 0, bodyError));
+          return;
+        }
+        if (outcome.stream !== null && outcome.stream !== undefined) {
+          streamID = outcome.stream;
+          signal.addEventListener('abort', () => host.__tbFetchCancel(streamID), { once: true });
+          finish(resolve, __tbMakeStreamingResponse(outcome));
           return;
         }
         const response = __tbMakeResponse(bytes, status, statusText, finalUrl, type, fields, responseType, outcome.redirectCount > 0, bodyError);

@@ -628,6 +628,14 @@ async fn route_service_call(
                 }
             });
         }
+        ServiceCall::Network(NetworkCall::DialRead { id: stream }) => {
+            let result = assignment.network.read_stream(stream).await;
+            send_reply(&context.responder, id, ServiceReply::StreamChunk(result)).await?;
+        }
+        ServiceCall::Network(NetworkCall::CancelStream { id: stream }) => {
+            assignment.network.cancel_stream(stream);
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
+        }
         ServiceCall::Network(NetworkCall::CancelDial { id: target }) => {
             if let Some(dial) = context
                 .dials

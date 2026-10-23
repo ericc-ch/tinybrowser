@@ -4,7 +4,7 @@
 //! [`net::Agent`].
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,18 @@ struct CacheKey {
 /// `MAX_RESPONSE_BODY_BYTES`, so the cache holds at most that much per entry.
 type ResponseCache = Arc<Mutex<HashMap<CacheKey, DialOutcome>>>;
 
+enum StreamMessage {
+    Chunk(Vec<u8>),
+    End,
+    Error(DialFailure),
+}
+
+struct StreamState {
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamMessage>,
+}
+
+type StreamMap = Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<StreamState>>>>>;
+
 fn cache_key(request: &DialRequest) -> CacheKey {
     CacheKey {
         method: request.method.clone(),
@@ -93,6 +105,34 @@ fn response_forbids_storage(outcome: &DialOutcome) -> bool {
         name.eq_ignore_ascii_case("cache-control")
             && value.to_ascii_lowercase().contains("no-store")
     })
+}
+
+fn etag(outcome: &DialOutcome) -> Option<String> {
+    outcome
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .map(|(_, value)| value.clone())
+}
+
+/// Reuses the stored body for a validated 304 and applies the new headers.
+fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOutcome {
+    let mut merged = cached.clone();
+    merged.status = 200;
+    merged.final_url = response.final_url().to_string();
+    for (name, value) in response.headers().iter() {
+        let value = isomorphic_decode(value);
+        if let Some((_, existing)) = merged
+            .headers
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+        {
+            *existing = value;
+        } else {
+            merged.headers.push((name.to_owned(), value));
+        }
+    }
+    merged
 }
 
 fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: &str) -> bool {
@@ -117,6 +157,8 @@ pub(crate) struct NetworkContext {
     agent: Agent,
     permits: NetworkPermits,
     cache: ResponseCache,
+    streams: StreamMap,
+    next_stream: Arc<AtomicU64>,
 }
 
 impl NetworkContext {
@@ -140,6 +182,8 @@ impl NetworkContext {
             agent,
             permits: NetworkPermits::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            next_stream: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -151,6 +195,8 @@ impl NetworkContext {
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
             cache: Arc::clone(&self.cache),
+            streams: Arc::clone(&self.streams),
+            next_stream: Arc::clone(&self.next_stream),
         }
     }
 
@@ -204,6 +250,8 @@ pub(crate) struct TabNetworkHandle {
     permits: NetworkPermits,
     tab: Arc<Semaphore>,
     cache: ResponseCache,
+    streams: StreamMap,
+    next_stream: Arc<AtomicU64>,
 }
 
 impl TabNetworkHandle {
@@ -309,10 +357,25 @@ impl TabNetworkHandle {
     ) -> Result<DialOutcome, DialFailure> {
         let started = Instant::now();
         let _keepalive = KeepaliveReservation::acquire(request)?;
+        if request.stream_body {
+            return self.dial_stream(request, initiator).await;
+        }
         let mode = cache_mode(request).to_owned();
-        if let Some(hit) = self.cached_response(request, &mode)? {
+        let cached = self.cached_hit(request);
+        if let Some(hit) = Self::cached_response(request, &mode, cached.as_ref())? {
             return Ok(hit);
         }
+        // A default or no-cache request revalidates a stored response when it
+        // has a validator; the 304 path reuses the stored body. A page-supplied
+        // validator is the caller's own conditional request and must surface
+        // its 304.
+        let explicit_validator = request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"));
+        let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
+            .then(|| cached.as_ref().and_then(etag))
+            .flatten();
         logging::trace!(
             target: "browser::net",
             "request start {:?} {}",
@@ -329,6 +392,11 @@ impl TabNetworkHandle {
             let _global = Self::acquire(&self.permits.global, deadline).await?;
             let _tab = Self::acquire(&self.tab, deadline).await?;
             let mut outbound = outbound_request(request, initiator, deadline)?;
+            if let Some(etag) = conditional.as_deref() {
+                let _ = outbound
+                    .headers
+                    .insert("If-None-Match", etag.as_bytes().to_vec());
+            }
             let blocked_redirect = watch_redirects(request, initiator, &mut outbound);
             let response = match self.agent.send(outbound).await {
                 Ok(response) => response,
@@ -337,7 +405,19 @@ impl TabNetworkHandle {
                 }
             };
             let response_type = response.response_type();
+            // An opaque response has no readable body, so it can never satisfy
+            // integrity metadata
+            // (<https://www.w3.org/TR/SRI/#verify-integrity>).
+            if request.integrity.is_some() && response_type.is_opaque() {
+                return Err(DialFailure::Connect);
+            }
             let status = response.status();
+            if status == 304
+                && !explicit_validator
+                && let Some(cached) = cached.as_ref()
+            {
+                return Ok(merge_not_modified(cached, &response));
+            }
             let redirect_count = response.redirect_count();
             let final_url = response.final_url().to_string();
             let content_type = content_type_header(response.headers());
@@ -354,27 +434,7 @@ impl TabNetworkHandle {
             // An opaque response hides its body as well as its status and
             // headers (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
             let status_text = response.status_text().to_owned();
-            let body = if request.read_body && !response_type.is_opaque() {
-                match response
-                    .into_body()
-                    .await
-                    .bytes(renderer::MAX_RESPONSE_BODY_BYTES)
-                    .await
-                {
-                    Ok(body) => {
-                        if let Some(integrity) = request.integrity.as_deref()
-                            && !renderer::integrity_verifies(integrity, &body)
-                        {
-                            return Err(DialFailure::Connect);
-                        }
-                        Ok(body)
-                    }
-                    Err(net::NetError::Decode(_)) => Err(renderer::BodyError),
-                    Err(error) => return Err(dial_failure(&error)),
-                }
-            } else {
-                Ok(Vec::new())
-            };
+            let body = read_response_body(request, response, response_type).await?;
             Ok(DialOutcome {
                 status: if response_type.is_opaque() { 0 } else { status },
                 status_text,
@@ -391,6 +451,7 @@ impl TabNetworkHandle {
                 body,
                 response_type,
                 redirect_count,
+                stream: None,
             })
         };
         let result = tokio::select! {
@@ -403,24 +464,160 @@ impl TabNetworkHandle {
         result
     }
 
-    fn cached_response(
+    async fn dial_stream(
         &self,
         request: &DialRequest,
+        initiator: &Url,
+    ) -> Result<DialOutcome, DialFailure> {
+        let mode = cache_mode(request).to_owned();
+        let cached = self.cached_hit(request);
+        if let Some(hit) = Self::cached_response(request, &mode, cached.as_ref())? {
+            return Ok(hit);
+        }
+        let explicit_validator = request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"));
+        let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
+            .then(|| cached.as_ref().and_then(etag))
+            .flatten();
+        let cache_key = cache_key(request);
+        let budget = if request.timeout_ms == 0 {
+            PAGE_FETCH_TIMEOUT
+        } else {
+            PAGE_FETCH_TIMEOUT.min(Duration::from_millis(request.timeout_ms))
+        };
+        let deadline = Instant::now() + budget;
+        let _global = Self::acquire(&self.permits.global, deadline).await?;
+        let _tab = Self::acquire(&self.tab, deadline).await?;
+        let mut outbound = outbound_request(request, initiator, deadline)?;
+        if let Some(etag) = conditional.as_deref() {
+            let _ = outbound
+                .headers
+                .insert("If-None-Match", etag.as_bytes().to_vec());
+        }
+        let blocked_redirect = watch_redirects(request, initiator, &mut outbound);
+        let response = match self.agent.send(outbound).await {
+            Ok(response) => response,
+            Err(error) => {
+                return refused_redirect(&blocked_redirect).ok_or_else(|| dial_failure(&error));
+            }
+        };
+        let response_type = response.response_type();
+        let status = response.status();
+        if status == 304
+            && !explicit_validator
+            && let Some(cached) = cached.as_ref()
+        {
+            return Ok(merge_not_modified(cached, &response));
+        }
+        let status_text = response.status_text().to_owned();
+        let final_url = response.final_url().to_string();
+        let headers = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| {
+                !name.eq_ignore_ascii_case("set-cookie")
+                    && !name.eq_ignore_ascii_case("set-cookie2")
+            })
+            .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
+            .collect();
+        let content_type = content_type_header(response.headers());
+        let mut outcome = DialOutcome {
+            status: if response_type.is_opaque() { 0 } else { status },
+            status_text,
+            final_url: if response_type.is_opaque() {
+                String::new()
+            } else {
+                final_url
+            },
+            content_type,
+            headers,
+            body: Ok(Vec::new()),
+            response_type,
+            redirect_count: response.redirect_count(),
+            stream: None,
+        };
+        if response_type.is_opaque() {
+            return Ok(outcome);
+        }
+        let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, Arc::new(tokio::sync::Mutex::new(StreamState { rx })));
+        outcome.stream = Some(id);
+        spawn_stream_body(
+            response,
+            request.integrity.clone(),
+            should_store(request, &outcome, &mode),
+            outcome.clone(),
+            Arc::clone(&self.cache),
+            cache_key,
+            tx,
+        );
+        Ok(outcome)
+    }
+
+    pub(crate) async fn read_stream(&self, id: u64) -> Result<Option<Vec<u8>>, DialFailure> {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut state = state.lock().await;
+        match state.rx.recv().await {
+            Some(StreamMessage::Chunk(bytes)) => Ok(Some(bytes)),
+            Some(StreamMessage::End) | None => {
+                self.remove_stream(id);
+                Ok(None)
+            }
+            Some(StreamMessage::Error(failure)) => {
+                self.remove_stream(id);
+                Err(failure)
+            }
+        }
+    }
+
+    pub(crate) fn cancel_stream(&self, id: u64) {
+        self.remove_stream(id);
+    }
+
+    fn remove_stream(&self, id: u64) {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    fn cached_hit(&self, request: &DialRequest) -> Option<DialOutcome> {
+        if request.kind != DialKind::JsFetch {
+            return None;
+        }
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&cache_key(request))
+            .cloned()
+    }
+
+    fn cached_response(
+        request: &DialRequest,
         mode: &str,
+        cached: Option<&DialOutcome>,
     ) -> Result<Option<DialOutcome>, DialFailure> {
         if request.kind != DialKind::JsFetch || !matches!(mode, "force-cache" | "only-if-cached") {
             return Ok(None);
         }
-        let hit = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&cache_key(request))
-            .cloned();
-        if hit.is_none() && mode == "only-if-cached" {
+        if cached.is_none() && mode == "only-if-cached" {
             return Err(DialFailure::Connect);
         }
-        Ok(hit)
+        Ok(cached.cloned())
     }
 
     fn remember_response(
@@ -634,6 +831,89 @@ fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
     };
 }
 
+fn spawn_stream_body(
+    response: net::Response,
+    integrity: Option<String>,
+    store: bool,
+    stored: DialOutcome,
+    cache: ResponseCache,
+    cache_key: CacheKey,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamMessage>,
+) {
+    tokio::spawn(async move {
+        let mut body = response.into_body().await;
+        let mut total = 0usize;
+        let mut buffer = Vec::new();
+        loop {
+            match body.read_chunk().await {
+                Ok(Some(chunk)) => {
+                    total = total.saturating_add(chunk.len());
+                    if total > renderer::MAX_RESPONSE_BODY_BYTES {
+                        let _ = tx.send(StreamMessage::Error(DialFailure::Connect));
+                        break;
+                    }
+                    if integrity.is_some() || store {
+                        buffer.extend_from_slice(&chunk);
+                    }
+                    if tx.send(StreamMessage::Chunk(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    if let Some(integrity) = integrity.as_deref()
+                        && !renderer::integrity_verifies(integrity, &buffer)
+                    {
+                        let _ = tx.send(StreamMessage::Error(DialFailure::Connect));
+                    } else {
+                        if store {
+                            let mut stored = stored;
+                            stored.body = Ok(buffer);
+                            stored.stream = None;
+                            cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(cache_key, stored);
+                        }
+                        let _ = tx.send(StreamMessage::End);
+                    }
+                    break;
+                }
+                Err(_) => {
+                    let _ = tx.send(StreamMessage::Error(DialFailure::Connect));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn read_response_body(
+    request: &DialRequest,
+    response: net::Response,
+    response_type: net::cors::ResponseType,
+) -> Result<Result<Vec<u8>, renderer::BodyError>, DialFailure> {
+    if !request.read_body || response_type.is_opaque() {
+        return Ok(Ok(Vec::new()));
+    }
+    match response
+        .into_body()
+        .await
+        .bytes(renderer::MAX_RESPONSE_BODY_BYTES)
+        .await
+    {
+        Ok(body) => {
+            if let Some(integrity) = request.integrity.as_deref()
+                && !renderer::integrity_verifies(integrity, &body)
+            {
+                return Err(DialFailure::Connect);
+            }
+            Ok(Ok(body))
+        }
+        Err(net::NetError::Decode(_)) => Ok(Err(renderer::BodyError)),
+        Err(error) => Err(dial_failure(&error)),
+    }
+}
+
 fn trace_dial_result(
     request: &DialRequest,
     started: Instant,
@@ -672,6 +952,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         body: Ok(Vec::new()),
         response_type: net::cors::ResponseType::Basic,
         redirect_count: 0,
+        stream: None,
     })
 }
 

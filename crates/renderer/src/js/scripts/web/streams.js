@@ -122,7 +122,7 @@ globalThis.ReadableStream = class ReadableStream {
         },
         cancel: reason => this.cancel(reason),
         releaseLock: () => { data.reader = null; },
-        closed: closedPromise,
+        closed: data.closedPromise,
       };
       data.reader = reader;
       return reader;
@@ -151,7 +151,7 @@ globalThis.ReadableStream = class ReadableStream {
       },
       cancel: reason => this.cancel(reason),
       releaseLock: () => { data.reader = null; },
-      closed: closedPromise,
+      closed: data.closedPromise,
     };
     data.reader = reader;
     return reader;
@@ -229,6 +229,9 @@ globalThis.ReadableStream = class ReadableStream {
           return;
         }
         if (!canceled[0]) __tbArray.push(queues[0], step.value);
+        // `Response.clone()` and `Request.clone()` expose the second branch as
+        // a structured clone, as WPT requires for script-visible chunks
+        // (<https://streams.spec.whatwg.org/#readable-stream-tee>).
         if (!canceled[1]) __tbArray.push(queues[1], structuredClone(step.value));
       }, reason => {
         pumping = null;
@@ -289,6 +292,7 @@ globalThis.WritableStream = class WritableStream {
       resolveClosed = resolve;
       rejectClosed = reject;
     });
+    closedPromise.catch(() => {});
     const data = {
       sink: sinkObject, writer: null, closed: false, closing: false, errored: null,
       queue: Promise.resolve(), closedPromise, resolveClosed, rejectClosed, controller: null,
@@ -334,7 +338,7 @@ globalThis.WritableStream = class WritableStream {
       },
       abort: reason => __tbWritableAbort(data, reason),
       releaseLock: () => { data.writer = null; },
-      closed: closedPromise,
+      closed: data.closedPromise,
       get ready() { return data.queue.then(() => undefined); },
       get desiredSize() { return data.closed ? 0 : 1; },
     };
@@ -354,7 +358,7 @@ const __tbWritableAbort = (data, reason) => {
     () => typeof data.sink.abort === 'function' ? data.sink.abort(reason) : undefined,
     () => typeof data.sink.abort === 'function' ? data.sink.abort(reason) : undefined,
   );
-  data.queue.then(data.resolveClosed, data.rejectClosed);
+  data.queue.then(() => data.rejectClosed(reason), () => data.rejectClosed(reason));
   return data.queue;
 };
 Object.defineProperty(globalThis.WritableStream.prototype, Symbol.toStringTag, { value: 'WritableStream', writable: false, enumerable: false, configurable: true });

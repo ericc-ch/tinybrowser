@@ -289,6 +289,19 @@ impl NetworkHost for HostServices {
         })
     }
 
+    fn dial_read(&self, stream: u64) -> Result<Option<Vec<u8>>, renderer::DialFailure> {
+        match self.call(ServiceCall::Network(NetworkCall::DialRead { id: stream })) {
+            Some(ServiceReply::StreamChunk(result)) => result,
+            _ => Err(renderer::DialFailure::Connect),
+        }
+    }
+
+    fn cancel_stream(&self, stream: u64) {
+        let _result = self.call(ServiceCall::Network(NetworkCall::CancelStream {
+            id: stream,
+        }));
+    }
+
     fn dial_sync(
         &self,
         request: renderer::DialRequest,

@@ -175,6 +175,7 @@ pub(crate) struct JsFetchRequest {
     pub body_len: u64,
     pub integrity: Option<String>,
     pub cache: String,
+    pub stream_body: bool,
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -458,6 +459,7 @@ impl JsRealm {
                     response_type,
                     body_error,
                     redirect_count,
+                    stream,
                 ) = match outcome {
                     Some(outcome) => {
                         let body_error = outcome.body.is_err();
@@ -475,6 +477,7 @@ impl JsRealm {
                             outcome.response_type.as_str().to_owned(),
                             body_error,
                             outcome.redirect_count,
+                            outcome.stream,
                         )
                     }
                     // A failed dial is a network error: the renderer rejects
@@ -490,6 +493,7 @@ impl JsRealm {
                         "error".to_owned(),
                         false,
                         0,
+                        None,
                     ),
                 };
                 let outcome = Object::new(ctx.clone())?;
@@ -502,6 +506,7 @@ impl JsRealm {
                 outcome.set("responseType", response_type)?;
                 outcome.set("bodyError", body_error)?;
                 outcome.set("redirectCount", redirect_count)?;
+                outcome.set("stream", stream)?;
                 if let Err(error) = func.call::<_, ()>((outcome,)) {
                     bindings::host::report_callback_error(&ctx, &error);
                 }
@@ -973,6 +978,7 @@ impl JsRealm {
         install_header_policy_host_functions(ctx)?;
         install_mime_host_functions(ctx)?;
         install_sync_fetch(ctx, world)?;
+        install_stream_host_functions(ctx, world)?;
         Self::install_csp_host_functions(ctx, world)?;
         let fetch_outbox = Rc::clone(&outbox);
         bridge::object(ctx)?.set(
@@ -1016,6 +1022,7 @@ impl JsRealm {
                         .next()
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "default".to_owned());
+                    let stream_body = parts.next().is_some_and(|value| value == "1");
                     let cors = mode.map(|mode| crate::protocol::CorsRequest {
                         mode,
                         credentials,
@@ -1036,6 +1043,7 @@ impl JsRealm {
                             body_len,
                             integrity,
                             cache,
+                            stream_body,
                         }));
                     Ok::<(), rquickjs::Error>(())
                 },
@@ -1446,7 +1454,22 @@ pub(super) fn javascript_module_mime(typ: Option<&str>) -> bool {
     javascript_mime(Some(typ))
 }
 
-fn javascript_mime(typ: Option<&str>) -> bool {
+/// Classic scripts additionally accept `text/html` and `text/plain`
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+pub(crate) fn classic_script_mime(typ: Option<&str>) -> bool {
+    let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
+        return true;
+    };
+    let essence = typ
+        .split(';')
+        .next()
+        .unwrap_or(typ)
+        .trim()
+        .to_ascii_lowercase();
+    essence == "text/html" || essence == "text/plain" || javascript_mime(Some(typ))
+}
+
+pub(crate) fn javascript_mime(typ: Option<&str>) -> bool {
     let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
         return true;
     };
@@ -1627,6 +1650,29 @@ fn install_header_policy_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
     Ok(())
 }
 
+fn install_stream_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    let read_world = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbFetchRead",
+        Func::from(move |stream: u64| -> rquickjs::Result<Option<Vec<u8>>> {
+            read_world
+                .borrow()
+                .runtime
+                .services
+                .dial_read(stream)
+                .map_err(|_| rquickjs::Error::new_from_js("dial", "network error"))
+        }),
+    )?;
+    let cancel_world = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbFetchCancel",
+        Func::from(move |stream: u64| {
+            cancel_world.borrow().runtime.services.cancel_stream(stream);
+        }),
+    )?;
+    Ok(())
+}
+
 fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
     let sync_world = world.clone();
     bridge::object(ctx)?.set(
@@ -1727,6 +1773,7 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             body_len: 0,
             integrity: None,
             cache: None,
+            stream_body: false,
         });
     match outcome {
         // The header list stays as served; nothing is sniffed into it

@@ -173,6 +173,7 @@ impl QueuedDial {
                 body_len: 0,
                 integrity: None,
                 cache: None,
+                stream_body: false,
             },
             context,
             ancestors: Vec::new(),
@@ -2457,8 +2458,12 @@ impl Document {
                 let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
                     body.is_some_and(|body| crate::csp::integrity_verifies(metadata, body))
                 });
+                // A classic script with a non-JavaScript MIME type does not
+                // execute (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+                let mime_ok = crate::js::classic_script_mime(outcome.content_type.as_deref());
                 if !blocked
                     && integrity_ok
+                    && mime_ok
                     && let Some(body) = body
                     && (200..300).contains(&outcome.status)
                 {
