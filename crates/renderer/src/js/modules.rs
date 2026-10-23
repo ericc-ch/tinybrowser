@@ -106,6 +106,10 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             timeout_ms: 0,
             csp: Some(Box::new(gate)),
             cors: None,
+            keepalive: false,
+            body_len: 0,
+            integrity: None,
+            cache: None,
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);
@@ -148,5 +152,6 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     {
         return Err(Error::new_loading(name));
     }
-    Module::declare(ctx.clone(), name, outcome.body)
+    let body = outcome.body.map_err(|_| Error::new_loading(name))?;
+    Module::declare(ctx.clone(), name, body)
 }

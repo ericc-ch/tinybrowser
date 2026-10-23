@@ -15,7 +15,7 @@ use markup5ever::interface::QuirksMode;
 use crate::documents::BlitzDocument;
 
 mod csp;
-pub use csp::RedirectGate;
+pub use csp::{RedirectGate, integrity_verifies};
 mod document;
 mod documents;
 mod dom;
@@ -37,11 +37,11 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url, decode_data_url_bounded};
 pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
-    BrowserServices, BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialKind,
-    DialOutcome, DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost,
-    Mount, NetworkHost, RendererEvent, ResourceLimit, ResponseHead, STORAGE_QUOTA_BYTES,
-    ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError,
-    StorageHost, StorageKind, TabError,
+    BodyError, BrowserServices, BrowsingContextHost, DialCancellation, DialCompletion, DialFailure,
+    DialKind, DialOutcome, DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES,
+    MessagingHost, Mount, NetworkHost, RendererEvent, ResourceLimit, ResponseHead,
+    STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource,
+    StorageChange, StorageError, StorageHost, StorageKind, TabError,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

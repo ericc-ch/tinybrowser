@@ -59,11 +59,22 @@ const __tbSyncRequestBody = body => {
     return { bytes: Array.from(stored.bytes), type: body.type || null };
   }
   if (body instanceof ArrayBuffer) return { bytes: Array.from(new Uint8Array(body)), type: null };
-  if (ArrayBuffer.isView(body)) return { bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)), type: null };
-  if (body instanceof URLSearchParams) {
-    return { bytes: Array.from(__tbUtf8Encode(String(body))), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
+  if (ArrayBuffer.isView(body)) {
+    return {
+      bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)),
+      type: null,
+    };
   }
-  return { bytes: Array.from(__tbUtf8Encode(String(body))), type: 'text/plain;charset=UTF-8' };
+  if (body instanceof URLSearchParams) {
+    return {
+      bytes: Array.from(__tbUtf8Encode(String(body))),
+      type: 'application/x-www-form-urlencoded;charset=UTF-8',
+    };
+  }
+  return {
+    bytes: Array.from(__tbUtf8Encode(String(body))),
+    type: 'text/plain;charset=UTF-8',
+  };
 };
 // "get a final MIME type": the override MIME type when one is set, otherwise
 // the response MIME type, whose extraction failure is `text/xml`

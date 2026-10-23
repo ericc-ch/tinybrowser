@@ -3,8 +3,9 @@
 //! Tab coordinators receive [`TabNetworkHandle`]. They do not expose or own
 //! [`net::Agent`].
 
-use std::io::{Read, Write};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use net::{Agent, AgentOptions, InitiatorKind, Method, Request};
@@ -16,17 +17,92 @@ use url::Url;
 /// Default per-call fetch timeout on a [`TabNetworkHandle`].
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on one body carried inside a control reply.
-///
-/// A top-level navigation document streams under
-/// [`renderer::MAX_RESPONSE_BODY_BYTES`]. This limit is the control reply,
-/// including a child frame whose response is returned in that reply.
-pub(crate) const CONTROL_BODY_LIMIT: usize = 1_048_576;
+/// In-flight keepalive request bytes across every realm in this process
+/// (<https://fetch.spec.whatwg.org/#keepalive-flag>).
+const KEEPALIVE_QUOTA: usize = 65_536;
+static KEEPALIVE_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Upper bound on one decoded response body. The compressed input is capped by
-/// [`CONTROL_BODY_LIMIT`], but gzip and brotli can expand by orders of
-/// magnitude; the decoded side needs its own bound.
-const MAX_DECODED_BODY_BYTES: usize = 8 * 1024 * 1024;
+struct KeepaliveReservation(usize);
+
+impl KeepaliveReservation {
+    fn acquire(request: &DialRequest) -> Result<Option<Self>, DialFailure> {
+        if !request.keepalive {
+            return Ok(None);
+        }
+        let Ok(length) = usize::try_from(request.body_len) else {
+            return Err(DialFailure::Limit);
+        };
+        if length > KEEPALIVE_QUOTA {
+            return Err(DialFailure::Limit);
+        }
+        let mut current = KEEPALIVE_IN_FLIGHT.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(length) else {
+                return Err(DialFailure::Limit);
+            };
+            if next > KEEPALIVE_QUOTA {
+                return Err(DialFailure::Limit);
+            }
+            match KEEPALIVE_IN_FLIGHT.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(Some(Self(length))),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for KeepaliveReservation {
+    fn drop(&mut self) {
+        KEEPALIVE_IN_FLIGHT.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CacheKey {
+    method: String,
+    url: String,
+    credentials: String,
+}
+
+/// A whole buffered response. The fetch body is already bounded by
+/// `MAX_RESPONSE_BODY_BYTES`, so the cache holds at most that much per entry.
+type ResponseCache = Arc<Mutex<HashMap<CacheKey, DialOutcome>>>;
+
+fn cache_key(request: &DialRequest) -> CacheKey {
+    CacheKey {
+        method: request.method.clone(),
+        url: request.url.clone(),
+        credentials: request.cors.map_or_else(
+            || "none".to_owned(),
+            |cors| format!("{:?}", cors.credentials),
+        ),
+    }
+}
+
+fn cache_mode(request: &DialRequest) -> &str {
+    request.cache.as_deref().unwrap_or("default")
+}
+
+fn response_forbids_storage(outcome: &DialOutcome) -> bool {
+    outcome.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("cache-control")
+            && value.to_ascii_lowercase().contains("no-store")
+    })
+}
+
+fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: &str) -> bool {
+    request.kind == DialKind::JsFetch
+        && request.method.eq_ignore_ascii_case("GET")
+        && (200..300).contains(&outcome.status)
+        && outcome.body.is_ok()
+        && mode != "no-store"
+        && !response_forbids_storage(outcome)
+}
 
 /// One completed navigation dial: the response head the tab mounts plus the
 /// streaming body.
@@ -40,6 +116,7 @@ pub(crate) struct NavOutcome {
 pub(crate) struct NetworkContext {
     agent: Agent,
     permits: NetworkPermits,
+    cache: ResponseCache,
 }
 
 impl NetworkContext {
@@ -62,6 +139,7 @@ impl NetworkContext {
         Ok(Self {
             agent,
             permits: NetworkPermits::new(),
+            cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -72,6 +150,7 @@ impl NetworkContext {
             agent: self.agent.clone(),
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
+            cache: Arc::clone(&self.cache),
         }
     }
 
@@ -124,6 +203,7 @@ pub(crate) struct TabNetworkHandle {
     agent: Agent,
     permits: NetworkPermits,
     tab: Arc<Semaphore>,
+    cache: ResponseCache,
 }
 
 impl TabNetworkHandle {
@@ -211,7 +291,7 @@ impl TabNetworkHandle {
             content_type_header(headers),
             &pairs,
         );
-        let body = response.into_body();
+        let body = response.into_body().await;
         Ok(NavOutcome {
             head,
             body,
@@ -228,6 +308,11 @@ impl TabNetworkHandle {
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<DialOutcome, DialFailure> {
         let started = Instant::now();
+        let _keepalive = KeepaliveReservation::acquire(request)?;
+        let mode = cache_mode(request).to_owned();
+        if let Some(hit) = self.cached_response(request, &mode)? {
+            return Ok(hit);
+        }
         logging::trace!(
             target: "browser::net",
             "request start {:?} {}",
@@ -253,9 +338,9 @@ impl TabNetworkHandle {
             };
             let response_type = response.response_type();
             let status = response.status();
+            let redirect_count = response.redirect_count();
             let final_url = response.final_url().to_string();
             let content_type = content_type_header(response.headers());
-            let content_encoding = content_encoding_header(response.headers());
             let headers = response
                 .headers()
                 .iter()
@@ -269,24 +354,26 @@ impl TabNetworkHandle {
             // An opaque response hides its body as well as its status and
             // headers (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
             let status_text = response.status_text().to_owned();
-            let (body, body_error) = if request.read_body && !response_type.is_opaque() {
-                let raw = response
+            let body = if request.read_body && !response_type.is_opaque() {
+                match response
                     .into_body()
-                    .bytes(CONTROL_BODY_LIMIT)
                     .await
-                    .map_err(|error| dial_failure(&error))?;
-                let null_body = has_null_body(request, &raw, status);
-                match content_encoding {
-                    Some(encoding) if !null_body => {
-                        match decode_content_encoding(&raw, &encoding) {
-                            Some(decoded) => (decoded, false),
-                            None => (raw, true),
+                    .bytes(renderer::MAX_RESPONSE_BODY_BYTES)
+                    .await
+                {
+                    Ok(body) => {
+                        if let Some(integrity) = request.integrity.as_deref()
+                            && !renderer::integrity_verifies(integrity, &body)
+                        {
+                            return Err(DialFailure::Connect);
                         }
+                        Ok(body)
                     }
-                    _ => (raw, false),
+                    Err(net::NetError::Decode(_)) => Err(renderer::BodyError),
+                    Err(error) => return Err(dial_failure(&error)),
                 }
             } else {
-                (Vec::new(), false)
+                Ok(Vec::new())
             };
             Ok(DialOutcome {
                 status: if response_type.is_opaque() { 0 } else { status },
@@ -302,8 +389,8 @@ impl TabNetworkHandle {
                 content_type,
                 headers,
                 body,
-                body_error,
                 response_type,
+                redirect_count,
             })
         };
         let result = tokio::select! {
@@ -311,24 +398,47 @@ impl TabNetworkHandle {
             _ = cancel.changed() => Err(DialFailure::Cancelled),
             result = call => result,
         };
-        match &result {
-            Ok(outcome) => logging::trace!(
-                target: "browser::net",
-                "request done {:?} {} -> {} in {:?}",
-                request.kind,
-                request.url,
-                outcome.status,
-                started.elapsed()
-            ),
-            Err(failure) => logging::trace!(
-                target: "browser::net",
-                "request failed {:?} {} in {:?}: {failure:?}",
-                request.kind,
-                request.url,
-                started.elapsed()
-            ),
-        }
+        self.remember_response(request, &mode, &result);
+        trace_dial_result(request, started, &result);
         result
+    }
+
+    fn cached_response(
+        &self,
+        request: &DialRequest,
+        mode: &str,
+    ) -> Result<Option<DialOutcome>, DialFailure> {
+        if request.kind != DialKind::JsFetch || !matches!(mode, "force-cache" | "only-if-cached") {
+            return Ok(None);
+        }
+        let hit = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&cache_key(request))
+            .cloned();
+        if hit.is_none() && mode == "only-if-cached" {
+            return Err(DialFailure::Connect);
+        }
+        Ok(hit)
+    }
+
+    fn remember_response(
+        &self,
+        request: &DialRequest,
+        mode: &str,
+        result: &Result<DialOutcome, DialFailure>,
+    ) {
+        let Ok(outcome) = result else {
+            return;
+        };
+        if !should_store(request, outcome, mode) {
+            return;
+        }
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cache_key(request), outcome.clone());
     }
 
     async fn acquire(
@@ -421,6 +531,16 @@ fn watch_redirects(
 
 /// Builds the `net` request for one page dial: URL, method, CORS parameters,
 /// headers, body, and initiator.
+/// JS header values are `ByteString`s: each UTF-16 code unit is one byte. The
+/// renderer carries them as Rust `String`, so UTF-8 would turn `0x80..=0xFF`
+/// into two wire bytes.
+fn isomorphic_encode(value: &str) -> Vec<u8> {
+    value
+        .chars()
+        .map(|character| u8::try_from(character).unwrap_or(0))
+        .collect()
+}
+
 fn outbound_request(
     request: &DialRequest,
     initiator: &Url,
@@ -453,20 +573,20 @@ fn outbound_request(
     let mut outbound = Request::new(method, url);
     apply_cors(request, initiator, &mut outbound);
     if let Some(content_type) = &request.content_type {
-        let _ = outbound
-            .headers
-            .insert("Content-Type", content_type.as_bytes());
+        let content_type = isomorphic_encode(content_type);
+        let _ = outbound.headers.insert("Content-Type", content_type);
     }
     for (name, value) in &request.headers {
         if request.kind == DialKind::JsFetch && forbidden_page_header(name, value) {
             continue;
         }
-        if no_cors && !net::cors::is_no_cors_safelisted_request_header(name, value.as_bytes()) {
+        let value = isomorphic_encode(value);
+        if no_cors && !net::cors::is_no_cors_safelisted_request_header(name, &value) {
             continue;
         }
         outbound
             .headers
-            .insert(name, value.as_bytes())
+            .insert(name, value)
             .map_err(|_| DialFailure::Connect)?;
     }
     if let Some(referrer) = &request.referrer
@@ -514,6 +634,30 @@ fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
     };
 }
 
+fn trace_dial_result(
+    request: &DialRequest,
+    started: Instant,
+    result: &Result<DialOutcome, DialFailure>,
+) {
+    match result {
+        Ok(outcome) => logging::trace!(
+            target: "browser::net",
+            "request done {:?} {} -> {} in {:?}",
+            request.kind,
+            request.url,
+            outcome.status,
+            started.elapsed()
+        ),
+        Err(failure) => logging::trace!(
+            target: "browser::net",
+            "request failed {:?} {} in {:?}: {failure:?}",
+            request.kind,
+            request.url,
+            started.elapsed()
+        ),
+    }
+}
+
 fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutcome> {
     let url = blocked
         .lock()
@@ -525,9 +669,9 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         final_url: url.to_string(),
         content_type: None,
         headers: Vec::new(),
-        body: Vec::new(),
-        body_error: false,
+        body: Ok(Vec::new()),
         response_type: net::cors::ResponseType::Basic,
+        redirect_count: 0,
     })
 }
 
@@ -539,7 +683,8 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
         NetError::Transport(TransportError::Timeout(_)) => DialFailure::Timeout,
         NetError::Limit(_) => DialFailure::Limit,
         NetError::Transport(TransportError::Connect(_) | TransportError::Io(_))
-        | NetError::Protocol(_) => DialFailure::Connect,
+        | NetError::Protocol(_)
+        | NetError::Decode(_) => DialFailure::Connect,
     }
 }
 
@@ -620,102 +765,6 @@ fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
         .map(isomorphic_decode)
         .collect();
     (!values.is_empty()).then(|| values.join(", "))
-}
-
-/// Every `Content-Encoding` value from the response as one string, in wire
-/// order. The codings apply in order, so decoding walks them in reverse
-/// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
-fn content_encoding_header(headers: &net::HeaderMap) -> Option<String> {
-    let values: Vec<String> = headers
-        .get_all("content-encoding")
-        .map(isomorphic_decode)
-        .collect();
-    (!values.is_empty()).then(|| values.join(", "))
-}
-
-/// Statuses and methods whose response body is null regardless of the wire
-/// bytes (<https://fetch.spec.whatwg.org/#null-body-status>).
-fn has_null_body(request: &DialRequest, body: &[u8], status: u16) -> bool {
-    body.is_empty()
-        || request.method.eq_ignore_ascii_case("HEAD")
-        || matches!(status, 101 | 204 | 205 | 304)
-}
-
-/// Decodes a response body for the `Content-Encoding` list. `None` means a
-/// supported coding failed or exceeded [`MAX_DECODED_BODY_BYTES`]; unsupported
-/// codings leave the bytes untouched, which is what the Fetch spec asks for
-/// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>). `zstd` is
-/// still unsupported, so zstd responses pass through compressed.
-fn decode_content_encoding(body: &[u8], encoding: &str) -> Option<Vec<u8>> {
-    if body.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut data = body.to_vec();
-    for coding in encoding.split(',').rev() {
-        let coding = coding.trim();
-        if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
-            continue;
-        }
-        data = if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
-            decode_with_limit(flate2::read::MultiGzDecoder::new(&data[..]))?
-        } else if coding.eq_ignore_ascii_case("deflate") {
-            let zlib_wrapped = data.len() >= 2
-                && (data[0] & 0x0f) == 8
-                && (u16::from(data[0]) << 8 | u16::from(data[1])) % 31 == 0;
-            if zlib_wrapped {
-                decode_with_limit(flate2::read::ZlibDecoder::new(&data[..]))?
-            } else {
-                decode_with_limit(flate2::read::DeflateDecoder::new(&data[..]))?
-            }
-        } else if coding.eq_ignore_ascii_case("br") {
-            let mut decoded = LimitedWriter::new();
-            brotli_decompressor::BrotliDecompress(&mut &data[..], &mut decoded).ok()?;
-            decoded.into_inner()
-        } else {
-            // Unsupported coding: leave the bytes untouched.
-            continue;
-        };
-    }
-    Some(data)
-}
-
-fn decode_with_limit(reader: impl Read) -> Option<Vec<u8>> {
-    let mut decoded = Vec::new();
-    reader
-        .take(MAX_DECODED_BODY_BYTES as u64 + 1)
-        .read_to_end(&mut decoded)
-        .ok()?;
-    (decoded.len() <= MAX_DECODED_BODY_BYTES).then_some(decoded)
-}
-
-/// A writer that refuses to grow past [`MAX_DECODED_BODY_BYTES`]. Brotli takes
-/// a writer rather than a reader, so `take` cannot bound it.
-struct LimitedWriter {
-    data: Vec<u8>,
-}
-
-impl LimitedWriter {
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.data
-    }
-}
-
-impl Write for LimitedWriter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        if self.data.len() + buffer.len() > MAX_DECODED_BODY_BYTES {
-            return Err(std::io::Error::other("decoded body limit exceeded"));
-        }
-        self.data.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Network-boundary `Referer` check: rejects only a true downgrade (https
@@ -807,54 +856,5 @@ mod tests {
         assert!(sends_default_ua_client_hints(
             &Url::parse("http://localhost/").expect("localhost")
         ));
-    }
-
-    use flate2::Compression;
-    use flate2::write::{DeflateEncoder, GzEncoder};
-
-    fn gzip(data: &[u8]) -> Vec<u8> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
-    }
-
-    #[test]
-    fn decodes_every_gzip_member() {
-        let mut body = gzip(b"one");
-        body.extend(gzip(b"two"));
-        assert_eq!(decode_content_encoding(&body, "gzip").unwrap(), b"onetwo");
-    }
-
-    #[test]
-    fn decodes_raw_deflate() {
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(b"deflated").unwrap();
-        let body = encoder.finish().unwrap();
-        assert_eq!(
-            decode_content_encoding(&body, "deflate").unwrap(),
-            b"deflated"
-        );
-    }
-
-    #[test]
-    fn leaves_unsupported_coding_untouched() {
-        assert_eq!(
-            decode_content_encoding(b"zstd bytes", "zstd").unwrap(),
-            b"zstd bytes"
-        );
-    }
-
-    #[test]
-    fn empty_body_skips_decoding() {
-        assert_eq!(
-            decode_content_encoding(b"", "gzip").unwrap(),
-            Vec::<u8>::new()
-        );
-    }
-
-    #[test]
-    fn refuses_decoded_bodies_past_the_limit() {
-        let body = gzip(&vec![0; MAX_DECODED_BODY_BYTES + 1]);
-        assert!(decode_content_encoding(&body, "gzip").is_none());
     }
 }

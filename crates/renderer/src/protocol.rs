@@ -478,6 +478,22 @@ pub struct DialRequest {
     /// and subresource dials.
     #[serde(default)]
     pub cors: Option<CorsRequest>,
+    /// A `fetch(..., {keepalive: true})` request. The browser enforces the
+    /// in-flight byte quota across realms
+    /// (<https://fetch.spec.whatwg.org/#keepalive-flag>).
+    #[serde(default)]
+    pub keepalive: bool,
+    /// Request-body length for the keepalive quota.
+    #[serde(default)]
+    pub body_len: u64,
+    /// Subresource Integrity metadata; the browser checks the decoded body
+    /// before returning it (<https://www.w3.org/TR/SRI/#verify-integrity>).
+    #[serde(default)]
+    pub integrity: Option<String>,
+    /// Request cache mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>).
+    #[serde(default)]
+    pub cache: Option<String>,
 }
 
 /// The CORS parameters a page `fetch`/XHR sends over the wire. The browser
@@ -499,6 +515,10 @@ fn default_dial_method() -> String {
     "GET".to_owned()
 }
 
+/// A response body that could not be decoded.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BodyError;
+
 /// Result of one blocking GET.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialOutcome {
@@ -515,17 +535,19 @@ pub struct DialOutcome {
     /// Response headers visible to page scripts, in wire order.
     #[serde(default)]
     pub headers: Vec<(String, String)>,
-    /// Response body, when [`DialRequest::read_body`].
-    pub body: Vec<u8>,
-    /// The body could not be decoded for its `Content-Encoding`; consuming it
-    /// rejects instead of returning bytes
+    /// Response body, when [`DialRequest::read_body`]. `Err` means the body
+    /// could not be decoded for its `Content-Encoding`; consuming it rejects
+    /// instead of returning bytes
     /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
-    pub body_error: bool,
+    pub body: Result<Vec<u8>, BodyError>,
     /// How the response was filtered
     /// (<https://fetch.spec.whatwg.org/#concept-response-type>); `basic` for
     /// same-origin and subresource responses.
     #[serde(default)]
     pub response_type: net::cors::ResponseType,
+    /// Redirect hops followed before this response.
+    #[serde(default)]
+    pub redirect_count: u32,
 }
 
 impl DialOutcome {
@@ -545,9 +567,9 @@ impl DialOutcome {
             final_url,
             content_type,
             headers,
-            body,
-            body_error: false,
+            body: Ok(body),
             response_type: net::cors::ResponseType::Basic,
+            redirect_count: 0,
         }
     }
 }

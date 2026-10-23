@@ -891,7 +891,7 @@ fn parse_integrity_metadata(metadata: &str) -> Vec<(String, String)> {
 /// algorithm's mismatch fails the load
 /// (<https://www.w3.org/TR/SRI/#does-response-match-metadatalist>).
 #[must_use]
-pub(crate) fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
+pub fn integrity_verifies(integrity: &str, bytes: &[u8]) -> bool {
     let integrity = integrity.trim();
     if integrity.is_empty() {
         return true;

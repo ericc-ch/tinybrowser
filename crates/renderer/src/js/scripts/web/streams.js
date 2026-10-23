@@ -9,14 +9,34 @@ const __tbStreamResult = (value, done) => {
   result.done = done;
   return result;
 };
+const __tbStreamWake = data => {
+  const waiters = data.readWaiters;
+  data.readWaiters = [];
+  for (let index = 0; index < waiters.length; index++) {
+    if (data.errored !== null) waiters[index].reject(data.errored);
+    else waiters[index].resolve();
+  }
+};
 const __tbWritableData = host.slots('tinybrowser.writable.data');
 const __tbWritableBrand = value => __tbBrand(value, __tbWritableData);
 globalThis.ReadableStream = class ReadableStream {
   constructor(source, strategy) {
     const sourceObject = source === undefined ? {} : Object(source);
     const type = sourceObject.type === 'bytes' ? 'bytes' : 'default';
+    let resolveClosed;
+    let rejectClosed;
+    const closedPromise = new Promise((resolve, reject) => {
+      resolveClosed = resolve;
+      rejectClosed = reject;
+    });
+    // A stream may error before anyone observes `reader.closed`; mark the
+    // internal rejection handled while leaving the promise rejected for later
+    // observers.
+    closedPromise.catch(() => {});
     const data = {
-      chunks: [], closed: false, errored: null, canceled: false, reader: null, disturbed: false, cancelWaiters: [],
+      chunks: [], closed: false, closing: false, errored: null, canceled: false, reader: null,
+      disturbed: false, cancelWaiters: [], readWaiters: [],
+      closedPromise, resolveClosed, rejectClosed,
       type,
       pull: typeof sourceObject.pull === 'function' ? sourceObject.pull : null,
       cancel: typeof sourceObject.cancel === 'function' ? sourceObject.cancel : null,
@@ -25,16 +45,37 @@ globalThis.ReadableStream = class ReadableStream {
     };
     __tbStreamData.set(this, data);
     data.controller = {
-      enqueue(chunk) { if (!data.closed && data.errored === null && !data.canceled) __tbArray.push(data.chunks, chunk); },
-      close() { data.closed = true; },
-      error(error) { data.errored = error; },
+      enqueue(chunk) {
+        if (data.closed || data.errored !== null || data.canceled) return;
+        __tbArray.push(data.chunks, chunk);
+        __tbStreamWake(data);
+      },
+      close() {
+        if (data.closed || data.errored !== null) return;
+        data.closed = true;
+        data.resolveClosed();
+        __tbStreamWake(data);
+      },
+      error(error) {
+        if (data.closed || data.errored !== null) return;
+        data.errored = error;
+        data.rejectClosed(error);
+        __tbStreamWake(data);
+      },
       get desiredSize() { return data.closed ? null : 1; },
     };
-    if (typeof sourceObject.start === 'function') sourceObject.start(data.controller);
+    if (typeof sourceObject.start === 'function') {
+      try {
+        sourceObject.start(data.controller);
+      } catch (error) {
+        data.controller.error(error);
+      }
+    }
   }
   get locked() { return __tbStreamBrand(this).reader !== null; }
   getReader(options) {
     const data = __tbStreamBrand(this);
+    if (data.disturbed) throw new TypeError('The stream is disturbed');
     if (data.reader !== null) throw new TypeError('The stream is locked to a reader');
     if (options !== undefined && options !== null && Object(options).mode !== undefined) {
       const mode = Object(options).mode;
@@ -51,14 +92,17 @@ globalThis.ReadableStream = class ReadableStream {
             if (data.chunks.length === 0) {
               if (data.closed || data.canceled) return Promise.resolve(__tbStreamResult(view.subarray(0, 0), true));
               if (data.pull !== null) {
-                const pulled = Promise.resolve(__tbApply(data.pull, data.source, [data.controller])).then(step);
+                const pulled = Promise.resolve(__tbApply(data.pull, data.source, [data.controller]))
+                  .then(step, error => { data.controller.error(error); throw error; });
                 const canceled = new Promise(resolve => __tbArray.push(data.cancelWaiters, resolve));
                 return Promise.race([pulled, canceled]).then(value => {
                   if (data.canceled) return __tbStreamResult(view.subarray(0, 0), true);
                   return value;
                 });
               }
-              return Promise.resolve(__tbStreamResult(view.subarray(0, 0), true));
+              return new Promise((resolve, reject) => {
+                __tbArray.push(data.readWaiters, { resolve, reject });
+              }).then(step);
             }
             const chunk = __tbArray.shift(data.chunks);
             const bytes = chunk instanceof Uint8Array
@@ -78,7 +122,7 @@ globalThis.ReadableStream = class ReadableStream {
         },
         cancel: reason => this.cancel(reason),
         releaseLock: () => { data.reader = null; },
-        closed: Promise.resolve(),
+        closed: closedPromise,
       };
       data.reader = reader;
       return reader;
@@ -91,20 +135,23 @@ globalThis.ReadableStream = class ReadableStream {
           if (data.chunks.length > 0) return Promise.resolve(__tbStreamResult(__tbArray.shift(data.chunks), false));
           if (data.closed || data.canceled) return Promise.resolve(__tbStreamResult(undefined, true));
           if (data.pull !== null) {
-            const pulled = Promise.resolve(__tbApply(data.pull, data.source, [data.controller])).then(step);
+            const pulled = Promise.resolve(__tbApply(data.pull, data.source, [data.controller]))
+              .then(step, error => { data.controller.error(error); throw error; });
             const canceled = new Promise(resolve => __tbArray.push(data.cancelWaiters, resolve));
             return Promise.race([pulled, canceled]).then(value => {
               if (data.canceled) return __tbStreamResult(undefined, true);
               return value;
             });
           }
-          return Promise.resolve(__tbStreamResult(undefined, true));
+          return new Promise((resolve, reject) => {
+            __tbArray.push(data.readWaiters, { resolve, reject });
+          }).then(step);
         };
         return step();
       },
       cancel: reason => this.cancel(reason),
       releaseLock: () => { data.reader = null; },
-      closed: Promise.resolve(),
+      closed: closedPromise,
     };
     data.reader = reader;
     return reader;
@@ -117,10 +164,12 @@ globalThis.ReadableStream = class ReadableStream {
     // (<https://streams.spec.whatwg.org/#readable-stream-cancel>).
     data.canceled = true;
     data.chunks.length = 0;
+    data.resolveClosed();
     while (data.cancelWaiters.length > 0) {
       const waiter = __tbArray.shift(data.cancelWaiters);
       waiter(__tbStreamResult(undefined, true));
     }
+    __tbStreamWake(data);
     if (data.cancel !== null) return Promise.resolve(__tbApply(data.cancel, data.source, [reason]));
     return Promise.resolve();
   }

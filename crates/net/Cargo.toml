@@ -20,10 +20,12 @@ percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 tokio-native-tls = "0.3"
 thiserror = "2"
-tokio = { version = "1.53", default-features = false, features = ["net", "time"] }
+tokio = { version = "1.53", default-features = false, features = ["net", "time", "io-util", "rt"] }
 tower-service = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "zlib", "brotli"] }
 cookies = { workspace = true }
 url = "2"
 
 [dev-dependencies]
+flate2 = "1"
 tokio = { version = "1.53", default-features = false, features = ["rt", "macros"] }

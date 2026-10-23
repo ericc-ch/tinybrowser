@@ -169,6 +169,10 @@ impl QueuedDial {
                 timeout_ms: 0,
                 csp: None,
                 cors: None,
+                keepalive: false,
+                body_len: 0,
+                integrity: None,
+                cache: None,
             },
             context,
             ancestors: Vec::new(),
@@ -2449,11 +2453,16 @@ impl Document {
                 // SRI verification fails the load like a network error:
                 // no execution, no `load` event, and no CSP violation
                 // (<https://www.w3.org/TR/SRI/#verify-integrity>).
-                let integrity_ok = integrity
-                    .as_deref()
-                    .is_none_or(|metadata| crate::csp::integrity_verifies(metadata, &outcome.body));
-                if !blocked && integrity_ok && (200..300).contains(&outcome.status) {
-                    let source = String::from_utf8_lossy(&outcome.body);
+                let body = outcome.body.as_ref().ok();
+                let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
+                    body.is_some_and(|body| crate::csp::integrity_verifies(metadata, body))
+                });
+                if !blocked
+                    && integrity_ok
+                    && let Some(body) = body
+                    && (200..300).contains(&outcome.status)
+                {
+                    let source = String::from_utf8_lossy(body);
                     let filename = outcome.final_url.clone();
                     self.eval_classic(&source, Some(element), 1, &filename);
                     self.fire_js(|js| js.fire_node_load(element));
@@ -2527,7 +2536,10 @@ impl Document {
         self.record_event(RendererEvent::Navigated {
             url: url.to_string(),
         });
-        self.install_frame_response(&head, &outcome.body, None);
+        let Ok(body) = &outcome.body else {
+            return;
+        };
+        self.install_frame_response(&head, body, None);
     }
 
     /// Hands one Blitz subresource response to its handler. A redirect the
@@ -2545,15 +2557,19 @@ impl Document {
             && destination.is_some_and(|destination| {
                 self.response_url_blocked(&outcome.final_url, request_url, destination, None)
             });
-        if !blocked && (200..300).contains(&outcome.status) {
+        let body = outcome.body.as_ref().ok();
+        if !blocked
+            && (200..300).contains(&outcome.status)
+            && let Some(body) = body
+        {
             self.subresource_bytes
-                .insert(outcome.final_url.clone(), outcome.body.clone());
+                .insert(outcome.final_url.clone(), body.clone());
         }
         let Some(handler) = self.blitz_handlers.remove(&id) else {
             return;
         };
         let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
-        if blocked {
+        if blocked || body.is_none() {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
             let element = Url::parse(&request_url)
                 .ok()
@@ -2570,7 +2586,7 @@ impl Document {
         } else {
             Box::new(handler).bytes(
                 outcome.final_url.clone(),
-                blitz_traits::net::Bytes::from(outcome.body.clone()),
+                blitz_traits::net::Bytes::from(body.cloned().unwrap_or_default()),
             );
         }
         // The arrival changes style or layout; apply it now so the tree is

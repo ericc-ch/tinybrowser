@@ -152,9 +152,9 @@ impl Document {
                                 // as the response's `Content-Type` header
                                 // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
                                 headers: vec![("content-type".to_owned(), content_type)],
-                                body,
-                                body_error: false,
+                                body: Ok(body),
                                 response_type: net::cors::ResponseType::Basic,
+                                redirect_count: 0,
                             },
                         });
                     } else {
@@ -369,6 +369,10 @@ impl Document {
         dial.req.headers = fetch.headers;
         dial.req.referrer = fetch.referrer;
         dial.req.cors = fetch.cors;
+        dial.req.keepalive = fetch.keepalive;
+        dial.req.body_len = fetch.body_len;
+        dial.req.integrity = fetch.integrity;
+        dial.req.cache = Some(fetch.cache);
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));
