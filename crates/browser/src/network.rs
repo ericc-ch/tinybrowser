@@ -75,6 +75,7 @@ struct CacheKey {
 struct CachedResponse {
     outcome: DialOutcome,
     stored_at: Instant,
+    request_headers: Vec<(String, String)>,
 }
 
 type ResponseCache = Arc<Mutex<HashMap<CacheKey, CachedResponse>>>;
@@ -120,10 +121,40 @@ fn response_forbids_storage(outcome: &DialOutcome) -> bool {
     outcome.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("cache-control")
             && value.to_ascii_lowercase().contains("no-store")
-    }) || outcome
+    })
+}
+
+fn vary_matches(entry: &CachedResponse, request: &DialRequest) -> bool {
+    let request_header = |name: &str| {
+        request
+            .headers
+            .iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    entry
+        .outcome
         .headers
         .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .all(|field| {
+            if field == "*" {
+                return false;
+            }
+            let stored = entry
+                .request_headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(field))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            stored == request_header(field)
+        })
 }
 
 fn fresh(entry: &CachedResponse) -> bool {
@@ -608,10 +639,13 @@ impl TabNetworkHandle {
         spawn_stream_body(
             response,
             request.integrity.clone(),
-            should_store(request, &outcome, &mode),
-            outcome.clone(),
-            Arc::clone(&self.cache),
-            cache_key,
+            StreamCache {
+                store: should_store(request, &outcome, &mode),
+                stored: outcome.clone(),
+                cache: Arc::clone(&self.cache),
+                cache_key,
+                request_headers: request.headers.clone(),
+            },
             tx,
         );
         Ok(outcome)
@@ -660,6 +694,7 @@ impl TabNetworkHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&cache_key(request))
+            .filter(|entry| vary_matches(entry, request))
             .cloned()
     }
 
@@ -713,6 +748,7 @@ impl TabNetworkHandle {
                 CachedResponse {
                     outcome: outcome.clone(),
                     stored_at: Instant::now(),
+                    request_headers: request.headers.clone(),
                 },
             );
     }
@@ -940,15 +976,27 @@ fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
     };
 }
 
-fn spawn_stream_body(
-    response: net::Response,
-    integrity: Option<String>,
+struct StreamCache {
     store: bool,
     stored: DialOutcome,
     cache: ResponseCache,
     cache_key: CacheKey,
+    request_headers: Vec<(String, String)>,
+}
+
+fn spawn_stream_body(
+    response: net::Response,
+    integrity: Option<String>,
+    write: StreamCache,
     tx: tokio::sync::mpsc::UnboundedSender<StreamMessage>,
 ) {
+    let StreamCache {
+        store,
+        stored,
+        cache,
+        cache_key,
+        request_headers,
+    } = write;
     tokio::spawn(async move {
         let mut body = response.into_body().await;
         let mut total = 0usize;
@@ -986,6 +1034,7 @@ fn spawn_stream_body(
                                     CachedResponse {
                                         outcome: stored,
                                         stored_at: Instant::now(),
+                                        request_headers,
                                     },
                                 );
                         }
