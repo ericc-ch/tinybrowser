@@ -17,8 +17,8 @@ Maximize web spec conformance per byte.
 
 ## Size and release
 
-- Size is a headline constraint, but never pay with a used feature. `display: grid`, for example, stays: real pages use it, so grid layout code stays. Cut code nothing calls, not conformance.
-- No binary packing. No compressor, stub, or self-extractor step (nothing UPX-like). Shrink real code, then strip what no consumer reads.
+- Size is an important constraint, but never try to gain smaller size by removing feature(s).
+- No binary packing. No compressor, stub, or self-extractor step (nothing UPX-like).
 - The toolchain is pinned nightly (`rust-toolchain.toml`) for `[profile.release] rustflags` and in-tree std. Release invariants live in `Cargo.toml`/`build.rs` with their size reason: `panic = "abort"`, `force-unwind-tables=no`, `[unstable] build-std`. Changing one means re-measuring; see `docs/size.md`.
 - Release never unwinds. Design for it: no cleanup may depend on `Drop` after a panic, never use `catch_unwind` on a production path, and a child process must not outlive its parent (`crates/browser/src/child/mod.rs` exits on channel EOF).
 - A panic must leave a record. The panic hook writes synchronously to the log file before the abort (`crates/logging/src/crash.rs`); the async log queue is lost on abort. Keep crash-path code panic-free.
