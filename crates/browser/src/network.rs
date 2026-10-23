@@ -14,6 +14,8 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
+use crate::wire::RendererAssignmentId;
+
 /// Default per-call fetch timeout on a [`TabNetworkHandle`].
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -67,6 +69,8 @@ struct CacheKey {
     method: String,
     url: String,
     credentials: String,
+    initiator: String,
+    partition: RendererAssignmentId,
 }
 
 /// A whole buffered response. The fetch body is already bounded by
@@ -80,6 +84,48 @@ struct CachedResponse {
 
 type ResponseCache = Arc<Mutex<HashMap<CacheKey, CachedResponse>>>;
 
+/// The cache decision shared by the buffered and streaming dial paths.
+/// `hit` is a complete response; `etag` is a stored validator the network
+/// path may use for a conditional request.
+struct CacheRead {
+    mode: String,
+    explicit_validator: bool,
+    hit: Option<DialOutcome>,
+    stored: Option<CachedResponse>,
+    etag: Option<String>,
+}
+
+const CACHE_MAX_ENTRIES: usize = 64;
+const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn insert_cached(
+    cache: &mut HashMap<CacheKey, CachedResponse>,
+    key: CacheKey,
+    entry: CachedResponse,
+) {
+    let body_len = entry.outcome.body.as_ref().map_or(0, Vec::len);
+    if body_len > renderer::MAX_RESPONSE_BODY_BYTES {
+        return;
+    }
+    let mut total = cache
+        .values()
+        .map(|entry| entry.outcome.body.as_ref().map_or(0, Vec::len))
+        .sum::<usize>();
+    while cache.len() >= CACHE_MAX_ENTRIES || total.saturating_add(body_len) > CACHE_MAX_BYTES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.stored_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(removed) = cache.remove(&oldest) {
+            total = total.saturating_sub(removed.outcome.body.as_ref().map_or(0, Vec::len));
+        }
+    }
+    cache.insert(key, entry);
+}
+
 enum StreamMessage {
     Chunk(Vec<u8>),
     End,
@@ -90,9 +136,15 @@ struct StreamState {
     rx: tokio::sync::mpsc::UnboundedReceiver<StreamMessage>,
 }
 
-type StreamMap = Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<StreamState>>>>>;
+#[derive(Clone)]
+struct StreamEntry {
+    owner: RendererAssignmentId,
+    state: Arc<tokio::sync::Mutex<StreamState>>,
+}
 
-fn cache_key(request: &DialRequest) -> CacheKey {
+type StreamMap = Arc<Mutex<HashMap<u64, StreamEntry>>>;
+
+fn cache_key(request: &DialRequest, initiator: &Url, partition: RendererAssignmentId) -> CacheKey {
     CacheKey {
         method: request.method.clone(),
         url: request.url.clone(),
@@ -100,6 +152,8 @@ fn cache_key(request: &DialRequest) -> CacheKey {
             || "none".to_owned(),
             |cors| format!("{:?}", cors.credentials),
         ),
+        initiator: initiator.origin().ascii_serialization(),
+        partition,
     }
 }
 
@@ -224,8 +278,33 @@ fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: &str) -> boo
         && request.method.eq_ignore_ascii_case("GET")
         && (200..300).contains(&outcome.status)
         && outcome.body.is_ok()
+        // An opaque response has no readable body and cannot satisfy a later
+        // CORS request, so keeping it only creates a response-type mismatch.
+        && !outcome.response_type.is_opaque()
         && mode != "no-store"
         && !response_forbids_storage(outcome)
+}
+
+/// Rechecks the request-mode rules that produced a cached filtered response.
+/// The cache partition keeps other origins away, but one document can still
+/// switch modes between requests.
+fn cache_usable(request: &DialRequest, initiator: &Url, entry: &CachedResponse) -> bool {
+    if entry.outcome.response_type.is_opaque() {
+        return false;
+    }
+    let Some(cors) = request.cors else {
+        return true;
+    };
+    let Ok(url) = Url::parse(&request.url) else {
+        return false;
+    };
+    match cors.mode {
+        net::cors::RequestMode::SameOrigin => url.origin() == initiator.origin(),
+        net::cors::RequestMode::NoCors => {
+            !matches!(entry.outcome.response_type, net::cors::ResponseType::Cors)
+        }
+        net::cors::RequestMode::Cors | net::cors::RequestMode::Navigate => true,
+    }
 }
 
 /// One completed navigation dial: the response head the tab mounts plus the
@@ -437,31 +516,22 @@ impl TabNetworkHandle {
         &self,
         request: &DialRequest,
         initiator: &Url,
+        owner: RendererAssignmentId,
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<DialOutcome, DialFailure> {
         let started = Instant::now();
         let _keepalive = KeepaliveReservation::acquire(request)?;
         if request.stream_body {
-            return self.dial_stream(request, initiator).await;
+            return self.dial_stream(request, initiator, owner).await;
         }
-        let mode = cache_mode(request).to_owned();
-        let page_conditional = has_page_conditional(request);
-        let cached = if page_conditional {
-            None
-        } else {
-            self.cached_hit(request)
-        };
-        if let Some(hit) = Self::cached_response(request, &mode, cached.as_ref())? {
+        let cache = self.cache_read(request, initiator, owner)?;
+        if let Some(hit) = cache.hit {
             return Ok(hit);
         }
-        // A default or no-cache request revalidates a stored response when it
-        // has a validator; the 304 path reuses the stored body. A page-supplied
-        // validator is the caller's own conditional request and must surface
-        // its 304.
-        let explicit_validator = page_conditional;
-        let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
-            .then(|| cached.as_ref().and_then(|entry| etag(&entry.outcome)))
-            .flatten();
+        let mode = cache.mode;
+        let explicit_validator = cache.explicit_validator;
+        let conditional = cache.etag;
+        let stored = cache.stored;
         logging::trace!(
             target: "browser::net",
             "request start {:?} {}",
@@ -500,7 +570,7 @@ impl TabNetworkHandle {
             let status = response.status();
             if status == 304
                 && !explicit_validator
-                && let Some(cached) = cached.as_ref()
+                && let Some(cached) = stored.as_ref()
             {
                 return Ok(merge_not_modified(&cached.outcome, &response));
             }
@@ -545,7 +615,7 @@ impl TabNetworkHandle {
             _ = cancel.changed() => Err(DialFailure::Cancelled),
             result = call => result,
         };
-        self.remember_response(request, &mode, &result);
+        self.remember_response(request, initiator, owner, &mode, &result);
         trace_dial_result(request, started, &result);
         result
     }
@@ -554,22 +624,17 @@ impl TabNetworkHandle {
         &self,
         request: &DialRequest,
         initiator: &Url,
+        owner: RendererAssignmentId,
     ) -> Result<DialOutcome, DialFailure> {
-        let mode = cache_mode(request).to_owned();
-        let page_conditional = has_page_conditional(request);
-        let cached = if page_conditional {
-            None
-        } else {
-            self.cached_hit(request)
-        };
-        if let Some(hit) = Self::cached_response(request, &mode, cached.as_ref())? {
+        let cache = self.cache_read(request, initiator, owner)?;
+        if let Some(hit) = cache.hit {
             return Ok(hit);
         }
-        let explicit_validator = page_conditional;
-        let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
-            .then(|| cached.as_ref().and_then(|entry| etag(&entry.outcome)))
-            .flatten();
-        let cache_key = cache_key(request);
+        let mode = cache.mode;
+        let explicit_validator = cache.explicit_validator;
+        let conditional = cache.etag;
+        let stored = cache.stored;
+        let cache_key = cache_key(request, initiator, owner);
         let budget = if request.timeout_ms == 0 {
             PAGE_FETCH_TIMEOUT
         } else {
@@ -593,9 +658,12 @@ impl TabNetworkHandle {
         };
         let response_type = response.response_type();
         let status = response.status();
+        if request.integrity.is_some() && response_type.is_opaque() {
+            return Err(DialFailure::Connect);
+        }
         if status == 304
             && !explicit_validator
-            && let Some(cached) = cached.as_ref()
+            && let Some(cached) = stored.as_ref()
         {
             return Ok(merge_not_modified(&cached.outcome, &response));
         }
@@ -634,7 +702,13 @@ impl TabNetworkHandle {
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, Arc::new(tokio::sync::Mutex::new(StreamState { rx })));
+            .insert(
+                id,
+                StreamEntry {
+                    owner,
+                    state: Arc::new(tokio::sync::Mutex::new(StreamState { rx })),
+                },
+            );
         outcome.stream = Some(id);
         spawn_stream_body(
             response,
@@ -651,8 +725,12 @@ impl TabNetworkHandle {
         Ok(outcome)
     }
 
-    pub(crate) async fn read_stream(&self, id: u64) -> Result<Option<Vec<u8>>, DialFailure> {
-        let Some(state) = self
+    pub(crate) async fn read_stream(
+        &self,
+        owner: RendererAssignmentId,
+        id: u64,
+    ) -> Result<Option<Vec<u8>>, DialFailure> {
+        let Some(entry) = self
             .streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -661,7 +739,10 @@ impl TabNetworkHandle {
         else {
             return Ok(None);
         };
-        let mut state = state.lock().await;
+        if entry.owner != owner {
+            return Ok(None);
+        }
+        let mut state = entry.state.lock().await;
         match state.rx.recv().await {
             Some(StreamMessage::Chunk(bytes)) => Ok(Some(bytes)),
             Some(StreamMessage::End) | None => {
@@ -675,8 +756,16 @@ impl TabNetworkHandle {
         }
     }
 
-    pub(crate) fn cancel_stream(&self, id: u64) {
-        self.remove_stream(id);
+    pub(crate) fn cancel_stream(&self, owner: RendererAssignmentId, id: u64) {
+        let matches_owner = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .is_some_and(|entry| entry.owner == owner);
+        if matches_owner {
+            self.remove_stream(id);
+        }
     }
 
     fn remove_stream(&self, id: u64) {
@@ -686,15 +775,69 @@ impl TabNetworkHandle {
             .remove(&id);
     }
 
-    fn cached_hit(&self, request: &DialRequest) -> Option<CachedResponse> {
+    fn cache_read(
+        &self,
+        request: &DialRequest,
+        initiator: &Url,
+        owner: RendererAssignmentId,
+    ) -> Result<CacheRead, DialFailure> {
+        let mode = cache_mode(request).to_owned();
+        let explicit_validator = has_page_conditional(request);
+        let cached = if explicit_validator {
+            None
+        } else {
+            self.cached_hit(request, initiator, owner)
+        };
+        if let Some(hit) = Self::cached_response(request, &mode, cached.as_ref())? {
+            return Ok(CacheRead {
+                mode,
+                explicit_validator,
+                hit: Some(hit),
+                stored: cached,
+                etag: None,
+            });
+        }
+        // A default or no-cache request revalidates a stored response when it
+        // has a validator; the 304 path reuses the stored body. A page-supplied
+        // validator is the caller's own conditional request and must surface
+        // its 304.
+        let etag = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
+            .then(|| cached.as_ref().and_then(|entry| etag(&entry.outcome)))
+            .flatten();
+        Ok(CacheRead {
+            mode,
+            explicit_validator,
+            hit: None,
+            stored: cached,
+            etag,
+        })
+    }
+
+    fn cached_integrity_ok(request: &DialRequest, entry: &CachedResponse) -> bool {
+        let Some(integrity) = request.integrity.as_deref() else {
+            return true;
+        };
+        entry
+            .outcome
+            .body
+            .as_ref()
+            .is_ok_and(|body| renderer::integrity_verifies(integrity, body))
+    }
+
+    fn cached_hit(
+        &self,
+        request: &DialRequest,
+        initiator: &Url,
+        partition: RendererAssignmentId,
+    ) -> Option<CachedResponse> {
         if request.kind != DialKind::JsFetch {
             return None;
         }
         self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&cache_key(request))
-            .filter(|entry| vary_matches(entry, request))
+            .get(&cache_key(request, initiator, partition))
+            .filter(|entry| vary_matches(entry, request) && cache_usable(request, initiator, entry))
             .cloned()
     }
 
@@ -717,13 +860,28 @@ impl TabNetworkHandle {
             {
                 return Err(DialFailure::Connect);
             }
+            if !Self::cached_integrity_ok(request, cached) {
+                return Err(DialFailure::Connect);
+            }
             return Ok(Some(cached.outcome.clone()));
         }
         if mode == "force-cache" {
-            return Ok(cached.map(|entry| entry.outcome.clone()));
+            let Some(cached) = cached else {
+                return Ok(None);
+            };
+            if !Self::cached_integrity_ok(request, cached) {
+                return Err(DialFailure::Connect);
+            }
+            return Ok(Some(cached.outcome.clone()));
         }
         if mode == "default" && cached.is_some_and(fresh) {
-            return Ok(cached.map(|entry| entry.outcome.clone()));
+            let Some(cached) = cached else {
+                return Ok(None);
+            };
+            if !Self::cached_integrity_ok(request, cached) {
+                return Err(DialFailure::Connect);
+            }
+            return Ok(Some(cached.outcome.clone()));
         }
         Ok(None)
     }
@@ -731,6 +889,8 @@ impl TabNetworkHandle {
     fn remember_response(
         &self,
         request: &DialRequest,
+        initiator: &Url,
+        partition: RendererAssignmentId,
         mode: &str,
         result: &Result<DialOutcome, DialFailure>,
     ) {
@@ -740,17 +900,20 @@ impl TabNetworkHandle {
         if !should_store(request, outcome, mode) {
             return;
         }
-        self.cache
+        let key = cache_key(request, initiator, partition);
+        let mut cache = self
+            .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                cache_key(request),
-                CachedResponse {
-                    outcome: outcome.clone(),
-                    stored_at: Instant::now(),
-                    request_headers: request.headers.clone(),
-                },
-            );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_cached(
+            &mut cache,
+            key,
+            CachedResponse {
+                outcome: outcome.clone(),
+                stored_at: Instant::now(),
+                request_headers: request.headers.clone(),
+            },
+        );
     }
 
     async fn acquire(
@@ -1026,17 +1189,18 @@ fn spawn_stream_body(
                             let mut stored = stored;
                             stored.body = Ok(buffer);
                             stored.stream = None;
-                            cache
+                            let mut cache = cache
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(
-                                    cache_key,
-                                    CachedResponse {
-                                        outcome: stored,
-                                        stored_at: Instant::now(),
-                                        request_headers,
-                                    },
-                                );
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            insert_cached(
+                                &mut cache,
+                                cache_key,
+                                CachedResponse {
+                                    outcome: stored,
+                                    stored_at: Instant::now(),
+                                    request_headers,
+                                },
+                            );
                         }
                         let _ = tx.send(StreamMessage::End);
                     }
@@ -1235,6 +1399,121 @@ fn is_safe_referrer(referrer: &str, request_url: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn js_fetch(mode: net::cors::RequestMode, url: &str) -> DialRequest {
+        DialRequest {
+            kind: DialKind::JsFetch,
+            url: url.to_owned(),
+            initiator: "http://a.test/page".to_owned(),
+            read_body: true,
+            method: "GET".to_owned(),
+            body: Vec::new(),
+            content_type: None,
+            headers: Vec::new(),
+            referrer: None,
+            timeout_ms: 0,
+            csp: None,
+            cors: Some(renderer::CorsRequest {
+                mode,
+                credentials: net::cors::CredentialsMode::SameOrigin,
+                redirect: net::cors::RedirectMode::Follow,
+            }),
+            keepalive: false,
+            body_len: 0,
+            integrity: None,
+            cache: None,
+            stream_body: false,
+            referrer_source: None,
+            referrer_policy: None,
+        }
+    }
+
+    fn cached(response_type: net::cors::ResponseType) -> CachedResponse {
+        CachedResponse {
+            outcome: DialOutcome {
+                status: 200,
+                status_text: "OK".to_owned(),
+                final_url: "http://a.test/".to_owned(),
+                content_type: None,
+                headers: Vec::new(),
+                body: Ok(Vec::new()),
+                response_type,
+                redirect_count: 0,
+                stream: None,
+            },
+            stored_at: Instant::now(),
+            request_headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cache_partitions_by_document_and_initiator_origin() {
+        let request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let other_initiator = Url::parse("http://b.test/page").expect("other URL");
+        let first = cache_key(&request, &initiator, RendererAssignmentId::new(1));
+        let same = cache_key(&request, &initiator, RendererAssignmentId::new(1));
+        let other_document = cache_key(&request, &initiator, RendererAssignmentId::new(2));
+        let other_origin = cache_key(&request, &other_initiator, RendererAssignmentId::new(1));
+        assert_eq!(first, same);
+        assert_ne!(first, other_document);
+        assert_ne!(first, other_origin);
+    }
+
+    #[test]
+    fn cached_cors_response_is_not_reused_as_no_cors_across_origins() {
+        let request = js_fetch(net::cors::RequestMode::NoCors, "http://b.test/data");
+        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        assert!(!cache_usable(
+            &request,
+            &initiator,
+            &cached(net::cors::ResponseType::Cors)
+        ));
+        assert!(!cache_usable(
+            &request,
+            &initiator,
+            &cached(net::cors::ResponseType::Opaque)
+        ));
+        let same_origin = js_fetch(net::cors::RequestMode::NoCors, "http://a.test/data");
+        assert!(cache_usable(
+            &same_origin,
+            &initiator,
+            &cached(net::cors::ResponseType::Basic)
+        ));
+    }
+
+    #[test]
+    fn cached_body_still_needs_to_satisfy_integrity_metadata() {
+        let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        request.integrity = Some("sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_owned());
+        assert!(TabNetworkHandle::cached_integrity_ok(
+            &request,
+            &cached(net::cors::ResponseType::Basic)
+        ));
+        request.integrity = Some("sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
+        assert!(!TabNetworkHandle::cached_integrity_ok(
+            &request,
+            &cached(net::cors::ResponseType::Basic)
+        ));
+    }
+
+    #[test]
+    fn cache_evicts_the_oldest_entry_at_the_count_limit() {
+        let mut cache = HashMap::new();
+        for index in 0..=CACHE_MAX_ENTRIES {
+            let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+            request.url = format!("http://a.test/{index}");
+            let key = cache_key(
+                &request,
+                &Url::parse("http://a.test/page").expect("page URL"),
+                RendererAssignmentId::new(1),
+            );
+            let mut entry = cached(net::cors::ResponseType::Basic);
+            entry.stored_at = Instant::now() + Duration::from_secs(index as u64);
+            insert_cached(&mut cache, key, entry);
+        }
+        assert_eq!(cache.len(), CACHE_MAX_ENTRIES);
+    }
 
     #[tokio::test]
     async fn exhausted_permits_fail_with_queue_full_before_the_deadline() {

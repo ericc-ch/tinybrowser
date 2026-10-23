@@ -961,14 +961,11 @@ impl JsRealm {
         Ok(())
     }
 
-    /// Timer and fetch submission hooks the JS shim calls.
-    fn install_task_host_functions(
-        &self,
+    /// Referrer decisions shared by the document loader and the fetch shim.
+    fn install_referrer_host_functions(
         ctx: &Ctx<'_>,
         world: &Rc<RefCell<World>>,
     ) -> Result<(), JsError> {
-        let outbox = Rc::clone(&self.world.borrow().outbox);
-        Self::install_timer_host_functions(ctx, &outbox)?;
         let referrer_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbReferrer",
@@ -977,6 +974,27 @@ impl JsRealm {
                 fetch_referrer(&world, &request_url)
             }),
         )?;
+        bridge::object(ctx)?.set(
+            "__tbReferrerForPolicy",
+            Func::from(
+                |source: String, target: String, policy: String| -> Option<String> {
+                    let source = Url::parse(&source).ok()?;
+                    referrer_for_policy(&policy, &source, &target)
+                },
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Timer and fetch submission hooks the JS shim calls.
+    fn install_task_host_functions(
+        &self,
+        ctx: &Ctx<'_>,
+        world: &Rc<RefCell<World>>,
+    ) -> Result<(), JsError> {
+        let outbox = Rc::clone(&self.world.borrow().outbox);
+        Self::install_timer_host_functions(ctx, &outbox)?;
+        Self::install_referrer_host_functions(ctx, world)?;
         install_header_policy_host_functions(ctx)?;
         install_mime_host_functions(ctx)?;
         install_sync_fetch(ctx, world)?;

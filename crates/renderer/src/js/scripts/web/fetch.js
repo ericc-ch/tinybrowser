@@ -1155,45 +1155,13 @@ const __tbParseRange = (value, length) => {
   if (end >= length) end = length - 1;
   return { start, end };
 };
+// Credentials, fragments, scheme downgrades, and the strict default all live
+// in the host policy helper so the fetch path and the document path cannot
+// disagree (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
 const __tbReferrerForPolicy = (source, target, policy) => {
   if (source === '' || source === null || source === undefined) return '';
-  let sourceURL;
-  let targetURL;
-  try {
-    sourceURL = new URL(source);
-    targetURL = new URL(target);
-  } catch (error) {
-    return '';
-  }
-  // Credentials and fragments never appear in a referrer
-  // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-  sourceURL.username = '';
-  sourceURL.password = '';
-  sourceURL.hash = '';
-  const sameOrigin = sourceURL.origin === targetURL.origin;
-  const downgrade = sourceURL.protocol === 'https:' && targetURL.protocol !== 'https:';
-  const origin = sourceURL.origin + '/';
-  switch (policy) {
-    case 'no-referrer':
-      return '';
-    case 'same-origin':
-      return sameOrigin ? sourceURL.href : '';
-    case 'origin':
-      return origin;
-    case 'strict-origin':
-      return downgrade ? '' : origin;
-    case 'origin-when-cross-origin':
-      return sameOrigin ? sourceURL.href : origin;
-    case 'strict-origin-when-cross-origin':
-      return downgrade ? '' : sameOrigin ? sourceURL.href : origin;
-    case 'unsafe-url':
-      return sourceURL.href;
-    case '':
-    case 'no-referrer-when-downgrade':
-      return downgrade ? '' : sourceURL.href;
-    default:
-      return '';
-  }
+  const referrer = host.__tbReferrerForPolicy(String(source), String(target), String(policy));
+  return referrer === null || referrer === undefined ? '' : String(referrer);
 };
 const __tbDetermineReferrer = (data, target) => {
   // With no explicit policy the client's document policy decides; the host

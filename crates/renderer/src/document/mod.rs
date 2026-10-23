@@ -1750,8 +1750,11 @@ impl Document {
         }
         let mut world = self.world.borrow_mut();
         world.csp = self.response_policy.clone();
-        if let Some(policy) = self.response_referrer_policy.as_deref() {
-            let policy = policy.split(',').next().unwrap_or(policy).trim();
+        if let Some(policy) = self
+            .response_referrer_policy
+            .as_deref()
+            .and_then(net::referrer_policy_from_header)
+        {
             policy.clone_into(&mut world.state.referrer_policy);
         } else {
             world.state.referrer_policy.clear();

@@ -493,7 +493,7 @@ impl Agent {
                 .headers()
                 .value("referrer-policy")
                 .and_then(|value| value.to_str().ok())
-                .map(|value| value.split(',').next().unwrap_or(value).trim().to_owned());
+                .and_then(crate::referrer_policy_from_header);
             let next = match classify_response(response, &url, &dial, &hop)? {
                 HopOutcome::Final(response) => return Ok(*response),
                 HopOutcome::Redirect { next } => next,
