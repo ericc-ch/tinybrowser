@@ -1086,7 +1086,7 @@ impl EventTargetState {
 pub(crate) enum RealmRequest {
     Timer(super::TimeoutRequest),
     ClearTimer(i32),
-    Fetch(super::JsFetchRequest),
+    Fetch(Box<super::JsFetchRequest>),
     AbortFetch(i32),
     Script(NodeId),
     Image(NodeId),

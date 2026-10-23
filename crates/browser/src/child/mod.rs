@@ -268,7 +268,7 @@ impl NetworkHost for HostServices {
         let id = self.client.call_with(
             BrowserCall {
                 assignment,
-                call: ServiceCall::Network(NetworkCall::Dial(request)),
+                call: ServiceCall::Network(NetworkCall::Dial(Box::new(request))),
             },
             move |reply| match reply {
                 Ok(ServiceReply::Dial(outcome)) => completion(outcome),
@@ -289,11 +289,24 @@ impl NetworkHost for HostServices {
         })
     }
 
+    fn dial_read(&self, stream: u64) -> Result<Option<Vec<u8>>, renderer::DialFailure> {
+        match self.call(ServiceCall::Network(NetworkCall::DialRead { id: stream })) {
+            Some(ServiceReply::StreamChunk(result)) => result,
+            _ => Err(renderer::DialFailure::Connect),
+        }
+    }
+
+    fn cancel_stream(&self, stream: u64) {
+        let _result = self.call(ServiceCall::Network(NetworkCall::CancelStream {
+            id: stream,
+        }));
+    }
+
     fn dial_sync(
         &self,
         request: renderer::DialRequest,
     ) -> Result<renderer::DialOutcome, renderer::DialFailure> {
-        match self.call(ServiceCall::Network(NetworkCall::Dial(request))) {
+        match self.call(ServiceCall::Network(NetworkCall::Dial(Box::new(request)))) {
             Some(ServiceReply::Dial(outcome)) => outcome,
             _ => Err(renderer::DialFailure::Connect),
         }

@@ -933,48 +933,7 @@ impl Engine {
         match url.scheme() {
             "about" => self.keep_initial_blank(child, initiator),
             "data" => self.load_data_frame(child, initiator, url),
-            "javascript" => {
-                // Navigate to a javascript: URL returns when the initiator
-                // is not same origin-domain with the target's active
-                // document
-                // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url>).
-                let same_origin = match (self.frames.get(&initiator), self.frames.get(&child)) {
-                    (Some(source), Some(target)) => {
-                        source.world().borrow().origin == target.world().borrow().origin
-                    }
-                    _ => false,
-                };
-                if !same_origin {
-                    return;
-                }
-                let script = percent_decode(url.as_str());
-                let script = script
-                    .strip_prefix("javascript:")
-                    .unwrap_or(&script)
-                    .to_owned();
-                let source = url.as_str().to_owned();
-                let initial = self
-                    .frames
-                    .get(&child)
-                    .is_some_and(Document::is_initial_blank);
-                // The inline check for a `javascript:` navigation uses the
-                // initiator's policy, not the target frame's
-                // (<https://w3c.github.io/webappsec-csp/#should-block-navigation-request>).
-                let policy = self
-                    .frames
-                    .get(&initiator)
-                    .map(|document| document.world().borrow().csp.clone())
-                    .unwrap_or_default();
-                if let Some(document) = self.frames.get_mut(&child) {
-                    if initial {
-                        // The script runs in the document the browser already
-                        // created; a string result still replaces it.
-                        document.eval_frame_script(&script, &source, &policy);
-                    } else {
-                        document.load_javascript_frame(&script, &source, &policy);
-                    }
-                }
-            }
+            "javascript" => self.load_javascript_frame_url(child, initiator, url),
             "blob" => self.load_blob_frame(child, initiator, url),
             "http" | "https" => {
                 // The document the navigation started from, which supplies the
@@ -1023,6 +982,13 @@ impl Engine {
                             timeout_ms: 0,
                             csp: gate.map(Box::new),
                             cors: None,
+                            keepalive: false,
+                            body_len: 0,
+                            integrity: None,
+                            cache: None,
+                            stream_body: false,
+                            referrer_source: None,
+                            referrer_policy: None,
                         },
                         ancestors,
                     );
@@ -1033,6 +999,48 @@ impl Engine {
                     document.load_about_blank(None, None);
                 }
                 self.inherit_policy(child, initiator);
+            }
+        }
+    }
+
+    /// Navigates to a `javascript:` URL returns when the initiator is not same
+    /// origin-domain with the target's active document
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url>).
+    fn load_javascript_frame_url(&mut self, child: FrameId, initiator: FrameId, url: &Url) {
+        let same_origin = match (self.frames.get(&initiator), self.frames.get(&child)) {
+            (Some(source), Some(target)) => {
+                source.world().borrow().origin == target.world().borrow().origin
+            }
+            _ => false,
+        };
+        if !same_origin {
+            return;
+        }
+        let script = percent_decode(url.as_str());
+        let script = script
+            .strip_prefix("javascript:")
+            .unwrap_or(&script)
+            .to_owned();
+        let source = url.as_str().to_owned();
+        let initial = self
+            .frames
+            .get(&child)
+            .is_some_and(Document::is_initial_blank);
+        // The inline check for a `javascript:` navigation uses the initiator's
+        // policy, not the target frame's
+        // (<https://w3c.github.io/webappsec-csp/#should-block-navigation-request>).
+        let policy = self
+            .frames
+            .get(&initiator)
+            .map(|document| document.world().borrow().csp.clone())
+            .unwrap_or_default();
+        if let Some(document) = self.frames.get_mut(&child) {
+            if initial {
+                // The script runs in the document the browser already created;
+                // a string result still replaces it.
+                document.eval_frame_script(&script, &source, &policy);
+            } else {
+                document.load_javascript_frame(&script, &source, &policy);
             }
         }
     }

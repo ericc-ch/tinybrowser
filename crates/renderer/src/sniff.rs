@@ -546,6 +546,14 @@ fn parse_mime_type(input: &str) -> Option<MimeType> {
             && value.chars().all(is_http_quoted_string_token)
             && !parameters.iter().any(|(existing, _)| *existing == name)
         {
+            // Charset labels are ASCII case-insensitive; the serialized MIME
+            // type normalizes them
+            // (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>).
+            let value = if name == "charset" {
+                value.to_ascii_lowercase()
+            } else {
+                value
+            };
             parameters.push((name, value));
         }
     }
@@ -566,6 +574,19 @@ fn parse_mime_type(input: &str) -> Option<MimeType> {
 #[must_use]
 pub(crate) fn parse_serialized_mime_type(input: &str) -> String {
     parse_mime_type(input).map_or_else(String::new, |mime| mime.serialize())
+}
+
+/// The essence and `boundary` parameter of a MIME type, for the multipart
+/// parser. The second element is empty when the parameter is absent.
+#[must_use]
+pub(crate) fn mime_type_parts(input: &str) -> Option<(String, String)> {
+    let mime = parse_mime_type(input)?;
+    let boundary = mime
+        .parameters
+        .iter()
+        .find(|(name, _)| name == "boundary")
+        .map_or_else(String::new, |(_, value)| value.clone());
+    Some((mime.essence, boundary))
 }
 
 /// Collect an HTTP quoted string with `extract-value` true
@@ -1180,8 +1201,8 @@ mod tests {
     }
 
     #[test]
-    fn case_is_normalized_but_parameter_values_keep_their_case() {
-        assert_eq!(parsed("TEXT/HTML;CHARSET=GBK"), "text/html;charset=GBK");
+    fn case_is_normalized_and_charset_is_ascii_lowercased() {
+        assert_eq!(parsed("TEXT/HTML;CHARSET=GBK"), "text/html;charset=gbk");
     }
 
     #[test]

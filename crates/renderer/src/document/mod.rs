@@ -169,6 +169,13 @@ impl QueuedDial {
                 timeout_ms: 0,
                 csp: None,
                 cors: None,
+                keepalive: false,
+                body_len: 0,
+                integrity: None,
+                cache: None,
+                stream_body: false,
+                referrer_source: None,
+                referrer_policy: None,
             },
             context,
             ancestors: Vec::new(),
@@ -399,6 +406,9 @@ pub(crate) struct Document {
     /// from the response being parsed, parsed once
     /// (<https://w3c.github.io/webappsec-csp/#parse-response-csp>).
     response_policy: crate::csp::List,
+    /// `Referrer-Policy` from the response being parsed, applied after the
+    /// parser installs the new document (the state reset clears the realm).
+    response_referrer_policy: Option<String>,
     /// When set, [`Document::install_parsed`] replaces the world's policy
     /// with the response headers. A script's `document.open()` leaves it
     /// unset so the existing policy survives.
@@ -513,6 +523,7 @@ impl Document {
             character_set: "UTF-8",
             response_content_type: None,
             response_policy: crate::csp::List::default(),
+            response_referrer_policy: None,
             embedder_csp_reports: Vec::new(),
             csp_from_response: false,
             reporting_endpoints: Vec::new(),
@@ -1251,6 +1262,7 @@ impl Document {
         self.parser_owner = owner;
         self.response_content_type = None;
         self.response_policy = crate::csp::List::default();
+        self.response_referrer_policy = None;
         self.csp_from_response = false;
         self.sniff_header.clear();
         self.apply_mime_sniff = false;
@@ -1333,6 +1345,8 @@ impl Document {
                 head.content_security_policy_report_only.as_deref(),
             )
         });
+        self.response_referrer_policy
+            .clone_from(&head.referrer_policy);
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
         self.mime_guard = crate::sniff::MimeGuard {
@@ -1741,7 +1755,17 @@ impl Document {
         if !self.csp_from_response {
             return;
         }
-        self.world.borrow_mut().csp = self.response_policy.clone();
+        let mut world = self.world.borrow_mut();
+        world.csp = self.response_policy.clone();
+        if let Some(policy) = self
+            .response_referrer_policy
+            .as_deref()
+            .and_then(net::referrer_policy_from_header)
+        {
+            policy.clone_into(&mut world.state.referrer_policy);
+        } else {
+            world.state.referrer_policy.clear();
+        }
     }
 
     /// Rebinds the realm's `document` global to the installed document and
@@ -2480,11 +2504,20 @@ impl Document {
                 // SRI verification fails the load like a network error:
                 // no execution, no `load` event, and no CSP violation
                 // (<https://www.w3.org/TR/SRI/#verify-integrity>).
-                let integrity_ok = integrity
-                    .as_deref()
-                    .is_none_or(|metadata| crate::csp::integrity_verifies(metadata, &outcome.body));
-                if !blocked && integrity_ok && (200..300).contains(&outcome.status) {
-                    let source = String::from_utf8_lossy(&outcome.body);
+                let body = outcome.body.as_ref().ok();
+                let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
+                    body.is_some_and(|body| crate::csp::integrity_verifies(metadata, body))
+                });
+                // A classic script with a non-JavaScript MIME type does not
+                // execute (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+                let mime_ok = crate::js::classic_script_mime(outcome.content_type.as_deref());
+                if !blocked
+                    && integrity_ok
+                    && mime_ok
+                    && let Some(body) = body
+                    && (200..300).contains(&outcome.status)
+                {
+                    let source = String::from_utf8_lossy(body);
                     let filename = outcome.final_url.clone();
                     self.eval_classic(&source, Some(element), 1, &filename);
                     self.fire_js(|js| js.fire_node_load(element));
@@ -2558,7 +2591,10 @@ impl Document {
         self.record_event(RendererEvent::Navigated {
             url: url.to_string(),
         });
-        self.install_frame_response(&head, &outcome.body, None);
+        let Ok(body) = &outcome.body else {
+            return;
+        };
+        self.install_frame_response(&head, body, None);
     }
 
     /// Hands one Blitz subresource response to its handler. A redirect the
@@ -2576,15 +2612,19 @@ impl Document {
             && destination.is_some_and(|destination| {
                 self.response_url_blocked(&outcome.final_url, request_url, destination, None)
             });
-        if !blocked && (200..300).contains(&outcome.status) {
+        let body = outcome.body.as_ref().ok();
+        if !blocked
+            && (200..300).contains(&outcome.status)
+            && let Some(body) = body
+        {
             self.subresource_bytes
-                .insert(outcome.final_url.clone(), outcome.body.clone());
+                .insert(outcome.final_url.clone(), body.clone());
         }
         let Some(handler) = self.blitz_handlers.remove(&id) else {
             return;
         };
         let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
-        if blocked {
+        if blocked || body.is_none() {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
             let element = Url::parse(&request_url)
                 .ok()
@@ -2601,7 +2641,7 @@ impl Document {
         } else {
             Box::new(handler).bytes(
                 outcome.final_url.clone(),
-                blitz_traits::net::Bytes::from(outcome.body.clone()),
+                blitz_traits::net::Bytes::from(body.cloned().unwrap_or_default()),
             );
         }
         // The arrival changes style or layout; apply it now so the tree is

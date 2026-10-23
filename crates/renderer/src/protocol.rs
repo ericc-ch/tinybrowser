@@ -276,6 +276,9 @@ pub struct ResponseHead {
     /// A violated policy's `report-to` directive resolves its endpoint names
     /// against it (<https://w3c.github.io/reporting/#header>).
     pub reporting_endpoints: Option<String>,
+    /// `Referrer-Policy` response header, which seeds the document policy
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-header>).
+    pub referrer_policy: Option<String>,
     /// `X-Content-Type-Options: nosniff` on the response.
     pub no_sniff: bool,
     /// The body came from HTTP, so the Apache `text/plain` check applies.
@@ -323,6 +326,7 @@ impl ResponseHead {
                 "content-security-policy-report-only",
             ),
             reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
+            referrer_policy: crate::csp::combined_header(headers, "referrer-policy"),
             no_sniff: crate::sniff::headers_nosniff(headers),
             http_response: true,
             history: HistorySnapshot::default(),
@@ -345,6 +349,7 @@ impl ResponseHead {
             content_security_policy: None,
             content_security_policy_report_only: None,
             reporting_endpoints: None,
+            referrer_policy: None,
             no_sniff: false,
             http_response: false,
             history: HistorySnapshot::default(),
@@ -478,6 +483,31 @@ pub struct DialRequest {
     /// and subresource dials.
     #[serde(default)]
     pub cors: Option<CorsRequest>,
+    /// A `fetch(..., {keepalive: true})` request. The browser enforces the
+    /// in-flight byte quota across realms
+    /// (<https://fetch.spec.whatwg.org/#keepalive-flag>).
+    #[serde(default)]
+    pub keepalive: bool,
+    /// Request-body length for the keepalive quota.
+    #[serde(default)]
+    pub body_len: u64,
+    /// Subresource Integrity metadata; the browser checks the decoded body
+    /// before returning it (<https://www.w3.org/TR/SRI/#verify-integrity>).
+    #[serde(default)]
+    pub integrity: Option<String>,
+    /// Request cache mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>).
+    #[serde(default)]
+    pub cache: Option<String>,
+    /// Ask the browser to return headers first and stream the decoded body.
+    #[serde(default)]
+    pub stream_body: bool,
+    /// Source document URL for recomputing the referrer on redirects.
+    #[serde(default)]
+    pub referrer_source: Option<String>,
+    /// Referrer policy attached to the request.
+    #[serde(default)]
+    pub referrer_policy: Option<String>,
 }
 
 /// The CORS parameters a page `fetch`/XHR sends over the wire. The browser
@@ -499,11 +529,17 @@ fn default_dial_method() -> String {
     "GET".to_owned()
 }
 
+/// A response body that could not be decoded.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BodyError;
+
 /// Result of one blocking GET.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialOutcome {
     /// HTTP status.
     pub status: u16,
+    /// HTTP reason phrase, or `"OK"` for scheme fetches.
+    pub status_text: String,
     /// Final URL after redirects.
     pub final_url: String,
     /// Every `Content-Type` response header value joined with `", "`, when
@@ -513,13 +549,23 @@ pub struct DialOutcome {
     /// Response headers visible to page scripts, in wire order.
     #[serde(default)]
     pub headers: Vec<(String, String)>,
-    /// Response body, when [`DialRequest::read_body`].
-    pub body: Vec<u8>,
+    /// Response body, when [`DialRequest::read_body`]. `Err` means the body
+    /// could not be decoded for its `Content-Encoding`; consuming it rejects
+    /// instead of returning bytes
+    /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+    pub body: Result<Vec<u8>, BodyError>,
     /// How the response was filtered
     /// (<https://fetch.spec.whatwg.org/#concept-response-type>); `basic` for
     /// same-origin and subresource responses.
     #[serde(default)]
     pub response_type: net::cors::ResponseType,
+    /// Redirect hops followed before this response.
+    #[serde(default)]
+    pub redirect_count: u32,
+    /// Browser-side stream handle for a progressive body. The body is empty
+    /// in the head outcome and chunks arrive through the network host.
+    #[serde(default)]
+    pub stream: Option<u64>,
 }
 
 impl DialOutcome {
@@ -535,11 +581,14 @@ impl DialOutcome {
     ) -> Self {
         Self {
             status,
+            status_text: String::new(),
             final_url,
             content_type,
             headers,
-            body,
+            body: Ok(body),
             response_type: net::cors::ResponseType::Basic,
+            redirect_count: 0,
+            stream: None,
         }
     }
 }
@@ -560,6 +609,19 @@ pub trait NetworkHost: Send + Sync + 'static {
     /// Implementations must invoke it exactly once, including when submission
     /// is rejected.
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> DialCancellation;
+
+    /// Reads the next chunk of a streamed response body. `None` is the end of
+    /// the body. Hosts without progressive bodies return a connect failure.
+    ///
+    /// # Errors
+    ///
+    /// The carrier's network failure or cancellation.
+    fn dial_read(&self, _stream: u64) -> Result<Option<Vec<u8>>, DialFailure> {
+        Err(DialFailure::Connect)
+    }
+
+    /// Cancels a streamed response body.
+    fn cancel_stream(&self, _stream: u64) {}
 
     /// Performs `request` on the calling thread and returns when the response
     /// arrives. The browser process answers on the reader thread, so this does

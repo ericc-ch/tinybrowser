@@ -70,4 +70,6 @@ pub enum NetError {
     Protocol(#[source] ProtocolError),
     #[error("limit exceeded: {0}")]
     Limit(#[source] LimitExceeded),
+    #[error("content decoding failed: {0}")]
+    Decode(Box<str>),
 }

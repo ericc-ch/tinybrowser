@@ -306,7 +306,7 @@ impl HttpEngine {
         headers: &HeaderMap,
         body: Option<&[u8]>,
         budget: CallBudget,
-    ) -> Result<(u16, HeaderMap, Incoming), NetError> {
+    ) -> Result<(u16, HeaderMap, Incoming, bool), NetError> {
         if budget.is_expired() {
             return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
         }
@@ -341,11 +341,19 @@ impl HttpEngine {
             Ok(Err(error)) => return Err(map_client_error(error, &host)),
             Err(error) => return Err(error),
         };
+        // HTTP/2 has no reason phrase; `StatusCode::canonical_reason` would
+        // invent one (<https://www.rfc-editor.org/rfc/rfc9113#section-8.3.2>).
+        let http2 = response.version() == hyper::Version::HTTP_2;
         let mut mapped = HeaderMap::new();
         for (name, value) in response.headers() {
             mapped.insert_wire(name.clone(), value.clone());
         }
-        Ok((response.status().as_u16(), mapped, response.into_body()))
+        Ok((
+            response.status().as_u16(),
+            mapped,
+            response.into_body(),
+            http2,
+        ))
     }
 }
 

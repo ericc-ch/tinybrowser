@@ -146,14 +146,17 @@ impl Document {
                             integrity: dial.integrity,
                             outcome: crate::protocol::DialOutcome {
                                 status: 200,
+                                status_text: "OK".to_owned(),
                                 final_url,
                                 content_type: Some(content_type.clone()),
                                 // Scheme fetch serves the data: MIME type
                                 // as the response's `Content-Type` header
                                 // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
                                 headers: vec![("content-type".to_owned(), content_type)],
-                                body,
+                                body: Ok(body),
                                 response_type: net::cors::ResponseType::Basic,
+                                redirect_count: 0,
+                                stream: None,
                             },
                         });
                     } else {
@@ -253,7 +256,7 @@ impl Document {
                     self.timers.remove(&page_id);
                 }
             }
-            RealmRequest::Fetch(fetch) => self.queue_js_fetch(fetch),
+            RealmRequest::Fetch(fetch) => self.queue_js_fetch(*fetch),
             RealmRequest::AbortFetch(js_id) => self.dials.cancel_fetch(js_id),
             RealmRequest::Script(element) => self.queue_dynamic_script(element),
             RealmRequest::Image(element) => {
@@ -368,6 +371,13 @@ impl Document {
         dial.req.headers = fetch.headers;
         dial.req.referrer = fetch.referrer;
         dial.req.cors = fetch.cors;
+        dial.req.keepalive = fetch.keepalive;
+        dial.req.body_len = fetch.body_len;
+        dial.req.integrity = fetch.integrity;
+        dial.req.cache = Some(fetch.cache);
+        dial.req.stream_body = fetch.stream_body;
+        dial.req.referrer_source = fetch.referrer_source;
+        dial.req.referrer_policy = fetch.referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

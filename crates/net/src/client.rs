@@ -1,16 +1,23 @@
 use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::resolve::HostMap;
-use crate::transport::{CallBudget, HttpEngine, Proxy, basic_authorization, within};
+use crate::transport::{CallBudget, HttpEngine, Proxy, basic_authorization};
+use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder};
+use bytes::Bytes;
 use cookies::{CookieJar, CookieOp, RetrievalKind};
-use http_body_util::BodyExt as _;
+use hyper::body::Body as HttpBody;
 use hyper::header::{self, HeaderValue};
 use percent_encoding::percent_decode_str;
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, BufReader, ReadBuf};
 use url::Url;
 
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
@@ -316,12 +323,23 @@ impl Agent {
             .to_str()
             .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
         if let Some(referrer) = headers.value("referer") {
-            preflight.append(header::REFERER, referrer.clone());
+            // A preflight's Referer is the request's stripped referrer without
+            // the origin path slash
+            // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+            let referrer = referrer
+                .to_str()
+                .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+            let referrer = referrer.strip_suffix('/').unwrap_or(referrer);
+            preflight.append(
+                header::REFERER,
+                HeaderValue::from_str(referrer)
+                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
+            );
         }
         if let Some(ua) = &self.ua {
             preflight.append(header::USER_AGENT, ua.clone());
         }
-        let (status, preflight_headers, body) = self
+        let (status, preflight_headers, body, _http2) = self
             .engine
             .send(&Method::OPTIONS, wire, &preflight, None, budget)
             .await?;
@@ -421,7 +439,35 @@ impl Agent {
             previous_url: None,
             origin_tainted: false,
         };
+        // Defaults every browser request carries. They live here, not in the
+        // renderer, so XHR and subresources get the same values and page
+        // scripts cannot override them.
+        if hop.headers.value("accept").is_none() {
+            hop.headers
+                .append(header::ACCEPT, HeaderValue::from_static("*/*"));
+        }
+        if hop.headers.value("accept-language").is_none() {
+            hop.headers
+                .append(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
+        }
+        let empty_body = hop.body.as_ref().is_none_or(Vec::is_empty);
+        if empty_body
+            && (hop.method == Method::POST
+                || hop.method == Method::PUT
+                || hop.method == Method::PATCH)
+            && hop.headers.value("content-length").is_none()
+        {
+            hop.headers
+                .append(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        }
         let mut url = request.url;
+        let initial_referrer = hop
+            .headers
+            .value("referer")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let referrer_source = request.referrer_source.clone().or(initial_referrer);
+        let mut referrer_policy = request.referrer_policy.clone();
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
         let mut budget = self.engine.budget_at();
@@ -430,9 +476,10 @@ impl Agent {
         }
 
         loop {
-            let response = self
+            let mut response = self
                 .exchange(&dial, &url, &mut hop, cross_site_redirect, budget)
                 .await?;
+            response.redirect_count = followed;
             let hop_status = response.status();
             if self.max_redirects == 0 {
                 cors_gate(&response, &dial, &hop)?;
@@ -442,10 +489,18 @@ impl Agent {
                     dial.credentials_include(),
                 ));
             }
+            let redirect_policy = response
+                .headers()
+                .value("referrer-policy")
+                .and_then(|value| value.to_str().ok())
+                .and_then(crate::referrer_policy_from_header);
             let next = match classify_response(response, &url, &dial, &hop)? {
-                HopOutcome::Final(response) => return Ok(response),
+                HopOutcome::Final(response) => return Ok(*response),
                 HopOutcome::Redirect { next } => next,
             };
+            if let Some(policy) = redirect_policy {
+                referrer_policy = Some(policy);
+            }
             if followed == self.max_redirects {
                 return Err(NetError::Limit(LimitExceeded::Redirect));
             }
@@ -458,6 +513,16 @@ impl Agent {
             }
             cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
             apply_redirect_policy(hop_status, &url, &next, &mut hop);
+            if let Some(source) = referrer_source.as_deref() {
+                let policy = referrer_policy.as_deref().unwrap_or("");
+                match referrer_for(source, &next, policy) {
+                    Some(referrer) => {
+                        hop.headers.remove("referer");
+                        let _ = hop.headers.insert("referer", referrer.into_bytes());
+                    }
+                    None => hop.headers.remove("referer"),
+                }
+            }
             url = next;
             followed += 1;
         }
@@ -521,7 +586,7 @@ impl Agent {
         } else {
             hop_headers.remove("cookie");
         }
-        let (status, response_headers, reader) = self
+        let (status, response_headers, reader, http2) = self
             .engine
             .send(
                 &hop.method,
@@ -531,14 +596,37 @@ impl Agent {
                 budget,
             )
             .await?;
+        let content_encoding: Vec<String> = response_headers
+            .get_all("content-encoding")
+            .filter_map(|value| std::str::from_utf8(value).ok())
+            .flat_map(|value| value.split(','))
+            .map(|coding| coding.trim().to_ascii_lowercase())
+            .filter(|coding| !coding.is_empty())
+            .collect();
         let response = Response {
             status,
+            status_text: if http2 {
+                String::new()
+            } else {
+                hyper::StatusCode::from_u16(status)
+                    .ok()
+                    .and_then(|status| status.canonical_reason())
+                    .unwrap_or("")
+                    .to_owned()
+            },
             headers: response_headers,
             final_url: url.clone(),
-            body: Body {
+            body: RawBody {
                 inner: reader,
                 budget,
+                current: None,
+                offset: 0,
+                shared_error: Arc::new(Mutex::new(None)),
+                shared_input: Arc::new(AtomicBool::new(false)),
+                timer: None,
             },
+            content_encoding,
+            redirect_count: 0,
             filtering: hop.response_type,
         };
         // Set-Cookie must be read before CORS filtering removes it, and only
@@ -589,6 +677,12 @@ pub struct Request {
     /// (`1` for the first redirect) before the hop is followed. `false`
     /// rejects the dial. Unset follows every redirect the cap allows.
     pub on_redirect: Option<RedirectGate>,
+    /// Source document URL used to recompute `Referer` on every redirect
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    pub referrer_source: Option<String>,
+    /// Referrer policy for redirect recomputation. Empty means the default
+    /// `strict-origin-when-cross-origin`.
+    pub referrer_policy: Option<String>,
 }
 
 impl std::fmt::Debug for Request {
@@ -604,6 +698,8 @@ impl std::fmt::Debug for Request {
             .field("deadline", &self.deadline)
             .field("cors", &self.cors)
             .field("on_redirect", &self.on_redirect.is_some())
+            .field("referrer_source", &self.referrer_source)
+            .field("referrer_policy", &self.referrer_policy)
             .finish()
     }
 }
@@ -630,26 +726,36 @@ impl Request {
             deadline: None,
             cors,
             on_redirect: None,
+            referrer_source: None,
+            referrer_policy: None,
         }
     }
 }
 
-fn followable_location(status: u16, headers: &HeaderMap) -> Result<Option<&str>, NetError> {
+fn followable_location(status: u16, headers: &HeaderMap) -> Option<Vec<u8>> {
     if !matches!(status, 301 | 302 | 303 | 307 | 308) {
-        return Ok(None);
+        return None;
     }
-    let Some(raw) = headers.get("location") else {
-        return Ok(None);
-    };
-    let location =
-        std::str::from_utf8(raw).map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
-    Ok(Some(location))
+    headers.get("location").map(<[u8]>::to_vec)
 }
 
-// https://fetch.spec.whatwg.org/#http-redirect-fetch
-fn resolve_location(current: &Url, location: &str) -> Result<Url, NetError> {
+// <https://fetch.spec.whatwg.org/#http-redirect-fetch>
+fn resolve_location(current: &Url, location: &[u8]) -> Result<Url, NetError> {
+    // Location is a byte sequence, not UTF-8. Percent-encode every non-ASCII
+    // byte before URL parsing so invalid UTF-8 survives as `%FF` rather than
+    // failing the redirect (<https://fetch.spec.whatwg.org/#concept-location-url>).
+    let location = location
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii() {
+                char::from(*byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
     let mut next = current
-        .join(location)
+        .join(&location)
         .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
     if !matches!(next.scheme(), "http" | "https") {
         return Err(NetError::Protocol(ProtocolError::RejectedRequest));
@@ -660,6 +766,61 @@ fn resolve_location(current: &Url, location: &str) -> Result<Url, NetError> {
         next.set_fragment(Some(fragment));
     }
     Ok(next)
+}
+
+/// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>
+fn referrer_for(source: &str, target: &Url, policy: &str) -> Option<String> {
+    let mut source = Url::parse(source).ok()?;
+    if !matches!(source.scheme(), "http" | "https") {
+        return None;
+    }
+    source.set_username("").ok()?;
+    source.set_password(None).ok()?;
+    source.set_fragment(None);
+    let same_origin = source.origin() == target.origin();
+    let downgrade = source.scheme() == "https" && target.scheme() != "https";
+    let origin = format!("{}/", source.origin().ascii_serialization());
+    let policy = if policy.is_empty() {
+        "strict-origin-when-cross-origin"
+    } else {
+        policy
+    };
+    let referrer = match policy {
+        "no-referrer" => return None,
+        "same-origin" => same_origin.then(|| source.to_string())?,
+        "origin" => origin,
+        "strict-origin" => {
+            if downgrade {
+                return None;
+            }
+            origin
+        }
+        "origin-when-cross-origin" => {
+            if same_origin {
+                source.to_string()
+            } else {
+                origin
+            }
+        }
+        "no-referrer-when-downgrade" => {
+            if downgrade {
+                return None;
+            }
+            source.to_string()
+        }
+        "unsafe-url" => source.to_string(),
+        _ => {
+            if downgrade {
+                return None;
+            }
+            if same_origin {
+                source.to_string()
+            } else {
+                origin
+            }
+        }
+    };
+    Some(referrer)
 }
 
 // https://fetch.spec.whatwg.org/#http-redirect-fetch
@@ -704,7 +865,7 @@ fn loopback_http(url: &Url) -> bool {
 /// What the caller does after one hop.
 enum HopOutcome {
     /// The response is the final result.
-    Final(Response),
+    Final(Box<Response>),
     /// The response redirects; fetch `next`.
     Redirect { next: Url },
 }
@@ -822,17 +983,27 @@ fn classify_response(
     hop: &Hop,
 ) -> Result<HopOutcome, NetError> {
     cors_gate(&response, dial, hop)?;
-    let Some(location) =
-        followable_location(response.status(), response.headers())?.map(str::to_owned)
-    else {
-        return Ok(HopOutcome::Final(finalize(
+    let settings = dial.cors;
+    // Manual mode never validates or follows Location; the response is an
+    // opaque-redirect filtered response
+    // (<https://fetch.spec.whatwg.org/#http-redirect-fetch>).
+    if settings.redirect == crate::cors::RedirectMode::Manual
+        && matches!(response.status(), 301 | 302 | 303 | 307 | 308)
+    {
+        return Ok(HopOutcome::Final(Box::new(finalize(
+            response,
+            crate::cors::ResponseType::OpaqueRedirect,
+            dial.credentials_include(),
+        ))));
+    }
+    let Some(location) = followable_location(response.status(), response.headers()) else {
+        return Ok(HopOutcome::Final(Box::new(finalize(
             response,
             hop.response_type,
             dial.credentials_include(),
-        )));
+        ))));
     };
     let next = resolve_location(current_url, &location)?;
-    let settings = dial.cors;
     // A redirect to a URL that includes credentials is a network error
     // once the request is `cors`-tainted or would cross an origin
     // (<https://fetch.spec.whatwg.org/#http-redirect-fetch>, steps 9-10).
@@ -848,14 +1019,8 @@ fn classify_response(
         crate::cors::RedirectMode::Error => {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
-        crate::cors::RedirectMode::Manual => {
-            return Ok(HopOutcome::Final(finalize(
-                response,
-                crate::cors::ResponseType::OpaqueRedirect,
-                dial.credentials_include(),
-            )));
-        }
-        crate::cors::RedirectMode::Follow => {}
+        // Manual returned above; unreachable here.
+        crate::cors::RedirectMode::Manual | crate::cors::RedirectMode::Follow => {}
     }
     Ok(HopOutcome::Redirect { next })
 }
@@ -901,8 +1066,9 @@ fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) -> Result<(), NetEr
 
 /// Streaming response body. Dropping it closes the socket.
 pub struct Body {
-    inner: hyper::body::Incoming,
-    budget: CallBudget,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    shared_error: Arc<Mutex<Option<NetError>>>,
+    shared_input: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Body {
@@ -912,36 +1078,102 @@ impl std::fmt::Debug for Body {
 }
 
 impl Body {
-    /// Next chunk, or `None` at end of body.
+    /// Wraps the raw socket body in the decoders named by `Content-Encoding`.
+    async fn decoded(raw: RawBody, codings: &[String]) -> Self {
+        let shared_error = Arc::clone(&raw.shared_error);
+        let shared_input = Arc::clone(&raw.shared_input);
+        Self::wrap(Box::new(raw), codings, shared_error, shared_input).await
+    }
+
+    async fn wrap(
+        mut reader: Box<dyn AsyncRead + Send + Unpin>,
+        codings: &[String],
+        shared_error: Arc<Mutex<Option<NetError>>>,
+        shared_input: Arc<AtomicBool>,
+    ) -> Self {
+        for coding in codings.iter().rev() {
+            match coding.as_str() {
+                "identity" => {}
+                "gzip" | "x-gzip" => {
+                    let mut decoder = GzipDecoder::new(BufReader::new(reader));
+                    // A gzip response may carry several members
+                    // (<https://www.rfc-editor.org/rfc/rfc7230#section-4.1.3>).
+                    decoder.multiple_members(true);
+                    reader = Box::new(decoder);
+                }
+                "br" => {
+                    reader = Box::new(BrotliDecoder::new(BufReader::new(reader)));
+                }
+                "deflate" => {
+                    let mut buffered = BufReader::new(reader);
+                    let zlib = match buffered.fill_buf().await {
+                        Ok(header) => {
+                            header.len() >= 2
+                                && (header[0] & 0x0f) == 8
+                                && (u16::from(header[0]) << 8 | u16::from(header[1])) % 31 == 0
+                        }
+                        Err(error) => {
+                            set_body_error(
+                                &shared_error,
+                                NetError::Decode(error.to_string().into()),
+                            );
+                            false
+                        }
+                    };
+                    reader = if zlib {
+                        Box::new(ZlibDecoder::new(buffered))
+                    } else {
+                        Box::new(DeflateDecoder::new(buffered))
+                    };
+                }
+                // Unsupported coding: leave the remaining bytes untouched
+                // (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+                _ => break,
+            }
+        }
+        Self {
+            reader,
+            shared_error,
+            shared_input,
+        }
+    }
+
+    /// Next decoded chunk, or `None` at end of body.
     ///
     /// # Errors
     ///
     /// [`NetError::Transport`] when the socket read fails or the deadline
-    /// expires.
+    /// expires; [`NetError::Decode`] when a decoder rejects the bytes.
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, NetError> {
-        loop {
-            let frame = within(self.budget, TimeoutKind::RecvBody, self.inner.frame()).await?;
-            match frame {
-                Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data() {
-                        return Ok(Some(data.to_vec()));
-                    }
+        let mut buffer = vec![0; 16 * 1024];
+        match self.reader.read(&mut buffer).await {
+            Ok(0) => Ok(None),
+            Ok(read) => {
+                buffer.truncate(read);
+                Ok(Some(buffer))
+            }
+            Err(error) => {
+                let shared = self
+                    .shared_error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if shared.is_none()
+                    && error.kind() == std::io::ErrorKind::UnexpectedEof
+                    && !self.shared_input.load(Ordering::Relaxed)
+                {
+                    return Ok(None);
                 }
-                Some(Err(error)) => {
-                    return Err(NetError::Transport(TransportError::Io(
-                        std::io::Error::other(error),
-                    )));
-                }
-                None => return Ok(None),
+                Err(shared.unwrap_or_else(|| NetError::Decode(error.to_string().into())))
             }
         }
     }
 
-    /// Entire body, failing if it would exceed `limit` bytes.
+    /// Entire decoded body, failing if it would exceed `limit` bytes.
     ///
     /// # Errors
     ///
-    /// [`NetError::Limit`] when the body is larger than `limit`.
+    /// [`NetError::Limit`] when the decoded body is larger than `limit`.
     /// [`NetError::Transport`] when a read fails.
     pub async fn bytes(mut self, limit: usize) -> Result<Vec<u8>, NetError> {
         let mut out = Vec::new();
@@ -955,13 +1187,97 @@ impl Body {
     }
 }
 
+/// Raw socket body before content decoders.
+struct RawBody {
+    inner: hyper::body::Incoming,
+    budget: CallBudget,
+    current: Option<Bytes>,
+    offset: usize,
+    shared_error: Arc<Mutex<Option<NetError>>>,
+    shared_input: Arc<AtomicBool>,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl std::fmt::Debug for RawBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawBody").finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for RawBody {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Some(deadline) = this.budget.deadline() {
+            let timer = this
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline.into())));
+            if timer.as_mut().poll(cx).is_ready() {
+                set_body_error(
+                    &this.shared_error,
+                    NetError::Transport(TransportError::Timeout(
+                        this.budget.timeout_kind(TimeoutKind::RecvBody),
+                    )),
+                );
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "body read timed out",
+                )));
+            }
+        }
+        loop {
+            if let Some(current) = this.current.as_ref() {
+                if this.offset < current.len() {
+                    let remaining = &current[this.offset..];
+                    let take = remaining.len().min(buffer.remaining());
+                    buffer.put_slice(&remaining[..take]);
+                    this.offset += take;
+                    return Poll::Ready(Ok(()));
+                }
+                this.current = None;
+                this.offset = 0;
+            }
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        this.shared_input.store(true, Ordering::Relaxed);
+                        this.current = Some(data);
+                        this.offset = 0;
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    let error =
+                        NetError::Transport(TransportError::Io(std::io::Error::other(error)));
+                    set_body_error(&this.shared_error, error);
+                    return Poll::Ready(Err(std::io::Error::other("body read failed")));
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+fn set_body_error(slot: &Mutex<Option<NetError>>, error: NetError) {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
 /// HTTP response after redirects. Status codes are data, including 4xx and 5xx.
 #[derive(Debug)]
 pub struct Response {
     status: u16,
+    status_text: String,
     headers: HeaderMap,
     final_url: Url,
-    body: Body,
+    body: RawBody,
+    content_encoding: Vec<String>,
+    redirect_count: u32,
     filtering: crate::cors::ResponseType,
 }
 
@@ -970,6 +1286,12 @@ impl Response {
     #[must_use]
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    /// HTTP reason phrase, for the `Response.statusText` getter.
+    #[must_use]
+    pub fn status_text(&self) -> &str {
+        &self.status_text
     }
 
     /// How the response was filtered: basic, CORS, or opaque
@@ -991,9 +1313,99 @@ impl Response {
         &self.final_url
     }
 
-    /// Consumes the response and returns its body stream.
+    /// Number of redirect hops followed for this response.
     #[must_use]
-    pub fn into_body(self) -> Body {
-        self.body
+    pub fn redirect_count(&self) -> u32 {
+        self.redirect_count
+    }
+
+    /// Consumes the response and returns its decoded body stream.
+    pub async fn into_body(self) -> Body {
+        Body::decoded(self.body, &self.content_encoding).await
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::{Arc, AtomicBool, Body, Mutex, NetError};
+    use flate2::Compression;
+    use flate2::write::{DeflateEncoder, GzEncoder};
+    use std::io::Write as _;
+    use tokio::io::{AsyncWriteExt as _, duplex};
+
+    async fn decode(bytes: &[u8], coding: &str) -> Result<Vec<u8>, NetError> {
+        let (mut writer, reader) = duplex(bytes.len().saturating_add(32).max(64));
+        writer.write_all(bytes).await.expect("write");
+        drop(writer);
+        let body = Body::wrap(
+            Box::new(reader),
+            &[coding.to_owned()],
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+        body.bytes(4 * 1024 * 1024).await
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(data).expect("gzip");
+        encoder.finish().expect("gzip finish")
+    }
+
+    #[tokio::test]
+    async fn decodes_every_gzip_member() {
+        let mut body = gzip(b"one");
+        body.extend(gzip(b"two"));
+        assert_eq!(decode(&body, "gzip").await.expect("gzip"), b"onetwo");
+    }
+
+    #[tokio::test]
+    async fn decodes_raw_deflate() {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(b"deflated").expect("deflate");
+        let body = encoder.finish().expect("deflate finish");
+        assert_eq!(
+            decode(&body, "deflate").await.expect("deflate"),
+            b"deflated"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_unsupported_coding_untouched() {
+        assert_eq!(
+            decode(b"zstd bytes", "zstd").await.expect("passthrough"),
+            b"zstd bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_body_is_not_a_decode_error() {
+        let body = Body::wrap(
+            Box::new(tokio::io::empty()),
+            &["gzip".to_owned()],
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert_eq!(body.bytes(1024).await.expect("empty"), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn refuses_decoded_bodies_past_the_limit() {
+        let body = gzip(&vec![0; 2 * 1024 * 1024]);
+        let decoded = Body::wrap(
+            Box::new({
+                let (mut writer, reader) = duplex(body.len() + 32);
+                writer.write_all(&body).await.expect("write");
+                drop(writer);
+                reader
+            }),
+            &["gzip".to_owned()],
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+        assert!(matches!(decoded.bytes(1024).await, Err(NetError::Limit(_))));
     }
 }

@@ -610,11 +610,23 @@ async fn route_service_call(
                 );
             let dials = context.dials.clone();
             tokio::spawn(async move {
-                let outcome = tokio::select! {
+                let mut outcome = tokio::select! {
                     biased;
                     _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
-                    result = worker_network.dial_request(&request, &initiator, cancel_rx) => result,
+                    result = worker_network.dial_request(&request, &initiator, assignment_id, cancel_rx.clone()) => result,
                 };
+                // A 421 asks for a retry on a different connection, but only an
+                // idempotent method may be replayed
+                // (<https://www.rfc-editor.org/rfc/rfc9110#section-15.5.20>).
+                if is_idempotent(&request.method)
+                    && matches!(&outcome, Ok(head) if head.status == 421)
+                {
+                    outcome = tokio::select! {
+                        biased;
+                        _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
+                        result = worker_network.dial_request(&request, &initiator, assignment_id, cancel_rx) => result,
+                    };
+                }
                 dials
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -627,6 +639,14 @@ async fn route_service_call(
                     let _result = worker_kill.send(true);
                 }
             });
+        }
+        ServiceCall::Network(NetworkCall::DialRead { id: stream }) => {
+            let result = assignment.network.read_stream(assignment_id, stream).await;
+            send_reply(&context.responder, id, ServiceReply::StreamChunk(result)).await?;
+        }
+        ServiceCall::Network(NetworkCall::CancelStream { id: stream }) => {
+            assignment.network.cancel_stream(assignment_id, stream);
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Network(NetworkCall::CancelDial { id: target }) => {
             if let Some(dial) = context
@@ -1250,6 +1270,14 @@ pub(crate) async fn spawn_process(
         assignments: AtomicUsize::new(0),
         _slot: slot,
     })
+}
+
+/// Methods a server may safely receive twice after a 421
+/// (<https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2>).
+fn is_idempotent(method: &str) -> bool {
+    ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"]
+        .iter()
+        .any(|candidate| method.eq_ignore_ascii_case(candidate))
 }
 
 async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {

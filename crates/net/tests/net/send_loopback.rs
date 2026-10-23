@@ -30,7 +30,10 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             .await
             .expect("status is response data");
         assert_eq!(response.status(), status);
-        assert_eq!(response.into_body().bytes(16).await.expect("body"), b"no");
+        assert_eq!(
+            response.into_body().await.bytes(16).await.expect("body"),
+            b"no"
+        );
         server.assert_clean();
     }
 
@@ -54,7 +57,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         Some(&b"text/plain"[..])
     );
     assert_eq!(
-        response.into_body().bytes(16).await.expect("body"),
+        response.into_body().await.bytes(16).await.expect("body"),
         b"hello"
     );
     server.assert_clean();
@@ -66,6 +69,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             .await
             .expect("chunked")
             .into_body()
+            .await
             .bytes(64)
             .await
             .expect("body"),
@@ -81,6 +85,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             .await
             .expect("response")
             .into_body()
+            .await
             .bytes(16)
             .await,
         Err(NetError::Limit(LimitExceeded::Size(16)))
@@ -196,7 +201,8 @@ async fn response_bodies_stream_and_drop_cancels_the_socket() {
         .send(Request::new(Method::GET, server.url("/stream")))
         .await
         .expect("stream")
-        .into_body();
+        .into_body()
+        .await;
     let mut collected = Vec::new();
     let mut chunks = 0;
     while let Some(chunk) = body.read_chunk().await.expect("chunk") {
@@ -225,7 +231,8 @@ async fn response_bodies_stream_and_drop_cancels_the_socket() {
             .send(Request::new(Method::GET, server.url("/cancel")))
             .await
             .expect("cancel")
-            .into_body();
+            .into_body()
+            .await;
         let _ = body.read_chunk().await.expect("partial chunk");
     }
     let deadline = Instant::now() + OBSERVE_TIMEOUT;
@@ -577,7 +584,10 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
         .send(Request::new(Method::GET, server.url("/v6")))
         .await
         .expect("ipv6 send");
-    assert_eq!(response.into_body().bytes(8).await.expect("body"), b"v6");
+    assert_eq!(
+        response.into_body().await.bytes(8).await.expect("body"),
+        b"v6"
+    );
     server.assert_clean();
 }
 
@@ -827,7 +837,7 @@ async fn resolve_maps_hit_miss_and_fail() {
         .await
         .expect("mapped hit");
     assert_eq!(
-        response.into_body().bytes(16).await.expect("body"),
+        response.into_body().await.bytes(16).await.expect("body"),
         b"mapped"
     );
     assert_eq!(
@@ -843,7 +853,10 @@ async fn resolve_maps_hit_miss_and_fail() {
         .send(Request::new(Method::GET, miss_server.url("/")))
         .await
         .expect("unmapped 127.0.0.1 uses libc");
-    assert_eq!(miss.into_body().bytes(16).await.expect("body"), b"direct");
+    assert_eq!(
+        miss.into_body().await.bytes(16).await.expect("body"),
+        b"direct"
+    );
     miss_server.assert_clean();
 
     let failed = agent.send(Request::new(

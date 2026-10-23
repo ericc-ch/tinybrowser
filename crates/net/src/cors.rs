@@ -228,7 +228,8 @@ fn is_simple_range(value: &[u8]) -> bool {
 /// (<https://fetch.spec.whatwg.org/#forbidden-request-header>). Pages cannot
 /// set these, and the browser adds them after the preflight decision, so they
 /// never appear in the CORS-unsafe request-header names.
-fn is_forbidden_request_header(name: &str) -> bool {
+#[must_use]
+pub fn is_forbidden_request_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name.starts_with("proxy-") || name.starts_with("sec-") {
         return true;
@@ -257,6 +258,37 @@ fn is_forbidden_request_header(name: &str) -> bool {
             | "upgrade"
             | "via"
     )
+}
+
+/// Whether `method` is a forbidden method
+/// (<https://fetch.spec.whatwg.org/#forbidden-method>).
+#[must_use]
+pub fn is_forbidden_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("CONNECT")
+        || method.eq_ignore_ascii_case("TRACE")
+        || method.eq_ignore_ascii_case("TRACK")
+}
+
+/// Whether a forbidden-method header carries a forbidden method in any
+/// comma-separated token
+/// (<https://fetch.spec.whatwg.org/#forbidden-method>).
+#[must_use]
+pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
+    if !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "x-http-method-override" | "x-http-method" | "x-method-override"
+    ) {
+        return false;
+    }
+    value.split(|&byte| byte == b',').any(|part| {
+        let token = part
+            .iter()
+            .copied()
+            .skip_while(|byte| *byte == b' ' || *byte == b'\t')
+            .take_while(|byte| *byte != b' ' && *byte != b'\t')
+            .collect::<Vec<u8>>();
+        std::str::from_utf8(&token).is_ok_and(is_forbidden_method)
+    })
 }
 
 /// The CORS-unsafe request-header names of `headers`, sorted lowercase

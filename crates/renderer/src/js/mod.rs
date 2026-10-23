@@ -171,6 +171,13 @@ pub(crate) struct JsFetchRequest {
     pub headers: Vec<(String, String)>,
     pub referrer: Option<String>,
     pub cors: Option<crate::protocol::CorsRequest>,
+    pub keepalive: bool,
+    pub body_len: u64,
+    pub integrity: Option<String>,
+    pub cache: String,
+    pub stream_body: bool,
+    pub referrer_source: Option<String>,
+    pub referrer_policy: Option<String>,
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -444,35 +451,65 @@ impl JsRealm {
                 // document parser, it never adds a field to a `fetch`
                 // Response, and `blob().type` reads the header list
                 // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-                let (status, body, url, content_type, headers, response_type) = match outcome {
-                    Some(outcome) => (
-                        i32::from(outcome.status),
-                        outcome.body,
-                        outcome.final_url,
-                        outcome.content_type.unwrap_or_default(),
-                        outcome
-                            .headers
-                            .into_iter()
-                            .map(|(name, value)| vec![name, value])
-                            .collect::<Vec<_>>(),
-                        outcome.response_type.as_str().to_owned(),
-                    ),
+                let (
+                    status,
+                    status_text,
+                    body,
+                    url,
+                    content_type,
+                    headers,
+                    response_type,
+                    body_error,
+                    redirect_count,
+                    stream,
+                ) = match outcome {
+                    Some(outcome) => {
+                        let body_error = outcome.body.is_err();
+                        (
+                            i32::from(outcome.status),
+                            outcome.status_text,
+                            outcome.body.unwrap_or_default(),
+                            outcome.final_url,
+                            outcome.content_type.unwrap_or_default(),
+                            outcome
+                                .headers
+                                .into_iter()
+                                .map(|(name, value)| vec![name, value])
+                                .collect::<Vec<_>>(),
+                            outcome.response_type.as_str().to_owned(),
+                            body_error,
+                            outcome.redirect_count,
+                            outcome.stream,
+                        )
+                    }
                     // A failed dial is a network error: the renderer rejects
                     // and `Response.type` never becomes observable
                     // (<https://fetch.spec.whatwg.org/#concept-network-error>).
                     None => (
                         0,
+                        String::new(),
                         Vec::new(),
                         String::new(),
                         String::new(),
                         Vec::new(),
                         "error".to_owned(),
+                        false,
+                        0,
+                        None,
                     ),
                 };
-                let bytes = TypedArray::new(ctx.clone(), body)?;
-                if let Err(error) =
-                    func.call::<_, ()>((status, bytes, url, content_type, headers, response_type))
-                {
+                let outcome = Object::new(ctx.clone())?;
+                outcome.set("status", status)?;
+                outcome.set("statusText", status_text)?;
+                outcome.set("body", TypedArray::new(ctx.clone(), body)?)?;
+                outcome.set("url", url)?;
+                outcome.set("contentType", content_type)?;
+                outcome.set("headers", headers)?;
+                outcome.set("responseType", response_type)?;
+                outcome.set("bodyError", body_error)?;
+                outcome.set("redirectCount", redirect_count)?;
+                outcome.set("stream", stream)?;
+                if let Err(error) = func.call::<_, ()>((outcome,)) {
                     bindings::host::report_callback_error(&ctx, &error);
                 }
                 Ok(())
@@ -924,14 +961,11 @@ impl JsRealm {
         Ok(())
     }
 
-    /// Timer and fetch submission hooks the JS shim calls.
-    fn install_task_host_functions(
-        &self,
+    /// Referrer decisions shared by the document loader and the fetch shim.
+    fn install_referrer_host_functions(
         ctx: &Ctx<'_>,
         world: &Rc<RefCell<World>>,
     ) -> Result<(), JsError> {
-        let outbox = Rc::clone(&self.world.borrow().outbox);
-        Self::install_timer_host_functions(ctx, &outbox)?;
         let referrer_world = world.clone();
         bridge::object(ctx)?.set(
             "__tbReferrer",
@@ -940,26 +974,31 @@ impl JsRealm {
                 fetch_referrer(&world, &request_url)
             }),
         )?;
-        // Parse a MIME type and serialize it back; `XMLHttpRequest`'s
-        // `overrideMimeType` stores the result, `""` on failure
-        // (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>).
         bridge::object(ctx)?.set(
-            "__tbParseMimeType",
-            Func::from(|value: String| -> String {
-                crate::sniff::parse_serialized_mime_type(&value)
-            }),
+            "__tbReferrerForPolicy",
+            Func::from(
+                |source: String, target: String, policy: String| -> Option<String> {
+                    let source = Url::parse(&source).ok()?;
+                    referrer_for_policy(&policy, &source, &target)
+                },
+            ),
         )?;
-        // "extract a MIME type" over one combined `Content-Type` value,
-        // serialized, `""` on failure. The `blob()` methods and the XHR blob
-        // response read it
-        // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-        bridge::object(ctx)?.set(
-            "__tbExtractMimeType",
-            Func::from(|value: String| -> String {
-                crate::sniff::extract_mime_type(&value).unwrap_or_default()
-            }),
-        )?;
+        Ok(())
+    }
+
+    /// Timer and fetch submission hooks the JS shim calls.
+    fn install_task_host_functions(
+        &self,
+        ctx: &Ctx<'_>,
+        world: &Rc<RefCell<World>>,
+    ) -> Result<(), JsError> {
+        let outbox = Rc::clone(&self.world.borrow().outbox);
+        Self::install_timer_host_functions(ctx, &outbox)?;
+        Self::install_referrer_host_functions(ctx, world)?;
+        install_header_policy_host_functions(ctx)?;
+        install_mime_host_functions(ctx)?;
         install_sync_fetch(ctx, world)?;
+        install_stream_host_functions(ctx, world)?;
         Self::install_csp_host_functions(ctx, world)?;
         let fetch_outbox = Rc::clone(&outbox);
         bridge::object(ctx)?.set(
@@ -993,6 +1032,19 @@ impl JsRealm {
                         Some("manual") => net::cors::RedirectMode::Manual,
                         _ => net::cors::RedirectMode::Follow,
                     };
+                    let keepalive = parts.next().is_some_and(|value| value == "1");
+                    let body_len = parts
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0);
+                    let integrity = parts.next().filter(|value| !value.is_empty());
+                    let cache = parts
+                        .next()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "default".to_owned());
+                    let stream_body = parts.next().is_some_and(|value| value == "1");
+                    let referrer_source = parts.next().filter(|value| !value.is_empty());
+                    let referrer_policy = parts.next().filter(|value| !value.is_empty());
                     let cors = mode.map(|mode| crate::protocol::CorsRequest {
                         mode,
                         credentials,
@@ -1000,7 +1052,7 @@ impl JsRealm {
                     });
                     fetch_outbox
                         .borrow_mut()
-                        .push_back(RealmRequest::Fetch(JsFetchRequest {
+                        .push_back(RealmRequest::Fetch(Box::new(JsFetchRequest {
                             url,
                             js_id,
                             method,
@@ -1009,7 +1061,14 @@ impl JsRealm {
                             headers,
                             referrer,
                             cors,
-                        }));
+                            keepalive,
+                            body_len,
+                            integrity,
+                            cache,
+                            stream_body,
+                            referrer_source,
+                            referrer_policy,
+                        })));
                     Ok::<(), rquickjs::Error>(())
                 },
             ),
@@ -1436,6 +1495,21 @@ pub(super) fn javascript_module_mime(typ: Option<&str>) -> bool {
     javascript_mime_essence(essence)
 }
 
+/// Classic scripts additionally accept `text/html` and `text/plain`
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+pub(crate) fn classic_script_mime(typ: Option<&str>) -> bool {
+    let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
+        return true;
+    };
+    let essence = typ
+        .split(';')
+        .next()
+        .unwrap_or(typ)
+        .trim()
+        .to_ascii_lowercase();
+    essence == "text/html" || essence == "text/plain" || javascript_mime_essence(&essence)
+}
+
 /// Whether `typ` is exactly a JavaScript MIME type essence string, with no
 /// parameters and no surrounding whitespace
 /// (<https://html.spec.whatwg.org/multipage/scripting.html#javascript-mime-type-essence-match>).
@@ -1522,6 +1596,97 @@ struct SyncPageFetch {
 }
 
 /// `__tbSyncFetch`: one page request that finishes before `send` returns.
+/// MIME host calls. One Rust parser serves serialization, multipart boundaries,
+/// and `blob().type`, so JS never keeps a second MIME grammar.
+fn install_mime_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
+    // Parse a MIME type and serialize it back; `XMLHttpRequest`'s
+    // `overrideMimeType` stores the result, `""` on failure
+    // (<https://mimesniff.spec.whatwg.org/#parse-a-mime-type>).
+    bridge::object(ctx)?.set(
+        "__tbParseMimeType",
+        Func::from(|value: String| -> String { crate::sniff::parse_serialized_mime_type(&value) }),
+    )?;
+    bridge::object(ctx)?.set(
+        "__tbMimeTypeParts",
+        Func::from(|value: String| -> Vec<String> {
+            crate::sniff::mime_type_parts(&value)
+                .map_or_else(Vec::new, |(essence, boundary)| vec![essence, boundary])
+        }),
+    )?;
+    // "extract a MIME type" over one combined `Content-Type` value, serialized,
+    // `""` on failure. The `blob()` methods and the XHR blob response read it
+    // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+    bridge::object(ctx)?.set(
+        "__tbExtractMimeType",
+        Func::from(|value: String| -> String {
+            crate::sniff::extract_mime_type(&value).unwrap_or_default()
+        }),
+    )?;
+    Ok(())
+}
+
+/// Header and method policy predicates. `net::cors` is the only table, so the
+/// preflight decision and the JS `Headers` guard cannot drift.
+fn install_header_policy_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
+    bridge::object(ctx)?.set(
+        "__tbIsForbiddenRequestHeader",
+        Func::from(|name: String| net::cors::is_forbidden_request_header(&name)),
+    )?;
+    bridge::object(ctx)?.set(
+        "__tbIsCorsSafelistedHeader",
+        Func::from(|name: String, value: String| {
+            net::cors::is_cors_safelisted_request_header(&name, value.as_bytes())
+        }),
+    )?;
+    bridge::object(ctx)?.set(
+        "__tbIsNoCorsSafelistedHeader",
+        Func::from(|name: String, value: String| {
+            net::cors::is_no_cors_safelisted_request_header(&name, value.as_bytes())
+        }),
+    )?;
+    bridge::object(ctx)?.set(
+        "__tbIsForbiddenMethod",
+        Func::from(|method: String| net::cors::is_forbidden_method(&method)),
+    )?;
+    bridge::object(ctx)?.set(
+        "__tbIsForbiddenMethodHeader",
+        Func::from(|name: String, value: String| {
+            net::cors::is_forbidden_method_header(&name, value.as_bytes())
+        }),
+    )?;
+    bridge::object(ctx)?.set(
+        "__tbIsCorsSafelistedMethod",
+        Func::from(|method: String| {
+            net::Method::parse(&method)
+                .is_ok_and(|method| net::cors::is_cors_safelisted_method(&method))
+        }),
+    )?;
+    Ok(())
+}
+
+fn install_stream_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    let read_world = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbFetchRead",
+        Func::from(move |stream: u64| -> rquickjs::Result<Option<Vec<u8>>> {
+            read_world
+                .borrow()
+                .runtime
+                .services
+                .dial_read(stream)
+                .map_err(|_| rquickjs::Error::new_from_js("dial", "network error"))
+        }),
+    )?;
+    let cancel_world = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbFetchCancel",
+        Func::from(move |stream: u64| {
+            cancel_world.borrow().runtime.services.cancel_stream(stream);
+        }),
+    )?;
+    Ok(())
+}
+
 fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
     let sync_world = world.clone();
     bridge::object(ctx)?.set(
@@ -1618,20 +1783,30 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
                 },
                 redirect: net::cors::RedirectMode::Follow,
             }),
+            keepalive: false,
+            body_len: 0,
+            integrity: None,
+            cache: None,
+            stream_body: false,
+            referrer_source: None,
+            referrer_policy: None,
         });
     match outcome {
         // The header list stays as served; nothing is sniffed into it
         // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
-        Ok(outcome) => Some(sync_fetch_value(
-            i32::from(outcome.status),
-            outcome.body,
-            outcome.final_url,
-            outcome
-                .headers
-                .into_iter()
-                .map(|(name, value)| vec![name, value])
-                .collect(),
-        )),
+        Ok(outcome) => {
+            let body = outcome.body.ok()?;
+            Some(sync_fetch_value(
+                i32::from(outcome.status),
+                body,
+                outcome.final_url,
+                outcome
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| vec![name, value])
+                    .collect(),
+            ))
+        }
         Err(_) => None,
     }
 }

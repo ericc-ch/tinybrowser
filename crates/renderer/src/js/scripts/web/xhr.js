@@ -59,11 +59,22 @@ const __tbSyncRequestBody = body => {
     return { bytes: Array.from(stored.bytes), type: body.type || null };
   }
   if (body instanceof ArrayBuffer) return { bytes: Array.from(new Uint8Array(body)), type: null };
-  if (ArrayBuffer.isView(body)) return { bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)), type: null };
-  if (body instanceof URLSearchParams) {
-    return { bytes: Array.from(__tbUtf8Encode(String(body))), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
+  if (ArrayBuffer.isView(body)) {
+    return {
+      bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)),
+      type: null,
+    };
   }
-  return { bytes: Array.from(__tbUtf8Encode(String(body))), type: 'text/plain;charset=UTF-8' };
+  if (body instanceof URLSearchParams) {
+    return {
+      bytes: Array.from(__tbUtf8Encode(String(body))),
+      type: 'application/x-www-form-urlencoded;charset=UTF-8',
+    };
+  }
+  return {
+    bytes: Array.from(__tbUtf8Encode(String(body))),
+    type: 'text/plain;charset=UTF-8',
+  };
 };
 // "get a final MIME type": the override MIME type when one is set, otherwise
 // the response MIME type, whose extraction failure is `text/xml`
@@ -273,7 +284,15 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   setRequestHeader(name, value) {
     const data = __tbBrand(this, __tbXhrData);
     if (data.state !== 1 || data.sent) throw new DOMException('Request not open', 'InvalidStateError');
-    __tbApply(__tbHeadersAppend, data.headers, [name, value]);
+    // ByteString conversion comes first, so a code unit above 0xFF is a
+    // TypeError; an invalid header name or value is a SyntaxError
+    // (<https://xhr.spec.whatwg.org/#dom-xmlhttprequest-setrequestheader>).
+    const headerName = __tbByteString(name);
+    const headerValue = __tbByteString(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+    if (!__tbIsHeaderName(headerName) || !__tbIsHeaderValue(headerValue)) {
+      throw new DOMException('Invalid header', 'SyntaxError');
+    }
+    __tbHeadersAppendRaw(data.headers, headerName, headerValue);
   }
   // https://xhr.spec.whatwg.org/#the-send()-method
   send(body = null) {
@@ -317,7 +336,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
         __tbXhrSyncError(data, 'The request body could not be extracted.');
       }
       const type = __tbApply(__tbHeadersGet, data.headers, ['content-type']) === null ? payload.type : null;
-      const fields = __tbArray.map(__tbBrand(data.headers, __tbHeadersData), entry => [entry[0], entry[1]]);
+      const fields = __tbArray.map(__tbHeadersList(data.headers), entry => [entry[0], entry[1]]);
       const referrer = host.__tbReferrer(data.url);
       const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, [referrer === null || referrer === undefined ? '' : String(referrer), data.withCredentials ? '1' : '0'], data.timeout);
       if (result === null || result === undefined) {
@@ -326,12 +345,14 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       __tbXhrFinish(this, data, generation, result[0], result[1], result[2], result[3], true);
       return;
     }
+    const referrer = host.__tbReferrer(data.url);
     data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, {
       mode: 'cors',
       credentials: data.withCredentials ? 'include' : 'same-origin',
       redirect: 'follow',
-    }, (status, bytes, url, _type, fields) => {
-      __tbXhrFinish(this, data, generation, status, bytes, url, fields, false);
+    }, referrer, outcome => {
+      if (outcome.bodyError) __tbXhrError(this, data, 'error');
+      else __tbXhrFinish(this, data, generation, outcome.status, outcome.body, outcome.url, outcome.headers, false);
     });
     __tbXhrTimeout(this, data);
   }
@@ -352,13 +373,14 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   }
   getResponseHeader(name) {
     const data = __tbBrand(this, __tbXhrData);
-    if (data.state < 2 || /^set-cookie2?$/i.test(String(name))) return null;
-    return __tbApply(__tbHeadersGet, data.responseHeaders, [name]);
+    const headerName = __tbByteString(name);
+    if (data.state < 2 || !__tbIsHeaderName(headerName)) return null;
+    return __tbHeadersLookupRaw(data.responseHeaders, headerName.toLowerCase());
   }
   getAllResponseHeaders() {
     const data = __tbBrand(this, __tbXhrData);
     if (data.state < 2) return '';
-    return __tbArray.map(__tbBrand(data.responseHeaders, __tbHeadersData), entry => [entry[0], entry[1]]).filter(([name]) => !/^set-cookie2?$/i.test(name))
+    return __tbArray.map(__tbHeadersList(data.responseHeaders), entry => [entry[0], entry[1]])
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([name, value]) => name + ': ' + value + '\r\n').join('');
   }
