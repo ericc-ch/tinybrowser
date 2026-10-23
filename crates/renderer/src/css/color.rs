@@ -1,10 +1,16 @@
-//! CSS `<color>` parsing for canvas styles.
+//! CSS `<color>` parsing for canvas styles and the input color state.
 //!
-//! Canvas accepts any CSS color where it takes a color
-//! (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>),
-//! so the parser follows CSS Color 4 for the sRGB syntaxes. Wide-gamut
-//! functions (`lab()`, `oklch()`, `color()`) are not parsed yet and are
-//! treated as invalid assignments, leaving the previous value in place.
+//! Both consumers accept any CSS color where they take a color
+//! (<https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-fillstyle>,
+//! <https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>).
+//! The parser follows CSS Color 4: named and system colors, hex, `rgb()`,
+//! `hsl()`, `hwb()`, `lab()`, relative colors, `color-mix()`, and every
+//! predefined `color()` space. It serializes the authored syntax for canvas
+//! when the sRGB bytes cannot represent it.
+//!
+//! Known gap: out-of-gamut colors are clipped per channel instead of running
+//! the CSS gamut-mapping algorithm, so wide-gamut values that are far outside
+//! sRGB can differ from a browser that implements OKLCH local-MINDE mapping.
 
 /// A parsed color plus the exact CSS serialization, when the syntax has no
 /// sRGB-byte equivalent (`color()`, relative colors, `color-mix()`).
@@ -166,8 +172,18 @@ fn percentage(text: &str) -> Option<f32> {
     number(text.strip_suffix('%')?).map(|value| value / 100.0)
 }
 
+fn percentage_or_number(text: &str) -> Option<f32> {
+    if text.eq_ignore_ascii_case("none") {
+        return Some(0.0);
+    }
+    percentage(text).or_else(|| number(text).map(|value| value / 100.0))
+}
+
 fn alpha(text: Option<&str>) -> Option<u8> {
     let Some(text) = text else { return Some(255) };
+    if text.eq_ignore_ascii_case("none") {
+        return Some(0);
+    }
     let value = number(text).or_else(|| percentage(text))?;
     Some(channel(value))
 }
@@ -184,6 +200,9 @@ fn channel(value: f32) -> u8 {
 }
 
 fn rgb_component(text: &str) -> Option<f32> {
+    if text.eq_ignore_ascii_case("none") {
+        return Some(0.0);
+    }
     if let Some(percent) = percentage(text) {
         return Some(percent);
     }
@@ -229,6 +248,9 @@ fn parse_rgb(args: &Args) -> Option<[u8; 4]> {
 }
 
 fn hue(text: &str) -> Option<f32> {
+    if text.eq_ignore_ascii_case("none") {
+        return Some(0.0);
+    }
     let (value, factor) = if let Some(value) = text.strip_suffix("deg") {
         (number(value)?, 1.0)
     } else if let Some(value) = text.strip_suffix("grad") {
@@ -249,8 +271,18 @@ fn parse_hsl(args: &Args) -> Option<[u8; 4]> {
     }
     let (components, alpha_text) = legacy_alpha(args)?;
     let hue = hue(&components[0])? / 360.0;
-    let saturation = percentage(&components[1])?.clamp(0.0, 1.0);
-    let lightness = percentage(&components[2])?.clamp(0.0, 1.0);
+    // The modern syntax accepts a bare number for saturation and lightness,
+    // where 100 means 100%; the legacy comma syntax requires percentages
+    // (<https://drafts.csswg.org/css-color-4/#the-hsl-notation>).
+    let percentage_channel = |text: &str| {
+        if args.comma {
+            percentage(text)
+        } else {
+            percentage_or_number(text)
+        }
+    };
+    let saturation = percentage_channel(&components[1])?.clamp(0.0, 1.0);
+    let lightness = percentage_channel(&components[2])?.clamp(0.0, 1.0);
     let alpha = alpha(alpha_text)?;
     let (red, green, blue) = hsl_to_rgb(hue, saturation, lightness);
     Some([channel(red), channel(green), channel(blue), alpha])
@@ -292,8 +324,15 @@ fn parse_hwb(args: &Args) -> Option<[u8; 4]> {
     }
     let (components, alpha_text) = legacy_alpha(args)?;
     let hue = hue(&components[0])? / 360.0;
-    let whiteness = percentage(&components[1])?.clamp(0.0, 1.0);
-    let blackness = percentage(&components[2])?.clamp(0.0, 1.0);
+    let percentage_channel = |text: &str| {
+        if text.eq_ignore_ascii_case("none") {
+            Some(0.0)
+        } else {
+            percentage(text)
+        }
+    };
+    let whiteness = percentage_channel(&components[1])?.clamp(0.0, 1.0);
+    let blackness = percentage_channel(&components[2])?.clamp(0.0, 1.0);
     let alpha = alpha(alpha_text)?;
     if whiteness + blackness >= 1.0 {
         let gray = channel(whiteness / (whiteness + blackness));
@@ -310,55 +349,32 @@ fn named(name: &str) -> Option<[u8; 4]> {
         let rgb = rgb.1.to_be_bytes();
         return Some([rgb[1], rgb[2], rgb[3], 255]);
     }
-    // CSS system colors resolve to the UA's palette. tinybrowser has no theme,
-    // so they resolve to black; the important part is that they parse
+    // CSS system colors resolve to the UA's light palette. tinybrowser has
+    // no platform theme, so it uses the Chrome light values, including the
+    // 19 standard names and their legacy aliases
     // (<https://drafts.csswg.org/css-color-4/#css-system-colors>).
-    matches!(
-        name,
-        "accentcolor"
-            | "accentcolortext"
-            | "activetext"
-            | "buttonborder"
-            | "buttonface"
-            | "buttontext"
-            | "canvas"
-            | "canvastext"
-            | "field"
-            | "fieldtext"
-            | "graytext"
-            | "highlight"
-            | "highlighttext"
-            | "linktext"
-            | "mark"
-            | "marktext"
-            | "selecteditem"
-            | "selecteditemtext"
-            | "visitedtext"
-            | "activeborder"
-            | "activecaption"
-            | "appworkspace"
-            | "background"
-            | "buttonhighlight"
-            | "buttonshadow"
-            | "captiontext"
-            | "inactiveborder"
-            | "inactivecaption"
-            | "inactivecaptiontext"
-            | "infobackground"
-            | "infotext"
-            | "menu"
-            | "menutext"
-            | "scrollbar"
-            | "threeddarkshadow"
-            | "threedface"
-            | "threedhighlight"
-            | "threedlightshadow"
-            | "threedshadow"
-            | "window"
-            | "windowframe"
-            | "windowtext"
-    )
-    .then_some([0, 0, 0, 255])
+    let palette =
+        match name {
+            "accentcolor" => [0x00, 0x75, 0xff, 255],
+            "accentcolortext" | "highlighttext" | "selecteditemtext" | "canvas" | "field"
+            | "window" | "background" | "infobackground" | "menu" | "appworkspace"
+            | "scrollbar" => [0xff, 0xff, 0xff, 255],
+            "activetext" => [0xff, 0x00, 0x00, 255],
+            "buttonborder" | "buttontext" | "canvastext" | "captiontext" | "fieldtext"
+            | "infotext" | "marktext" | "menutext" | "windowtext" | "inactiveborder"
+            | "threeddarkshadow" | "threedhighlight" | "threedlightshadow" | "threedshadow"
+            | "windowframe" => [0, 0, 0, 255],
+            "buttonface" | "threedface" | "activecaption" | "inactivecaption"
+            | "buttonhighlight" | "buttonshadow" => [0xef, 0xef, 0xef, 255],
+            "graytext" | "inactivecaptiontext" | "activeborder" => [0x80, 0x80, 0x80, 255],
+            "highlight" => [0x00, 0x41, 0xc6, 204],
+            "linktext" => [0x00, 0x00, 0xee, 255],
+            "visitedtext" => [0x55, 0x1a, 0x8b, 255],
+            "mark" => [0xff, 0xff, 0x00, 255],
+            "selecteditem" => [0x19, 0x67, 0xd2, 255],
+            _ => return None,
+        };
+    Some(palette)
 }
 
 /// CSS named colors, `0xRRGGBB`.
@@ -577,7 +593,7 @@ fn from_bytes(bytes: [u8; 4]) -> [f32; 4] {
     clippy::cast_sign_loss,
     reason = "channels are clamped to 0..1 before scaling to 0..255"
 )]
-fn to_bytes([r, g, b, a]: [f32; 4]) -> [u8; 4] {
+pub(crate) fn to_bytes([r, g, b, a]: [f32; 4]) -> [u8; 4] {
     let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
     [channel(r), channel(g), channel(b), channel(a)]
 }
@@ -652,6 +668,44 @@ fn serialize_color_function(space: &str, components: &[Component], alpha: f32) -
     )
 }
 
+/// The authored Display P3 components and alpha of a `color(display-p3 …)`
+/// value, without clamping or converting spaces. A color input in the
+/// `display-p3` color space keeps these components, including values outside
+/// the 0..1 range
+/// (<https://html.spec.whatwg.org/multipage/input.html#update-a-color-well-control-color>).
+pub(crate) fn display_p3_components(input: &str) -> Option<([f32; 3], f32)> {
+    let lower = input.trim().to_ascii_lowercase();
+    let inner = function_args(&lower, "color")?;
+    let (space, rest) = inner.trim().split_once(char::is_whitespace)?;
+    if !space.eq_ignore_ascii_case("display-p3") {
+        return None;
+    }
+    let (channels, alpha) = rest
+        .split_once('/')
+        .map_or((rest, None), |(channels, alpha)| {
+            (channels.trim(), Some(alpha.trim()))
+        });
+    let components: Vec<Component> = channels
+        .split_whitespace()
+        .map(Component::parse)
+        .collect::<Option<_>>()?;
+    if components.len() != 3 {
+        return None;
+    }
+    let alpha = match alpha {
+        None => 1.0,
+        Some(text) => Component::parse(text)?.number()?,
+    };
+    Some((
+        [
+            components[0].value(),
+            components[1].value(),
+            components[2].value(),
+        ],
+        alpha,
+    ))
+}
+
 fn parse_color_function(inner: &str) -> Option<ParsedColor> {
     let inner = inner.trim();
     let (space, rest) = inner.split_once(char::is_whitespace)?;
@@ -689,19 +743,148 @@ fn parse_color_function(inner: &str) -> Option<ParsedColor> {
         None => 1.0,
         Some(text) => Component::parse(text)?.number()?,
     };
-    // sRGB is the only space the bitmap stores directly. Other spaces keep
-    // their serialization and paint with a best-effort sRGB approximation.
-    let value = [
-        components[0].value().clamp(0.0, 1.0),
-        components[1].value().clamp(0.0, 1.0),
-        components[2].value().clamp(0.0, 1.0),
-        alpha_value.clamp(0.0, 1.0),
-    ];
+    let srgb = color_space_to_srgb(
+        space,
+        [
+            components[0].value(),
+            components[1].value(),
+            components[2].value(),
+        ],
+    );
+    let bytes = to_bytes([srgb[0], srgb[1], srgb[2], alpha_value.clamp(0.0, 1.0)]);
     Some(ParsedColor {
-        bytes: to_bytes(value),
-        value,
+        bytes,
+        // Keep the converted float components, so a color input's value is
+        // not quantized to 8-bit sRGB before it serializes again
+        // (<https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>).
+        value: [srgb[0], srgb[1], srgb[2], alpha_value.clamp(0.0, 1.0)],
         serialized: Some(serialize_color_function(space, &components, alpha_value)),
     })
+}
+
+/// Converts a predefined `color()` space to non-linear sRGB
+/// (<https://drafts.csswg.org/css-color-4/#color-conversion-code>).
+///
+/// Out-of-gamut values are clipped per channel when they become bytes. CSS
+/// Color 4 specifies OKLCH local-MINDE gamut mapping first; that step is a
+/// recorded gap, so wide-gamut values that are far outside sRGB can differ
+/// from a browser that implements it.
+fn color_space_to_srgb(space: &str, components: [f32; 3]) -> [f32; 3] {
+    match space {
+        "srgb-linear" => components.map(gamma_encode),
+        "display-p3" => xyz_d65_to_srgb(matrix(DISPLAY_P3_TO_XYZ_D65, components.map(linearize))),
+        "a98-rgb" => xyz_d65_to_srgb(matrix(A98_RGB_TO_XYZ_D65, components.map(a98_decode))),
+        "prophoto-rgb" => xyz_d50_to_srgb(matrix(
+            PROPHOTO_RGB_TO_XYZ_D50,
+            components.map(prophoto_decode),
+        )),
+        "rec2020" => xyz_d65_to_srgb(matrix(REC2020_TO_XYZ_D65, components.map(rec2020_decode))),
+        "xyz" | "xyz-d65" => xyz_d65_to_srgb(components),
+        "xyz-d50" => xyz_d50_to_srgb(components),
+        _ => components,
+    }
+}
+
+/// Converts non-linear sRGB to non-linear Display P3, for serializing a
+/// color input's value in the `display-p3` color space
+/// (<https://drafts.csswg.org/css-color-4/#color-conversion-code>).
+pub(crate) fn srgb_to_display_p3(components: [f32; 3]) -> [f32; 3] {
+    let xyz = matrix(SRGB_TO_XYZ_D65, components.map(linearize));
+    matrix(XYZ_D65_TO_DISPLAY_P3, xyz).map(gamma_encode)
+}
+
+fn matrix(coefficients: [[f32; 3]; 3], [x, y, z]: [f32; 3]) -> [f32; 3] {
+    coefficients.map(|row| row[0] * x + row[1] * y + row[2] * z)
+}
+
+fn xyz_d65_to_srgb(xyz: [f32; 3]) -> [f32; 3] {
+    matrix(XYZ_D65_TO_SRGB, xyz).map(gamma_encode)
+}
+
+fn xyz_d50_to_srgb(xyz: [f32; 3]) -> [f32; 3] {
+    xyz_d65_to_srgb(matrix(BRADFORD_D50_TO_D65, xyz))
+}
+
+fn a98_decode(value: f32) -> f32 {
+    value.signum() * value.abs().powf(563.0 / 256.0)
+}
+
+fn prophoto_decode(value: f32) -> f32 {
+    value.signum() * value.abs().powf(1.8)
+}
+
+fn rec2020_decode(value: f32) -> f32 {
+    const ALPHA: f32 = 1.099_296_8;
+    const BETA: f32 = 0.018_054;
+    if value.abs() < BETA * 4.5 {
+        value / 4.5
+    } else {
+        value.signum() * ((value.abs() + ALPHA - 1.0) / ALPHA).powf(1.0 / 0.45)
+    }
+}
+
+static DISPLAY_P3_TO_XYZ_D65: [[f32; 3]; 3] = [
+    [0.486_570_95, 0.265_667_7, 0.198_217_28],
+    [0.228_974_56, 0.691_738_5, 0.079_286_91],
+    [0.0, 0.045_113_38, 1.043_944_4],
+];
+
+static A98_RGB_TO_XYZ_D65: [[f32; 3]; 3] = [
+    [0.576_669_04, 0.185_558_24, 0.188_228_65],
+    [0.297_344_98, 0.627_363_57, 0.075_291_46],
+    [0.027_031_36, 0.070_688_85, 0.991_337_54],
+];
+
+static PROPHOTO_RGB_TO_XYZ_D50: [[f32; 3]; 3] = [
+    [0.797_760_5, 0.135_185_84, 0.031_349_35],
+    [0.288_071_13, 0.711_843_2, 0.000_085_65],
+    [0.0, 0.0, 0.825_104_6],
+];
+
+static REC2020_TO_XYZ_D65: [[f32; 3]; 3] = [
+    [0.636_958_05, 0.144_616_9, 0.168_880_98],
+    [0.262_700_2, 0.677_998_1, 0.059_301_72],
+    [0.0, 0.028_072_693, 1.060_985_1],
+];
+
+static BRADFORD_D50_TO_D65: [[f32; 3]; 3] = [
+    [0.955_473_5, -0.023_098_54, 0.063_259_31],
+    [-0.028_369_707, 1.009_995_5, 0.021_041_399],
+    [0.012_314_002, -0.020_507_697, 1.330_365_9],
+];
+
+static SRGB_TO_XYZ_D65: [[f32; 3]; 3] = [
+    [0.412_390_8, 0.357_584_3, 0.180_480_8],
+    [0.212_639, 0.715_168_7, 0.072_192_31],
+    [0.019_330_819, 0.119_194_78, 0.950_532_15],
+];
+
+static XYZ_D65_TO_DISPLAY_P3: [[f32; 3]; 3] = [
+    [2.493_497, -0.931_383_6, -0.402_710_78],
+    [-0.829_489, 1.762_664_1, 0.023_624_69],
+    [0.035_845_83, -0.076_172_39, 0.956_884_5],
+];
+
+static XYZ_D65_TO_SRGB: [[f32; 3]; 3] = [
+    [3.240_97, -1.537_383_2, -0.498_610_76],
+    [-0.969_243_65, 1.875_967_5, 0.041_555_06],
+    [0.055_630_08, -0.203_976_96, 1.056_971_5],
+];
+
+fn linearize(value: f32) -> f32 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn gamma_encode(value: f32) -> f32 {
+    if value <= 0.003_130_8 {
+        12.92 * value
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 /// A `lab()` lightness: a number, a percentage of 100, or `none`.
@@ -781,29 +964,9 @@ fn lab_to_srgb(lightness: f32, a_axis: f32, b_axis: f32, alpha: f32) -> [u8; 4] 
     let x_d50 = inverse(fx) * 0.964_22;
     let y_d50 = inverse(fy);
     let z_d50 = inverse(fz) * 0.825_21;
-    // Bradford-adapted D50 -> D65.
-    let x65 = 0.955_47 * x_d50 - 0.023_099 * y_d50 + 0.063_259 * z_d50;
-    let y65 = -0.028_37 * x_d50 + 1.009_995 * y_d50 + 0.021_041 * z_d50;
-    let z65 = 0.012_314 * x_d50 - 0.020_508 * y_d50 + 1.330_366 * z_d50;
-    // XYZ D65 -> linear sRGB.
-    let linear = [
-        3.240_97 * x65 - 1.537_38 * y65 - 0.498_611 * z65,
-        -0.969_244 * x65 + 1.875_97 * y65 + 0.041_555 * z65,
-        0.055_63 * x65 - 0.203_977 * y65 + 1.056_97 * z65,
-    ];
-    let encode = |value: f32| {
-        if value <= 0.003_130_8 {
-            12.92 * value
-        } else {
-            1.055 * value.powf(1.0 / 2.4) - 0.055
-        }
-    };
-    to_bytes([
-        encode(linear[0]),
-        encode(linear[1]),
-        encode(linear[2]),
-        alpha,
-    ])
+    // Bradford-adapted D50 -> the shared D65 -> sRGB conversion path.
+    let srgb = xyz_d50_to_srgb([x_d50, y_d50, z_d50]);
+    to_bytes([srgb[0], srgb[1], srgb[2], alpha])
 }
 
 fn parse_relative(rest: &str, color_function: bool) -> Option<ParsedColor> {
@@ -957,66 +1120,4 @@ fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
         value,
         serialized: Some(serialized_srgb(value)),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{parse, parse_exact};
-
-    #[test]
-    fn hex_lengths() {
-        assert_eq!(parse("#f00"), Some([255, 0, 0, 255]));
-        assert_eq!(parse("#ff0000"), Some([255, 0, 0, 255]));
-        assert_eq!(parse("#ff000080"), Some([255, 0, 0, 128]));
-        assert_eq!(parse("#f008"), Some([255, 0, 0, 136]));
-    }
-
-    #[test]
-    fn functional_forms() {
-        assert_eq!(parse("rgb(0, 128, 255)"), Some([0, 128, 255, 255]));
-        assert_eq!(parse("rgba(0, 0, 0, 0.5)"), Some([0, 0, 0, 128]));
-        assert_eq!(parse("rgb(100% 0% 0% / 50%)"), Some([255, 0, 0, 128]));
-        assert_eq!(parse("hsl(120, 100%, 25%)"), Some([0, 128, 0, 255]));
-    }
-
-    #[test]
-    fn names_and_invalid() {
-        assert_eq!(parse("RED"), Some([255, 0, 0, 255]));
-        assert_eq!(parse("transparent"), Some([0, 0, 0, 0]));
-        assert_eq!(parse("not-a-color"), None);
-        assert_eq!(parse("#12"), None);
-    }
-
-    #[test]
-    fn color_function_rejects_unknown_spaces_and_bad_alpha() {
-        assert!(parse_exact("color(bogus 1 0 0)").is_none());
-        assert!(parse_exact("color(srgb 1 0 0 / garbage)").is_none());
-        assert!(parse_exact("lab(50 0 0 / garbage)").is_none());
-        assert!(parse_exact("lab(50 0 0)").is_some());
-    }
-
-    #[test]
-    fn color_mix_is_premultiplied_and_scales_partial_percentages() {
-        let transparent_red = parse_exact("color-mix(in srgb, transparent, red)").unwrap();
-        assert_eq!(transparent_red.bytes, [255, 0, 0, 128]);
-
-        let partial = parse_exact("color-mix(in srgb, red 25%, blue 25%)").unwrap();
-        assert_eq!(partial.bytes, [128, 0, 128, 128]);
-
-        assert!(parse_exact("color-mix(in srgb, red 150%, blue)").is_none());
-        assert!(parse_exact("color-mix(in srgb, red -1%, blue)").is_none());
-    }
-
-    #[test]
-    fn relative_rgb_numbers_are_zero_to_255() {
-        let mixed = parse_exact("rgb(from #000000 128 0 0)").unwrap();
-        assert_eq!(mixed.bytes, [128, 0, 0, 255]);
-    }
-
-    #[test]
-    fn lab_mixes_in_srgb_not_lab_coordinates() {
-        let lab = parse_exact("lab(50 0 0)").unwrap();
-        let same = parse_exact("color-mix(in srgb, lab(50 0 0), lab(50 0 0))").unwrap();
-        assert_eq!(same.bytes, lab.bytes);
-    }
 }

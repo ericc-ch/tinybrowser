@@ -3,14 +3,16 @@
 
 use super::super::{
     AttrArgument, CollectionKind, JsNamedNodeMap, JsTokenList, LegacyNullString, NodeContext,
-    NodeOrString, OptString, WebIdlString, attached_attr_id, attr_owner, attr_state, attr_wrapper,
-    attribute_local_name, attribute_value, blur_node, deref_weak, document_is_html_content,
-    dom_string, element_box, element_click, fixup_focus_after_removal, focus_node, host,
-    host_node_id, is_focusable, js_string_to_utf8, live_collection, make_weak, rect_object,
-    remove_attribute_sync, schedule_mutation_delivery, set_attribute_node, set_attribute_sync,
-    string_value, throw_dom, throw_dom_error, touch_attr, valid_attribute_local_name,
-    validate_and_extract, with_node_data, world, world_for_node, wrap_node,
+    NodeOrString, OptString, WebIdlString, after_attribute_change, attached_attr_id, attr_owner,
+    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, deref_weak,
+    document_is_html_content, dom_string, element_box, element_click, fixup_focus_after_removal,
+    focus_node, host, host_node_id, is_focusable, js_string_to_utf8, live_collection, make_weak,
+    rect_object, remove_attribute_sync, schedule_mutation_delivery, set_attribute_node,
+    set_attribute_sync, string_value, throw_dom, throw_dom_error, touch_attr,
+    valid_attribute_local_name, validate_and_extract, with_node_data, world, world_for_node,
+    wrap_node,
 };
+use super::forms::{fixup_option_on_insert, fixup_radio_on_insert};
 use crate::dom::adoption::materialize_children;
 
 use std::collections::HashSet;
@@ -1786,6 +1788,7 @@ impl JsNode {
         )?;
         let namespace = name.ns.to_string();
         let local = name.local.to_string();
+        let previous_value;
         {
             let world = world(&ctx)?;
             let world = world.borrow();
@@ -1798,6 +1801,7 @@ impl JsNode {
                 &namespace,
                 &local,
             );
+            previous_value = old_value.clone();
             // Reuse the stored qualified name when the attribute is already
             // present, so the write replaces instead of duplicating it.
             let stored = parsed
@@ -1831,6 +1835,9 @@ impl JsNode {
             });
         }
         touch_attr(&ctx, self.handle.0, &namespace, &local, &value.0)?;
+        if namespace.is_empty() {
+            after_attribute_change(&ctx, self.handle.0, &local, previous_value.as_deref())?;
+        }
         schedule_mutation_delivery(&ctx)
     }
 
@@ -2212,9 +2219,18 @@ impl JsNode {
             })
             .unwrap_or_default();
         let iframes = replace_all_journaled(&mut parsed, container, added.clone());
+        let controls = crate::dom::forms::descendant_controls(
+            &parsed.document.base,
+            container.document,
+            container.node,
+        );
         drop(parsed);
         world.destroy_child_navigables(&iframes);
         drop(world);
+        for id in controls {
+            fixup_option_on_insert(ctx, id)?;
+            fixup_radio_on_insert(ctx, id)?;
+        }
         register_inserted_iframes(ctx, &added)?;
         upgrade_parsed_tree(ctx, container)?;
         schedule_mutation_delivery(ctx)
@@ -2296,8 +2312,22 @@ impl JsNode {
             }
             _ => place_adjacent_rest(&ctx, &mut parsed, position.as_str(), element, moved.clone())?,
         }
+        let controls: Vec<_> = moved
+            .iter()
+            .flat_map(|root| {
+                crate::dom::forms::descendant_controls(
+                    &parsed.document.base,
+                    root.document,
+                    root.node,
+                )
+            })
+            .collect();
         drop(parsed);
         drop(world);
+        for id in controls {
+            fixup_option_on_insert(&ctx, id)?;
+            fixup_radio_on_insert(&ctx, id)?;
+        }
         register_inserted_iframes(&ctx, &moved)?;
         // Custom elements in parsed markup upgrade, like the innerHTML and
         // outerHTML paths below.

@@ -28,6 +28,14 @@ tools/intl/generate-data); every other locale silently falls back.
 Lone surrogates round-trip through character data, titles, and
 attributes. The layout tree still stores UTF-8 (docs/upstream.md).
 
+## CSS colors
+
+Canvas styles and `<input type=color>` use the CSS Color 4 parser in
+`crates/renderer/src/css/color.rs`. It implements the predefined `color()`
+spaces, but clips out-of-gamut colors per channel instead of running OKLCH
+local-MINDE gamut mapping. Wide-gamut colors far outside sRGB can differ from
+a browser that implements the mapping algorithm.
+
 ## Missing surfaces
 
 No workers or service-workers. Canvas `getContext` returns a same-object

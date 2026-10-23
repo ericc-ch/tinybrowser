@@ -1458,24 +1458,41 @@ pub(crate) fn script_at(world: &World, id: crate::dom::tree::NodeId) -> Option<S
     let source = match crate::dom::tree::attr(base, id.node, "src") {
         Some(src) if !src.trim().is_empty() => ScriptSource::Src(src.to_owned()),
         _ => ScriptSource::Inline {
-            source: element_text(base, id.node),
+            source: crate::dom::text::child_text_content(base, id.node),
             // Known gap: Blitz stores no script line numbers.
             line: 0,
         },
     };
-    let typ = crate::dom::tree::attr(base, id.node, "type");
-    if typ.is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module")) {
+    // The script block's type string: the `type` attribute when present,
+    // otherwise `text/` plus the `language` attribute, otherwise
+    // `text/javascript`; an exactly empty `type` or `language` also means
+    // `text/javascript`
+    // (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    let typ = crate::dom::tree::attr(base, id.node, "type").map(str::trim_ascii);
+    let language = crate::dom::tree::attr(base, id.node, "language");
+    let type_string = match (typ, language) {
+        (Some(""), _) | (None, Some("") | None) => "text/javascript".to_owned(),
+        (Some(typ), _) => typ.to_owned(),
+        (None, Some(language)) => format!("text/{language}"),
+    };
+    if type_string.eq_ignore_ascii_case("module") {
         Some(Script::Module(source))
+    } else if javascript_mime_essence(&type_string) {
+        Some(Script::Classic(source))
     } else {
-        javascript_mime(typ).then_some(Script::Classic(source))
+        None
     }
 }
 
 pub(super) fn javascript_module_mime(typ: Option<&str>) -> bool {
-    let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
+    // A response header is a MIME type, so parameters and whitespace are
+    // allowed and the first parsable item wins
+    // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+    let Some(mime) = typ.and_then(crate::sniff::extract_mime_type) else {
         return false;
     };
-    javascript_mime(Some(typ))
+    let essence = mime.split(';').next().unwrap_or(&mime);
+    javascript_mime_essence(essence)
 }
 
 /// Classic scripts additionally accept `text/html` and `text/plain`
@@ -1490,61 +1507,34 @@ pub(crate) fn classic_script_mime(typ: Option<&str>) -> bool {
         .unwrap_or(typ)
         .trim()
         .to_ascii_lowercase();
-    essence == "text/html" || essence == "text/plain" || javascript_mime(Some(typ))
+    essence == "text/html" || essence == "text/plain" || javascript_mime_essence(&essence)
 }
 
-pub(crate) fn javascript_mime(typ: Option<&str>) -> bool {
-    let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
-        return true;
-    };
-    let essence = typ
-        .split(';')
-        .next()
-        .unwrap_or(typ)
-        .trim()
-        .to_ascii_lowercase();
+/// Whether `typ` is exactly a JavaScript MIME type essence string, with no
+/// parameters and no surrounding whitespace
+/// (<https://html.spec.whatwg.org/multipage/scripting.html#javascript-mime-type-essence-match>).
+fn javascript_mime_essence(typ: &str) -> bool {
     // https://mimesniff.spec.whatwg.org/#javascript-mime-type
-    matches!(
-        essence.as_str(),
-        "application/ecmascript"
-            | "application/javascript"
-            | "application/x-ecmascript"
-            | "application/x-javascript"
-            | "text/ecmascript"
-            | "text/javascript"
-            | "text/javascript1.0"
-            | "text/javascript1.1"
-            | "text/javascript1.2"
-            | "text/javascript1.3"
-            | "text/javascript1.4"
-            | "text/javascript1.5"
-            | "text/jscript"
-            | "text/livescript"
-            | "text/x-ecmascript"
-            | "text/x-javascript"
-    )
-}
-
-fn element_text(base: &blitz_dom::BaseDocument, id: crate::dom::tree::BlitzId) -> String {
-    // Script source is the node's [child text content], not descendant text
-    // (<https://dom.spec.whatwg.org/#concept-child-text-content>,
-    // <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
-    let mut text = String::new();
-    let children = base
-        .get_node(id)
-        .map(|node| node.children.iter().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
-    for child in children {
-        if let Some(blitz_dom::NodeData::Text(data)) = base.get_node(child).map(|node| &node.data) {
-            text.push_str(&data.content);
-        }
-        if let Some(blitz_dom::NodeData::CDataSection { contents }) =
-            base.get_node(child).map(|node| &node.data)
-        {
-            text.push_str(contents);
-        }
-    }
-    text
+    [
+        "application/ecmascript",
+        "application/javascript",
+        "application/x-ecmascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "text/javascript",
+        "text/javascript1.0",
+        "text/javascript1.1",
+        "text/javascript1.2",
+        "text/javascript1.3",
+        "text/javascript1.4",
+        "text/javascript1.5",
+        "text/jscript",
+        "text/livescript",
+        "text/x-ecmascript",
+        "text/x-javascript",
+    ]
+    .iter()
+    .any(|essence| typ.eq_ignore_ascii_case(essence))
 }
 
 /// Owns [`JsRealm::turn_deadline`] for one renderer turn. Nested enters keep

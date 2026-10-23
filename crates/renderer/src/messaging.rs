@@ -177,7 +177,7 @@ impl FrameTree {
 
     /// The top-level traversable of `frame`
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#nav-top>).
-    fn top_level(&self, frame: FrameId) -> FrameId {
+    pub(crate) fn top_level(&self, frame: FrameId) -> FrameId {
         let mut top = frame;
         while let Some(parent) = self.parent(top) {
             top = parent;

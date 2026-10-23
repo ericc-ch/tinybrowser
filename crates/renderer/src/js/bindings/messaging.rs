@@ -372,8 +372,7 @@ fn frame_global(ctx: Ctx<'_>, frame: f64) -> Result<Option<Object<'_>>> {
     let Some(target) = current.borrow().frame_world(frame) else {
         return Ok(None);
     };
-    let same_origin =
-        target.borrow().document_url.origin() == current.borrow().document_url.origin();
+    let same_origin = target.borrow().origin == current.borrow().origin;
     if !same_origin {
         return Ok(None);
     }
@@ -399,8 +398,7 @@ pub(crate) fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
         return Ok(Value::new_null(ctx));
     };
     let root = target.borrow().main_document_root();
-    let same_origin =
-        target.borrow().document_url.origin() == current.borrow().document_url.origin();
+    let same_origin = target.borrow().origin == current.borrow().origin;
     if !same_origin {
         return Err(throw_dom(
             &ctx,

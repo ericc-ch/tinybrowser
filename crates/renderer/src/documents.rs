@@ -39,6 +39,26 @@ pub(crate) struct BlitzDocument {
     /// Script elements whose [already started] flag is set
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
     started_scripts: HashSet<blitz_traits::node_id::NodeId>,
+    /// Selects whose option selectedness was materialized from attributes and
+    /// the reset rule. Insertions, removals, and the relevant attribute
+    /// changes invalidate the entry
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
+    selectedness_normalized: HashSet<blitz_traits::node_id::NodeId>,
+    /// Stored option selectedness. Blitz folds selectedness into the
+    /// `selected` attribute unless a dirty bit is set, but the spec keeps a
+    /// separate selectedness slot and dirtiness flag
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
+    option_selectedness: HashMap<blitz_traits::node_id::NodeId, bool>,
+    /// Options whose selectedness was set by script or a selectedIndex/value
+    /// setter. A later `selected` attribute change does not override them
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-dirtiness>).
+    option_dirtiness: HashSet<blitz_traits::node_id::NodeId>,
+    /// Inputs whose stored value is the sanitized current value while the
+    /// element is still logically pristine. The dirty slot also drives Blitz's
+    /// layout editor, so a marker keeps the sanitized text on screen without
+    /// making the value user-dirty
+    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
+    pristine_values: HashSet<blitz_traits::node_id::NodeId>,
     /// Live ranges by slot, adjusted by every structural mutation. Slots
     /// free with the document; see `dom::range::RangeTable`.
     pub ranges: crate::dom::range::RangeTable,
@@ -66,6 +86,10 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
+            selectedness_normalized: HashSet::new(),
+            option_selectedness: HashMap::new(),
+            option_dirtiness: HashSet::new(),
+            pristine_values: HashSet::new(),
             ranges: crate::dom::range::RangeTable::default(),
             exact_text: HashMap::new(),
             exact_attrs: HashMap::new(),
@@ -83,11 +107,78 @@ impl BlitzDocument {
             fragments: HashSet::new(),
             pi_attributes: HashMap::new(),
             started_scripts: HashSet::new(),
+            selectedness_normalized: HashSet::new(),
+            option_selectedness: HashMap::new(),
+            option_dirtiness: HashSet::new(),
+            pristine_values: HashSet::new(),
             ranges: crate::dom::range::RangeTable::default(),
             exact_text: HashMap::new(),
             exact_attrs: HashMap::new(),
             template_owners: HashMap::new(),
         }
+    }
+
+    /// Whether a select's option selectedness is already materialized.
+    pub(crate) fn selectedness_normalized(&self, select: blitz_traits::node_id::NodeId) -> bool {
+        self.selectedness_normalized.contains(&select)
+    }
+
+    /// Marks a select's option selectedness as materialized.
+    pub(crate) fn mark_selectedness_normalized(&mut self, select: blitz_traits::node_id::NodeId) {
+        self.selectedness_normalized.insert(select);
+    }
+
+    /// Drops the materialized selectedness for one select.
+    pub(crate) fn invalidate_selectedness(&mut self, select: blitz_traits::node_id::NodeId) {
+        self.selectedness_normalized.remove(&select);
+    }
+
+    /// The stored selectedness slot for an option, when materialized.
+    pub(crate) fn option_selectedness(
+        &self,
+        option: blitz_traits::node_id::NodeId,
+    ) -> Option<bool> {
+        self.option_selectedness.get(&option).copied()
+    }
+
+    /// Stores an option's selectedness slot.
+    pub(crate) fn set_option_selectedness(
+        &mut self,
+        option: blitz_traits::node_id::NodeId,
+        selected: bool,
+    ) {
+        self.option_selectedness.insert(option, selected);
+    }
+
+    /// Whether an option's selectedness was set by script.
+    pub(crate) fn option_dirty(&self, option: blitz_traits::node_id::NodeId) -> bool {
+        self.option_dirtiness.contains(&option)
+    }
+
+    /// Marks an option's selectedness as script-set.
+    pub(crate) fn mark_option_dirty(&mut self, option: blitz_traits::node_id::NodeId) {
+        self.option_dirtiness.insert(option);
+    }
+
+    /// Clears an option's dirtiness, so its `selected` attribute applies
+    /// again.
+    pub(crate) fn clear_option_dirty(&mut self, option: blitz_traits::node_id::NodeId) {
+        self.option_dirtiness.remove(&option);
+    }
+
+    /// Whether an input's stored value is a sanitized pristine value.
+    pub(crate) fn pristine_value(&self, node: blitz_traits::node_id::NodeId) -> bool {
+        self.pristine_values.contains(&node)
+    }
+
+    /// Marks an input's stored value as sanitized but pristine.
+    pub(crate) fn mark_pristine_value(&mut self, node: blitz_traits::node_id::NodeId) {
+        self.pristine_values.insert(node);
+    }
+
+    /// Clears the pristine marker before a user value supersedes it.
+    pub(crate) fn clear_pristine_value(&mut self, node: blitz_traits::node_id::NodeId) {
+        self.pristine_values.remove(&node);
     }
 
     /// Records `entry` when an observer watches this document.

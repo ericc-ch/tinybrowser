@@ -10,7 +10,7 @@ use rquickjs::{
 };
 
 use crate::documents::JournalEntry;
-use crate::dom::forms::{option_selected, select_options};
+use crate::dom::forms::{effective_selected_options, select_options};
 use crate::dom::insertion::siblings_around;
 use crate::dom::tree::{BlitzId, NodeId, attr, html_namespace, is_element};
 use crate::js::world::Handle;
@@ -123,6 +123,18 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         return Ok(Vec::new());
     };
     let owner = owner.borrow();
+    if matches!(kind, CollectionKind::SelectedOptions) {
+        let Some(mut parsed) = owner.document_mut(scope) else {
+            return Ok(Vec::new());
+        };
+        return Ok(effective_selected_options(&mut parsed, scope.node)
+            .into_iter()
+            .map(|option| NodeId {
+                document: scope.document,
+                node: option.node,
+            })
+            .collect());
+    }
     let Some(parsed) = owner.document(scope) else {
         return Ok(Vec::new());
     };
@@ -150,10 +162,7 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
         ),
         CollectionKind::ElementsByName(name) => collect_by_name(base, document, scope.node, name),
         CollectionKind::SelectOptions => select_options(base, document, scope.node),
-        CollectionKind::SelectedOptions => select_options(base, document, scope.node)
-            .into_iter()
-            .filter(|option| option_selected(base, option.node))
-            .collect(),
+        CollectionKind::SelectedOptions => Vec::new(),
         CollectionKind::WindowNamed(name) => collect_window_named(base, document, scope.node, name),
         CollectionKind::HtmlScripts => collect_html_scripts(&parsed.document, document, scope.node),
         CollectionKind::TableBodies => table_bodies(base, document, scope.node),
@@ -260,92 +269,6 @@ fn element_name(base: &blitz_dom::BaseDocument, id: BlitzId) -> Option<&QualName
 fn is_option_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     element_name(base, id)
         .is_some_and(|name| name.ns == html_namespace() && name.local.as_str() == "option")
-}
-
-/// The index of the first selected option, or `-1`
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
-fn select_selected_index(base: &blitz_dom::BaseDocument, document: u32, select: BlitzId) -> i32 {
-    select_options(base, document, select)
-        .iter()
-        .position(|option| option_selected(base, option.node))
-        .map_or(-1, |index| i32::try_from(index).unwrap_or(-1))
-}
-
-/// Sets an option's selectedness through its `selected` content attribute,
-/// reusing the stored qualified name so clearing removes the exact attribute
-/// the parser kept (see `forms.rs` for the same pattern).
-fn set_option_selected(parsed: &mut crate::Parsed, option: NodeId, selected: bool) {
-    let (name, old_value) = {
-        let base = &parsed.document.base;
-        let Some(node) = base.get_node(option.node) else {
-            return;
-        };
-        let Some(element) = node.data.downcast_element() else {
-            return;
-        };
-        let name = element
-            .attrs
-            .iter()
-            .find(|attribute| attribute.name.local.as_str() == "selected")
-            .map_or_else(
-                || {
-                    QualName::new(
-                        None,
-                        markup5ever::Namespace::from(""),
-                        LocalName::from("selected"),
-                    )
-                },
-                |attribute| attribute.name.clone(),
-            );
-        (name, attr(base, option.node, "selected").map(str::to_owned))
-    };
-    if selected == old_value.is_some() {
-        return;
-    }
-    if selected {
-        parsed
-            .document
-            .base
-            .mutate()
-            .set_attribute(option.node, name, "");
-    } else {
-        parsed
-            .document
-            .base
-            .mutate()
-            .clear_attribute(option.node, name);
-    }
-    parsed.document.record(JournalEntry::Attributes {
-        target: option,
-        name: "selected".to_owned(),
-        namespace: String::new(),
-        old_value,
-    });
-}
-
-/// Sets the select's selected option by index; a negative index clears every
-/// option. Blitz has no select value slot or dirtiness flag, so the
-/// attributes are the whole state.
-fn set_select_selected_index(
-    parsed: &mut crate::Parsed,
-    document: u32,
-    select: BlitzId,
-    value: i32,
-) {
-    let options = {
-        let base = &parsed.document.base;
-        select_options(base, document, select)
-    };
-    if value < 0 {
-        for option in options {
-            set_option_selected(parsed, option, false);
-        }
-        return;
-    }
-    let wanted = usize::try_from(value).unwrap_or(usize::MAX);
-    for (index, option) in options.into_iter().enumerate() {
-        set_option_selected(parsed, option, index == wanted);
-    }
 }
 
 fn collect_by_tag(
@@ -992,10 +915,13 @@ impl JsOptionsCollection {
             return Ok(-1);
         };
         let owner = owner.borrow();
-        Ok(owner.document(select).map_or(-1, |parsed| {
-            let base = &parsed.document.base;
-            select_selected_index(base, select.document, select.node)
-        }))
+        let Some(mut parsed) = owner.document_mut(select) else {
+            return Ok(-1);
+        };
+        Ok(crate::dom::forms::selected_index_of(
+            &mut parsed,
+            select.node,
+        ))
     }
 
     fn set_selected_index(&self, ctx: &Ctx<'_>, value: i32) -> Result<()> {
@@ -1008,7 +934,7 @@ impl JsOptionsCollection {
         let Some(mut parsed) = owner.document_mut(select) else {
             return Ok(());
         };
-        set_select_selected_index(&mut parsed, select.document, select.node, value);
+        crate::dom::forms::set_select_selected_index_value(&mut parsed, select.node, value);
         Ok(())
     }
 }

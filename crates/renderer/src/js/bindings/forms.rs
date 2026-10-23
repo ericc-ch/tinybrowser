@@ -15,11 +15,9 @@
 //! into the tree.
 
 use super::{focus, host_node_id, owning_world, world, world_for_node};
-use crate::documents::JournalEntry;
 use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
-use crate::dom::tree::{NodeId, attr, is_html_element};
+use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
-use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::prelude::Opt;
 use rquickjs::{Array, Ctx, Object, Persistent, Result, Value};
 use std::cell::RefCell;
@@ -55,7 +53,59 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbSetOptionSelectedness",
         rquickjs::prelude::Func::from(set_option_selectedness),
     )?;
+    globals.set(
+        "__tbFormCanSubmit",
+        rquickjs::prelude::Func::from(form_can_submit),
+    )?;
+    globals.set(
+        "__tbSameOriginWithTop",
+        rquickjs::prelude::Func::from(same_origin_with_top),
+    )?;
     Ok(())
+}
+
+/// Whether the calling realm is same origin with its top-level traversable.
+/// `showPicker()` requires it, and `document.domain` does not widen it
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-showpicker>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn same_origin_with_top(ctx: Ctx<'_>) -> Result<bool> {
+    let current = world(&ctx)?;
+    let frame = current.borrow().frame();
+    let top = current
+        .borrow()
+        .runtime
+        .shared
+        .borrow()
+        .tree
+        .top_level(frame);
+    if top == frame {
+        return Ok(true);
+    }
+    let Some(top_world) = current.borrow().frame_world(top) else {
+        return Ok(false);
+    };
+    let same = current.borrow().origin == top_world.borrow().origin;
+    Ok(same)
+}
+
+/// Whether `form` can start a submission: a stale wrapper or a form outside
+/// the main document has no browsing context to navigate
+/// (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn form_can_submit<'js>(ctx: Ctx<'js>, form: Value<'js>) -> bool {
+    let Some(node) = host_node_id(&ctx, &form) else {
+        return false;
+    };
+    let Some(owner) = owning_world(&ctx, node) else {
+        return false;
+    };
+    !focus::cannot_navigate(&owner.borrow(), node)
 }
 
 /// Resolves an encoding label to its canonical name, or `null`
@@ -89,49 +139,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    let (name, old_value) = {
-        let base = &parsed.document.base;
-        let Some(target) = base.get_node(node.node) else {
-            return Ok(());
-        };
-        let Some(element) = target.data.downcast_element() else {
-            return Ok(());
-        };
-        // Reuse the stored qualified name so clearing removes the exact
-        // attribute the parser kept; a fresh `selected` falls back to the
-        // empty namespace plain HTML attributes parse into.
-        let name = element
-            .attrs
-            .iter()
-            .find(|attribute| attribute.name.local.as_str() == "selected")
-            .map_or_else(
-                || QualName::new(None, Namespace::from(""), LocalName::from("selected")),
-                |attribute| attribute.name.clone(),
-            );
-        (name, attr(base, node.node, "selected").map(str::to_owned))
-    };
-    if selected == old_value.is_some() {
-        return Ok(());
-    }
-    if selected {
-        parsed
-            .document
-            .base
-            .mutate()
-            .set_attribute(node.node, name, "");
-    } else {
-        parsed
-            .document
-            .base
-            .mutate()
-            .clear_attribute(node.node, name);
-    }
-    parsed.document.record(JournalEntry::Attributes {
-        target: node,
-        name: "selected".to_owned(),
-        namespace: String::new(),
-        old_value,
-    });
+    crate::dom::forms::initialize_option_selectedness(&mut parsed, node.node, selected);
     Ok(())
 }
 
@@ -160,10 +168,10 @@ pub(super) fn form_entries<'js>(
     let submitter = submitter.0.and_then(|value| host_node_id(&ctx, &value));
     let pending = {
         let world = world_rc.borrow();
-        let Some(parsed) = world.document(id) else {
+        let Some(mut parsed) = world.document_mut(id) else {
             return Ok(entries);
         };
-        crate::dom::forms::collect_pending_entries(&parsed, id, submitter)
+        crate::dom::forms::collect_pending_entries(&mut parsed, id, submitter)
     };
     for entry in pending {
         match entry {

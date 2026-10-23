@@ -84,13 +84,17 @@ pub(crate) fn is_connected(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> b
 }
 
 /// Whether `node` is an HTML `iframe` element.
-pub(crate) fn is_iframe_element(base: &blitz_dom::BaseDocument, id: BlitzNodeId) -> bool {
+pub(crate) fn is_child_navigable_container(
+    base: &blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+) -> bool {
     base.get_node(id).is_some_and(|node| {
         let blitz_dom::NodeData::Element(element) = &node.data else {
             return false;
         };
         element.name.ns == html_namespace()
-            && element.name.local == markup5ever::local_name!("iframe")
+            && (element.name.local == markup5ever::local_name!("iframe")
+                || element.name.local == markup5ever::local_name!("frame"))
     })
 }
 
@@ -144,6 +148,21 @@ pub(crate) fn attr<'a>(
 ) -> Option<&'a str> {
     let local = markup5ever::LocalName::from(name);
     attr_find(base, id, |qualified| qualified.local == local)
+}
+
+/// The value of the first attribute with the given local name in no
+/// namespace. HTML attributes and their reflected IDL properties never match
+/// a same-named attribute in another namespace
+/// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
+pub(crate) fn attr_no_namespace<'a>(
+    base: &'a blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+    name: &str,
+) -> Option<&'a str> {
+    let local = markup5ever::LocalName::from(name);
+    attr_find(base, id, |qualified| {
+        qualified.local == local && qualified.ns == markup5ever::ns!()
+    })
 }
 
 /// The value of the first attribute whose qualified name is `qualified`.
@@ -244,9 +263,11 @@ pub(crate) fn first_element_with_id(
             continue;
         };
         if node.data.downcast_element().is_some_and(|element| {
-            element
-                .attr(markup5ever::LocalName::from("id"))
-                .is_some_and(|value| value == id)
+            element.attrs().iter().any(|attribute| {
+                attribute.name.local.as_str() == "id"
+                    && attribute.name.ns == markup5ever::ns!()
+                    && attribute.value == id
+            })
         }) {
             return Some(NodeId {
                 document,
