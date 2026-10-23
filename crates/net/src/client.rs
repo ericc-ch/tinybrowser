@@ -732,22 +732,30 @@ impl Request {
     }
 }
 
-fn followable_location(status: u16, headers: &HeaderMap) -> Result<Option<&str>, NetError> {
+fn followable_location(status: u16, headers: &HeaderMap) -> Option<Vec<u8>> {
     if !matches!(status, 301 | 302 | 303 | 307 | 308) {
-        return Ok(None);
+        return None;
     }
-    let Some(raw) = headers.get("location") else {
-        return Ok(None);
-    };
-    let location =
-        std::str::from_utf8(raw).map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
-    Ok(Some(location))
+    headers.get("location").map(<[u8]>::to_vec)
 }
 
-// https://fetch.spec.whatwg.org/#http-redirect-fetch
-fn resolve_location(current: &Url, location: &str) -> Result<Url, NetError> {
+// <https://fetch.spec.whatwg.org/#http-redirect-fetch>
+fn resolve_location(current: &Url, location: &[u8]) -> Result<Url, NetError> {
+    // Location is a byte sequence, not UTF-8. Percent-encode every non-ASCII
+    // byte before URL parsing so invalid UTF-8 survives as `%FF` rather than
+    // failing the redirect (<https://fetch.spec.whatwg.org/#concept-location-url>).
+    let location = location
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii() {
+                char::from(*byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
     let mut next = current
-        .join(location)
+        .join(&location)
         .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
     if !matches!(next.scheme(), "http" | "https") {
         return Err(NetError::Protocol(ProtocolError::RejectedRequest));
@@ -975,9 +983,7 @@ fn classify_response(
     hop: &Hop,
 ) -> Result<HopOutcome, NetError> {
     cors_gate(&response, dial, hop)?;
-    let Some(location) =
-        followable_location(response.status(), response.headers())?.map(str::to_owned)
-    else {
+    let Some(location) = followable_location(response.status(), response.headers()) else {
         return Ok(HopOutcome::Final(Box::new(finalize(
             response,
             hop.response_type,
