@@ -1,5 +1,6 @@
 (function() {
   const STATE = host.slots('abort-state');
+  const DEPENDENTS = new Map();
   const EventTargetConstructor = globalThis.EventTarget;
   const EventConstructor = globalThis.Event;
   const dispatchEvent = EventTargetConstructor.prototype.dispatchEvent;
@@ -18,6 +19,13 @@
       ? reason
       : new DOMException('signal is aborted without reason', 'AbortError');
     __tbApply(dispatchEvent, signal, [new EventConstructor('abort')]);
+    // Dependent signals abort after the source's listeners, so listeners on
+    // the source observe their own signal before a clone's.
+    const dependents = DEPENDENTS.get(signal);
+    if (dependents !== undefined) {
+      DEPENDENTS.delete(signal);
+      for (const dependent of dependents) signalAbort(dependent, state.reason);
+    }
   }
   function AbortSignal() {
     throw new TypeError('Illegal constructor');
@@ -71,7 +79,12 @@
           controller.abort(signal.reason);
           break;
         }
-        signal.addEventListener('abort', () => controller.abort(signal.reason));
+        let dependents = DEPENDENTS.get(signal);
+        if (dependents === undefined) {
+          dependents = new Set();
+          DEPENDENTS.set(signal, dependents);
+        }
+        dependents.add(controller.signal);
       }
       return controller.signal;
     },

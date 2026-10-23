@@ -610,11 +610,20 @@ async fn route_service_call(
                 );
             let dials = context.dials.clone();
             tokio::spawn(async move {
-                let outcome = tokio::select! {
+                let mut outcome = tokio::select! {
                     biased;
                     _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
-                    result = worker_network.dial_request(&request, &initiator, cancel_rx) => result,
+                    result = worker_network.dial_request(&request, &initiator, cancel_rx.clone()) => result,
                 };
+                // A 421 tells the client to retry on a different connection
+                // (<https://www.rfc-editor.org/rfc/rfc9110#section-15.5.20>).
+                if matches!(&outcome, Ok(head) if head.status == 421) {
+                    outcome = tokio::select! {
+                        biased;
+                        _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
+                        result = worker_network.dial_request(&request, &initiator, cancel_rx) => result,
+                    };
+                }
                 dials
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)

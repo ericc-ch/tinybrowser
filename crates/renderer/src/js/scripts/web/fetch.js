@@ -452,28 +452,44 @@ const __tbInstallBody = (proto, slots) => {
     },
     text: {
       value() {
-        return __tbConsumeBody(__tbBodyData(this, slots))
+        const data = __tbBodyData(this, slots);
+        if (data.bodySignal !== undefined && data.bodySignal !== null && data.bodySignal.aborted) {
+          return Promise.reject(data.bodySignal.reason);
+        }
+        return __tbConsumeBody(data)
           .then(result => __tbDecodeBytes(result.bytes, 'utf-8', false, false));
       },
       writable: true, configurable: true,
     },
     json: {
       value() {
-        return __tbConsumeBody(__tbBodyData(this, slots))
+        const data = __tbBodyData(this, slots);
+        if (data.bodySignal !== undefined && data.bodySignal !== null && data.bodySignal.aborted) {
+          return Promise.reject(data.bodySignal.reason);
+        }
+        return __tbConsumeBody(data)
           .then(result => JSON.parse(__tbDecodeBytes(result.bytes, 'utf-8', false, false)));
       },
       writable: true, configurable: true,
     },
     arrayBuffer: {
       value() {
-        return __tbConsumeBody(__tbBodyData(this, slots))
+        const data = __tbBodyData(this, slots);
+        if (data.bodySignal !== undefined && data.bodySignal !== null && data.bodySignal.aborted) {
+          return Promise.reject(data.bodySignal.reason);
+        }
+        return __tbConsumeBody(data)
           .then(result => __tbBytesCopy(result.bytes).buffer);
       },
       writable: true, configurable: true,
     },
     bytes: {
       value() {
-        return __tbConsumeBody(__tbBodyData(this, slots))
+        const data = __tbBodyData(this, slots);
+        if (data.bodySignal !== undefined && data.bodySignal !== null && data.bodySignal.aborted) {
+          return Promise.reject(data.bodySignal.reason);
+        }
+        return __tbConsumeBody(data)
           .then(result => __tbBytesCopy(result.bytes));
       },
       writable: true, configurable: true,
@@ -481,6 +497,9 @@ const __tbInstallBody = (proto, slots) => {
     blob: {
       value() {
         const data = __tbBodyData(this, slots);
+        if (data.bodySignal !== undefined && data.bodySignal !== null && data.bodySignal.aborted) {
+          return Promise.reject(data.bodySignal.reason);
+        }
         const type = __tbBlobTypeFromHeader(__tbHeadersLookupRaw(data.headers, 'content-type'));
         return __tbConsumeBody(data).then(result => __tbMakeBlob(result.bytes, type));
       },
@@ -1212,6 +1231,7 @@ globalThis.fetch = function(input, init) {
   const keepalive = data.keepalive;
   return new Promise(function(resolve, reject) {
     if (signal.aborted) {
+      if (body !== null) body.cancel(signal.reason);
       reject(signal.reason);
       return;
     }
@@ -1221,6 +1241,7 @@ globalThis.fetch = function(input, init) {
     const onAbort = () => {
       if (settled) return;
       settled = true;
+      if (body !== null) body.cancel(signal.reason);
       if (streamID !== null) host.__tbFetchCancel(streamID);
       if (requestID !== null) __tbCancelPageRequest(requestID);
       reject(signal.reason);

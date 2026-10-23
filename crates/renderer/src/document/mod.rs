@@ -406,6 +406,9 @@ pub(crate) struct Document {
     /// from the response being parsed, parsed once
     /// (<https://w3c.github.io/webappsec-csp/#parse-response-csp>).
     response_policy: crate::csp::List,
+    /// `Referrer-Policy` from the response being parsed, applied after the
+    /// parser installs the new document (the state reset clears the realm).
+    response_referrer_policy: Option<String>,
     /// When set, [`Document::install_parsed`] replaces the world's policy
     /// with the response headers. A script's `document.open()` leaves it
     /// unset so the existing policy survives.
@@ -520,6 +523,7 @@ impl Document {
             character_set: "UTF-8",
             response_content_type: None,
             response_policy: crate::csp::List::default(),
+            response_referrer_policy: None,
             embedder_csp_reports: Vec::new(),
             csp_from_response: false,
             reporting_endpoints: Vec::new(),
@@ -1251,6 +1255,7 @@ impl Document {
         self.parser_owner = owner;
         self.response_content_type = None;
         self.response_policy = crate::csp::List::default();
+        self.response_referrer_policy = None;
         self.csp_from_response = false;
         self.sniff_header.clear();
         self.apply_mime_sniff = false;
@@ -1306,12 +1311,6 @@ impl Document {
         // A response document resolves against its own URL; any inherited
         // `about:srcdoc` base stops applying.
         world.base_url = None;
-        if let Some(policy) = head.referrer_policy.as_deref() {
-            let policy = policy.split(',').next().unwrap_or(policy).trim();
-            policy.clone_into(&mut world.state.referrer_policy);
-        } else {
-            world.state.referrer_policy.clear();
-        }
         drop(world);
         // The realm is already new when this runs; this opens the parser and
         // the decoder for the response that will feed it.
@@ -1339,6 +1338,8 @@ impl Document {
                 head.content_security_policy_report_only.as_deref(),
             )
         });
+        self.response_referrer_policy
+            .clone_from(&head.referrer_policy);
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
         self.mime_guard = crate::sniff::MimeGuard {
@@ -1747,7 +1748,14 @@ impl Document {
         if !self.csp_from_response {
             return;
         }
-        self.world.borrow_mut().csp = self.response_policy.clone();
+        let mut world = self.world.borrow_mut();
+        world.csp = self.response_policy.clone();
+        if let Some(policy) = self.response_referrer_policy.as_deref() {
+            let policy = policy.split(',').next().unwrap_or(policy).trim();
+            policy.clone_into(&mut world.state.referrer_policy);
+        } else {
+            world.state.referrer_policy.clear();
+        }
     }
 
     /// Rebinds the realm's `document` global to the installed document and
