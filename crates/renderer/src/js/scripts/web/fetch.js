@@ -883,6 +883,17 @@ globalThis.Request = class Request {
         source.bodyUsed = true;
       }
       const extracted = __tbExtractBody(options.body === undefined ? null : options.body);
+      if (options.body instanceof FormData) {
+        let empty = true;
+        for (const entry of options.body) {
+          empty = false;
+          break;
+        }
+        // An empty FormData request body is zero bytes; the Response
+        // constructor keeps the multipart terminator instead
+        // (<https://fetch.spec.whatwg.org/#bodyinit-safely-extract>).
+        if (empty) extracted.bytes = new __tbUint8Array(0);
+      }
       if (extracted.type !== null && __tbHeadersLookupRaw(headers, 'content-type') === null) {
         __tbHeadersAppendRaw(headers, 'content-type', extracted.type);
       }

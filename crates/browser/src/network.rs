@@ -102,6 +102,16 @@ fn cache_key(request: &DialRequest) -> CacheKey {
     }
 }
 
+fn has_page_conditional(request: &DialRequest) -> bool {
+    request.headers.iter().any(|(name, _)| {
+        name.eq_ignore_ascii_case("if-none-match")
+            || name.eq_ignore_ascii_case("if-modified-since")
+            || name.eq_ignore_ascii_case("if-match")
+            || name.eq_ignore_ascii_case("if-unmodified-since")
+            || name.eq_ignore_ascii_case("if-range")
+    })
+}
+
 fn cache_mode(request: &DialRequest) -> &str {
     request.cache.as_deref().unwrap_or("default")
 }
@@ -110,25 +120,43 @@ fn response_forbids_storage(outcome: &DialOutcome) -> bool {
     outcome.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("cache-control")
             && value.to_ascii_lowercase().contains("no-store")
-    })
+    }) || outcome
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("vary"))
 }
 
 fn fresh(entry: &CachedResponse) -> bool {
     let age = entry.stored_at.elapsed().as_secs();
-    entry
-        .outcome
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
-        .flat_map(|(_, value)| value.split(','))
-        .filter_map(|directive| directive.trim().split_once('='))
-        .any(|(name, value)| {
-            name.eq_ignore_ascii_case("max-age")
-                && value
+    let mut saw_max_age = false;
+    for (name, value) in &entry.outcome.headers {
+        if !name.eq_ignore_ascii_case("cache-control") {
+            continue;
+        }
+        for directive in value.split(',') {
+            let Some((name, value)) = directive.trim().split_once('=') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("max-age") {
+                saw_max_age = true;
+                if value
                     .trim()
                     .parse::<u64>()
                     .is_ok_and(|max_age| age <= max_age)
-        })
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    if saw_max_age {
+        return false;
+    }
+    entry.outcome.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("expires")
+            && httpdate::parse_http_date(value)
+                .is_ok_and(|expires| expires > std::time::SystemTime::now())
+    })
 }
 
 fn etag(outcome: &DialOutcome) -> Option<String> {
@@ -161,6 +189,7 @@ fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOut
 
 fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: &str) -> bool {
     request.kind == DialKind::JsFetch
+        && !has_page_conditional(request)
         && request.method.eq_ignore_ascii_case("GET")
         && (200..300).contains(&outcome.status)
         && outcome.body.is_ok()
@@ -385,7 +414,12 @@ impl TabNetworkHandle {
             return self.dial_stream(request, initiator).await;
         }
         let mode = cache_mode(request).to_owned();
-        let cached = self.cached_hit(request);
+        let page_conditional = has_page_conditional(request);
+        let cached = if page_conditional {
+            None
+        } else {
+            self.cached_hit(request)
+        };
         if let Some(hit) = Self::cached_response(request, &mode, cached.as_ref())? {
             return Ok(hit);
         }
@@ -393,10 +427,7 @@ impl TabNetworkHandle {
         // has a validator; the 304 path reuses the stored body. A page-supplied
         // validator is the caller's own conditional request and must surface
         // its 304.
-        let explicit_validator = request
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"));
+        let explicit_validator = page_conditional;
         let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
             .then(|| cached.as_ref().and_then(|entry| etag(&entry.outcome)))
             .flatten();
@@ -494,14 +525,16 @@ impl TabNetworkHandle {
         initiator: &Url,
     ) -> Result<DialOutcome, DialFailure> {
         let mode = cache_mode(request).to_owned();
-        let cached = self.cached_hit(request);
+        let page_conditional = has_page_conditional(request);
+        let cached = if page_conditional {
+            None
+        } else {
+            self.cached_hit(request)
+        };
         if let Some(hit) = Self::cached_response(request, &mode, cached.as_ref())? {
             return Ok(hit);
         }
-        let explicit_validator = request
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("if-none-match"));
+        let explicit_validator = page_conditional;
         let conditional = (!explicit_validator && matches!(mode.as_str(), "default" | "no-cache"))
             .then(|| cached.as_ref().and_then(|entry| etag(&entry.outcome)))
             .flatten();

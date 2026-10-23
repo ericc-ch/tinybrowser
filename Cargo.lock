@@ -309,6 +309,7 @@ dependencies = [
 name = "browser"
 version = "0.1.0"
 dependencies = [
+ "httpdate",
  "logging",
  "net",
  "postcard",
