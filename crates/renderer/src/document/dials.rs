@@ -172,6 +172,23 @@ impl DialLedger {
         self.js_fetches + self.queued_js_fetches
     }
 
+    /// Whether a frame navigation is queued, in flight, or waiting for its
+    /// completion task. The frame's current document stays complete until the
+    /// response commits, so the parent must not fire the container's `load`
+    /// for that old document in the meantime
+    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#the-document-object>).
+    pub(crate) fn has_pending_frame_load(&self) -> bool {
+        let is_frame_load =
+            |context: &DialContext| matches!(context, DialContext::FrameLoad { .. });
+        self.queued
+            .iter()
+            .any(|entry| is_frame_load(&entry.dial.context))
+            || self
+                .in_flight
+                .values()
+                .any(|dial| is_frame_load(&dial.context))
+    }
+
     /// Drops a queued or in-flight page fetch for one JS id, running its
     /// cancellation handle.
     pub(crate) fn cancel_fetch(&mut self, id: i32) {

@@ -3,9 +3,8 @@
 
 use super::super::{
     CollectionKind, LegacyNullString, WebIdlCodeUnits, WebIdlString, WebIdlUnsignedLong,
-    document_base_url_string, host, live_collection, remove_attribute_sync,
-    schedule_mutation_delivery, set_attribute_sync, throw_dom, with_node_data, world,
-    world_for_node, wrap_node,
+    document_base_url_string, host, live_collection, schedule_mutation_delivery,
+    set_attribute_sync, throw_dom, with_node_data, world, world_for_node, wrap_node,
 };
 
 use rquickjs::{Ctx, Exception, Result, Value};
@@ -639,6 +638,11 @@ impl JsNode {
     /// Sets a textarea's dirty value. The children stay the default value
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value>).
     pub(super) fn set_textarea_value(&self, ctx: &Ctx<'_>, value: String) -> Result<()> {
+        // The API value normalizes CRLF and CR to LF before the dirty-value
+        // comparison, so setting the same normalized value leaves the
+        // selection alone
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-api-value>).
+        let value = crate::dom::text::normalize_newlines(&value);
         let previous = self.value(ctx.clone())?;
         self.set_dirty_control_value(ctx, value, previous)
     }
@@ -865,6 +869,18 @@ impl JsNode {
                 "InvalidStateError",
                 "reset is only available on a form",
             ));
+        }
+        // The reset event is trusted and cancelable; a canceled event leaves
+        // every control untouched
+        // (<https://html.spec.whatwg.org/multipage/forms.html#concept-form-reset>).
+        if !crate::js::events::fire_trusted_cancelable(
+            &ctx,
+            crate::js::world::EventTargetKey::Node(self.handle.0),
+            "reset",
+            true,
+            true,
+        )? {
+            return Ok(());
         }
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1100,7 +1116,7 @@ impl JsNode {
             .document(self.handle.0)
             .map_or_else(String::new, |parsed| {
                 let base = &parsed.document.base;
-                attr(base, self.handle.0.node, "label").map_or_else(
+                crate::dom::tree::attr_no_namespace(base, self.handle.0.node, "label").map_or_else(
                     || crate::dom::forms::option_text(base, self.handle.0.node),
                     str::to_owned,
                 )
@@ -1229,15 +1245,14 @@ pub(super) fn fixup_option_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
 /// An inserted checked radio unchecks the other radios it joins.
 pub(super) fn fixup_radio_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     let world_rc = world(ctx)?;
-    let group = {
-        let world = world_rc.borrow();
-        let Some(parsed) = world.document(id) else {
-            return Ok(());
-        };
-        crate::dom::forms::radios_to_uncheck(&parsed.document.base, id.document, id.node)
+    let world = world_rc.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
+        return Ok(());
     };
+    let group = crate::dom::forms::radios_to_uncheck(&parsed.document.base, id.document, id.node);
+    let mut mutator = parsed.document.base.mutate();
     for member in group {
-        remove_attribute_sync(ctx, member, "", "checked", false)?;
+        mutator.set_checkedness(member.node, false);
     }
     Ok(())
 }

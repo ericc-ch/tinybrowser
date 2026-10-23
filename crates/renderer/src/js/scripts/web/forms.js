@@ -841,7 +841,7 @@
       throw new TypeError('Class constructor FormDataEvent cannot be invoked without new');
     }
     const init = arguments[1];
-    if (init === undefined || init === null || init.formData === undefined) {
+    if (init === undefined || init === null || init.formData === undefined || init.formData === null) {
       throw new TypeError('FormDataEventInit requires formData');
     }
     const event = Reflect.construct(globalThis.Event, arguments, new.target);
@@ -877,9 +877,63 @@
     }
     return 'UTF-8';
   };
-  // A string encoded in `label`, as bytes. `__tbEncodeForm` applies the
-  // Encoding Standard's `encode`, so unrepresentable characters become numeric
-  // character references.
+  // windows-1252 maps its 0x80..0x9F range to these code points; the holes
+  // have no character. Unrepresentable characters become numeric character
+  // references, matching the Encoding Standard's `encode`.
+  const windows1252High = [
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+  ];
+  const windows1252Byte = code => {
+    if (code <= 0x7F || (code >= 0xA0 && code <= 0xFF)) return code;
+    const index = windows1252High.indexOf(code);
+    return index === -1 ? null : 0x80 + index;
+  };
+  const windows1252Encode = text => {
+    const bytes = [];
+    for (const character of text) {
+      const code = character.codePointAt(0);
+      const byte = windows1252Byte(code);
+      if (byte !== null) {
+        bytes.push(byte);
+      } else {
+        for (const digit of `&#${code};`) bytes.push(digit.charCodeAt(0));
+      }
+    }
+    return new Uint8Array(bytes);
+  };
+  const charsetBytes = (text, label) => {
+    const normalized = toWellFormed(String(text));
+    const encoding = String(label).toLowerCase();
+    if (encoding === 'utf-8') return encoder.encode(normalized);
+    if (encoding === 'windows-1252') return windows1252Encode(normalized);
+    const encoded = host.__tbEncodeForm(normalized, label);
+    const bytes = new Uint8Array(encoded.length);
+    for (let index = 0; index < encoded.length; index++) {
+      bytes[index] = encoded.charCodeAt(index);
+    }
+    return bytes;
+  };
+  // Percent-encode already encoded bytes for application/x-www-form-urlencoded
+  // (<https://url.spec.whatwg.org/#concept-urlencoded-byte-serializer>).
+  const urlEncodeBytes = bytes => {
+    let out = '';
+    for (const byte of bytes) {
+      if ((byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A)
+          || (byte >= 0x61 && byte <= 0x7A)
+          || byte === 0x2A || byte === 0x2D || byte === 0x2E || byte === 0x5F) {
+        out += String.fromCharCode(byte);
+      } else if (byte === 0x20) {
+        out += '+';
+      } else {
+        out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+      }
+    }
+    return out;
+  };
+  const urlEncodeByte = (text, label) => urlEncodeBytes(charsetBytes(text, label));
   // A JS string with a lone surrogate cannot cross to Rust as UTF-8; replace
   // lone surrogates with U+FFFD, the same replacement the Encoding Standard's
   // `encode` applies
@@ -904,18 +958,6 @@
     }
     return out;
   };
-  const charsetBytes = (text, label) => {
-    const encoded = host.__tbEncodeForm(toWellFormed(String(text)), label);
-    const bytes = new Uint8Array(encoded.length);
-    for (let index = 0; index < encoded.length; index++) {
-      bytes[index] = encoded.charCodeAt(index);
-    }
-    return bytes;
-  };
-  // application/x-www-form-urlencoded over the encoded bytes: unreserved bytes
-  // stay, a space becomes `+`, everything else is percent-encoded
-  // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
-  const urlEncodeByte = (text, label) => host.__tbUrlEncodeForm(toWellFormed(String(text)), label);
   // A `File`/`Blob` entry serializes as its file name
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
   const entryValueString = value =>
@@ -1090,6 +1132,17 @@
     submitForm(form, formData, submitter);
   };
 
+  // <https://html.spec.whatwg.org/multipage/forms.html#dom-fs-action>
+  Object.defineProperty(globalThis.HTMLFormElement.prototype, 'action', {
+    get() {
+      const attribute = this.getAttribute('action');
+      if (attribute === null || attribute === '') return this.ownerDocument.URL;
+      return new globalThis.URL(attribute, this.ownerDocument.baseURI).href;
+    },
+    set(value) { this.setAttribute('action', __tbToDOMString(value)); },
+    enumerable: true, configurable: true,
+  });
+
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>
   Object.defineProperty(globalThis.HTMLFormElement.prototype, 'submit', {
     value: function() {
@@ -1179,6 +1232,10 @@
   });
 
   Object.defineProperties(globalThis.HTMLSelectElement.prototype, {
+    showPicker: {
+      value: function() { showPicker(this); },
+      writable: true, enumerable: true, configurable: true,
+    },
     // `[Reflect, ReflectDefault=0] attribute unsigned long size`: numeric
     // `[Reflect]` is not auto-generated, so this shim owns the property
     // until the generator lowers it (like `rows`/`cols` below). The getter
@@ -1489,7 +1546,123 @@
     element.value = formatValueInUnit(type, value);
   };
 
+  // Autofill field names
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#autofill-field>).
+  const autofillFields = new Set([
+    'name', 'honorific-prefix', 'given-name', 'additional-name', 'family-name',
+    'honorific-suffix', 'nickname', 'username', 'new-password',
+    'current-password', 'one-time-code', 'organization-title', 'organization',
+    'street-address', 'address-line1', 'address-line2', 'address-line3',
+    'address-level4', 'address-level3', 'address-level2', 'address-level1',
+    'country', 'country-name', 'postal-code', 'cc-name', 'cc-given-name',
+    'cc-additional-name', 'cc-family-name', 'cc-number', 'cc-exp',
+    'cc-exp-month', 'cc-exp-year', 'cc-csc', 'cc-type',
+    'transaction-currency', 'transaction-amount', 'language', 'bday',
+    'bday-day', 'bday-month', 'bday-year', 'sex', 'url', 'photo', 'tel',
+    'tel-country-code', 'tel-national', 'tel-area-code', 'tel-local',
+    'tel-local-prefix', 'tel-local-suffix', 'tel-extension', 'email', 'impp',
+    'webauthn',
+  ]);
+  const contactTokens = new Set(['home', 'work', 'mobile', 'fax', 'pager']);
+  const autocompleteValue = element => {
+    const raw = element.getAttribute('autocomplete');
+    if (element.localName === 'input' && element.type === 'hidden') return '';
+    if (element.localName === 'form') {
+      if (raw === null) return 'on';
+      const token = raw.trim().toLowerCase();
+      return token === 'off' ? 'off' : 'on';
+    }
+    if (raw === null) return '';
+    const tokens = raw.toLowerCase().split(/[\t\n\f\r ]+/).filter(Boolean);
+    if (tokens.length === 0) return '';
+    if (tokens.length === 1) {
+      return tokens[0] === 'on' || tokens[0] === 'off' || autofillFields.has(tokens[0])
+        ? tokens[0]
+        : '';
+    }
+    let index = 0;
+    const result = [];
+    if (tokens[index]?.startsWith('section-')) {
+      if (tokens[index].length === 'section-'.length) return '';
+      result.push(tokens[index]);
+      index += 1;
+    }
+    if (tokens[index] === 'shipping' || tokens[index] === 'billing') {
+      result.push(tokens[index]);
+      index += 1;
+    }
+    if (contactTokens.has(tokens[index])) {
+      result.push(tokens[index]);
+      index += 1;
+    }
+    if (autofillFields.has(tokens[index])) {
+      result.push(tokens[index]);
+      index += 1;
+    }
+    if (tokens[index] === 'webauthn') {
+      result.push(tokens[index]);
+      index += 1;
+    }
+    return index === tokens.length && result.length > 0 ? result.join(' ') : '';
+  };
+  for (const name of ['HTMLFormElement', 'HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement']) {
+    const constructor = globalThis[name];
+    if (!constructor || !constructor.prototype) continue;
+    Object.defineProperty(constructor.prototype, 'autocomplete', {
+      get() { return autocompleteValue(this); },
+      set(value) { this.setAttribute('autocomplete', __tbToDOMString(value)); },
+      enumerable: true, configurable: true,
+    });
+  }
+
+  // A control is mutable unless disabled; an input with `readonly` is also
+  // immutable in the states where the attribute applies
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-readonly-attribute>).
+  const readonlyApplies = new Set([
+    'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month',
+    'week', 'time', 'datetime-local', 'number',
+  ]);
+  const controlIsMutable = element => {
+    if (element.disabled) return false;
+    if (element.localName === 'input' && readonlyApplies.has(element.type)) {
+      return !element.readOnly;
+    }
+    return true;
+  };
+  // The rendered check only guards `select.showPicker()`. A `display: none`
+  // box or a `content-visibility: hidden` ancestor means no box is rendered
+  // (<https://drafts.csswg.org/css-display-4/#becoming-visible>).
+  const isBeingRendered = element => {
+    if (!element.isConnected) return false;
+    for (let node = element; node !== null; node = node.parentElement) {
+      const style = globalThis.getComputedStyle(node);
+      if (style.display === 'none' || style.contentVisibility === 'hidden') {
+        return false;
+      }
+    }
+    return true;
+  };
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-showpicker>
+  const showPicker = element => {
+    if (!controlIsMutable(element)) {
+      throw new DOMException('The element is not mutable', 'InvalidStateError');
+    }
+    if (!host.__tbUserActivationActive()) {
+      throw new DOMException('A user gesture is required', 'NotAllowedError');
+    }
+    if (element.localName === 'select' && !isBeingRendered(element)) {
+      throw new DOMException('The element is not being rendered', 'NotSupportedError');
+    }
+    // Showing the picker is optional, but the activation is consumed whether
+    // or not this engine draws one
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#show-the-picker,-if-applicable>).
+    host.__tbConsumeUserActivation();
+  };
   Object.defineProperties(globalThis.HTMLInputElement.prototype, {
+    showPicker: {
+      value: function() { showPicker(this); },
+      writable: true, enumerable: true, configurable: true,
+    },
     valueAsNumber: {
       get() { return valueAsNumberOf(this); },
       set(value) { setValueAsNumber(this, value); },
@@ -1522,6 +1695,121 @@
     configurable: true,
   });
 
+  // `output.value` follows its text content, with a value-mode flag that
+  // freezes `defaultValue` once the value is set directly; resetting restores
+  // the frozen default
+  // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-output-defaultvalue>).
+  const outputStates = new WeakMap();
+  const outputState = element => {
+    let state = outputStates.get(element);
+    if (state === undefined) {
+      state = { valueMode: false, defaultValue: element.textContent };
+      outputStates.set(element, state);
+    }
+    return state;
+  };
+  if (globalThis.HTMLOutputElement) {
+    Object.defineProperties(globalThis.HTMLOutputElement.prototype, {
+      type: {
+        get() { return 'output'; },
+        configurable: true,
+      },
+      defaultValue: {
+        get() {
+          const state = outputState(this);
+          return state.valueMode ? state.defaultValue : this.textContent;
+        },
+        set(value) {
+          const text = __tbToDOMString(value);
+          const state = outputState(this);
+          state.defaultValue = text;
+          if (!state.valueMode) this.textContent = text;
+        },
+        configurable: true,
+      },
+      value: {
+        get() { return this.textContent; },
+        set(value) {
+          const text = __tbToDOMString(value);
+          const state = outputState(this);
+          if (!state.valueMode) {
+            state.defaultValue = this.textContent;
+            state.valueMode = true;
+          }
+          this.textContent = text;
+        },
+        configurable: true,
+      },
+    });
+    const nativeFormReset = globalThis.HTMLFormElement.prototype.reset;
+    Object.defineProperty(globalThis.HTMLFormElement.prototype, 'reset', {
+      value: function() {
+        nativeFormReset.call(this);
+        for (const output of this.querySelectorAll('output')) {
+          const state = outputState(output);
+          // In value mode the stored default is restored; otherwise the
+          // current text already is the default value.
+          if (!state.valueMode) state.defaultValue = output.textContent;
+          state.valueMode = false;
+          output.textContent = state.defaultValue;
+        }
+      },
+      writable: true, enumerable: true, configurable: true,
+    });
+  }
+
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-progress-position>
+  if (globalThis.HTMLProgressElement) {
+    Object.defineProperty(globalThis.HTMLProgressElement.prototype, 'position', {
+      get() {
+        if (!this.hasAttribute('value')) return -1;
+        const value = Number(this.getAttribute('value'));
+        let max = Number(this.getAttribute('max'));
+        if (!Number.isFinite(max) || max <= 0) max = 1;
+        const position = value / max;
+        return Number.isFinite(position) ? Math.min(Math.max(position, 0), 1) : 0;
+      },
+      configurable: true,
+    });
+  }
+
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-legend-form>
+  if (globalThis.HTMLLegendElement) {
+    Object.defineProperty(globalThis.HTMLLegendElement.prototype, 'form', {
+      get() {
+        const parent = this.parentElement;
+        return parent !== null && parent.tagName === 'FIELDSET' ? parent.form : null;
+      },
+      configurable: true,
+    });
+  }
+
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-fieldset-type>
+  const fieldSetElements = new WeakMap();
+  if (globalThis.HTMLFieldSetElement) {
+    Object.defineProperties(globalThis.HTMLFieldSetElement.prototype, {
+      type: {
+        get() { return 'fieldset'; },
+        configurable: true,
+      },
+      elements: {
+        get() {
+          let collection = fieldSetElements.get(this);
+          if (collection === undefined) {
+            collection = collectionOf(
+              () => Array.from(this.querySelectorAll(LISTED))
+                .filter(element => !(element.tagName === 'INPUT' && element.type === 'image')),
+              HTMLCollectionInterface.prototype, false,
+            );
+            fieldSetElements.set(this, collection);
+          }
+          return collection;
+        },
+        configurable: true,
+      },
+    });
+  }
+
   // ── labels and labelable elements ──────────────────────────────────────
 
   const LABELABLE = new Set(['BUTTON', 'METER', 'OUTPUT', 'PROGRESS', 'SELECT', 'TEXTAREA']);
@@ -1546,8 +1834,13 @@
     get() {
       if (this.hasAttribute('for')) {
         const reference = this.htmlFor;
+        if (reference === '') return null;
         const root = this.getRootNode ? this.getRootNode() : this.ownerDocument;
-        const element = root.getElementById ? root.getElementById(reference) : null;
+        let element = root.getElementById ? root.getElementById(reference) : null;
+        if (element === null && typeof root.querySelectorAll === 'function') {
+          element = Array.from(root.querySelectorAll('[id]'))
+            .find(candidate => candidate.id === reference) ?? null;
+        }
         return element !== null && isLabelable(element) ? element : null;
       }
       for (const descendant of this.querySelectorAll('button, input, meter, output, progress, select, textarea')) {
@@ -1570,12 +1863,12 @@
 
   const labelsOf = element => {
     if (!isLabelable(element)) return null;
-    const root = element.getRootNode ? element.getRootNode() : element.ownerDocument;
-    const labels = Array.from(root.querySelectorAll('label'))
-      .filter(label => label.control === element);
-    // An array (for `assert_array_equals`) that still reports as a NodeList.
-    Object.setPrototypeOf(labels, collectionInterface('NodeList').prototype);
-    return labels;
+    return collectionOf(() => {
+      const root = element.getRootNode ? element.getRootNode() : element.ownerDocument;
+      const labels = Array.from(root.querySelectorAll('label'));
+      if (root.nodeType === 1 && root.tagName === 'LABEL') labels.unshift(root);
+      return labels.filter(label => label.control === element);
+    }, collectionInterface('NodeList').prototype, false);
   };
   for (const name of [
     'HTMLButtonElement', 'HTMLInputElement', 'HTMLMeterElement', 'HTMLOutputElement',
@@ -1622,18 +1915,23 @@
   const FormControlsInterface = collectionInterface('HTMLFormControlsCollection');
   const RadioNodeListInterface = collectionInterface('RadioNodeList');
   Object.setPrototypeOf(FormControlsInterface.prototype, HTMLCollectionInterface.prototype);
-  Object.setPrototypeOf(RadioNodeListInterface.prototype, HTMLCollectionInterface.prototype);
+  // `RadioNodeList` extends `NodeList`, not `HTMLCollection`
+  // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#radionodelist>).
+  Object.setPrototypeOf(
+    RadioNodeListInterface.prototype,
+    globalThis.NodeList.prototype,
+  );
 
   // A live, named, indexed collection. `getList` recomputes on each access so
   // the collection tracks DOM changes; the proxy's prototype reports the right
   // interface for `instanceof`.
   const collectionOf = (getList, prototype, radioList) =>
     new Proxy({}, {
-      get(_target, property) {
+      get(target, property, receiver) {
         const list = getList();
         if (property === 'length') return list.length;
         if (property === 'item') return index => list[Number(index)] ?? null;
-        if (property === 'namedItem') return name => namedItemIn(getList(), String(name), prototype);
+        if (property === 'namedItem') return name => namedItemIn(getList(), String(name), getList);
         if (property === 'value' && radioList) {
           const checked = list.find(element => element.type === 'radio' && element.checked);
           return checked ? checked.value : '';
@@ -1641,28 +1939,65 @@
         if (property === Symbol.iterator) return function* () { yield* list; };
         if (typeof property === 'string') {
           if (/^\d+$/.test(property)) return list[Number(property)];
-          const named = namedItemIn(list, property, prototype);
-          return named === null ? undefined : named;
+          const named = namedItemIn(list, property, getList);
+          return named === null ? Reflect.get(prototype, property, receiver) : named;
         }
         return undefined;
+      },
+      getOwnPropertyDescriptor(target, property) {
+        const list = getList();
+        if (property === 'length') {
+          return {
+            value: list.length, writable: true, enumerable: false, configurable: true,
+          };
+        }
+        if (typeof property === 'string' && /^\d+$/.test(property)) {
+          const index = Number(property);
+          if (index < list.length) {
+            return {
+              value: list[index], writable: false, enumerable: true, configurable: true,
+            };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(target, property);
       },
       getPrototypeOf() { return prototype; },
       has(_target, property) {
         const list = getList();
         if (property === 'length' || property === 'item' || property === 'namedItem') return true;
         if (typeof property === 'string' && /^\d+$/.test(property)) return list[Number(property)] !== undefined;
-        return namedItemIn(list, String(property), prototype) !== null;
+        return namedItemIn(list, String(property), getList) !== null;
       },
     });
 
-  const namedItemIn = (list, name, prototype) => {
-    const matches = list.filter(
+  const namedItemIn = (list, name, liveList) => {
+    const matches = () => (liveList ? liveList() : list).filter(
       element => element.id === name || element.getAttribute('name') === name,
     );
-    if (matches.length === 0) return null;
-    if (matches.length === 1) return matches[0];
-    return collectionOf(() => matches, prototype, true);
+    const first = matches();
+    if (first.length === 0) return null;
+    if (first.length === 1) return first[0];
+    return collectionOf(matches, RadioNodeListInterface.prototype, true);
   };
+
+  // `document.forms`: every form in tree order, with named access by `name` or
+  // `id` (<https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-forms>).
+  const formsCache = host.slots();
+  Object.defineProperty(globalThis.Document.prototype, 'forms', {
+    get() {
+      let forms = formsCache.get(this);
+      if (forms === undefined) {
+        forms = collectionOf(
+          () => Array.from(this.querySelectorAll('form')),
+          HTMLCollectionInterface.prototype,
+          false,
+        );
+        formsCache.set(this, forms);
+      }
+      return forms;
+    },
+    configurable: true,
+  });
 
   const elementsCache = host.slots();
   Object.defineProperties(globalThis.HTMLFormElement.prototype, {
@@ -1684,4 +2019,5 @@
       configurable: true,
     },
   });
+
 })();

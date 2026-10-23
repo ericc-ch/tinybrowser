@@ -22,6 +22,7 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 - 82eb84a8 expose the document font context. Canvas text must shape with the database holding `@font-face` fonts; the shared process context does not see them, so an embedder cannot otherwise measure or draw the fonts a page declares.
 - c198da78 accept zero-sized SVG images. usvg rejects width or height 0, so a valid image with no painted area was reported as a failed load; the declared intrinsic size now survives and `naturalWidth` / `naturalHeight` can be 0 without an error.
 - ab3cb6c3 load `<img src>` while detached. `new Image()` never enters a document, but the spec starts the image request when `src` is set; the special-attribute path returned early for detached nodes, so script-created images never fetched and canvas `drawImage` waited forever for `load`.
+- 6f761083 match `:focus-visible` from the `FOCUSRING` element state and keep the fork's real `:focus-within`. Stylo's `:focus-visible` branch was hardcoded false, so keyboard focus never matched the pseudo-class; `focus()` now receives the caller's focus-visible decision and the UA sheet uses `:focus-visible`.
 
 ### html5ever (third_party/html5ever, master)
 

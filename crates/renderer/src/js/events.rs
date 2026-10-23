@@ -105,11 +105,22 @@ impl JsEvent {
     /// A user-agent-created event: `isTrusted` true and `initialized` set
     /// (<https://dom.spec.whatwg.org/#concept-event-create>).
     pub(crate) fn trusted(typ: &str, bubbles: bool, cancelable: bool) -> Self {
+        Self::trusted_with(typ, bubbles, cancelable, false)
+    }
+
+    /// A trusted event whose `composed` flag is set, for the input events that
+    /// cross shadow boundaries.
+    pub(crate) fn trusted_composed(typ: &str, bubbles: bool, cancelable: bool) -> Self {
+        Self::trusted_with(typ, bubbles, cancelable, true)
+    }
+
+    fn trusted_with(typ: &str, bubbles: bool, cancelable: bool, composed: bool) -> Self {
         Self {
             state: EventStateCell(RefCell::new(EventState {
                 typ: typ.to_owned(),
                 bubbles,
                 cancelable,
+                composed,
                 is_trusted: true,
                 initialized: true,
                 time_stamp: now_millis(),
@@ -1075,6 +1086,21 @@ pub(crate) fn fire_trusted(
     Ok(())
 }
 
+/// Fires a trusted event that crosses shadow boundaries. `input` and
+/// `beforeinput` are composed, while `change` is not
+/// (<https://w3c.github.io/uievents/#events-inputevents>).
+pub(crate) fn fire_trusted_composed(
+    ctx: &Ctx<'_>,
+    target: EventTargetKey,
+    typ: &str,
+    bubbles: bool,
+    cancelable: bool,
+) -> Result<()> {
+    let event = realm_event(ctx, JsEvent::trusted_composed(typ, bubbles, cancelable))?;
+    dispatch(ctx, target, &event, None)?;
+    Ok(())
+}
+
 /// Fires `popstate` with the deserialized state for the activated entry.
 /// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-popstateevent-interface>
 pub(crate) fn fire_trusted_popstate<'js>(ctx: &Ctx<'js>, state: Value<'js>) -> Result<()> {
@@ -1085,6 +1111,19 @@ pub(crate) fn fire_trusted_popstate<'js>(ctx: &Ctx<'js>, state: Value<'js>) -> R
     event.set("state", state)?;
     dispatch(ctx, EventTargetKey::Window, &event, None)?;
     Ok(())
+}
+
+/// Fires a trusted event and reports whether it was not canceled, for
+/// cancelable events that gate a following action such as `reset`.
+pub(crate) fn fire_trusted_cancelable(
+    ctx: &Ctx<'_>,
+    target: EventTargetKey,
+    typ: &str,
+    bubbles: bool,
+    cancelable: bool,
+) -> Result<bool> {
+    let event = realm_event(ctx, JsEvent::trusted(typ, bubbles, cancelable))?;
+    dispatch(ctx, target, &event, None)
 }
 
 /// Fires a trusted `click` and reports whether it was not canceled, so the
@@ -1160,6 +1199,15 @@ fn dispatch<'js>(
     };
     let restored = window.set("event", previous);
     let outcome = result.and(handler);
+    // A click event runs the activation behavior of a label ancestor after
+    // dispatch, including for events the page dispatched itself
+    // (<https://html.spec.whatwg.org/multipage/forms.html#the-label-element:activation-behavior>).
+    if typ == "click"
+        && !canceled
+        && let EventTargetKey::Node(node) = target
+    {
+        super::bindings::focus::run_label_activation(ctx, node)?;
+    }
     // The current event restores even when dispatch threw; the dispatch
     // error wins over a restore error, so a failed invocation cannot leak a
     // stale current event into the next dispatch.

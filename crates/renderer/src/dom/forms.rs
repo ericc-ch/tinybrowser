@@ -9,7 +9,9 @@
 use blitz_dom::{BaseDocument, NodeData};
 
 use crate::Parsed;
-use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_html_element};
+use crate::dom::tree::{
+    BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected, is_html_element,
+};
 
 /// A control's contribution to the entry list, resolved inside one world
 /// borrow; file controls read their JS `files` after the borrow ends.
@@ -222,11 +224,12 @@ pub(crate) fn pending_entry(
     is_submitter: bool,
 ) -> Vec<PendingEntry> {
     let id = NodeId { document, node };
+    let dirname = dirname_entry(parsed, node, local);
     let base = &parsed.document.base;
     // A dirty value wins. Otherwise the submission value is the `value`
     // content attribute (the default value), or empty when absent.
     let value_attr = || attr(base, node, "value").unwrap_or_default().to_owned();
-    match local {
+    let mut entries = match local {
         "textarea" => {
             let mut value = textarea_api_value(base, node);
             if wrap_is_hard(attr(base, node, "wrap")) {
@@ -291,7 +294,87 @@ pub(crate) fn pending_entry(
             }
         }
         _ => Vec::new(),
+    };
+    if let Some(entry) = dirname {
+        entries.push(entry);
     }
+    entries
+}
+
+/// The `dirname` entry for a control whose directionality applies to form
+/// submission
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submitting-element-directionality:-the-dirname-attribute>).
+fn dirname_entry(parsed: &Parsed, node: BlitzId, local: &str) -> Option<PendingEntry> {
+    use crate::dom::input::InputType;
+    let base = &parsed.document.base;
+    let dirname = attr(base, node, "dirname")?;
+    if dirname.is_empty() {
+        return None;
+    }
+    let value = match local {
+        "textarea" => textarea_api_value(base, node),
+        "input" => match crate::dom::input::input_type(base, node).unwrap_or(InputType::Text) {
+            InputType::Hidden
+            | InputType::Text
+            | InputType::Search
+            | InputType::Tel
+            | InputType::Url
+            | InputType::Email
+            | InputType::Password
+            | InputType::Submit => crate::dom::input::current_value(parsed, node),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(PendingEntry::Text(
+        dirname.to_owned(),
+        directionality(base, node, &value),
+    ))
+}
+
+/// The element's directionality: its `dir` attribute, the nearest ancestor's,
+/// or `auto` heuristics over the control's value
+/// (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
+fn directionality(base: &BaseDocument, node: BlitzId, value: &str) -> String {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if let Some(dir) = attr(base, current, "dir") {
+            let dir = dir.trim().to_ascii_lowercase();
+            if dir == "rtl" || dir == "ltr" {
+                return dir;
+            }
+            if dir == "auto" {
+                return if first_strong_is_rtl(value) {
+                    "rtl".to_owned()
+                } else {
+                    "ltr".to_owned()
+                };
+            }
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    "ltr".to_owned()
+}
+
+/// The first strong directional character: Hebrew and Arabic blocks are RTL,
+/// Latin letters are LTR; no strong character defaults to LTR.
+fn first_strong_is_rtl(value: &str) -> bool {
+    for character in value.chars() {
+        if character.is_ascii_alphabetic() {
+            return false;
+        }
+        let code = character as u32;
+        if (0x0590..=0x08FF).contains(&code)
+            || (0xFB1D..=0xFDFF).contains(&code)
+            || (0xFE70..=0xFEFF).contains(&code)
+        {
+            return true;
+        }
+        if character.is_alphabetic() {
+            return false;
+        }
+    }
+    false
 }
 
 /// The `option` elements in a `select`'s list of options, in tree order:
@@ -309,22 +392,48 @@ pub(crate) fn select_options(base: &BaseDocument, document: u32, select: BlitzId
         let Some(node) = base.get_node(current) else {
             continue;
         };
-        if node.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace() && element.name.local.as_str() == "select"
-        }) {
+        let Some(element) = node.data.downcast_element() else {
+            stack.extend(node.children.iter().rev().copied());
+            continue;
+        };
+        if element.name.ns != html_namespace() {
+            stack.extend(node.children.iter().rev().copied());
             continue;
         }
-        if node.data.downcast_element().is_some_and(|element| {
-            element.name.ns == html_namespace() && element.name.local.as_str() == "option"
-        }) {
-            options.push(NodeId {
-                document,
-                node: current,
-            });
+        match element.name.local.as_str() {
+            // The option list does not descend into another select, an
+            // option, or an `hr`
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list>).
+            "select" | "hr" | "datalist" => continue,
+            "option" => {
+                options.push(NodeId {
+                    document,
+                    node: current,
+                });
+                continue;
+            }
+            // A nested optgroup is not part of the option list either.
+            "optgroup" if has_optgroup_ancestor(base, current) => continue,
+            _ => {}
         }
         stack.extend(node.children.iter().rev().copied());
     }
     options
+}
+
+/// Whether `node` has an ancestor `optgroup` before its owning `select`.
+fn has_optgroup_ancestor(base: &BaseDocument, node: BlitzId) -> bool {
+    let mut cursor = base.get_node(node).and_then(|target| target.parent);
+    while let Some(current) = cursor {
+        if is_html_element(base, current, "select") {
+            return false;
+        }
+        if is_html_element(base, current, "optgroup") {
+            return true;
+        }
+        cursor = base.get_node(current).and_then(|target| target.parent);
+    }
+    false
 }
 
 /// The `select` whose list of options contains `node`: its nearest ancestor
@@ -527,7 +636,8 @@ pub(crate) fn option_effective_selected(parsed: &mut Parsed, option: BlitzId) ->
 /// An `option`'s value: its `value` attribute, else its text
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
 pub(crate) fn option_value(base: &BaseDocument, option: BlitzId) -> String {
-    attr(base, option, "value").map_or_else(|| option_text(base, option), str::to_owned)
+    crate::dom::tree::attr_no_namespace(base, option, "value")
+        .map_or_else(|| option_text(base, option), str::to_owned)
 }
 
 /// An `option`'s text: its descendant text with ASCII whitespace stripped and
@@ -707,11 +817,21 @@ pub(crate) fn radio_group_members(
     name: &str,
     except: BlitzId,
 ) -> Vec<NodeId> {
-    if name.is_empty() {
+    // A radio button whose name is missing or empty belongs to no group
+    // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+    if name.is_empty() || attr(base, except, "name").is_none() {
         return Vec::new();
     }
+    // A radio button group lives in one tree and shares the form owner, so a
+    // disconnected tree's root, not the document root, is the search root
+    // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+    let mut root = except;
+    while let Some(parent) = base.get_node(root).and_then(|node| node.parent) {
+        root = parent;
+    }
+    let owner = form_owner_of(base, document, except);
     let mut group = Vec::new();
-    let mut stack = vec![base.root_node().id];
+    let mut stack = vec![root];
     // Reverse-push keeps the pop order in tree order.
     while let Some(id) = stack.pop() {
         let Some(node) = base.get_node(id) else {
@@ -725,7 +845,8 @@ pub(crate) fn radio_group_members(
                         .unwrap_or("text")
                         .trim()
                         .eq_ignore_ascii_case("radio")
-                    && attr(base, id, "name").unwrap_or_default() == name
+                    && attr(base, id, "name").is_some_and(|candidate| candidate == name)
+                    && form_owner_of(base, document, id) == owner
             })
         {
             group.push(NodeId { document, node: id });
@@ -809,7 +930,8 @@ pub(crate) fn radios_to_uncheck(base: &BaseDocument, document: u32, input: Blitz
         .unwrap_or("text")
         .trim()
         .eq_ignore_ascii_case("radio")
-        && attr(base, input, "checked").is_some()
+        && element.checkedness()
+        && (is_connected(base, input) || form_owner_of(base, document, input).is_some())
     {
         let name = attr(base, input, "name").unwrap_or_default().to_owned();
         radio_group_members(base, document, &name, input)

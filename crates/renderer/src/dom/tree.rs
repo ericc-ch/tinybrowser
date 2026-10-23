@@ -146,6 +146,21 @@ pub(crate) fn attr<'a>(
     attr_find(base, id, |qualified| qualified.local == local)
 }
 
+/// The value of the first attribute with the given local name in no
+/// namespace. HTML attributes and their reflected IDL properties never match
+/// a same-named attribute in another namespace
+/// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
+pub(crate) fn attr_no_namespace<'a>(
+    base: &'a blitz_dom::BaseDocument,
+    id: BlitzNodeId,
+    name: &str,
+) -> Option<&'a str> {
+    let local = markup5ever::LocalName::from(name);
+    attr_find(base, id, |qualified| {
+        qualified.local == local && qualified.ns == markup5ever::ns!()
+    })
+}
+
 /// The value of the first attribute whose qualified name is `qualified`.
 ///
 /// <https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>

@@ -138,14 +138,16 @@
   const supportsSelection = element =>
     element.tagName === 'TEXTAREA' || element.selectionStart !== null;
   const fireInput = (element, inputType, data) => {
-    fire(element, new InputEvent('input', { bubbles: true, inputType: inputType, data: data }));
+    fire(element, new InputEvent('input', {
+      bubbles: true, composed: true, inputType: inputType, data: data,
+    }));
   };
   // Replaces the inclusive range with `text`, gating on the cancelable
   // `beforeinput` event first
   // (<https://w3c.github.io/uievents/#events-inputevents>).
   const replaceRange = (element, text, start, end, inputType, data) => {
     const before = new InputEvent('beforeinput', {
-      bubbles: true, cancelable: true, inputType: inputType, data: data,
+      bubbles: true, cancelable: true, composed: true, inputType: inputType, data: data,
     });
     if (!fire(element, before)) return;
     if (typeof host.__tbMarkUserEdited === 'function') host.__tbMarkUserEdited(element);

@@ -70,6 +70,26 @@
   });
   const userAgentData = Object.create(NavigatorUAData.prototype);
   uaDataKey.set(userAgentData, Object.freeze({}));
+  // https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation
+  const userActivationKey = host.slots('UserActivation');
+  class UserActivation {
+    constructor() {
+      throw new TypeError('Illegal constructor');
+    }
+    get isActive() {
+      __tbBrand(this, userActivationKey);
+      return host.__tbUserActivationActive();
+    }
+    get hasBeenActive() {
+      __tbBrand(this, userActivationKey);
+      return host.__tbUserActivationSticky();
+    }
+  }
+  Object.defineProperty(UserActivation.prototype, Symbol.toStringTag, {
+    value: 'UserActivation', writable: false, enumerable: false, configurable: true,
+  });
+  const userActivation = Object.create(UserActivation.prototype);
+  userActivationKey.set(userActivation, Object.freeze({}));
   class Navigator {
     get userAgent() {
       return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
@@ -93,9 +113,15 @@
       if (globalThis.isSecureContext === false) return undefined;
       return userAgentData;
     }
+    get userActivation() {
+      return userActivation;
+    }
   }
   Object.defineProperty(globalThis, 'NavigatorUAData', {
     value: NavigatorUAData, writable: true, configurable: true,
+  });
+  Object.defineProperty(globalThis, 'UserActivation', {
+    value: UserActivation, writable: true, configurable: true,
   });
   Object.defineProperty(globalThis, 'Navigator', {
     value: Navigator, writable: true, configurable: true,
