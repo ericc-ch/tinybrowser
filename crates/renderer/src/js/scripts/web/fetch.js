@@ -1,32 +1,64 @@
 // https://fetch.spec.whatwg.org/#headers-class
 // Page requests share the browser process's HTTP client with navigation.
 const __tbHeadersData = host.slots('tinybrowser.headers.data');
-const __tbHeadersGuard = host.slots('tinybrowser.headers.guard');
 const __tbHeadersIteratorState = host.slots('tinybrowser.headers.iterator');
 const __tbResponseData = host.slots('tinybrowser.response.data');
 const __tbRequestData = host.slots('tinybrowser.request.data');
 let __tbKeepaliveAvailable = 65536;
-// A header name is a byte sequence that is an HTTP token
-// (<https://fetch.spec.whatwg.org/#concept-header-name>).
-const __tbHeaderName = value => {
-  const name = __tbToDOMString(value);
-  for (let index = 0; index < name.length; index++) {
-    if (name.charCodeAt(index) > 0xFF) throw new TypeError('Invalid header name');
+// WebIDL ByteString conversion: one code point per byte, and anything above
+// 0xFF is a TypeError before any header algorithm runs
+// (<https://webidl.spec.whatwg.org/#es-ByteString>).
+const __tbByteString = value => {
+  const text = __tbToDOMString(value);
+  for (let index = 0; index < text.length; index++) {
+    if (text.charCodeAt(index) > 0xFF) throw new TypeError('Value is not a byte string');
   }
-  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) throw new TypeError('Invalid header name');
+  return text;
+};
+// WebIDL USVString conversion: lone surrogates become U+FFFD before the value
+// reaches Rust, whose `String` cannot carry them
+// (<https://webidl.spec.whatwg.org/#es-USVString>).
+const __tbToUSVString = value => {
+  const text = __tbToDOMString(value);
+  let result = '';
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        result += text[index] + text[index + 1];
+        index += 1;
+      } else {
+        result += '\uFFFD';
+      }
+    } else if (code >= 0xDC00 && code <= 0xDFFF) {
+      result += '\uFFFD';
+    } else {
+      result += text[index];
+    }
+  }
+  return result;
+};
+const __tbIsHeaderName = value => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value);
+const __tbHeaderName = value => {
+  const name = __tbByteString(value);
+  if (!__tbIsHeaderName(name)) throw new TypeError('Invalid header name');
   return name.toLowerCase();
 };
-// A header value is a byte sequence with no 0x00, 0x0A, or 0x0D, and a JS
-// string holds it with one code point per byte
-// (<https://fetch.spec.whatwg.org/#concept-header-value>).
-const __tbHeaderValue = value => {
-  value = __tbToDOMString(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+const __tbIsHeaderValue = value => {
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
-    if (code === 0x00 || code === 0x0A || code === 0x0D || code > 0xFF) throw new TypeError('Invalid header value');
+    if (code === 0x00 || code === 0x0A || code === 0x0D || code > 0xFF) return false;
   }
-  return value;
+  return true;
 };
+const __tbHeaderValue = value => {
+  const text = __tbByteString(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+  if (!__tbIsHeaderValue(text)) throw new TypeError('Invalid header value');
+  return text;
+};
+// HTTP whitespace is SP and HTAB; JS `trim()` also strips NBSP and BOM.
+const __tbHttpTrim = value => value.replace(/^[\t ]+|[\t ]+$/g, '');
 // <https://fetch.spec.whatwg.org/#forbidden-request-header>
 const __tbForbiddenRequestHeader = name =>
   name === 'accept-charset' || name === 'accept-encoding' ||
@@ -34,41 +66,77 @@ const __tbForbiddenRequestHeader = name =>
   name === 'connection' || name === 'content-length' || name === 'cookie' ||
   name === 'cookie2' || name === 'date' || name === 'dnt' || name === 'expect' ||
   name === 'host' || name === 'keep-alive' || name === 'origin' || name === 'referer' ||
-  name === 'set-cookie' || name === 'te' || name === 'trailer' ||
+  name === 'set-cookie' || name === 'set-cookie2' || name === 'te' || name === 'trailer' ||
   name === 'transfer-encoding' || name === 'upgrade' || name === 'via' ||
   name.indexOf('proxy-') === 0 || name.indexOf('sec-') === 0;
-// <https://fetch.spec.whatwg.org/#forbidden-method>
-const __tbForbiddenMethod = value => /^(CONNECT|TRACE|TRACK)$/i.test(value.trim());
+const __tbIsForbiddenMethod = value => /^(CONNECT|TRACE|TRACK)$/i.test(value);
 const __tbForbiddenMethodHeader = name =>
   name === 'x-http-method-override' || name === 'x-http-method' || name === 'x-method-override';
+const __tbForbiddenMethodInValue = value => {
+  const parts = __tbApply(__tbStringSplit, value, [',']);
+  for (let index = 0; index < parts.length; index++) {
+    if (__tbIsForbiddenMethod(__tbHttpTrim(parts[index]))) return true;
+  }
+  return false;
+};
 // <https://fetch.spec.whatwg.org/#cors-safelisted-request-header>
+const __tbCorsUnsafeByte = code =>
+  (code >= 0x00 && code <= 0x08) || (code >= 0x0A && code <= 0x1F) ||
+  code === 0x7F || code === 0x22 || code === 0x28 || code === 0x29 ||
+  code === 0x3A || code === 0x3C || code === 0x3E || code === 0x3F ||
+  code === 0x40 || code === 0x5B || code === 0x5C || code === 0x5D ||
+  code === 0x7B || code === 0x7D;
 const __tbCorsSafelistedHeader = (name, value) => {
-  if (name !== 'accept' && name !== 'accept-language' && name !== 'content-language' && name !== 'content-type') return false;
   if (value.length > 128) return false;
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if ((code >= 0x00 && code <= 0x08) || (code >= 0x0A && code <= 0x1F) || code === 0x7F ||
-        code === 0x22 || code === 0x28 || code === 0x29 || code === 0x3A || code === 0x3C ||
-        code === 0x3E || code === 0x3F || code === 0x40 || code === 0x5B || code === 0x5C ||
-        code === 0x5D || code === 0x7B || code === 0x7D) return false;
+  if (name === 'accept') {
+    for (let index = 0; index < value.length; index++) {
+      if (__tbCorsUnsafeByte(value.charCodeAt(index))) return false;
+    }
+    return true;
+  }
+  if (name === 'accept-language' || name === 'content-language') {
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      const allowed = (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5A) ||
+        (code >= 0x61 && code <= 0x7A) || code === 0x20 || code === 0x2A ||
+        code === 0x2C || code === 0x2D || code === 0x2E || code === 0x3B || code === 0x3D;
+      if (!allowed) return false;
+    }
+    return true;
   }
   if (name === 'content-type') {
+    for (let index = 0; index < value.length; index++) {
+      if (__tbCorsUnsafeByte(value.charCodeAt(index))) return false;
+    }
     const essence = __tbAsciiLower(__tbApply(__tbStringTrim, __tbApply(__tbStringSplit, value, [';'])[0], []));
-    if (essence !== 'application/x-www-form-urlencoded' && essence !== 'multipart/form-data' && essence !== 'text/plain') return false;
+    return essence === 'application/x-www-form-urlencoded' ||
+      essence === 'multipart/form-data' || essence === 'text/plain';
   }
-  return true;
+  return false;
 };
-const __tbHeadersList = headers => __tbBrand(headers, __tbHeadersData);
-const __tbHeadersGuardOf = headers => {
-  const guard = __tbHeadersGuard.get(headers);
-  return guard === undefined ? 'none' : guard;
+const __tbHeadersRecord = headers => __tbBrand(headers, __tbHeadersData);
+const __tbHeadersList = headers => __tbHeadersRecord(headers).list;
+const __tbHeadersGuardOf = headers => __tbHeadersRecord(headers).guard;
+const __tbHeadersTouch = record => {
+  record.version += 1;
+  record.sorted = null;
+};
+const __tbHeadersLookupRaw = (headers, name) => {
+  const entries = __tbHeadersList(headers);
+  const values = [];
+  for (let index = 0; index < entries.length; index++) {
+    if (entries[index][0] === name) __tbArray.push(values, entries[index][1]);
+  }
+  return values.length === 0 ? null : __tbArray.join(values, ', ');
 };
 // Sorted-and-combined view the iterator and `forEach` walk: names sort
 // alphabetically, duplicate values combine with ", ", and every set-cookie
 // entry stays separate in insertion order
 // (<https://fetch.spec.whatwg.org/#concept-header-list-sort-and-combine>).
 const __tbSortedHeaders = headers => {
-  const entries = __tbHeadersList(headers);
+  const record = __tbHeadersRecord(headers);
+  if (record.sorted !== null) return record.sorted;
+  const entries = record.list;
   const list = [];
   const indexByName = Object.create(null);
   for (let index = 0; index < entries.length; index++) {
@@ -87,12 +155,12 @@ const __tbSortedHeaders = headers => {
     }
   }
   __tbArray.sort(list, (a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  record.sorted = list;
   return list;
 };
 const __tbHeadersIteratorProto = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())));
-Object.defineProperty(__tbHeadersIteratorProto, Symbol.iterator, {
-  value: function() { return this; },
-  writable: true, enumerable: false, configurable: true,
+Object.defineProperty(__tbHeadersIteratorProto, Symbol.toStringTag, {
+  value: 'Headers Iterator', writable: false, enumerable: false, configurable: true,
 });
 Object.defineProperty(__tbHeadersIteratorProto, 'next', {
   value: function() {
@@ -109,6 +177,87 @@ const __tbHeadersIterator = (headers, kind) => {
   const iterator = Object.create(__tbHeadersIteratorProto);
   __tbHeadersIteratorState.set(iterator, { headers, kind, index: 0 });
   return iterator;
+};
+const __tbHeadersAllowed = (record, name, value, existing) => {
+  switch (record.guard) {
+    case 'none':
+      return true;
+    case 'immutable':
+      throw new TypeError('Headers are immutable');
+    case 'response':
+      return name !== 'set-cookie' && name !== 'set-cookie2';
+    case 'request':
+    case 'request-no-cors':
+      if (__tbForbiddenRequestHeader(name)) return false;
+      if (__tbForbiddenMethodHeader(name) && __tbForbiddenMethodInValue(value)) return false;
+      if (record.guard === 'request') return true;
+      return __tbCorsSafelistedHeader(name, existing === null ? value : existing + ', ' + value);
+    default:
+      throw new TypeError('Invalid headers guard');
+  }
+};
+const __tbHeadersAppendRaw = (headers, name, value) => {
+  const record = __tbHeadersRecord(headers);
+  const header = [__tbHeaderName(name), __tbHeaderValue(value)];
+  if (!__tbHeadersAllowed(record, header[0], header[1], __tbHeadersLookupRaw(headers, header[0]))) return;
+  __tbArray.push(record.list, header);
+  __tbHeadersTouch(record);
+};
+const __tbHeadersDeleteRaw = (headers, name) => {
+  const record = __tbHeadersRecord(headers);
+  if (record.guard === 'immutable') throw new TypeError('Headers are immutable');
+  const normalized = __tbHeaderName(name);
+  for (let index = record.list.length - 1; index >= 0; index--) {
+    if (record.list[index][0] === normalized) __tbArray.remove(record.list, index);
+  }
+  __tbHeadersTouch(record);
+};
+const __tbHeadersSetRaw = (headers, name, value) => {
+  const record = __tbHeadersRecord(headers);
+  if (record.guard === 'immutable') throw new TypeError('Headers are immutable');
+  const header = [__tbHeaderName(name), __tbHeaderValue(value)];
+  if (!__tbHeadersAllowed(record, header[0], header[1], null)) return;
+  for (let index = record.list.length - 1; index >= 0; index--) {
+    if (record.list[index][0] === header[0]) __tbArray.remove(record.list, index);
+  }
+  __tbArray.push(record.list, header);
+  __tbHeadersTouch(record);
+};
+const __tbHeadersGetRaw = (headers, name) => {
+  const normalized = __tbHeaderName(name);
+  return __tbHeadersLookupRaw(headers, normalized);
+};
+const __tbFillHeaders = (headers, init) => {
+  if (init === undefined) return;
+  if (init === null || (typeof init !== 'object' && typeof init !== 'function')) {
+    throw new TypeError('The Headers init must be a sequence or a record');
+  }
+  const iteratorMethod = init[Symbol.iterator];
+  if (iteratorMethod !== undefined && iteratorMethod !== null) {
+    if (typeof iteratorMethod !== 'function') throw new TypeError('The Headers init must be iterable');
+    const iterator = __tbApply(iteratorMethod, init, []);
+    while (true) {
+      const step = iterator.next();
+      if (step.done) break;
+      if (step.value === null || typeof step.value !== 'object') throw new TypeError('Header pairs must be objects');
+      const values = __tbArrayFrom(step.value);
+      if (values.length !== 2) throw new TypeError('Header pairs must contain two values');
+      __tbHeadersAppendRaw(headers, values[0], values[1]);
+    }
+  } else {
+    // WebIDL record conversion: ownKeys, then per-key
+    // getOwnPropertyDescriptor and (for enumerable keys) get, with the name
+    // converted to a ByteString before the value is read
+    // (<https://webidl.spec.whatwg.org/#es-to-record>).
+    const keys = Reflect.ownKeys(init);
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index];
+      const descriptor = __tbGetOwnPropertyDescriptor(init, key);
+      if (descriptor === undefined || !descriptor.enumerable) continue;
+      const name = __tbHeaderName(key);
+      __tbHeadersAppendRaw(headers, name, init[key]);
+    }
+  }
 };
 // https://fetch.spec.whatwg.org/#concept-method-normalize
 const __tbRequestMethod = value => {
@@ -146,62 +295,12 @@ const __tbBrand = (value, slots, message) => {
 };
 globalThis.Headers = class Headers {
   constructor(init) {
-    const entries = [];
-    __tbHeadersData.set(this, entries);
-    __tbHeadersGuard.set(this, 'none');
-    if (init === undefined) return;
-    if (init === null || (typeof init !== 'object' && typeof init !== 'function')) {
-      throw new TypeError('The Headers init must be a sequence or a record');
-    }
-    const iteratorMethod = init[Symbol.iterator];
-    if (iteratorMethod !== undefined && iteratorMethod !== null) {
-      if (typeof iteratorMethod !== 'function') throw new TypeError('The Headers init must be iterable');
-      const iterator = __tbApply(iteratorMethod, init, []);
-      while (true) {
-        const step = iterator.next();
-        if (step.done) break;
-        const values = __tbArrayFrom(step.value);
-        if (values.length !== 2) throw new TypeError('Header pairs must contain two values');
-        __tbArray.push(entries, [__tbHeaderName(values[0]), __tbHeaderValue(values[1])]);
-      }
-    } else {
-      for (const name of __tbObjectKeys(init)) {
-        __tbArray.push(entries, [__tbHeaderName(name), __tbHeaderValue(init[name])]);
-      }
-    }
+    __tbHeadersData.set(this, { list: [], guard: 'none', version: 0, sorted: null });
+    __tbFillHeaders(this, init);
   }
-  append(name, value) {
-    const guard = __tbHeadersGuardOf(this);
-    if (guard === 'immutable') throw new TypeError('Headers are immutable');
-    const header = [__tbHeaderName(name), __tbHeaderValue(value)];
-    if ((guard === 'request' || guard === 'request-no-cors') && __tbForbiddenRequestHeader(header[0])) return;
-    if (guard === 'response' && header[0] === 'set-cookie') return;
-    if (guard === 'request' && __tbForbiddenMethodHeader(header[0]) && __tbForbiddenMethod(header[1])) return;
-    if (guard === 'request-no-cors') {
-      const existing = this.get(header[0]);
-      if (!__tbCorsSafelistedHeader(header[0], existing === null ? header[1] : existing + ', ' + header[1])) return;
-    }
-    __tbArray.push(__tbHeadersList(this), header);
-  }
-  delete(name) {
-    if (__tbHeadersGuardOf(this) === 'immutable') throw new TypeError('Headers are immutable');
-    const entries = __tbHeadersList(this);
-    name = __tbHeaderName(name);
-    for (let index = entries.length - 1; index >= 0; index--) {
-      if (entries[index][0] === name) __tbArray.remove(entries, index);
-    }
-  }
-  get(name) {
-    const entries = __tbHeadersList(this);
-    name = __tbHeaderName(name);
-    // Duplicate values combine with ', '
-    // (<https://fetch.spec.whatwg.org/#dom-headers-get>).
-    const values = [];
-    for (let index = 0; index < entries.length; index++) {
-      if (entries[index][0] === name) values[values.length] = entries[index][1];
-    }
-    return values.length === 0 ? null : __tbArray.join(values, ', ');
-  }
+  append(name, value) { __tbHeadersAppendRaw(this, name, value); }
+  delete(name) { __tbHeadersDeleteRaw(this, name); }
+  get(name) { return __tbHeadersGetRaw(this, name); }
   getSetCookie() {
     const entries = __tbHeadersList(this);
     const values = [];
@@ -210,21 +309,8 @@ globalThis.Headers = class Headers {
     }
     return values;
   }
-  has(name) { return this.get(name) !== null; }
-  set(name, value) {
-    if (__tbHeadersGuardOf(this) === 'immutable') throw new TypeError('Headers are immutable');
-    const header = [__tbHeaderName(name), __tbHeaderValue(value)];
-    this.delete(header[0]);
-    const guard = __tbHeadersGuardOf(this);
-    if ((guard === 'request' || guard === 'request-no-cors') && __tbForbiddenRequestHeader(header[0])) return;
-    if (guard === 'response' && header[0] === 'set-cookie') return;
-    if (guard === 'request' && __tbForbiddenMethodHeader(header[0]) && __tbForbiddenMethod(header[1])) return;
-    if (guard === 'request-no-cors') {
-      const existing = this.get(header[0]);
-      if (!__tbCorsSafelistedHeader(header[0], existing === null ? header[1] : existing + ', ' + header[1])) return;
-    }
-    __tbArray.push(__tbHeadersList(this), header);
-  }
+  has(name) { return __tbHeadersGetRaw(this, name) !== null; }
+  set(name, value) { __tbHeadersSetRaw(this, name, value); }
   forEach(callback, thisArg) {
     if (typeof callback !== 'function') throw new TypeError('callback is not a function');
     const list = __tbSortedHeaders(this);
@@ -244,9 +330,14 @@ const __tbHeadersAppend = __tbHeadersConstructor.prototype.append;
 // Internal construction with a guard; page code only sees the default guard
 // (<https://fetch.spec.whatwg.org/#concept-headers-guard>).
 const __tbMakeHeaders = (entries, guard) => {
-  const headers = new __tbHeadersConstructor();
-  __tbHeadersData.set(headers, entries);
-  __tbHeadersGuard.set(headers, guard);
+  const headers = Object.create(__tbHeadersConstructor.prototype);
+  __tbHeadersData.set(headers, { list: entries, guard, version: 0, sorted: null });
+  return headers;
+};
+const __tbNewHeaders = (init, guard) => {
+  const headers = Object.create(__tbHeadersConstructor.prototype);
+  __tbHeadersData.set(headers, { list: [], guard, version: 0, sorted: null });
+  __tbFillHeaders(headers, init);
   return headers;
 };
 // A BodyInit becomes bytes plus a type, or a ReadableStream when the caller
@@ -264,21 +355,26 @@ const __tbConcatBytes = chunks => {
   }
   return bytes;
 };
+const __tbNormalizeLineEndings = value => String(value).replace(/\r\n|\r|\n/g, '\r\n');
 const __tbMultipartEscape = value =>
-  String(value).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
-let __tbMultipartSequence = 0;
+  __tbNormalizeLineEndings(value).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
 const __tbMultipartBoundary = () => {
-  __tbMultipartSequence += 1;
-  return '----tinybrowser' + __tbMultipartSequence + Math.random().toString(16).slice(2);
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index++) bytes[index] = Math.floor(Math.random() * 256);
+  }
+  let boundary = '----tinybrowser';
+  for (let index = 0; index < bytes.length; index++) boundary += bytes[index].toString(16).padStart(2, '0');
+  return boundary;
 };
 // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>
 const __tbFormDataBody = formData => {
   const boundary = __tbMultipartBoundary();
   const type = 'multipart/form-data; boundary=' + boundary;
   const chunks = [];
-  let count = 0;
   for (const entry of formData) {
-    count += 1;
     const name = entry[0];
     const value = entry[1];
     let head = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + __tbMultipartEscape(name) + '"';
@@ -292,10 +388,9 @@ const __tbFormDataBody = formData => {
     }
     head += '\r\n';
     __tbArray.push(chunks, __tbUtf8Encode(head));
-    __tbArray.push(chunks, fileBytes === null ? __tbUtf8Encode(String(value)) : fileBytes);
+    __tbArray.push(chunks, fileBytes === null ? __tbUtf8Encode(__tbNormalizeLineEndings(String(value))) : fileBytes);
     __tbArray.push(chunks, __tbUtf8Encode('\r\n'));
   }
-  if (count === 0) return { bytes: new __tbUint8Array(0), type };
   __tbArray.push(chunks, __tbUtf8Encode('--' + boundary + '--\r\n'));
   return { bytes: __tbConcatBytes(chunks), type };
 };
@@ -335,6 +430,7 @@ const __tbBodyStream = extracted => {
   if (extracted.stream !== null) return extracted.stream;
   if (extracted.bytes === null) return null;
   return new ReadableStream({
+    type: 'bytes',
     start(controller) {
       controller.enqueue(extracted.bytes);
       controller.close();
@@ -343,29 +439,60 @@ const __tbBodyStream = extracted => {
 };
 const __tbBodyUsed = data =>
   data.bodyUsed || (data.stream !== null && __tbStreamDisturbed(data.stream));
-const __tbConsumeBody = data => {
-  if (data.stream === null && data.bodyError !== true) return Promise.resolve(new __tbUint8Array(0));
-  if (__tbBodyUsed(data)) return Promise.reject(new TypeError('Body already used'));
-  data.bodyUsed = true;
-  if (data.bodyError === true) return Promise.reject(new TypeError('Body decoding failed'));
-  return __tbResponseBytes(data.stream);
+// A null-prototype result keeps `Object.prototype.then` from turning the
+// bytes into a thenable while the promise chain is still internal.
+const __tbReadResult = bytes => {
+  const result = __tbObjectCreate(null);
+  result.bytes = bytes;
+  return result;
 };
-// A Content-Type split into its essence and boundary. A failed parse yields
-// null, which every caller treats as "not a form body".
+const __tbConsumeBody = data => {
+  if (data.stream === null) return Promise.resolve(__tbReadResult(new __tbUint8Array(0)));
+  if (data.stream.locked || __tbBodyUsed(data)) return Promise.reject(new TypeError('Body already used'));
+  data.bodyUsed = true;
+  return __tbReadAllBytes(data.stream);
+};
+// A Content-Type split into its essence and boundary. Parameters are parsed
+// with quoted-string handling, so a boundary containing `=` or `;` survives
+// (<https://mimesniff.spec.whatwg.org/#parsing-a-mime-type>).
 const __tbContentType = headers => {
-  const value = __tbApply(__tbHeadersGet, headers, ['content-type']);
+  const value = __tbHeadersLookupRaw(headers, 'content-type');
   if (value === null) return null;
-  const parts = __tbApply(__tbStringSplit, value, [';']);
-  const essence = __tbAsciiLower(__tbApply(__tbStringTrim, parts[0], []));
+  let index = 0;
+  while (index < value.length && value[index] !== ';') index++;
+  const essence = __tbAsciiLower(__tbHttpTrim(value.slice(0, index)));
   let boundary = null;
-  for (let index = 1; index < parts.length; index++) {
-    const parameter = __tbApply(__tbStringSplit, parts[index], ['=']);
-    if (parameter.length !== 2) continue;
-    if (__tbAsciiLower(__tbApply(__tbStringTrim, parameter[0], [])) !== 'boundary') continue;
-    boundary = __tbApply(__tbStringTrim, parameter[1], []);
-    if (boundary.length >= 2 && boundary[0] === '"' && boundary[boundary.length - 1] === '"') {
-      boundary = __tbApply(__tbStringSlice, boundary, [1, boundary.length - 1]);
+  while (index < value.length) {
+    index += 1;
+    while (index < value.length && (value[index] === ' ' || value[index] === '\t')) index++;
+    const nameStart = index;
+    while (index < value.length && value[index] !== '=' && value[index] !== ';') index++;
+    const name = __tbAsciiLower(__tbHttpTrim(value.slice(nameStart, index)));
+    if (index >= value.length || value[index] !== '=') continue;
+    index += 1;
+    while (index < value.length && (value[index] === ' ' || value[index] === '\t')) index++;
+    let parameter;
+    if (value[index] === '"') {
+      index += 1;
+      let part = '';
+      let start = index;
+      while (index < value.length && value[index] !== '"') {
+        if (value[index] === '\\' && index + 1 < value.length) {
+          part += value.slice(start, index);
+          index += 1;
+          start = index;
+        }
+        index += 1;
+      }
+      part += value.slice(start, index);
+      parameter = part;
+      if (index < value.length) index += 1;
+    } else {
+      const start = index;
+      while (index < value.length && value[index] !== ';') index++;
+      parameter = __tbHttpTrim(value.slice(start, index));
     }
+    if (name === 'boundary') boundary = parameter;
   }
   return { essence, boundary };
 };
@@ -385,42 +512,54 @@ const __tbAsciiBytes = bytes => {
   return text;
 };
 const __tbDispositionParam = (head, key) => {
-  const quoted = new RegExp(key + '="([^"]*)"', 'i').exec(head);
+  const quoted = new RegExp('(?:^|;)\\s*' + key + '="([^"]*)"', 'i').exec(head);
   if (quoted !== null) return quoted[1];
-  const bare = new RegExp(key + '=([^;\\r\\n]*)', 'i').exec(head);
-  return bare === null ? null : __tbApply(__tbStringTrim, bare[1], []);
+  const bare = new RegExp('(?:^|;)\\s*' + key + '=([^;\\r\\n]*)', 'i').exec(head);
+  return bare === null ? null : __tbHttpTrim(bare[1]);
 };
 const __tbParseMultipart = (bytes, boundary) => {
   const formData = new FormData();
   const delimiter = __tbUtf8Encode('--' + boundary);
+  const crlfDelimiter = __tbUtf8Encode('\r\n--' + boundary);
   const separator = __tbUtf8Encode('\r\n\r\n');
   let position = __tbBytesIndexOf(bytes, delimiter, 0);
-  if (position === -1) return formData;
-  while (position !== -1) {
-    position += delimiter.length;
-    if (position + 1 < bytes.length && bytes[position] === 0x2D && bytes[position + 1] === 0x2D) break;
-    if (position + 1 < bytes.length && bytes[position] === 0x0D && bytes[position + 1] === 0x0A) position += 2;
+  if (position === -1) throw new TypeError('Missing multipart boundary');
+  position += delimiter.length;
+  while (true) {
+    // Transport padding between the boundary and the line break is legal
+    // (<https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1>).
+    while (position < bytes.length && (bytes[position] === 0x20 || bytes[position] === 0x09)) position += 1;
+    if (position + 1 < bytes.length && bytes[position] === 0x2D && bytes[position + 1] === 0x2D) {
+      position += 2;
+      while (position < bytes.length && (bytes[position] === 0x20 || bytes[position] === 0x09)) position += 1;
+      if (position < bytes.length && !(bytes[position] === 0x0D && bytes[position + 1] === 0x0A)) {
+        throw new TypeError('Malformed multipart terminator');
+      }
+      break;
+    }
+    if (position + 1 >= bytes.length || bytes[position] !== 0x0D || bytes[position + 1] !== 0x0A) {
+      throw new TypeError('Malformed multipart body');
+    }
+    position += 2;
     const headerEnd = __tbBytesIndexOf(bytes, separator, position);
-    if (headerEnd === -1) break;
+    if (headerEnd === -1) throw new TypeError('Malformed multipart headers');
     const head = __tbAsciiBytes(bytes.subarray(position, headerEnd));
     const valueStart = headerEnd + separator.length;
-    const next = __tbBytesIndexOf(bytes, delimiter, valueStart);
-    if (next === -1) break;
-    let valueEnd = next;
-    if (valueEnd >= 2 && bytes[valueEnd - 2] === 0x0D && bytes[valueEnd - 1] === 0x0A) valueEnd -= 2;
-    const value = bytes.subarray(valueStart, valueEnd);
+    const next = __tbBytesIndexOf(bytes, crlfDelimiter, valueStart);
+    if (next === -1) throw new TypeError('Missing multipart terminator');
+    const value = bytes.subarray(valueStart, next);
     const name = __tbDispositionParam(head, 'name');
     if (name !== null) {
       const filename = __tbDispositionParam(head, 'filename');
       if (filename !== null) {
         const typeMatch = /content-type:\s*([^\r\n]+)/i.exec(head);
-        const type = typeMatch === null ? 'text/plain' : __tbApply(__tbStringTrim, typeMatch[1], []);
+        const type = typeMatch === null ? 'text/plain' : __tbHttpTrim(typeMatch[1]);
         formData.append(name, new File([value], filename, { type }));
       } else {
         formData.append(name, __tbDecodeBytes(value, 'utf-8', false, true));
       }
     }
-    position = next;
+    position = next + crlfDelimiter.length;
   }
   return formData;
 };
@@ -438,44 +577,64 @@ const __tbFormDataFromBytes = (bytes, contentType) => {
   }
   throw new TypeError('Body is not a form');
 };
+const __tbToUint16 = value => {
+  let number = Number(value);
+  if (!Number.isFinite(number)) number = 0;
+  number = Math.trunc(number) % 65536;
+  return number < 0 ? number + 65536 : number;
+};
+const __tbStatusText = value => {
+  const text = __tbByteString(value === undefined ? '' : value);
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code <= 0x08 || code === 0x0A || code === 0x0B || code === 0x0C ||
+        (code >= 0x0E && code <= 0x1F) || code === 0x7F) {
+      throw new TypeError('Invalid status text');
+    }
+  }
+  return text;
+};
+const __tbErroredStream = () => new ReadableStream({
+  type: 'bytes',
+  start(controller) { controller.error(new TypeError('Body decoding failed')); },
+});
+const __tbResponseRecord = (body, status, statusText, headers) => {
+  const extracted = __tbExtractBody(body);
+  // The body's type becomes the Content-Type when the header list holds none
+  // (<https://fetch.spec.whatwg.org/#dom-response>).
+  if (extracted.type !== null && __tbHeadersLookupRaw(headers, 'content-type') === null) {
+    __tbHeadersAppendRaw(headers, 'content-type', extracted.type);
+  }
+  return {
+    stream: __tbBodyStream(extracted),
+    bodyUsed: false,
+    status,
+    statusText,
+    url: '',
+    type: 'default',
+    redirected: false,
+    headers,
+  };
+};
+const __tbCreateResponse = record => {
+  const response = Object.create(globalThis.Response.prototype);
+  __tbResponseData.set(response, record);
+  return response;
+};
 // https://fetch.spec.whatwg.org/#response-class
 globalThis.Response = class Response {
   constructor(body, init) {
     const options = init === undefined ? {} : Object(init);
-    const status = options.status === undefined ? 200 : Number(options.status);
-    if (!Number.isInteger(status) || status < 200 || status > 599) throw new RangeError('Invalid response status');
+    const status = __tbToUint16(options.status === undefined ? 200 : options.status);
+    if (status < 200 || status > 599) throw new RangeError('Invalid response status');
+    const statusText = __tbStatusText(options.statusText);
     const storedBody = body === undefined || body === null ? null : body;
     // A null body status has no body (<https://fetch.spec.whatwg.org/#null-body-status>).
-    if (storedBody !== null && (status === 101 || status === 204 || status === 205 || status === 304)) {
+    if (storedBody !== null && (status === 204 || status === 205 || status === 304)) {
       throw new TypeError('A null body status cannot have a body');
     }
-    const headers = new __tbHeadersConstructor(options.headers);
-    __tbHeadersGuard.set(headers, 'response');
-    const statusText = options.statusText === undefined ? '' : String(options.statusText);
-    for (let index = 0; index < statusText.length; index++) {
-      const code = statusText.charCodeAt(index);
-      if (code > 0xFF || code === 0x0A || code === 0x0D) throw new TypeError('Invalid status text');
-    }
-    const extracted = __tbExtractBody(storedBody);
-    // The body's type becomes the Content-Type when the header list holds
-    // none (<https://fetch.spec.whatwg.org/#dom-response>).
-    if (extracted.type !== null && __tbApply(__tbHeadersGet, headers, ['content-type']) === null) {
-      __tbApply(__tbHeadersAppend, headers, ['content-type', extracted.type]);
-    }
-    __tbResponseData.set(this, {
-        stream: __tbBodyStream(extracted),
-        bodyUsed: false,
-        status,
-        statusText: statusText,
-        url: options.url === undefined ? '' : String(options.url),
-        // `ResponseInit` has no `type` member; the constructor always yields
-        // "default". Only the network path sets another type, through
-        // `__tbMakeResponse`
-        // (<https://fetch.spec.whatwg.org/#responseinit>).
-        type: 'default',
-        redirected: false,
-        headers,
-    });
+    const headers = __tbNewHeaders(options.headers, 'response');
+    __tbResponseData.set(this, __tbResponseRecord(storedBody, status, statusText, headers));
   }
   get status() { return __tbBrand(this, __tbResponseData).status; }
   get statusText() { return __tbBrand(this, __tbResponseData).statusText; }
@@ -486,32 +645,26 @@ globalThis.Response = class Response {
   get ok() { const status = __tbBrand(this, __tbResponseData).status; return status >= 200 && status <= 299; }
   get body() { return __tbBrand(this, __tbResponseData).stream; }
   get bodyUsed() { return __tbBodyUsed(__tbBrand(this, __tbResponseData)); }
-  text() { return __tbConsumeBody(__tbBrand(this, __tbResponseData)).then(bytes => __tbDecodeBytes(bytes, 'utf-8', false, false)); }
-  json() {
-    return this.text().then(JSON.parse);
-  }
-  arrayBuffer() { return __tbConsumeBody(__tbBrand(this, __tbResponseData)).then(bytes => __tbBytesCopy(bytes).buffer); }
-  bytes() { return __tbConsumeBody(__tbBrand(this, __tbResponseData)).then(bytes => __tbBytesCopy(bytes)); }
+  text() { return __tbConsumeBody(__tbBrand(this, __tbResponseData)).then(result => __tbDecodeBytes(result.bytes, 'utf-8', false, false)); }
+  json() { return this.text().then(JSON.parse); }
+  arrayBuffer() { return __tbConsumeBody(__tbBrand(this, __tbResponseData)).then(result => __tbBytesCopy(result.bytes).buffer); }
+  bytes() { return __tbConsumeBody(__tbBrand(this, __tbResponseData)).then(result => __tbBytesCopy(result.bytes)); }
   blob() {
     const data = __tbBrand(this, __tbResponseData);
-    const header = __tbApply(__tbHeadersGet, data.headers, ['content-type']);
-    // The Blob type is the MIME type extracted from the header list
-    // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+    const header = __tbHeadersLookupRaw(data.headers, 'content-type');
     const type = __tbBlobTypeFromHeader(header);
-    return __tbConsumeBody(data).then(bytes => __tbMakeBlob(bytes, type));
+    return __tbConsumeBody(data).then(result => __tbMakeBlob(result.bytes, type));
   }
   formData() {
     const data = __tbBrand(this, __tbResponseData);
     const contentType = __tbContentType(data.headers);
     if (data.stream === null) {
-      // An absent body is an empty urlencoded form, and an error for every
-      // other content type (<https://fetch.spec.whatwg.org/#dom-body-formdata>).
       if (contentType !== null && contentType.essence === 'application/x-www-form-urlencoded') {
         return Promise.resolve(new FormData());
       }
       return Promise.reject(new TypeError('Body is not a form'));
     }
-    return __tbConsumeBody(data).then(bytes => __tbFormDataFromBytes(bytes, contentType));
+    return __tbConsumeBody(data).then(result => __tbFormDataFromBytes(result.bytes, contentType));
   }
   clone() {
     const data = __tbBrand(this, __tbResponseData);
@@ -524,8 +677,10 @@ globalThis.Response = class Response {
       stream = branches[1];
     }
     const copy = Object.create(globalThis.Response.prototype);
-    const headers = new __tbHeadersConstructor(data.headers);
-    __tbHeadersGuard.set(headers, __tbHeadersGuardOf(data.headers));
+    const headers = __tbMakeHeaders(
+      __tbArray.map(__tbHeadersList(data.headers), entry => [entry[0], entry[1]]),
+      __tbHeadersGuardOf(data.headers),
+    );
     __tbResponseData.set(copy, { ...data, stream, bodyUsed: false, headers });
     return copy;
   }
@@ -534,31 +689,45 @@ globalThis.Response = class Response {
     const options = init === undefined ? {} : Object(init);
     const body = JSON.stringify(data);
     if (body === undefined) throw new TypeError('The data is not JSON serializable');
-    const headers = new __tbHeadersConstructor(options.headers);
-    if (__tbApply(__tbHeadersGet, headers, ['content-type']) === null) {
-      __tbApply(__tbHeadersAppend, headers, ['content-type', 'application/json']);
+    const status = __tbToUint16(options.status === undefined ? 200 : options.status);
+    if (status < 200 || status > 599) throw new RangeError('Invalid response status');
+    const statusText = __tbStatusText(options.statusText);
+    if (status === 204 || status === 205 || status === 304) {
+      throw new TypeError('A null body status cannot have a body');
     }
-    return new globalThis.Response(body, { status: options.status, statusText: options.statusText, headers });
+    const headers = __tbNewHeaders(options.headers, 'response');
+    if (__tbHeadersLookupRaw(headers, 'content-type') === null) {
+      __tbHeadersAppendRaw(headers, 'content-type', 'application/json');
+    }
+    return __tbCreateResponse(__tbResponseRecord(body, status, statusText, headers));
   }
   // <https://fetch.spec.whatwg.org/#dom-response-redirect>
   static redirect(url, status) {
-    const code = status === undefined ? 302 : Number(status);
-    if (code !== 301 && code !== 302 && code !== 303 && code !== 307 && code !== 308) {
-      throw new RangeError('Invalid redirect status');
-    }
     let resolved;
     try {
       const base = host.__tbResolveUrl('', undefined);
-      resolved = new URL(String(url), base === null ? undefined : base).href;
+      resolved = new URL(__tbToUSVString(url), base === null ? undefined : base).href;
     } catch (error) {
       throw new TypeError('Invalid URL');
     }
-    return new globalThis.Response(null, { status: code, headers: [['location', resolved]] });
+    const code = __tbToUint16(status === undefined ? 302 : status);
+    if (code !== 301 && code !== 302 && code !== 303 && code !== 307 && code !== 308) {
+      throw new RangeError('Invalid redirect status');
+    }
+    return __tbCreateResponse({
+      stream: null,
+      bodyUsed: false,
+      status: code,
+      statusText: '',
+      url: '',
+      type: 'default',
+      redirected: false,
+      headers: __tbMakeHeaders([['location', resolved]], 'immutable'),
+    });
   }
   // <https://fetch.spec.whatwg.org/#dom-response-error>
   static error() {
-    const response = Object.create(globalThis.Response.prototype);
-    __tbResponseData.set(response, {
+    return __tbCreateResponse({
       stream: null,
       bodyUsed: false,
       status: 0,
@@ -568,36 +737,49 @@ globalThis.Response = class Response {
       redirected: false,
       headers: __tbMakeHeaders([], 'immutable'),
     });
-    return response;
   }
 };
-const __tbConsumeResponse = response => __tbConsumeBody(__tbBrand(response, __tbResponseData));
-const __tbResponseBytes = async body => {
-  if (body === null) return new Uint8Array(0);
-  if (body instanceof ReadableStream) {
+const __tbChunkBytes = chunk => {
+  if (chunk instanceof Uint8Array) return chunk;
+  if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  throw new TypeError('A body stream chunk must be a BufferSource');
+};
+const __tbReadAllBytes = async stream => {
+  const drained = __tbDrainClosedStream(stream);
+  if (drained !== null) {
     const chunks = [];
     let length = 0;
-    const reader = body.getReader();
-    while (true) {
-      const step = await reader.read();
-      if (step.done) break;
-      let chunk;
-      if (step.value instanceof Uint8Array) chunk = step.value;
-      else if (ArrayBuffer.isView(step.value)) chunk = new Uint8Array(step.value.buffer, step.value.byteOffset, step.value.byteLength);
-      else if (step.value instanceof ArrayBuffer) chunk = new Uint8Array(step.value);
-      else throw new TypeError('A body stream chunk must be a BufferSource');
-      chunks.push(chunk);
+    for (let index = 0; index < drained.length; index++) {
+      const chunk = __tbChunkBytes(drained[index]);
+      __tbArray.push(chunks, chunk);
       length += chunk.length;
     }
     const bytes = new Uint8Array(length);
     let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-    return bytes;
+    for (let index = 0; index < chunks.length; index++) {
+      bytes.set(chunks[index], offset);
+      offset += chunks[index].length;
+    }
+    return __tbReadResult(bytes);
   }
-  if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
-  if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
-  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength).slice();
-  return __tbUtf8Encode(String(body));
+  const chunks = [];
+  let length = 0;
+  const reader = stream.getReader();
+  while (true) {
+    const step = await reader.read();
+    if (step.done) break;
+    const chunk = __tbChunkBytes(step.value);
+    __tbArray.push(chunks, chunk);
+    length += chunk.length;
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (let index = 0; index < chunks.length; index++) {
+    bytes.set(chunks[index], offset);
+    offset += chunks[index].length;
+  }
+  return __tbReadResult(bytes);
 };
 Object.defineProperty(globalThis.Response.prototype, Symbol.toStringTag, { value: 'Response', writable: false, enumerable: false, configurable: true });
 const __tbLookupObjectUrl = url => {
@@ -620,27 +802,35 @@ const __tbRequestCache = value => {
   return cache;
 };
 const __tbRequestDuplex = value => {
-  const duplex = String(value);
-  if (duplex !== 'half' && duplex !== 'full') throw new TypeError('Invalid duplex mode');
-  return duplex;
+  if (String(value) !== 'half') throw new TypeError('Invalid duplex mode');
+  return 'half';
 };
 globalThis.Request = class Request {
   constructor(input, init) {
     const options = init === undefined ? {} : Object(init);
     const source = input instanceof globalThis.Request ? __tbBrand(input, __tbRequestData) : null;
-    const url = source === null
-      ? (host.__tbResolveUrl(String(input), undefined) ?? String(input))
-      : source.url;
+    let url;
+    if (source === null) {
+      const resolved = host.__tbResolveUrl(__tbToUSVString(input), undefined);
+      if (resolved === null) throw new TypeError('Invalid URL');
+      const parsed = new URL(resolved);
+      if (parsed.username !== '' || parsed.password !== '') throw new TypeError('URL with credentials');
+      url = resolved;
+    } else {
+      url = source.url;
+    }
     const method = options.method !== undefined ? __tbRequestMethod(options.method) : source === null ? 'GET' : source.method;
-    const headers = new __tbHeadersConstructor(options.headers !== undefined ? options.headers : source === null ? undefined : source.headers);
     const mode = options.mode !== undefined ? __tbRequestMode(options.mode) : source === null ? 'cors' : source.mode;
-    // The guard follows the mode: a no-cors request only accepts
-    // CORS-safelisted headers
-    // (<https://fetch.spec.whatwg.org/#concept-headers-guard>).
-    __tbHeadersGuard.set(headers, mode === 'no-cors' ? 'request-no-cors' : 'request');
+    const initHeaders = options.headers !== undefined ? options.headers : source === null ? undefined : source.headers;
+    // The guard is installed before the list is filled so construction cannot
+    // bypass it (<https://fetch.spec.whatwg.org/#concept-headers-guard>).
+    const headers = __tbNewHeaders(initHeaders, mode === 'no-cors' ? 'request-no-cors' : 'request');
     const credentials = options.credentials !== undefined ? __tbCredentialsMode(options.credentials) : source === null ? 'same-origin' : source.credentials;
     const redirect = options.redirect !== undefined ? __tbRedirectMode(options.redirect) : source === null ? 'follow' : source.redirect;
     const cache = options.cache !== undefined ? __tbRequestCache(options.cache) : source === null ? 'default' : source.cache;
+    if (cache === 'only-if-cached' && mode !== 'same-origin') {
+      throw new TypeError('only-if-cached requires same-origin mode');
+    }
     const integrity = options.integrity !== undefined ? String(options.integrity) : source === null ? '' : source.integrity;
     const keepalive = options.keepalive !== undefined ? Boolean(options.keepalive) : source === null ? false : source.keepalive;
     const duplex = options.duplex !== undefined ? __tbRequestDuplex(options.duplex) : source === null ? 'half' : source.duplex;
@@ -651,7 +841,7 @@ globalThis.Request = class Request {
       if (value === '' || value === 'about:client') {
         referrer = value;
       } else {
-        const resolved = host.__tbResolveUrl(value, undefined);
+        const resolved = host.__tbResolveUrl(__tbToUSVString(value), undefined);
         if (resolved === null) throw new TypeError('Invalid referrer');
         // A referrer cross-origin to the current settings object is not
         // exposed; it becomes "about:client"
@@ -663,9 +853,19 @@ globalThis.Request = class Request {
     } else {
       referrer = source === null ? 'about:client' : source.referrer;
     }
-    const signal = options.signal !== undefined ? options.signal : source === null ? new AbortController().signal : source.signal;
-    // A body inherited from a Request is transferred: the source becomes
-    // disturbed and the new request gets its own stream
+    let signal = options.signal !== undefined && options.signal !== null
+      ? options.signal
+      : source === null ? new AbortController().signal : source.signal;
+    if (typeof AbortSignal.any === 'function') {
+      signal = AbortSignal.any([signal]);
+    } else {
+      const controller = new AbortController();
+      if (signal.aborted) controller.abort(signal.reason);
+      else signal.addEventListener('abort', () => controller.abort(signal.reason));
+      signal = controller.signal;
+    }
+    // A body inherited from a Request is transferred through a proxy reader;
+    // the source becomes disturbed and the new request gets its own stream
     // (<https://fetch.spec.whatwg.org/#dom-request>).
     const inheritedBody = options.body === undefined && source !== null;
     if (inheritedBody && source.stream !== null && (__tbBodyUsed(source) || source.stream.locked)) {
@@ -673,9 +873,6 @@ globalThis.Request = class Request {
     }
     if (options.body !== undefined && options.body !== null && options.body instanceof ReadableStream && options.duplex === undefined) {
       throw new TypeError('A stream body requires duplex');
-    }
-    if (duplex === 'full') {
-      throw new TypeError('duplex "full" is not supported');
     }
     if ((method === 'GET' || method === 'HEAD') && (inheritedBody ? source.stream !== null : options.body !== undefined && options.body !== null)) {
       throw new TypeError('GET and HEAD requests cannot have a body');
@@ -686,31 +883,48 @@ globalThis.Request = class Request {
       throw new TypeError('Invalid request method for no-cors mode');
     }
     let stream;
+    let bodySize = 0;
     if (inheritedBody) {
       if (source.stream === null) {
         stream = null;
       } else {
-        const branches = source.stream.tee();
+        const reader = source.stream.getReader();
         source.bodyUsed = true;
-        stream = branches[0];
+        stream = new ReadableStream({
+          pull(controller) {
+            return reader.read().then(step => {
+              if (step.done) controller.close();
+              else controller.enqueue(step.value);
+            });
+          },
+        });
+        bodySize = source.bodySize === undefined ? 0 : source.bodySize;
       }
     } else {
       if (source !== null && source.stream !== null && !__tbBodyUsed(source) && !source.stream.locked) {
-        // Replacing the body still consumes the source request.
-        source.stream.tee();
+        // Replacing the body still consumes the source request in the
+        // vendored WPT revision this tree pins.
+        source.stream.getReader();
         source.bodyUsed = true;
       }
       const extracted = __tbExtractBody(options.body === undefined ? null : options.body);
-      if (extracted.type !== null && __tbApply(__tbHeadersGet, headers, ['content-type']) === null) {
-        __tbApply(__tbHeadersAppend, headers, ['content-type', extracted.type]);
+      if (extracted.type !== null && __tbHeadersLookupRaw(headers, 'content-type') === null) {
+        __tbHeadersAppendRaw(headers, 'content-type', extracted.type);
       }
       stream = __tbBodyStream(extracted);
+      bodySize = extracted.bytes === null ? 0 : extracted.bytes.length;
+    }
+    if (keepalive && stream !== null) {
+      throw new TypeError('A keepalive request cannot have a stream body');
+    }
+    if (stream !== null && mode !== 'same-origin' && mode !== 'cors') {
+      throw new TypeError('A stream body requires same-origin or cors mode');
     }
     // A Request keeps a blob URL's data alive, so fetching it still works
     // after revokeObjectURL (<https://w3c.github.io/FileAPI/#lifeTime>).
     const blob = source !== null ? source.blob : url.indexOf('blob:') === 0 ? __tbLookupObjectUrl(url) : null;
     __tbRequestData.set(this, {
-      url, method, blob, headers, stream, bodyUsed: false, mode, credentials, redirect,
+      url, method, blob, headers, stream, bodyUsed: false, bodySize, mode, credentials, redirect,
       referrer, referrerPolicy, cache, integrity, keepalive, duplex, signal,
       destination: source === null ? '' : source.destination,
       isReloadNavigation: false,
@@ -735,18 +949,15 @@ globalThis.Request = class Request {
   get isReloadNavigation() { return __tbBrand(this, __tbRequestData).isReloadNavigation; }
   get isHistoryNavigation() { return __tbBrand(this, __tbRequestData).isHistoryNavigation; }
   get signal() { return __tbBrand(this, __tbRequestData).signal; }
-  text() { return __tbConsumeBody(__tbBrand(this, __tbRequestData)).then(bytes => __tbDecodeBytes(bytes, 'utf-8', false, false)); }
+  text() { return __tbConsumeBody(__tbBrand(this, __tbRequestData)).then(result => __tbDecodeBytes(result.bytes, 'utf-8', false, false)); }
   json() { return this.text().then(JSON.parse); }
-  arrayBuffer() { return __tbConsumeBody(__tbBrand(this, __tbRequestData)).then(bytes => __tbBytesCopy(bytes).buffer); }
-  bytes() { return __tbConsumeBody(__tbBrand(this, __tbRequestData)).then(bytes => __tbBytesCopy(bytes)); }
-  // https://fetch.spec.whatwg.org/#dom-body-blob
+  arrayBuffer() { return __tbConsumeBody(__tbBrand(this, __tbRequestData)).then(result => __tbBytesCopy(result.bytes).buffer); }
+  bytes() { return __tbConsumeBody(__tbBrand(this, __tbRequestData)).then(result => __tbBytesCopy(result.bytes)); }
   blob() {
     const data = __tbBrand(this, __tbRequestData);
-    const header = __tbApply(__tbHeadersGet, data.headers, ['content-type']);
-    // The Blob type is the MIME type extracted from the header list
-    // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
+    const header = __tbHeadersLookupRaw(data.headers, 'content-type');
     const type = __tbBlobTypeFromHeader(header);
-    return __tbConsumeBody(data).then(bytes => __tbMakeBlob(bytes, type));
+    return __tbConsumeBody(data).then(result => __tbMakeBlob(result.bytes, type));
   }
   formData() {
     const data = __tbBrand(this, __tbRequestData);
@@ -757,7 +968,7 @@ globalThis.Request = class Request {
       }
       return Promise.reject(new TypeError('Body is not a form'));
     }
-    return __tbConsumeBody(data).then(bytes => __tbFormDataFromBytes(bytes, contentType));
+    return __tbConsumeBody(data).then(result => __tbFormDataFromBytes(result.bytes, contentType));
   }
   clone() {
     const data = __tbBrand(this, __tbRequestData);
@@ -770,66 +981,60 @@ globalThis.Request = class Request {
       stream = branches[1];
     }
     const copy = Object.create(globalThis.Request.prototype);
-    const headers = new __tbHeadersConstructor(data.headers);
-    __tbHeadersGuard.set(headers, __tbHeadersGuardOf(data.headers));
+    const headers = __tbMakeHeaders(
+      __tbArray.map(__tbHeadersList(data.headers), entry => [entry[0], entry[1]]),
+      __tbHeadersGuardOf(data.headers),
+    );
     __tbRequestData.set(copy, { ...data, stream, bodyUsed: false, headers });
     return copy;
   }
 };
 Object.defineProperty(globalThis.Request.prototype, Symbol.toStringTag, { value: 'Request', writable: false, enumerable: false, configurable: true });
-const __tbMakeResponse = (body, status, url, type, fields, responseType, redirected, bodyError) => {
+const __tbRequestConstructor = globalThis.Request;
+const __tbMakeResponse = (body, status, statusText, url, type, fields, responseType, redirected, bodyError) => {
   const headers = __tbMakeHeaders(fields, 'response');
-  if (type && __tbApply(__tbHeadersGet, headers, ['content-type']) === null) {
-    __tbApply(__tbHeadersAppend, headers, ['content-type', type]);
+  if (type && __tbHeadersLookupRaw(headers, 'content-type') === null) {
+    __tbHeadersAppendRaw(headers, 'content-type', type);
   }
-  // An opaque or network-error response carries status 0, which the public
-  // constructor rejects; build it with a placeholder and set the real status
-  // on the private state (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
-  const constructorStatus = status >= 200 && status <= 599 ? status : 200;
-  const nullBody = constructorStatus === 101 || constructorStatus === 204 ||
-    constructorStatus === 205 || constructorStatus === 304 ||
-    responseType === 'opaque' || responseType === 'opaqueredirect';
-  const response = new globalThis.Response(nullBody ? null : body, { status: constructorStatus, url, headers });
-  const data = __tbBrand(response, __tbResponseData);
-  data.status = status;
-  // A data: or blob: response uses the "OK" reason phrase; it did not come
-  // from an HTTP status line
-  // (<https://fetch.spec.whatwg.org/#scheme-fetch>).
-  if (status === 200 && (url.indexOf('data:') === 0 || url.indexOf('blob:') === 0)) {
-    data.statusText = 'OK';
-  }
-  // Network response headers are immutable
-  // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
-  __tbHeadersGuard.set(data.headers, 'immutable');
-  // The network path is the only source of a non-"default" type.
-  data.type = responseType;
-  data.redirected = redirected === true;
-  data.bodyError = bodyError === true;
-  return response;
+  __tbHeadersRecord(headers).guard = 'immutable';
+  const extracted = __tbExtractBody(bodyError ? null : body);
+  const stream = bodyError ? __tbErroredStream() : __tbBodyStream(extracted);
+  return __tbCreateResponse({
+    stream,
+    bodyUsed: false,
+    status,
+    statusText: statusText === undefined ? '' : String(statusText),
+    url: url === undefined ? '' : String(url),
+    type: responseType,
+    redirected: redirected === true,
+    headers,
+  });
 };
+
 // <https://fetch.spec.whatwg.org/#bodyinit-safely-extract>
 const __tbPageRequestBody = async body => {
   if (body === null || body === undefined) return { bytes: [], type: null };
   if (body instanceof ReadableStream) {
-    return { bytes: Array.from(await __tbResponseBytes(body)), type: null };
+    const result = await __tbReadAllBytes(body);
+    return { bytes: Array.from(result.bytes), type: null };
   }
   const extracted = __tbExtractBody(body);
   return { bytes: extracted.bytes === null ? [] : Array.from(extracted.bytes), type: extracted.type };
 };
 const __tbQueuePageRequest = (url, method, body, headers, cors, referrer, callback) => {
   const id = ++host.__tb_fetchSeq;
-  host.__tb_fetchCbs[id] = function(status, bytes, finalUrl, contentType, responseHeaders, responseType, bodyError) {
+  host.__tb_fetchCbs[id] = function(outcome) {
     delete host.__tb_fetchCbs[id];
-    callback(status, bytes, finalUrl, contentType, responseHeaders, responseType, bodyError);
+    callback(outcome);
   };
   __tbPageRequestBody(body).then(payload => {
     if (!host.__tb_fetchCbs[id]) return;
     const type = __tbApply(__tbHeadersGet, headers, ['content-type']) === null ? payload.type : null;
     const fields = __tbArray.map(__tbSortedHeaders(headers), entry => [entry[0], entry[1]]);
     host.__queueFetch(url, id, method, payload.bytes, type, fields, [referrer === null || referrer === undefined ? '' : String(referrer), cors.mode, cors.credentials, cors.redirect]);
-  }, () => {
+  }).catch(() => {
     const done = host.__tb_fetchCbs[id];
-    if (done) done(0, new Uint8Array(), '', '', [], 'error');
+    if (done) done({ status: 0, statusText: '', body: new Uint8Array(0), url: '', contentType: '', headers: [], responseType: 'error', bodyError: false });
   });
   return id;
 };
@@ -858,82 +1063,77 @@ const __tbParseRange = (value, length) => {
   if (end >= length) end = length - 1;
   return { start, end };
 };
-const __tbBodySize = body => {
-  if (body === null || body === undefined) return 0;
-  if (typeof body === 'string') return __tbUtf8Encode(body).length;
-  if (body instanceof Blob) return body.size;
-  if (body instanceof ArrayBuffer) return body.byteLength;
-  if (ArrayBuffer.isView(body)) return body.byteLength;
-  if (body instanceof URLSearchParams) return __tbUtf8Encode(String(body)).length;
-  if (body instanceof FormData) return __tbFormDataBody(body).bytes.length;
-  return 0;
+const __tbReferrerForPolicy = (source, target, policy) => {
+  if (source === '' || source === null || source === undefined) return '';
+  let sourceURL;
+  let targetURL;
+  try {
+    sourceURL = new URL(source);
+    targetURL = new URL(target);
+  } catch (error) {
+    return '';
+  }
+  const sameOrigin = sourceURL.origin === targetURL.origin;
+  const downgrade = sourceURL.protocol === 'https:' && targetURL.protocol !== 'https:';
+  const origin = sourceURL.origin + '/';
+  switch (policy) {
+    case 'no-referrer':
+      return '';
+    case 'same-origin':
+      return sameOrigin ? sourceURL.href : '';
+    case 'origin':
+      return origin;
+    case 'strict-origin':
+      return downgrade ? '' : origin;
+    case 'origin-when-cross-origin':
+      return sameOrigin ? sourceURL.href : origin;
+    case 'strict-origin-when-cross-origin':
+      return downgrade ? '' : sameOrigin ? sourceURL.href : origin;
+    case 'unsafe-url':
+      return sourceURL.href;
+    case '':
+    case 'no-referrer-when-downgrade':
+      return downgrade ? '' : sourceURL.href;
+    default:
+      return '';
+  }
+};
+const __tbDetermineReferrer = (data, target) => {
+  // With no explicit policy the client's document policy decides; the host
+  // helper owns the scheme, downgrade, and credential rules
+  // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+  if (data.referrer === 'about:client' && data.referrerPolicy === '') {
+    const referrer = host.__tbReferrer(target);
+    return referrer === null || referrer === undefined ? '' : referrer;
+  }
+  let source = data.referrer;
+  if (source === 'about:client') {
+    source = host.__tbResolveUrl('', undefined);
+    if (source === null) return '';
+  }
+  const policy = data.referrerPolicy === '' ? 'strict-origin-when-cross-origin' : data.referrerPolicy;
+  return __tbReferrerForPolicy(source, target, policy);
 };
 globalThis.fetch = function(input, init) {
-  const options = init === undefined ? {} : Object(init);
-  let url;
-  let method = 'GET';
-  let blob = null;
-  let headers = new __tbHeadersConstructor();
-  let body = null;
-  let mode = 'cors';
-  let credentials = 'same-origin';
-  let redirect = 'follow';
-  let referrer = null;
-  let signal = null;
-  let keepalive = false;
-  if (input instanceof globalThis.Request) {
-    const source = __tbBrand(input, __tbRequestData);
-    url = source.url;
-    method = source.method;
-    blob = source.blob;
-    headers = new __tbHeadersConstructor(source.headers);
-    body = source.stream;
-    mode = source.mode;
-    credentials = source.credentials;
-    redirect = source.redirect;
-    referrer = source.referrer === 'about:client' ? host.__tbReferrer(url) : source.referrer;
-    signal = source.signal;
-    keepalive = source.keepalive;
-    if (source.stream !== null && (__tbBodyUsed(source) || source.stream.locked)) {
-      return Promise.reject(new TypeError('Body already used'));
-    }
-  } else {
-    const resolved = host.__tbResolveUrl(String(input), undefined);
-    url = resolved === null ? String(input) : resolved;
-    referrer = host.__tbReferrer(url);
-  }
+  let request;
   try {
-    if (options.method !== undefined) method = __tbRequestMethod(options.method);
-    if (options.headers !== undefined) headers = new __tbHeadersConstructor(options.headers);
-    if (options.body !== undefined) body = options.body;
-    if (options.mode !== undefined) mode = __tbRequestMode(options.mode);
-    if (options.credentials !== undefined) credentials = __tbCredentialsMode(options.credentials);
-    if (options.redirect !== undefined) redirect = __tbRedirectMode(options.redirect);
-    if (options.signal !== undefined) signal = options.signal;
-    if (options.keepalive !== undefined) keepalive = Boolean(options.keepalive);
-    if (mode === 'no-cors' && !__tbCorsSafelistedMethod(method)) {
-      throw new TypeError('Invalid request method for no-cors mode');
-    }
-    if ((method === 'GET' || method === 'HEAD') && body !== null) {
-      throw new TypeError('GET and HEAD requests cannot have a body');
-    }
+    request = new __tbRequestConstructor(input, init);
   } catch (error) {
     return Promise.reject(error);
   }
-  // A user agent supplies Accept and Accept-Language when the page did not
-  // (<https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>).
-  if (__tbApply(__tbHeadersGet, headers, ['accept']) === null) {
-    __tbApply(__tbHeadersAppend, headers, ['accept', '*/*']);
-  }
-  if (__tbApply(__tbHeadersGet, headers, ['accept-language']) === null) {
-    __tbApply(__tbHeadersAppend, headers, ['accept-language', 'en-US']);
-  }
-  if (body === null && (method === 'POST' || method === 'PUT') &&
-      __tbApply(__tbHeadersGet, headers, ['content-length']) === null) {
-    __tbApply(__tbHeadersAppend, headers, ['content-length', '0']);
-  }
+  const data = __tbBrand(request, __tbRequestData);
+  const url = data.url;
+  const method = data.method;
+  const headers = data.headers;
+  const body = data.stream;
+  const mode = data.mode;
+  const credentials = data.credentials;
+  const redirect = data.redirect;
+  const referrer = __tbDetermineReferrer(data, url);
+  const signal = data.signal;
+  const keepalive = data.keepalive;
   return new Promise(function(resolve, reject) {
-    if (signal !== null && signal !== undefined && signal.aborted) {
+    if (signal.aborted) {
       reject(signal.reason);
       return;
     }
@@ -941,7 +1141,7 @@ globalThis.fetch = function(input, init) {
     let settled = false;
     let quota = 0;
     if (keepalive) {
-      quota = __tbBodySize(body);
+      quota = data.bodySize === undefined ? 0 : data.bodySize;
       if (quota > __tbKeepaliveAvailable) {
         reject(new TypeError('Keepalive quota exceeded'));
         return;
@@ -952,15 +1152,15 @@ globalThis.fetch = function(input, init) {
       if (settled) return;
       settled = true;
       if (quota !== 0) __tbKeepaliveAvailable += quota;
-      __tbCancelPageRequest(requestID);
+      if (requestID !== null) __tbCancelPageRequest(requestID);
       reject(signal.reason);
     };
-    if (signal !== null && signal !== undefined) signal.addEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort);
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
       if (quota !== 0) __tbKeepaliveAvailable += quota;
-      if (signal !== null && signal !== undefined) signal.removeEventListener('abort', onAbort);
+      signal.removeEventListener('abort', onAbort);
       callback(value);
     };
     if (url.indexOf('blob:') === 0) {
@@ -968,14 +1168,14 @@ globalThis.fetch = function(input, init) {
         finish(reject, new TypeError('Failed to fetch'));
         return;
       }
-      const entry = blob === null ? __tbLookupObjectUrl(url) : blob;
+      const entry = data.blob === null ? __tbLookupObjectUrl(url) : data.blob;
       if (entry === null) {
         finish(reject, new TypeError('Failed to fetch'));
         return;
       }
-      const range = __tbApply(__tbHeadersGet, headers, ['range']);
+      const range = __tbHeadersLookupRaw(headers, 'range');
       if (range === null) {
-        finish(resolve, __tbMakeResponse(entry.contents, 200, url, entry.type, [], 'basic', false, false));
+        finish(resolve, __tbMakeResponse(entry.contents, 200, 'OK', url, entry.type, [], 'basic', false, false));
         return;
       }
       const contents = typeof entry.contents === 'string' ? __tbUtf8Encode(entry.contents) : entry.contents;
@@ -991,19 +1191,27 @@ globalThis.fetch = function(input, init) {
       ];
       finish(resolve, __tbMakeResponse(
         __tbBytesCopy(contents, parsed.start, parsed.end + 1),
-        206, url, entry.type, fields, 'basic', false, false,
+        206, 'Partial Content', url, entry.type, fields, 'basic', false, false,
       ));
       return;
     }
-    requestID = __tbQueuePageRequest(url, method, body, headers, { mode, credentials, redirect }, referrer, (status, bytes, finalUrl, type, fields, responseType, bodyError) => {
+    requestID = __tbQueuePageRequest(url, method, body, headers, { mode, credentials, redirect }, referrer, outcome => {
+      const status = outcome.status;
+      const statusText = outcome.statusText;
+      const bytes = outcome.body;
+      const finalUrl = outcome.url;
+      const type = outcome.contentType;
+      const fields = outcome.headers;
+      const responseType = outcome.responseType;
+      const bodyError = outcome.bodyError;
       if (responseType !== 'error') {
         // A manual redirect is an opaque-redirect filtered response
         // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque-redirect>).
         if (redirect === 'manual' && (status === 301 || status === 302 || status === 303 || status === 307 || status === 308)) {
-          finish(resolve, __tbMakeResponse(null, 0, '', '', [], 'opaqueredirect', false, false));
+          finish(resolve, __tbMakeResponse(null, 0, '', url, '', [], 'opaqueredirect', false, false));
           return;
         }
-        const response = __tbMakeResponse(bytes, status, finalUrl, type, fields, responseType, finalUrl !== url, bodyError);
+        const response = __tbMakeResponse(bytes, status, statusText, finalUrl, type, fields, responseType, finalUrl !== url, bodyError);
         // A HEAD response has no body regardless of what the wire carried
         // (<https://fetch.spec.whatwg.org/#concept-head>).
         if (method === 'HEAD') __tbBrand(response, __tbResponseData).stream = null;

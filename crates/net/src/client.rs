@@ -421,6 +421,27 @@ impl Agent {
             previous_url: None,
             origin_tainted: false,
         };
+        // Defaults every browser request carries. They live here, not in the
+        // renderer, so XHR and subresources get the same values and page
+        // scripts cannot override them.
+        if hop.headers.value("accept").is_none() {
+            hop.headers
+                .append(header::ACCEPT, HeaderValue::from_static("*/*"));
+        }
+        if hop.headers.value("accept-language").is_none() {
+            hop.headers
+                .append(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
+        }
+        let empty_body = hop.body.as_ref().is_none_or(Vec::is_empty);
+        if empty_body
+            && (hop.method == Method::POST
+                || hop.method == Method::PUT
+                || hop.method == Method::PATCH)
+            && hop.headers.value("content-length").is_none()
+        {
+            hop.headers
+                .append(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        }
         let mut url = request.url;
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
@@ -533,6 +554,11 @@ impl Agent {
             .await?;
         let response = Response {
             status,
+            status_text: hyper::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|status| status.canonical_reason())
+                .unwrap_or("")
+                .to_owned(),
             headers: response_headers,
             final_url: url.clone(),
             body: Body {
@@ -959,6 +985,7 @@ impl Body {
 #[derive(Debug)]
 pub struct Response {
     status: u16,
+    status_text: String,
     headers: HeaderMap,
     final_url: Url,
     body: Body,
@@ -970,6 +997,12 @@ impl Response {
     #[must_use]
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    /// HTTP reason phrase, for the `Response.statusText` getter.
+    #[must_use]
+    pub fn status_text(&self) -> &str {
+        &self.status_text
     }
 
     /// How the response was filtered: basic, CORS, or opaque

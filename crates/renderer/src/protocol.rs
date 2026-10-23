@@ -504,6 +504,8 @@ fn default_dial_method() -> String {
 pub struct DialOutcome {
     /// HTTP status.
     pub status: u16,
+    /// HTTP reason phrase, or `"OK"` for scheme fetches.
+    pub status_text: String,
     /// Final URL after redirects.
     pub final_url: String,
     /// Every `Content-Type` response header value joined with `", "`, when
@@ -518,7 +520,6 @@ pub struct DialOutcome {
     /// The body could not be decoded for its `Content-Encoding`; consuming it
     /// rejects instead of returning bytes
     /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
-    #[serde(default)]
     pub body_error: bool,
     /// How the response was filtered
     /// (<https://fetch.spec.whatwg.org/#concept-response-type>); `basic` for
@@ -540,6 +541,7 @@ impl DialOutcome {
     ) -> Self {
         Self {
             status,
+            status_text: String::new(),
             final_url,
             content_type,
             headers,

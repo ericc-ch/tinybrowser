@@ -444,44 +444,54 @@ impl JsRealm {
                 // document parser, it never adds a field to a `fetch`
                 // Response, and `blob().type` reads the header list
                 // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-                let (status, body, url, content_type, headers, response_type, body_error) =
-                    match outcome {
-                        Some(outcome) => (
-                            i32::from(outcome.status),
-                            outcome.body,
-                            outcome.final_url,
-                            outcome.content_type.unwrap_or_default(),
-                            outcome
-                                .headers
-                                .into_iter()
-                                .map(|(name, value)| vec![name, value])
-                                .collect::<Vec<_>>(),
-                            outcome.response_type.as_str().to_owned(),
-                            outcome.body_error,
-                        ),
-                        // A failed dial is a network error: the renderer rejects
-                        // and `Response.type` never becomes observable
-                        // (<https://fetch.spec.whatwg.org/#concept-network-error>).
-                        None => (
-                            0,
-                            Vec::new(),
-                            String::new(),
-                            String::new(),
-                            Vec::new(),
-                            "error".to_owned(),
-                            false,
-                        ),
-                    };
-                let bytes = TypedArray::new(ctx.clone(), body)?;
-                if let Err(error) = func.call::<_, ()>((
+                let (
                     status,
-                    bytes,
+                    status_text,
+                    body,
                     url,
                     content_type,
                     headers,
                     response_type,
                     body_error,
-                )) {
+                ) = match outcome {
+                    Some(outcome) => (
+                        i32::from(outcome.status),
+                        outcome.status_text,
+                        outcome.body,
+                        outcome.final_url,
+                        outcome.content_type.unwrap_or_default(),
+                        outcome
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| vec![name, value])
+                            .collect::<Vec<_>>(),
+                        outcome.response_type.as_str().to_owned(),
+                        outcome.body_error,
+                    ),
+                    // A failed dial is a network error: the renderer rejects
+                    // and `Response.type` never becomes observable
+                    // (<https://fetch.spec.whatwg.org/#concept-network-error>).
+                    None => (
+                        0,
+                        String::new(),
+                        Vec::new(),
+                        String::new(),
+                        String::new(),
+                        Vec::new(),
+                        "error".to_owned(),
+                        false,
+                    ),
+                };
+                let outcome = Object::new(ctx.clone())?;
+                outcome.set("status", status)?;
+                outcome.set("statusText", status_text)?;
+                outcome.set("body", TypedArray::new(ctx.clone(), body)?)?;
+                outcome.set("url", url)?;
+                outcome.set("contentType", content_type)?;
+                outcome.set("headers", headers)?;
+                outcome.set("responseType", response_type)?;
+                outcome.set("bodyError", body_error)?;
+                if let Err(error) = func.call::<_, ()>((outcome,)) {
                     bindings::host::report_callback_error(&ctx, &error);
                 }
                 Ok(())

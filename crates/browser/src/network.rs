@@ -3,7 +3,7 @@
 //! Tab coordinators receive [`TabNetworkHandle`]. They do not expose or own
 //! [`net::Agent`].
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,11 @@ pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`renderer::MAX_RESPONSE_BODY_BYTES`]. This limit is the control reply,
 /// including a child frame whose response is returned in that reply.
 pub(crate) const CONTROL_BODY_LIMIT: usize = 1_048_576;
+
+/// Upper bound on one decoded response body. The compressed input is capped by
+/// [`CONTROL_BODY_LIMIT`], but gzip and brotli can expand by orders of
+/// magnitude; the decoded side needs its own bound.
+const MAX_DECODED_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// One completed navigation dial: the response head the tab mounts plus the
 /// streaming body.
@@ -263,24 +268,29 @@ impl TabNetworkHandle {
                 .collect();
             // An opaque response hides its body as well as its status and
             // headers (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+            let status_text = response.status_text().to_owned();
             let (body, body_error) = if request.read_body && !response_type.is_opaque() {
                 let raw = response
                     .into_body()
                     .bytes(CONTROL_BODY_LIMIT)
                     .await
                     .map_err(|error| dial_failure(&error))?;
+                let null_body = has_null_body(request, &raw, status);
                 match content_encoding {
-                    Some(encoding) => match decode_content_encoding(&raw, &encoding) {
-                        Some(decoded) => (decoded, false),
-                        None => (raw, true),
-                    },
-                    None => (raw, false),
+                    Some(encoding) if !null_body => {
+                        match decode_content_encoding(&raw, &encoding) {
+                            Some(decoded) => (decoded, false),
+                            None => (raw, true),
+                        }
+                    }
+                    _ => (raw, false),
                 }
             } else {
                 (Vec::new(), false)
             };
             Ok(DialOutcome {
                 status: if response_type.is_opaque() { 0 } else { status },
+                status_text,
                 // An opaque filtered response has an empty URL list, so
                 // `Response.url` must not reveal where the request landed
                 // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
@@ -459,15 +469,6 @@ fn outbound_request(
             .insert(name, value.as_bytes())
             .map_err(|_| DialFailure::Connect)?;
     }
-    if request.kind == DialKind::JsFetch
-        && request.body.is_empty()
-        && matches!(
-            outbound.method.as_str().to_ascii_uppercase().as_str(),
-            "POST" | "PUT"
-        )
-    {
-        let _ = outbound.headers.insert("content-length", b"0");
-    }
     if let Some(referrer) = &request.referrer
         // Defense in depth: the renderer computes this per `referrer_for_policy`,
         // but the network boundary re-validates so a compromised renderer cannot
@@ -520,6 +521,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         .take()?;
     Some(DialOutcome {
         status: 0,
+        status_text: String::new(),
         final_url: url.to_string(),
         content_type: None,
         headers: Vec::new(),
@@ -631,41 +633,89 @@ fn content_encoding_header(headers: &net::HeaderMap) -> Option<String> {
     (!values.is_empty()).then(|| values.join(", "))
 }
 
-/// Decodes a response body for the `Content-Encoding` list. `None` is a
-/// network error, the same result a browser gives for a coding it cannot
-/// decode. `zstd` stays unsupported: it is not in the dependency tree yet.
+/// Statuses and methods whose response body is null regardless of the wire
+/// bytes (<https://fetch.spec.whatwg.org/#null-body-status>).
+fn has_null_body(request: &DialRequest, body: &[u8], status: u16) -> bool {
+    body.is_empty()
+        || request.method.eq_ignore_ascii_case("HEAD")
+        || matches!(status, 101 | 204 | 205 | 304)
+}
+
+/// Decodes a response body for the `Content-Encoding` list. `None` means a
+/// supported coding failed or exceeded [`MAX_DECODED_BODY_BYTES`]; unsupported
+/// codings leave the bytes untouched, which is what the Fetch spec asks for
+/// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>). `zstd` is
+/// still unsupported, so zstd responses pass through compressed.
 fn decode_content_encoding(body: &[u8], encoding: &str) -> Option<Vec<u8>> {
-    let codings: Vec<String> = encoding
-        .split(',')
-        .map(|coding| coding.trim().to_ascii_lowercase())
-        .collect();
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
     let mut data = body.to_vec();
-    for coding in codings.iter().rev() {
-        data = match coding.as_str() {
-            "identity" => data,
-            "gzip" | "x-gzip" => {
-                let mut decoded = Vec::new();
-                flate2::read::GzDecoder::new(&data[..])
-                    .read_to_end(&mut decoded)
-                    .ok()?;
-                decoded
+    for coding in encoding.split(',').rev() {
+        let coding = coding.trim();
+        if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
+            continue;
+        }
+        data = if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
+            decode_with_limit(flate2::read::MultiGzDecoder::new(&data[..]))?
+        } else if coding.eq_ignore_ascii_case("deflate") {
+            let zlib_wrapped = data.len() >= 2
+                && (data[0] & 0x0f) == 8
+                && (u16::from(data[0]) << 8 | u16::from(data[1])) % 31 == 0;
+            if zlib_wrapped {
+                decode_with_limit(flate2::read::ZlibDecoder::new(&data[..]))?
+            } else {
+                decode_with_limit(flate2::read::DeflateDecoder::new(&data[..]))?
             }
-            "deflate" => {
-                let mut decoded = Vec::new();
-                flate2::read::ZlibDecoder::new(&data[..])
-                    .read_to_end(&mut decoded)
-                    .ok()?;
-                decoded
-            }
-            "br" => {
-                let mut decoded = Vec::new();
-                brotli_decompressor::BrotliDecompress(&mut &data[..], &mut decoded).ok()?;
-                decoded
-            }
-            _ => return None,
+        } else if coding.eq_ignore_ascii_case("br") {
+            let mut decoded = LimitedWriter::new();
+            brotli_decompressor::BrotliDecompress(&mut &data[..], &mut decoded).ok()?;
+            decoded.into_inner()
+        } else {
+            // Unsupported coding: leave the bytes untouched.
+            continue;
         };
     }
     Some(data)
+}
+
+fn decode_with_limit(reader: impl Read) -> Option<Vec<u8>> {
+    let mut decoded = Vec::new();
+    reader
+        .take(MAX_DECODED_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut decoded)
+        .ok()?;
+    (decoded.len() <= MAX_DECODED_BODY_BYTES).then_some(decoded)
+}
+
+/// A writer that refuses to grow past [`MAX_DECODED_BODY_BYTES`]. Brotli takes
+/// a writer rather than a reader, so `take` cannot bound it.
+struct LimitedWriter {
+    data: Vec<u8>,
+}
+
+impl LimitedWriter {
+    fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.data
+    }
+}
+
+impl Write for LimitedWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.data.len() + buffer.len() > MAX_DECODED_BODY_BYTES {
+            return Err(std::io::Error::other("decoded body limit exceeded"));
+        }
+        self.data.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Network-boundary `Referer` check: rejects only a true downgrade (https
@@ -757,5 +807,54 @@ mod tests {
         assert!(sends_default_ua_client_hints(
             &Url::parse("http://localhost/").expect("localhost")
         ));
+    }
+
+    use flate2::Compression;
+    use flate2::write::{DeflateEncoder, GzEncoder};
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn decodes_every_gzip_member() {
+        let mut body = gzip(b"one");
+        body.extend(gzip(b"two"));
+        assert_eq!(decode_content_encoding(&body, "gzip").unwrap(), b"onetwo");
+    }
+
+    #[test]
+    fn decodes_raw_deflate() {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(b"deflated").unwrap();
+        let body = encoder.finish().unwrap();
+        assert_eq!(
+            decode_content_encoding(&body, "deflate").unwrap(),
+            b"deflated"
+        );
+    }
+
+    #[test]
+    fn leaves_unsupported_coding_untouched() {
+        assert_eq!(
+            decode_content_encoding(b"zstd bytes", "zstd").unwrap(),
+            b"zstd bytes"
+        );
+    }
+
+    #[test]
+    fn empty_body_skips_decoding() {
+        assert_eq!(
+            decode_content_encoding(b"", "gzip").unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn refuses_decoded_bodies_past_the_limit() {
+        let body = gzip(&vec![0; MAX_DECODED_BODY_BYTES + 1]);
+        assert!(decode_content_encoding(&body, "gzip").is_none());
     }
 }
