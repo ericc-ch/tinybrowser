@@ -11,6 +11,12 @@ binary via cargo each run; --binary PATH uses a prebuilt binary as-is.
 Paths and our flags first; literal -- starts upstream flags.
 --exclude=worker skips Worker variants too. Prove with `... selftest`.
 
+A linked worktree may leave third_party/wpt uninitialized: the harness
+falls back to the canonical checkout (the first `git worktree list`
+entry), and `check_pin` still compares that checkout's HEAD with the
+worktree's gitlink. Use `--wpt-root` for a different pin;
+`--allow-pin-mismatch` only when the difference is known to be harmless.
+
 Tight loop: --score prints per-directory buckets; --save-report keeps
 the wptreport; rerun feeds attention-tests back (TIMEOUTs excluded
 unless --include-timeout); --dry-run lists the selection. profile

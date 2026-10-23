@@ -37,6 +37,7 @@ Maximize web spec conformance per byte.
 - **Web API bindings & IDL**: Read `docs/bindings.md` for JS/Rust ownership, WebIDL contracts, and platform objects.
 - **Engine behavior**: Read `docs/engines.md` to search and fetch Chromium/Firefox sources without cloning.
 - **Engine forks & submodules**: Read `third_party/README.md` for submodule maintenance, fork branches, and update workflows.
+- **Linked worktrees**: Run `tools/worktree-init` after `git worktree add`. It shares submodule objects with the canonical checkout and leaves WPT to the harness's canonical-checkout fallback; see `third_party/README.md`. Do not initialize a linked worktree with a bare `git submodule update --init --recursive`; it clones object stores and unused upstream test fixtures again.
 - **WPT & conformance harness**: Read `tools/wpt/README.md` for test runners, scoring, and failure diffing. Check `.github/workflows/wpt.yml` runs (`gh run list --workflow=wpt.yml`) against `docs/progress.md` for regressions.
 - **Upstream gaps, priorities, snapshot**: See `docs/upstream.md`, `docs/priorities.md`, `docs/progress.md`.
 - **Project notes**: `~/Documents/obsidian/everything/projects/tinybrowser/`

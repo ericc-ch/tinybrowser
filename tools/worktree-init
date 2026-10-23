@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Initialize a linked worktree's build submodules without cloning them again.
+#
+#   tools/worktree-init
+#
+# A linked worktree shares the superproject's object database, but every
+# submodule it initializes is a separate clone with its own object store. This
+# points each new submodule clone at the canonical checkout's clone with
+# `--reference`: the worktree gets its own checkout and refs (so branches and
+# pins can diverge), but immutable objects are read from the canonical store
+# instead of being fetched and stored a second time.
+#
+# WPT is 1.2 GB of test data, so it is not initialized here.
+# tools/wpt/cli.py resolves the canonical checkout through `git worktree list`
+# and still runs this worktree's binary against the full suite. A branch that
+# needs a different WPT pin uses a checkout at that revision and --wpt-root.
+#
+# Keep the canonical checkout: the alternates point into it.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+GIT_DIR="$(cd "$(git rev-parse --git-dir)" && pwd -P)"
+COMMON_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+
+if [[ "$GIT_DIR" == "$COMMON_DIR" ]]; then
+  echo "worktree-init: run this from a linked worktree, not the canonical checkout" >&2
+  echo "worktree-init: a fresh clone initializes with:" >&2
+  echo "  git submodule update --init third_party/blitz third_party/html5ever third_party/rquickjs" >&2
+  echo "  git -C third_party/rquickjs submodule update --init sys/quickjs" >&2
+  exit 2
+fi
+
+# The main worktree is the first porcelain entry; cli.py uses the same rule.
+WORKTREES="$(git worktree list --porcelain)"
+PRIMARY="${WORKTREES%%$'\n'*}"
+PRIMARY="${PRIMARY#worktree }"
+WPT="$PRIMARY/third_party/wpt"
+
+# Per-worktree config, so the canonical checkout and CI still initialize WPT.
+git config extensions.worktreeConfig true
+
+if [[ -f "$ROOT/third_party/wpt/wpt" ]]; then
+  # A branch that deliberately keeps its own WPT checkout keeps it and its
+  # update setting; leave that decision alone.
+  echo "worktree-init: keeping the existing WPT checkout at third_party/wpt" >&2
+else
+  git config --worktree submodule.third_party/wpt.update none
+  if [[ ! -f "$WPT/wpt" ]]; then
+    echo "worktree-init: warning: no WPT checkout at $WPT" >&2
+    echo "worktree-init: run 'git submodule update --init third_party/wpt' there" >&2
+  fi
+fi
+
+init_submodule() {
+  local path="$1" module
+  if [[ -L "$path" ]]; then
+    echo "worktree-init: $path is a symlink; this worktree needs its own checkout" >&2
+    echo "worktree-init: remove the link and rerun; objects are still shared" >&2
+    exit 1
+  fi
+  if [[ -e "$path" && ! -e "$path/.git" ]] \
+    && [[ -n "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "worktree-init: $path has files but no .git metadata" >&2
+    echo "worktree-init: remove it and rerun; copied files have no history to keep" >&2
+    exit 1
+  fi
+  module="$COMMON_DIR/modules/$path"
+  if [[ -d "$module/objects" ]]; then
+    echo "worktree-init: $path (objects from $module)"
+    git submodule update --init --reference "$module" "$path"
+  else
+    echo "worktree-init: $path (canonical clone missing; cloning normally)" >&2
+    git submodule update --init "$path"
+  fi
+}
+
+for path in third_party/blitz third_party/html5ever third_party/rquickjs; do
+  init_submodule "$path"
+done
+
+# rquickjs carries its own submodule; its canonical gitdir is nested under the
+# rquickjs clone, not under the top-level modules/ directory.
+NESTED="$COMMON_DIR/modules/third_party/rquickjs/modules/rquickjs-sys/quickjs"
+if [[ -d "$NESTED/objects" ]]; then
+  echo "worktree-init: third_party/rquickjs/sys/quickjs (objects from $NESTED)"
+  git -C third_party/rquickjs submodule update --init --reference "$NESTED" sys/quickjs
+else
+  echo "worktree-init: third_party/rquickjs/sys/quickjs (canonical clone missing; cloning normally)" >&2
+  git -C third_party/rquickjs submodule update --init sys/quickjs
+fi
+
+echo "worktree-init: done; WPT runs from $WPT"

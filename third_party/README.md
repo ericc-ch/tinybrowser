@@ -4,6 +4,29 @@ Submodules for living forks we rebase; vendored copies for small frozen
 deltas; snapshots for test input. Only the forks and vendored crates
 ship in the binary.
 
+## Linked worktrees
+
+A linked worktree needs the build submodules but not a second copy of
+their objects, and not the 1.2 GB WPT tree. After `git worktree add`,
+run:
+
+    tools/worktree-init
+
+It initializes blitz, html5ever, rquickjs, and rquickjs's nested
+sys/quickjs with the canonical checkout's clones as git alternates: the
+worktree keeps its own checkouts and refs, while immutable objects are
+read from the canonical store. It also sets
+`submodule.third_party/wpt.update=none` in that worktree's config, so a
+later `git submodule update --init` skips WPT (`--recursive` also pulls
+upstream test fixtures the build does not use). The harness resolves the
+canonical WPT checkout through `git worktree list` and still runs the
+worktree's binary against the full suite. A branch that bumps the WPT pin
+needs its own checkout plus `--wpt-root`.
+
+Keep the canonical checkout: the alternates point into it. Initialize
+worktrees with this script, not a bare `git submodule update --init`,
+which clones each submodule's object store again.
+
 ## Forks (submodules, ship in binary)
 
 - rquickjs + QuickJS-NG at third_party/rquickjs (nested sys/quickjs).
@@ -13,8 +36,8 @@ ship in the binary.
 - html5ever at third_party/html5ever, branch master.
   [patch.crates-io] xml5ever only; builds against registry markup5ever.
 - Update: pull upstream in the submodule, push the fork branch, bump
-  the pointer here. Check pins with git submodule status. Fresh clones:
-  git submodule update --init --recursive.
+  the pointer here. Check pins with git submodule status. Fresh clones
+  (canonical checkout): git submodule update --init --recursive.
 
 ## Vendored crates (ship in binary)
 
