@@ -1,6 +1,6 @@
 # Upstream bugs
 
-Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as known-fails.
+Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as known-fails. On fork syncs, upstream wins conflicts: take upstream's shape and re-apply the fork patch on top of it, even where the fork had fixed the code the change rewrites — the fork carries fixes upstream has not taken yet, not a competing design.
 
 ## Fork changes
 
