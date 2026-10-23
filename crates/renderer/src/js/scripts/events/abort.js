@@ -63,6 +63,20 @@
     },
     writable: true, enumerable: true, configurable: true,
   });
+  Object.defineProperty(AbortSignal, 'any', {
+    value: function(signals) {
+      const controller = new AbortController();
+      for (const signal of signals) {
+        if (signal.aborted) {
+          controller.abort(signal.reason);
+          break;
+        }
+        signal.addEventListener('abort', () => controller.abort(signal.reason));
+      }
+      return controller.signal;
+    },
+    writable: true, enumerable: true, configurable: true,
+  });
   function AbortController() {
     if (new.target === undefined) {
       throw new TypeError('Class constructor AbortController cannot be invoked without new');

@@ -395,6 +395,9 @@ const __tbReadResult = bytes => {
   return result;
 };
 const __tbConsumeBody = data => {
+  if (data.bodySignal !== undefined && data.bodySignal !== null && data.bodySignal.aborted) {
+    return Promise.reject(data.bodySignal.reason);
+  }
   if (data.stream === null) return Promise.resolve(__tbReadResult(new __tbUint8Array(0)));
   if (data.stream.locked || __tbBodyUsed(data)) return Promise.reject(new TypeError('Body already used'));
   data.bodyUsed = true;
@@ -418,6 +421,34 @@ const __tbInstallBody = (proto, slots) => {
     bodyUsed: {
       get() { return __tbBodyUsed(__tbBodyData(this, slots)); },
       configurable: true,
+    },
+    textStream: {
+      value() {
+        const data = __tbBodyData(this, slots);
+        if (__tbBodyUsed(data)) throw new TypeError('Body already used');
+        const source = data.stream;
+        if (source === null) {
+          return new ReadableStream({ start(controller) { controller.close(); } });
+        }
+        data.bodyUsed = true;
+        const reader = source.getReader();
+        const decoder = new TextDecoder();
+        return new ReadableStream({
+          async pull(controller) {
+            const step = await reader.read();
+            if (step.done) {
+              const tail = decoder.decode();
+              if (tail !== '') controller.enqueue(tail);
+              controller.close();
+              return;
+            }
+            const text = decoder.decode(step.value, { stream: true });
+            if (text !== '') controller.enqueue(text);
+          },
+          cancel(reason) { return reader.cancel(reason); },
+        });
+      },
+      writable: true, configurable: true,
     },
     text: {
       value() {
@@ -458,6 +489,9 @@ const __tbInstallBody = (proto, slots) => {
     formData: {
       value() {
         const data = __tbBodyData(this, slots);
+        if (data.bodySignal !== undefined && data.bodySignal !== null && data.bodySignal.aborted) {
+          return Promise.reject(data.bodySignal.reason);
+        }
         const contentType = __tbContentType(data.headers);
         if (data.stream === null) {
           if (contentType !== null && contentType.essence === 'application/x-www-form-urlencoded') {
@@ -550,6 +584,7 @@ const __tbParseMultipart = (bytes, boundary) => {
   return formData;
 };
 const __tbFormDataFromBytes = (bytes, contentType) => {
+  if (bytes.length === 0) return new FormData();
   if (contentType === null) throw new TypeError('Body is not a form');
   if (contentType.essence === 'multipart/form-data') {
     if (contentType.boundary === null) throw new TypeError('Missing multipart boundary');
@@ -605,6 +640,10 @@ const __tbResponseRecord = (body, status, statusText, headers) => {
 const __tbCreateResponse = record => {
   const response = Object.create(globalThis.Response.prototype);
   __tbResponseData.set(response, record);
+  return response;
+};
+const __tbWithSignal = (response, signal) => {
+  __tbBrand(response, __tbResponseData).bodySignal = signal;
   return response;
 };
 // https://fetch.spec.whatwg.org/#response-class
@@ -797,6 +836,9 @@ globalThis.Request = class Request {
     if (cache === 'only-if-cached' && mode !== 'same-origin') {
       throw new TypeError('only-if-cached requires same-origin mode');
     }
+    if (mode === 'no-cors' && redirect !== 'follow') {
+      throw new TypeError('no-cors requests must follow redirects');
+    }
     const integrity = options.integrity !== undefined ? String(options.integrity) : source === null ? '' : source.integrity;
     if (options.priority !== undefined
         && options.priority !== 'high'
@@ -825,8 +867,8 @@ globalThis.Request = class Request {
     } else {
       referrer = source === null ? 'about:client' : source.referrer;
     }
-    let signal = options.signal !== undefined && options.signal !== null
-      ? options.signal
+    let signal = options.signal !== undefined
+      ? options.signal === null ? new AbortController().signal : options.signal
       : source === null ? new AbortController().signal : source.signal;
     if (typeof AbortSignal.any === 'function') {
       signal = AbortSignal.any([signal]);
@@ -948,7 +990,8 @@ globalThis.Request = class Request {
       __tbArray.map(__tbHeadersList(data.headers), entry => [entry[0], entry[1]]),
       __tbHeadersGuardOf(data.headers),
     );
-    __tbRequestData.set(copy, { ...data, stream, bodyUsed: false, headers });
+    const signal = AbortSignal.any([data.signal]);
+    __tbRequestData.set(copy, { ...data, stream, signal, bodyUsed: false, headers });
     return copy;
   }
 };
@@ -980,13 +1023,30 @@ const __tbMakeResponse = (body, status, statusText, url, type, fields, responseT
   });
 };
 
-const __tbMakeStreamingResponse = outcome => {
+const __tbMakeStreamingResponse = (outcome, signal) => {
   const headers = __tbMakeHeaders(outcome.headers, 'response');
   __tbHeadersRecord(headers).guard = 'immutable';
   const id = outcome.stream;
   const stream = new ReadableStream({
     type: 'bytes',
+    start(controller) {
+      if (signal !== undefined && signal !== null) {
+        const abort = () => {
+          host.__tbFetchCancel(id);
+          controller.error(signal.reason);
+        };
+        if (signal.aborted) {
+          abort();
+          return;
+        }
+        signal.addEventListener('abort', abort, { once: true });
+      }
+    },
     pull(controller) {
+      if (signal !== undefined && signal !== null && signal.aborted) {
+        controller.error(signal.reason);
+        return;
+      }
       let chunk;
       try {
         chunk = host.__tbFetchRead(id);
@@ -1008,6 +1068,7 @@ const __tbMakeStreamingResponse = outcome => {
     type: outcome.responseType,
     redirected: outcome.redirectCount > 0,
     headers,
+    bodySignal: signal,
   });
 };
 
@@ -1236,24 +1297,24 @@ globalThis.fetch = function(input, init) {
       const responseType = outcome.responseType;
       const bodyError = outcome.bodyError;
       if (responseType !== 'error') {
-        // A manual redirect is an opaque-redirect filtered response
+        // A redirect in manual mode is an opaque-redirect filtered response
         // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque-redirect>).
-        if (redirect === 'manual' && (status === 301 || status === 302 || status === 303 || status === 307 || status === 308)) {
+        if (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) {
           finish(resolve, __tbMakeResponse(null, 0, '', url, '', [], 'opaqueredirect', false, false));
           return;
         }
         if (status === 204 || status === 205 || status === 304) {
           if (outcome.stream !== null && outcome.stream !== undefined) host.__tbFetchCancel(outcome.stream);
-          finish(resolve, __tbMakeResponse(null, status, statusText, finalUrl, type, fields, responseType, outcome.redirectCount > 0, bodyError));
+          finish(resolve, __tbWithSignal(__tbMakeResponse(null, status, statusText, finalUrl, type, fields, responseType, outcome.redirectCount > 0, bodyError), signal));
           return;
         }
         if (outcome.stream !== null && outcome.stream !== undefined) {
           streamID = outcome.stream;
           signal.addEventListener('abort', () => host.__tbFetchCancel(streamID), { once: true });
-          finish(resolve, __tbMakeStreamingResponse(outcome));
+          finish(resolve, __tbMakeStreamingResponse(outcome, signal));
           return;
         }
-        const response = __tbMakeResponse(bytes, status, statusText, finalUrl, type, fields, responseType, outcome.redirectCount > 0, bodyError);
+        const response = __tbWithSignal(__tbMakeResponse(bytes, status, statusText, finalUrl, type, fields, responseType, outcome.redirectCount > 0, bodyError), signal);
         // A HEAD response has no body regardless of what the wire carried
         // (<https://fetch.spec.whatwg.org/#concept-head>).
         if (method === 'HEAD') __tbBrand(response, __tbResponseData).stream = null;

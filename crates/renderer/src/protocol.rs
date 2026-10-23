@@ -276,6 +276,9 @@ pub struct ResponseHead {
     /// A violated policy's `report-to` directive resolves its endpoint names
     /// against it (<https://w3c.github.io/reporting/#header>).
     pub reporting_endpoints: Option<String>,
+    /// `Referrer-Policy` response header, which seeds the document policy
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-header>).
+    pub referrer_policy: Option<String>,
     /// `X-Content-Type-Options: nosniff` on the response.
     pub no_sniff: bool,
     /// The body came from HTTP, so the Apache `text/plain` check applies.
@@ -323,6 +326,7 @@ impl ResponseHead {
                 "content-security-policy-report-only",
             ),
             reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
+            referrer_policy: crate::csp::combined_header(headers, "referrer-policy"),
             no_sniff: crate::sniff::headers_nosniff(headers),
             http_response: true,
             history: HistorySnapshot::default(),
@@ -345,6 +349,7 @@ impl ResponseHead {
             content_security_policy: None,
             content_security_policy_report_only: None,
             reporting_endpoints: None,
+            referrer_policy: None,
             no_sniff: false,
             http_response: false,
             history: HistorySnapshot::default(),

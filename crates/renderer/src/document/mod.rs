@@ -1306,6 +1306,12 @@ impl Document {
         // A response document resolves against its own URL; any inherited
         // `about:srcdoc` base stops applying.
         world.base_url = None;
+        if let Some(policy) = head.referrer_policy.as_deref() {
+            let policy = policy.split(',').next().unwrap_or(policy).trim();
+            policy.clone_into(&mut world.state.referrer_policy);
+        } else {
+            world.state.referrer_policy.clear();
+        }
         drop(world);
         // The realm is already new when this runs; this opens the parser and
         // the decoder for the response that will feed it.

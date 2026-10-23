@@ -323,7 +323,18 @@ impl Agent {
             .to_str()
             .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
         if let Some(referrer) = headers.value("referer") {
-            preflight.append(header::REFERER, referrer.clone());
+            // A preflight's Referer is the request's stripped referrer without
+            // the origin path slash
+            // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+            let referrer = referrer
+                .to_str()
+                .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+            let referrer = referrer.strip_suffix('/').unwrap_or(referrer);
+            preflight.append(
+                header::REFERER,
+                HeaderValue::from_str(referrer)
+                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
+            );
         }
         if let Some(ua) = &self.ua {
             preflight.append(header::USER_AGENT, ua.clone());
@@ -456,7 +467,7 @@ impl Agent {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let referrer_source = request.referrer_source.clone().or(initial_referrer);
-        let referrer_policy = request.referrer_policy.clone();
+        let mut referrer_policy = request.referrer_policy.clone();
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
         let mut budget = self.engine.budget_at();
@@ -478,10 +489,18 @@ impl Agent {
                     dial.credentials_include(),
                 ));
             }
+            let redirect_policy = response
+                .headers()
+                .value("referrer-policy")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(',').next().unwrap_or(value).trim().to_owned());
             let next = match classify_response(response, &url, &dial, &hop)? {
                 HopOutcome::Final(response) => return Ok(*response),
                 HopOutcome::Redirect { next } => next,
             };
+            if let Some(policy) = redirect_policy {
+                referrer_policy = Some(policy);
+            }
             if followed == self.max_redirects {
                 return Err(NetError::Limit(LimitExceeded::Redirect));
             }
