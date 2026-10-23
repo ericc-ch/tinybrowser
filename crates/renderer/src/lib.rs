@@ -16,6 +16,7 @@ use crate::documents::BlitzDocument;
 
 mod csp;
 pub use csp::RedirectGate;
+mod css;
 mod document;
 mod documents;
 mod dom;
@@ -132,7 +133,7 @@ pub(crate) fn parse_html(input: &str, mut config: blitz_dom::DocumentConfig) -> 
     // The sink appends the doctype as a real document child now. HTML never
     // produces PI nodes (`<?...?>` is a bogus comment), so there is nothing
     // to initialize here; XML fills the maps in `xml.rs` after parsing.
-    Parsed {
+    let mut parsed = Parsed {
         id: 0,
         document,
         quirks_mode,
@@ -141,7 +142,9 @@ pub(crate) fn parse_html(input: &str, mut config: blitz_dom::DocumentConfig) -> 
         ready_state: ReadyState::Loading,
         url: None,
         character_set: "UTF-8",
-    }
+    };
+    crate::dom::forms::initialize_controls(&mut parsed);
+    parsed
 }
 
 fn style_quirks(mode: QuirksMode) -> blitz_dom::StyleQuirksMode {

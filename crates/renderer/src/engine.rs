@@ -1324,7 +1324,18 @@ impl Engine {
                 if waiting {
                     continue;
                 }
-                if eager_realm && let Some(document) = self.frames.get_mut(&child) {
+                // A navigated frame always gets its realm before `load`:
+                // `contentWindow.location` must be readable in the load
+                // handler, and the cap only exists to keep a burst of blank
+                // parser-created iframes cheap. A blank frame has no URL of
+                // its own to report.
+                let navigated = self
+                    .frames
+                    .get(&child)
+                    .is_some_and(|document| !document.is_initial_blank());
+                if (eager_realm || navigated)
+                    && let Some(document) = self.frames.get_mut(&child)
+                {
                     document.ensure_js_ok();
                 }
                 self.publish_frame_document(container, child);

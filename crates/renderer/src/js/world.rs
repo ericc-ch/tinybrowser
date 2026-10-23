@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use blitz_traits::node_id::NodeId as BlitzNodeId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
@@ -12,7 +13,7 @@ use url::Url;
 
 use crate::documents::DocumentStore;
 use crate::documents::JournalEntry;
-use crate::dom::tree::{NodeId, attr, is_connected, is_iframe_element};
+use crate::dom::tree::{NodeId, attr, is_child_navigable_container, is_connected};
 use crate::dom_string::DomString;
 
 use crate::js::FrameRuntime;
@@ -929,6 +930,14 @@ pub(crate) struct World {
     /// Elements whose `click()` is running, so a nested `click()` returns
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
     clicks_in_progress: HashSet<NodeId>,
+    /// When the realm's transient activation expires, or `None` once it was
+    /// consumed or never granted
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#transient-activation>).
+    transient_activation: Option<Instant>,
+    /// Whether the realm was ever activated, exposed as
+    /// `navigator.userActivation.hasBeenActive`
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation-hasbeenactive>).
+    sticky_activation: bool,
     brands: HashMap<String, Persistent<Object<'static>>>,
     pub(crate) bridge: Option<Persistent<Object<'static>>>,
     /// Containers whose insertion steps already fired `load` (src-less
@@ -1316,6 +1325,8 @@ impl World {
             events: EventTargetState::default(),
             state: DocumentState::default(),
             clicks_in_progress: HashSet::new(),
+            transient_activation: None,
+            sticky_activation: false,
             brands: HashMap::new(),
             bridge: None,
             insertion_load_fired: HashSet::new(),
@@ -1603,7 +1614,8 @@ impl World {
         let eligible = self
             .with_document(container, |parsed| {
                 let base = &parsed.document.base;
-                is_iframe_element(base, container.node) && is_connected(base, container.node)
+                is_child_navigable_container(base, container.node)
+                    && is_connected(base, container.node)
             })
             .unwrap_or(false);
         if !eligible || self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
@@ -1649,7 +1661,7 @@ impl World {
                 if id == container.node {
                     seen = true;
                 } else if seen
-                    && is_iframe_element(base, id)
+                    && is_child_navigable_container(base, id)
                     && is_connected(base, id)
                     && let Some(frame) = self.frame_for_container(NodeId {
                         document: container.document,
@@ -1734,7 +1746,7 @@ impl World {
                 if stop == Some(id) {
                     break;
                 }
-                if is_iframe_element(base, id) && is_connected(base, id) {
+                if is_child_navigable_container(base, id) && is_connected(base, id) {
                     containers.push(NodeId { document, node: id });
                 }
                 if let Some(node) = base.get_node(id) {
@@ -2593,6 +2605,38 @@ impl World {
             self.clicks_in_progress.insert(node);
         } else {
             self.clicks_in_progress.remove(&node);
+        }
+    }
+
+    /// Grants transient activation and sets the sticky flag for a trusted
+    /// user interaction
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#activation-notification>).
+    pub(crate) fn activate_user(&mut self) {
+        // The transient activation duration is implementation-defined; the
+        // HTML Standard's non-normative guidance suggests a few seconds.
+        self.transient_activation = Some(Instant::now() + Duration::from_secs(5));
+        self.sticky_activation = true;
+    }
+
+    /// Whether the realm has transient activation that has not expired.
+    pub(crate) fn user_activation_active(&self) -> bool {
+        self.transient_activation
+            .is_some_and(|expires| Instant::now() < expires)
+    }
+
+    /// Whether the realm was ever activated.
+    pub(crate) fn user_activation_sticky(&self) -> bool {
+        self.sticky_activation
+    }
+
+    /// Consumes transient activation, returning whether it was active
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation>).
+    pub(crate) fn consume_user_activation(&mut self) -> bool {
+        if self.user_activation_active() {
+            self.transient_activation = None;
+            true
+        } else {
+            false
         }
     }
 

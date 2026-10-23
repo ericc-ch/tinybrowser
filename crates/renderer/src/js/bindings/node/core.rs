@@ -25,8 +25,8 @@ use crate::dom::equality;
 use crate::dom::insertion::{
     InsertedNode, InsertionStep, MoveTarget, classify_inserted, collect_html_insertion_steps,
     ensure_can_move, ensure_document_content_model, ensure_no_cycle, ensure_parented,
-    iframe_containers_in_subtrees, iframe_fires_initial_load, insert_parsed, move_parsed,
-    replace_all_journaled, replace_all_with_node, replace_parsed, unlink_journaled,
+    iframe_containers_in_subtrees, insert_parsed, move_parsed, replace_all_journaled,
+    replace_all_with_node, replace_parsed, unlink_journaled,
 };
 use crate::dom::tree::{
     BlitzId, NodeId, ancestor_chain, child_ids, element_node_name, is_connected, is_element,
@@ -634,9 +634,18 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let iframes = replace_all_with_node(&mut parsed, parent, node);
+        let controls = crate::dom::forms::descendant_controls(
+            &parsed.document.base,
+            parent.document,
+            parent.node,
+        );
         drop(parsed);
         world.destroy_child_navigables(&iframes);
         drop(world);
+        for id in controls {
+            fixup_option_on_insert(&ctx, id)?;
+            fixup_radio_on_insert(&ctx, id)?;
+        }
         schedule_mutation_delivery(&ctx)
     }
 
@@ -2300,9 +2309,18 @@ pub(super) fn apply_inserted(
     moved: &[NodeId],
     deliver: bool,
 ) -> Result<()> {
-    for id in moved {
-        fixup_option_on_insert(ctx, *id)?;
-        fixup_radio_on_insert(ctx, *id)?;
+    let mut ordered = moved.to_vec();
+    {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        if let Some(parsed) = world.document(parent) {
+            ordered
+                .sort_by(|a, b| tree_order(&parsed.document.base, parent.document, a.node, b.node));
+        }
+    }
+    for id in ordered {
+        fixup_option_on_insert(ctx, id)?;
+        fixup_radio_on_insert(ctx, id)?;
     }
     // Insertion steps run while parent is connected. Queue mutation records
     // first so an inserted script can `takeRecords` its own addition
@@ -2486,17 +2504,12 @@ pub(super) fn run_html_insertion_steps(
     for step in steps {
         match step {
             InsertionStep::Iframe(id) => {
-                let fire_load = world(ctx)?
-                    .borrow()
-                    .with_document(id, |parsed| {
-                        iframe_fires_initial_load(&parsed.document.base, id.node)
-                    })
-                    .unwrap_or(false);
                 World::materialize_iframe(&world(ctx)?, id);
-                if fire_load {
-                    super::super::window::fire_node_load(ctx, id)?;
-                    let _ = world(ctx)?.borrow_mut().insertion_load_fired.insert(id);
-                }
+                // The initial `load` is an element task, not part of the
+                // insertion steps: the engine fires it after the child frame's
+                // realm exists, so `contentWindow.location` is readable in the
+                // handler
+                // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
             }
             InsertionStep::Script(id) => prepare_classic_script(ctx, id)?,
             InsertionStep::Meta(id) => {

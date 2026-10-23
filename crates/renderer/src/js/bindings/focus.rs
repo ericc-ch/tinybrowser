@@ -7,6 +7,7 @@ use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
 use crate::documents::JournalEntry;
+use crate::dom::input::InputType;
 use crate::dom::tree::{BlitzId, NodeId, attr, form_owner_of, html_namespace, is_connected};
 use crate::js::world::EventTargetKey;
 use crate::js::{FrameNavigation, NavigationTarget, World};
@@ -45,29 +46,32 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    let base = &parsed.document.base;
-    let Some(tree) = base.get_node(node.node) else {
-        return Ok(false);
+    Ok(is_focusable_in(&parsed.document.base, node.node))
+}
+
+fn is_focusable_in(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    let Some(tree) = base.get_node(node) else {
+        return false;
     };
     let Some(element) = tree.data.downcast_element() else {
-        return Ok(false);
+        return false;
     };
-    if !is_connected(base, node.node) || is_actually_disabled(base, node.node) {
-        return Ok(false);
+    if !is_connected(base, node) || is_actually_disabled(base, node) {
+        return false;
     }
     // `tabindex` applies to SVG elements too.
-    if attr(base, node.node, "tabindex").is_some() {
-        return Ok(true);
+    if attr(base, node, "tabindex").is_some() {
+        return true;
     }
     if element.name.ns != html_namespace() {
-        return Ok(false);
+        return false;
     }
-    Ok(match element.name.local.as_str() {
-        "input" => !is_hidden_input(base, node.node),
-        "a" => attr(base, node.node, "href").is_some(),
+    match element.name.local.as_str() {
+        "input" => !is_hidden_input(base, node),
+        "a" => attr(base, node, "href").is_some(),
         "button" | "select" | "textarea" => true,
         _ => false,
-    })
+    }
 }
 
 /// The HTML "actually disabled" check for the form controls the engine
@@ -171,19 +175,6 @@ fn write_attr(parsed: &mut crate::Parsed, node: NodeId, local: &str, value: Opti
     });
 }
 
-/// Sets or clears a boolean content attribute such as `checked`.
-fn set_presence_attr(parsed: &mut crate::Parsed, node: NodeId, local: &str, present: bool) {
-    write_attr(parsed, node, local, present.then_some(""));
-}
-
-/// The `type` of an `input`, lowercased and trimmed; missing means `text`.
-fn input_type(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
-    attr(base, node, "type")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-}
-
 /// The group's currently checked radio, if any. An empty or missing `name`
 /// forms no group, so a nameless radio is only its own group member
 /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
@@ -192,13 +183,86 @@ fn radio_group_checked(
     document: u32,
     node: BlitzId,
 ) -> Option<NodeId> {
-    if attr(base, node, "checked").is_some() {
+    if checkedness(base, node) {
         return Some(NodeId { document, node });
     }
-    let name = attr(base, node, "name")?;
+    let name = attr(base, node, "name").unwrap_or_default();
     crate::dom::forms::radio_group_members(base, document, name, node)
         .into_iter()
-        .find(|member| attr(base, member.node, "checked").is_some())
+        .find(|member| checkedness(base, member.node))
+}
+
+/// An input's checkedness: the dirty slot when set, otherwise the `checked`
+/// attribute (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty>).
+fn checkedness(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    base.get_node(node)
+        .and_then(|target| target.data.downcast_element())
+        .is_some_and(blitz_dom::ElementData::checkedness)
+}
+
+/// The indeterminate IDL flag is stored on the element and has no attribute
+/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate>).
+fn indeterminate(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    base.get_node(node)
+        .and_then(|target| target.data.downcast_element())
+        .is_some_and(|element| element.form_state.indeterminate)
+}
+
+/// The activation target for a click: the first node in the event path with an
+/// activation behavior, starting at the event target
+/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
+pub(crate) fn activation_target(ctx: &Ctx<'_>, target: NodeId) -> Result<Option<NodeId>> {
+    let world = world_for_node(ctx, target)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(target) else {
+        return Ok(None);
+    };
+    let base = &parsed.document.base;
+    let mut cursor = Some(target.node);
+    while let Some(current) = cursor {
+        if has_activation(base, current) {
+            return Ok(Some(NodeId {
+                document: target.document,
+                node: current,
+            }));
+        }
+        cursor = base.get_node(current).and_then(|node| node.parent);
+    }
+    Ok(None)
+}
+
+fn has_activation(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    let Some(tree) = base.get_node(node) else {
+        return false;
+    };
+    let Some(element) = tree.data.downcast_element() else {
+        return false;
+    };
+    if element.name.ns != html_namespace() {
+        return false;
+    }
+    match element.name.local.as_str() {
+        "input" => matches!(
+            crate::dom::input::input_type(base, node),
+            Some(
+                InputType::Submit
+                    | InputType::Image
+                    | InputType::Reset
+                    | InputType::Checkbox
+                    | InputType::Radio
+                    | InputType::Color
+                    | InputType::Date
+                    | InputType::DatetimeLocal
+                    | InputType::File
+                    | InputType::Month
+                    | InputType::Time
+                    | InputType::Week
+            )
+        ),
+        "button" | "label" => true,
+        "a" | "area" => attr(base, node, "href").is_some(),
+        _ => false,
+    }
 }
 
 /// Moves focus to `node`. The previously focused area is cleared before the
@@ -278,7 +342,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         event.borrow().initialize("click".to_owned(), true, true);
         let not_canceled = events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
         if not_canceled {
-            complete_activation(ctx, node)?;
+            complete_activation(ctx, node, &previous)?;
         } else {
             legacy_canceled_activation(ctx, node, &previous)?;
         }
@@ -289,16 +353,16 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
 }
 
 /// The checkedness state a canceled click restores.
-enum PreActivation {
+pub(crate) enum PreActivation {
     None,
-    Checkbox { checked: bool },
+    Checkbox { checked: bool, indeterminate: bool },
     Radio(Option<NodeId>),
 }
 
 /// The legacy-pre-activation behavior: a checkbox toggles, a radio becomes
 /// checked and remembers the group's previous checked radio. Blitz keeps no
 /// checkedness slot, so the `checked` attribute is the whole state.
-fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
+pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(node) else {
@@ -316,41 +380,86 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
         if element.name.ns != html_namespace() || element.name.local.as_str() != "input" {
             return Ok(PreActivation::None);
         }
-        input_type(base, node.node)
+        crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text)
     };
-    Ok(match type_attr.as_str() {
-        "checkbox" => {
-            let checked = attr(&parsed.document.base, node.node, "checked").is_some();
-            let previous = PreActivation::Checkbox { checked };
-            set_presence_attr(&mut parsed, node, "checked", !checked);
+    Ok(match type_attr {
+        InputType::Checkbox => {
+            let checked = checkedness(&parsed.document.base, node.node);
+            let indeterminate = indeterminate(&parsed.document.base, node.node);
+            let previous = PreActivation::Checkbox {
+                checked,
+                indeterminate,
+            };
+            let mut mutator = parsed.document.base.mutate();
+            mutator.set_checkedness(node.node, !checked);
+            // Activation clears indeterminateness
+            // (<https://html.spec.whatwg.org/multipage/input.html#checkbox-state-(type=checkbox):activation-behavior>).
+            mutator.set_indeterminate(node.node, false);
             previous
         }
-        "radio" => {
-            let previous = radio_group_checked(&parsed.document.base, node.document, node.node);
-            set_presence_attr(&mut parsed, node, "checked", true);
-            PreActivation::Radio(previous)
+        InputType::Radio => {
+            // An already checked radio has no pre-activation change; the
+            // click fires no `input` or `change`
+            // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio):activation-behavior>).
+            if checkedness(&parsed.document.base, node.node) {
+                PreActivation::None
+            } else {
+                let previous = radio_group_checked(&parsed.document.base, node.document, node.node);
+                let name = attr(&parsed.document.base, node.node, "name").unwrap_or_default();
+                let members = crate::dom::forms::radio_group_members(
+                    &parsed.document.base,
+                    node.document,
+                    name,
+                    node.node,
+                );
+                let mut mutator = parsed.document.base.mutate();
+                for member in members {
+                    mutator.set_checkedness(member.node, false);
+                }
+                mutator.set_checkedness(node.node, true);
+                mutator.set_indeterminate(node.node, false);
+                PreActivation::Radio(previous)
+            }
         }
         _ => PreActivation::None,
     })
 }
 
 /// The legacy-canceled-activation behavior: undo the pre-activation change.
-fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivation) -> Result<()> {
+pub(crate) fn legacy_canceled_activation(
+    ctx: &Ctx<'_>,
+    node: NodeId,
+    previous: &PreActivation,
+) -> Result<()> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
     match previous {
-        PreActivation::Checkbox { checked } => {
-            set_presence_attr(&mut parsed, node, "checked", *checked);
+        PreActivation::Checkbox {
+            checked,
+            indeterminate,
+        } => {
+            let mut mutator = parsed.document.base.mutate();
+            mutator.set_checkedness(node.node, *checked);
+            // A canceled activation restores the pre-click state, including
+            // indeterminateness; a handler that set it during the click must
+            // not leak that change
+            // (<https://html.spec.whatwg.org/multipage/input.html#canceled-activation-steps>).
+            mutator.set_indeterminate(node.node, *indeterminate);
         }
         PreActivation::Radio(Some(other)) => {
-            set_presence_attr(&mut parsed, node, "checked", false);
-            set_presence_attr(&mut parsed, *other, "checked", true);
+            let mut mutator = parsed.document.base.mutate();
+            mutator.set_checkedness(node.node, false);
+            mutator.set_checkedness(other.node, true);
         }
         PreActivation::Radio(None) => {
-            set_presence_attr(&mut parsed, node, "checked", false);
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_checkedness(node.node, false);
         }
         PreActivation::None => {}
     }
@@ -360,22 +469,33 @@ fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivat
 /// The post-click activation for a non-canceled click. A checkbox or radio
 /// already changed checkedness in pre-activation, so only its events fire;
 /// other controls run their activation behavior.
-fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
-    let world = world_for_node(ctx, node)?;
-    let checkable = {
+pub(crate) fn complete_activation(
+    ctx: &Ctx<'_>,
+    node: NodeId,
+    previous: &PreActivation,
+) -> Result<()> {
+    // Checkbox and radio checkedness already moved in pre-activation. Only a
+    // click that stays a checkbox or radio fires `input` and `change`; a
+    // handler that changes the type to submit must still run the new default
+    // action. An already checked radio returns no pre-activation change, so
+    // the ordinary activation behavior observes no change
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:activation-behavior>).
+    let still_checkable = {
+        let world = world_for_node(ctx, node)?;
         let world = world.borrow();
         world.document(node).is_some_and(|parsed| {
-            let base = &parsed.document.base;
-            base.get_node(node.node)
-                .and_then(|tree| tree.data.downcast_element())
-                .is_some_and(|element| {
-                    element.name.ns == html_namespace()
-                        && element.name.local.as_str() == "input"
-                        && matches!(input_type(base, node.node).as_str(), "checkbox" | "radio")
-                })
+            matches!(
+                crate::dom::input::input_type(&parsed.document.base, node.node),
+                Some(InputType::Checkbox | InputType::Radio)
+            )
         })
     };
-    if checkable {
+    if still_checkable
+        && matches!(
+            previous,
+            PreActivation::Checkbox { .. } | PreActivation::Radio(_)
+        )
+    {
         fire_checkable_events(ctx, node)
     } else {
         run_activation(ctx, node)
@@ -384,7 +504,7 @@ fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
 
 /// Fires the `input` and `change` events a checkbox/radio activation produces.
 fn fire_checkable_events(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
-    events::fire_trusted(ctx, EventTargetKey::Node(node), "input", true, false)?;
+    events::fire_trusted_composed(ctx, EventTargetKey::Node(node), "input", true, false)?;
     events::fire_trusted(ctx, EventTargetKey::Node(node), "change", true, false)?;
     Ok(())
 }
@@ -422,17 +542,19 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             if element.name.ns != html_namespace() || element.name.local.as_str() != "input" {
                 return Ok(());
             }
-            input_type(base, node.node)
+            crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text)
         };
-        match type_attr.as_str() {
-            "checkbox" => {
-                let checked = attr(&parsed.document.base, node.node, "checked").is_some();
-                set_presence_attr(&mut parsed, node, "checked", !checked);
+        match type_attr {
+            InputType::Checkbox => {
+                let checked = checkedness(&parsed.document.base, node.node);
+                let mut mutator = parsed.document.base.mutate();
+                mutator.set_checkedness(node.node, !checked);
+                mutator.set_indeterminate(node.node, false);
                 true
             }
-            "radio" => {
+            InputType::Radio => {
                 // A checked radio cannot be unchecked by clicking.
-                if attr(&parsed.document.base, node.node, "checked").is_some() {
+                if checkedness(&parsed.document.base, node.node) {
                     false
                 } else {
                     // The clicked radio joins its group and unchecks the
@@ -447,10 +569,12 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                         &name,
                         node.node,
                     );
-                    set_presence_attr(&mut parsed, node, "checked", true);
+                    let mut mutator = parsed.document.base.mutate();
                     for member in members {
-                        set_presence_attr(&mut parsed, member, "checked", false);
+                        mutator.set_checkedness(member.node, false);
                     }
+                    mutator.set_checkedness(node.node, true);
+                    mutator.set_indeterminate(node.node, false);
                     true
                 }
             }
@@ -458,7 +582,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         }
     };
     if changed {
-        events::fire_trusted(ctx, EventTargetKey::Node(node), "input", true, false)?;
+        events::fire_trusted_composed(ctx, EventTargetKey::Node(node), "input", true, false)?;
         events::fire_trusted(ctx, EventTargetKey::Node(node), "change", true, false)?;
     }
     Ok(())
@@ -507,13 +631,120 @@ fn hyperlink_referrer_policy(base: &blitz_dom::BaseDocument, node: BlitzId) -> S
     )
 }
 
+/// The label element's activation behavior: a click on the label or a
+/// non-interactive descendant runs synthetic click activation steps on the
+/// labeled control
+/// (<https://html.spec.whatwg.org/multipage/forms.html#the-label-element:activation-behavior>).
+pub(crate) fn run_label_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let label = {
+        let world = world_for_node(ctx, node)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(node) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let mut cursor = Some(node.node);
+        let mut label = None;
+        while let Some(current) = cursor {
+            if crate::dom::tree::is_html_element(base, current, "label") {
+                label = Some(NodeId {
+                    document: node.document,
+                    node: current,
+                });
+                break;
+            }
+            cursor = base.get_node(current).and_then(|target| target.parent);
+        }
+        let Some(label) = label else {
+            return Ok(());
+        };
+        // A click on interactive content, or on a descendant of it, does not
+        // forward to the labeled control. The label itself is the target when
+        // the label was clicked, so it does not count here.
+        let mut cursor = Some(node.node);
+        while let Some(current) = cursor {
+            if current == label.node {
+                break;
+            }
+            if is_interactive_content(base, current) {
+                return Ok(());
+            }
+            cursor = base.get_node(current).and_then(|target| target.parent);
+        }
+        label
+    };
+    // The label's `control` getter owns the `for`/descendant lookup and
+    // labelable-element rules
+    // (<https://html.spec.whatwg.org/multipage/forms.html#dom-label-control>).
+    let label_value = wrap_node(ctx, label)?;
+    let Some(label_object) = label_value.as_object() else {
+        return Ok(());
+    };
+    let control: Value<'_> = label_object.get("control")?;
+    if let Some(control) = host_node_id(ctx, &control) {
+        // A click on the labeled control itself, or inside it, already ran
+        // that control's own activation behavior. Forwarding it again would
+        // recurse (a labelable but non-interactive control such as `meter`
+        // does not stop the walk above).
+        let inside_control = {
+            let world = world_for_node(ctx, node)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(node) else {
+                return Ok(());
+            };
+            let base = &parsed.document.base;
+            let mut cursor = Some(node.node);
+            let mut inside = false;
+            while let Some(current) = cursor {
+                if current == control.node {
+                    inside = true;
+                    break;
+                }
+                if current == label.node {
+                    break;
+                }
+                cursor = base.get_node(current).and_then(|target| target.parent);
+            }
+            inside
+        };
+        if !inside_control {
+            element_click(ctx, control)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `node` is interactive content for label forwarding
+/// (<https://html.spec.whatwg.org/multipage/dom.html#interactive-content>).
+fn is_interactive_content(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
+    let Some(target) = base.get_node(node) else {
+        return false;
+    };
+    let Some(element) = target.data.downcast_element() else {
+        return false;
+    };
+    if element.name.ns != html_namespace() {
+        return false;
+    }
+    match element.name.local.as_str() {
+        "a" => attr(base, node, "href").is_some(),
+        "audio" | "video" => attr(base, node, "controls").is_some(),
+        "button" | "details" | "iframe" | "embed" | "select" | "textarea" => true,
+        "input" => {
+            crate::dom::input::input_type(base, node) != Some(crate::dom::input::InputType::Hidden)
+        }
+        "img" => attr(base, node, "usemap").is_some(),
+        _ => false,
+    }
+}
+
 /// The activation behavior of a clicked control: a submit button submits its
 /// form owner with itself as submitter, a reset button resets it, and a
 /// checkbox or radio updates its checkedness
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
 fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let world = world_for_node(ctx, node)?;
-    let (activation, form) = {
+    let (activation, form, consumes_activation) = {
         let world = world.borrow();
         let Some(parsed) = world.document(node) else {
             return Ok(());
@@ -528,20 +759,55 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         if element.name.ns != html_namespace() {
             return Ok(());
         }
+        let mut consumes_activation = false;
         let activation = match element.name.local.as_str() {
-            "input" => match input_type(base, node.node).as_str() {
-                "submit" => Activation::Submit,
-                "reset" => Activation::Reset,
-                "checkbox" | "radio" => Activation::ToggleCheckedness,
-                _ => Activation::None,
-            },
-            "button" => match input_type(base, node.node).as_str() {
-                // The missing and invalid value defaults are both Auto (submit).
-                // `input_type` of a button reads its own `type` attribute the
-                // same way; missing or invalid falls through to submit.
-                "reset" => Activation::Reset,
-                _ => Activation::Submit,
-            },
+            "input" => {
+                let kind =
+                    crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text);
+                // The input activation behavior shows the picker for these
+                // states, which consumes the transient activation
+                // (<https://html.spec.whatwg.org/multipage/input.html#input-activation-behavior>).
+                consumes_activation = matches!(
+                    kind,
+                    InputType::Color
+                        | InputType::Date
+                        | InputType::DatetimeLocal
+                        | InputType::File
+                        | InputType::Month
+                        | InputType::Time
+                        | InputType::Week
+                );
+                match kind {
+                    // An image button submits with its coordinates; the
+                    // submission shim decides whether to add them
+                    // (<https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):activation-behavior>).
+                    InputType::Submit | InputType::Image => Activation::Submit,
+                    InputType::Reset => Activation::Reset,
+                    InputType::Checkbox | InputType::Radio => Activation::ToggleCheckedness,
+                    _ => Activation::None,
+                }
+            }
+            "button" => {
+                // A button with a command but no explicit `type` runs the
+                // command behavior instead of submitting
+                // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
+                let explicit = crate::dom::tree::attr(base, node.node, "type");
+                let has_command = crate::dom::tree::attr(base, node.node, "command").is_some()
+                    || crate::dom::tree::attr(base, node.node, "commandfor").is_some();
+                if explicit.is_none() && has_command {
+                    Activation::None
+                } else {
+                    // `type` is an enumerated attribute: no trimming. The
+                    // missing and invalid defaults are Auto (submit); button
+                    // has an activation behavior that does nothing
+                    // (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-button-type>).
+                    match explicit {
+                        Some(value) if value.eq_ignore_ascii_case("reset") => Activation::Reset,
+                        Some(value) if value.eq_ignore_ascii_case("button") => Activation::None,
+                        _ => Activation::Submit,
+                    }
+                }
+            }
             // An anchor without `href` has no activation behavior.
             "a" | "area" if crate::dom::tree::attr(base, node.node, "href").is_some() => {
                 Activation::Link
@@ -549,40 +815,15 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             _ => Activation::None,
         };
         let form = form_owner_of(base, node.document, node.node);
-        (activation, form)
+        (activation, form, consumes_activation)
     };
+    if consumes_activation {
+        world.borrow_mut().consume_user_activation();
+    }
     match activation {
         Activation::None => Ok(()),
         Activation::ToggleCheckedness => toggle_checkedness(ctx, node),
-        Activation::Link => {
-            if cannot_navigate(&world.borrow(), node) {
-                return Ok(());
-            }
-            let (spec, target, referrer_policy) = {
-                let world = world.borrow();
-                let Some(parsed) = world.document(node) else {
-                    return Ok(());
-                };
-                let base = &parsed.document.base;
-                (
-                    crate::dom::tree::attr(base, node.node, "href").map(str::to_owned),
-                    crate::dom::tree::attr(base, node.node, "target").map(str::to_owned),
-                    hyperlink_referrer_policy(base, node.node),
-                )
-            };
-            let Some(spec) = spec else {
-                return Ok(());
-            };
-            // Following the hyperlink queues the navigation; the target picks
-            // the navigable at navigation time, so a frame inserted between
-            // the click and the drain is still eligible
-            // (<https://html.spec.whatwg.org/multipage/links.html#following-hyperlinks-2>).
-            let navigation =
-                FrameNavigation::get(NavigationTarget::Target(target.unwrap_or_default()), spec)
-                    .with_referrer_policy(referrer_policy);
-            world.borrow_mut().queue_frame_navigation(navigation);
-            Ok(())
-        }
+        Activation::Link => follow_link(ctx, node),
         Activation::Submit | Activation::Reset => {
             let Some(form) = form else {
                 return Ok(());
@@ -619,6 +860,37 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     }
 }
 
+/// Follows an `a`/`area` hyperlink after its activation behavior
+/// (<https://html.spec.whatwg.org/multipage/links.html#following-hyperlinks-2>).
+fn follow_link(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    if cannot_navigate(&world.borrow(), node) {
+        return Ok(());
+    }
+    let (spec, target, referrer_policy) = {
+        let world = world.borrow();
+        let Some(parsed) = world.document(node) else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        (
+            crate::dom::tree::attr(base, node.node, "href").map(str::to_owned),
+            crate::dom::tree::attr(base, node.node, "target").map(str::to_owned),
+            hyperlink_referrer_policy(base, node.node),
+        )
+    };
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    // The target picks the navigable at navigation time, so a frame inserted
+    // between the click and the drain is still eligible.
+    let navigation =
+        FrameNavigation::get(NavigationTarget::Target(target.unwrap_or_default()), spec)
+            .with_referrer_policy(referrer_policy);
+    world.borrow_mut().queue_frame_navigation(navigation);
+    Ok(())
+}
+
 pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>) -> Result<()> {
     let globals = crate::js::bridge::object(ctx)?;
     globals.set(
@@ -637,7 +909,208 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>) -> Result<()> {
         "__tbSetNativeValue",
         rquickjs::prelude::Func::from(set_native_value),
     )?;
+    globals.set(
+        "__tbUserActivationActive",
+        rquickjs::prelude::Func::from(user_activation_active),
+    )?;
+    globals.set(
+        "__tbUserActivationSticky",
+        rquickjs::prelude::Func::from(user_activation_sticky),
+    )?;
+    globals.set(
+        "__tbConsumeUserActivation",
+        rquickjs::prelude::Func::from(consume_user_activation),
+    )?;
+    globals.set("__tbSetActive", rquickjs::prelude::Func::from(set_active))?;
+    globals.set("__tbFocusNext", rquickjs::prelude::Func::from(focus_next))?;
     Ok(())
+}
+
+/// The element's tabindex for sequential navigation, or `None` when it is
+/// focusable but not sequentially focusable. A negative tabindex is
+/// programmatically focusable only
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#the-tabindex-attribute>).
+fn sequential_tabindex(base: &blitz_dom::BaseDocument, node: BlitzId) -> Option<i64> {
+    if !is_focusable_in(base, node) {
+        return None;
+    }
+    let Some(raw) = attr(base, node, "tabindex") else {
+        return Some(0);
+    };
+    let value = raw.trim_ascii().parse::<i64>().ok()?;
+    (value >= 0).then_some(value)
+}
+
+/// Moves sequential focus to the next or previous focusable area. A radio
+/// button group is one focusable area: its checked member, else its first
+/// member, represents the group
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
+    let world_rc = super::world(&ctx)?;
+    let (focusables, representative_of, current) = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.main_document() else {
+            return Ok(());
+        };
+        let base = &parsed.document.base;
+        let document = parsed.id;
+        let mut order = Vec::new();
+        let mut stack = vec![base.root_node().id];
+        while let Some(id) = stack.pop() {
+            order.push(NodeId { document, node: id });
+            if let Some(node) = base.get_node(id) {
+                stack.extend(node.children.iter().rev().copied());
+            }
+        }
+        let mut positions = std::collections::HashMap::new();
+        for (index, node) in order.iter().enumerate() {
+            positions.insert(*node, index);
+        }
+        let mut tab_stops = Vec::new();
+        let mut representative_of = std::collections::HashMap::new();
+        for (order_index, node) in order.into_iter().enumerate() {
+            let Some(tabindex) = sequential_tabindex(base, node.node) else {
+                continue;
+            };
+            if crate::dom::input::input_type(base, node.node) == Some(InputType::Radio) {
+                let name = attr(base, node.node, "name").unwrap_or_default();
+                let mut group =
+                    crate::dom::forms::radio_group_members(base, document, name, node.node);
+                group.push(node);
+                group.sort_by_key(|member| positions.get(member).copied().unwrap_or(usize::MAX));
+                let checked = group
+                    .iter()
+                    .find(|member| checkedness(base, member.node))
+                    .copied();
+                let representative = checked
+                    .filter(|member| sequential_tabindex(base, member.node).is_some())
+                    .or_else(|| {
+                        group
+                            .iter()
+                            .copied()
+                            .find(|member| sequential_tabindex(base, member.node).is_some())
+                    });
+                if let Some(representative) = representative {
+                    for member in &group {
+                        representative_of.insert(*member, representative);
+                    }
+                    // The group's one tab stop sits at the checked member's
+                    // position; an unchecked group uses its first member
+                    // (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation>).
+                    if representative == node {
+                        tab_stops.push((tabindex, order_index, node));
+                    }
+                }
+                continue;
+            }
+            tab_stops.push((tabindex, order_index, node));
+        }
+        tab_stops.sort_by_key(|(tabindex, order_index, _)| {
+            // Positive tabindex values come first in ascending order; zero
+            // and missing values follow in tree order
+            // (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation-starting-point>).
+            let positive = *tabindex > 0;
+            (
+                i32::from(!positive),
+                if positive { *tabindex } else { 0 },
+                *order_index,
+            )
+        });
+        let focusables: Vec<NodeId> = tab_stops.into_iter().map(|(_, _, node)| node).collect();
+        (
+            focusables,
+            representative_of,
+            world.active_element(document),
+        )
+    };
+    if focusables.is_empty() {
+        return Ok(());
+    }
+    let index = current.and_then(|active| focusables.iter().position(|node| *node == active));
+    // A focused radio can stop being the group's tab stop when another member
+    // becomes checked. Forward navigation then moves to the new representative
+    // instead of restarting at the document's first control.
+    if index.is_none()
+        && !backward
+        && let Some(representative) = current.and_then(|active| representative_of.get(&active))
+        && focusables.contains(representative)
+    {
+        return focus_node(&ctx, *representative);
+    }
+    let next = if backward {
+        index.map_or(focusables.len() - 1, |at| {
+            if at == 0 {
+                focusables.len() - 1
+            } else {
+                at - 1
+            }
+        })
+    } else {
+        index.map_or(0, |at| (at + 1) % focusables.len())
+    };
+    focus_node(&ctx, focusables[next])
+}
+
+/// Sets or clears the `:active` state on one element. The input paths call
+/// this for pointer presses, space presses, and the label's associated
+/// control, and clear it when focus moves away
+/// (<https://drafts.csswg.org/selectors/#the-active-pseudo>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn set_active<'js>(ctx: Ctx<'js>, element: Value<'js>, active: bool) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(());
+    };
+    let world_rc = world_for_node(&ctx, node)?;
+    let world = world_rc.borrow_mut();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(());
+    };
+    let Some(tree) = parsed.document.base.get_node_mut(node.node) else {
+        return Ok(());
+    };
+    if active {
+        tree.active();
+    } else {
+        tree.unactive();
+    }
+    Ok(())
+}
+
+/// Whether the current realm has unexpired transient activation
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation-isactive>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn user_activation_active(ctx: Ctx<'_>) -> Result<bool> {
+    Ok(super::world(&ctx)?.borrow().user_activation_active())
+}
+
+/// Whether the current realm was ever activated
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation-hasbeenactive>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn user_activation_sticky(ctx: Ctx<'_>) -> Result<bool> {
+    Ok(super::world(&ctx)?.borrow().user_activation_sticky())
+}
+
+/// Consumes the current realm's transient activation
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn consume_user_activation(ctx: Ctx<'_>) -> Result<bool> {
+    Ok(super::world(&ctx)?.borrow_mut().consume_user_activation())
 }
 
 /// Runs the activation behavior for an element the input paths clicked, so a
@@ -693,13 +1166,41 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
     {
         return Err(Exception::throw_type(&ctx, "argument is not an element"));
     }
-    // Same write the IDL setter performs, minus the author-visible entry
-    // point (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-    // Blitz keeps no control value store (see `forms.rs`), so the `value`
-    // content attribute carries it; the dirty-value flag is a known cutover
-    // gap. Going through the tree mutator also keeps Blitz's text-input
-    // state in sync.
-    write_attr(&mut parsed, node, "value", Some(&value.0));
+    let local = parsed
+        .document
+        .base
+        .get_node(node.node)
+        .and_then(|tree| tree.data.downcast_element())
+        .filter(|element| element.name.ns == crate::dom::tree::html_namespace())
+        .map(|element| element.name.local.to_string());
+    match local.as_deref() {
+        Some("input") => {
+            let Some(kind) = crate::dom::input::input_type(&parsed.document.base, node.node) else {
+                return Ok(());
+            };
+            if kind.value_mode() == crate::dom::input::ValueMode::Current {
+                let sanitized =
+                    crate::dom::input::sanitize(&parsed.document.base, node.node, kind, &value.0);
+                parsed
+                    .document
+                    .base
+                    .mutate()
+                    .set_dirty_value(node.node, sanitized);
+                parsed.document.clear_pristine_value(node.node);
+            } else {
+                write_attr(&mut parsed, node, "value", Some(&value.0));
+            }
+        }
+        Some("textarea") => {
+            parsed
+                .document
+                .base
+                .mutate()
+                .set_dirty_value(node.node, value.0);
+            parsed.document.clear_pristine_value(node.node);
+        }
+        _ => write_attr(&mut parsed, node, "value", Some(&value.0)),
+    }
     Ok(())
 }
 
@@ -724,11 +1225,14 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
             return Ok(());
         }
     }
+    // A WebDriver click is a trusted user interaction, so it grants
+    // activation before the click event reaches the page
+    // (<https://html.spec.whatwg.org/multipage/interaction.html#activation-notification>).
+    world_for_node(&ctx, node)?.borrow_mut().activate_user();
     if is_focusable(&ctx, node)? {
         focus_node(&ctx, node)?;
     }
-    if events::fire_trusted_click(&ctx, EventTargetKey::Node(node))? {
-        run_activation(&ctx, node)?;
-    }
+    // The dispatch runs the activation behavior for a non-canceled click.
+    events::fire_trusted_click(&ctx, EventTargetKey::Node(node))?;
     Ok(())
 }

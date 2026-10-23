@@ -12,7 +12,7 @@ mod collections;
 mod cssom_host;
 mod document;
 mod exceptions;
-mod focus;
+pub(crate) mod focus;
 pub(crate) mod forms;
 pub(crate) mod geometry;
 pub(crate) mod host;

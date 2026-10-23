@@ -31,11 +31,7 @@ pub(crate) fn record(
 /// its line breaks escaped.
 pub(crate) fn forwarded(line: &str) -> String {
     let mut out = String::with_capacity(line.len() + 1);
-    let _ = write!(
-        Escaped(&mut out),
-        "{}",
-        line.trim_end_matches(['\r', '\n'])
-    );
+    let _ = write!(Escaped(&mut out), "{}", line.trim_end_matches(['\r', '\n']));
     out.push('\n');
     out
 }

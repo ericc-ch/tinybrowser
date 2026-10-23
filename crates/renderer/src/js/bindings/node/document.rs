@@ -26,8 +26,8 @@ use crate::js::events;
 use crate::js::world::World;
 
 use crate::dom::insertion::{
-    InsertionStep, collect_html_insertion_steps, collect_nonce_elements, iframe_fires_initial_load,
-    insert_parsed, place_journaled, replace_parsed,
+    InsertionStep, collect_html_insertion_steps, collect_nonce_elements, insert_parsed,
+    place_journaled, replace_parsed,
 };
 use crate::dom::tree::{
     BlitzId, NodeId, html_namespace, is_connected, is_html_element, qualified_name, sibling,
@@ -1987,17 +1987,12 @@ pub(super) fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> R
     }
     for step in steps {
         if let InsertionStep::Iframe(id) = step {
-            let fire_load = world(ctx)?
-                .borrow()
-                .with_document(id, |parsed| {
-                    iframe_fires_initial_load(&parsed.document.base, id.node)
-                })
-                .unwrap_or(false);
             World::materialize_iframe(&world(ctx)?, id);
-            if fire_load {
-                super::super::window::fire_node_load(ctx, id)?;
-                let _ = world(ctx)?.borrow_mut().insertion_load_fired.insert(id);
-            }
+            // The initial `load` is an element task, not part of the
+            // insertion steps: the engine fires it after the child frame's
+            // realm exists, so `contentWindow.location` is readable in the
+            // handler
+            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
         }
     }
     Ok(())

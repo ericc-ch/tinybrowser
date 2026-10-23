@@ -1371,36 +1371,37 @@ pub(crate) fn is_mergeable_text_node(base: &blitz_dom::BaseDocument, id: BlitzId
     )
 }
 
-/// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
-/// the data of all `Text` descendants in tree order.
-///
-/// Descends only into elements: a `Document` or other non-container child
-/// contributes nothing, so its subtree is not entered. Fragment backings are
-/// plain elements, so fragments are covered.
-pub(crate) fn descendant_text(
-    base: &blitz_dom::BaseDocument,
-    id: crate::dom::tree::BlitzId,
-) -> crate::dom_string::DomString {
-    let mut text = crate::dom_string::DomString::default();
-    let mut stack = base
-        .get_node(id)
-        .map(|node| node.children.iter().rev().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
-    while let Some(current) = stack.pop() {
-        let Some(node) = base.get_node(current) else {
-            continue;
-        };
-        match &node.data {
-            NodeData::Text(data) => text.push_str(&data.content),
-            // CDATA sections contribute their data to ancestor text content
-            // exactly like text
-            // (<https://dom.spec.whatwg.org/#concept-descendant-text-content>).
-            NodeData::CDataSection { contents } => text.push_str(contents),
-            NodeData::Element(_) => {
-                stack.extend(node.children.iter().rev().copied());
-            }
+/// A node's child text content: the data of its Text children in tree order
+/// (<https://dom.spec.whatwg.org/#concept-child-text-content>).
+pub(crate) fn child_text_content(base: &blitz_dom::BaseDocument, id: BlitzId) -> String {
+    let mut text = String::new();
+    let Some(target) = base.get_node(id) else {
+        return text;
+    };
+    for child in &target.children {
+        match base.get_node(*child).map(|child| &child.data) {
+            Some(NodeData::Text(data)) => text.push_str(&data.content),
+            Some(NodeData::CDataSection { contents }) => text.push_str(contents),
             _ => {}
         }
     }
     text
+}
+
+/// The API value of a text control: the raw value with CRLF and CR normalized
+/// to LF (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-api-value>).
+pub(crate) fn normalize_newlines(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
 }

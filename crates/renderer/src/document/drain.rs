@@ -109,6 +109,7 @@ impl Document {
 
     pub(crate) fn waiting_for_load(&self) -> bool {
         self.world.borrow().main_ready_state() != crate::ReadyState::Complete
+            || self.dials.has_pending_frame_load()
     }
 
     fn has_pending_frame_loads(&self) -> bool {
