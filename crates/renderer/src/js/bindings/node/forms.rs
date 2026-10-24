@@ -587,16 +587,20 @@ impl JsNode {
                 let world_rc = world(&ctx)?;
                 let (kind, sanitized, previous) = {
                     let world = world_rc.borrow();
-                    let Some(parsed) = world.document(self.handle.0) else {
+                    let Some(mut parsed) = world.document_mut(self.handle.0) else {
                         return Ok(());
                     };
-                    let base = &parsed.document.base;
+                    let base = &mut parsed.document.base;
                     let Some(kind) = crate::dom::input::input_type(base, self.handle.0.node) else {
                         return Ok(());
                     };
                     if kind.value_mode() == crate::dom::input::ValueMode::Current {
-                        let sanitized =
-                            crate::dom::input::sanitize(base, self.handle.0.node, kind, &value.0);
+                        let sanitized = crate::dom::input::sanitize_with_device(
+                            base,
+                            self.handle.0.node,
+                            kind,
+                            &value.0,
+                        );
                         let previous =
                             crate::dom::input::current_value(&parsed, self.handle.0.node);
                         (kind, Some(sanitized), Some(previous))

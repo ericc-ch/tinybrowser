@@ -7,6 +7,7 @@
 //! The IDL getter, form submission, and type changes all read this value.
 
 use blitz_dom::BaseDocument;
+use style::device::Device;
 
 use crate::Parsed;
 use crate::dom::microsyntaxes::{
@@ -394,6 +395,22 @@ fn step_base_from_attributes(base: &BaseDocument, node: BlitzId) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Applies the state's algorithm with the document's device, so a system
+/// color in the color state resolves with the used color scheme. Callers need
+/// mutable access only for that state; every other kind is read-only.
+pub(crate) fn sanitize_with_device(
+    base: &mut BaseDocument,
+    node: BlitzId,
+    kind: InputType,
+    raw: &str,
+) -> String {
+    if kind == InputType::Color {
+        sanitize_color_with_device(base, node, raw)
+    } else {
+        sanitize(base, node, kind, raw)
+    }
+}
+
 /// The color state's value: parse, then force alpha opaque unless the `alpha`
 /// attribute is present, and serialize in sRGB or `display-p3` according to
 /// the `colorspace` attribute
@@ -402,7 +419,24 @@ fn sanitize_color(base: &BaseDocument, node: BlitzId, raw: &str) -> String {
     let display_p3 = attr(base, node, "colorspace")
         .is_some_and(|space| space.eq_ignore_ascii_case("display-p3"));
     let preserve_alpha = attr(base, node, "alpha").is_some();
-    let Some(parsed) = crate::css::color::parse_exact(raw) else {
+    sanitize_color_with(display_p3, preserve_alpha, None, raw)
+}
+
+fn sanitize_color_with_device(base: &mut BaseDocument, node: BlitzId, raw: &str) -> String {
+    let display_p3 = attr(base, node, "colorspace")
+        .is_some_and(|space| space.eq_ignore_ascii_case("display-p3"));
+    let preserve_alpha = attr(base, node, "alpha").is_some();
+    let device = base.stylist_device();
+    sanitize_color_with(display_p3, preserve_alpha, Some(device), raw)
+}
+
+fn sanitize_color_with(
+    display_p3: bool,
+    preserve_alpha: bool,
+    device: Option<&Device>,
+    raw: &str,
+) -> String {
+    let Some(parsed) = crate::css::color::parse_exact(raw, device) else {
         return if display_p3 {
             "color(display-p3 0 0 0)".to_owned()
         } else if preserve_alpha {
@@ -413,7 +447,9 @@ fn sanitize_color(base: &BaseDocument, node: BlitzId, raw: &str) -> String {
     };
     let alpha = if preserve_alpha { parsed.value[3] } else { 1.0 };
     if display_p3 {
-        if let Some((components, authored_alpha)) = crate::css::color::display_p3_components(raw) {
+        if let Some((components, authored_alpha)) =
+            crate::css::color::display_p3_components(raw, device)
+        {
             let alpha = if preserve_alpha { authored_alpha } else { 1.0 };
             return serialize_color_function("display-p3", components, alpha);
         }
@@ -485,7 +521,9 @@ pub(crate) fn sync_sanitized_value(parsed: &mut Parsed, node: BlitzId) {
     } else {
         attr(base, node, "value").unwrap_or("").to_owned()
     };
-    let sanitized = sanitize(base, node, kind, &raw);
+    // The slot this writes feeds every later read, so a system color has to
+    // resolve with the document's device here.
+    let sanitized = sanitize_with_device(&mut parsed.document.base, node, kind, &raw);
     parsed
         .document
         .base

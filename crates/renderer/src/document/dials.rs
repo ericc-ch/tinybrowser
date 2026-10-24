@@ -215,3 +215,20 @@ fn delays_load(context: DialContext) -> bool {
         | DialContext::BlitzResource { .. } => true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DialLedger;
+    use crate::js::Stop;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_completion_from_a_replaced_document_cannot_settle_a_dial() {
+        let mut ledger =
+            DialLedger::new(Arc::new(Stop::new()), Arc::new(tokio::sync::Notify::new()));
+        // The completion task of a dial adopted before a navigation keeps the
+        // old ledger's id; the replacement ledger has no such entry, so the
+        // stale task must not finish (or re-finish) anything here.
+        assert!(!ledger.settle(7), "an unknown dial id must not settle");
+    }
+}

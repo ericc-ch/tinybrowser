@@ -1151,8 +1151,12 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
                 return Ok(());
             };
             if kind.value_mode() == crate::dom::input::ValueMode::Current {
-                let sanitized =
-                    crate::dom::input::sanitize(&parsed.document.base, node.node, kind, &value.0);
+                let sanitized = crate::dom::input::sanitize_with_device(
+                    &mut parsed.document.base,
+                    node.node,
+                    kind,
+                    &value.0,
+                );
                 parsed
                     .document
                     .base

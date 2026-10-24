@@ -1897,9 +1897,16 @@ fn sanitize_current(
     value: &str,
 ) -> String {
     let world = world.borrow();
-    world.document(element).map_or_else(String::new, |parsed| {
-        crate::dom::input::sanitize(&parsed.document.base, element.node, kind, value)
-    })
+    world
+        .document_mut(element)
+        .map_or_else(String::new, |mut parsed| {
+            crate::dom::input::sanitize_with_device(
+                &mut parsed.document.base,
+                element.node,
+                kind,
+                value,
+            )
+        })
 }
 
 /// After an attribute change, runs the element's attribute-change hooks: an

@@ -19,7 +19,7 @@ use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
 use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
 use rquickjs::prelude::Opt;
-use rquickjs::{Array, Ctx, Exception, Object, Persistent, Result, Value};
+use rquickjs::{Array, Ctx, Object, Persistent, Result, TypedArray, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -255,7 +255,7 @@ pub(super) fn form_navigate<'js>(
     url: String,
     target: String,
     method: String,
-    body: String,
+    body: TypedArray<'js, u8>,
     content_type: Option<String>,
     form: Value<'js>,
 ) -> Result<()> {
@@ -271,22 +271,12 @@ pub(super) fn form_navigate<'js>(
         return Ok(());
     }
     let world_rc = world(&ctx)?;
-    // The shim sends the body as a Latin-1 binary string, one char per byte
-    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>);
-    // a char above U+00FF would corrupt it.
-    let body = body
-        .chars()
-        .map(|character| {
-            u8::try_from(u32::from(character))
-                .map_err(|_| Exception::throw_type(&ctx, "Form body byte out of range"))
-        })
-        .collect::<Result<Vec<u8>>>()?;
     let navigation = FrameNavigation {
         target: crate::js::NavigationTarget::Target(target),
         spec: url,
         srcdoc: None,
         method,
-        body,
+        body: body.to_vec(),
         content_type,
         // A form submission carries no policy of its own yet, so the initiator
         // document's referrer policy decides.

@@ -1022,7 +1022,7 @@ impl JsRealm {
                 move |url: String,
                       js_id: i32,
                       method: String,
-                      body: Vec<u8>,
+                      body: TypedArray<'_, u8>,
                       content_type: Option<String>,
                       headers: Vec<Vec<String>>,
                       options: Vec<String>| {
@@ -1071,7 +1071,7 @@ impl JsRealm {
                             url,
                             js_id,
                             method,
-                            body,
+                            body: body.to_vec(),
                             content_type,
                             headers,
                             referrer,
@@ -1266,15 +1266,8 @@ fn install_history_host_functions(
                 return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
             }
             world.document_url = next;
-            world.history.state = Some(state.clone());
-            match handling {
-                crate::protocol::HistoryHandling::Push => {
-                    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
-                    world.history.index = world.history.index.saturating_add(1);
-                    world.history.length = world.history.index.saturating_add(1);
-                }
-                crate::protocol::HistoryHandling::Replace => {}
-            }
+            // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
+            world.history.apply(state.clone(), handling);
             world
                 .outbox
                 .borrow_mut()
@@ -1721,7 +1714,7 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
         Func::from(
             move |url: String,
                   method: String,
-                  body: Vec<u8>,
+                  body: TypedArray<'_, u8>,
                   content_type: Option<String>,
                   headers: Vec<Vec<String>>,
                   options: Vec<String>,
@@ -1739,7 +1732,7 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                     SyncPageFetch {
                         url,
                         method,
-                        body,
+                        body: body.to_vec(),
                         content_type,
                         headers,
                         referrer,

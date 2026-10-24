@@ -677,9 +677,10 @@ fn publish(
     engine: &mut Engine,
     outbox: &exchange::BlockingSender<FromRenderer>,
 ) -> bool {
-    let Ok(events) = engine.take_events() else {
+    let Ok((events, internal)) = engine.take_browser_events() else {
         return false;
     };
+    let had_browser_event = !events.is_empty();
     for (frame, event) in events {
         if !send_to_browser(
             outbox,
@@ -691,6 +692,17 @@ fn publish(
         ) {
             return false;
         }
+    }
+    if had_browser_event {
+        return true;
+    }
+    if internal {
+        // Nothing the browser acts on happened, but its JS-truth waiter
+        // predicates still have to run, so send a payload-free wake.
+        return send_to_browser(
+            outbox,
+            Frame::Notify(RendererNotice::Activity { assignment }),
+        );
     }
     true
 }

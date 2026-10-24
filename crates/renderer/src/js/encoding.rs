@@ -64,15 +64,14 @@ fn encode_into<'js>(ctx: Ctx<'js>, source: Value<'js>, max: usize) -> Result<Obj
 /// Single-shot only: every caller passes a whole buffer, so the input is
 /// always final and nothing carries forward
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
-fn decode(
-    ctx: Ctx<'_>,
-    source: String,
+fn decode<'js>(
+    ctx: Ctx<'js>,
+    source: TypedArray<'js, u8>,
     label: String,
     fatal: bool,
     ignore_bom: bool,
 ) -> Result<String> {
-    let bytes = bytes_from_latin1(&source)
-        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+    let bytes = source.to_vec();
     let encoding = resolve_label(&ctx, &label)?;
     let mut decoder = if ignore_bom {
         encoding.new_decoder_without_bom_handling()
@@ -90,13 +89,13 @@ fn decode(
 /// (<https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-documents>,
 /// <https://xhr.spec.whatwg.org/#response-xml>).
 ///
-/// `source` is the isomorphic Latin-1 projection of the raw response bytes
-/// (`__tbToLatin1(responseBytes)`): every byte 0-255 maps 1:1, so
-/// `bytes_from_latin1` round-trips losslessly and fatal decoding below sees
-/// the true bytes.
-fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Result<String> {
-    let bytes = bytes_from_latin1(&source)
-        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+/// Fatal decoding below sees the response's true bytes, not a re-encoding.
+fn decode_xml_response<'js>(
+    ctx: Ctx<'js>,
+    source: TypedArray<'js, u8>,
+    content_type: String,
+) -> Result<String> {
+    let bytes = source.to_vec();
     let header = (!content_type.trim().is_empty()).then_some(content_type.as_str());
     let (encoding, bom_len) =
         crate::sniff::sniff_encoding(&bytes, header, true).unwrap_or((encoding_rs::UTF_8, 0));
@@ -136,15 +135,14 @@ fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
 /// the bytes behind the error stay queued in `carry`, so later calls
 /// continue after the error
 /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
-fn decoder_decode(
-    ctx: Ctx<'_>,
+fn decoder_decode<'js>(
+    ctx: Ctx<'js>,
     id: u64,
-    source: String,
+    source: TypedArray<'js, u8>,
     fatal: bool,
     stream: bool,
 ) -> Result<String> {
-    let bytes = bytes_from_latin1(&source)
-        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+    let bytes = source.to_vec();
     let world_rc = super::bindings::world(&ctx)?;
     let mut world = world_rc.borrow_mut();
     let Some(session) = world.state.decoders.get_mut(&id) else {
@@ -304,16 +302,6 @@ fn reserve_output(decoder: &mut encoding_rs::Decoder, output: &mut String, remai
             .unwrap_or(remaining.saturating_mul(3))
             .max(4),
     );
-}
-
-/// Isomorphic decode: each code point below 256 becomes that byte
-/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
-fn bytes_from_latin1(text: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(text.len());
-    for character in text.chars() {
-        bytes.push(u8::try_from(u32::from(character)).ok()?);
-    }
-    Some(bytes)
 }
 
 fn latin1_from_bytes(bytes: &[u8]) -> String {

@@ -187,7 +187,11 @@ pub enum HistoryHandling {
     Replace,
 }
 
-/// Observable HTML-job outcomes, in the order the renderer ran them.
+/// Renderer outcomes, in the order the renderer ran them.
+///
+/// The browser wire carries only [`BrowserEvent`]: timer, fetch, and script
+/// failures are renderer-side progress that no host acts on, so they never
+/// cross the process boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererEvent {
     /// The document reached `readyState = "complete"` and dispatched `load`.
@@ -222,6 +226,56 @@ pub enum RendererEvent {
     FetchFailed,
     /// A timer or `fetch` callback threw, or `execute_pending_job` failed.
     ScriptFailed,
+}
+
+impl RendererEvent {
+    /// The event a host acts on, or `None` for renderer-internal progress.
+    #[must_use]
+    pub fn into_browser(self) -> Option<BrowserEvent> {
+        Some(match self {
+            Self::Load => BrowserEvent::Load,
+            Self::DomContentLoaded => BrowserEvent::DomContentLoaded,
+            Self::Navigated { url } => BrowserEvent::Navigated { url },
+            Self::HistoryUpdated {
+                url,
+                state,
+                handling,
+            } => BrowserEvent::HistoryUpdated {
+                url,
+                state,
+                handling,
+            },
+            Self::HistoryTraversal { delta } => BrowserEvent::HistoryTraversal { delta },
+            Self::Timer(..) | Self::Fetch { .. } | Self::FetchFailed | Self::ScriptFailed => {
+                return None;
+            }
+        })
+    }
+}
+
+/// A renderer outcome the browser acts on. The IPC notice carries this type,
+/// so the browser never receives an event it has no state for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BrowserEvent {
+    /// The document reached `readyState = "complete"` and dispatched `load`.
+    Load,
+    /// The document finished parsing and dispatched `DOMContentLoaded`
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>);
+    /// subresources may still be loading.
+    DomContentLoaded,
+    /// A frame committed a navigation to this URL.
+    Navigated {
+        /// The final URL after redirects.
+        url: String,
+    },
+    /// A history API update in the active document (no new JS realm).
+    HistoryUpdated {
+        url: String,
+        state: String,
+        handling: HistoryHandling,
+    },
+    /// Request to traverse the tab's session history by `delta` entries.
+    HistoryTraversal { delta: i32 },
 }
 
 /// Which of the two storage areas a change belongs to.
@@ -370,7 +424,7 @@ impl ResponseHead {
     }
 }
 
-/// Browser-owned history state passed to a newly created document realm.
+/// The browser's session history, as the renderer mirrors it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HistorySnapshot {
     /// Total session-history entry count.
@@ -379,6 +433,23 @@ pub struct HistorySnapshot {
     pub index: usize,
     /// Serialized classic history API state of the active entry.
     pub state: Option<String>,
+}
+
+impl HistorySnapshot {
+    /// Mirrors one same-document history update.
+    ///
+    /// The browser owns the entries; the renderer keeps this mirror because
+    /// `history.length` and `history.state` are synchronous DOM reads, while
+    /// the browser's authoritative update arrives later as a renderer event.
+    /// The browser replaces this snapshot on mount and traversal, so the two
+    /// only differ between a script's update and that event.
+    pub(crate) fn apply(&mut self, state: String, handling: HistoryHandling) {
+        self.state = Some(state);
+        if matches!(handling, HistoryHandling::Push) {
+            self.index = self.index.saturating_add(1);
+            self.length = self.index.saturating_add(1);
+        }
+    }
 }
 
 /// Why a browser-service dial failed. Preserved across the renderer seam.

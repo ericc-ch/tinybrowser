@@ -29,7 +29,9 @@ pub const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
 use crate::documents::DocumentStore;
 use crate::js::{FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, SharedHandle, TargetOrigin};
-use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError};
+use crate::protocol::{
+    BrowserEvent, BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError,
+};
 use crate::storage::PendingStorageEvent;
 
 /// One renderer process's page engine.
@@ -384,6 +386,29 @@ impl Engine {
             events.extend(pending.into_iter().map(|event| (frame, event)));
         }
         Ok(events)
+    }
+
+    /// Removes and returns every pending event the browser acts on, with its
+    /// frame. The flag reports whether renderer-internal progress was
+    /// discarded: it carries no browser-side state, but the browser still
+    /// needs a wake to re-check its JS-truth waiters.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::RendererUnavailable`] when a frame retained more events
+    /// than its limit; the queue empties and the excess is lost.
+    pub fn take_browser_events(
+        &mut self,
+    ) -> Result<(Vec<(FrameId, BrowserEvent)>, bool), TabError> {
+        let mut internal = false;
+        let mut events = Vec::new();
+        for (frame, event) in self.take_events()? {
+            match event.into_browser() {
+                Some(event) => events.push((frame, event)),
+                None => internal = true,
+            }
+        }
+        Ok((events, internal))
     }
 
     /// Runs every immediately ready task in every frame until the shared

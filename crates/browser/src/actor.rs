@@ -11,15 +11,16 @@ use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
 use renderer::{
-    DialFailure, FrameId, HistorySnapshot as RendererHistorySnapshot, MAX_RESPONSE_BODY_BYTES,
-    Mount, RemoteValue, RendererEvent, ResourceLimit, ResponseHead, ScriptSource, TabError,
+    BrowserEvent, DialFailure, FrameId, HistorySnapshot as RendererHistorySnapshot,
+    MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue, ResourceLimit, ResponseHead, ScriptSource,
+    TabError,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
-use crate::assignment::Assignment;
+use crate::assignment::{Assignment, RendererWake};
 use crate::exchange::{self, RequestId, ServerInput};
 use crate::history::{HistorySnapshot, SessionHistory};
 use crate::manager::RendererProcessManager;
@@ -596,7 +597,7 @@ struct Tab {
     renderer: Option<Arc<Assignment>>,
     pending_mount: Option<Mount>,
     site: Option<Site>,
-    events_rx: Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
+    events_rx: Option<mpsc::Receiver<RendererWake>>,
     document_url: Url,
     /// Emulated viewport size in device pixels
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
@@ -1109,12 +1110,12 @@ impl Tab {
         true
     }
 
-    async fn handle_renderer_event(&mut self, frame: FrameId, event: &RendererEvent) {
+    async fn handle_renderer_event(&mut self, frame: FrameId, event: &BrowserEvent) {
         if frame != FrameId::MAIN {
             return;
         }
         match event {
-            RendererEvent::Navigated { url } => {
+            BrowserEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
                     self.history.navigate(url.clone(), None);
                     self.document_url = url;
@@ -1127,7 +1128,7 @@ impl Tab {
                 self.navigation_failed = false;
                 self.record_event(TabEvent::Navigated).await;
             }
-            RendererEvent::Load => {
+            BrowserEvent::Load => {
                 // A `load` for the document a navigation replaced can arrive
                 // after the carrier committed the new response. Only the
                 // document the tab is navigating to may settle the wait.
@@ -1144,10 +1145,10 @@ impl Tab {
                 self.document_loaded = true;
                 self.record_event(TabEvent::Load).await;
             }
-            RendererEvent::DomContentLoaded => {
+            BrowserEvent::DomContentLoaded => {
                 self.record_event(TabEvent::DomContentLoaded).await;
             }
-            RendererEvent::HistoryUpdated {
+            BrowserEvent::HistoryUpdated {
                 url,
                 state,
                 handling,
@@ -1160,13 +1161,9 @@ impl Tab {
                     self.record_event(TabEvent::SameDocumentNavigation).await;
                 }
             }
-            RendererEvent::HistoryTraversal { delta } => {
+            BrowserEvent::HistoryTraversal { delta } => {
                 self.traverse_history(*delta).await;
             }
-            RendererEvent::Timer(..)
-            | RendererEvent::Fetch { .. }
-            | RendererEvent::FetchFailed
-            | RendererEvent::ScriptFailed => {}
         }
     }
 
@@ -1242,7 +1239,7 @@ enum Wake {
     // Boxed: a navigation outcome carries response bodies and headers, and
     // the unboxed form trips `large_enum_variant` next to the small arms.
     Navigation(Box<Option<(u64, Result<NavOutcome, DialFailure>)>>),
-    Renderer(Option<(FrameId, RendererEvent)>),
+    Renderer(Option<RendererWake>),
     Delivery(Option<RemoteWindowMessage>),
     WaiterDeadline,
 }
@@ -1290,15 +1287,18 @@ async fn coordinator_loop(
                 waiters.retain(|waiter| waiter.id != id && !waiter.reply.is_closed());
             }
             Wake::Command(Some(ServerInput::RequestChunk | ServerInput::RequestEnd))
-            | Wake::WaiterDeadline => {}
+            | Wake::WaiterDeadline
+            // Renderer-internal progress has no tab state to update; the wake
+            // itself is what the waiter loop below needs.
+            | Wake::Renderer(Some(RendererWake::Activity)) => {}
             Wake::Command(Some(ServerInput::Notify(_)) | None) => break,
             Wake::Navigation(boxed) => {
                 if let Some((epoch, result)) = *boxed {
                     tab.handle_navigation(epoch, result).await;
                 }
             }
-            Wake::Renderer(Some((frame, event))) => {
-                let navigated = matches!(event, RendererEvent::Navigated { .. });
+            Wake::Renderer(Some(RendererWake::Event(frame, event))) => {
+                let navigated = matches!(event, BrowserEvent::Navigated { .. });
                 tab.handle_renderer_event(frame, &event).await;
                 if navigated {
                     // The frame's realm is gone, so its JS-truth waiters cannot
@@ -1324,8 +1324,8 @@ async fn coordinator_loop(
 }
 
 async fn next_renderer_event(
-    events: &mut Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
-) -> Option<(FrameId, RendererEvent)> {
+    events: &mut Option<mpsc::Receiver<RendererWake>>,
+) -> Option<RendererWake> {
     match events {
         Some(receiver) => receiver.recv().await,
         None => pending().await,

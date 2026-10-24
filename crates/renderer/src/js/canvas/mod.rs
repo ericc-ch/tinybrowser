@@ -4032,7 +4032,26 @@ fn css_color_exact(
     } else {
         lower
     };
-    Ok(crate::css::color::parse_exact(&source).map(|parsed| (parsed.bytes, parsed.serialized)))
+    Ok(parse_canvas_color(ctx, object, &source)?.map(|parsed| (parsed.bytes, parsed.serialized)))
+}
+
+/// Parses a canvas color against the canvas document's device, so a system
+/// color resolves with the document's used color scheme.
+fn parse_canvas_color(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    source: &str,
+) -> Result<Option<crate::css::color::ParsedColor>> {
+    let Ok(id) = canvas_id(object) else {
+        return Ok(crate::css::color::parse_exact(source, None));
+    };
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
+        return Ok(crate::css::color::parse_exact(source, None));
+    };
+    let device = parsed.document.base.stylist_device();
+    Ok(crate::css::color::parse_exact(source, Some(device)))
 }
 
 /// The canvas element's computed `color`, or black when it has no computed
