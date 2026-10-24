@@ -271,12 +271,9 @@ pub(super) fn form_navigate<'js>(
         return Ok(());
     }
     let world_rc = world(&ctx)?;
-    // The body arrives as a Latin-1 string, one char per byte, so file bytes
-    // survive the JS boundary unchanged
-    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>).
-    // A char above U+00FF would corrupt the body silently, so it throws: the
-    // shim builds this string from bytes 0-255, and only a shim break can
-    // produce one.
+    // The shim sends the body as a Latin-1 binary string, one char per byte
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>);
+    // a char above U+00FF would corrupt it.
     let body = body
         .chars()
         .map(|character| {
