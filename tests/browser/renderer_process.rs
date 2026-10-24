@@ -1,12 +1,10 @@
 //! Renderer-process lifecycle over CDP: one daemon, one renderer child per site.
 
-mod common;
-
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use common::Fixture;
+use crate::fixture::Fixture;
 use serde_json::{Value, json};
 
 fn attach(client: &mut cdp::Client, target: &str) -> String {
@@ -268,7 +266,7 @@ fn aborted_tab_releases_its_assignment() {
         .expect("blocked eval never returned after close");
     runner.join().expect("runner");
 
-    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let path = fixture.data().join("tinybrowser/logs/default.log");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -317,7 +315,7 @@ fn a_wedged_renderer_is_interrupted_and_the_tab_recovers() {
     client
         .call("Page.navigate", &json!({"url": url}), Some(&session))
         .expect("navigate");
-    wait_for_load(&mut client, Duration::from_secs(5));
+    crate::fixture::wait_for_load(&mut client, &session, Duration::from_secs(5));
 
     // A blocking script must time out, interrupt the renderer, and return
     // instead of holding the tab for the full request budget.
@@ -340,7 +338,7 @@ fn a_wedged_renderer_is_interrupted_and_the_tab_recovers() {
     client
         .call("Page.navigate", &json!({"url": url}), Some(&session))
         .expect("renavigate");
-    wait_for_load(&mut client, Duration::from_secs(10));
+    crate::fixture::wait_for_load(&mut client, &session, Duration::from_secs(10));
     assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
     server.join().expect("server");
 }
@@ -380,7 +378,7 @@ fn post_message_to_a_busy_tab_does_not_block_the_sender() {
             Some(&session),
         )
         .expect("navigate");
-    wait_for_load(&mut client, Duration::from_secs(5));
+    crate::fixture::wait_for_load(&mut client, &session, Duration::from_secs(5));
     assert_eq!(
         eval(
             &mut client,
@@ -431,7 +429,7 @@ fn post_message_to_a_busy_tab_does_not_block_the_sender() {
     );
 
     // The message reached the target's delivery mailbox.
-    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let path = fixture.data().join("tinybrowser/logs/default.log");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -491,7 +489,7 @@ fn window_messages_are_limited_to_related_tabs() {
             Some(&session),
         )
         .expect("navigate");
-    wait_for_load(&mut client, Duration::from_secs(5));
+    crate::fixture::wait_for_load(&mut client, &session, Duration::from_secs(5));
 
     assert_eq!(
         eval(
@@ -503,7 +501,7 @@ fn window_messages_are_limited_to_related_tabs() {
         "true"
     );
     std::thread::sleep(Duration::from_millis(300));
-    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let path = fixture.data().join("tinybrowser/logs/default.log");
     let log = std::fs::read_to_string(&path).unwrap_or_default();
     assert!(
         !log.contains("window message queued"),
@@ -571,7 +569,7 @@ fn legal_storage_values_do_not_kill_the_renderer() {
             Some(&session),
         )
         .expect("navigate");
-    wait_for_load(&mut client, Duration::from_secs(5));
+    crate::fixture::wait_for_load(&mut client, &session, Duration::from_secs(5));
 
     // 2,500,000 quotes encode to 5,000,002 bytes: inside the 5 MiB storage
     // quota, but ~10 MiB on the wire once the control JSON escapes the
@@ -587,20 +585,6 @@ fn legal_storage_values_do_not_kill_the_renderer() {
     );
     assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
     server.join().expect("server");
-}
-
-fn wait_for_load(client: &mut cdp::Client, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let event = client
-            .read_event(Duration::from_millis(500))
-            .expect("event read")
-            .expect("event");
-        if event["method"] == json!("Page.loadEventFired") {
-            return;
-        }
-        assert!(Instant::now() < deadline, "load event not seen");
-    }
 }
 
 #[test]
@@ -683,7 +667,7 @@ fn log_level_reaches_the_daemon_file() {
     let mut client = fixture.connect();
     let created = create(&mut client);
 
-    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let path = fixture.data().join("tinybrowser/logs/default.log");
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut text = String::new();
     loop {

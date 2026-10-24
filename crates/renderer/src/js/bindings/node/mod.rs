@@ -53,10 +53,7 @@ impl JsNode {
 }
 
 #[rquickjs::methods]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs method ABI passes Ctx by value"
-)]
+
 impl JsNode {
     #[qjs(constructor)]
     fn ctor(ctx: Ctx<'_>) -> Result<Self> {

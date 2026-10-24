@@ -520,11 +520,6 @@ impl<'js> html_marquee_element_generated::HTMLMarqueeElement<'js> for JsNode {
 
 impl html_audio_element_generated::HTMLAudioElement<'_> for JsNode {}
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
     pub(super) fn natural_width(&self, ctx: Ctx<'_>) -> Result<u32> {

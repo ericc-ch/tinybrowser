@@ -205,73 +205,149 @@ fn dispatch_groups(
 ) -> (Vec<TokenStream>, Vec<TokenStream>) {
     let mut arms = Vec::new();
     for (index, attribute) in interface.attributes.iter().enumerate() {
-        arms.push((
-            index * 2 + 1,
-            false,
-            getter_dispatch(index * 2 + 1, attribute, interface),
-        ));
-        if let Some(setter) = setter_dispatch((index, attribute), interface) {
+        arms.push((index * 2 + 1, false, getter_dispatch(attribute, interface)));
+        if let Some(setter) = setter_dispatch(attribute, interface) {
             arms.push((index * 2 + 2, true, setter));
         }
     }
     for (index, operation) in interface.operations.iter().enumerate() {
         let id = interface.attributes.len() * 2 + index + 1;
-        arms.push((id, true, operation_dispatch(id, operation, interface)));
+        arms.push((id, true, operation_dispatch(operation, interface)));
     }
     if let Some(stringifier) = &interface.stringifier {
         let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
         let body = match stringifier {
             crate::model::Stringifier::Attribute(index) => {
-                getter_dispatch(id, &interface.attributes[*index], interface)
+                getter_dispatch(&interface.attributes[*index], interface)
             }
             // An anonymous `stringifier;` calls the provided method and
             // converts the string result.
             crate::model::Stringifier::Method => quote! {
-                #id => {
-                    let result: rquickjs::String = receiver.stringifier(&ctx)?;
-                    rquickjs::IntoJs::into_js(result, &ctx)
-                }
+                let result: rquickjs::String = receiver.stringifier(&ctx)?;
+                rquickjs::IntoJs::into_js(result, &ctx)
             },
         };
         arms.push((id, false, body));
     }
     let mut routes = Vec::new();
     let mut groups = Vec::new();
-    // Bound each generated switch while retaining one native entry point and
-    // one payload borrow. These are plain Rust functions, not JS callbacks.
+    // Each member's body becomes its own function taking only what it uses,
+    // and a group of four members dispatches to them, so no generated body
+    // grows past the line bound while the routes retain one native entry
+    // point and one payload borrow. These are plain Rust functions, not JS
+    // callbacks.
     for (index, chunk) in arms.chunks(4).enumerate() {
         let name = format_ident!("{prefix}_group_{index}");
         let first = chunk[0].0;
         let last = chunk[chunk.len() - 1].0;
-        let parameters = if chunk.iter().any(|(_, uses_params, _)| *uses_params) {
-            format_ident!("params")
-        } else {
-            format_ident!("_params")
-        };
-        let bodies = chunk.iter().map(|(_, _, body)| body);
-        routes.push(quote! {
-            #first..=#last => #name(&ctx, &receiver, operation, params)
-        });
-        groups.push(quote! {
-            #[allow(
-                clippy::too_many_lines,
-                reason = "generated from IDL; a dispatch group batches four members with one receiver borrow"
-            )]
-            fn #name<'js>(
-                ctx: &Ctx<'js>,
-                receiver: &#payload,
-                operation: host::Operation,
-                #parameters: &Params<'_, 'js>,
-            ) -> Result<Value<'js>> {
-                let ctx = ctx.clone();
-                match operation.index() {
-                    #(#bodies,)*
-                    _ => Err(rquickjs::Exception::throw_internal(&ctx, "unknown native operation")),
-                }
-            }
-        });
+        let uses_params = chunk.iter().any(|(_, uses_params, _)| *uses_params);
+        let member_routes = chunk
+            .iter()
+            .map(|(id, uses_params, body)| {
+                let member = format_ident!("{prefix}_op_{id}");
+                let call = member_call(*uses_params, body);
+                quote! { #id => #member(#call) }
+            })
+            .collect::<Vec<_>>();
+        for (id, uses_params, body) in chunk {
+            let member = format_ident!("{prefix}_op_{id}");
+            groups.push(member_function(&member, payload, *uses_params, body));
+        }
+        routes.push(group_route(&name, uses_params, first, last));
+        groups.push(group_function(&name, payload, uses_params, &member_routes));
     }
     (routes, groups)
+}
+
+/// The argument list handing a member body what it uses: a body written
+/// against an owned `Ctx` gets the context, and the receiver and params go
+/// through only when the body reaches for them.
+fn member_call(uses_params: bool, body: &TokenStream) -> TokenStream {
+    let tokens = body.to_string();
+    let mut call = Vec::new();
+    if tokens.contains("ctx") {
+        call.push(quote! { ctx });
+    }
+    if tokens.contains("receiver") {
+        call.push(quote! { receiver });
+    }
+    if uses_params {
+        call.push(quote! { params });
+    }
+    quote! { #(#call),* }
+}
+
+fn member_function(
+    member: &proc_macro2::Ident,
+    payload: &TokenStream,
+    uses_params: bool,
+    body: &TokenStream,
+) -> TokenStream {
+    let tokens = body.to_string();
+    let mut signature = Vec::new();
+    if tokens.contains("ctx") {
+        signature.push(quote! { ctx: &Ctx<'js> });
+    }
+    if tokens.contains("receiver") {
+        signature.push(quote! { receiver: &#payload });
+    }
+    if uses_params {
+        signature.push(quote! { params: &Params<'_, 'js> });
+    }
+    // Bodies are written against an owned `Ctx`; the clone gives them one.
+    let shadow = tokens
+        .contains("ctx")
+        .then(|| quote! { let ctx = ctx.clone(); });
+    quote! {
+        fn #member<'js>(#(#signature),*) -> Result<Value<'js>> {
+            #shadow
+            #body
+        }
+    }
+}
+
+fn group_route(
+    name: &proc_macro2::Ident,
+    uses_params: bool,
+    first: usize,
+    last: usize,
+) -> TokenStream {
+    let call = if uses_params {
+        quote! { #name(&ctx, &receiver, operation, params) }
+    } else {
+        quote! { #name(&ctx, &receiver, operation) }
+    };
+    quote! { #first..=#last => #call }
+}
+
+fn group_function(
+    name: &proc_macro2::Ident,
+    payload: &TokenStream,
+    uses_params: bool,
+    member_routes: &[TokenStream],
+) -> TokenStream {
+    let signature = if uses_params {
+        quote! {
+            ctx: &Ctx<'js>,
+            receiver: &#payload,
+            operation: host::Operation,
+            params: &Params<'_, 'js>,
+        }
+    } else {
+        quote! {
+            ctx: &Ctx<'js>,
+            receiver: &#payload,
+            operation: host::Operation,
+        }
+    };
+    quote! {
+        fn #name<'js>(#signature) -> Result<Value<'js>> {
+            match operation.index() {
+                #(#member_routes,)*
+                _ => Err(rquickjs::Exception::throw_internal(ctx, "unknown native operation")),
+            }
+        }
+    }
 }
 
 fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> TokenStream {
@@ -708,7 +784,7 @@ fn method_call(interface: &Interface, method: &syn::Ident, arguments: &TokenStre
     }
 }
 
-fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> TokenStream {
+fn getter_dispatch(getter: &Attribute, interface: &Interface) -> TokenStream {
     let method = &getter.rust;
     // Operation dispatch always hands over an owned `Ctx`; attributes borrow it.
     let ctx_arg = quote! { &ctx };
@@ -786,7 +862,7 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             }
         },
     };
-    quote! { #id => { #body } }
+    quote! { #body }
 }
 
 /// One attribute setter's value conversion from the first argument.
@@ -831,25 +907,19 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
     }
 }
 
-fn setter_dispatch(
-    (index, attribute): (usize, &Attribute),
-    interface: &Interface,
-) -> Option<TokenStream> {
+fn setter_dispatch(attribute: &Attribute, interface: &Interface) -> Option<TokenStream> {
     let setter = attribute.setter.as_ref()?;
-    let id = index * 2 + 2;
     let ctx_arg = quote! { &ctx };
     let method = match setter {
         Setter::Method { rust } => rust,
         Setter::Reflect { content } => {
-            return Some(reflect_setter(index, attribute, content));
+            return Some(reflect_setter(attribute, content));
         }
         Setter::PutForwards { target, nullable } => {
             let name = &attribute.name;
             return Some(quote! {
-                #id => {
-                    // https://webidl.spec.whatwg.org/#es-attributes
-                    host::put_forwards(params, #name, #target, #nullable)
-                }
+                // https://webidl.spec.whatwg.org/#es-attributes
+                host::put_forwards(params, #name, #target, #nullable)
             });
         }
     };
@@ -865,21 +935,18 @@ fn setter_dispatch(
         body
     };
     Some(quote! {
-        #id => {
-            // https://webidl.spec.whatwg.org/#es-attributes
-            // Chromium and Firefox reject an omitted setter argument;
-            // WebIDL instead converts undefined, so follow that algorithm.
-            let value = #convert;
-            #body
-        }
+        // https://webidl.spec.whatwg.org/#es-attributes
+        // Chromium and Firefox reject an omitted setter argument;
+        // WebIDL instead converts undefined, so follow that algorithm.
+        let value = #convert;
+        #body
     })
 }
 
 /// A `[Reflect]` setter: convert the value, then write the content
 /// attribute through the shared helper. Reactions wrap the write, like any
 /// setter.
-fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenStream {
-    let id = index * 2 + 2;
+fn reflect_setter(attribute: &Attribute, content: &str) -> TokenStream {
     let convert = match attribute.return_type {
         ReturnType::String if attribute.legacy_null_to_empty => {
             quote! { host::legacy_null_string_argument(params, 0)? }
@@ -933,15 +1000,13 @@ fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenSt
         body
     };
     quote! {
-        #id => {
-            // https://webidl.spec.whatwg.org/#es-attributes
-            let value = #convert;
-            #body
-        }
+        // https://webidl.spec.whatwg.org/#es-attributes
+        let value = #convert;
+        #body
     }
 }
 
-fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -> TokenStream {
+fn operation_dispatch(operation: &Operation, interface: &Interface) -> TokenStream {
     let method = &operation.rust;
     let required = operation
         .arguments
@@ -1001,11 +1066,9 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
         body
     };
     quote! {
-        #id => {
-            host::require_arguments(params, #required)?;
-            #(#arguments)*
-            #body
-        }
+        host::require_arguments(params, #required)?;
+        #(#arguments)*
+        #body
     }
 }
 
@@ -1081,13 +1144,22 @@ fn converted_argument(
                 let #variable = #struct_name::from_object(&ctx, &value)?;
             }
         }
-        ReturnType::Enumeration(name) | ReturnType::Union(name, _) => {
+        ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             let default = union_default_value(argument);
             quote! {
                 #fetch
                 #default
                 let #variable = #name::from_value(&ctx, value)?;
+            }
+        }
+        ReturnType::Union(name, _) => {
+            let name = format_ident!("{name}");
+            let default = union_default_value(argument);
+            quote! {
+                #fetch
+                #default
+                let #variable = #name::from_value(&ctx, &value)?;
             }
         }
         ReturnType::NullableUnion(name, _) => {
@@ -1097,7 +1169,7 @@ fn converted_argument(
                 let #variable = if value.is_null() || value.is_undefined() {
                     None
                 } else {
-                    Some(#name::from_value(&ctx, value)?)
+                    Some(#name::from_value(&ctx, &value)?)
                 };
             }
         }
@@ -1703,8 +1775,8 @@ fn union(union: &Union) -> TokenStream {
                 // A platform object implementing the interface; anything
                 // else falls through. `is_interface` is strict: `Attr` has
                 // its own payload and does not implement `Node`.
-                if host::is_interface(ctx, &value, #interface) {
-                    return host::node_argument(ctx, &value).map(Self::#variant);
+                if host::is_interface(ctx, value, #interface) {
+                    return host::node_argument(ctx, value).map(Self::#variant);
                 }
             }),
             UnionMemberType::Interface {
@@ -1714,8 +1786,8 @@ fn union(union: &Union) -> TokenStream {
                 // Non-node platform objects are not exposed by this engine,
                 // so this trial never matches; it keeps the generated union
                 // total without inventing values.
-                if host::is_interface(ctx, &value, #interface) {
-                    return Ok(Self::#variant(value));
+                if host::is_interface(ctx, value, #interface) {
+                    return Ok(Self::#variant(value.clone()));
                 }
             }),
             UnionMemberType::Dictionary(name) => {
@@ -1726,7 +1798,7 @@ fn union(union: &Union) -> TokenStream {
                     // dictionary defaults fill an omitted argument
                     // (<https://webidl.spec.whatwg.org/#es-union>).
                     if value.is_null() || value.is_undefined() || value.is_object() {
-                        return #name::from_object(ctx, &value).map(Self::#variant);
+                        return #name::from_object(ctx, value).map(Self::#variant);
                     }
                 });
             }
@@ -1739,7 +1811,7 @@ fn union(union: &Union) -> TokenStream {
                 // https://webidl.spec.whatwg.org/#es-long
                 if value.is_number() {
                     let converted: rquickjs::Coerced<i32> =
-                        rquickjs::FromJs::from_js(ctx, value)?;
+                        rquickjs::FromJs::from_js(ctx, value.clone())?;
                     return Ok(Self::#variant(converted.0));
                 }
             }),
@@ -1748,7 +1820,7 @@ fn union(union: &Union) -> TokenStream {
                 // Coerced rejects Symbol and stringifies everything else.
                 // A string member is tried last, so this is the tail
                 // expression.
-                rquickjs::FromJs::from_js(ctx, value)
+                rquickjs::FromJs::from_js(ctx, value.clone())
                     .map(|string: rquickjs::Coerced<rquickjs::String>| Self::#variant(string.0))
             }),
         }
@@ -1775,12 +1847,11 @@ fn union(union: &Union) -> TokenStream {
         }
 
         impl<'js> #name #generic {
-            // A union trial calls `from_object` on a reference for dictionary
-            // members, so a union without a string member never consumes the
-            // value.
+            // The value borrows through the trial chain: only the members that
+            // take ownership clone it, so a union whose members all borrow
+            // never pays for a clone.
             #[allow(dead_code, reason = "generated from IDL; return-only unions do not convert from JS")]
-            #[allow(clippy::needless_pass_by_value, reason = "generated from IDL; string members consume the value")]
-            fn from_value(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+            fn from_value(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Self> {
                 #(#trials)*
                 #mismatch
             }
@@ -1817,26 +1888,38 @@ fn union_into_js(union: &Union, name: &proc_macro2::Ident, generic: &TokenStream
     } else {
         quote! { _ctx }
     };
-    let arms = union.members.iter().map(|member| {
+    // Members whose conversion is the same share one arm: the patterns merge,
+    // so the match stays exhaustive without repeating a body.
+    let mut grouped: Vec<(String, proc_macro2::TokenStream, Vec<&syn::Ident>)> = Vec::new();
+    for member in &union.members {
         let variant = &member.variant;
-        match member.type_ {
-            UnionMemberType::Interface { .. } => quote! {
-                Self::#variant(value) => Ok(value),
-            },
-            UnionMemberType::String => quote! {
-                Self::#variant(value) => Ok(value.into_value()),
-            },
-            UnionMemberType::Boolean | UnionMemberType::Long => quote! {
-                Self::#variant(value) => rquickjs::IntoJs::into_js(value, &#ctx_name),
-            },
+        let body = match member.type_ {
+            UnionMemberType::Interface { .. } => quote! { Ok(value) },
+            UnionMemberType::String => quote! { Ok(value.into_value()) },
+            UnionMemberType::Boolean | UnionMemberType::Long => {
+                quote! { rquickjs::IntoJs::into_js(value, &#ctx_name) }
+            }
             // Excluded by `convertible` above; `union_result` rejects
             // dictionary members before emitting a returned union.
-            UnionMemberType::Dictionary(_) => quote! {},
+            UnionMemberType::Dictionary(_) => continue,
+        };
+        // `Boolean` and `Long` share body text but bind different types; an
+        // or-pattern needs one type for `value`.
+        let key = match member.type_ {
+            UnionMemberType::Boolean => format!("bool:{body}"),
+            UnionMemberType::Long => format!("i32:{body}"),
+            _ => body.to_string(),
+        };
+        match grouped.iter_mut().find(|(known, _, _)| *known == key) {
+            Some((_, _, variants)) => variants.push(variant),
+            None => grouped.push((key, body, vec![variant])),
         }
+    }
+    let arms = grouped.iter().map(|(_, body, variants)| {
+        quote! { #(Self::#variants(value))|* => #body, }
     });
     quote! {
         impl<'js> rquickjs::IntoJs<'js> for #name #generic {
-            #[allow(clippy::match_same_arms, reason = "generated from IDL; interface members share the identity conversion")]
             fn into_js(self, #ctx_name: &Ctx<'js>) -> Result<Value<'js>> {
                 match self {
                     #(#arms)*
@@ -1867,7 +1950,7 @@ fn union_fallback(union: &Union) -> TokenStream {
         // remaining value with `ToBoolean` (`2.3` is true, `""` is false).
         let variant = &member.variant;
         return quote! {
-            rquickjs::FromJs::from_js(ctx, value)
+            rquickjs::FromJs::from_js(ctx, value.clone())
                 .map(|converted: rquickjs::Coerced<bool>| Self::#variant(converted.0))
         };
     }

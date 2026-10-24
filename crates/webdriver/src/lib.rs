@@ -933,7 +933,7 @@ async fn delete_cookies(sessions: &Sessions, session: &str) -> (u16, Value) {
 /// The session's virtual window rectangle, matching the engine's
 /// `innerWidth`/`innerHeight` and the element geometry stand-in.
 fn rect_number(value: f64) -> Value {
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         reason = "rect values are validated into the i32 range before storage"
     )]

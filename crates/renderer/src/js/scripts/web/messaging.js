@@ -776,6 +776,19 @@ host.__tbFrameProxy = __tbFrameProxy;
 
 // ── posting and delivery ───────────────────────────────────────────────
 // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage
+// `postMessage` step 5: `/` names the incumbent origin and is passed through
+// for the host to resolve with origin identity intact; anything else but `*`
+// must parse as a URL, throwing `SyntaxError` here before anything is queued.
+function __tbNormalizeTargetOrigin(targetOrigin) {
+  const checked = targetOrigin === undefined ? '/' : String(targetOrigin);
+  if (checked === '/' || checked === '*') return checked;
+  try {
+    new globalThis.URL(checked);
+  } catch (error) {
+    throw new globalThis.DOMException('Invalid target origin', 'SyntaxError');
+  }
+  return checked;
+}
 function __tbPostMessage(targetFrame, argumentCount, message, targetOrigin, transfer) {
   if (argumentCount === 0) {
     throw new TypeError(`Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.`);
@@ -789,19 +802,10 @@ function __tbPostMessage(targetFrame, argumentCount, message, targetOrigin, tran
     transfer = targetOrigin.transfer;
     targetOrigin = targetOrigin.targetOrigin;
   }
-  const sourceOrigin = String(location.origin);
-  let checkedOrigin = targetOrigin === undefined ? '/' : String(targetOrigin);
-  if (checkedOrigin === '/') {
-    checkedOrigin = sourceOrigin;
-  } else if (checkedOrigin !== '*') {
-    let parsed;
-    try {
-      parsed = new globalThis.URL(checkedOrigin);
-    } catch (error) {
-      throw new globalThis.DOMException('Invalid target origin', 'SyntaxError');
-    }
-    checkedOrigin = parsed.origin;
-  }
+  // The target origin is parsed before the message is serialized: a
+  // `SyntaxError` must not detach buffers, ports, or canvases
+  // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+  const checkedOrigin = __tbNormalizeTargetOrigin(targetOrigin);
   const encoded = __tbEncode(message, transfer, null);
   host.__tbPostWindowMessage(targetFrame, checkedOrigin, encoded.payload, encoded.ports);
 }
@@ -836,9 +840,10 @@ host.__tbDeliverMessageError = function(sourceFrame, origin) {
   }));
 };
 // A message from another tab cannot name a frame in this renderer, so its
-// source is `null`
+// source is `null`, and its `origin` is the sender's serialized origin at
+// post time
 // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-host.__tbDeliverRemoteMessage = function(payload) {
+host.__tbDeliverRemoteMessage = function(origin, payload) {
   if (String(payload).indexOf(__tbPayloadVersion) !== 0) return;
   let data;
   try {
@@ -847,7 +852,7 @@ host.__tbDeliverRemoteMessage = function(payload) {
     return;
   }
   host.__tbDispatchTrusted(new __tbMessageEventConstructor('message', {
-    data: data, origin: '', source: null, ports: Object.freeze([]),
+    data: data, origin: origin, source: null, ports: Object.freeze([]),
   }));
 };
 
@@ -1050,9 +1055,19 @@ Object.defineProperty(globalThis, 'name', {
             }
           };
           case 'closed': return closedTabs.has(tab);
-          case 'postMessage': return (message, targetOrigin, transfer) => {
-            const encoded = __tbEncode(message, transfer ?? [], null);
-            host.__tbWindowPostMessage(tab, encoded.payload);
+          case 'postMessage': return function(message, targetOrigin, transfer) {
+            // Same argument handling as a same-page `postMessage`
+            // (<https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage>).
+            if (arguments.length === 0) {
+              throw new TypeError(`Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.`);
+            }
+            if (targetOrigin !== null && typeof targetOrigin === 'object') {
+              transfer = targetOrigin.transfer;
+              targetOrigin = targetOrigin.targetOrigin;
+            }
+            const checkedOrigin = __tbNormalizeTargetOrigin(targetOrigin);
+            const encoded = __tbEncode(message, transfer, null);
+            host.__tbWindowPostMessage(tab, checkedOrigin, encoded.payload);
           };
           case 'localStorage': return host.__tbStorageArea('local');
           case 'sessionStorage': return remoteSession(tab);

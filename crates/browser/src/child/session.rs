@@ -225,7 +225,9 @@ fn handle_request(
             | Command::RemoveInitScript { .. }
             | Command::SetViewport { .. }
             | Command::ContentSize { .. }
-            | Command::WindowMessage { .. }
+            | Command::WaitForJs { .. }
+            | Command::CancelWait { .. }
+            | Command::WindowMessage(..)
             | Command::HistoryTraverse { .. } => {
                 Reply::Unit(Err(stream_error("unknown assignment")))
             }
@@ -609,12 +611,20 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
         Command::ContentSize { frame } => {
             Handled::Reply(Reply::ContentSize(engine.content_size(frame)))
         }
+        Command::WaitForJs { id, frame, source } => {
+            engine.add_js_waiter(id, frame, source);
+            Handled::Reply(Reply::Unit(Ok(())))
+        }
+        Command::CancelWait { id } => {
+            engine.cancel_js_waiter(id);
+            Handled::Reply(Reply::Unit(Ok(())))
+        }
         Command::Screenshot { frame, request } => match engine.screenshot_frame(frame, &request) {
             Ok(png) => Handled::Screenshot(png),
             Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),
         },
-        Command::WindowMessage { payload } => {
-            engine.receive_remote_window_message(payload);
+        Command::WindowMessage(message) => {
+            engine.receive_remote_window_message(message);
             Handled::Reply(Reply::Unit(Ok(())))
         }
         Command::HistoryTraverse { url, history } => {
@@ -673,7 +683,10 @@ fn publish(
     engine: &mut Engine,
     outbox: &exchange::BlockingSender<FromRenderer>,
 ) -> bool {
-    let Ok(events) = engine.take_events() else {
+    // The predicates run first: their evaluation is the drain's last work,
+    // and only the ids that became true cross the boundary.
+    let settled = engine.settle_js_waiters();
+    let Ok(events) = engine.take_browser_events() else {
         return false;
     };
     for (frame, event) in events {
@@ -684,6 +697,14 @@ fn publish(
                 frame,
                 event,
             }),
+        ) {
+            return false;
+        }
+    }
+    for id in settled {
+        if !send_to_browser(
+            outbox,
+            Frame::Notify(RendererNotice::WaiterSettled { assignment, id }),
         ) {
             return false;
         }

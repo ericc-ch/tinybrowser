@@ -52,27 +52,27 @@ const __tbXhrTimeout = (xhr, data) => {
 // the slot; other body types match the async extractor
 // (<https://fetch.spec.whatwg.org/#bodyinit-safely-extract>).
 const __tbSyncRequestBody = body => {
-  if (body === null || body === undefined) return { bytes: [], type: null };
+  if (body === null || body === undefined) return { bytes: new __tbUint8Array(0), type: null };
   if (typeof Blob === 'function' && body instanceof Blob) {
     const stored = __tbBlobData.get(body);
     if (stored === undefined) return null;
-    return { bytes: Array.from(stored.bytes), type: body.type || null };
+    return { bytes: stored.bytes, type: body.type || null };
   }
-  if (body instanceof ArrayBuffer) return { bytes: Array.from(new Uint8Array(body)), type: null };
+  if (body instanceof ArrayBuffer) return { bytes: new __tbUint8Array(body), type: null };
   if (ArrayBuffer.isView(body)) {
     return {
-      bytes: Array.from(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)),
+      bytes: new __tbUint8Array(body.buffer, body.byteOffset, body.byteLength),
       type: null,
     };
   }
   if (body instanceof URLSearchParams) {
     return {
-      bytes: Array.from(__tbUtf8Encode(String(body))),
+      bytes: __tbUtf8Encode(String(body)),
       type: 'application/x-www-form-urlencoded;charset=UTF-8',
     };
   }
   return {
-    bytes: Array.from(__tbUtf8Encode(String(body))),
+    bytes: __tbUtf8Encode(String(body)),
     type: 'text/plain;charset=UTF-8',
   };
 };
@@ -222,7 +222,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       // Decoded the way navigations decode: BOM, then the transport charset
       // or the XML declaration, then UTF-8. Fatal: undecodable bytes mean no
       // document, not replacement text.
-      source = host.__tbDecodeXmlResponse(__tbToLatin1(data.responseBytes), header);
+      source = host.__tbDecodeXmlResponse(data.responseBytes, header);
     } catch (_) {
       __tbXhrResetDocument(data, null);
       return null;
@@ -325,7 +325,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
         if (entry === null) {
           __tbXhrSyncError(data, 'The request failed due to a network error.');
         }
-        const bytes = Array.from(__tbUtf8Encode(String(entry.contents)));
+        const bytes = __tbUtf8Encode(String(entry.contents));
         // The blob URL response's header list carries the blob's type
         // (<https://fetch.spec.whatwg.org/#scheme-fetch>).
         __tbXhrFinish(this, data, generation, 200, bytes, data.url, [['content-type', entry.type]], true);

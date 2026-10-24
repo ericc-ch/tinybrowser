@@ -20,12 +20,20 @@ use crate::link::{RendererHandle, ResponseWriter};
 use crate::network::TabNetworkHandle;
 use crate::site::Site;
 use crate::wire::{Command as RendererCommand, RendererAssignmentId, Reply};
-use renderer::{FrameId, Mount, RendererEvent, TabError};
+use renderer::{BrowserEvent, FrameId, Mount, TabError};
 
 /// Bounded event handoff to one assignment's subscribers. Saturation is a
 /// protocol violation: dropping lifecycle events would corrupt tab state,
 /// while blocking the reader could strand a reply behind those events.
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
+
+/// One wake for the tab actor: a browser event or a settled JS waiter. Both
+/// run the actor's waiter predicates.
+#[derive(Clone, Debug)]
+pub(crate) enum RendererWake {
+    Event(FrameId, BrowserEvent),
+    WaiterSettled(u64),
+}
 
 /// One browser-authorized top-level document inside a renderer process.
 pub(crate) struct Assignment {
@@ -42,7 +50,7 @@ pub(crate) struct Assignment {
     /// the browser, never by the renderer. `None` before the first mount;
     /// opaque for `about:blank` and friends.
     committed_origin: Mutex<Option<Origin>>,
-    subscribers: Mutex<Vec<mpsc::Sender<(FrameId, RendererEvent)>>>,
+    subscribers: Mutex<Vec<mpsc::Sender<RendererWake>>>,
 }
 
 impl Assignment {
@@ -117,7 +125,7 @@ impl Assignment {
 
     /// Subscribes to this document's frame-tagged events after this call.
     #[must_use]
-    pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, RendererEvent)> {
+    pub(crate) fn subscribe(&self) -> mpsc::Receiver<RendererWake> {
         let (tx, rx) = mpsc::channel(EVENT_SUBSCRIBER_CAPACITY);
         self.subscribers
             .lock()
@@ -129,21 +137,29 @@ impl Assignment {
     /// Delivers one event to every subscriber; returns whether a subscriber
     /// was too slow to accept it (the caller treats saturation as a protocol
     /// violation).
-    pub(crate) fn publish_event(&self, frame: FrameId, event: &RendererEvent) -> bool {
+    pub(crate) fn publish_event(&self, frame: FrameId, event: &BrowserEvent) -> bool {
+        self.publish(&RendererWake::Event(frame, event.clone()))
+    }
+
+    /// Delivers one settled JS waiter to every subscriber; returns whether a
+    /// subscriber was too slow (a dropped settlement would hang the waiter).
+    pub(crate) fn publish_waiter_settled(&self, id: u64) -> bool {
+        self.publish(&RendererWake::WaiterSettled(id))
+    }
+
+    fn publish(&self, wake: &RendererWake) -> bool {
         let mut saturated = false;
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(
-                |subscriber| match subscriber.try_send((frame, event.clone())) {
-                    Ok(()) => true,
-                    Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        saturated = true;
-                        false
-                    }
-                },
-            );
+            .retain(|subscriber| match subscriber.try_send(wake.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    saturated = true;
+                    false
+                }
+            });
         saturated
     }
 }

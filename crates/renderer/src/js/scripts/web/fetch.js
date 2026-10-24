@@ -1093,13 +1093,13 @@ const __tbMakeStreamingResponse = (outcome, signal) => {
 
 // <https://fetch.spec.whatwg.org/#bodyinit-safely-extract>
 const __tbPageRequestBody = async body => {
-  if (body === null || body === undefined) return { bytes: [], type: null };
+  if (body === null || body === undefined) return { bytes: new __tbUint8Array(0), type: null };
   if (body instanceof ReadableStream) {
     const result = await __tbReadAllBytes(body);
-    return { bytes: Array.from(result.bytes), type: null };
+    return { bytes: result.bytes, type: null };
   }
   const extracted = __tbExtractBody(body);
-  return { bytes: extracted.bytes === null ? [] : Array.from(extracted.bytes), type: extracted.type };
+  return { bytes: extracted.bytes === null ? new __tbUint8Array(0) : extracted.bytes, type: extracted.type };
 };
 const __tbQueuePageRequest = (url, method, body, headers, cors, referrer, callback) => {
   const id = ++host.__tb_fetchSeq;

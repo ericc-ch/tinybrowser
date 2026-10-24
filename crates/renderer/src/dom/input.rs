@@ -7,6 +7,8 @@
 //! The IDL getter, form submission, and type changes all read this value.
 
 use blitz_dom::BaseDocument;
+use style::color::{AbsoluteColor, ColorSpace};
+use style::device::Device;
 
 use crate::Parsed;
 use crate::dom::microsyntaxes::{
@@ -203,7 +205,13 @@ pub(crate) fn current_value(parsed: &Parsed, node: BlitzId) -> String {
                 {
                     element.form_state.value.clone()
                 }
-                _ => sanitize(base, node, kind, attr(base, node, "value").unwrap_or("")),
+                _ => sanitize(
+                    base,
+                    base.device(),
+                    node,
+                    kind,
+                    attr(base, node, "value").unwrap_or(""),
+                ),
             }
         }
         ValueMode::Default => attr(base, node, "value").unwrap_or("").to_owned(),
@@ -214,7 +222,15 @@ pub(crate) fn current_value(parsed: &Parsed, node: BlitzId) -> String {
 
 /// Applies a state's value sanitization algorithm
 /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-pub(crate) fn sanitize(base: &BaseDocument, node: BlitzId, kind: InputType, raw: &str) -> String {
+/// Applies the state's algorithm. The document's device resolves a system
+/// color in the color state with the used color scheme.
+pub(crate) fn sanitize(
+    base: &BaseDocument,
+    device: &Device,
+    node: BlitzId,
+    kind: InputType,
+    raw: &str,
+) -> String {
     match kind {
         InputType::Text | InputType::Search | InputType::Tel | InputType::Password => {
             strip_newlines(raw)
@@ -269,7 +285,7 @@ pub(crate) fn sanitize(base: &BaseDocument, node: BlitzId, kind: InputType, raw:
             .unwrap_or_default(),
         InputType::Number => valid_float(raw).map(|_| raw.to_owned()).unwrap_or_default(),
         InputType::Range => sanitize_range(base, node, raw),
-        InputType::Color => sanitize_color(base, node, raw),
+        InputType::Color => sanitize_color(base, device, node, raw),
         InputType::Hidden
         | InputType::Checkbox
         | InputType::Radio
@@ -394,40 +410,78 @@ fn step_base_from_attributes(base: &BaseDocument, node: BlitzId) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Applies the state's algorithm after flushing pending device changes, for
+/// callers that mutate the document (attribute changes, IDL setters).
+pub(crate) fn sanitize_with_device(
+    base: &mut BaseDocument,
+    node: BlitzId,
+    kind: InputType,
+    raw: &str,
+) -> String {
+    let _device = base.stylist_device();
+    let device = base.device();
+    sanitize(base, device, node, kind, raw)
+}
+
+/// How the color state serializes its value: the `colorspace` attribute
+/// selects Display P3, and `alpha` keeps the authored alpha
+/// (<https://html.spec.whatwg.org/multipage/input.html#update-a-color-well-control-color>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColorWellOptions {
+    display_p3: bool,
+    preserve_alpha: bool,
+}
+
+impl ColorWellOptions {
+    fn from_attributes(base: &BaseDocument, node: BlitzId) -> Self {
+        Self {
+            display_p3: attr(base, node, "colorspace")
+                .is_some_and(|space| space.eq_ignore_ascii_case("display-p3")),
+            preserve_alpha: attr(base, node, "alpha").is_some(),
+        }
+    }
+
+    fn default_value(self) -> String {
+        if self.display_p3 {
+            "color(display-p3 0 0 0)".to_owned()
+        } else if self.preserve_alpha {
+            "color(srgb 0 0 0)".to_owned()
+        } else {
+            "#000000".to_owned()
+        }
+    }
+}
+
 /// The color state's value: parse, then force alpha opaque unless the `alpha`
 /// attribute is present, and serialize in sRGB or `display-p3` according to
 /// the `colorspace` attribute
 /// (<https://html.spec.whatwg.org/multipage/input.html#update-a-color-well-control-color>).
-fn sanitize_color(base: &BaseDocument, node: BlitzId, raw: &str) -> String {
-    let display_p3 = attr(base, node, "colorspace")
-        .is_some_and(|space| space.eq_ignore_ascii_case("display-p3"));
-    let preserve_alpha = attr(base, node, "alpha").is_some();
-    let Some(parsed) = crate::css::color::parse_exact(raw) else {
-        return if display_p3 {
-            "color(display-p3 0 0 0)".to_owned()
-        } else if preserve_alpha {
-            "color(srgb 0 0 0)".to_owned()
-        } else {
-            "#000000".to_owned()
-        };
+fn sanitize_color(base: &BaseDocument, device: &Device, node: BlitzId, raw: &str) -> String {
+    let options = ColorWellOptions::from_attributes(base, node);
+    let Some(parsed) = crate::css::color::parse_exact(raw, Some(device), &AbsoluteColor::BLACK)
+    else {
+        return options.default_value();
     };
-    let alpha = if preserve_alpha { parsed.value[3] } else { 1.0 };
-    if display_p3 {
-        if let Some((components, authored_alpha)) = crate::css::color::display_p3_components(raw) {
-            let alpha = if preserve_alpha { authored_alpha } else { 1.0 };
-            return serialize_color_function("display-p3", components, alpha);
-        }
-        let [red, green, blue] = crate::css::color::srgb_to_display_p3([
-            parsed.value[0],
-            parsed.value[1],
-            parsed.value[2],
-        ]);
-        serialize_color_function("display-p3", [red, green, blue], alpha)
-    } else if preserve_alpha {
+    if options.display_p3 {
+        // Keep the authored Display P3 components when the input already names
+        // that space; a round trip through sRGB would perturb them.
+        let p3 = parsed.absolute.to_color_space(ColorSpace::DisplayP3);
+        let alpha = if options.preserve_alpha {
+            p3.alpha
+        } else {
+            1.0
+        };
+        return serialize_color_function(
+            "display-p3",
+            [p3.components.0, p3.components.1, p3.components.2],
+            alpha,
+        );
+    }
+    if options.preserve_alpha {
         serialize_color_function(
             "srgb",
             [parsed.value[0], parsed.value[1], parsed.value[2]],
-            alpha,
+            parsed.value[3],
         )
     } else {
         let [red, green, blue, _] = parsed.bytes;
@@ -485,7 +539,9 @@ pub(crate) fn sync_sanitized_value(parsed: &mut Parsed, node: BlitzId) {
     } else {
         attr(base, node, "value").unwrap_or("").to_owned()
     };
-    let sanitized = sanitize(base, node, kind, &raw);
+    // The slot this writes feeds every later read, so a system color has to
+    // resolve with the document's device here.
+    let sanitized = sanitize_with_device(&mut parsed.document.base, node, kind, &raw);
     parsed
         .document
         .base

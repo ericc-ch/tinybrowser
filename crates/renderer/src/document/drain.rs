@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{DialContext, Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
+use super::{DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::dom::tree::NodeId;
 use crate::js::RealmRequest;
-use crate::protocol::RendererEvent;
+use crate::protocol::{BrowserEvent, RendererEvent};
 
 /// Upper bound on realm requests applied in one turn. Host callbacks can
 /// enqueue more work while a request runs, so a turn must not loop forever.
@@ -26,17 +26,16 @@ impl Document {
         self.drain_blitz_fetches();
         self.launch_queued_dials();
         self.adopt_dial_completions();
-        if let Some(task) = self.tasks.pop_front() {
-            // Joins the drain's turn when one is open, so serial tasks share
-            // its deadline. A task outside a drain still opens its own turn.
-            let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
-            self.run_task(task);
+        let Some(task) = self.tasks.pop_front() else {
             let fired = self.check_load();
-            return !self.stop.is_set()
-                && (fired || self.has_pending_frame_loads() || self.has_ready_work());
-        }
+            return !self.stop.is_set() && (fired || self.has_pending_frame_loads());
+        };
+        // Joins the drain's turn when one is open, so serial tasks share
+        // its deadline. A task outside a drain still opens its own turn.
+        let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
+        self.run_task(task);
         let fired = self.check_load();
-        !self.stop.is_set() && (fired || self.has_pending_frame_loads())
+        !self.stop.is_set() && (fired || self.has_pending_frame_loads() || self.has_ready_work())
     }
 
     /// Whether a task is queued or a timer is already due.
@@ -193,20 +192,18 @@ impl Document {
                 self.adopt_js_work();
             }
             Task::DialFinished(id, done) => {
-                if let Some(dial) = self.dials.take_finished(id) {
-                    dial.settle();
+                if self.dials.settle(id) {
                     self.finish_dial(*done);
                 }
             }
             Task::DialFailed(id, fail) => {
-                if let Some(dial) = self.dials.take_finished(id) {
-                    dial.settle();
+                if self.dials.settle(id) {
                     self.fail_dial(fail);
                 }
             }
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
-            Task::RemoteMessage(payload) => self.deliver_remote_message(&payload),
+            Task::RemoteMessage(message) => self.deliver_remote_message(&message),
             Task::BroadcastMessage {
                 origin,
                 name,
@@ -261,22 +258,24 @@ impl Document {
             RealmRequest::Script(element) => self.queue_dynamic_script(element),
             RealmRequest::Image(element) => {
                 self.world.borrow_mut().image_update_started(element);
-                self.queue_image(element, true);
+                self.queue_image(element, ImageUpdate::SrcChanged);
             }
             RealmRequest::HistoryPush {
                 url,
                 state,
-                replace,
+                handling,
             } => {
                 self.apply_document_url_same_origin(&url);
-                self.record_event(RendererEvent::HistoryUpdated {
+                self.record_event(RendererEvent::Browser(BrowserEvent::HistoryUpdated {
                     url,
                     state,
-                    replace,
-                });
+                    handling,
+                }));
             }
             RealmRequest::HistoryTraverse { delta } => {
-                self.record_event(RendererEvent::HistoryTraversal { delta });
+                self.record_event(RendererEvent::Browser(BrowserEvent::HistoryTraversal {
+                    delta,
+                }));
             }
             RealmRequest::CspViolation(target, violations) => {
                 self.fire_csp_violations(target, &violations);

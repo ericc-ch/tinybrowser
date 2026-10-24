@@ -37,7 +37,9 @@
     if (target.origin !== current.origin) {
       throw new DOMException('History URL must be same-origin', 'SecurityError');
     }
-    length = host.__tbHistoryUpdate(next, serialized, replace);
+    length = replace
+      ? host.__tbHistoryReplace(next, serialized)
+      : host.__tbHistoryPush(next, serialized);
     currentState = __tbDecode(serialized, Object.create(null));
   }
   Object.defineProperty(globalThis.history, Symbol.toStringTag, { value: 'History' });

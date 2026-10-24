@@ -1415,7 +1415,7 @@ impl Canvas2D {
         self.ellipse_arc(x, y, rx, ry, rotation, start, end, counterclockwise);
     }
 
-    #[allow(clippy::too_many_arguments, reason = "shared by arc() and ellipse()")]
+    #[expect(clippy::too_many_arguments, reason = "shared by arc() and ellipse()")]
     fn ellipse_arc(
         &mut self,
         cx: f32,

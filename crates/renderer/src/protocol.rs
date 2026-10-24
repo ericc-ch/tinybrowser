@@ -177,9 +177,53 @@ impl fmt::Display for ScriptFailure {
 
 impl std::error::Error for ScriptFailure {}
 
+/// Whether a history API update replaces the current entry or pushes a new
+/// one (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-pushstate>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryHandling {
+    /// `history.pushState`: a new entry after the current one.
+    Push,
+    /// `history.replaceState`: the current entry in place.
+    Replace,
+}
+
 /// Observable HTML-job outcomes, in the order the renderer ran them.
+///
+/// The IPC wire carries only [`BrowserEvent`]; timer, fetch, and script
+/// failures are renderer-side progress that no host acts on, so they never
+/// cross the process boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererEvent {
+    /// An outcome the browser acts on.
+    Browser(BrowserEvent),
+    /// A host timer whose delay elapsed.
+    Timer(u32),
+    /// A `fetch` or navigation job finished with this HTTP status.
+    Fetch {
+        /// HTTP status.
+        status: u16,
+    },
+    /// `send` or the body read failed.
+    FetchFailed,
+    /// A timer or `fetch` callback threw, or `execute_pending_job` failed.
+    ScriptFailed,
+}
+
+impl RendererEvent {
+    /// The event a host acts on, or `None` for renderer-internal progress.
+    #[must_use]
+    pub fn into_browser(self) -> Option<BrowserEvent> {
+        match self {
+            Self::Browser(event) => Some(event),
+            Self::Timer(..) | Self::Fetch { .. } | Self::FetchFailed | Self::ScriptFailed => None,
+        }
+    }
+}
+
+/// A renderer outcome the browser acts on. The IPC notice carries this type,
+/// so the browser never receives an event it has no state for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BrowserEvent {
     /// The document reached `readyState = "complete"` and dispatched `load`.
     Load,
     /// The document finished parsing and dispatched `DOMContentLoaded`
@@ -197,21 +241,10 @@ pub enum RendererEvent {
     HistoryUpdated {
         url: String,
         state: String,
-        replace: bool,
+        handling: HistoryHandling,
     },
     /// Request to traverse the tab's session history by `delta` entries.
     HistoryTraversal { delta: i32 },
-    /// A host timer whose delay elapsed.
-    Timer(u32),
-    /// A `fetch` or navigation job finished with this HTTP status.
-    Fetch {
-        /// HTTP status.
-        status: u16,
-    },
-    /// `send` or the body read failed.
-    FetchFailed,
-    /// A timer or `fetch` callback threw, or `execute_pending_job` failed.
-    ScriptFailed,
 }
 
 /// Which of the two storage areas a change belongs to.
@@ -360,7 +393,7 @@ impl ResponseHead {
     }
 }
 
-/// Browser-owned history state passed to a newly created document realm.
+/// The browser's session history, as the renderer mirrors it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HistorySnapshot {
     /// Total session-history entry count.
@@ -369,6 +402,26 @@ pub struct HistorySnapshot {
     pub index: usize,
     /// Serialized classic history API state of the active entry.
     pub state: Option<String>,
+}
+
+impl HistorySnapshot {
+    /// Mirrors one same-document history update.
+    ///
+    /// The browser owns the entries; the renderer keeps this mirror because
+    /// `history.length` and `history.state` are synchronous DOM reads, while
+    /// the browser's authoritative update arrives later as a renderer event.
+    /// The browser replaces this snapshot on mount and traversal, so the two
+    /// only differ between a script's update and that event.
+    pub(crate) fn apply(&mut self, state: String, handling: HistoryHandling) {
+        self.state = Some(state);
+        match handling {
+            HistoryHandling::Push => {
+                self.index = self.index.saturating_add(1);
+                self.length = self.index.saturating_add(1);
+            }
+            HistoryHandling::Replace => {}
+        }
+    }
 }
 
 /// Why a browser-service dial failed. Preserved across the renderer seam.
@@ -706,8 +759,8 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     fn window_opener(&self) -> Option<u64>;
 
     /// `postMessage` to a window this realm opened, encoded by the caller's
-    /// realm.
-    fn window_post_message(&self, tab: u64, payload: &str);
+    /// realm. The target resolves the message when the delivery task runs.
+    fn window_post_message(&self, tab: u64, message: PostedMessage);
 
     /// Reads one key from another tab's same-origin session area.
     fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;
@@ -717,6 +770,19 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
 pub trait MessagingHost: Send + Sync + 'static {
     /// `BroadcastChannel.postMessage` for every same-origin channel.
     fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64);
+}
+
+/// One cross-context post, as it travels from the posting realm to the target
+/// document. The browser authorizes `origin` before forwarding the rest
+/// unchanged, so every hop carries the same value instead of rebuilding it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PostedMessage {
+    /// The sender's serialized origin at post time.
+    pub origin: String,
+    /// The normalized target origin: `*`, `/`, or a serialized origin.
+    pub target_origin: String,
+    /// `__tbEncode` payload from the sender's realm.
+    pub payload: String,
 }
 
 /// Complete host capability set used by an engine.

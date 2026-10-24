@@ -515,11 +515,6 @@ impl<'js> html_table_row_element_generated::HTMLTableRowElement<'js> for JsNode 
     }
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-title
     pub(super) fn title<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {

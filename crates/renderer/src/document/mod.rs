@@ -17,10 +17,10 @@ use url::Url;
 use crate::Parsed;
 use crate::ReadyState;
 use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
-use crate::messaging::SharedHandle;
+use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
 use crate::protocol::{
-    BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent, ResponseHead,
-    ScriptFailure, TabError,
+    BrowserEvent, BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent,
+    ResponseHead, ScriptFailure, TabError,
 };
 
 use self::dials::DialLedger;
@@ -51,8 +51,10 @@ enum Task {
     DialFailed(u64, DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
-    /// One cross-tab `message` payload from another renderer.
-    RemoteMessage(String),
+    /// One cross-tab `message` from another renderer. The sender's origin and
+    /// intended target origin travel with it, so the task re-checks both
+    /// against whichever document runs it.
+    RemoteMessage(crate::protocol::PostedMessage),
     /// One `BroadcastChannel` message for this frame's channels.
     BroadcastMessage {
         origin: String,
@@ -78,10 +80,37 @@ enum Task {
     NodeError(crate::dom::tree::NodeId),
 }
 
-/// One posted window message, ready for the target realm's task queue.
+/// What triggered an image load watch: a connected insert may reuse a request
+/// that is already filed, a `src` mutation always starts a new one
+/// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageUpdate {
+    Inserted,
+    SrcChanged,
+}
+
+/// Why a realm is being replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealmReset {
+    /// A navigation creates a new document instance: the `DocumentId` changes
+    /// so tasks bound to the old one stop being runnable.
+    Navigation,
+    /// `document.open()` keeps the document and window: the identity stays.
+    Reopen,
+}
+
+/// One posted window message, ready for the target realm's task queue. The
+/// task is bound to the document that was the target window's associated
+/// document at post time, and it is not runnable once that document is
+/// replaced
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>,
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
 pub(crate) struct WindowMessage {
     pub(crate) source: FrameId,
     pub(crate) origin: String,
+    /// The intended target origin the sender passed to `postMessage`, checked
+    /// inside the task against the document that runs it.
+    pub(crate) target_origin: TargetOrigin,
     pub(crate) payload: String,
     pub(crate) ports: Vec<u64>,
 }
@@ -288,7 +317,7 @@ fn materialize_iframe_document(
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each bool mirrors an HTML document or parser flag"
 )]
@@ -458,6 +487,7 @@ impl Document {
         init_scripts: &Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
+        runtime.shared.borrow_mut().begin_document(frame);
         let world = Rc::new(RefCell::new(World::new(
             document_url.clone(),
             frame,
@@ -784,7 +814,7 @@ impl Document {
     /// Queues the image fetch for a newly connected `<img>`, if it still needs one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn queue_connected_image(&mut self, element: crate::dom::tree::NodeId) {
-        self.queue_image(element, false);
+        self.queue_image(element, ImageUpdate::Inserted);
     }
 
     /// Drops a disconnected `<img>`'s decoded size and ignores its waiter.
@@ -1034,6 +1064,11 @@ impl Document {
         self.tasks.push_back(Task::WindowMessage(message));
     }
 
+    /// Whether `id` still names this frame's current document instance.
+    pub(crate) fn matches_document(&self, id: DocumentId) -> bool {
+        self.shared.borrow().document_id(self.frame) == Some(id)
+    }
+
     /// Queues one `storage` event as a task on this frame's task source
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     pub(crate) fn push_storage_event(&mut self, event: crate::storage::PendingStorageEvent) {
@@ -1042,8 +1077,8 @@ impl Document {
 
     /// Queues one cross-tab `message` as a task on this frame's task source
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#posted-message-task-source>).
-    pub(crate) fn push_remote_message(&mut self, payload: String) {
-        self.tasks.push_back(Task::RemoteMessage(payload));
+    pub(crate) fn push_remote_message(&mut self, message: crate::protocol::PostedMessage) {
+        self.tasks.push_back(Task::RemoteMessage(message));
     }
 
     /// Queues one `BroadcastChannel` message on this frame's task source
@@ -1078,11 +1113,22 @@ impl Document {
     }
 
     /// Dispatches one cross-tab `message` event at this frame's window.
-    fn deliver_remote_message(&mut self, payload: &str) {
+    fn deliver_remote_message(&mut self, message: &crate::protocol::PostedMessage) {
+        // The intended target origin is checked when the task runs, against the
+        // document active then
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+        let sender = Url::parse(&message.origin).ok().map(|url| url.origin());
+        let Some(target_origin) = TargetOrigin::parse(&message.target_origin, sender.as_ref())
+        else {
+            return;
+        };
+        if !target_origin.admits(&self.world.borrow().origin) {
+            return;
+        }
         if !self.ensure_js_ok() {
             return;
         }
-        self.fire_js(|js| js.deliver_remote_message(payload));
+        self.fire_js(|js| js.deliver_remote_message(&message.origin, &message.payload));
         self.adopt_js_work();
     }
 
@@ -1112,6 +1158,19 @@ impl Document {
     }
 
     fn deliver_window_message(&mut self, message: &WindowMessage) {
+        // The intended target origin is checked when the task runs, not when
+        // it was queued: a navigation that committed between the two must not
+        // receive the sender's message. Origins compare with identity, so two
+        // opaque origins never match
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>,
+        // Blink: LocalDOMWindow::DispatchMessageEventWithOriginCheck).
+        if !message.target_origin.admits(&self.world.borrow().origin) {
+            // The transferred endpoints arrive with no message to carry them;
+            // forgetting them fires `close` at their peers instead of leaking
+            // the endpoints until the next reset.
+            self.shared.borrow_mut().forget_endpoints(&message.ports);
+            return;
+        }
         if !self.ensure_js_ok() {
             return;
         }
@@ -1288,7 +1347,7 @@ impl Document {
     /// parse leaves the document on its previous URL, as a streamed response
     /// with an unusable final URL does.
     pub(crate) fn install_head(&mut self, head: &ResponseHead, origin: Option<url::Origin>) {
-        self.reset_js_realm(false);
+        self.reset_js_realm(RealmReset::Navigation);
         // A new response brings its own HTTP status: documents without one
         // (blank, data) report zero rather than a previous page's status.
         // Violation `status-code` reports it
@@ -1449,7 +1508,7 @@ impl Document {
     ///
     /// <https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-open-steps>
     pub(crate) fn reopen_document(&mut self) {
-        self.reset_js_realm(true);
+        self.reset_js_realm(RealmReset::Reopen);
         // A script writes text, not bytes, and it takes the input stream away
         // from any live response: dropping the decoder ignores the rest of
         // that body instead of decoding it with the wrong charset.
@@ -1462,7 +1521,7 @@ impl Document {
     /// EOF with the markup in hand and no decoder, but the carrier owns this
     /// parser: `document.close()` must not end it.
     pub(crate) fn load_html(&mut self, input: &str) {
-        self.reset_js_realm(false);
+        self.reset_js_realm(RealmReset::Navigation);
         self.start_parser(input, true, ParserOwner::Carrier, None);
         self.finish_parse();
     }
@@ -1554,7 +1613,23 @@ impl Document {
         }
     }
 
-    fn reset_js_realm(&mut self, keep_stream_writes: bool) {
+    fn reset_js_realm(&mut self, reason: RealmReset) {
+        // A task is not runnable once its document is not fully active
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+        for task in std::mem::take(&mut self.tasks) {
+            match task {
+                Task::WindowMessage(message) => {
+                    self.shared.borrow_mut().forget_endpoints(&message.ports);
+                }
+                Task::PortMessage { ports, .. } => {
+                    self.shared.borrow_mut().forget_endpoints(&ports);
+                }
+                _ => {}
+            }
+        }
+        if reason == RealmReset::Navigation {
+            self.shared.borrow_mut().begin_document(self.frame);
+        }
         let old = std::mem::replace(
             &mut self.dials,
             DialLedger::new(Arc::clone(&self.stop), Arc::clone(&self.wake)),
@@ -1564,7 +1639,10 @@ impl Document {
         // A pending `load` from the replaced document must not be reported as
         // the new document's readiness.
         self.events.retain(|event| {
-            !matches!(event, RendererEvent::Load | RendererEvent::DomContentLoaded)
+            !matches!(
+                event,
+                RendererEvent::Browser(BrowserEvent::Load | BrowserEvent::DomContentLoaded)
+            )
         });
         // The old realm's ports are gone with it; the peers fire `close`
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
@@ -1596,7 +1674,7 @@ impl Document {
         self.parser_eof = true;
         self.world.borrow_mut().parser_active = false;
         self.world.borrow_mut().state.current_script = None;
-        if keep_stream_writes {
+        if reason == RealmReset::Reopen {
             self.world.borrow().clear_outbox_for_open();
         } else {
             self.world.borrow().clear_outbox();
@@ -2588,9 +2666,9 @@ impl Document {
         // Announce the commit before the new document's load, so the
         // browser can re-create the top-level execution contexts
         // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
-        self.record_event(RendererEvent::Navigated {
+        self.record_event(RendererEvent::Browser(BrowserEvent::Navigated {
             url: url.to_string(),
-        });
+        }));
         let Ok(body) = &outcome.body else {
             return;
         };
@@ -2804,7 +2882,7 @@ impl Document {
         self.run_deferred_modules();
         self.fire_js(crate::js::JsRealm::fire_dom_content_loaded);
         self.adopt_js_work();
-        self.record_event(RendererEvent::DomContentLoaded);
+        self.record_event(RendererEvent::Browser(BrowserEvent::DomContentLoaded));
         // A script may have appended an iframe after the parser finished; its
         // load must delay this document's own load event
         // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
@@ -2873,7 +2951,7 @@ impl Document {
         }
         self.complete_ready_state();
         self.load_fired = true;
-        self.record_event(RendererEvent::Load);
+        self.record_event(RendererEvent::Browser(BrowserEvent::Load));
         self.fire_js(crate::js::JsRealm::fire_load);
         self.adopt_js_work();
         true
@@ -2918,7 +2996,7 @@ impl Document {
             })
             .unwrap_or_default();
         for element in images {
-            self.queue_image(element, false);
+            self.queue_image(element, ImageUpdate::Inserted);
         }
     }
 
@@ -3157,18 +3235,21 @@ impl Document {
     /// delivery that beat this registration) settles here, otherwise the
     /// Blitz delivery for the selected URL settles it.
     ///
-    /// `force` is a `src` mutation: a connected insert skips work when a
-    /// request is already in flight or decoded.
+    /// A connected insert skips work when a request is already in flight or
+    /// decoded; a `src` mutation must reload regardless.
     pub(in crate::document) fn queue_image(
         &mut self,
         element: crate::dom::tree::NodeId,
-        force: bool,
+        update: ImageUpdate,
     ) {
-        if !force
-            && (self.in_flight_images.contains_key(&element)
-                || self.world.borrow().images.sizes.contains_key(&element))
-        {
-            return;
+        match update {
+            ImageUpdate::Inserted
+                if self.in_flight_images.contains_key(&element)
+                    || self.world.borrow().images.sizes.contains_key(&element) =>
+            {
+                return;
+            }
+            ImageUpdate::Inserted | ImageUpdate::SrcChanged => {}
         }
         let src = self.world.borrow().document(element).and_then(|parsed| {
             crate::dom::tree::is_html_element(&parsed.document.base, element.node, "img")

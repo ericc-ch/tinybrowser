@@ -252,10 +252,6 @@ pub struct JsDomParser {
 
 include!(concat!(env!("OUT_DIR"), "/DOMParser.rs"));
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "generated dispatch passes Ctx and Value by value"
-)]
 impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-domparser
     fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
@@ -335,10 +331,6 @@ pub(super) fn install_xhr_parse(ctx: &Ctx<'_>) -> Result<()> {
 /// with the response URL. The shim only passes the five response-XML types;
 /// anything else is a host-contract violation, reported the way a failed
 /// parse is: the shim treats a throw as no document.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn xhr_parse_document<'js>(
     ctx: Ctx<'js>,
     source: rquickjs::String<'js>,
