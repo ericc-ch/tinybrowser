@@ -1312,10 +1312,6 @@ impl<'js> html_hyperlink_element_utils_generated::HTMLHyperlinkElementUtils<'js>
     }
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     // The element's border box from the render pipeline's layout; zero when
     // the element generates no box (for example `display: none`).

@@ -932,10 +932,6 @@ impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js>
     }
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     pub(super) fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
         // https://dom.spec.whatwg.org/#dom-node-nodetype

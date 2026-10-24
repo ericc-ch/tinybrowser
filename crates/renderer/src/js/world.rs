@@ -1783,6 +1783,7 @@ impl World {
         for container in containers {
             if let Some(frame) = shared.tree.frame_for_container(*container) {
                 shared.tree.remove(frame);
+                shared.forget_document(frame);
             }
         }
     }

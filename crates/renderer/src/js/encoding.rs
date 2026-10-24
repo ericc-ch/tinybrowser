@@ -64,10 +64,6 @@ fn encode_into<'js>(ctx: Ctx<'js>, source: Value<'js>, max: usize) -> Result<Obj
 /// Single-shot only: every caller passes a whole buffer, so the input is
 /// always final and nothing carries forward
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn decode(
     ctx: Ctx<'_>,
     source: String,
@@ -98,10 +94,6 @@ fn decode(
 /// (`__tbToLatin1(responseBytes)`): every byte 0-255 maps 1:1, so
 /// `bytes_from_latin1` round-trips losslessly and fatal decoding below sees
 /// the true bytes.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Result<String> {
     let bytes = bytes_from_latin1(&source)
         .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
@@ -123,10 +115,6 @@ fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Re
 /// is what buffers a trailing partial sequence; a fresh decoder per call
 /// would silently drop it
 /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
     let encoding = resolve_label(&ctx, &label)?;
     let world_rc = super::bindings::world(&ctx)?;
@@ -148,10 +136,6 @@ fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
 /// the bytes behind the error stay queued in `carry`, so later calls
 /// continue after the error
 /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn decoder_decode(
     ctx: Ctx<'_>,
     id: u64,
@@ -199,10 +183,6 @@ fn decoder_decode(
 
 /// Drops session `id`. Best-effort: after realm teardown there is no world
 /// left, and the realm drop itself reclaims every session.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn decoder_free(ctx: Ctx<'_>, id: u64) {
     if let Ok(world) = super::bindings::world(&ctx) {
         world.borrow_mut().state.decoders.remove(&id);
@@ -224,10 +204,6 @@ fn resolve_label(ctx: &Ctx<'_>, label: &str) -> Result<&'static Encoding> {
 /// Takes the value, not a string: a lone surrogate has no UTF-8 form for a
 /// Rust `String` to cross in, so the Latin1 check runs on UTF-16 units and
 /// reports `None` for the caller's `InvalidCharacterError`.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn atob<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, input)? else {
         return Ok(None);
@@ -238,10 +214,6 @@ fn atob<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
 
 /// Latin-1-only `btoa`
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#atob>).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn btoa<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, input)? else {
         return Ok(None);
@@ -252,10 +224,6 @@ fn btoa<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
 }
 
 /// Standard base64 of isomorphic-latin1 bytes, for `FileReader` data URLs.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn base64_encode<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, source)? else {
         return Ok(None);

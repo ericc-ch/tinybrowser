@@ -7,11 +7,6 @@
 //!
 //! Spec: <https://html.spec.whatwg.org/multipage/canvas.html#2dcontext>
 
-#![expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs passes every JS argument by value"
-)]
-
 mod path2d;
 mod state;
 mod text;

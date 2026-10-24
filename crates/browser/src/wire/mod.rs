@@ -59,6 +59,10 @@ pub enum Command {
     },
     /// Delivers one remote `message` event, encoded by the sender's realm.
     WindowMessage {
+        /// The sender's serialized origin at post time.
+        origin: String,
+        /// The normalized target origin the sender asked for.
+        target_origin: String,
         /// `__tbEncode` payload from the posting window.
         payload: String,
     },
@@ -360,6 +364,10 @@ pub enum BrowsingContextCall {
     WindowMessage {
         /// Target tab identity.
         tab: u64,
+        /// The sender's serialized origin at post time.
+        origin: String,
+        /// The normalized target origin the sender asked for.
+        target_origin: String,
         /// `__tbEncode` payload from the sender's realm.
         payload: String,
     },

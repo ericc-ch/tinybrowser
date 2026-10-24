@@ -3,7 +3,7 @@ use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use net::{
@@ -124,24 +124,34 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     server.assert_clean();
 }
 
-#[tokio::test]
-async fn timeout_global_covers_every_redirect_hop() {
-    let hop_delay = Duration::from_millis(80);
-    let global = Duration::from_millis(150);
-    let hops = Arc::new(std::sync::Mutex::new(0_u8));
+/// One redirect-chain server shared by the hop-deadline tests: every
+/// connection stalls `hop_delay`, redirects `redirects` times, then lands.
+/// The count is an `AtomicU8` because the accept thread only increments it.
+fn redirect_server(hop_delay: Duration, redirects: u8) -> (TestServer, Arc<AtomicU8>) {
+    let hops = Arc::new(AtomicU8::new(0));
     let server_hops = Arc::clone(&hops);
     let server = TestServer::start(move |connection| {
         connection.read_request();
         std::thread::sleep(hop_delay);
-        let mut number = server_hops.lock().expect("hop counter");
-        *number = number.saturating_add(1);
-        let payload = if *number < 3 {
+        let number = server_hops.fetch_add(1, Ordering::Relaxed) + 1;
+        let payload = if number <= redirects {
             canned_redirect(302, "/next")
         } else {
             canned_ok(&[], b"landed")
         };
         let _ = connection.write_all(&payload);
     });
+    (server, hops)
+}
+
+#[tokio::test]
+async fn timeout_global_covers_every_redirect_hop() {
+    // The margins are wide on purpose: one hop is well under the global
+    // deadline, and two hops overshoot it, so a loaded CI box cannot flip
+    // which side of the deadline the chain ends on.
+    let hop_delay = Duration::from_millis(150);
+    let global = Duration::from_millis(400);
+    let (server, _hops) = redirect_server(hop_delay, 2);
     let started = Instant::now();
     let result = Agent::new(AgentOptions {
         timeout_global: Some(global),
@@ -153,7 +163,7 @@ async fn timeout_global_covers_every_redirect_hop() {
     let elapsed = started.elapsed();
     assert!(
         matches!(
-            result,
+            &result,
             Err(NetError::Transport(TransportError::Timeout(
                 TimeoutKind::Global
             )))
@@ -161,32 +171,24 @@ async fn timeout_global_covers_every_redirect_hop() {
         "expected global timeout, got {result:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(400),
+        elapsed < global + hop_delay,
         "absolute deadline waited {elapsed:?}"
     );
-    assert!(hop_delay < global);
+    // Two stalled hops take 300 ms and the global deadline is 400 ms, so a
+    // mid-chain expiry is the only arithmetic outcome.
+    assert!(hop_delay.saturating_mul(2) < global);
     assert!(hop_delay.saturating_mul(3) > global);
     server.assert_clean();
 }
 
 #[tokio::test]
 async fn timeout_per_call_restarts_on_every_redirect_hop() {
-    let hop_delay = Duration::from_millis(80);
-    let per_call = Duration::from_millis(150);
-    let hops = Arc::new(std::sync::Mutex::new(0_u8));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |connection| {
-        connection.read_request();
-        std::thread::sleep(hop_delay);
-        let mut number = server_hops.lock().expect("hop counter");
-        *number = number.saturating_add(1);
-        let payload = if *number < 3 {
-            canned_redirect(302, "/next")
-        } else {
-            canned_ok(&[], b"landed")
-        };
-        let _ = connection.write_all(&payload);
-    });
+    // One hop fits the per-call deadline many times over, but the whole chain
+    // does not: a budget minted once at call start would expire mid-chain, so
+    // success proves every hop got a fresh deadline.
+    let hop_delay = Duration::from_millis(100);
+    let per_call = Duration::from_millis(500);
+    let (server, hops) = redirect_server(hop_delay, 6);
     let result = Agent::new(AgentOptions {
         timeout_per_call: Some(per_call),
         ..AgentOptions::default()
@@ -199,22 +201,21 @@ async fn timeout_per_call_restarts_on_every_redirect_hop() {
         "each hop gets its own per-call deadline, got {result:?}"
     );
     assert_eq!(
-        *hops.lock().expect("hop counter"),
-        3,
-        "all three hops must be served"
+        hops.load(Ordering::Relaxed),
+        7,
+        "all seven hops must be served"
     );
     server.assert_clean();
 }
 
 #[tokio::test]
 async fn timeout_per_call_bounds_a_single_slow_hop() {
-    let hop_delay = Duration::from_millis(80);
-    let per_call = Duration::from_millis(30);
-    let server = TestServer::start(move |connection| {
-        connection.read_request();
-        std::thread::sleep(hop_delay);
-        let _ = connection.write_all(&canned_ok(&[], b"landed"));
-    });
+    // The hop stalls far past the per-call deadline: the test pins the
+    // deadline kind, not the stall length, so the slack stays wide.
+    let hop_delay = Duration::from_secs(1);
+    let per_call = Duration::from_millis(50);
+    let (server, _hops) = redirect_server(hop_delay, 0);
+    let started = Instant::now();
     let result = Agent::new(AgentOptions {
         timeout_per_call: Some(per_call),
         ..AgentOptions::default()
@@ -222,6 +223,11 @@ async fn timeout_per_call_bounds_a_single_slow_hop() {
     .expect("timeout options")
     .send(Request::new(Method::GET, server.url("/start")))
     .await;
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "per-call deadline waited {elapsed_ms} ms",
+        elapsed_ms = started.elapsed().as_millis()
+    );
     assert!(
         matches!(
             result,

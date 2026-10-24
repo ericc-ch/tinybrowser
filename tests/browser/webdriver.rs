@@ -4,10 +4,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::fixture::Fixture;
 use base64::Engine as _;
-use crate::common::Fixture;
 use serde_json::{Value, json};
-
 
 fn start(extra_args: Vec<String>) -> (String, Fixture) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -232,13 +231,7 @@ fn navigate_returns_after_load_not_after_timers() {
     let server_addr = server_listener.local_addr().expect("server addr");
     let server = thread::spawn(move || {
         let (mut navigation, _) = server_listener.accept().expect("navigation");
-        let mut head = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-            let read = navigation.read(&mut chunk).expect("request");
-            assert_ne!(read, 0);
-            head.extend_from_slice(&chunk[..read]);
-        }
+        crate::fixture::read_request_head(&mut navigation);
         let body = b"<!doctype html><script>window.early = 1; setTimeout(function() { window.late = 1; }, 30000);</script>";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -293,13 +286,7 @@ fn new_window_uses_builder_resolve_map() {
     let server_addr = server_listener.local_addr().expect("server addr");
     let server = thread::spawn(move || {
         let (mut navigation, _) = server_listener.accept().expect("navigation");
-        let mut head = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-            let read = navigation.read(&mut chunk).expect("request");
-            assert_ne!(read, 0);
-            head.extend_from_slice(&chunk[..read]);
-        }
+        crate::fixture::read_request_head(&mut navigation);
         let body = b"<!doctype html><title>mapped</title>";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

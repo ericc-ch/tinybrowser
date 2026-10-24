@@ -666,10 +666,6 @@ impl<'js> html_frame_element_generated::HTMLFrameElement<'js> for JsNode {
     }
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-activeelement
     pub(super) fn active_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
@@ -1437,10 +1433,7 @@ impl JsNode {
         }
     }
 }
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Rest by value"
-)]
+
 pub(in crate::js::bindings) fn construct_node<'js>(
     ctx: Ctx<'js>,
     name: WebIdlString,
@@ -1450,10 +1443,6 @@ pub(in crate::js::bindings) fn construct_node<'js>(
     construct_node_in_owner(&ctx, &owner, &name, args)
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Rest by value"
-)]
 pub(in crate::js::bindings) fn construct_node_in_frame<'js>(
     ctx: Ctx<'js>,
     frame: f64,
@@ -1559,10 +1548,6 @@ pub(in crate::js::bindings) fn install_custom_construction(ctx: &Ctx<'_>) -> Res
     Ok(())
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Value by value"
-)]
 pub(super) fn push_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
     let id = host_node_id(&ctx, &value)
         .ok_or_else(|| Exception::throw_type(&ctx, "custom element candidate is not an element"))?;
@@ -1577,10 +1562,6 @@ pub(super) fn push_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) ->
     Ok(())
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Value by value"
-)]
 pub(super) fn discard_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
     let Some(id) = host_node_id(&ctx, &value) else {
         return Ok(());
@@ -2261,10 +2242,6 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
     pub(super) fn get_scripts<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {

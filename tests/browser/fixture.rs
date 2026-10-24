@@ -1,15 +1,18 @@
 //! Shared fixtures for the browser-level integration suites in this binary.
 
-use std::io::Read;
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Reads one HTTP/1.1 request head and returns the request target. Test
-/// servers call this before replying: closing a socket with unread data sends
-/// RST, which can abort the response delivery.
-pub(crate) fn read_request_target(stream: &mut TcpStream) -> String {
+use serde_json::json;
+
+/// Reads one HTTP/1.1 request head and discards it. Test servers call this
+/// before replying: closing a socket with unread data sends RST, which can
+/// abort the response delivery.
+pub(crate) fn read_request_head(stream: &mut TcpStream) {
     // Short polls instead of one long blocking read: under load the request
     // can lag the accept, and a single long read hides which side stalled.
     stream
@@ -23,16 +26,77 @@ pub(crate) fn read_request_target(stream: &mut TcpStream) -> String {
         match stream.read(&mut chunk) {
             Ok(0) => panic!("request closed early"),
             Ok(n) => head.extend_from_slice(&chunk[..n]),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // A poll timeout surfaces as `WouldBlock` or `TimedOut` depending
+            // on the platform.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(error) => panic!("read: {error}"),
         }
     }
-    String::from_utf8_lossy(&head)
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .expect("target")
-        .to_owned()
+}
+
+/// Serves one HTML body on an ephemeral port for every connection it gets,
+/// reading each request head first. The thread runs until the test process
+/// exits; a test that only loads the page once simply never sees a second
+/// connection.
+pub(crate) fn serve_html(body: &'static [u8]) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
+    let addr = listener.local_addr().expect("server addr");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            read_request_head(&mut stream);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    addr
+}
+
+/// Creates a target, attaches to it, and waits for `Page.loadEventFired`
+/// after navigating it to `url`; returns the attached session id.
+pub(crate) fn load_page(client: &mut cdp::Client, url: &str, timeout: Duration) -> String {
+    let created = client
+        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
+        .expect("create");
+    let target_id = created["targetId"].as_str().expect("id").to_owned();
+    let attached = client
+        .call(
+            "Target.attachToTarget",
+            &json!({"targetId": target_id, "flatten": true}),
+            None,
+        )
+        .expect("attach");
+    let session = attached["sessionId"].as_str().expect("session").to_owned();
+    client
+        .call("Page.enable", &json!({}), Some(&session))
+        .expect("enable Page events");
+    client
+        .call("Page.navigate", &json!({"url": url}), Some(&session))
+        .expect("navigate");
+    wait_for_load(client, timeout);
+    session
+}
+
+/// Waits for the next `Page.loadEventFired` event.
+pub(crate) fn wait_for_load(client: &mut cdp::Client, timeout: Duration) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let event = client
+            .read_event(Duration::from_millis(500))
+            .expect("read event")
+            .expect("load event");
+        if event["method"] == json!("Page.loadEventFired") {
+            return event;
+        }
+        assert!(Instant::now() < deadline, "no load event: {event}");
+    }
 }
 
 pub struct Fixture {

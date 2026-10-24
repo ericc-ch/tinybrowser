@@ -84,11 +84,13 @@ base64 = "0.23"
 # No `nursery` (experimental). Suppressions are `#[expect]` with a reason, so a
 # stale one fails the build instead of rotting; `allow_attributes_without_reason`
 # keeps even the generated glue honest. Hand-written code has no `#[allow]`.
-# `webidl-bindgen` still emits `#[allow(dead_code)]`: the same generated shape is
-# used by some interfaces and unused by others, so an expectation would fail
-# wherever an interface does use it. Emitting the attribute only when the
-# generator knows the item is unreferenced is the follow-up that re-enables
-# `allow_attributes = "deny"`.
+# `webidl-bindgen` still emits `#[allow(dead_code)]` on generated unions and
+# enumerations: the same generated shape is used by some interfaces and unused
+# by others, so an expectation would fail wherever an interface does use it.
+# Usage-tracked emission is the follow-up that re-enables
+# `allow_attributes = "deny"` (#136). The generator's other shapes — one
+# dispatch function per member, borrowed union trials, merged identical arms —
+# stopped triggering their lints instead of allowing them.
 # `restriction` lints are denied individually (blanket is banned by clippy).
 [workspace.lints.rust]
 unsafe_code = "deny"

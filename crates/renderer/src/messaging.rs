@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use crate::dom::tree::NodeId;
 use crate::protocol::FrameId;
+use url::Url;
 
 /// Handle every realm holds to the renderer-process shared state.
 pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
@@ -536,20 +537,65 @@ impl PortTable {
     }
 }
 
+/// The intended target origin one posted message carries, resolved at the
+/// post-time boundary: `*` accepts any document, and an exact origin compares
+/// with origin identity, so two opaque origins (`"null"` serialized) never
+/// match each other
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TargetOrigin {
+    Any,
+    Exact(url::Origin),
+}
+
+impl TargetOrigin {
+    /// Resolves the sender's target-origin argument for a cross-tab message,
+    /// where only serialized origins survive the browser hop: `/` names the
+    /// sender's origin, and an origin that fails to parse (an opaque sender's
+    /// `"null"`) can never match a different document, so the message is
+    /// dropped.
+    pub(crate) fn from_remote(spec: &str, sender: &str) -> Option<Self> {
+        match spec {
+            "*" => Some(Self::Any),
+            "/" => Url::parse(sender).ok().map(|url| Self::Exact(url.origin())),
+            other => Url::parse(other).ok().map(|url| Self::Exact(url.origin())),
+        }
+    }
+
+    /// Whether a document with `origin` may receive the message.
+    pub(crate) fn admits(&self, origin: &url::Origin) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(target) => target == origin,
+        }
+    }
+}
+
+/// Identity of one document instance in a frame. A navigation replaces the
+/// instance, so a task or delivery stamped with an older id belongs to a
+/// document whose tasks are no longer runnable
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentId(pub(crate) u64);
+
 /// One task the engine must run in a named frame's realm.
 pub(crate) enum Delivery {
-    /// A posted window message, after its origin was re-checked against the
-    /// target document's origin
-    /// ([step 9.1](https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps)).
+    /// A posted window message, bound to the target frame's document as of
+    /// post time
+    /// ([window post message steps](https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps)).
     WindowMessage {
         /// The frame whose realm must decode and dispatch the message.
         target: FrameId,
+        /// The target frame's document at post time: a navigation that
+        /// committed before the engine routes the delivery replaced it, and
+        /// the message dies with the document it was posted to.
+        document: DocumentId,
         /// The frame whose realm encoded the message.
         source: FrameId,
         /// The sender's origin at post time, serialized.
         origin: String,
-        /// The target origin the sender asked for (`*`, or an origin).
-        target_origin: String,
+        /// The target origin the sender asked for.
+        target_origin: TargetOrigin,
         payload: String,
         /// Transferred endpoints, in transfer-list order.
         ports: Vec<u64>,
@@ -574,6 +620,12 @@ pub(crate) struct Shared {
     /// Frame ids are minted here so a frame's browsing context can be created
     /// from inside a script (an `iframe` insertion), not only from the engine.
     next_frame: u64,
+    /// Document ids are minted here so a delivery can name the document it
+    /// was posted to; the engine compares that identity at routing time. The
+    /// map holds each live frame's current document instance.
+    document_ids: HashMap<FrameId, DocumentId>,
+    /// Monotonic document-instance counter backing `begin_document`.
+    next_document: u64,
     /// Frames whose browsing contexts a navigation destroyed, with the
     /// `iframe` containers that owned them; the engine drops their documents
     /// at its next turn.
@@ -588,6 +640,8 @@ impl Default for Shared {
             deliveries: Vec::new(),
             // `FrameId::MAIN` is 0 and is not minted here.
             next_frame: 1,
+            document_ids: HashMap::new(),
+            next_document: 0,
             removed_frames: Vec::new(),
         }
     }
@@ -600,6 +654,25 @@ impl Shared {
         let frame = FrameId::new(self.next_frame);
         self.next_frame = self.next_frame.saturating_add(1);
         frame
+    }
+
+    /// Records a new document instance for `frame` and returns its identity:
+    /// a document is created and again replaced at every navigation.
+    pub(crate) fn begin_document(&mut self, frame: FrameId) -> DocumentId {
+        let id = DocumentId(self.next_document);
+        self.next_document = self.next_document.saturating_add(1);
+        self.document_ids.insert(frame, id);
+        id
+    }
+
+    /// The current document instance of `frame`.
+    pub(crate) fn document_id(&self, frame: FrameId) -> Option<DocumentId> {
+        self.document_ids.get(&frame).copied()
+    }
+
+    /// Drops `frame`'s document identity alongside its tree entry.
+    pub(crate) fn forget_document(&mut self, frame: FrameId) {
+        self.document_ids.remove(&frame);
     }
 
     /// Takes the pending deliveries for the engine to route.
@@ -645,6 +718,7 @@ impl Shared {
         }
         for child in &removed {
             let container = self.tree.remove(*child).map(|(_, container)| container);
+            self.forget_document(*child);
             self.close_frame_ports(*child);
             self.removed_frames.push((*child, container));
         }

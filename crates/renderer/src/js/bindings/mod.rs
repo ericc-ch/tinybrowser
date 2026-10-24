@@ -551,10 +551,6 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
 /// (<https://drafts.csswg.org/cssom/#resolved-values>). `getComputedStyle`
 /// falls back to the inline style and then to initial values on an empty
 /// result.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn resolved_style<'js>(
     ctx: Ctx<'js>,
     element: Value<'js>,
@@ -582,10 +578,6 @@ fn resolved_style<'js>(
 
 /// The active document's viewport size in CSS pixels, for the live `window`
 /// metrics (<https://drafts.csswg.org/cssom-view/#dom-window-innerwidth>).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
     let (width, height) = world(&ctx).ok().map_or_else(
         || crate::engine::DEFAULT_VIEWPORT,
@@ -1836,7 +1828,7 @@ mod realm_tests {
             None
         }
 
-        fn window_post_message(&self, _tab: u64, _payload: &str) {}
+        fn window_post_message(&self, _tab: u64, _origin: &str, _target: &str, _payload: &str) {}
 
         fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
             None

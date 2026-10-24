@@ -1,10 +1,10 @@
 //! One integration binary for every browser-level suite: `cargo test
-//! --test browser cdp::` filters inside it, and helpers in `common` are
+//! --test browser cdp::` filters inside it, and helpers in `fixture` are
 //! dead-code checked against the whole tree instead of per binary.
 
 mod cdp;
-mod common;
 mod daemon;
+mod fixture;
 mod modes;
 mod renderer_process;
 mod webdriver;

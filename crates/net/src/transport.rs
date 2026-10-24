@@ -36,54 +36,73 @@ use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::resolve::{HostMap, ResolveFailure, Target};
 
-/// Absolute deadlines for one `send` call.
-///
-/// `global` is fixed at the start of the call and covers every redirect hop.
-/// `hop` is `timeout_per_call` measured from the current hop.
+/// The global deadline for one `send` call, fixed when the call starts and
+/// covering every redirect hop.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CallBudget {
-    pub global: Option<Instant>,
-    pub hop: Option<Instant>,
+    global: Option<Instant>,
     clock: Clock,
 }
 
 impl CallBudget {
-    pub fn from_engine(timeout_global: Option<Duration>, start: Instant, clock: Clock) -> Self {
+    /// Starts the budget for one call from `engine`'s global timeout.
+    pub(crate) fn start(engine: &HttpEngine) -> Self {
         Self {
-            global: timeout_global.map(|limit| start + limit),
-            // A per-call deadline only exists once a hop starts; `exchange`
-            // mints it through `with_hop_start` before each hop.
-            hop: None,
-            clock,
+            global: engine
+                .timeout_global
+                .map(|limit| engine.clock.monotonic() + limit),
+            clock: engine.clock,
         }
     }
 
-    pub fn with_hop_start(self, timeout_per_call: Option<Duration>) -> Self {
-        let hop_start = self.clock.monotonic();
-        Self {
+    /// A request deadline may only tighten the global timeout, never stretch
+    /// it past what the engine configured.
+    pub(crate) fn tighten_global(&mut self, deadline: Instant) {
+        self.global = Some(self.global.map_or(deadline, |global| global.min(deadline)));
+    }
+
+    /// Mints the budget for one hop: the global deadline plus
+    /// `timeout_per_call` measured from now.
+    pub(crate) fn start_hop(&self, timeout_per_call: Option<Duration>) -> HopBudget {
+        HopBudget {
             global: self.global,
-            hop: timeout_per_call.map(|limit| hop_start + limit),
+            hop: timeout_per_call.map(|limit| self.clock.monotonic() + limit),
             clock: self.clock,
         }
     }
 
-    pub fn deadline(self) -> Option<Instant> {
+    pub(crate) fn is_expired(&self) -> bool {
+        self.global.is_some_and(|end| self.clock.monotonic() >= end)
+    }
+}
+
+/// The deadlines for one hop of a `send` call: the call's global deadline
+/// plus the hop's own `timeout_per_call` deadline.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HopBudget {
+    global: Option<Instant>,
+    hop: Option<Instant>,
+    clock: Clock,
+}
+
+impl HopBudget {
+    pub(crate) fn deadline(&self) -> Option<Instant> {
         match (self.global, self.hop) {
             (Some(global), Some(hop)) => Some(global.min(hop)),
             (global, hop) => global.or(hop),
         }
     }
 
-    pub fn remaining(self) -> Option<Duration> {
+    pub(crate) fn is_expired(&self) -> bool {
+        self.remaining() == Some(Duration::ZERO)
+    }
+
+    fn remaining(&self) -> Option<Duration> {
         self.deadline()
             .map(|end| end.saturating_duration_since(self.clock.monotonic()))
     }
 
-    pub fn is_expired(self) -> bool {
-        self.remaining() == Some(Duration::ZERO)
-    }
-
-    pub fn timeout_kind(self, fallback: TimeoutKind) -> TimeoutKind {
+    pub(crate) fn timeout_kind(&self, fallback: TimeoutKind) -> TimeoutKind {
         let now = self.clock.monotonic();
         if self.global.is_some_and(|end| now >= end) {
             TimeoutKind::Global
@@ -211,7 +230,7 @@ pub(crate) struct HttpEngine {
     pub(crate) timeout_global: Option<Duration>,
     pub(crate) timeout_per_call: Option<Duration>,
     proxied: Option<ProxiedClient>,
-    clock: Clock,
+    pub(crate) clock: Clock,
 }
 
 type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
@@ -280,10 +299,6 @@ impl HttpEngine {
         }
     }
 
-    pub(crate) fn budget_at(&self) -> CallBudget {
-        CallBudget::from_engine(self.timeout_global, self.clock.monotonic(), self.clock)
-    }
-
     /// Sends one hop. Redirects, cookies, and header shaping belong to the
     /// caller; this method applies the deadline and maps transport failures.
     ///
@@ -297,7 +312,7 @@ impl HttpEngine {
         wire_url: &Url,
         headers: &HeaderMap,
         body: Option<&[u8]>,
-        budget: CallBudget,
+        budget: HopBudget,
     ) -> Result<(u16, HeaderMap, Incoming, bool), NetError> {
         if budget.is_expired() {
             return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
@@ -349,10 +364,10 @@ impl HttpEngine {
     }
 }
 
-/// Awaits `future` under the call deadline. `fallback` names the phase when
+/// Awaits `future` under the hop deadline. `fallback` names the phase when
 /// neither the global nor the per-call deadline is the one that expired.
 pub(crate) async fn within<T>(
-    budget: CallBudget,
+    budget: HopBudget,
     fallback: TimeoutKind,
     future: impl Future<Output = T>,
 ) -> Result<T, NetError> {

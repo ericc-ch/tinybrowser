@@ -613,8 +613,12 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
             Ok(png) => Handled::Screenshot(png),
             Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),
         },
-        Command::WindowMessage { payload } => {
-            engine.receive_remote_window_message(payload);
+        Command::WindowMessage {
+            origin,
+            target_origin,
+            payload,
+        } => {
+            engine.receive_remote_window_message(origin, &target_origin, payload);
             Handled::Reply(Reply::Unit(Ok(())))
         }
         Command::HistoryTraverse { url, history } => {

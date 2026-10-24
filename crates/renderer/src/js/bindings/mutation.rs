@@ -230,10 +230,6 @@ impl<'js> mutation_observer_generated::MutationObserver<'js> for JsMutationObser
 /// Delivers queued records to observer callbacks; installed as a global and
 /// scheduled as a microtask after every mutation
 /// (<https://dom.spec.whatwg.org/#notify-mutation-observers>).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx by value"
-)]
 pub(crate) fn deliver_mutations(ctx: Ctx<'_>) -> Result<()> {
     let runtime = world(&ctx)?.borrow().runtime.clone();
     let pending = runtime

@@ -385,11 +385,6 @@ impl super::host::SharedClass for JsAttr<'_> {
     }
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
-)]
 impl<'object> JsAttr<'object> {
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
     pub(super) fn node_value<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
@@ -434,6 +429,10 @@ impl<'object> JsAttr<'object> {
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
     )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
+    )]
     pub(super) fn node_type(&self, _ctx: &Ctx<'_>) -> Result<u16> {
         Ok(2)
     }
@@ -460,6 +459,10 @@ impl<'object> JsAttr<'object> {
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
     )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
+    )]
     pub(super) fn is_connected(&self, _ctx: &Ctx<'_>) -> Result<bool> {
         Ok(false)
     }
@@ -468,6 +471,10 @@ impl<'object> JsAttr<'object> {
     #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
     )]
     pub(super) fn parent_node<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         Ok(Value::new_null(ctx.clone()))
@@ -509,6 +516,10 @@ impl<'object> JsAttr<'object> {
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
     )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
+    )]
     pub(super) fn has_child_nodes(&self, _ctx: Ctx<'_>) -> Result<bool> {
         Ok(false)
     }
@@ -526,6 +537,10 @@ impl<'object> JsAttr<'object> {
     #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
     )]
     pub(super) fn normalize(&self, _ctx: Ctx<'_>) -> Result<()> {
         Ok(())
@@ -609,6 +624,10 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
+    )]
     pub(super) fn append_child<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -629,6 +648,10 @@ impl<'object> JsAttr<'object> {
         self.append_child(ctx, node)
     }
     // https://dom.spec.whatwg.org/#concept-node-pre-remove
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
+    )]
     pub(super) fn remove_child<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -1090,10 +1113,6 @@ pub struct JsNamedNodeMap {
 
 include!(concat!(env!("OUT_DIR"), "/NamedNodeMap.rs"));
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
-)]
 impl JsNamedNodeMap {
     /// The element this map belongs to. Adoption keeps the map object, so
     /// every operation follows the adopted copy

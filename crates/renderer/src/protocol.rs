@@ -716,8 +716,10 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     fn window_opener(&self) -> Option<u64>;
 
     /// `postMessage` to a window this realm opened, encoded by the caller's
-    /// realm.
-    fn window_post_message(&self, tab: u64, payload: &str);
+    /// realm. `origin` is the sender's serialized origin and `target_origin`
+    /// the normalized argument (`*`, `/`, or a parsed URL string); the target
+    /// resolves both when the delivery task runs.
+    fn window_post_message(&self, tab: u64, origin: &str, target_origin: &str, payload: &str);
 
     /// Reads one key from another tab's same-origin session area.
     fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;

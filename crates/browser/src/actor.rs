@@ -516,13 +516,22 @@ impl TabHandle {
     }
 }
 
+/// One cross-tab `postMessage` in flight through the browser: the sender's
+/// serialized origin and the normalized target origin ride with the encoded
+/// payload, and the target's realm checks both when the delivery task runs.
+pub(crate) struct RemoteWindowMessage {
+    pub(crate) origin: String,
+    pub(crate) target_origin: String,
+    pub(crate) payload: String,
+}
+
 /// Join handle and delivery mailbox for one tab coordinator task.
 pub(crate) struct TabTask {
     pub handle: TabHandle,
     /// Ordered `postMessage` deliveries for this tab. Senders enqueue without
     /// waiting; the coordinator drains it in order, so a busy target never
     /// blocks the sender's renderer or the browser owner task.
-    deliveries: mpsc::Sender<String>,
+    deliveries: mpsc::Sender<RemoteWindowMessage>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -545,7 +554,7 @@ impl TabTask {
     }
 
     /// The tab's `postMessage` mailbox.
-    pub(crate) fn deliveries(&self) -> mpsc::Sender<String> {
+    pub(crate) fn deliveries(&self) -> mpsc::Sender<RemoteWindowMessage> {
         self.deliveries.clone()
     }
 
@@ -838,12 +847,23 @@ impl Tab {
     }
 
     /// Routes one remote `postMessage` payload into this tab's main frame.
-    async fn deliver_window_message(&mut self, payload: String) -> Result<(), TabError> {
+    async fn deliver_window_message(
+        &mut self,
+        RemoteWindowMessage {
+            origin,
+            target_origin,
+            payload,
+        }: RemoteWindowMessage,
+    ) -> Result<(), TabError> {
         if self.renderer.is_none() {
             self.mount_virtual().await?;
         }
         match self
-            .renderer_request(RendererCommand::WindowMessage { payload })
+            .renderer_request(RendererCommand::WindowMessage {
+                origin,
+                target_origin,
+                payload,
+            })
             .await?
         {
             Reply::Unit(result) => result,
@@ -1143,9 +1163,6 @@ impl Tab {
             RendererEvent::HistoryTraversal { delta } => {
                 self.traverse_history(*delta).await;
             }
-            // Timer, Fetch, FetchFailed, and ScriptFailed report load-lifecycle
-            // progress the renderer already settled internally; the tab has no
-            // state to update for them.
             RendererEvent::Timer(..)
             | RendererEvent::Fetch { .. }
             | RendererEvent::FetchFailed
@@ -1226,14 +1243,14 @@ enum Wake {
     // the unboxed form trips `large_enum_variant` next to the small arms.
     Navigation(Box<Option<(u64, Result<NavOutcome, DialFailure>)>>),
     Renderer(Option<(FrameId, RendererEvent)>),
-    Delivery(Option<String>),
+    Delivery(Option<RemoteWindowMessage>),
     WaiterDeadline,
 }
 
 async fn coordinator_loop(
     mut server: TabServer,
     mut tab: Tab,
-    delivery_rx: mpsc::Receiver<String>,
+    delivery_rx: mpsc::Receiver<RemoteWindowMessage>,
 ) {
     let mut waiters = Vec::new();
     let mut delivery_rx = Some(delivery_rx);
@@ -1293,8 +1310,8 @@ async fn coordinator_loop(
                 tab.drop_renderer();
                 fail_waiters(&server, &mut waiters, &TabError::ActorStopped).await;
             }
-            Wake::Delivery(Some(payload)) => {
-                let _result = tab.deliver_window_message(payload).await;
+            Wake::Delivery(Some(message)) => {
+                let _result = tab.deliver_window_message(message).await;
             }
             Wake::Delivery(None) => {
                 // Every delivery sender is gone; stop selecting on the lane.
@@ -1315,7 +1332,9 @@ async fn next_renderer_event(
     }
 }
 
-async fn next_delivery(deliveries: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+async fn next_delivery(
+    deliveries: &mut Option<mpsc::Receiver<RemoteWindowMessage>>,
+) -> Option<RemoteWindowMessage> {
     match deliveries {
         Some(receiver) => receiver.recv().await,
         None => pending().await,

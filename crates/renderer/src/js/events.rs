@@ -504,18 +504,10 @@ pub(crate) fn install_event_target_bridge(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn is_event_bridge<'js>(ctx: Ctx<'js>, value: Value<'js>) -> bool {
     Class::<JsEvent>::from_js(&ctx, value).is_ok()
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn dispatch_trusted_bridge<'js>(
     ctx: Ctx<'js>,
     target: Object<'js>,
@@ -677,10 +669,6 @@ fn set_custom_event_prototype<'js>(ctx: &Ctx<'js>, class: &Class<'js, JsEvent>) 
 /// (<https://dom.spec.whatwg.org/#dom-customevent-customevent>).
 ///
 /// The wrapper owns arity; this native owns the Web IDL conversions.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(crate) fn construct_custom_event<'js>(
     ctx: Ctx<'js>,
     args: Rest<Value<'js>>,
@@ -707,10 +695,6 @@ pub(crate) fn construct_custom_event<'js>(
 ///
 /// Returns false when the event is being dispatched, in which case the caller
 /// must not set `detail` either.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(crate) fn init_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<bool> {
     // Convert the arguments before the algorithm's dispatch-flag check.
     let mut args = args.0.into_iter();
@@ -760,10 +744,6 @@ pub(crate) fn install_security_policy_violation_event_js(ctx: &Ctx<'_>) -> Resul
 ///
 /// The wrapper owns the readonly attributes and arity; this native owns the
 /// `EventInit` conversions.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(crate) fn construct_security_policy_violation_event<'js>(
     ctx: Ctx<'js>,
     args: Rest<Value<'js>>,

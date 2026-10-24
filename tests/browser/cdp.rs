@@ -1,11 +1,9 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
 
-use crate::common::Fixture;
+use crate::fixture::Fixture;
 use serde_json::json;
-
 
 fn start() -> (Fixture, cdp::Client) {
     let mut fixture = Fixture::new("tinybrowser-cdp");
@@ -239,11 +237,7 @@ fn get_properties_reports_descriptors_and_releases_groups() {
 
 #[test]
 fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
-    fn evaluate(
-        client: &mut cdp::Client,
-        session: &str,
-        expression: &str,
-    ) -> serde_json::Value {
+    fn evaluate(client: &mut cdp::Client, session: &str, expression: &str) -> serde_json::Value {
         client
             .call(
                 "Runtime.evaluate",
@@ -254,59 +248,14 @@ fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
             .clone()
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
-    let server_addr = listener.local_addr().expect("server addr");
-    let body = b"<!doctype html><p>hi</p>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut stream = stream;
-            crate::common::read_request_target(&mut stream);
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.write_all(body);
-        }
-    });
+    let server_addr = crate::fixture::serve_html(b"<!doctype html><p>hi</p>");
 
     let (_fixture, mut client) = start();
-    let created = client
-        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
-        .expect("create");
-    let target_id = created["targetId"].as_str().expect("id").to_owned();
-    let attached = client
-        .call(
-            "Target.attachToTarget",
-            &json!({"targetId": target_id, "flatten": true}),
-            None,
-        )
-        .expect("attach");
-    let session = attached["sessionId"].as_str().expect("session").to_owned();
-    client
-        .call("Page.enable", &json!({}), Some(&session))
-        .expect("enable Page events");
-    client
-        .call(
-            "Page.navigate",
-            &json!({"url": format!("http://{server_addr}/")}),
-            Some(&session),
-        )
-        .expect("navigate");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let Some(event) = client
-            .read_event(Duration::from_millis(500))
-            .expect("read event")
-        else {
-            assert!(Instant::now() < deadline, "no load event in 10s");
-            continue;
-        };
-        if event["method"] == json!("Page.loadEventFired") {
-            break;
-        }
-        assert!(Instant::now() < deadline, "no load event: {event}");
-    }
+    let session = crate::fixture::load_page(
+        &mut client,
+        &format!("http://{server_addr}/"),
+        Duration::from_secs(10),
+    );
 
     let set_cookie = "document.cookie = 'a=1; path=/'";
     let read_cookie = "document.cookie";
@@ -338,55 +287,14 @@ fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
 
 #[test]
 fn page_navigate_loads_http_document() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
-    let server_addr = listener.local_addr().expect("server addr");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let _ = crate::common::read_request_target(&mut stream);
-        let body = b"<!doctype html><p id=ok>hi</p>";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).expect("head");
-        stream.write_all(body).expect("body");
-    });
+    let server_addr = crate::fixture::serve_html(b"<!doctype html><p id=ok>hi</p>");
 
     let (_fixture, mut client) = start();
-    let created = client
-        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
-        .expect("create");
-    let target_id = created["targetId"].as_str().expect("id").to_owned();
-    let attached = client
-        .call(
-            "Target.attachToTarget",
-            &json!({"targetId": target_id, "flatten": true}),
-            None,
-        )
-        .expect("attach");
-    let session = attached["sessionId"].as_str().expect("session").to_owned();
-    client
-        .call("Page.enable", &json!({}), Some(&session))
-        .expect("enable Page events");
-    client
-        .call(
-            "Page.navigate",
-            &json!({"url": format!("http://{server_addr}/")}),
-            Some(&session),
-        )
-        .expect("navigate");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let load = loop {
-        let event = client
-            .read_event(Duration::from_millis(500))
-            .expect("read event")
-            .expect("load event");
-        if event["method"] == json!("Page.loadEventFired") {
-            break event;
-        }
-        assert!(Instant::now() < deadline, "no load event: {event}");
-    };
-    assert_eq!(load["sessionId"], json!(session));
+    let session = crate::fixture::load_page(
+        &mut client,
+        &format!("http://{server_addr}/"),
+        Duration::from_secs(2),
+    );
     let evaluated = client
         .call(
             "Runtime.evaluate",
@@ -395,7 +303,6 @@ fn page_navigate_loads_http_document() {
         )
         .expect("eval");
     assert_eq!(evaluated["result"]["value"], json!("hi"));
-    server.join().expect("server");
 }
 
 fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {

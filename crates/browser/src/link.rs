@@ -775,7 +775,12 @@ async fn route_window_call(
             let opener = context.tabs.opener(assignment.tab).map(TabId::get);
             send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
-        BrowsingContextCall::WindowMessage { tab, payload } => {
+        BrowsingContextCall::WindowMessage {
+            tab,
+            origin,
+            target_origin,
+            payload,
+        } => {
             // A page can only hold a `WindowProxy` for a related window: its
             // own, its opener, or a tab it opened. An unrelated target is a
             // forged call and is ignored.
@@ -784,7 +789,14 @@ async fn route_window_call(
                 // Enqueue on the target's mailbox and return: the spec's
                 // `postMessage` is asynchronous, and waiting here would let a
                 // busy target block this renderer.
-                let _queued = context.tabs.deliver(target, payload);
+                let _queued = context.tabs.deliver(
+                    target,
+                    crate::actor::RemoteWindowMessage {
+                        origin,
+                        target_origin,
+                        payload,
+                    },
+                );
             }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }

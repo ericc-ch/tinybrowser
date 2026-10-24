@@ -35,31 +35,18 @@ impl Document {
         let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         self.run_task(task);
         let fired = self.check_load();
-        !self.stop.is_set()
-            && (fired || self.has_pending_frame_loads() || self.has_ready_work())
+        !self.stop.is_set() && (fired || self.has_pending_frame_loads() || self.has_ready_work())
     }
 
-    /// The oldest queued task this document may run: one it queued itself, or
-    /// one that outlives a document replacement.
+    /// The oldest queued task. Every entry belongs to this document
+    /// instance: a replacement purges the queue with its document.
     fn next_task(&mut self) -> Option<Task> {
-        while let Some((generation, task)) = self.tasks.pop_front() {
-            if generation == self.generation || task.survives_document_replacement() {
-                return Some(task);
-            }
-        }
-        None
+        self.tasks.pop_front()
     }
 
     /// Whether a task is queued or a timer is already due.
     pub(crate) fn has_ready_work(&self) -> bool {
-        if self
-            .tasks
-            .iter()
-            .any(|(generation, task)| {
-                *generation == self.generation || task.survives_document_replacement()
-            })
-            || self.dials.has_queued()
-        {
+        if !self.tasks.is_empty() || self.dials.has_queued() {
             return true;
         }
         if self.world.borrow().has_outbox_work() {
@@ -211,18 +198,22 @@ impl Document {
                 self.adopt_js_work();
             }
             Task::DialFinished(id, done) => {
-                if self.dials.take_finished(id).is_some() {
+                if self.dials.settle(id) {
                     self.finish_dial(*done);
                 }
             }
             Task::DialFailed(id, fail) => {
-                if self.dials.take_finished(id).is_some() {
+                if self.dials.settle(id) {
                     self.fail_dial(fail);
                 }
             }
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
-            Task::RemoteMessage(payload) => self.deliver_remote_message(&payload),
+            Task::RemoteMessage {
+                origin,
+                target_origin,
+                payload,
+            } => self.deliver_remote_message(&origin, &target_origin, &payload),
             Task::BroadcastMessage {
                 origin,
                 name,

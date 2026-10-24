@@ -501,14 +501,20 @@ pub(crate) fn route(method: &str, kind: TargetKind) -> Option<Handler> {
 /// params and otherwise report `MethodNotFound`, exactly like a real handler
 /// that cannot honor the request.
 pub(crate) fn accept(reason: Accepted, params: &Value) -> Result<Value, DispatchError> {
+    if premise_holds(reason, params) {
+        Ok(json!({}))
+    } else {
+        Err(DispatchError::MethodNotFound)
+    }
+}
+
+/// Whether an accepted no-op applies. Conditional variants prove their premise
+/// here, once; the rest hold unconditionally.
+fn premise_holds(reason: Accepted, params: &Value) -> bool {
     match reason {
-        Accepted::DefaultEmulatedMedia if !emulated_media_is_default(params) => {
-            Err(DispatchError::MethodNotFound)
-        }
-        Accepted::CacheAlreadyDisabled
-            if params.get("cacheDisabled").and_then(Value::as_bool) != Some(true) =>
-        {
-            Err(DispatchError::MethodNotFound)
+        Accepted::DefaultEmulatedMedia => emulated_media_is_default(params),
+        Accepted::CacheAlreadyDisabled => {
+            params.get("cacheDisabled").and_then(Value::as_bool) == Some(true)
         }
         Accepted::WaitingForDebugger
         | Accepted::DomainWithoutEvents
@@ -516,9 +522,7 @@ pub(crate) fn accept(reason: Accepted, params: &Value) -> Result<Value, Dispatch
         | Accepted::PageHasNoChildTargets
         | Accepted::RendererOwnsFonts
         | Accepted::NoDownloadPipeline
-        | Accepted::NoHttpCache
-        | Accepted::DefaultEmulatedMedia
-        | Accepted::CacheAlreadyDisabled => Ok(json!({})),
+        | Accepted::NoHttpCache => true,
     }
 }
 
@@ -749,9 +753,7 @@ async fn execute_json(tab: &TabHandle, script: &str) -> Result<Value, DispatchEr
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     let RemoteValue::String(text) = value else {
-        return Err(DispatchError::Failed(
-            "the browser helper did not return JSON".into(),
-        ));
+        return Err(DispatchError::BadHelperReply("browser"));
     };
     serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))
 }
@@ -936,9 +938,7 @@ async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     let RemoteValue::String(key) = value else {
-        return Err(DispatchError::Failed(
-            "the browser helper did not return the origin".into(),
-        ));
+        return Err(DispatchError::BadHelperReply("Storage.getStorageKey"));
     };
     Ok(json!({"storageKey": key}))
 }
@@ -949,13 +949,8 @@ pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchE
     const SCRIPT: &str = r#"(function(){
       host.__tb_dom_nodes = host.array();
       host.__tb_dom_id = 0;
-      const register = node => {
-        const nodes = host.__tb_dom_nodes;
-        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++host.__tb_dom_id;
-        nodes[id] = node;
-        return id;
-      };
+      host.__tb_dom_by_node = new Map();
+      const register = __REGISTER__;
       const walk = node => {
         const id = register(node);
         const entry = { __proto__: null, nodeId: id, backendNodeId: id, nodeType: node.nodeType, nodeName: node.nodeName };
@@ -974,13 +969,11 @@ pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchE
       return host.stringify(root);
     })()"#;
     let value = tab
-        .execute_browser_script(SCRIPT)
+        .execute_browser_script(SCRIPT.replace("__REGISTER__", REGISTER_PRELUDE).as_str())
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     let RemoteValue::String(text) = value else {
-        return Err(DispatchError::Failed(
-            "DOM.getDocument could not serialize the document".into(),
-        ));
+        return Err(DispatchError::BadHelperReply("DOM.getDocument"));
     };
     let root: Value =
         serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))?;
@@ -1136,9 +1129,7 @@ async fn dom_eval(tab: &TabHandle, script: &str) -> Result<Value, DispatchError>
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     let RemoteValue::String(text) = value else {
-        return Err(DispatchError::Failed(
-            "the DOM helper did not return JSON".into(),
-        ));
+        return Err(DispatchError::BadHelperReply("DOM"));
     };
     serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))
 }
@@ -1162,31 +1153,47 @@ fn requested_node_expression(params: &Value) -> String {
     format!("(host.__tb_dom_nodes || [])[{id}]")
 }
 
-/// `DOM.querySelector`/`DOM.querySelectorAll`: register the matches in the
-/// page's node table and answer with their ids.
+/// The page-side node registrar shared by every `DOM.*` method that answers
+/// with node ids. The `Map` is the node-to-id reverse lookup, so a
+/// `querySelectorAll` over N nodes registers in O(N) instead of scanning the
+/// table per match. `DOM.getDocument` recreates it when the table resets.
+const REGISTER_PRELUDE: &str = r"(function(){
+  const nodes = host.__tb_dom_nodes;
+  const byNode = host.__tb_dom_by_node;
+  return node => {
+    const known = byNode.get(node);
+    if (known !== undefined) return known;
+    const id = ++host.__tb_dom_id;
+    nodes[id] = node;
+    byNode.set(node, id);
+    return id;
+  };
+})()";
+
+/// The `selector` parameter a DOM query method requires.
+fn requested_selector(params: &Value) -> Result<String, DispatchError> {
+    let Some(selector) = params.get("selector").and_then(Value::as_str) else {
+        return Err(DispatchError::InvalidParams("selector"));
+    };
+    Ok(json_string(selector))
+}
+
 /// `DOM.querySelector`: the first matching node's id.
 pub(crate) async fn dom_query_selector(
     tab: &TabHandle,
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const SCRIPT: &str = r"(function(){
-      const register = node => {
-        const nodes = host.__tb_dom_nodes;
-        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++host.__tb_dom_id;
-        nodes[id] = node;
-        return id;
-      };
+      const register = __REGISTER__;
       const n = host.__tb_dom_nodes[__NODE__];
       if (!n || !n.querySelector) return host.stringify({__proto__: null, nodeId: 0});
       const found = n.querySelector(__SELECTOR__);
       if (!found) return host.stringify({__proto__: null, nodeId: 0});
       return host.stringify({__proto__: null, nodeId: register(found)});
     })()";
-    let selector =
-        serde_json::to_string(params.get("selector").and_then(Value::as_str).unwrap_or(""))
-            .unwrap_or_else(|_| "\"\"".to_owned());
+    let selector = requested_selector(params)?;
     let script = SCRIPT
+        .replace("__REGISTER__", REGISTER_PRELUDE)
         .replace("__NODE__", &requested_node(params).to_string())
         .replace("__SELECTOR__", &selector);
     dom_eval(tab, &script).await
@@ -1198,23 +1205,16 @@ pub(crate) async fn dom_query_selector_all(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const SCRIPT: &str = r"(function(){
-      const register = node => {
-        const nodes = host.__tb_dom_nodes;
-        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++host.__tb_dom_id;
-        nodes[id] = node;
-        return id;
-      };
+      const register = __REGISTER__;
       const n = host.__tb_dom_nodes[__NODE__];
       if (!n || !n.querySelectorAll) return host.stringify({__proto__: null, nodeIds: []});
       const nodeIds = host.array();
       for (const found of n.querySelectorAll(__SELECTOR__)) host.push(nodeIds, register(found));
       return host.stringify({__proto__: null, nodeIds: nodeIds});
     })()";
-    let selector =
-        serde_json::to_string(params.get("selector").and_then(Value::as_str).unwrap_or(""))
-            .unwrap_or_else(|_| "\"\"".to_owned());
+    let selector = requested_selector(params)?;
     let script = SCRIPT
+        .replace("__REGISTER__", REGISTER_PRELUDE)
         .replace("__NODE__", &requested_node(params).to_string())
         .replace("__SELECTOR__", &selector);
     dom_eval(tab, &script).await
@@ -1286,19 +1286,14 @@ pub(crate) async fn dom_node_for_location(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
-      const register = node => {
-        const nodes = host.__tb_dom_nodes;
-        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++host.__tb_dom_id;
-        nodes[id] = node;
-        return id;
-      };
+      const register = __REGISTER__;
       const x = __X__, y = __Y__;
       const found = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
       if (!found) return host.stringify({__proto__: null, nodeId: 0});
       return host.stringify({__proto__: null, nodeId: register(found)});
     })()";
     let script = TEMPLATE
+        .replace("__REGISTER__", REGISTER_PRELUDE)
         .replace(
             "__X__",
             &params
@@ -1744,7 +1739,25 @@ pub(crate) fn target_id(value: Option<&Value>) -> Result<TabId, DispatchError> {
 #[derive(Debug)]
 pub(crate) enum DispatchError {
     MethodNotFound,
+    /// A required parameter is missing or malformed.
+    InvalidParams(&'static str),
+    /// A browser or page helper answered in a shape the dispatch cannot read.
+    BadHelperReply(&'static str),
     Failed(String),
+}
+
+impl DispatchError {
+    /// The JSON-RPC error message for the reply.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::MethodNotFound => String::new(),
+            Self::InvalidParams(name) => format!("Invalid params: {name}"),
+            Self::BadHelperReply(helper) => {
+                format!("the {helper} helper did not return a string result")
+            }
+            Self::Failed(message) => message.clone(),
+        }
+    }
 }
 
 pub(crate) fn attach_session(reply: &mut Value, session: Option<&str>) {

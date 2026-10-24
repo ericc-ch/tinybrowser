@@ -776,10 +776,6 @@ pub(crate) struct JsOptionsCollection {
 
 include!(concat!(env!("OUT_DIR"), "/HTMLOptionsCollection.rs"));
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "generated operation dispatch passes Ctx by value"
-)]
 impl JsOptionsCollection {
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length
     fn set_length(&self, ctx: &Ctx<'_>, value: u32) -> Result<()> {
@@ -1370,10 +1366,6 @@ fn window_named_value(ctx: Ctx<'_>, name: String) -> Result<Value<'_>> {
     }
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 /// Whether `name` is a supported Window named-property name
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
 fn window_named_has(ctx: Ctx<'_>, name: String) -> Result<bool> {

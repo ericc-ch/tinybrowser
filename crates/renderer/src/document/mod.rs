@@ -17,7 +17,7 @@ use url::Url;
 use crate::Parsed;
 use crate::ReadyState;
 use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
-use crate::messaging::SharedHandle;
+use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
 use crate::protocol::{
     BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent, ResponseHead,
     ScriptFailure, TabError,
@@ -51,8 +51,14 @@ enum Task {
     DialFailed(u64, DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
-    /// One cross-tab `message` payload from another renderer.
-    RemoteMessage(String),
+    /// One cross-tab `message` from another renderer: the sender's origin at
+    /// post time and the intended target origin travel with it, so the task
+    /// re-checks both against whichever document runs it.
+    RemoteMessage {
+        origin: String,
+        target_origin: TargetOrigin,
+        payload: String,
+    },
     /// One `BroadcastChannel` message for this frame's channels.
     BroadcastMessage {
         origin: String,
@@ -78,20 +84,6 @@ enum Task {
     NodeError(crate::dom::tree::NodeId),
 }
 
-impl Task {
-    /// A posted window message is a task on the window, not the document:
-    /// the window post message steps gate it by the target-origin check
-    /// inside the task, against whichever document is active when it runs,
-    /// with no fully-active guard
-    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-    /// Every other task source owns a document, and its tasks are not
-    /// runnable once that document is replaced
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
-    fn survives_document_replacement(&self) -> bool {
-        matches!(self, Self::WindowMessage(_) | Self::RemoteMessage(_))
-    }
-}
-
 /// What triggered an image load watch: a connected insert may reuse a request
 /// that is already filed, a `src` mutation always starts a new one
 /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
@@ -101,12 +93,18 @@ pub(crate) enum ImageUpdate {
     SrcChanged,
 }
 
-/// One posted window message, ready for the target realm's task queue.
+/// One posted window message, ready for the target realm's task queue. The
+/// task is bound to the document that was the target window's associated
+/// document at post time, and it is not runnable once that document is
+/// replaced
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>,
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
 pub(crate) struct WindowMessage {
     pub(crate) source: FrameId,
     pub(crate) origin: String,
-    /// The intended target origin the sender passed to `postMessage`.
-    pub(crate) target_origin: String,
+    /// The intended target origin the sender passed to `postMessage`, checked
+    /// inside the task against the document that runs it.
+    pub(crate) target_origin: TargetOrigin,
     pub(crate) payload: String,
     pub(crate) ports: Vec<u64>,
 }
@@ -349,14 +347,11 @@ pub(crate) struct Document {
     /// The renderer-process state every frame shares.
     shared: SharedHandle,
     url: Url,
-    /// Counts document replacements in this frame. A task carries the
-    /// generation that queued it, and only a current-generation task is
-    /// runnable: a task is dropped once its document is not fully active
+    /// This document instance's identity. A task is not runnable once its
+    /// document is not fully active
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
-    /// Without the stamp a queued `DialFinished` or window message from the
-    /// old document runs against the new document's state.
-    generation: u64,
-    tasks: VecDeque<(u64, Task)>,
+    id: DocumentId,
+    tasks: VecDeque<Task>,
     timers: HashMap<u32, Timer>,
     next_timer_id: u32,
     /// Every queued, in-flight, and cancelled dial for this document.
@@ -490,6 +485,7 @@ impl Document {
         init_scripts: &Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
+        let id = runtime.shared.borrow_mut().begin_document(frame);
         let world = Rc::new(RefCell::new(World::new(
             document_url.clone(),
             frame,
@@ -526,7 +522,7 @@ impl Document {
             viewport_size: crate::engine::DEFAULT_VIEWPORT,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
-            generation: 0,
+            id,
             tasks: VecDeque::new(),
             timers: HashMap::new(),
             next_timer_id: 1,
@@ -820,10 +816,13 @@ impl Document {
         self.queue_image(element, ImageUpdate::Inserted);
     }
 
-    /// Queues a task stamped with the current document generation
+    /// Queues a task on this document's task source
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-task>).
+    /// A task is only runnable while its document is fully active, and a
+    /// replacement purges the queue with the document it belonged to
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
     fn queue_task(&mut self, task: Task) {
-        self.tasks.push_back((self.generation, task));
+        self.tasks.push_back(task);
     }
 
     /// Drops a disconnected `<img>`'s decoded size and ignores its waiter.
@@ -1073,6 +1072,17 @@ impl Document {
         self.queue_task(Task::WindowMessage(message));
     }
 
+    /// Whether `id` still names this document instance.
+    pub(crate) fn matches_document(&self, id: DocumentId) -> bool {
+        self.id == id
+    }
+
+    /// This document instance's identity. Tests stamp deliveries with it.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> DocumentId {
+        self.id
+    }
+
     /// Queues one `storage` event as a task on this frame's task source
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     pub(crate) fn push_storage_event(&mut self, event: crate::storage::PendingStorageEvent) {
@@ -1081,8 +1091,17 @@ impl Document {
 
     /// Queues one cross-tab `message` as a task on this frame's task source
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#posted-message-task-source>).
-    pub(crate) fn push_remote_message(&mut self, payload: String) {
-        self.queue_task(Task::RemoteMessage(payload));
+    pub(crate) fn push_remote_message(
+        &mut self,
+        origin: String,
+        target_origin: TargetOrigin,
+        payload: String,
+    ) {
+        self.queue_task(Task::RemoteMessage {
+            origin,
+            target_origin,
+            payload,
+        });
     }
 
     /// Queues one `BroadcastChannel` message on this frame's task source
@@ -1117,11 +1136,22 @@ impl Document {
     }
 
     /// Dispatches one cross-tab `message` event at this frame's window.
-    fn deliver_remote_message(&mut self, payload: &str) {
+    fn deliver_remote_message(
+        &mut self,
+        origin: &str,
+        target_origin: &TargetOrigin,
+        payload: &str,
+    ) {
+        // The intended target origin is checked when the task runs, against the
+        // document active then
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+        if !target_origin.admits(&self.world.borrow().origin) {
+            return;
+        }
         if !self.ensure_js_ok() {
             return;
         }
-        self.fire_js(|js| js.deliver_remote_message(payload));
+        self.fire_js(|js| js.deliver_remote_message(origin, payload));
         self.adopt_js_work();
     }
 
@@ -1151,15 +1181,20 @@ impl Document {
     }
 
     fn deliver_window_message(&mut self, message: &WindowMessage) {
-        if !self.ensure_js_ok() {
-            return;
-        }
         // The intended target origin is checked when the task runs, not when
         // it was queued: a navigation that committed between the two must not
-        // receive the sender's message
+        // receive the sender's message. Origins compare with identity, so two
+        // opaque origins never match
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>,
         // Blink: LocalDOMWindow::DispatchMessageEventWithOriginCheck).
-        if message.target_origin != "*" && message.target_origin != self.origin_string() {
+        if !message.target_origin.admits(&self.world.borrow().origin) {
+            // The transferred endpoints arrive with no message to carry them;
+            // forgetting them fires `close` at their peers instead of leaking
+            // the endpoints until the next reset.
+            self.shared.borrow_mut().forget_endpoints(&message.ports);
+            return;
+        }
+        if !self.ensure_js_ok() {
             return;
         }
         let delivered = match &self.js {
@@ -1602,10 +1637,10 @@ impl Document {
     }
 
     fn reset_js_realm(&mut self, keep_stream_writes: bool) {
-        // The queued tasks belong to the replaced document; the bump makes
-        // every one of them unrunnable, so `next_task` drops them instead of
-        // running old work against the new document's state.
-        self.generation += 1;
+        // A task is not runnable once its document is not fully active
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+        self.tasks.clear();
+        self.id = self.shared.borrow_mut().begin_document(self.frame);
         let old = std::mem::replace(
             &mut self.dials,
             DialLedger::new(Arc::clone(&self.stop), Arc::clone(&self.wake)),
@@ -3215,11 +3250,16 @@ impl Document {
         element: crate::dom::tree::NodeId,
         update: ImageUpdate,
     ) {
-        if update == ImageUpdate::Inserted
-            && (self.in_flight_images.contains_key(&element)
-                || self.world.borrow().images.sizes.contains_key(&element))
-        {
-            return;
+        // A connected insert skips work when a request is already in flight or
+        // decoded; a `src` mutation must reload regardless.
+        match update {
+            ImageUpdate::Inserted
+                if self.in_flight_images.contains_key(&element)
+                    || self.world.borrow().images.sizes.contains_key(&element) =>
+            {
+                return;
+            }
+            ImageUpdate::Inserted | ImageUpdate::SrcChanged => {}
         }
         let src = self.world.borrow().document(element).and_then(|parsed| {
             crate::dom::tree::is_html_element(&parsed.document.base, element.node, "img")

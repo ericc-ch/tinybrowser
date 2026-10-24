@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::common::Fixture;
+use crate::fixture::Fixture;
 
 fn pid_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()

@@ -1,8 +1,3 @@
-#![expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs passes every JS argument by value"
-)]
-
 //! Geometry interfaces used by canvas and CSSOM View.
 //!
 //! `DOMPoint` and `DOMPointReadOnly` are dictionaries with identity in
