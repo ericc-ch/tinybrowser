@@ -561,6 +561,25 @@ impl Document {
     /// non-empty one
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-src>).
     #[must_use]
+    /// The `iframe`'s `referrerpolicy` attribute parsed to a policy token,
+    /// or the empty string when absent or invalid, which leaves the
+    /// document's policy in force
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-referrerpolicy>).
+    pub(crate) fn frame_referrer_policy(&self, container: crate::dom::tree::NodeId) -> String {
+        let world = self.world.borrow();
+        world
+            .document(container)
+            .and_then(|parsed| {
+                crate::dom::tree::attr(
+                    &parsed.document.base,
+                    container.node,
+                    "referrerpolicy",
+                )
+                .and_then(crate::js::parse_referrer_policy)
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn frame_src(&self, container: crate::dom::tree::NodeId) -> Option<String> {
         let world = self.world.borrow();
         let value = world.document(container).and_then(|parsed| {
@@ -1969,6 +1988,24 @@ impl Document {
         self.world.borrow_mut().apply_meta_policy(id);
     }
 
+    /// A parser-inserted `<meta name=referrer>` sets the document's policy,
+    /// mirroring the JS insertion path
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+    fn apply_meta_referrer(&mut self, id: crate::dom::tree::NodeId) {
+        let policy = self.world.borrow().document(id).and_then(|parsed| {
+            let base = &parsed.document.base;
+            let name = crate::dom::tree::attr(base, id.node, "name").unwrap_or_default();
+            if !name.eq_ignore_ascii_case("referrer") {
+                return None;
+            }
+            let content = crate::dom::tree::attr(base, id.node, "content").unwrap_or_default();
+            crate::js::parse_referrer_policy(content)
+        });
+        if let Some(policy) = policy {
+            self.world.borrow_mut().state.referrer_policy = policy;
+        }
+    }
+
     pub(in crate::document) fn inline_script_violations(
         &self,
         source: &str,
@@ -2199,7 +2236,7 @@ impl Document {
     /// Queues one violation report POST. The response is dropped and the
     /// dial never gates load.
     fn queue_report(&mut self, url: &Url, body: Vec<u8>, content_type: &str) {
-        let mut dial = QueuedDial::new(DialContext::CspReport, url, &self.url);
+        let mut dial = QueuedDial::new(DialContext::CspReport, url, &self.dial_initiator());
         "POST".clone_into(&mut dial.req.method);
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
@@ -2272,7 +2309,13 @@ impl Document {
                     continue;
                 };
                 let node_id = crate::dom::tree::NodeId { document, node: id };
-                if crate::csp::meta_policy(base, id).is_some() {
+                // A `<meta name=referrer>` applies its policy in the same
+                // insertion steps as a CSP meta
+                // (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+                let referrer_meta = crate::dom::tree::is_html_element(base, id, "meta")
+                    && crate::dom::tree::attr(base, id, "name")
+                        .is_some_and(|name| name.eq_ignore_ascii_case("referrer"));
+                if referrer_meta || crate::csp::meta_policy(base, id).is_some() {
                     steps.push(Step::Meta(node_id));
                 }
                 if crate::dom::tree::is_html_element(base, id, "script") {
@@ -2290,6 +2333,7 @@ impl Document {
         for step in steps {
             let id = match step {
                 Step::Meta(id) => {
+                    self.apply_meta_referrer(id);
                     self.apply_meta_csp(id);
                     continue;
                 }
@@ -2392,7 +2436,8 @@ impl Document {
             return false;
         }
         self.parser_blocked_script = Some(id);
-        let mut dial = QueuedDial::new(DialContext::ClassicScript { element: id }, &url, &self.url);
+        let mut dial =
+            QueuedDial::new(DialContext::ClassicScript { element: id }, &url, &self.dial_initiator());
         let (referrer, referrer_policy) = self.subresource_referrer(Some(id), &url);
         dial.req.referrer = referrer;
         dial.req.referrer_policy = referrer_policy;
@@ -2462,6 +2507,20 @@ impl Document {
             return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
+    }
+
+    /// The URL a dial from this document claims as its initiator. A
+    /// local-scheme document (`about:srcdoc`) has no URL the renderer
+    /// assignment's site lock could authorize, so its dials ride the
+    /// creator's URL — the document the assignment was granted for
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    pub(in crate::document) fn dial_initiator(&self) -> Url {
+        if self.url.scheme() == "about" {
+            let world = self.world.borrow();
+            world.base_url.clone().unwrap_or_else(|| self.url.clone())
+        } else {
+            self.url.clone()
+        }
     }
 
     /// This frame's base URL: the first `base` element's `href` resolved
@@ -3026,7 +3085,7 @@ impl Document {
                     destination,
                 },
                 &fetch.url,
-                &self.url,
+                &self.dial_initiator(),
             );
             let (referrer, referrer_policy) = self.subresource_referrer(element, &fetch.url);
             dial.req.referrer = referrer;

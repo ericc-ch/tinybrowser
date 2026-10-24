@@ -117,8 +117,16 @@ impl Engine {
                         .get(&parent)
                         .and_then(|document| document.frame_src(container));
                     if let Some(src) = src {
-                        let navigation =
-                            FrameNavigation::get(NavigationTarget::Container(container), src);
+                        let navigation = FrameNavigation::get(
+                            NavigationTarget::Container(container),
+                            src,
+                        )
+                        .with_referrer_policy(
+                            self.frames
+                                .get(&parent)
+                                .map(|document| document.frame_referrer_policy(container))
+                                .unwrap_or_default(),
+                        );
                         self.navigate_frame(child, parent, &navigation);
                     }
                 }

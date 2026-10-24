@@ -212,6 +212,11 @@ pub enum RendererEvent {
     FetchFailed,
     /// A timer or `fetch` callback threw, or `execute_pending_job` failed.
     ScriptFailed,
+    /// A drain executed ready work. Script-visible state may have changed
+    /// even though no timer, fetch, or navigation event follows — a page that
+    /// settles a webdriver async-script callback in its last task and then
+    /// goes quiet must still wake a `run_until_js_true` waiter.
+    Turn,
 }
 
 /// Which of the two storage areas a change belongs to.

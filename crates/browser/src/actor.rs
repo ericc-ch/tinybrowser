@@ -1094,6 +1094,10 @@ impl Tab {
             return;
         }
         match event {
+            // Nothing to record; the coordinator re-checks JS-truth waiters
+            // after every renderer event, which is the whole point of this
+            // variant.
+            RendererEvent::Turn => {}
             RendererEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
                     self.history.navigate(url.clone(), None);
