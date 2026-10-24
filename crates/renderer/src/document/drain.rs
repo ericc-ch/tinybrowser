@@ -39,12 +39,11 @@ impl Document {
             && (fired || self.has_pending_frame_loads() || self.has_ready_work())
     }
 
-    /// The oldest queued task this document still owns. A task from a replaced
-    /// document is not runnable
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+    /// The oldest queued task this document may run: one it queued itself, or
+    /// one that outlives a document replacement.
     fn next_task(&mut self) -> Option<Task> {
         while let Some((generation, task)) = self.tasks.pop_front() {
-            if generation == self.generation {
+            if generation == self.generation || task.survives_document_replacement() {
                 return Some(task);
             }
         }
@@ -56,7 +55,9 @@ impl Document {
         if self
             .tasks
             .iter()
-            .any(|(generation, _)| *generation == self.generation)
+            .any(|(generation, task)| {
+                *generation == self.generation || task.survives_document_replacement()
+            })
             || self.dials.has_queued()
         {
             return true;

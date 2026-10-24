@@ -1075,16 +1075,19 @@ fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
     };
     let (first, first_weight) = split(parts[0])?;
     let (second, second_weight) = split(parts[1])?;
-    // Percentages are limited to 0..100; a missing one takes what is left.
-    if first_weight.is_some_and(|weight| !(0.0..=100.0).contains(&weight))
-        || second_weight.is_some_and(|weight| !(0.0..=100.0).contains(&weight))
+    // Negative percentages are specifically disallowed; anything above 100%
+    // normalizes: an omitted percentage takes what is left below 100%, and a
+    // total above 100% scales every weight down
+    // (<https://drafts.csswg.org/css-values-5/#mix-percentages>).
+    if first_weight.is_some_and(|weight| weight < 0.0)
+        || second_weight.is_some_and(|weight| weight < 0.0)
     {
         return None;
     }
     let (first_weight, second_weight) = match (first_weight, second_weight) {
         (None, None) => (50.0, 50.0),
-        (Some(weight), None) => (weight, 100.0 - weight),
-        (None, Some(weight)) => (100.0 - weight, weight),
+        (Some(weight), None) => (weight, (100.0 - weight).clamp(0.0, 100.0)),
+        (None, Some(weight)) => ((100.0 - weight).clamp(0.0, 100.0), weight),
         (Some(first), Some(second)) => (first, second),
     };
     let total = first_weight + second_weight;
@@ -1166,7 +1169,10 @@ mod tests {
         let partial = parse_exact("color-mix(in srgb, red 25%, blue 25%)").unwrap();
         assert_eq!(partial.bytes, [128, 0, 128, 128]);
 
-        assert!(parse_exact("color-mix(in srgb, red 150%, blue)").is_none());
+        // A single percentage above 100% scales down with the total, so the
+        // mix is the first color at full weight.
+        let over = parse_exact("color-mix(in srgb, red 150%, blue)").unwrap();
+        assert_eq!(over.bytes, [255, 0, 0, 255]);
         assert!(parse_exact("color-mix(in srgb, red -1%, blue)").is_none());
     }
 

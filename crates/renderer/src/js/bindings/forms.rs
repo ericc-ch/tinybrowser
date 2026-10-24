@@ -309,6 +309,8 @@ pub(super) fn form_navigate<'js>(
         // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>).
         body: body
             .chars()
+            // The JS shim builds this string from bytes 0-255, so every char
+            // is U+0000..U+00FF and the cast is the byte itself.
             .map(|character| character as u8)
             .collect(),
         content_type,

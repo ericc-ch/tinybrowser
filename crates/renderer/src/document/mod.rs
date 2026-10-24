@@ -78,6 +78,20 @@ enum Task {
     NodeError(crate::dom::tree::NodeId),
 }
 
+impl Task {
+    /// A posted window message is a task on the window, not the document:
+    /// the window post message steps gate it by the target-origin check
+    /// inside the task, against whichever document is active when it runs,
+    /// with no fully-active guard
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+    /// Every other task source owns a document, and its tasks are not
+    /// runnable once that document is replaced
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+    fn survives_document_replacement(&self) -> bool {
+        matches!(self, Self::WindowMessage(_) | Self::RemoteMessage(_))
+    }
+}
+
 /// What triggered an image load watch: a connected insert may reuse a request
 /// that is already filed, a `src` mutation always starts a new one
 /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).

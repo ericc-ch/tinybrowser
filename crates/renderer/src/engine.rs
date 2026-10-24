@@ -1196,15 +1196,15 @@ impl Engine {
                     payload,
                     ports,
                 } => {
-                    let allowed = self.frames.get(&target).is_some_and(|document| {
-                        target_origin == "*" || target_origin == document.origin_string()
-                    });
-                    // Blink re-checks the intended target origin against the
-                    // recipient's origin at delivery time and drops the
-                    // message on mismatch
-                    // (LocalDOMWindow::DispatchMessageEventWithOriginCheck).
-                    match (allowed, self.frames.get_mut(&target)) {
-                        (true, Some(document)) => {
+                    // The window post message steps gate nothing at post time:
+                    // the ports entangle with the target frame's realm and the
+                    // message queues even when the current document's origin
+                    // does not match, because the intended target origin is
+                    // checked inside the task, against whichever document is
+                    // active when it runs
+                    // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+                    match self.frames.get_mut(&target) {
+                        Some(document) => {
                             Self::route_endpoints(&self.runtime.shared, &ports, target);
                             document.push_window_message(WindowMessage {
                                 source,
@@ -1214,7 +1214,7 @@ impl Engine {
                                 ports,
                             });
                         }
-                        _ => self.runtime.shared.borrow_mut().forget_endpoints(&ports),
+                        None => self.runtime.shared.borrow_mut().forget_endpoints(&ports),
                     }
                 }
                 Delivery::PortMessage {

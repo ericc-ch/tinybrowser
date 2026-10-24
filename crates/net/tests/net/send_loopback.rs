@@ -207,6 +207,34 @@ async fn timeout_per_call_restarts_on_every_redirect_hop() {
 }
 
 #[tokio::test]
+async fn timeout_per_call_bounds_a_single_slow_hop() {
+    let hop_delay = Duration::from_millis(80);
+    let per_call = Duration::from_millis(30);
+    let server = TestServer::start(move |connection| {
+        connection.read_request();
+        std::thread::sleep(hop_delay);
+        let _ = connection.write_all(&canned_ok(&[], b"landed"));
+    });
+    let result = Agent::new(AgentOptions {
+        timeout_per_call: Some(per_call),
+        ..AgentOptions::default()
+    })
+    .expect("timeout options")
+    .send(Request::new(Method::GET, server.url("/start")))
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(NetError::Transport(TransportError::Timeout(
+                TimeoutKind::PerCall
+            )))
+        ),
+        "a slow hop must fail with the per-call deadline, got {result:?}"
+    );
+    server.assert_clean();
+}
+
+#[tokio::test]
 async fn response_bodies_stream_and_drop_cancels_the_socket() {
     let first_chunk_delivered = Arc::new(AtomicBool::new(false));
     let server_flag = Arc::clone(&first_chunk_delivered);
