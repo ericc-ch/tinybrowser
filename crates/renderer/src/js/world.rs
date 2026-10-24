@@ -1002,6 +1002,12 @@ pub(crate) struct ImageState {
     /// Elements whose current request already dispatched its `error` event,
     /// so a later scan does not repeat it.
     pub(crate) error_reported: HashSet<NodeId>,
+    /// Elements whose settled request loaded through a CORS check
+    /// (`crossorigin` content attribute; the network refuses a CORS-mode
+    /// load without a valid `Access-Control-Allow-Origin`). A load that is
+    /// not same-origin and not here taints the canvas
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+    pub(crate) cors_clean: HashSet<NodeId>,
 }
 
 impl ImageState {
@@ -1013,6 +1019,7 @@ impl ImageState {
         self.current_src.clear();
         self.broken.clear();
         self.error_reported.clear();
+        self.cors_clean.clear();
     }
 }
 
@@ -2130,6 +2137,7 @@ impl World {
         self.images.loading.insert(element);
         self.images.broken.remove(&element);
         self.images.error_reported.remove(&element);
+        self.images.cors_clean.remove(&element);
         if !self.images.sizes.contains_key(&element) {
             self.images.current_src.insert(element, url);
         }
@@ -2182,6 +2190,7 @@ impl World {
         self.images.current_src.remove(&element);
         self.images.broken.remove(&element);
         self.images.error_reported.remove(&element);
+        self.images.cors_clean.remove(&element);
         self.images.sizes.remove(&element);
     }
 

@@ -2649,7 +2649,7 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
             .flatten()
             .unwrap_or(ImageLookup::Unsupported);
         if let ImageLookup::Decoded(image) = &mut lookup {
-            image.origin_clean &= image_is_same_origin(&world.borrow(), id);
+            image.origin_clean &= image_origin_clean(&world.borrow(), id);
         }
         return Ok(lookup);
     }
@@ -2682,6 +2682,15 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
 /// Whether the image element's current request is same-origin with the
 /// document. `data:` images are treated as clean, like browsers do; a URL
 /// that does not parse is treated as cross-origin.
+/// Whether the image element's settled request is origin-clean for canvas:
+/// same-origin, or loaded through a CORS check (`crossorigin` content
+/// attribute; the network refuses a CORS-mode load without a valid
+/// `Access-Control-Allow-Origin`, so a settled CORS-mode load is clean)
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+fn image_origin_clean(world: &crate::js::world::World, id: NodeId) -> bool {
+    world.images.cors_clean.contains(&id) || image_is_same_origin(world, id)
+}
+
 fn image_is_same_origin(world: &crate::js::world::World, id: NodeId) -> bool {
     let Some(src) = world.images.current_src.get(&id) else {
         return true;

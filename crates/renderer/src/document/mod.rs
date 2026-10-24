@@ -174,7 +174,6 @@ impl QueuedDial {
                 integrity: None,
                 cache: None,
                 stream_body: false,
-                referrer_source: None,
                 referrer_policy: None,
             },
             context,
@@ -562,6 +561,25 @@ impl Document {
     /// non-empty one
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-src>).
     #[must_use]
+    /// The `iframe`'s `referrerpolicy` attribute parsed to a policy token,
+    /// or the empty string when absent or invalid, which leaves the
+    /// document's policy in force
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-referrerpolicy>).
+    pub(crate) fn frame_referrer_policy(&self, container: crate::dom::tree::NodeId) -> String {
+        let world = self.world.borrow();
+        world
+            .document(container)
+            .and_then(|parsed| {
+                crate::dom::tree::attr(
+                    &parsed.document.base,
+                    container.node,
+                    "referrerpolicy",
+                )
+                .and_then(crate::js::parse_referrer_policy)
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn frame_src(&self, container: crate::dom::tree::NodeId) -> Option<String> {
         let world = self.world.borrow();
         let value = world.document(container).and_then(|parsed| {
@@ -1970,6 +1988,24 @@ impl Document {
         self.world.borrow_mut().apply_meta_policy(id);
     }
 
+    /// A parser-inserted `<meta name=referrer>` sets the document's policy,
+    /// mirroring the JS insertion path
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+    fn apply_meta_referrer(&mut self, id: crate::dom::tree::NodeId) {
+        let policy = self.world.borrow().document(id).and_then(|parsed| {
+            let base = &parsed.document.base;
+            let name = crate::dom::tree::attr(base, id.node, "name").unwrap_or_default();
+            if !name.eq_ignore_ascii_case("referrer") {
+                return None;
+            }
+            let content = crate::dom::tree::attr(base, id.node, "content").unwrap_or_default();
+            crate::js::parse_referrer_policy(content)
+        });
+        if let Some(policy) = policy {
+            self.world.borrow_mut().state.referrer_policy = policy;
+        }
+    }
+
     pub(in crate::document) fn inline_script_violations(
         &self,
         source: &str,
@@ -2200,7 +2236,7 @@ impl Document {
     /// Queues one violation report POST. The response is dropped and the
     /// dial never gates load.
     fn queue_report(&mut self, url: &Url, body: Vec<u8>, content_type: &str) {
-        let mut dial = QueuedDial::new(DialContext::CspReport, url, &self.url);
+        let mut dial = QueuedDial::new(DialContext::CspReport, url, &self.dial_initiator());
         "POST".clone_into(&mut dial.req.method);
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
@@ -2273,7 +2309,13 @@ impl Document {
                     continue;
                 };
                 let node_id = crate::dom::tree::NodeId { document, node: id };
-                if crate::csp::meta_policy(base, id).is_some() {
+                // A `<meta name=referrer>` applies its policy in the same
+                // insertion steps as a CSP meta
+                // (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+                let referrer_meta = crate::dom::tree::is_html_element(base, id, "meta")
+                    && crate::dom::tree::attr(base, id, "name")
+                        .is_some_and(|name| name.eq_ignore_ascii_case("referrer"));
+                if referrer_meta || crate::csp::meta_policy(base, id).is_some() {
                     steps.push(Step::Meta(node_id));
                 }
                 if crate::dom::tree::is_html_element(base, id, "script") {
@@ -2291,6 +2333,7 @@ impl Document {
         for step in steps {
             let id = match step {
                 Step::Meta(id) => {
+                    self.apply_meta_referrer(id);
                     self.apply_meta_csp(id);
                     continue;
                 }
@@ -2393,7 +2436,11 @@ impl Document {
             return false;
         }
         self.parser_blocked_script = Some(id);
-        let mut dial = QueuedDial::new(DialContext::ClassicScript { element: id }, &url, &self.url);
+        let mut dial =
+            QueuedDial::new(DialContext::ClassicScript { element: id }, &url, &self.dial_initiator());
+        let (referrer, referrer_policy) = self.subresource_referrer(Some(id), &url);
+        dial.req.referrer = referrer;
+        dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
@@ -2412,6 +2459,44 @@ impl Document {
         })
     }
 
+    /// The `Referer` a page subresource request sends, with the policy the
+    /// network re-determines from on every redirect hop: the element's
+    /// `referrerpolicy` content attribute when present and valid, the
+    /// document's policy otherwise. The referrer source is the document's
+    /// URL — the creator's for an `about:srcdoc` document, since
+    /// `about:srcdoc` itself is a local scheme and would send nothing
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>,
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy>).
+    fn subresource_referrer(
+        &self,
+        element: Option<crate::dom::tree::NodeId>,
+        url: &Url,
+    ) -> (Option<String>, Option<String>) {
+        let world = self.world.borrow();
+        let source = world
+            .base_url
+            .as_ref()
+            .unwrap_or(&world.document_url)
+            .clone();
+        let policy = element
+            .and_then(|element| {
+                world.document(element).and_then(|parsed| {
+                    crate::dom::tree::attr(&parsed.document.base, element.node, "referrerpolicy")
+                        .and_then(crate::js::parse_referrer_policy)
+                })
+            })
+            .or_else(|| {
+                let policy = world.state.referrer_policy.clone();
+                (!policy.is_empty()).then_some(policy)
+            });
+        let referrer = crate::js::referrer_for_policy(
+            policy.as_deref().unwrap_or_default(),
+            &source,
+            url.as_str(),
+        );
+        (referrer, policy)
+    }
+
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
         let url = self
             .resolve_frame_url(spec)
@@ -2422,6 +2507,20 @@ impl Document {
             return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
+    }
+
+    /// The URL a dial from this document claims as its initiator. A
+    /// local-scheme document (`about:srcdoc`) has no URL the renderer
+    /// assignment's site lock could authorize, so its dials ride the
+    /// creator's URL — the document the assignment was granted for
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    pub(in crate::document) fn dial_initiator(&self) -> Url {
+        if self.url.scheme() == "about" {
+            let world = self.world.borrow();
+            world.base_url.clone().unwrap_or_else(|| self.url.clone())
+        } else {
+            self.url.clone()
+        }
     }
 
     /// This frame's base URL: the first `base` element's `href` resolved
@@ -2543,7 +2642,11 @@ impl Document {
                 }
             }
             DialContext::BlitzResource { id, destination } => {
-                self.deliver_blitz_resource(id, destination, &outcome, &req.url, redirected);
+                let cors_clean = req
+                    .cors
+                    .as_ref()
+                    .is_some_and(|cors| cors.mode == net::cors::RequestMode::Cors);
+                self.deliver_blitz_resource(id, destination, &outcome, &req.url, redirected, cors_clean);
             }
             // Fire-and-forget: the endpoint already stored the report, if it
             // cares. A failure is invisible by design.
@@ -2599,7 +2702,9 @@ impl Document {
 
     /// Hands one Blitz subresource response to its handler. A redirect the
     /// policy refuses is a failed load: empty bytes, and an `error` on the
-    /// element when the tree has one.
+    /// element when the tree has one. `cors_clean` records that the request
+    /// went out in CORS mode and survived the check, which makes the loaded
+    /// image origin-clean for canvas.
     fn deliver_blitz_resource(
         &mut self,
         id: u64,
@@ -2607,6 +2712,7 @@ impl Document {
         outcome: &DialOutcome,
         request_url: &str,
         redirected: bool,
+        cors_clean: bool,
     ) {
         let blocked = redirected
             && destination.is_some_and(|destination| {
@@ -2648,7 +2754,7 @@ impl Document {
         // current for the next capture instead of waiting for one to pump
         // the resolve loop.
         self.settle_blitz_layout();
-        self.settle_image_waiters(&request_url);
+        self.settle_image_waiters(&request_url, cors_clean);
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
@@ -2705,7 +2811,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&request_url);
+                    self.settle_image_waiters(&request_url, false);
                 }
             }
         }
@@ -2930,7 +3036,7 @@ impl Document {
             if let Some(bytes) = self.subresource_bytes.get(&url).cloned() {
                 Box::new(handler).bytes(url.clone(), blitz_traits::net::Bytes::from(bytes));
                 self.settle_blitz_layout();
-                self.settle_image_waiters(&url);
+                self.settle_image_waiters(&url, false);
                 continue;
             }
             // Per-destination policy: a blocked stylesheet, image, or font is
@@ -2938,11 +3044,10 @@ impl Document {
             // releases the resource as failed
             // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
             let destination = subresource_destination(fetch.kind);
+            let element = self.subresource_target(&fetch.url);
             if let Some(destination) = destination {
                 let violations = self.subresource_violations(&fetch.url, destination);
-                let target = self
-                    .subresource_target(&fetch.url)
-                    .or_else(|| self.document_node());
+                let target = element.or_else(|| self.document_node());
                 if !violations.is_empty()
                     && let Some(target) = target
                 {
@@ -2950,7 +3055,7 @@ impl Document {
                 }
                 if crate::csp::blocks(&violations) {
                     Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
-                    if let Some(element) = target {
+                    if let Some(element) = element {
                         if matches!(destination, crate::csp::Destination::Img) {
                             // The image lifecycle reports the error when the
                             // DOM walk reaches the element, so scripts that
@@ -2964,7 +3069,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&url);
+                    self.settle_image_waiters(&url, false);
                     continue;
                 }
             }
@@ -2980,8 +3085,37 @@ impl Document {
                     destination,
                 },
                 &fetch.url,
-                &self.url,
+                &self.dial_initiator(),
             );
+            let (referrer, referrer_policy) = self.subresource_referrer(element, &fetch.url);
+            dial.req.referrer = referrer;
+            dial.req.referrer_policy = referrer_policy;
+            // An image with a `crossorigin` content attribute loads in CORS
+            // mode: the network sends `Origin` and refuses the load without a
+            // valid `Access-Control-Allow-Origin`; a load that survives marks
+            // the image origin-clean for canvas
+            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
+            // <https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+            if destination == Some(crate::csp::Destination::Img) {
+                dial.req.cors = element.and_then(|element| {
+                    let world = self.world.borrow();
+                    let parsed = world.main_document()?;
+                    let base = &parsed.document.base;
+                    let cross = crate::dom::tree::attr(base, element.node, "crossorigin");
+                    let credentials = match cross.map(str::trim) {
+                        Some(value) if value.eq_ignore_ascii_case("use-credentials") => {
+                            net::cors::CredentialsMode::Include
+                        }
+                        Some(_) => net::cors::CredentialsMode::SameOrigin,
+                        None => return None,
+                    };
+                    Some(crate::protocol::CorsRequest {
+                        mode: net::cors::RequestMode::Cors,
+                        credentials,
+                        redirect: net::cors::RedirectMode::Follow,
+                    })
+                });
+            }
             dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
             self.dials.queue(dial, &self.load_delay);
         }
@@ -3237,7 +3371,11 @@ impl Document {
 
     /// Settles every waiter selected for `url` from Blitz's decoded state:
     /// decoded dimensions fire `load`, anything else fires `error`.
-    fn settle_image_waiters(&mut self, url: &str) {
+    /// Settles the in-flight image elements waiting on `url`. `cors_clean`
+    /// marks the elements' settled request as origin-clean for canvas: the
+    /// request went out in CORS mode and survived the check. Every other
+    /// settle path passes `false`, which falls back to the same-origin rule.
+    fn settle_image_waiters(&mut self, url: &str, cors_clean: bool) {
         let waiting: Vec<crate::dom::tree::NodeId> = self
             .in_flight_images
             .keys()
@@ -3251,6 +3389,13 @@ impl Document {
         for element in &waiting {
             self.in_flight_images.remove(element);
             let selected = self.image_selected_src.remove(element).unwrap_or_default();
+            if cors_clean {
+                self.world
+                    .borrow_mut()
+                    .images
+                    .cors_clean
+                    .insert(*element);
+            }
             if let Some((width, height)) = self.blitz_image_dims(*element) {
                 self.world
                     .borrow_mut()

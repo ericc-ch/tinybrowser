@@ -11,6 +11,7 @@ use crate::protocol::RendererEvent;
 /// enqueue more work while a request runs, so a turn must not loop forever.
 const MAX_REALM_REQUESTS_PER_TURN: usize = 1024;
 
+
 impl Document {
     /// Runs one batch of ready work and reports whether more may follow.
     ///
@@ -31,6 +32,11 @@ impl Document {
             // its deadline. A task outside a drain still opens its own turn.
             let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
             self.run_task(task);
+            // The task may have changed script-visible state with no timer,
+            // fetch, or navigation event to follow — a page that settles a
+            // webdriver async-script callback in its last task and then goes
+            // quiet must still wake a `run_until_js_true` waiter.
+            self.record_event(RendererEvent::Turn);
             let fired = self.check_load();
             return !self.stop.is_set()
                 && (fired || self.has_pending_frame_loads() || self.has_ready_work());
@@ -325,7 +331,11 @@ impl Document {
             self.tasks.push_back(Task::NodeError(element));
             return;
         }
-        let mut dial = QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.url);
+        let mut dial =
+            QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.dial_initiator());
+        let (referrer, referrer_policy) = self.subresource_referrer(Some(element), &url);
+        dial.req.referrer = referrer;
+        dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
@@ -364,20 +374,29 @@ impl Document {
             self.fail_js_fetch(fetch.js_id);
             return;
         }
-        let mut dial = QueuedDial::new(DialContext::JsFetch { id: fetch.js_id }, &url, &self.url);
+        let mut dial =
+            QueuedDial::new(DialContext::JsFetch { id: fetch.js_id }, &url, &self.dial_initiator());
         dial.req.method = fetch.method;
         dial.req.body = fetch.body;
         dial.req.content_type = fetch.content_type;
         dial.req.headers = fetch.headers;
         dial.req.referrer = fetch.referrer;
+        // An empty request policy means the client's policy container decides:
+        // resolve it here so every redirect hop re-determines with the same
+        // policy the initial request used
+        // (<https://fetch.spec.whatwg.org/#main-fetch>,
+        // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+        dial.req.referrer_policy = fetch.referrer_policy.or_else(|| {
+            let world = self.world.borrow();
+            let policy = world.state.referrer_policy.clone();
+            (!policy.is_empty()).then_some(policy)
+        });
         dial.req.cors = fetch.cors;
         dial.req.keepalive = fetch.keepalive;
         dial.req.body_len = fetch.body_len;
         dial.req.integrity = fetch.integrity;
         dial.req.cache = Some(fetch.cache);
         dial.req.stream_body = fetch.stream_body;
-        dial.req.referrer_source = fetch.referrer_source;
-        dial.req.referrer_policy = fetch.referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

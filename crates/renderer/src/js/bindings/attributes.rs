@@ -2004,6 +2004,16 @@ pub(crate) fn after_attribute_change(
         return Ok(());
     }
     if is_iframe {
+        // The iframe's own `referrerpolicy` attribute governs its navigation
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-referrerpolicy>).
+        let referrer_policy = world
+            .borrow()
+            .document(element)
+            .and_then(|parsed| {
+                crate::dom::tree::attr(&parsed.document.base, element.node, "referrerpolicy")
+                    .and_then(crate::js::parse_referrer_policy)
+            })
+            .unwrap_or_default();
         match srcdoc {
             Some(markup) => world
                 .borrow_mut()
@@ -2013,10 +2023,10 @@ pub(crate) fn after_attribute_change(
                 )),
             None => world
                 .borrow_mut()
-                .queue_frame_navigation(FrameNavigation::get(
-                    NavigationTarget::Container(element),
-                    spec,
-                )),
+                .queue_frame_navigation(
+                    FrameNavigation::get(NavigationTarget::Container(element), spec)
+                        .with_referrer_policy(referrer_policy),
+                ),
         }
     } else {
         // `src` set on a connected classic script runs the prepare steps,

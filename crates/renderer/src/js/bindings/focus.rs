@@ -238,7 +238,12 @@ fn has_activation(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
     let Some(element) = tree.data.downcast_element() else {
         return false;
     };
-    if element.name.ns != html_namespace() {
+    // An SVG `a` element has the same activation behavior as its HTML
+    // counterpart
+    // (<https://svgwg.org/svg2-draft/interact.html#SVGLinkElementEventHandling>).
+    let svg_anchor =
+        element.name.ns == crate::dom::tree::svg_namespace() && element.name.local.as_str() == "a";
+    if element.name.ns != html_namespace() && !svg_anchor {
         return false;
     }
     match element.name.local.as_str() {
@@ -756,7 +761,12 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(element) = tree.data.downcast_element() else {
             return Ok(());
         };
-        if element.name.ns != html_namespace() {
+        // An SVG `a` element has the same follow-the-hyperlink activation
+        // behavior as its HTML counterpart
+        // (<https://svgwg.org/svg2-draft/interact.html#SVGLinkElementEventHandling>).
+        let svg_anchor =
+            element.name.ns == crate::dom::tree::svg_namespace() && element.name.local.as_str() == "a";
+        if element.name.ns != html_namespace() && !svg_anchor {
             return Ok(());
         }
         let mut consumes_activation = false;

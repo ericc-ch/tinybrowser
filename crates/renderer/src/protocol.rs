@@ -212,6 +212,11 @@ pub enum RendererEvent {
     FetchFailed,
     /// A timer or `fetch` callback threw, or `execute_pending_job` failed.
     ScriptFailed,
+    /// A drain executed ready work. Script-visible state may have changed
+    /// even though no timer, fetch, or navigation event follows — a page that
+    /// settles a webdriver async-script callback in its last task and then
+    /// goes quiet must still wake a `run_until_js_true` waiter.
+    Turn,
 }
 
 /// Which of the two storage areas a change belongs to.
@@ -502,10 +507,9 @@ pub struct DialRequest {
     /// Ask the browser to return headers first and stream the decoded body.
     #[serde(default)]
     pub stream_body: bool,
-    /// Source document URL for recomputing the referrer on redirects.
-    #[serde(default)]
-    pub referrer_source: Option<String>,
-    /// Referrer policy attached to the request.
+    /// The request's referrer policy, re-determining the `Referer` on every
+    /// redirect hop. Empty means the document's policy
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     #[serde(default)]
     pub referrer_policy: Option<String>,
 }

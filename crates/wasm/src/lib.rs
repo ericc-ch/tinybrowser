@@ -155,6 +155,9 @@ impl GuestTab for Tab {
             .map(|events| {
                 events
                     .into_iter()
+                    // A turn is internal host coordination; the wasm event
+                    // surface has no consumer for it.
+                    .filter(|(_, event)| !matches!(event, RendererEvent::Turn))
                     .map(|(frame, event)| FrameEvent {
                         frame: frame.get(),
                         event: to_event(event),
@@ -200,6 +203,8 @@ fn to_event(event: RendererEvent) -> Event {
         RendererEvent::Fetch { status } => Event::Fetch(status),
         RendererEvent::FetchFailed => Event::FetchFailed,
         RendererEvent::ScriptFailed => Event::ScriptFailed,
+        // Filtered out before this match; unreachable without one.
+        RendererEvent::Turn => Event::Load,
     }
 }
 

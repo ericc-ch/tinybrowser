@@ -1121,7 +1121,6 @@ const __tbQueuePageRequest = (url, method, body, headers, cors, referrer, callba
       cors.integrity === undefined ? '' : String(cors.integrity),
       cors.cache === undefined ? '' : String(cors.cache),
       cors.stream === true ? '1' : '0',
-      cors.referrerSource === undefined || cors.referrerSource === null ? '' : String(cors.referrerSource),
       cors.referrerPolicy === undefined ? '' : String(cors.referrerPolicy),
     ]);
   }).catch(() => {
@@ -1272,9 +1271,6 @@ globalThis.fetch = function(input, init) {
       cache: data.cache,
       // HEAD has no body, and SRI has to see the whole body before exposure.
       stream: method !== 'HEAD' && data.integrity === '',
-      referrerSource: data.referrer === 'about:client'
-        ? host.__tbResolveUrl('', undefined)
-        : data.referrer,
       referrerPolicy: data.referrerPolicy,
     }, referrer, outcome => {
       const status = outcome.status;

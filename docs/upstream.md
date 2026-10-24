@@ -6,6 +6,8 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 
 ### blitz (third_party/blitz, master)
 
+- workspace `image` dependency gains the `bmp` feature. The image crate ships BMP in-tree, so this adds no crate; PNG/GIF/WebP/JPEG were already enabled. WPT's security-features endpoints encode their payload as a BMP (`common/security-features/subresource/image.py`), so every referrer-policy `img-tag` generated test failed on an undecodable image. Upstream pins `default-features = false` with no codecs declared.
+
 - c62d5c63 resolve_url returns None instead of panicking. A relative ref against a non-base (observed: foo.jpg against data:text/css) panicked the engine; unresolvable URLs now skip the fetch and form submission returns early.
 - 7189584d real doctype, processing-instruction, and CDATA nodes. These are real DOM nodes; a tree that cannot represent them forces every embedder to rebuild them from source with side tables.
 - 4954fea7 keep PI data, doctype nodes; drop only the XML declaration. The declaration is prolog, not content, so it creates no node; a later reserved-target PI stays a real node.
