@@ -177,6 +177,16 @@ impl fmt::Display for ScriptFailure {
 
 impl std::error::Error for ScriptFailure {}
 
+/// Whether a history API update replaces the current entry or pushes a new
+/// one (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-pushstate>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryHandling {
+    /// `history.pushState`: a new entry after the current one.
+    Push,
+    /// `history.replaceState`: the current entry in place.
+    Replace,
+}
+
 /// Observable HTML-job outcomes, in the order the renderer ran them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererEvent {
@@ -197,7 +207,7 @@ pub enum RendererEvent {
     HistoryUpdated {
         url: String,
         state: String,
-        replace: bool,
+        handling: HistoryHandling,
     },
     /// Request to traverse the tab's session history by `delta` entries.
     HistoryTraversal { delta: i32 },

@@ -520,9 +520,8 @@ impl<'js> html_marquee_element_generated::HTMLMarqueeElement<'js> for JsNode {
 
 impl html_audio_element_generated::HTMLAudioElement<'_> for JsNode {}
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
-    clippy::unused_self,
     reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
 )]
 impl JsNode {

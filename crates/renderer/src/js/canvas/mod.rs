@@ -173,14 +173,15 @@ fn canvas_image<'js>(
             "a layer is open",
         ));
     }
-    if registry.canvas_origin_clean(id) == Some(false) {
+    let origin_clean = registry.canvas_origin_clean(id);
+    if origin_clean == Some(false) {
         return Err(crate::js::bindings::throw_dom(
             ctx,
             "SecurityError",
             "the canvas is not origin-clean",
         ));
     }
-    let bytes = match (format, registry.canvas_origin_clean(id)) {
+    let bytes = match (format, origin_clean) {
         (CanvasImageFormat::Png, Some(_)) => registry.canvas_png(id),
         (CanvasImageFormat::Jpeg, Some(_)) => registry.canvas_jpeg(id, quality),
         (CanvasImageFormat::Png, None) => Canvas2D::blank_png(width, height),
@@ -1008,7 +1009,6 @@ fn quadratic_curve_to(
     })
 }
 
-#[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
 fn bezier_curve_to(
     this: This<Object<'_>>,
     c1x: Coerced<f64>,
@@ -1101,7 +1101,6 @@ fn arc_to(
     })
 }
 
-#[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
 fn ellipse<'js>(this: This<Object<'js>>, args: rquickjs::function::Rest<Value<'js>>) -> Result<()> {
     let ctx = this.0.ctx();
     let number = |index: usize| -> Result<f64> {
@@ -1502,7 +1501,6 @@ fn create_linear_gradient(
     resource_object(&this.0, "Gradient", id)
 }
 
-#[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
 fn create_radial_gradient(
     this: This<Object<'_>>,
     x0: Coerced<f64>,
@@ -4066,7 +4064,7 @@ fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<[u8; 4]> {
     else {
         return Ok(BLACK);
     };
-    let computed = styles.get_inherited_text().color.clone();
+    let computed = styles.get_inherited_text().color;
     let absolute = computed.to_color_space(style::color::ColorSpace::Srgb);
     let components = absolute.components;
     Ok(crate::css::color::to_bytes([

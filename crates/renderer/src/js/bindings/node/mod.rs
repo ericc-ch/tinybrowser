@@ -53,7 +53,7 @@ impl JsNode {
 }
 
 #[rquickjs::methods]
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs method ABI passes Ctx by value"
 )]

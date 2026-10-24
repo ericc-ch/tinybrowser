@@ -170,6 +170,43 @@ async fn timeout_global_covers_every_redirect_hop() {
 }
 
 #[tokio::test]
+async fn timeout_per_call_restarts_on_every_redirect_hop() {
+    let hop_delay = Duration::from_millis(80);
+    let per_call = Duration::from_millis(150);
+    let hops = Arc::new(std::sync::Mutex::new(0_u8));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |connection| {
+        connection.read_request();
+        std::thread::sleep(hop_delay);
+        let mut number = server_hops.lock().expect("hop counter");
+        *number = number.saturating_add(1);
+        let payload = if *number < 3 {
+            canned_redirect(302, "/next")
+        } else {
+            canned_ok(&[], b"landed")
+        };
+        let _ = connection.write_all(&payload);
+    });
+    let result = Agent::new(AgentOptions {
+        timeout_per_call: Some(per_call),
+        ..AgentOptions::default()
+    })
+    .expect("timeout options")
+    .send(Request::new(Method::GET, server.url("/start")))
+    .await;
+    assert!(
+        matches!(&result, Ok(response) if response.status() == 200),
+        "each hop gets its own per-call deadline, got {result:?}"
+    );
+    assert_eq!(
+        *hops.lock().expect("hop counter"),
+        3,
+        "all three hops must be served"
+    );
+    server.assert_clean();
+}
+
+#[tokio::test]
 async fn response_bodies_stream_and_drop_cancels_the_socket() {
     let first_chunk_delivered = Arc::new(AtomicBool::new(false));
     let server_flag = Arc::clone(&first_chunk_delivered);

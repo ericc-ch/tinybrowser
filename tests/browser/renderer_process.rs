@@ -1,12 +1,11 @@
 //! Renderer-process lifecycle over CDP: one daemon, one renderer child per site.
 
-mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use common::Fixture;
+use crate::common::Fixture;
 use serde_json::{Value, json};
 
 fn attach(client: &mut cdp::Client, target: &str) -> String {

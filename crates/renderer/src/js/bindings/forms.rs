@@ -67,7 +67,7 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
 /// Whether the calling realm is same origin with its top-level traversable.
 /// `showPicker()` requires it, and `document.domain` does not widen it
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-showpicker>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -94,7 +94,7 @@ fn same_origin_with_top(ctx: Ctx<'_>) -> Result<bool> {
 /// Whether `form` can start a submission: a stale wrapper or a form outside
 /// the main document has no browsing context to navigate
 /// (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -113,7 +113,7 @@ fn form_can_submit<'js>(ctx: Ctx<'js>, form: Value<'js>) -> bool {
 ///
 /// The `replacement` encoding is never returned: getting an encoding
 /// rejects it (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -126,7 +126,7 @@ pub(super) fn encoding_name(label: String) -> Option<String> {
 /// Sets an option's selectedness without the dirty flag, as the `Option`
 /// constructor does. Blitz models no selectedness slot, so the `selected`
 /// content attribute carries it directly.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -144,7 +144,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
 }
 
 /// The form's entry list as `[name, value, ...]`, in tree order.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -230,7 +230,7 @@ fn push_file_entries<'js>(
 
 /// The host half of the `input.files` setter: records the assigned file list so
 /// the form entry list can read it later.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -247,7 +247,7 @@ pub(super) fn set_input_files<'js>(
     if let Some(object) = files.as_object() {
         let length = object.get::<_, f64>("length").unwrap_or(0.0);
         if length.is_finite() && length > 0.0 {
-            #[allow(
+            #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 reason = "a file count is a small non-negative integer"
@@ -274,7 +274,7 @@ pub(super) fn set_input_files<'js>(
 /// Submission returns without navigating when the form cannot navigate
 /// (<https://html.spec.whatwg.org/multipage/links.html#cannot-navigate>), which
 /// is why the form itself crosses the boundary.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -309,14 +309,7 @@ pub(super) fn form_navigate<'js>(
         // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>).
         body: body
             .chars()
-            .map(|character| {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "the JS side maps each byte to U+0000..U+00FF"
-                )]
-                let byte = character as u8;
-                byte
-            })
+            .map(|character| character as u8)
             .collect(),
         content_type,
         // A form submission carries no policy of its own yet, so the initiator

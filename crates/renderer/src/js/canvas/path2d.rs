@@ -129,7 +129,7 @@ impl JsPath2D {
     }
 
     #[qjs(rename = "arc")]
-    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
+    #[expect(clippy::too_many_arguments, reason = "matches the IDL member")]
     fn arc(
         &self,
         ctx: Ctx<'_>,
@@ -190,7 +190,7 @@ impl JsPath2D {
     }
 
     #[qjs(rename = "ellipse")]
-    #[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
+    #[expect(clippy::too_many_arguments, reason = "matches the IDL member")]
     fn ellipse(
         &self,
         ctx: Ctx<'_>,

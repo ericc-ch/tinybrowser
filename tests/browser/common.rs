@@ -1,12 +1,39 @@
-//! Shared fixtures for the binary-level integration tests.
-//!
-//! Every `tests/*.rs` file compiles its own copy of this module, so helpers used
-//! by one test binary are dead code in the others.
-#![allow(dead_code)]
+//! Shared fixtures for the browser-level integration suites in this binary.
 
+use std::io::Read;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Reads one HTTP/1.1 request head and returns the request target. Test
+/// servers call this before replying: closing a socket with unread data sends
+/// RST, which can abort the response delivery.
+pub(crate) fn read_request_target(stream: &mut TcpStream) -> String {
+    // Short polls instead of one long blocking read: under load the request
+    // can lag the accept, and a single long read hides which side stalled.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 512];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        assert!(Instant::now() < deadline, "no request head within 10s");
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("request closed early"),
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("read: {error}"),
+        }
+    }
+    String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("target")
+        .to_owned()
+}
 
 pub struct Fixture {
     pub runtime: PathBuf,

@@ -510,7 +510,15 @@ pub(crate) fn accept(reason: Accepted, params: &Value) -> Result<Value, Dispatch
         {
             Err(DispatchError::MethodNotFound)
         }
-        _ => Ok(json!({})),
+        Accepted::WaitingForDebugger
+        | Accepted::DomainWithoutEvents
+        | Accepted::FocusIsNotEngineState
+        | Accepted::PageHasNoChildTargets
+        | Accepted::RendererOwnsFonts
+        | Accepted::NoDownloadPipeline
+        | Accepted::NoHttpCache
+        | Accepted::DefaultEmulatedMedia
+        | Accepted::CacheAlreadyDisabled => Ok(json!({})),
     }
 }
 
@@ -539,8 +547,8 @@ pub(crate) async fn run_script(
         ScriptMethod::ClearDeviceMetricsOverride => clear_device_metrics(tab).await,
         ScriptMethod::GetStorageKey => storage_key(tab).await,
         ScriptMethod::DomGetDocument => dom_get_document(tab).await,
-        ScriptMethod::DomQuerySelector => dom_query_selector(tab, params, false).await,
-        ScriptMethod::DomQuerySelectorAll => dom_query_selector(tab, params, true).await,
+        ScriptMethod::DomQuerySelector => dom_query_selector(tab, params).await,
+        ScriptMethod::DomQuerySelectorAll => dom_query_selector_all(tab, params).await,
         ScriptMethod::DomDescribeNode => dom_describe_node(tab, params).await,
         ScriptMethod::DomGetOuterHtml => dom_node_string(tab, params, "outerHTML").await,
         ScriptMethod::DomGetAttributes => dom_node_string(tab, params, "attributes").await,
@@ -885,10 +893,7 @@ fn capture_side(extent: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BROWSER, GetPropertiesParams, PAGE, ROUTES, capture_side, get_properties_script,
-        required_metric,
-    };
+    use super::{BROWSER, PAGE, ROUTES, capture_side, required_metric};
     use serde_json::json;
 
     #[test]
@@ -922,25 +927,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn get_properties_params_are_one_json_blob() {
-        let params: GetPropertiesParams = serde_json::from_value(json!({
-            "objectId": "a__OWN__",
-            "ownProperties": true,
-            "accessorPropertiesOnly": false,
-            "generatePreview": true,
-            "objectGroup": "playwright",
-        }))
-        .expect("typed params");
-        let blob = serde_json::to_string(&params).expect("json");
-        let script = get_properties_script(&params);
-
-        assert!(script.contains(&format!("const args = {blob};")));
-        assert!(script.contains(r#""objectId":"a__OWN__""#));
-        assert!(!script.contains("__ARGS__"));
-        assert!(!script.contains("afalse"));
-    }
 }
 
 /// `Storage.getStorageKey`: the tab's origin.
@@ -949,9 +935,10 @@ async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
         .execute_browser_script("String(location.origin)")
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
-    let key = match value {
-        RemoteValue::String(key) => key,
-        _ => String::new(),
+    let RemoteValue::String(key) = value else {
+        return Err(DispatchError::Failed(
+            "the browser helper did not return the origin".into(),
+        ));
     };
     Ok(json!({"storageKey": key}))
 }
@@ -1177,12 +1164,12 @@ fn requested_node_expression(params: &Value) -> String {
 
 /// `DOM.querySelector`/`DOM.querySelectorAll`: register the matches in the
 /// page's node table and answer with their ids.
+/// `DOM.querySelector`: the first matching node's id.
 pub(crate) async fn dom_query_selector(
     tab: &TabHandle,
     params: &Value,
-    all: bool,
 ) -> Result<Value, DispatchError> {
-    const SINGLE: &str = r"(function(){
+    const SCRIPT: &str = r"(function(){
       const register = node => {
         const nodes = host.__tb_dom_nodes;
         for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
@@ -1196,7 +1183,21 @@ pub(crate) async fn dom_query_selector(
       if (!found) return host.stringify({__proto__: null, nodeId: 0});
       return host.stringify({__proto__: null, nodeId: register(found)});
     })()";
-    const ALL: &str = r"(function(){
+    let selector =
+        serde_json::to_string(params.get("selector").and_then(Value::as_str).unwrap_or(""))
+            .unwrap_or_else(|_| "\"\"".to_owned());
+    let script = SCRIPT
+        .replace("__NODE__", &requested_node(params).to_string())
+        .replace("__SELECTOR__", &selector);
+    dom_eval(tab, &script).await
+}
+
+/// `DOM.querySelectorAll`: every matching node's id.
+pub(crate) async fn dom_query_selector_all(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const SCRIPT: &str = r"(function(){
       const register = node => {
         const nodes = host.__tb_dom_nodes;
         for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
@@ -1213,7 +1214,7 @@ pub(crate) async fn dom_query_selector(
     let selector =
         serde_json::to_string(params.get("selector").and_then(Value::as_str).unwrap_or(""))
             .unwrap_or_else(|_| "\"\"".to_owned());
-    let script = (if all { ALL } else { SINGLE })
+    let script = SCRIPT
         .replace("__NODE__", &requested_node(params).to_string())
         .replace("__SELECTOR__", &selector);
     dom_eval(tab, &script).await

@@ -551,9 +551,9 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
 /// (<https://drafts.csswg.org/cssom/#resolved-values>). `getComputedStyle`
 /// falls back to the inline style and then to initial values on an empty
 /// result.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
 )]
 fn resolved_style<'js>(
     ctx: Ctx<'js>,
@@ -582,7 +582,7 @@ fn resolved_style<'js>(
 
 /// The active document's viewport size in CSS pixels, for the live `window`
 /// metrics (<https://drafts.csswg.org/cssom-view/#dom-window-innerwidth>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -639,12 +639,8 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
 /// owns the id. Element commands use this so references returned by
 /// `execute_script` work as well as Find Element results
 /// (<https://w3c.github.io/webdriver/#elements>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "WebDriver element ids are small non-negative integers"

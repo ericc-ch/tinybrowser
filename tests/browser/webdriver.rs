@@ -5,10 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use common::Fixture;
+use crate::common::Fixture;
 use serde_json::{Value, json};
 
-mod common;
 
 fn start(extra_args: Vec<String>) -> (String, Fixture) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

@@ -301,10 +301,6 @@ pub(super) type AttrArgument<'js> = Class<'js, JsAttr<'js>>;
 /// (<https://dom.spec.whatwg.org/#interface-attr>), so it is a third payload
 /// of the one `EventTarget` contract. Listeners key on the Attr registry
 /// identity, which never changes even when the attribute moves documents.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "generated dispatch passes Ctx by value and the receiver object by value"
-)]
 impl<'js> event_target_generated::EventTarget<'js> for JsAttr<'js> {
     fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
         Err(rquickjs::Exception::throw_type(ctx, "Illegal constructor"))
@@ -389,7 +385,7 @@ impl super::host::SharedClass for JsAttr<'_> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     clippy::unused_self,
     reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
@@ -434,7 +430,7 @@ impl<'object> JsAttr<'object> {
         self.set_node_value(ctx, value)
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
     )]
@@ -460,7 +456,7 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isconnected
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
     )]
@@ -469,7 +465,7 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-parentnode
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
     )]
@@ -509,7 +505,7 @@ impl<'object> JsAttr<'object> {
         Ok(list)
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
     )]
@@ -527,7 +523,7 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-normalize
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
     )]
@@ -556,7 +552,7 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
     )]
@@ -1094,9 +1090,8 @@ pub struct JsNamedNodeMap {
 
 include!(concat!(env!("OUT_DIR"), "/NamedNodeMap.rs"));
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
-    clippy::unused_self,
     reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
 )]
 impl JsNamedNodeMap {

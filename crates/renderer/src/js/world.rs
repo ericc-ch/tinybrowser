@@ -635,7 +635,7 @@ impl<'js> Trace<'js> for Handle {
 
 /// `MutationObserver` options, already normalized. The booleans mirror the
 /// `MutationObserverInit` dictionary one-for-one.
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is a MutationObserverInit dictionary member"
 )]
@@ -1093,7 +1093,7 @@ pub(crate) enum RealmRequest {
     HistoryPush {
         url: String,
         state: String,
-        replace: bool,
+        handling: crate::protocol::HistoryHandling,
     },
     HistoryTraverse {
         delta: i32,

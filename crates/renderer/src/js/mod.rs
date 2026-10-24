@@ -1246,13 +1246,18 @@ fn install_history_host_functions(
             move |ctx: Ctx<'_>, url: String, state: String, replace: bool| {
                 let next = Url::parse(&url)
                     .map_err(|_| Exception::throw_type(&ctx, "Invalid history URL"))?;
+                let handling = if replace {
+                    crate::protocol::HistoryHandling::Replace
+                } else {
+                    crate::protocol::HistoryHandling::Push
+                };
                 let mut world = update_world.borrow_mut();
                 if !world.url_matches_origin(&next) {
                     return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
                 }
                 world.document_url = next;
                 world.history.state = Some(state.clone());
-                if !replace {
+                if handling == crate::protocol::HistoryHandling::Push {
                     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
                     world.history.index = world.history.index.saturating_add(1);
                     world.history.length = world.history.index.saturating_add(1);
@@ -1263,7 +1268,7 @@ fn install_history_host_functions(
                     .push_back(RealmRequest::HistoryPush {
                         url,
                         state,
-                        replace,
+                        handling,
                     });
                 Ok::<usize, rquickjs::Error>(world.history.length)
             },

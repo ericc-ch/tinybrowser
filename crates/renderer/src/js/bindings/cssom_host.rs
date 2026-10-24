@@ -107,7 +107,7 @@ fn cssom_throw(ctx: &Ctx<'_>, err: CssomError) -> rquickjs::Error {
     throw_dom(ctx, err.dom_exception_name(), "CSSOM operation failed")
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -137,7 +137,7 @@ fn node_sheet_id<'js>(ctx: Ctx<'js>, element: Value<'js>) -> f64 {
         })
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -166,7 +166,7 @@ fn with_path(path: &str) -> Option<Vec<usize>> {
     rule_path(path)
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -196,7 +196,7 @@ fn sheet_rule_count<'js>(ctx: Ctx<'js>, element: Value<'js>, id: f64, path: Stri
         })
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -239,7 +239,7 @@ fn rule_info_object<'js>(ctx: &Ctx<'js>, info: CssRuleInfo) -> Result<Object<'js
     Ok(object)
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -267,7 +267,7 @@ fn sheet_style_css_text<'js>(ctx: Ctx<'js>, element: Value<'js>, id: f64, path: 
         .unwrap_or_default()
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -305,7 +305,7 @@ fn sheet_style_get_property<'js>(
     Ok(Value::from(object))
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -343,7 +343,7 @@ fn sheet_style_names<'js>(
     Ok(Value::from(array))
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -377,7 +377,7 @@ fn sheet_style_set_property<'js>(
         .map_err(|err| cssom_throw(&ctx, err))
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -414,7 +414,7 @@ fn sheet_insert_rule<'js>(
     }
 }
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]

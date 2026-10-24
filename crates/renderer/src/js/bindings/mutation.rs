@@ -230,7 +230,7 @@ impl<'js> mutation_observer_generated::MutationObserver<'js> for JsMutationObser
 /// Delivers queued records to observer callbacks; installed as a global and
 /// scheduled as a microtask after every mutation
 /// (<https://dom.spec.whatwg.org/#notify-mutation-observers>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes Ctx by value"
 )]

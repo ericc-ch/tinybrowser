@@ -214,7 +214,7 @@ impl FrameTree {
 /// transferred to another realm (or, later, another thread) and still be the
 /// same port ([transferable objects](https://html.spec.whatwg.org/multipage/structured-data.html#transferable-objects)).
 #[derive(Default)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each bool mirrors a MessagePort state flag"
 )]

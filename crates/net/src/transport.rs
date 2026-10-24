@@ -48,15 +48,12 @@ pub(crate) struct CallBudget {
 }
 
 impl CallBudget {
-    pub fn from_engine(
-        timeout_global: Option<Duration>,
-        timeout_per_call: Option<Duration>,
-        start: Instant,
-        clock: Clock,
-    ) -> Self {
+    pub fn from_engine(timeout_global: Option<Duration>, start: Instant, clock: Clock) -> Self {
         Self {
             global: timeout_global.map(|limit| start + limit),
-            hop: timeout_per_call.map(|limit| start + limit),
+            // A per-call deadline only exists once a hop starts; `exchange`
+            // mints it through `with_hop_start` before each hop.
+            hop: None,
             clock,
         }
     }
@@ -284,12 +281,7 @@ impl HttpEngine {
     }
 
     pub(crate) fn budget_at(&self) -> CallBudget {
-        CallBudget::from_engine(
-            self.timeout_global,
-            self.timeout_per_call,
-            self.clock.monotonic(),
-            self.clock,
-        )
+        CallBudget::from_engine(self.timeout_global, self.clock.monotonic(), self.clock)
     }
 
     /// Sends one hop. Redirects, cookies, and header shaping belong to the

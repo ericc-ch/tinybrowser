@@ -523,9 +523,8 @@ impl html_label_element_generated::HTMLLabelElement<'_> for JsNode {}
 
 impl html_legend_element_generated::HTMLLegendElement<'_> for JsNode {}
 
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
-    clippy::unused_self,
     reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
 )]
 impl JsNode {

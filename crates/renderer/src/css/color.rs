@@ -1121,3 +1121,66 @@ fn parse_color_mix(inner: &str) -> Option<ParsedColor> {
         serialized: Some(serialized_srgb(value)),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, parse_exact};
+
+    #[test]
+    fn hex_lengths() {
+        assert_eq!(parse("#f00"), Some([255, 0, 0, 255]));
+        assert_eq!(parse("#ff0000"), Some([255, 0, 0, 255]));
+        assert_eq!(parse("#ff000080"), Some([255, 0, 0, 128]));
+        assert_eq!(parse("#f008"), Some([255, 0, 0, 136]));
+    }
+
+    #[test]
+    fn functional_forms() {
+        assert_eq!(parse("rgb(0, 128, 255)"), Some([0, 128, 255, 255]));
+        assert_eq!(parse("rgba(0, 0, 0, 0.5)"), Some([0, 0, 0, 128]));
+        assert_eq!(parse("rgb(100% 0% 0% / 50%)"), Some([255, 0, 0, 128]));
+        assert_eq!(parse("hsl(120, 100%, 25%)"), Some([0, 128, 0, 255]));
+    }
+
+    #[test]
+    fn names_and_invalid() {
+        assert_eq!(parse("RED"), Some([255, 0, 0, 255]));
+        assert_eq!(parse("transparent"), Some([0, 0, 0, 0]));
+        assert_eq!(parse("not-a-color"), None);
+        assert_eq!(parse("#12"), None);
+    }
+
+    #[test]
+    fn color_function_rejects_unknown_spaces_and_bad_alpha() {
+        assert!(parse_exact("color(bogus 1 0 0)").is_none());
+        assert!(parse_exact("color(srgb 1 0 0 / garbage)").is_none());
+        assert!(parse_exact("lab(50 0 0 / garbage)").is_none());
+        assert!(parse_exact("lab(50 0 0)").is_some());
+    }
+
+    #[test]
+    fn color_mix_is_premultiplied_and_scales_partial_percentages() {
+        let transparent_red = parse_exact("color-mix(in srgb, transparent, red)").unwrap();
+        assert_eq!(transparent_red.bytes, [255, 0, 0, 128]);
+
+        let partial = parse_exact("color-mix(in srgb, red 25%, blue 25%)").unwrap();
+        assert_eq!(partial.bytes, [128, 0, 128, 128]);
+
+        assert!(parse_exact("color-mix(in srgb, red 150%, blue)").is_none());
+        assert!(parse_exact("color-mix(in srgb, red -1%, blue)").is_none());
+    }
+
+    #[test]
+    fn relative_rgb_numbers_are_zero_to_255() {
+        let mixed = parse_exact("rgb(from #000000 128 0 0)").unwrap();
+        assert_eq!(mixed.bytes, [128, 0, 0, 255]);
+    }
+
+    #[test]
+    fn lab_mixes_in_srgb_not_lab_coordinates() {
+        // The sRGB midpoint of black and white is [128, 128, 128]; mixing the
+        // lab coordinates themselves would give L=50, [119, 119, 119].
+        let mixed = parse_exact("color-mix(in srgb, lab(0 0 0), lab(100 0 0))").unwrap();
+        assert_eq!(mixed.bytes, [128, 128, 128, 255]);
+    }
+}

@@ -1130,12 +1130,12 @@ impl Tab {
             RendererEvent::HistoryUpdated {
                 url,
                 state,
-                replace,
+                handling,
             } => {
                 if let Ok(url) = Url::parse(url)
                     && url.origin() == self.document_url.origin()
                 {
-                    self.history.update(url.clone(), state.clone(), *replace);
+                    self.history.update(url.clone(), state.clone(), *handling);
                     self.document_url = url;
                     self.record_event(TabEvent::SameDocumentNavigation).await;
                 }
@@ -1143,7 +1143,13 @@ impl Tab {
             RendererEvent::HistoryTraversal { delta } => {
                 self.traverse_history(*delta).await;
             }
-            _ => {}
+            // Timer, Fetch, FetchFailed, and ScriptFailed report load-lifecycle
+            // progress the renderer already settled internally; the tab has no
+            // state to update for them.
+            RendererEvent::Timer(..)
+            | RendererEvent::Fetch { .. }
+            | RendererEvent::FetchFailed
+            | RendererEvent::ScriptFailed => {}
         }
     }
 

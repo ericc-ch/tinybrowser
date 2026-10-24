@@ -14,7 +14,8 @@ use std::time::SystemTime;
 use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, schemeful_same_site};
 use renderer::{
     BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost, RendererEvent,
+    EmbeddedRenderer, HistoryHandling, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
+    RendererEvent,
     StorageChange, StorageHost, StorageKind,
 };
 use url::Url;
@@ -191,8 +192,8 @@ fn to_event(event: RendererEvent) -> Event {
         RendererEvent::HistoryUpdated {
             url,
             state,
-            replace,
-        } => Event::HistoryUpdated((url, state, replace)),
+            handling,
+        } => Event::HistoryUpdated((url, state, handling == HistoryHandling::Replace)),
         RendererEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
         RendererEvent::Load => Event::Load,
         RendererEvent::DomContentLoaded => Event::DomContentLoaded,

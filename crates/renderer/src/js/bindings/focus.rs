@@ -945,7 +945,7 @@ fn sequential_tabindex(base: &blitz_dom::BaseDocument, node: BlitzId) -> Option<
 /// button group is one focusable area: its checked member, else its first
 /// member, represents the group
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -1059,7 +1059,7 @@ fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
 /// this for pointer presses, space presses, and the label's associated
 /// control, and clear it when focus moves away
 /// (<https://drafts.csswg.org/selectors/#the-active-pseudo>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -1085,7 +1085,7 @@ fn set_active<'js>(ctx: Ctx<'js>, element: Value<'js>, active: bool) -> Result<(
 
 /// Whether the current realm has unexpired transient activation
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation-isactive>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -1095,7 +1095,7 @@ fn user_activation_active(ctx: Ctx<'_>) -> Result<bool> {
 
 /// Whether the current realm was ever activated
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation-hasbeenactive>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -1105,7 +1105,7 @@ fn user_activation_sticky(ctx: Ctx<'_>) -> Result<bool> {
 
 /// Consumes the current realm's transient activation
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -1116,7 +1116,7 @@ fn consume_user_activation(ctx: Ctx<'_>) -> Result<bool> {
 /// Runs the activation behavior for an element the input paths clicked, so a
 /// real click toggles a checkbox or submits a form
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -1145,7 +1145,7 @@ fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
 /// so routing the change through the IDL setter would make the edit invisible
 /// to them
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#input-events>).
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
@@ -1206,7 +1206,7 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
 
 /// The `WebDriver` "element click" step: a trusted click at the element, with
 /// focus moved to it first when it is focusable.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
