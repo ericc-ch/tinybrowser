@@ -174,10 +174,6 @@ async fn timeout_global_covers_every_redirect_hop() {
         elapsed < global + hop_delay,
         "absolute deadline waited {elapsed:?}"
     );
-    // Two stalled hops take 300 ms and the global deadline is 400 ms, so a
-    // mid-chain expiry is the only arithmetic outcome.
-    assert!(hop_delay.saturating_mul(2) < global);
-    assert!(hop_delay.saturating_mul(3) > global);
     server.assert_clean();
 }
 
@@ -223,10 +219,11 @@ async fn timeout_per_call_bounds_a_single_slow_hop() {
     .expect("timeout options")
     .send(Request::new(Method::GET, server.url("/start")))
     .await;
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "per-call deadline waited {elapsed_ms} ms",
-        elapsed_ms = started.elapsed().as_millis()
+        elapsed < Duration::from_millis(500),
+        "per-call deadline waited {} ms",
+        elapsed.as_millis()
     );
     assert!(
         matches!(

@@ -11,20 +11,23 @@ use serde_json::json;
 
 /// Reads one HTTP/1.1 request head and discards it. Test servers call this
 /// before replying: closing a socket with unread data sends RST, which can
-/// abort the response delivery.
-pub(crate) fn read_request_head(stream: &mut TcpStream) {
+/// abort the response delivery. `false` means the connection failed before a
+/// complete head arrived; the server loop moves on to the next connection.
+pub(crate) fn read_request_head(stream: &mut TcpStream) -> bool {
     // Short polls instead of one long blocking read: under load the request
     // can lag the accept, and a single long read hides which side stalled.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .expect("read timeout");
+    let Ok(()) = stream.set_read_timeout(Some(Duration::from_millis(100))) else {
+        return false;
+    };
     let mut head = Vec::new();
     let mut chunk = [0_u8; 512];
     let deadline = Instant::now() + Duration::from_secs(10);
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        assert!(Instant::now() < deadline, "no request head within 10s");
+        if Instant::now() >= deadline {
+            return false;
+        }
         match stream.read(&mut chunk) {
-            Ok(0) => panic!("request closed early"),
+            Ok(0) => return false,
             Ok(n) => head.extend_from_slice(&chunk[..n]),
             // A poll timeout surfaces as `WouldBlock` or `TimedOut` depending
             // on the platform.
@@ -33,25 +36,30 @@ pub(crate) fn read_request_head(stream: &mut TcpStream) {
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(error) => panic!("read: {error}"),
+            Err(error) => {
+                eprintln!("test server read failed: {error}");
+                return false;
+            }
         }
     }
+    true
 }
 
-/// Serves one HTML body on an ephemeral port for every connection it gets,
-/// reading each request head first. The thread runs until the test process
-/// exits; a test that only loads the page once simply never sees a second
-/// connection.
-pub(crate) fn serve_html(body: &'static [u8]) -> std::net::SocketAddr {
+/// Serves one body on an ephemeral port for every connection it gets, reading
+/// each request head first. The thread runs until the test process exits; a
+/// test that only loads the page once simply never sees a second connection.
+pub(crate) fn serve(body: &'static [u8], content_type: &'static str) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
     let addr = listener.local_addr().expect("server addr");
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            read_request_head(&mut stream);
+            if !read_request_head(&mut stream) {
+                continue;
+            }
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.write_all(body);
         }
@@ -80,32 +88,55 @@ pub(crate) fn load_page(client: &mut cdp::Client, url: &str, timeout: Duration) 
     client
         .call("Page.navigate", &json!({"url": url}), Some(&session))
         .expect("navigate");
-    wait_for_load(client, timeout);
+    wait_for_load(client, &session, timeout);
     session
 }
 
-/// Waits for the next `Page.loadEventFired` event.
-pub(crate) fn wait_for_load(client: &mut cdp::Client, timeout: Duration) -> serde_json::Value {
+/// Waits for the next `Page.loadEventFired` event for `session`. An event read
+/// that times out is retried until the overall deadline.
+pub(crate) fn wait_for_load(client: &mut cdp::Client, session: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let event = client
             .read_event(Duration::from_millis(500))
-            .expect("read event")
-            .expect("load event");
-        if event["method"] == json!("Page.loadEventFired") {
-            return event;
+            .expect("read event");
+        if let Some(event) = event
+            && event["method"] == json!("Page.loadEventFired")
+            && event["sessionId"] == json!(session)
+        {
+            return;
         }
-        assert!(Instant::now() < deadline, "no load event: {event}");
+        assert!(Instant::now() < deadline, "no load event for {session}");
     }
 }
 
 pub struct Fixture {
-    pub runtime: PathBuf,
-    pub data: PathBuf,
-    pub children: Vec<Child>,
+    runtime: PathBuf,
+    data: PathBuf,
+    children: Vec<Child>,
 }
 
 impl Fixture {
+    /// The profile's runtime directory.
+    pub fn runtime(&self) -> &std::path::Path {
+        &self.runtime
+    }
+
+    /// The profile's data directory.
+    pub fn data(&self) -> &std::path::Path {
+        &self.data
+    }
+
+    /// Live daemon children, in spawn order.
+    pub fn children(&mut self) -> &mut [Child] {
+        &mut self.children
+    }
+
+    /// Adopts a child the test spawned itself.
+    pub fn append_child(&mut self, child: Child) {
+        self.children.push(child);
+    }
+
     pub fn new(prefix: &str) -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -124,10 +155,19 @@ impl Fixture {
     }
 
     pub fn spawn_daemon(&mut self) -> u32 {
+        self.spawn_daemon_with(&[])
+    }
+
+    pub fn spawn_daemon_with_env(&mut self, key: &str, value: &str) -> u32 {
+        self.spawn_daemon_with(&[(key, value)])
+    }
+
+    pub fn spawn_daemon_with(&mut self, env: &[(&str, &str)]) -> u32 {
         let child = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
             .args(["daemon", "--profile=default"])
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("XDG_DATA_HOME", &self.data)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -160,22 +200,6 @@ impl Fixture {
 
     pub fn connect(&self) -> cdp::Client {
         cdp::Client::connect(self.endpoint()).expect("cdp connect")
-    }
-
-    pub fn spawn_daemon_with_env(&mut self, key: &str, value: &str) -> u32 {
-        let child = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
-            .args(["daemon", "--profile=default"])
-            .env("XDG_RUNTIME_DIR", &self.runtime)
-            .env("XDG_DATA_HOME", &self.data)
-            .env(key, value)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
-        let id = child.id();
-        self.children.push(child);
-        id
     }
 }
 

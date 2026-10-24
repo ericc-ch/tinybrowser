@@ -762,39 +762,13 @@ impl Conn {
                     close: method == "Browser.close",
                 }
             }
-            Err(DispatchError::MethodNotFound) => {
+            Err(error) => {
                 let mut reply = json!({
                     "id": id,
                     "error": {
-                        "code": -32601,
-                        "message": format!("'{method}' wasn't found")
+                        "code": error.code(),
+                        "message": error.message(method),
                     },
-                });
-                attach_session(&mut reply, session);
-                Outcome {
-                    reply,
-                    close: false,
-                }
-            }
-            Err(error @ (DispatchError::InvalidParams(_) | DispatchError::BadHelperReply(_))) => {
-                let code = match error {
-                    DispatchError::InvalidParams(_) => -32602,
-                    _ => -32000,
-                };
-                let mut reply = json!({
-                    "id": id,
-                    "error": {"code": code, "message": error.message()},
-                });
-                attach_session(&mut reply, session);
-                Outcome {
-                    reply,
-                    close: false,
-                }
-            }
-            Err(DispatchError::Failed(message)) => {
-                let mut reply = json!({
-                    "id": id,
-                    "error": {"code": -32000, "message": message},
                 });
                 attach_session(&mut reply, session);
                 Outcome {

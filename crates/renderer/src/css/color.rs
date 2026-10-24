@@ -25,9 +25,11 @@ use style::values::specified::Color as SpecifiedColor;
 use style_traits::{ParsingMode, ToCss};
 use url::Url;
 
-/// A parsed color plus the exact CSS serialization, when the syntax has no
+/// A parsed color: the computed absolute value, the straight sRGB bytes for
+/// painting, and the exact CSS serialization when the syntax has no
 /// HTML-compatible sRGB form (`color()`, relative colors, `color-mix()`).
 pub(crate) struct ParsedColor {
+    pub(crate) absolute: AbsoluteColor,
     pub(crate) bytes: [u8; 4],
     /// Straight (non-premultiplied) sRGB components plus alpha, each 0..=1.
     pub(crate) value: [f32; 4],
@@ -38,8 +40,14 @@ pub(crate) struct ParsedColor {
 ///
 /// `device` supplies the color scheme a system color resolves against; without
 /// one, a system color fails like it does in a context with no used color
-/// scheme.
-fn parse_absolute(input: &str, device: Option<&Device>) -> Option<AbsoluteColor> {
+/// scheme. `current` resolves the `currentcolor` keyword, which has no
+/// meaning outside an element
+/// (<https://drafts.csswg.org/css-color-4/#currentcolor-color>).
+fn parse_absolute(
+    input: &str,
+    device: Option<&Device>,
+    current: &AbsoluteColor,
+) -> Option<AbsoluteColor> {
     let url_data = UrlExtraData(ServoArc::new(Url::parse("about:blank").ok()?));
     let context = ParserContext::new(
         Origin::Author,
@@ -54,13 +62,17 @@ fn parse_absolute(input: &str, device: Option<&Device>) -> Option<AbsoluteColor>
     );
     let mut parser = Parser::new(input);
     let computed = SpecifiedColor::parse_and_compute(&context, &mut parser, device).ok()?;
-    Some(computed.resolve_to_absolute(&AbsoluteColor::BLACK))
+    Some(computed.resolve_to_absolute(current))
 }
 
 /// Parses a color for canvas and the color input, preserving the serialization
 /// of a non-legacy color space.
-pub(crate) fn parse_exact(input: &str, device: Option<&Device>) -> Option<ParsedColor> {
-    let absolute = parse_absolute(input, device)?;
+pub(crate) fn parse_exact(
+    input: &str,
+    device: Option<&Device>,
+    current: &AbsoluteColor,
+) -> Option<ParsedColor> {
+    let absolute = parse_absolute(input, device, current)?;
     let srgb = absolute.to_color_space(ColorSpace::Srgb);
     let value = [
         srgb.components.0,
@@ -78,6 +90,7 @@ pub(crate) fn parse_exact(input: &str, device: Option<&Device>) -> Option<Parsed
         Some(absolute.to_css_string())
     };
     Some(ParsedColor {
+        absolute,
         bytes: to_bytes(value),
         value,
         serialized,
@@ -95,45 +108,40 @@ pub(crate) fn to_bytes([r, g, b, a]: [f32; 4]) -> [u8; 4] {
     [channel(r), channel(g), channel(b), channel(a)]
 }
 
-/// The color's components in Display P3 plus its alpha, keeping authored
-/// Display P3 components when the input already names that space.
-///
-/// The color input serializes this directly, so a round trip through sRGB must
-/// not perturb a `color(display-p3 …)` value it was given
-/// (<https://html.spec.whatwg.org/multipage/input.html#update-a-color-well-control-color>).
-pub(crate) fn display_p3_components(
-    input: &str,
-    device: Option<&Device>,
-) -> Option<([f32; 3], f32)> {
-    let absolute = parse_absolute(input, device)?;
-    let p3 = if absolute.color_space == ColorSpace::DisplayP3 {
-        absolute
-    } else {
-        absolute.to_color_space(ColorSpace::DisplayP3)
-    };
-    Some((
-        [p3.components.0, p3.components.1, p3.components.2],
-        p3.alpha,
-    ))
-}
-
-/// Converts straight sRGB components to Display P3 for the color input's
-/// `colorspace=display-p3` serialization.
-pub(crate) fn srgb_to_display_p3([r, g, b]: [f32; 3]) -> [f32; 3] {
-    let srgb = AbsoluteColor::new(ColorSpace::Srgb, r, g, b, 1.0);
-    let p3 = srgb.to_color_space(ColorSpace::DisplayP3);
-    [p3.components.0, p3.components.1, p3.components.2]
-}
-
 #[cfg(test)]
 mod tests {
     use super::parse_exact;
+    use style::color::AbsoluteColor;
+
+    const BLACK: AbsoluteColor = AbsoluteColor::BLACK;
 
     #[test]
     fn color_mix_is_premultiplied() {
         // Canvas exposes the premultiplied result through `getImageData`; the
         // parser's syntax coverage belongs to WPT `css/css-color/parsing/`.
-        let transparent_red = parse_exact("color-mix(in srgb, transparent, red)", None).unwrap();
+        let transparent_red =
+            parse_exact("color-mix(in srgb, transparent, red)", None, &BLACK).unwrap();
         assert_eq!(transparent_red.bytes, [255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn color_mix_rejects_out_of_range_weights() {
+        // The `color-mix()` grammar is `<percentage [0,100]>`
+        // (<https://drafts.csswg.org/css-values-5/#funcdef-color-mix>).
+        assert!(parse_exact("color-mix(in srgb, red 150%, blue)", None, &BLACK).is_none());
+        assert!(parse_exact("color-mix(in srgb, red -10%, blue)", None, &BLACK).is_none());
+    }
+
+    #[test]
+    fn system_color_without_device_fails() {
+        // Resolving a system color needs the document's used color scheme.
+        assert!(parse_exact("Canvas", None, &BLACK).is_none());
+    }
+
+    #[test]
+    fn currentcolor_resolves_to_the_supplied_color() {
+        let red = parse_exact("red", None, &BLACK).unwrap();
+        let parsed = parse_exact("currentcolor", None, &red.absolute).unwrap();
+        assert_eq!(parsed.bytes, [255, 0, 0, 255]);
     }
 }

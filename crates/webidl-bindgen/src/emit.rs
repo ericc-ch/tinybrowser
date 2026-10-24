@@ -1903,7 +1903,13 @@ fn union_into_js(union: &Union, name: &proc_macro2::Ident, generic: &TokenStream
             // dictionary members before emitting a returned union.
             UnionMemberType::Dictionary(_) => continue,
         };
-        let key = body.to_string();
+        // `Boolean` and `Long` share body text but bind different types; an
+        // or-pattern needs one type for `value`.
+        let key = match member.type_ {
+            UnionMemberType::Boolean => format!("bool:{body}"),
+            UnionMemberType::Long => format!("i32:{body}"),
+            _ => body.to_string(),
+        };
         match grouped.iter_mut().find(|(known, _, _)| *known == key) {
             Some((_, _, variants)) => variants.push(variant),
             None => grouped.push((key, body, vec![variant])),

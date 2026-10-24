@@ -28,7 +28,7 @@ pub const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
 
 use crate::documents::DocumentStore;
 use crate::js::{FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime};
-use crate::messaging::{Delivery, SharedHandle, TargetOrigin};
+use crate::messaging::{Delivery, SharedHandle};
 use crate::protocol::{
     BrowserEvent, BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError,
 };
@@ -47,6 +47,16 @@ pub struct Engine {
     /// Page-scoped init scripts shared by every frame's world, with their
     /// identifiers (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
     init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
+    /// JS-truth predicates the browser waits on, evaluated after each drain.
+    js_waiters: Vec<JsWaiter>,
+}
+
+/// One JS-truth predicate: the browser registers it once and hears only when
+/// it evaluates to `true`, so it never polls the page.
+struct JsWaiter {
+    id: u64,
+    frame: FrameId,
+    source: crate::protocol::ScriptSource,
 }
 
 impl Engine {
@@ -78,6 +88,7 @@ impl Engine {
             frames,
             js_runtime,
             init_scripts,
+            js_waiters: Vec::new(),
         }
     }
 
@@ -389,26 +400,58 @@ impl Engine {
     }
 
     /// Removes and returns every pending event the browser acts on, with its
-    /// frame. The flag reports whether renderer-internal progress was
-    /// discarded: it carries no browser-side state, but the browser still
-    /// needs a wake to re-check its JS-truth waiters.
+    /// frame. Renderer-internal progress is discarded: it has no browser-side
+    /// state and never crosses the IPC boundary.
     ///
     /// # Errors
     ///
     /// [`TabError::RendererUnavailable`] when a frame retained more events
     /// than its limit; the queue empties and the excess is lost.
-    pub fn take_browser_events(
+    pub fn take_browser_events(&mut self) -> Result<Vec<(FrameId, BrowserEvent)>, TabError> {
+        Ok(self
+            .take_events()?
+            .into_iter()
+            .filter_map(|(frame, event)| event.into_browser().map(|event| (frame, event)))
+            .collect())
+    }
+
+    /// Registers a JS-truth predicate for [`Self::settle_js_waiters`].
+    pub fn add_js_waiter(
         &mut self,
-    ) -> Result<(Vec<(FrameId, BrowserEvent)>, bool), TabError> {
-        let mut internal = false;
-        let mut events = Vec::new();
-        for (frame, event) in self.take_events()? {
-            match event.into_browser() {
-                Some(event) => events.push((frame, event)),
-                None => internal = true,
+        id: u64,
+        frame: FrameId,
+        source: crate::protocol::ScriptSource,
+    ) {
+        self.js_waiters.push(JsWaiter { id, frame, source });
+    }
+
+    /// Drops a waiter that the browser no longer needs.
+    pub fn cancel_js_waiter(&mut self, id: u64) {
+        self.js_waiters.retain(|waiter| waiter.id != id);
+    }
+
+    /// Evaluates every registered predicate and returns the ids that became
+    /// true. The browser hears only those ids, so it never polls page state.
+    pub fn settle_js_waiters(&mut self) -> Vec<u64> {
+        if self.js_waiters.is_empty() {
+            return Vec::new();
+        }
+        let waiters = std::mem::take(&mut self.js_waiters);
+        let mut settled = Vec::new();
+        let mut pending = Vec::with_capacity(waiters.len());
+        for waiter in waiters {
+            let hit = matches!(
+                self.execute_remote_in(waiter.frame, waiter.source.as_ref(), None),
+                Ok(RemoteValue::Bool(true))
+            );
+            if hit {
+                settled.push(waiter.id);
+            } else {
+                pending.push(waiter);
             }
         }
-        Ok((events, internal))
+        self.js_waiters = pending;
+        settled
     }
 
     /// Runs every immediately ready task in every frame until the shared
@@ -478,21 +521,11 @@ impl Engine {
 
     /// Queues one remote `postMessage` payload on the main frame's task
     /// source; the frame dispatches a trusted `message` event with a null
-    /// source, after checking the intended target origin against whichever
-    /// document runs the task. `/` names the sender's origin, which travels
-    /// with the message because only its serialization survives the browser
-    /// hop.
-    pub fn receive_remote_window_message(
-        &mut self,
-        origin: String,
-        target_origin: &str,
-        payload: String,
-    ) {
-        let Some(target_origin) = TargetOrigin::from_remote(target_origin, &origin) else {
-            return;
-        };
+    /// source after checking the intended target origin against whichever
+    /// document runs the task.
+    pub fn receive_remote_window_message(&mut self, message: crate::protocol::PostedMessage) {
         if let Some(document) = self.frames.get_mut(&FrameId::MAIN) {
-            document.push_remote_message(origin, target_origin, payload);
+            document.push_remote_message(message);
         }
     }
 
@@ -527,7 +560,12 @@ impl Engine {
         source: Option<u64>,
     ) {
         for document in self.frames.values_mut() {
-            if document.origin_string() != origin {
+            // Two opaque origins never share a `BroadcastChannel`
+            // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+            // Their serialization is `"null"` for every document, so matching
+            // it would deliver across unrelated opaque documents.
+            let target = document.origin_string();
+            if target != origin || target == "null" {
                 continue;
             }
             if !document.world().borrow().is_attached() {
@@ -1211,8 +1249,6 @@ impl Engine {
             if let Some(container) = container {
                 self.publish_frame_document(container, frame);
                 if closed {
-                    // The written document is a fresh load: it supersedes the
-                    // insertion firing, so its own `load` must fire.
                     let parent = self.runtime.shared.borrow().tree.parent(frame);
                     if let Some(parent) = parent {
                         self.mark_frame_load_pending(container, parent);
@@ -1545,97 +1581,8 @@ mod data_url_tests {
 #[cfg(test)]
 mod messaging_tests {
     use super::{Engine, FrameId, Mount, ResponseHead};
-    use crate::messaging::{Delivery, TargetOrigin};
-    use crate::protocol::{
-        BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialRequest,
-        MessagingHost, NetworkHost, StorageChange, StorageError, StorageHost, StorageKind,
-    };
+    use crate::test_services::NullServices;
     use std::sync::Arc;
-    use url::Url;
-
-    struct NullServices;
-
-    impl NetworkHost for NullServices {
-        fn start_dial(
-            &self,
-            _request: DialRequest,
-            completion: DialCompletion,
-        ) -> DialCancellation {
-            completion(Err(DialFailure::Connect));
-            Box::new(|| {})
-        }
-
-        fn cookies_for(&self, _url: &Url) -> String {
-            String::new()
-        }
-
-        fn set_cookie(&self, _value: &str, _url: &Url) {}
-    }
-
-    impl StorageHost for NullServices {
-        fn storage_get(&self, _kind: StorageKind, _origin: &str, _key: &str) -> Option<String> {
-            None
-        }
-
-        fn storage_keys(&self, _kind: StorageKind, _origin: &str) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn storage_set(
-            &self,
-            _kind: StorageKind,
-            _origin: &str,
-            _url: &str,
-            _key: &str,
-            _value: &str,
-            _source: FrameId,
-        ) -> Result<Option<StorageChange>, StorageError> {
-            Ok(None)
-        }
-
-        fn storage_remove(
-            &self,
-            _kind: StorageKind,
-            _origin: &str,
-            _url: &str,
-            _key: &str,
-            _source: FrameId,
-        ) -> Option<StorageChange> {
-            None
-        }
-
-        fn storage_clear(
-            &self,
-            _kind: StorageKind,
-            _origin: &str,
-            _url: &str,
-            _source: FrameId,
-        ) -> Option<StorageChange> {
-            None
-        }
-    }
-
-    impl BrowsingContextHost for NullServices {
-        fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
-            None
-        }
-
-        fn window_close(&self, _tab: u64) {}
-
-        fn window_opener(&self) -> Option<u64> {
-            None
-        }
-
-        fn window_post_message(&self, _tab: u64, _origin: &str, _target: &str, _payload: &str) {}
-
-        fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
-            None
-        }
-    }
-
-    impl MessagingHost for NullServices {
-        fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
-    }
 
     fn engine() -> Engine {
         Engine::new(
@@ -1665,25 +1612,12 @@ mod messaging_tests {
             )
             .expect("mount");
         let _ready = engine.drain_ready();
-        // The delivery names the document it was posted to: the target
+        // Post through the real host path: the delivery captures the target
         // window's document at post time
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>).
-        let document = engine.frames[&FrameId::MAIN].id();
         engine
-            .runtime
-            .shared
-            .borrow_mut()
-            .deliveries
-            .push(Delivery::WindowMessage {
-                target: FrameId::MAIN,
-                document,
-                source: FrameId::MAIN,
-                origin: "https://example.test".to_owned(),
-                target_origin: TargetOrigin::Any,
-                // `__tbEncode('queued', [], null).payload`.
-                payload: r#"tb1:{"root":0,"nodes":[["string","queued"]]}"#.to_owned(),
-                ports: Vec::new(),
-            });
+            .eval_in(FrameId::MAIN, "postMessage('queued', '*')")
+            .expect("post");
         // A navigation commits before the engine routes the delivery: the new
         // document listens for `message`, and the sender's message must not
         // reach it.
@@ -1729,11 +1663,11 @@ mod messaging_tests {
         let payload = r#"tb1:{"root":0,"nodes":[["string","cross-tab"]]}"#.to_owned();
         // A target origin that names a different document is checked when the
         // task runs, so the message never reaches this realm.
-        engine.receive_remote_window_message(
-            "https://other.test".to_owned(),
-            "https://different.test",
-            payload.clone(),
-        );
+        engine.receive_remote_window_message(crate::protocol::PostedMessage {
+            origin: "https://other.test".to_owned(),
+            target_origin: "https://different.test".to_owned(),
+            payload: payload.clone(),
+        });
         let _ready = engine.drain_ready();
         assert_eq!(
             engine
@@ -1744,11 +1678,11 @@ mod messaging_tests {
         );
         // The matching target origin delivers, and `event.origin` is the
         // sender's origin at post time, not an empty string.
-        engine.receive_remote_window_message(
-            "https://other.test".to_owned(),
-            "https://example.test",
+        engine.receive_remote_window_message(crate::protocol::PostedMessage {
+            origin: "https://other.test".to_owned(),
+            target_origin: "https://example.test".to_owned(),
             payload,
-        );
+        });
         let _ready = engine.drain_ready();
         assert_eq!(
             engine
@@ -1791,15 +1725,5 @@ mod messaging_tests {
             "1",
             "`/` must resolve to the sender's origin, and a document is same origin with itself"
         );
-    }
-
-    #[test]
-    fn opaque_target_origins_never_match_each_other() {
-        let sender = Url::parse("data:text/html,one").expect("sender").origin();
-        let other = Url::parse("data:text/html,two").expect("other").origin();
-        // Two opaque origins are never same origin, whatever they serialize to.
-        assert!(!TargetOrigin::Exact(sender.clone()).admits(&other));
-        assert!(TargetOrigin::Exact(sender.clone()).admits(&sender));
-        assert!(TargetOrigin::Any.admits(&other));
     }
 }

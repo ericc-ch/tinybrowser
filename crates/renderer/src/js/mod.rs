@@ -1357,12 +1357,14 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     bridge::object(ctx)?.set(
         "__tbWindowPostMessage",
         Func::from(move |tab: u64, target_origin: String, payload: String| {
-            let origin = post_message.borrow().origin_string();
-            post_message.borrow().runtime.services.window_post_message(
+            let world = post_message.borrow();
+            world.runtime.services.window_post_message(
                 tab,
-                &origin,
-                &target_origin,
-                &payload,
+                crate::protocol::PostedMessage {
+                    origin: world.origin_string(),
+                    target_origin,
+                    payload,
+                },
             );
         }),
     )?;

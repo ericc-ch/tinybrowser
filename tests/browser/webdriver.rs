@@ -17,14 +17,14 @@ fn start(extra_args: Vec<String>) -> (String, Fixture) {
     command.args(["webdriver", &format!("--port={port}")]);
     command.args(extra_args);
     let child = command
-        .env("XDG_RUNTIME_DIR", &fixture.runtime)
-        .env("XDG_DATA_HOME", &fixture.data)
+        .env("XDG_RUNTIME_DIR", fixture.runtime())
+        .env("XDG_DATA_HOME", fixture.data())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn WebDriver");
-    fixture.children.push(child);
+    fixture.append_child(child);
     (format!("127.0.0.1:{port}"), fixture)
 }
 

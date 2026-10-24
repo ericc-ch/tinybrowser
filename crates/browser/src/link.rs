@@ -501,8 +501,8 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
                 frame,
                 event,
             }) => route_event(&context, assignment, frame, &event),
-            ServerInput::Notify(RendererNotice::Activity { assignment }) => {
-                route_activity(&context, assignment)
+            ServerInput::Notify(RendererNotice::WaiterSettled { assignment, id }) => {
+                route_waiter_settled(&context, assignment, id)
             }
             ServerInput::Notify(RendererNotice::Ready)
             | ServerInput::RequestChunk
@@ -532,15 +532,17 @@ fn route_event(
     }
 }
 
-/// Wakes the tab actor without an event. It shares the event route's
-/// authorization: a renderer may only speak for an assignment it hosts.
-fn route_activity(
+/// Routes a settled JS waiter. It shares the event route's authorization: a
+/// renderer may only speak for an assignment it hosts.
+fn route_waiter_settled(
     context: &ServiceContext,
     assignment: RendererAssignmentId,
+    id: u64,
 ) -> Result<(), RendererViolation> {
-    if let Some(assignment) = live_assignment(context, assignment)? {
-        // Saturation is harmless here: a full queue already wakes the actor.
-        assignment.publish_activity();
+    if let Some(assignment) = live_assignment(context, assignment)?
+        && assignment.publish_waiter_settled(id)
+    {
+        return Err(RendererViolation);
     }
     Ok(())
 }
@@ -803,28 +805,26 @@ async fn route_window_call(
             let opener = context.tabs.opener(assignment.tab).map(TabId::get);
             send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
-        BrowsingContextCall::WindowMessage {
-            tab,
-            origin,
-            target_origin,
-            payload,
-        } => {
+        BrowsingContextCall::WindowMessage { tab, message } => {
             // A page can only hold a `WindowProxy` for a related window: its
             // own, its opener, or a tab it opened. An unrelated target is a
             // forged call and is ignored.
+            // `MessageEvent.origin` is what a receiving page authenticates
+            // with, so the sender's claim must stay inside this renderer's
+            // site lock. An opaque origin has no authority to claim: its
+            // serialized `null` passes through, and no tuple-origin document
+            // admits it.
+            if message.origin != "null" && assignment.site.authorize(&message.origin).is_none() {
+                return Err(RendererViolation);
+            }
             let target = TabId::new(tab);
             if message_related(context, assignment, target) {
                 // Enqueue on the target's mailbox and return: the spec's
                 // `postMessage` is asynchronous, and waiting here would let a
                 // busy target block this renderer.
-                let _queued = context.tabs.deliver(
-                    target,
-                    crate::actor::RemoteWindowMessage {
-                        origin,
-                        target_origin,
-                        payload,
-                    },
-                );
+                let _queued = context
+                    .tabs
+                    .deliver(target, crate::actor::RemoteWindowMessage { message });
             }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }

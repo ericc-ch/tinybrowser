@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange::{Frame, RequestId};
 use renderer::{
-    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, RemoteValue, StorageChange,
-    StorageError, StorageKind, TabError,
+    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, PostedMessage, RemoteValue,
+    StorageChange, StorageError, StorageKind, TabError,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -58,15 +58,23 @@ pub enum Command {
         /// Viewport and crop window.
         request: renderer::ScreenshotRequest,
     },
-    /// Delivers one remote `message` event, encoded by the sender's realm.
-    WindowMessage {
-        /// The sender's serialized origin at post time.
-        origin: String,
-        /// The normalized target origin the sender asked for.
-        target_origin: String,
-        /// `__tbEncode` payload from the posting window.
-        payload: String,
+    /// Registers a JS-truth predicate the renderer evaluates after each drain
+    /// and reports through [`RendererNotice::WaiterSettled`].
+    WaitForJs {
+        /// Waiter identity, unique within this renderer.
+        id: u64,
+        /// Frame whose realm runs the predicate.
+        frame: FrameId,
+        /// Predicate source.
+        source: renderer::ScriptSource,
     },
+    /// Drops a waiter before it settles.
+    CancelWait {
+        /// Waiter identity from [`Command::WaitForJs`].
+        id: u64,
+    },
+    /// Delivers one remote `message` event, encoded by the sender's realm.
+    WindowMessage(renderer::PostedMessage),
     /// Activate an existing entry in the current document without replacing it.
     HistoryTraverse {
         url: String,
@@ -236,11 +244,12 @@ pub enum RendererNotice {
         /// The event.
         event: BrowserEvent,
     },
-    /// The renderer did work the browser has no state for, but its waiter
-    /// predicates still have to run.
-    Activity {
-        /// Top-level document that produced the work.
+    /// A registered JS-truth predicate evaluated to `true`.
+    WaiterSettled {
+        /// Top-level document that owns the waiter.
         assignment: RendererAssignmentId,
+        /// Waiter identity from the matching command.
+        id: u64,
     },
 }
 
@@ -371,12 +380,8 @@ pub enum BrowsingContextCall {
     WindowMessage {
         /// Target tab identity.
         tab: u64,
-        /// The sender's serialized origin at post time.
-        origin: String,
-        /// The normalized target origin the sender asked for.
-        target_origin: String,
-        /// `__tbEncode` payload from the sender's realm.
-        payload: String,
+        /// The encoded message, with the sender's claimed origin.
+        message: PostedMessage,
     },
     /// Reads one key from another tab's session area.
     RemoteSessionGet {

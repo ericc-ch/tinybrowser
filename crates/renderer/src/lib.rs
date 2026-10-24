@@ -32,6 +32,8 @@ mod remote;
 mod render;
 pub mod sniff;
 mod storage;
+#[cfg(test)]
+mod test_services;
 mod xml;
 
 pub use embedded::EmbeddedRenderer;
@@ -40,9 +42,10 @@ pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
     BodyError, BrowserEvent, BrowserServices, BrowsingContextHost, CorsRequest, DialCancellation,
     DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId, HistoryHandling,
-    HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost, RendererEvent,
-    ResourceLimit, ResponseHead, STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest,
-    ScriptFailure, ScriptSource, StorageChange, StorageError, StorageHost, StorageKind, TabError,
+    HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost, PostedMessage,
+    RendererEvent, ResourceLimit, ResponseHead, STORAGE_QUOTA_BYTES, ScreenshotClip,
+    ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError, StorageHost,
+    StorageKind, TabError,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

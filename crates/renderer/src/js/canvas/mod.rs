@@ -4014,25 +4014,9 @@ fn css_color_exact(
     object: &Object<'_>,
     text: &str,
 ) -> Result<Option<([u8; 4], Option<String>)>> {
-    let trimmed = text.trim();
-    if trimmed.eq_ignore_ascii_case("currentColor") {
-        return Ok(Some((current_color(ctx, object)?, None)));
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let source = if lower.contains("currentcolor") {
-        let [r, g, b, alpha] = current_color(ctx, object)?;
-        // Keep the alpha: dropping it turns `color: rgb(0 0 255 / 0.5)`
-        // into opaque blue when `currentcolor` is mixed or reused.
-        let replacement = if alpha == 255 {
-            format!("rgb({r} {g} {b})")
-        } else {
-            format!("rgb({r} {g} {b} / {})", f32::from(alpha) / 255.0)
-        };
-        lower.replace("currentcolor", &replacement)
-    } else {
-        lower
-    };
-    Ok(parse_canvas_color(ctx, object, &source)?.map(|parsed| (parsed.bytes, parsed.serialized)))
+    let current = current_color(ctx, object)?;
+    Ok(parse_canvas_color(ctx, object, text.trim(), &current)?
+        .map(|parsed| (parsed.bytes, parsed.serialized)))
 }
 
 /// Parses a canvas color against the canvas document's device, so a system
@@ -4041,50 +4025,63 @@ fn parse_canvas_color(
     ctx: &Ctx<'_>,
     object: &Object<'_>,
     source: &str,
+    current: &style::color::AbsoluteColor,
 ) -> Result<Option<crate::css::color::ParsedColor>> {
+    let Some(parsed) = with_canvas_document(ctx, object, |_, parsed| {
+        let device = parsed.document.base.stylist_device();
+        crate::css::color::parse_exact(source, Some(device), current)
+    })?
+    else {
+        return Ok(crate::css::color::parse_exact(
+            source,
+            None,
+            &style::color::AbsoluteColor::BLACK,
+        ));
+    };
+    Ok(parsed)
+}
+
+/// The canvas element's document and node, when the context really belongs to
+/// it. `__tbDoc`/`__tbNode` are writable, so a forged context must not reach
+/// another frame's style state.
+fn with_canvas_document<T>(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    f: impl FnOnce(NodeId, &mut crate::Parsed) -> T,
+) -> Result<Option<T>> {
     let Ok(id) = canvas_id(object) else {
-        return Ok(crate::css::color::parse_exact(source, None));
+        return Ok(None);
     };
     let world = world(ctx)?;
     let world = world.borrow();
+    if !world.owns_node(id) {
+        return Ok(None);
+    }
     let Some(mut parsed) = world.document_mut(id) else {
-        return Ok(crate::css::color::parse_exact(source, None));
+        return Ok(None);
     };
-    let device = parsed.document.base.stylist_device();
-    Ok(crate::css::color::parse_exact(source, Some(device)))
+    Ok(Some(f(id, &mut parsed)))
 }
 
 /// The canvas element's computed `color`, or black when it has no computed
 /// style (detached elements have none)
 /// (<https://drafts.csswg.org/css-color-4/#currentcolor-color>).
-fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<[u8; 4]> {
-    const BLACK: [u8; 4] = [0, 0, 0, 255];
-    let id = canvas_id(object)?;
-    let world = world(ctx)?;
-    let world = world.borrow();
-    // `__tbDoc`/`__tbNode` are writable; do not read another frame's
-    // stylesheet for a forged context.
-    if !world.owns_node(id) {
-        return Ok(BLACK);
-    }
-    let Some(mut parsed) = world.document_mut(id) else {
-        return Ok(BLACK);
-    };
-    let base = &mut parsed.document.base;
-    base.resolve(0.0);
-    let Some(styles) = base
-        .get_node(id.node)
-        .and_then(|node| node.primary_styles())
+fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<style::color::AbsoluteColor> {
+    let Some(current) = with_canvas_document(ctx, object, |id, parsed| {
+        let base = &mut parsed.document.base;
+        base.resolve(0.0);
+        let styles = base
+            .get_node(id.node)
+            .and_then(|node| node.primary_styles())?;
+        Some(
+            styles
+                .get_inherited_text()
+                .color
+                .to_color_space(style::color::ColorSpace::Srgb),
+        )
+    })?
     else {
-        return Ok(BLACK);
+        return Ok(style::color::AbsoluteColor::BLACK);
     };
-    let computed = styles.get_inherited_text().color;
-    let absolute = computed.to_color_space(style::color::ColorSpace::Srgb);
-    let components = absolute.components;
-    Ok(crate::css::color::to_bytes([
-        components.0,
-        components.1,
-        components.2,
-        absolute.alpha,
-    ]))
+    Ok(current.unwrap_or(style::color::AbsoluteColor::BLACK))
 }

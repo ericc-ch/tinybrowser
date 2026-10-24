@@ -16,8 +16,6 @@ use crate::messaging::{Delivery, MAX_FRAMES, PAYLOAD_VERSION, Shared, TargetOrig
 
 use crate::protocol::FrameId;
 
-use url::Url;
-
 /// Installs the frame-tree and cross-realm messaging host functions the shim
 /// calls: posting window messages and channel messages, reading the frame
 /// tree, and moving channel endpoints between realms.
@@ -95,36 +93,35 @@ fn post_window_message(
         return Ok(());
     }
     let world = world(&ctx)?;
-    let (source, origin, shared) = {
+    let (source, origin, origin_identity, shared) = {
         let world = world.borrow();
-        (world.frame(), world.origin_string(), world.shared())
+        (
+            world.frame(),
+            world.origin_string(),
+            world.origin.clone(),
+            world.shared(),
+        )
     };
-    // The shim parsed an explicit target origin and threw `SyntaxError` on
-    // failure; `/` keeps the sender's origin identity, which a serialized
-    // `"null"` cannot carry.
-    let target_origin = match target_origin.as_str() {
-        "*" => TargetOrigin::Any,
-        "/" => TargetOrigin::Exact(world.borrow().origin.clone()),
-        other => match Url::parse(other) {
-            Ok(url) => TargetOrigin::Exact(url.origin()),
-            Err(_) => return Ok(()),
-        },
+    // A page can call this host function directly, so every transferred
+    // endpoint must be one this frame detached; otherwise a hostile frame
+    // could hand another frame's in-transit port to a target of its choosing
+    // (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+    if !shared.borrow().ports.all_in_transit_from(&ports, source) {
+        return Ok(());
+    }
+    // The shim checked the syntax and threw `SyntaxError` before detaching;
+    // `/` keeps the sender's origin identity, which a serialized `"null"`
+    // cannot carry.
+    let Some(target_origin) = TargetOrigin::parse(&target_origin, Some(&origin_identity)) else {
+        shared.borrow_mut().forget_endpoints(&ports);
+        return Ok(());
     };
     // The task is bound to the target window's document as of post time
     // (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>).
     let Some(document) = shared.borrow().document_id(FrameId::new(target)) else {
+        shared.borrow_mut().forget_endpoints(&ports);
         return Ok(());
     };
-    {
-        // A page can call this host function directly, so every transferred
-        // endpoint must be one this frame detached; otherwise a hostile frame
-        // could hand another frame's in-transit port to a target of its
-        // choosing (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
-        let shared = shared.borrow();
-        if !shared.ports.all_in_transit_from(&ports, source) {
-            return Ok(());
-        }
-    }
     shared
         .borrow_mut()
         .deliveries

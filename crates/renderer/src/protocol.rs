@@ -187,34 +187,15 @@ pub enum HistoryHandling {
     Replace,
 }
 
-/// Renderer outcomes, in the order the renderer ran them.
+/// Observable HTML-job outcomes, in the order the renderer ran them.
 ///
-/// The browser wire carries only [`BrowserEvent`]: timer, fetch, and script
+/// The IPC wire carries only [`BrowserEvent`]; timer, fetch, and script
 /// failures are renderer-side progress that no host acts on, so they never
 /// cross the process boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererEvent {
-    /// The document reached `readyState = "complete"` and dispatched `load`.
-    Load,
-    /// The document finished parsing and dispatched `DOMContentLoaded`
-    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>);
-    /// subresources may still be loading.
-    DomContentLoaded,
-    /// A frame committed a navigation to this URL. The actor re-announces the
-    /// top-level document so a `CDP` client re-creates its execution contexts
-    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
-    Navigated {
-        /// The final URL after redirects.
-        url: String,
-    },
-    /// A history API update in the active document (no new JS realm).
-    HistoryUpdated {
-        url: String,
-        state: String,
-        handling: HistoryHandling,
-    },
-    /// Request to traverse the tab's session history by `delta` entries.
-    HistoryTraversal { delta: i32 },
+    /// An outcome the browser acts on.
+    Browser(BrowserEvent),
     /// A host timer whose delay elapsed.
     Timer(u32),
     /// A `fetch` or navigation job finished with this HTTP status.
@@ -232,24 +213,10 @@ impl RendererEvent {
     /// The event a host acts on, or `None` for renderer-internal progress.
     #[must_use]
     pub fn into_browser(self) -> Option<BrowserEvent> {
-        Some(match self {
-            Self::Load => BrowserEvent::Load,
-            Self::DomContentLoaded => BrowserEvent::DomContentLoaded,
-            Self::Navigated { url } => BrowserEvent::Navigated { url },
-            Self::HistoryUpdated {
-                url,
-                state,
-                handling,
-            } => BrowserEvent::HistoryUpdated {
-                url,
-                state,
-                handling,
-            },
-            Self::HistoryTraversal { delta } => BrowserEvent::HistoryTraversal { delta },
-            Self::Timer(..) | Self::Fetch { .. } | Self::FetchFailed | Self::ScriptFailed => {
-                return None;
-            }
-        })
+        match self {
+            Self::Browser(event) => Some(event),
+            Self::Timer(..) | Self::Fetch { .. } | Self::FetchFailed | Self::ScriptFailed => None,
+        }
     }
 }
 
@@ -263,7 +230,9 @@ pub enum BrowserEvent {
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>);
     /// subresources may still be loading.
     DomContentLoaded,
-    /// A frame committed a navigation to this URL.
+    /// A frame committed a navigation to this URL. The actor re-announces the
+    /// top-level document so a `CDP` client re-creates its execution contexts
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
     Navigated {
         /// The final URL after redirects.
         url: String,
@@ -445,9 +414,12 @@ impl HistorySnapshot {
     /// only differ between a script's update and that event.
     pub(crate) fn apply(&mut self, state: String, handling: HistoryHandling) {
         self.state = Some(state);
-        if matches!(handling, HistoryHandling::Push) {
-            self.index = self.index.saturating_add(1);
-            self.length = self.index.saturating_add(1);
+        match handling {
+            HistoryHandling::Push => {
+                self.index = self.index.saturating_add(1);
+                self.length = self.index.saturating_add(1);
+            }
+            HistoryHandling::Replace => {}
         }
     }
 }
@@ -787,10 +759,8 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
     fn window_opener(&self) -> Option<u64>;
 
     /// `postMessage` to a window this realm opened, encoded by the caller's
-    /// realm. `origin` is the sender's serialized origin and `target_origin`
-    /// the normalized argument (`*`, `/`, or a parsed URL string); the target
-    /// resolves both when the delivery task runs.
-    fn window_post_message(&self, tab: u64, origin: &str, target_origin: &str, payload: &str);
+    /// realm. The target resolves the message when the delivery task runs.
+    fn window_post_message(&self, tab: u64, message: PostedMessage);
 
     /// Reads one key from another tab's same-origin session area.
     fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;
@@ -800,6 +770,19 @@ pub trait BrowsingContextHost: Send + Sync + 'static {
 pub trait MessagingHost: Send + Sync + 'static {
     /// `BroadcastChannel.postMessage` for every same-origin channel.
     fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64);
+}
+
+/// One cross-context post, as it travels from the posting realm to the target
+/// document. The browser authorizes `origin` before forwarding the rest
+/// unchanged, so every hop carries the same value instead of rebuilding it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PostedMessage {
+    /// The sender's serialized origin at post time.
+    pub origin: String,
+    /// The normalized target origin: `*`, `/`, or a serialized origin.
+    pub target_origin: String,
+    /// `__tbEncode` payload from the sender's realm.
+    pub payload: String,
 }
 
 /// Complete host capability set used by an engine.

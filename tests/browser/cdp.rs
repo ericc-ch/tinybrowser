@@ -248,7 +248,7 @@ fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
             .clone()
     }
 
-    let server_addr = crate::fixture::serve_html(b"<!doctype html><p>hi</p>");
+    let server_addr = crate::fixture::serve(b"<!doctype html><p>hi</p>", "text/html");
 
     let (_fixture, mut client) = start();
     let session = crate::fixture::load_page(
@@ -287,7 +287,7 @@ fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
 
 #[test]
 fn page_navigate_loads_http_document() {
-    let server_addr = crate::fixture::serve_html(b"<!doctype html><p id=ok>hi</p>");
+    let server_addr = crate::fixture::serve(b"<!doctype html><p id=ok>hi</p>", "text/html");
 
     let (_fixture, mut client) = start();
     let session = crate::fixture::load_page(

@@ -947,9 +947,9 @@ async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
 /// DOM calls can look it up by `nodeId`.
 pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchError> {
     const SCRIPT: &str = r#"(function(){
+      host.__tbDomRegister = undefined;
       host.__tb_dom_nodes = host.array();
-      host.__tb_dom_id = 0;
-      host.__tb_dom_by_node = new Map();
+      host.__tb_dom_by_node = undefined;
       const register = __REGISTER__;
       const walk = node => {
         const id = register(node);
@@ -1154,20 +1154,29 @@ fn requested_node_expression(params: &Value) -> String {
 }
 
 /// The page-side node registrar shared by every `DOM.*` method that answers
-/// with node ids. The `Map` is the node-to-id reverse lookup, so a
-/// `querySelectorAll` over N nodes registers in O(N) instead of scanning the
-/// table per match. `DOM.getDocument` recreates it when the table resets.
+/// with node ids. It installs itself once per realm; the `Map` is the
+/// node-to-id reverse lookup, so a `querySelectorAll` over N nodes registers in
+/// O(N) instead of scanning the table per match. `DOM.getDocument` drops it to
+/// restart the ids.
 const REGISTER_PRELUDE: &str = r"(function(){
-  const nodes = host.__tb_dom_nodes;
-  const byNode = host.__tb_dom_by_node;
-  return node => {
-    const known = byNode.get(node);
-    if (known !== undefined) return known;
-    const id = ++host.__tb_dom_id;
-    nodes[id] = node;
-    byNode.set(node, id);
-    return id;
-  };
+  if (host.__tbDomRegister === undefined) {
+    const nodes = host.array();
+    const byNode = new Map();
+    let next = 0;
+    host.__tb_dom_nodes = nodes;
+    host.__tb_dom_by_node = byNode;
+    host.__tb_dom_id = next;
+    host.__tbDomRegister = node => {
+      const known = byNode.get(node);
+      if (known !== undefined) return known;
+      const id = ++next;
+      host.__tb_dom_id = id;
+      nodes[id] = node;
+      byNode.set(node, id);
+      return id;
+    };
+  }
+  return host.__tbDomRegister;
 })()";
 
 /// The `selector` parameter a DOM query method requires.
@@ -1747,10 +1756,19 @@ pub(crate) enum DispatchError {
 }
 
 impl DispatchError {
-    /// The JSON-RPC error message for the reply.
-    pub(crate) fn message(&self) -> String {
+    /// The JSON-RPC error code for the reply.
+    pub(crate) fn code(&self) -> i32 {
         match self {
-            Self::MethodNotFound => String::new(),
+            Self::MethodNotFound => -32601,
+            Self::InvalidParams(_) => -32602,
+            Self::BadHelperReply(_) | Self::Failed(_) => -32000,
+        }
+    }
+
+    /// The JSON-RPC error message for the reply.
+    pub(crate) fn message(&self, method: &str) -> String {
+        match self {
+            Self::MethodNotFound => format!("'{method}' wasn't found"),
             Self::InvalidParams(name) => format!("Invalid params: {name}"),
             Self::BadHelperReply(helper) => {
                 format!("the {helper} helper did not return a string result")

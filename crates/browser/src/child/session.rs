@@ -225,7 +225,9 @@ fn handle_request(
             | Command::RemoveInitScript { .. }
             | Command::SetViewport { .. }
             | Command::ContentSize { .. }
-            | Command::WindowMessage { .. }
+            | Command::WaitForJs { .. }
+            | Command::CancelWait { .. }
+            | Command::WindowMessage(..)
             | Command::HistoryTraverse { .. } => {
                 Reply::Unit(Err(stream_error("unknown assignment")))
             }
@@ -609,16 +611,20 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
         Command::ContentSize { frame } => {
             Handled::Reply(Reply::ContentSize(engine.content_size(frame)))
         }
+        Command::WaitForJs { id, frame, source } => {
+            engine.add_js_waiter(id, frame, source);
+            Handled::Reply(Reply::Unit(Ok(())))
+        }
+        Command::CancelWait { id } => {
+            engine.cancel_js_waiter(id);
+            Handled::Reply(Reply::Unit(Ok(())))
+        }
         Command::Screenshot { frame, request } => match engine.screenshot_frame(frame, &request) {
             Ok(png) => Handled::Screenshot(png),
             Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),
         },
-        Command::WindowMessage {
-            origin,
-            target_origin,
-            payload,
-        } => {
-            engine.receive_remote_window_message(origin, &target_origin, payload);
+        Command::WindowMessage(message) => {
+            engine.receive_remote_window_message(message);
             Handled::Reply(Reply::Unit(Ok(())))
         }
         Command::HistoryTraverse { url, history } => {
@@ -677,10 +683,12 @@ fn publish(
     engine: &mut Engine,
     outbox: &exchange::BlockingSender<FromRenderer>,
 ) -> bool {
-    let Ok((events, internal)) = engine.take_browser_events() else {
+    // The predicates run first: their evaluation is the drain's last work,
+    // and only the ids that became true cross the boundary.
+    let settled = engine.settle_js_waiters();
+    let Ok(events) = engine.take_browser_events() else {
         return false;
     };
-    let had_browser_event = !events.is_empty();
     for (frame, event) in events {
         if !send_to_browser(
             outbox,
@@ -693,16 +701,13 @@ fn publish(
             return false;
         }
     }
-    if had_browser_event {
-        return true;
-    }
-    if internal {
-        // Nothing the browser acts on happened, but its JS-truth waiter
-        // predicates still have to run, so send a payload-free wake.
-        return send_to_browser(
+    for id in settled {
+        if !send_to_browser(
             outbox,
-            Frame::Notify(RendererNotice::Activity { assignment }),
-        );
+            Frame::Notify(RendererNotice::WaiterSettled { assignment, id }),
+        ) {
+            return false;
+        }
     }
     true
 }

@@ -549,15 +549,16 @@ pub(crate) enum TargetOrigin {
 }
 
 impl TargetOrigin {
-    /// Resolves the sender's target-origin argument for a cross-tab message,
-    /// where only serialized origins survive the browser hop: `/` names the
-    /// sender's origin, and an origin that fails to parse (an opaque sender's
-    /// `"null"`) can never match a different document, so the message is
-    /// dropped.
-    pub(crate) fn from_remote(spec: &str, sender: &str) -> Option<Self> {
+    /// Resolves the sender's target-origin argument. `sender` is the posting
+    /// document's origin when the caller knows its identity; `/` names it
+    /// exactly. A serialized remote sender only keeps its URL, so an opaque
+    /// sender's `/` cannot be reconstructed and the message is dropped before
+    /// it reaches another document
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+    pub(crate) fn parse(spec: &str, sender: Option<&url::Origin>) -> Option<Self> {
         match spec {
             "*" => Some(Self::Any),
-            "/" => Url::parse(sender).ok().map(|url| Self::Exact(url.origin())),
+            "/" => sender.map(|origin| Self::Exact(origin.clone())),
             other => Url::parse(other).ok().map(|url| Self::Exact(url.origin())),
         }
     }

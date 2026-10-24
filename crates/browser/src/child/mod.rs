@@ -439,14 +439,9 @@ impl BrowsingContextHost for HostServices {
         }
     }
 
-    fn window_post_message(&self, tab: u64, origin: &str, target_origin: &str, payload: &str) {
+    fn window_post_message(&self, tab: u64, message: renderer::PostedMessage) {
         let _result = self.call(ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowMessage {
-                tab,
-                origin: origin.to_owned(),
-                target_origin: target_origin.to_owned(),
-                payload: payload.to_owned(),
-            },
+            BrowsingContextCall::WindowMessage { tab, message },
         ));
     }
 

@@ -5,7 +5,7 @@ use tokio::time::Instant;
 use super::{DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::dom::tree::NodeId;
 use crate::js::RealmRequest;
-use crate::protocol::RendererEvent;
+use crate::protocol::{BrowserEvent, RendererEvent};
 
 /// Upper bound on realm requests applied in one turn. Host callbacks can
 /// enqueue more work while a request runs, so a turn must not loop forever.
@@ -20,13 +20,13 @@ impl Document {
     pub(crate) fn drain_step(&mut self) -> bool {
         self.adopt_dial_completions();
         while let Some(id) = self.due_timer() {
-            self.queue_task(Task::Timer(id));
+            self.tasks.push_back(Task::Timer(id));
         }
         self.adopt_js_work();
         self.drain_blitz_fetches();
         self.launch_queued_dials();
         self.adopt_dial_completions();
-        let Some(task) = self.next_task() else {
+        let Some(task) = self.tasks.pop_front() else {
             let fired = self.check_load();
             return !self.stop.is_set() && (fired || self.has_pending_frame_loads());
         };
@@ -36,12 +36,6 @@ impl Document {
         self.run_task(task);
         let fired = self.check_load();
         !self.stop.is_set() && (fired || self.has_pending_frame_loads() || self.has_ready_work())
-    }
-
-    /// The oldest queued task. Every entry belongs to this document
-    /// instance: a replacement purges the queue with its document.
-    fn next_task(&mut self) -> Option<Task> {
-        self.tasks.pop_front()
     }
 
     /// Whether a task is queued or a timer is already due.
@@ -61,8 +55,8 @@ impl Document {
     fn adopt_dial_completions(&mut self) {
         for (id, completed) in self.dials.adopt() {
             match completed {
-                Ok(done) => self.queue_task(Task::DialFinished(id, Box::new(done))),
-                Err(fail) => self.queue_task(Task::DialFailed(id, fail)),
+                Ok(done) => self.tasks.push_back(Task::DialFinished(id, Box::new(done))),
+                Err(fail) => self.tasks.push_back(Task::DialFailed(id, fail)),
             }
         }
     }
@@ -209,11 +203,7 @@ impl Document {
             }
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
-            Task::RemoteMessage {
-                origin,
-                target_origin,
-                payload,
-            } => self.deliver_remote_message(&origin, &target_origin, &payload),
+            Task::RemoteMessage(message) => self.deliver_remote_message(&message),
             Task::BroadcastMessage {
                 origin,
                 name,
@@ -276,14 +266,16 @@ impl Document {
                 handling,
             } => {
                 self.apply_document_url_same_origin(&url);
-                self.record_event(RendererEvent::HistoryUpdated {
+                self.record_event(RendererEvent::Browser(BrowserEvent::HistoryUpdated {
                     url,
                     state,
                     handling,
-                });
+                }));
             }
             RealmRequest::HistoryTraverse { delta } => {
-                self.record_event(RendererEvent::HistoryTraversal { delta });
+                self.record_event(RendererEvent::Browser(BrowserEvent::HistoryTraversal {
+                    delta,
+                }));
             }
             RealmRequest::CspViolation(target, violations) => {
                 self.fire_csp_violations(target, &violations);
@@ -321,7 +313,7 @@ impl Document {
             parsed.document.mark_script_started(element.node);
         }
         let Ok(url) = self.resolve_dial_url(&src) else {
-            self.queue_task(Task::NodeError(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         };
         let violations = self.script_url_violations(&url, element);
@@ -329,7 +321,7 @@ impl Document {
             self.fire_csp_violations(element, &violations);
         }
         if crate::csp::blocks(&violations) {
-            self.queue_task(Task::NodeError(element));
+            self.tasks.push_back(Task::NodeError(element));
             return;
         }
         let mut dial = QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.url);

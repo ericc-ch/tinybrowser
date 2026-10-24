@@ -470,7 +470,7 @@ impl Agent {
         let mut referrer_policy = request.referrer_policy.clone();
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
-        let mut budget = CallBudget::start(&self.engine);
+        let mut budget = self.engine.call_budget();
         // The request's own deadline only tightens the engine's global
         // timeout; a later deadline must not stretch it.
         if let Some(deadline) = request.deadline {
@@ -561,10 +561,7 @@ impl Agent {
                 TimeoutKind::Global,
             )));
         }
-        // The hop's budget exists from here on: the per-call deadline is
-        // measured from this hop's start, and the send cannot happen without
-        // it (see `CallBudget::start_hop`).
-        let budget = budget.start_hop(self.engine.timeout_per_call);
+        let budget = budget.start_hop();
         let mut wire = url.clone();
         wire.set_fragment(None);
         let cross_origin = dial.cors.origin != wire.origin();

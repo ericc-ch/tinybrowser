@@ -27,12 +27,12 @@ use renderer::{BrowserEvent, FrameId, Mount, TabError};
 /// while blocking the reader could strand a reply behind those events.
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
 
-/// One wake for the tab actor: a browser event, or renderer work with no
-/// event to carry. Both run the actor's waiter predicates.
+/// One wake for the tab actor: a browser event or a settled JS waiter. Both
+/// run the actor's waiter predicates.
 #[derive(Clone, Debug)]
 pub(crate) enum RendererWake {
     Event(FrameId, BrowserEvent),
-    Activity,
+    WaiterSettled(u64),
 }
 
 /// One browser-authorized top-level document inside a renderer process.
@@ -141,10 +141,10 @@ impl Assignment {
         self.publish(&RendererWake::Event(frame, event.clone()))
     }
 
-    /// Wakes every subscriber without an event. A full queue is dropped: it
-    /// already holds an event that wakes the actor.
-    pub(crate) fn publish_activity(&self) {
-        let _saturated = self.publish(&RendererWake::Activity);
+    /// Delivers one settled JS waiter to every subscriber; returns whether a
+    /// subscriber was too slow (a dropped settlement would hang the waiter).
+    pub(crate) fn publish_waiter_settled(&self, id: u64) -> bool {
+        self.publish(&RendererWake::WaiterSettled(id))
     }
 
     fn publish(&self, wake: &RendererWake) -> bool {

@@ -36,21 +36,23 @@ use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::resolve::{HostMap, ResolveFailure, Target};
 
-/// The global deadline for one `send` call, fixed when the call starts and
-/// covering every redirect hop.
+/// The deadlines for one `send` call: the global limit covering every
+/// redirect hop plus the per-hop limit captured once at call start.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CallBudget {
     global: Option<Instant>,
+    per_call: Option<Duration>,
     clock: Clock,
 }
 
 impl CallBudget {
-    /// Starts the budget for one call from `engine`'s global timeout.
+    /// Starts the budget for one call from `engine`'s timeouts.
     pub(crate) fn start(engine: &HttpEngine) -> Self {
         Self {
             global: engine
                 .timeout_global
                 .map(|limit| engine.clock.monotonic() + limit),
+            per_call: engine.timeout_per_call,
             clock: engine.clock,
         }
     }
@@ -61,12 +63,12 @@ impl CallBudget {
         self.global = Some(self.global.map_or(deadline, |global| global.min(deadline)));
     }
 
-    /// Mints the budget for one hop: the global deadline plus
-    /// `timeout_per_call` measured from now.
-    pub(crate) fn start_hop(&self, timeout_per_call: Option<Duration>) -> HopBudget {
+    /// Mints the budget for one hop: the global deadline plus the per-call
+    /// deadline measured from now.
+    pub(crate) fn start_hop(&self) -> HopBudget {
         HopBudget {
             global: self.global,
-            hop: timeout_per_call.map(|limit| self.clock.monotonic() + limit),
+            hop: self.per_call.map(|limit| self.clock.monotonic() + limit),
             clock: self.clock,
         }
     }
@@ -227,10 +229,10 @@ impl fmt::Debug for Proxy {
 #[derive(Clone)]
 pub(crate) struct HttpEngine {
     client: Client<HttpsConnector<HttpConnector<HostResolver>>, RequestBody>,
-    pub(crate) timeout_global: Option<Duration>,
-    pub(crate) timeout_per_call: Option<Duration>,
+    timeout_global: Option<Duration>,
+    timeout_per_call: Option<Duration>,
     proxied: Option<ProxiedClient>,
-    pub(crate) clock: Clock,
+    clock: Clock,
 }
 
 type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
@@ -263,6 +265,11 @@ fn tls_connector(cas: &[native_tls::Certificate]) -> tokio_native_tls::TlsConnec
 }
 
 impl HttpEngine {
+    /// The budget one `send` call starts with.
+    pub(crate) fn call_budget(&self) -> CallBudget {
+        CallBudget::start(self)
+    }
+
     pub(crate) fn new(
         timeout_global: Option<Duration>,
         timeout_per_call: Option<Duration>,
