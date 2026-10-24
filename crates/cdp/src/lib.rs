@@ -776,6 +776,21 @@ impl Conn {
                     close: false,
                 }
             }
+            Err(error @ (DispatchError::InvalidParams(_) | DispatchError::BadHelperReply(_))) => {
+                let code = match error {
+                    DispatchError::InvalidParams(_) => -32602,
+                    _ => -32000,
+                };
+                let mut reply = json!({
+                    "id": id,
+                    "error": {"code": code, "message": error.message()},
+                });
+                attach_session(&mut reply, session);
+                Outcome {
+                    reply,
+                    close: false,
+                }
+            }
             Err(DispatchError::Failed(message)) => {
                 let mut reply = json!({
                     "id": id,

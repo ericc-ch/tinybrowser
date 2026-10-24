@@ -7,11 +7,6 @@
 //!
 //! Spec: <https://html.spec.whatwg.org/multipage/canvas.html#2dcontext>
 
-#![expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs passes every JS argument by value"
-)]
-
 mod path2d;
 mod state;
 mod text;
@@ -173,14 +168,15 @@ fn canvas_image<'js>(
             "a layer is open",
         ));
     }
-    if registry.canvas_origin_clean(id) == Some(false) {
+    let origin_clean = registry.canvas_origin_clean(id);
+    if origin_clean == Some(false) {
         return Err(crate::js::bindings::throw_dom(
             ctx,
             "SecurityError",
             "the canvas is not origin-clean",
         ));
     }
-    let bytes = match (format, registry.canvas_origin_clean(id)) {
+    let bytes = match (format, origin_clean) {
         (CanvasImageFormat::Png, Some(_)) => registry.canvas_png(id),
         (CanvasImageFormat::Jpeg, Some(_)) => registry.canvas_jpeg(id, quality),
         (CanvasImageFormat::Png, None) => Canvas2D::blank_png(width, height),
@@ -1008,7 +1004,6 @@ fn quadratic_curve_to(
     })
 }
 
-#[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
 fn bezier_curve_to(
     this: This<Object<'_>>,
     c1x: Coerced<f64>,
@@ -1101,7 +1096,6 @@ fn arc_to(
     })
 }
 
-#[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
 fn ellipse<'js>(this: This<Object<'js>>, args: rquickjs::function::Rest<Value<'js>>) -> Result<()> {
     let ctx = this.0.ctx();
     let number = |index: usize| -> Result<f64> {
@@ -1502,7 +1496,6 @@ fn create_linear_gradient(
     resource_object(&this.0, "Gradient", id)
 }
 
-#[allow(clippy::too_many_arguments, reason = "matches the IDL member")]
 fn create_radial_gradient(
     this: This<Object<'_>>,
     x0: Coerced<f64>,
@@ -4039,7 +4032,26 @@ fn css_color_exact(
     } else {
         lower
     };
-    Ok(crate::css::color::parse_exact(&source).map(|parsed| (parsed.bytes, parsed.serialized)))
+    Ok(parse_canvas_color(ctx, object, &source)?.map(|parsed| (parsed.bytes, parsed.serialized)))
+}
+
+/// Parses a canvas color against the canvas document's device, so a system
+/// color resolves with the document's used color scheme.
+fn parse_canvas_color(
+    ctx: &Ctx<'_>,
+    object: &Object<'_>,
+    source: &str,
+) -> Result<Option<crate::css::color::ParsedColor>> {
+    let Ok(id) = canvas_id(object) else {
+        return Ok(crate::css::color::parse_exact(source, None));
+    };
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
+        return Ok(crate::css::color::parse_exact(source, None));
+    };
+    let device = parsed.document.base.stylist_device();
+    Ok(crate::css::color::parse_exact(source, Some(device)))
 }
 
 /// The canvas element's computed `color`, or black when it has no computed
@@ -4066,7 +4078,7 @@ fn current_color(ctx: &Ctx<'_>, object: &Object<'_>) -> Result<[u8; 4]> {
     else {
         return Ok(BLACK);
     };
-    let computed = styles.get_inherited_text().color.clone();
+    let computed = styles.get_inherited_text().color;
     let absolute = computed.to_color_space(style::color::ColorSpace::Srgb);
     let components = absolute.components;
     Ok(crate::css::color::to_bytes([

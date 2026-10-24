@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{DialContext, Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
+use super::{DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::dom::tree::NodeId;
 use crate::js::RealmRequest;
 use crate::protocol::RendererEvent;
@@ -20,23 +20,28 @@ impl Document {
     pub(crate) fn drain_step(&mut self) -> bool {
         self.adopt_dial_completions();
         while let Some(id) = self.due_timer() {
-            self.tasks.push_back(Task::Timer(id));
+            self.queue_task(Task::Timer(id));
         }
         self.adopt_js_work();
         self.drain_blitz_fetches();
         self.launch_queued_dials();
         self.adopt_dial_completions();
-        if let Some(task) = self.tasks.pop_front() {
-            // Joins the drain's turn when one is open, so serial tasks share
-            // its deadline. A task outside a drain still opens its own turn.
-            let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
-            self.run_task(task);
+        let Some(task) = self.next_task() else {
             let fired = self.check_load();
-            return !self.stop.is_set()
-                && (fired || self.has_pending_frame_loads() || self.has_ready_work());
-        }
+            return !self.stop.is_set() && (fired || self.has_pending_frame_loads());
+        };
+        // Joins the drain's turn when one is open, so serial tasks share
+        // its deadline. A task outside a drain still opens its own turn.
+        let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
+        self.run_task(task);
         let fired = self.check_load();
-        !self.stop.is_set() && (fired || self.has_pending_frame_loads())
+        !self.stop.is_set() && (fired || self.has_pending_frame_loads() || self.has_ready_work())
+    }
+
+    /// The oldest queued task. Every entry belongs to this document
+    /// instance: a replacement purges the queue with its document.
+    fn next_task(&mut self) -> Option<Task> {
+        self.tasks.pop_front()
     }
 
     /// Whether a task is queued or a timer is already due.
@@ -56,8 +61,8 @@ impl Document {
     fn adopt_dial_completions(&mut self) {
         for (id, completed) in self.dials.adopt() {
             match completed {
-                Ok(done) => self.tasks.push_back(Task::DialFinished(id, Box::new(done))),
-                Err(fail) => self.tasks.push_back(Task::DialFailed(id, fail)),
+                Ok(done) => self.queue_task(Task::DialFinished(id, Box::new(done))),
+                Err(fail) => self.queue_task(Task::DialFailed(id, fail)),
             }
         }
     }
@@ -193,20 +198,22 @@ impl Document {
                 self.adopt_js_work();
             }
             Task::DialFinished(id, done) => {
-                if let Some(dial) = self.dials.take_finished(id) {
-                    dial.settle();
+                if self.dials.settle(id) {
                     self.finish_dial(*done);
                 }
             }
             Task::DialFailed(id, fail) => {
-                if let Some(dial) = self.dials.take_finished(id) {
-                    dial.settle();
+                if self.dials.settle(id) {
                     self.fail_dial(fail);
                 }
             }
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
-            Task::RemoteMessage(payload) => self.deliver_remote_message(&payload),
+            Task::RemoteMessage {
+                origin,
+                target_origin,
+                payload,
+            } => self.deliver_remote_message(&origin, &target_origin, &payload),
             Task::BroadcastMessage {
                 origin,
                 name,
@@ -261,18 +268,18 @@ impl Document {
             RealmRequest::Script(element) => self.queue_dynamic_script(element),
             RealmRequest::Image(element) => {
                 self.world.borrow_mut().image_update_started(element);
-                self.queue_image(element, true);
+                self.queue_image(element, ImageUpdate::SrcChanged);
             }
             RealmRequest::HistoryPush {
                 url,
                 state,
-                replace,
+                handling,
             } => {
                 self.apply_document_url_same_origin(&url);
                 self.record_event(RendererEvent::HistoryUpdated {
                     url,
                     state,
-                    replace,
+                    handling,
                 });
             }
             RealmRequest::HistoryTraverse { delta } => {
@@ -314,7 +321,7 @@ impl Document {
             parsed.document.mark_script_started(element.node);
         }
         let Ok(url) = self.resolve_dial_url(&src) else {
-            self.tasks.push_back(Task::NodeError(element));
+            self.queue_task(Task::NodeError(element));
             return;
         };
         let violations = self.script_url_violations(&url, element);
@@ -322,7 +329,7 @@ impl Document {
             self.fire_csp_violations(element, &violations);
         }
         if crate::csp::blocks(&violations) {
-            self.tasks.push_back(Task::NodeError(element));
+            self.queue_task(Task::NodeError(element));
             return;
         }
         let mut dial = QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.url);

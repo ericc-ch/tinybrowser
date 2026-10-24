@@ -12,9 +12,11 @@ use rquickjs::{Ctx, Object, Persistent, Result, Value};
 
 use crate::js::world::World;
 
-use crate::messaging::{Delivery, MAX_FRAMES, PAYLOAD_VERSION, Shared};
+use crate::messaging::{Delivery, MAX_FRAMES, PAYLOAD_VERSION, Shared, TargetOrigin};
 
 use crate::protocol::FrameId;
+
+use url::Url;
 
 /// Installs the frame-tree and cross-realm messaging host functions the shim
 /// calls: posting window messages and channel messages, reading the frame
@@ -72,13 +74,10 @@ pub(crate) fn install_messaging(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// One window message: the target origin is recorded and re-checked at
+/// One window message: the target origin is resolved here, where `/` still
+/// names the sender's origin with its identity intact, and re-checked at
 /// delivery
 /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn post_window_message(
     ctx: Ctx<'_>,
     target: f64,
@@ -100,6 +99,22 @@ fn post_window_message(
         let world = world.borrow();
         (world.frame(), world.origin_string(), world.shared())
     };
+    // The shim parsed an explicit target origin and threw `SyntaxError` on
+    // failure; `/` keeps the sender's origin identity, which a serialized
+    // `"null"` cannot carry.
+    let target_origin = match target_origin.as_str() {
+        "*" => TargetOrigin::Any,
+        "/" => TargetOrigin::Exact(world.borrow().origin.clone()),
+        other => match Url::parse(other) {
+            Ok(url) => TargetOrigin::Exact(url.origin()),
+            Err(_) => return Ok(()),
+        },
+    };
+    // The task is bound to the target window's document as of post time
+    // (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>).
+    let Some(document) = shared.borrow().document_id(FrameId::new(target)) else {
+        return Ok(());
+    };
     {
         // A page can call this host function directly, so every transferred
         // endpoint must be one this frame detached; otherwise a hostile frame
@@ -115,6 +130,7 @@ fn post_window_message(
         .deliveries
         .push(Delivery::WindowMessage {
             target: FrameId::new(target),
+            document,
             source,
             origin,
             target_origin,
@@ -124,10 +140,6 @@ fn post_window_message(
     Ok(())
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn port_new(ctx: Ctx<'_>) -> Result<Vec<f64>> {
     let world = world(&ctx)?;
     let (frame, shared) = {
@@ -141,10 +153,6 @@ fn port_new(ctx: Ctx<'_>) -> Result<Vec<f64>> {
     ])
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn port_post(ctx: Ctx<'_>, endpoint: f64, payload: String, ports: Vec<f64>) -> Result<()> {
     let Some(endpoint) = protocol_id(endpoint) else {
         return Ok(());
@@ -181,10 +189,6 @@ fn port_post(ctx: Ctx<'_>, endpoint: f64, payload: String, ports: Vec<f64>) -> R
     Ok(())
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn port_start(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
     let Some(endpoint) = protocol_id(endpoint) else {
         return Ok(());
@@ -204,10 +208,6 @@ fn port_start(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
     Ok(())
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn port_close(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
     let Some(endpoint) = protocol_id(endpoint) else {
         return Ok(());
@@ -227,10 +227,6 @@ fn port_close(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
     Ok(())
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn port_detach(ctx: Ctx<'_>, endpoint: f64) -> Result<bool> {
     let Some(endpoint) = protocol_id(endpoint) else {
         return Ok(false);
@@ -243,10 +239,6 @@ fn port_detach(ctx: Ctx<'_>, endpoint: f64) -> Result<bool> {
     Ok(shared.borrow_mut().ports.detach(endpoint, frame))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn port_adopt(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<bool>> {
     let Some(endpoint) = protocol_id(endpoint) else {
         return Ok(None);
@@ -259,10 +251,6 @@ fn port_adopt(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<bool>> {
     Ok(shared.borrow_mut().ports.adopt(endpoint, frame))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn port_peer(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<f64>> {
     let Some(endpoint) = protocol_id(endpoint) else {
         return Ok(None);
@@ -278,10 +266,6 @@ fn port_peer(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<f64>> {
     Ok(Some(crate::js::js_number(peer)))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn frame_parent(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(None);
@@ -294,10 +278,6 @@ fn frame_parent(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
     Ok(Some(crate::js::js_number(parent.get())))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn frame_top(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(None);
@@ -312,10 +292,6 @@ fn frame_top(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
     Ok(Some(crate::js::js_number(frame.get())))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn frame_child_count(ctx: Ctx<'_>, frame: f64) -> Result<f64> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(0.0);
@@ -328,10 +304,6 @@ fn frame_child_count(ctx: Ctx<'_>, frame: f64) -> Result<f64> {
     ))
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn frame_child(ctx: Ctx<'_>, frame: f64, index: f64) -> Result<Option<f64>> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(None);
@@ -356,10 +328,6 @@ fn frame_child(ctx: Ctx<'_>, frame: f64, index: f64) -> Result<Option<f64>> {
 /// Same-origin members forward through the target realm's window; a null
 /// answer means the member is blocked cross-origin
 /// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn frame_global(ctx: Ctx<'_>, frame: f64) -> Result<Option<Object<'_>>> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(None);
@@ -385,10 +353,6 @@ fn frame_global(ctx: Ctx<'_>, frame: f64) -> Result<Option<Object<'_>>> {
 /// `document` on a same-origin proxy wraps the target frame's active document
 /// in this realm; cross-origin access throws
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 pub(crate) fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(Value::new_null(ctx));
@@ -414,10 +378,6 @@ pub(crate) fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
 
 /// The browsing context name of `frame` for `window.name`
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn frame_name(ctx: Ctx<'_>, frame: f64) -> Result<String> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(String::new());
@@ -429,10 +389,6 @@ fn frame_name(ctx: Ctx<'_>, frame: f64) -> Result<String> {
 
 /// Sets the browsing context name of `frame` for `window.name`
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn set_frame_name(ctx: Ctx<'_>, frame: f64, name: String) -> Result<()> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(());
@@ -447,10 +403,6 @@ fn set_frame_name(ctx: Ctx<'_>, frame: f64, name: String) -> Result<()> {
 /// materialized yet. A script that sets a member on a just-inserted iframe's
 /// `contentWindow` gets a stored write instead of a cross-origin error
 /// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-set>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 fn frame_registered(ctx: Ctx<'_>, frame: f64) -> Result<bool> {
     let Some(frame) = protocol_id(frame) else {
         return Ok(false);
@@ -521,10 +473,6 @@ pub(crate) const HANDLER_ATTRIBUTES: &[&str] = &[
     "onwheel",
 ];
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 pub(crate) fn get_node_handler<'js>(
     ctx: Ctx<'js>,
     node: Value<'js>,
@@ -534,10 +482,6 @@ pub(crate) fn get_node_handler<'js>(
     get_handler(&ctx, Some(id), &name)
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 pub(crate) fn set_node_handler<'js>(
     ctx: Ctx<'js>,
     node: Value<'js>,
@@ -548,18 +492,10 @@ pub(crate) fn set_node_handler<'js>(
     set_handler(&ctx, Some(id), &name, value)
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 pub(crate) fn get_window_handler(ctx: Ctx<'_>, name: String) -> Result<Value<'_>> {
     get_handler(&ctx, None, &name)
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
-)]
 pub(crate) fn set_window_handler<'js>(
     ctx: Ctx<'js>,
     name: String,
@@ -623,7 +559,7 @@ fn protocol_id(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > f64::from(u32::MAX) {
         return None;
     }
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "the value is range-checked to a non-negative u32 above"

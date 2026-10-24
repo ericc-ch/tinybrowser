@@ -17,7 +17,7 @@ use url::Url;
 use crate::Parsed;
 use crate::ReadyState;
 use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
-use crate::messaging::SharedHandle;
+use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
 use crate::protocol::{
     BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent, ResponseHead,
     ScriptFailure, TabError,
@@ -51,8 +51,14 @@ enum Task {
     DialFailed(u64, DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
-    /// One cross-tab `message` payload from another renderer.
-    RemoteMessage(String),
+    /// One cross-tab `message` from another renderer: the sender's origin at
+    /// post time and the intended target origin travel with it, so the task
+    /// re-checks both against whichever document runs it.
+    RemoteMessage {
+        origin: String,
+        target_origin: TargetOrigin,
+        payload: String,
+    },
     /// One `BroadcastChannel` message for this frame's channels.
     BroadcastMessage {
         origin: String,
@@ -78,10 +84,27 @@ enum Task {
     NodeError(crate::dom::tree::NodeId),
 }
 
-/// One posted window message, ready for the target realm's task queue.
+/// What triggered an image load watch: a connected insert may reuse a request
+/// that is already filed, a `src` mutation always starts a new one
+/// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageUpdate {
+    Inserted,
+    SrcChanged,
+}
+
+/// One posted window message, ready for the target realm's task queue. The
+/// task is bound to the document that was the target window's associated
+/// document at post time, and it is not runnable once that document is
+/// replaced
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>,
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
 pub(crate) struct WindowMessage {
     pub(crate) source: FrameId,
     pub(crate) origin: String,
+    /// The intended target origin the sender passed to `postMessage`, checked
+    /// inside the task against the document that runs it.
+    pub(crate) target_origin: TargetOrigin,
     pub(crate) payload: String,
     pub(crate) ports: Vec<u64>,
 }
@@ -288,7 +311,7 @@ fn materialize_iframe_document(
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each bool mirrors an HTML document or parser flag"
 )]
@@ -324,6 +347,10 @@ pub(crate) struct Document {
     /// The renderer-process state every frame shares.
     shared: SharedHandle,
     url: Url,
+    /// This document instance's identity. A task is not runnable once its
+    /// document is not fully active
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+    id: DocumentId,
     tasks: VecDeque<Task>,
     timers: HashMap<u32, Timer>,
     next_timer_id: u32,
@@ -458,6 +485,7 @@ impl Document {
         init_scripts: &Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
+        let id = runtime.shared.borrow_mut().begin_document(frame);
         let world = Rc::new(RefCell::new(World::new(
             document_url.clone(),
             frame,
@@ -494,6 +522,7 @@ impl Document {
             viewport_size: crate::engine::DEFAULT_VIEWPORT,
             shared: Rc::clone(&runtime.shared),
             url: document_url,
+            id,
             tasks: VecDeque::new(),
             timers: HashMap::new(),
             next_timer_id: 1,
@@ -784,7 +813,16 @@ impl Document {
     /// Queues the image fetch for a newly connected `<img>`, if it still needs one
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn queue_connected_image(&mut self, element: crate::dom::tree::NodeId) {
-        self.queue_image(element, false);
+        self.queue_image(element, ImageUpdate::Inserted);
+    }
+
+    /// Queues a task on this document's task source
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-task>).
+    /// A task is only runnable while its document is fully active, and a
+    /// replacement purges the queue with the document it belonged to
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+    fn queue_task(&mut self, task: Task) {
+        self.tasks.push_back(task);
     }
 
     /// Drops a disconnected `<img>`'s decoded size and ignores its waiter.
@@ -1031,19 +1069,39 @@ impl Document {
     /// Queues one posted window message as a task on this frame's task source
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#posted-message-task-source>).
     pub(crate) fn push_window_message(&mut self, message: WindowMessage) {
-        self.tasks.push_back(Task::WindowMessage(message));
+        self.queue_task(Task::WindowMessage(message));
+    }
+
+    /// Whether `id` still names this document instance.
+    pub(crate) fn matches_document(&self, id: DocumentId) -> bool {
+        self.id == id
+    }
+
+    /// This document instance's identity. Tests stamp deliveries with it.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> DocumentId {
+        self.id
     }
 
     /// Queues one `storage` event as a task on this frame's task source
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     pub(crate) fn push_storage_event(&mut self, event: crate::storage::PendingStorageEvent) {
-        self.tasks.push_back(Task::StorageEvent(event));
+        self.queue_task(Task::StorageEvent(event));
     }
 
     /// Queues one cross-tab `message` as a task on this frame's task source
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#posted-message-task-source>).
-    pub(crate) fn push_remote_message(&mut self, payload: String) {
-        self.tasks.push_back(Task::RemoteMessage(payload));
+    pub(crate) fn push_remote_message(
+        &mut self,
+        origin: String,
+        target_origin: TargetOrigin,
+        payload: String,
+    ) {
+        self.queue_task(Task::RemoteMessage {
+            origin,
+            target_origin,
+            payload,
+        });
     }
 
     /// Queues one `BroadcastChannel` message on this frame's task source
@@ -1055,7 +1113,7 @@ impl Document {
         payload: String,
         source: Option<u64>,
     ) {
-        self.tasks.push_back(Task::BroadcastMessage {
+        self.queue_task(Task::BroadcastMessage {
             origin,
             name,
             payload,
@@ -1065,7 +1123,7 @@ impl Document {
 
     /// Queues one channel message as a task on this frame's task source.
     pub(crate) fn push_port_message(&mut self, endpoint: u64, payload: String, ports: Vec<u64>) {
-        self.tasks.push_back(Task::PortMessage {
+        self.queue_task(Task::PortMessage {
             endpoint,
             payload,
             ports,
@@ -1074,15 +1132,26 @@ impl Document {
 
     /// Queues a `close` event for one channel endpoint.
     pub(crate) fn push_port_closed(&mut self, endpoint: u64) {
-        self.tasks.push_back(Task::PortClosed { endpoint });
+        self.queue_task(Task::PortClosed { endpoint });
     }
 
     /// Dispatches one cross-tab `message` event at this frame's window.
-    fn deliver_remote_message(&mut self, payload: &str) {
+    fn deliver_remote_message(
+        &mut self,
+        origin: &str,
+        target_origin: &TargetOrigin,
+        payload: &str,
+    ) {
+        // The intended target origin is checked when the task runs, against the
+        // document active then
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+        if !target_origin.admits(&self.world.borrow().origin) {
+            return;
+        }
         if !self.ensure_js_ok() {
             return;
         }
-        self.fire_js(|js| js.deliver_remote_message(payload));
+        self.fire_js(|js| js.deliver_remote_message(origin, payload));
         self.adopt_js_work();
     }
 
@@ -1112,6 +1181,19 @@ impl Document {
     }
 
     fn deliver_window_message(&mut self, message: &WindowMessage) {
+        // The intended target origin is checked when the task runs, not when
+        // it was queued: a navigation that committed between the two must not
+        // receive the sender's message. Origins compare with identity, so two
+        // opaque origins never match
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>,
+        // Blink: LocalDOMWindow::DispatchMessageEventWithOriginCheck).
+        if !message.target_origin.admits(&self.world.borrow().origin) {
+            // The transferred endpoints arrive with no message to carry them;
+            // forgetting them fires `close` at their peers instead of leaking
+            // the endpoints until the next reset.
+            self.shared.borrow_mut().forget_endpoints(&message.ports);
+            return;
+        }
         if !self.ensure_js_ok() {
             return;
         }
@@ -1555,6 +1637,10 @@ impl Document {
     }
 
     fn reset_js_realm(&mut self, keep_stream_writes: bool) {
+        // A task is not runnable once its document is not fully active
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+        self.tasks.clear();
+        self.id = self.shared.borrow_mut().begin_document(self.frame);
         let old = std::mem::replace(
             &mut self.dials,
             DialLedger::new(Arc::clone(&self.stop), Arc::clone(&self.wake)),
@@ -2635,7 +2721,7 @@ impl Document {
                         .borrow_mut()
                         .fail_image(element, request_url.clone());
                 } else {
-                    self.tasks.push_back(Task::NodeError(element));
+                    self.queue_task(Task::NodeError(element));
                 }
             }
         } else {
@@ -2701,7 +2787,7 @@ impl Document {
                                 .borrow_mut()
                                 .fail_image(element, request_url.clone());
                         } else {
-                            self.tasks.push_back(Task::NodeError(element));
+                            self.queue_task(Task::NodeError(element));
                         }
                     }
                     self.settle_blitz_layout();
@@ -2782,7 +2868,7 @@ impl Document {
                 continue;
             }
             self.linked_sheets.insert(element, url);
-            self.tasks.push_back(Task::NodeLoad(element));
+            self.queue_task(Task::NodeLoad(element));
         }
     }
 
@@ -2918,7 +3004,7 @@ impl Document {
             })
             .unwrap_or_default();
         for element in images {
-            self.queue_image(element, false);
+            self.queue_image(element, ImageUpdate::Inserted);
         }
     }
 
@@ -2960,7 +3046,7 @@ impl Document {
                             // A blocked element load fails with an `error`
                             // event
                             // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fetching-resources>).
-                            self.tasks.push_back(Task::NodeError(element));
+                            self.queue_task(Task::NodeError(element));
                         }
                     }
                     self.settle_blitz_layout();
@@ -3157,18 +3243,23 @@ impl Document {
     /// delivery that beat this registration) settles here, otherwise the
     /// Blitz delivery for the selected URL settles it.
     ///
-    /// `force` is a `src` mutation: a connected insert skips work when a
-    /// request is already in flight or decoded.
+    /// A connected insert skips work when a request is already in flight or
+    /// decoded; a `src` mutation must reload regardless.
     pub(in crate::document) fn queue_image(
         &mut self,
         element: crate::dom::tree::NodeId,
-        force: bool,
+        update: ImageUpdate,
     ) {
-        if !force
-            && (self.in_flight_images.contains_key(&element)
-                || self.world.borrow().images.sizes.contains_key(&element))
-        {
-            return;
+        // A connected insert skips work when a request is already in flight or
+        // decoded; a `src` mutation must reload regardless.
+        match update {
+            ImageUpdate::Inserted
+                if self.in_flight_images.contains_key(&element)
+                    || self.world.borrow().images.sizes.contains_key(&element) =>
+            {
+                return;
+            }
+            ImageUpdate::Inserted | ImageUpdate::SrcChanged => {}
         }
         let src = self.world.borrow().document(element).and_then(|parsed| {
             crate::dom::tree::is_html_element(&parsed.document.base, element.node, "img")
@@ -3182,14 +3273,14 @@ impl Document {
             self.in_flight_images.remove(&element);
             self.image_selected_src.remove(&element);
             self.world.borrow_mut().forget_image(element);
-            self.tasks.push_back(Task::NodeError(element));
+            self.queue_task(Task::NodeError(element));
             return;
         };
         let Ok(url) = self.resolve_dial_url(&src) else {
             self.in_flight_images.remove(&element);
             self.image_selected_src.remove(&element);
             self.world.borrow_mut().fail_image(element, src);
-            self.tasks.push_back(Task::NodeError(element));
+            self.queue_task(Task::NodeError(element));
             return;
         };
         let selected = url.as_str().to_owned();
@@ -3201,7 +3292,7 @@ impl Document {
             self.in_flight_images.remove(&element);
             self.image_selected_src.remove(&element);
             if self.world.borrow_mut().report_image_error(element) {
-                self.tasks.push_back(Task::NodeError(element));
+                self.queue_task(Task::NodeError(element));
             }
             return;
         }
@@ -3214,7 +3305,7 @@ impl Document {
             self.world
                 .borrow_mut()
                 .store_image_dims(element, width, height, selected);
-            self.tasks.push_back(Task::NodeLoad(element));
+            self.queue_task(Task::NodeLoad(element));
             return;
         }
         self.in_flight_images

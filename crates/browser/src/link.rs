@@ -25,7 +25,7 @@ use crate::wire::{
     MessagingCall, NetworkCall, RendererAssignmentId, RendererCall, RendererNotice, RendererReply,
     Reply, ResponseStart, ServiceCall, ServiceReply, StorageCall, ToRenderer,
 };
-use renderer::{FrameId, Mount, RendererEvent, StorageChange, StorageKind, TabError};
+use renderer::{BrowserEvent, FrameId, Mount, StorageChange, StorageKind, TabError};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
@@ -501,6 +501,9 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
                 frame,
                 event,
             }) => route_event(&context, assignment, frame, &event),
+            ServerInput::Notify(RendererNotice::Activity { assignment }) => {
+                route_activity(&context, assignment)
+            }
             ServerInput::Notify(RendererNotice::Ready)
             | ServerInput::RequestChunk
             | ServerInput::RequestEnd
@@ -517,24 +520,49 @@ fn route_event(
     context: &ServiceContext,
     assignment: RendererAssignmentId,
     frame: FrameId,
-    event: &RendererEvent,
+    event: &BrowserEvent,
 ) -> Result<(), RendererViolation> {
-    let Some(assignment) = context
-        .registry
-        .resolve(assignment)
-        .filter(|assignment| assignment.hosted_by(context.renderer))
-    else {
-        return if context.registry.was_released(assignment) {
-            Ok(())
-        } else {
-            Err(RendererViolation)
-        };
+    let Some(assignment) = live_assignment(context, assignment)? else {
+        return Ok(());
     };
     if assignment.publish_event(frame, event) {
         Err(RendererViolation)
     } else {
         Ok(())
     }
+}
+
+/// Wakes the tab actor without an event. It shares the event route's
+/// authorization: a renderer may only speak for an assignment it hosts.
+fn route_activity(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+) -> Result<(), RendererViolation> {
+    if let Some(assignment) = live_assignment(context, assignment)? {
+        // Saturation is harmless here: a full queue already wakes the actor.
+        assignment.publish_activity();
+    }
+    Ok(())
+}
+
+/// The live assignment `id` names. `None` means it was already released and
+/// the notice is stale, which is not a violation.
+fn live_assignment(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+) -> Result<Option<Arc<Assignment>>, RendererViolation> {
+    let Some(assignment) = context
+        .registry
+        .resolve(assignment)
+        .filter(|assignment| assignment.hosted_by(context.renderer))
+    else {
+        return if context.registry.was_released(assignment) {
+            Ok(None)
+        } else {
+            Err(RendererViolation)
+        };
+    };
+    Ok(Some(assignment))
 }
 
 /// Whether `spec` parses as a non-HTTP(S) URL. Opaque documents share
@@ -775,7 +803,12 @@ async fn route_window_call(
             let opener = context.tabs.opener(assignment.tab).map(TabId::get);
             send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
-        BrowsingContextCall::WindowMessage { tab, payload } => {
+        BrowsingContextCall::WindowMessage {
+            tab,
+            origin,
+            target_origin,
+            payload,
+        } => {
             // A page can only hold a `WindowProxy` for a related window: its
             // own, its opener, or a tab it opened. An unrelated target is a
             // forged call and is ignored.
@@ -784,7 +817,14 @@ async fn route_window_call(
                 // Enqueue on the target's mailbox and return: the spec's
                 // `postMessage` is asynchronous, and waiting here would let a
                 // busy target block this renderer.
-                let _queued = context.tabs.deliver(target, payload);
+                let _queued = context.tabs.deliver(
+                    target,
+                    crate::actor::RemoteWindowMessage {
+                        origin,
+                        target_origin,
+                        payload,
+                    },
+                );
             }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }

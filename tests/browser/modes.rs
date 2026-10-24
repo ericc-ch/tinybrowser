@@ -1,8 +1,6 @@
 //! Subcommand selection and flag parsing at the binary boundary.
 
-mod common;
-
-use common::Fixture;
+use crate::fixture::Fixture;
 
 fn run(fixture: &Fixture, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_tinybrowser"))

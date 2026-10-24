@@ -1046,17 +1046,9 @@
       .replace(/\r/g, '%0D')
       .replace(/\n/g, '%0A')
       .replace(/"/g, '%22');
-  // The navigation body crosses to Rust as a Latin-1 string, one char per
-  // byte, so file bytes survive unchanged while text is UTF-8 encoded first.
+  // Text is encoded once; the navigation body crosses as a `Uint8Array`, so
+  // file bytes survive unchanged.
   const encoder = new TextEncoder();
-  const toLatin1 = bytes => {
-    // Chunked: per-byte `+=` is quadratic on large multipart bodies.
-    const parts = __tbPrivateArray();
-    for (let start = 0; start < bytes.length; start += 4096) {
-      __tbArray.push(parts, __tbApply(__tbIDLFromCharCode, null, __tbBytesCopy(bytes, start, start + 4096)));
-    }
-    return __tbArray.join(parts, '');
-  };
   const concatBytes = chunks => {
     let total = 0;
     for (const chunk of chunks) total += chunk.length;
@@ -1096,22 +1088,22 @@
     }
     push(`--${boundary}--\r\n`);
     return {
-      body: toLatin1(concatBytes(chunks)),
+      body: concatBytes(chunks),
       contentType: `multipart/form-data; boundary=${boundary}`,
     };
   };
 
   const encodeTextPlain = (formData, label) => {
-    let body = '';
+    const chunks = [];
     for (const entry of formData) {
       const name = charsetBytes(String(entry[0]).replace(/\r\n|\r|\n/g, '\r\n'), label);
       const value = charsetBytes(
         entryValueString(entry[1]).replace(/\r\n|\r|\n/g, '\r\n'),
         label,
       );
-      body += `${toLatin1(name)}=${toLatin1(value)}\r\n`;
+      chunks.push(name, encoder.encode('='), value, encoder.encode('\r\n'));
     }
-    return body;
+    return concatBytes(chunks);
   };
 
   const methodKeyword = raw => {
@@ -1157,7 +1149,7 @@
       const withoutFragment = hash === -1 ? action : action.slice(0, hash);
       const query = withoutFragment.indexOf('?');
       const base = query === -1 ? withoutFragment : withoutFragment.slice(0, query);
-      host.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', '', null, form);
+      host.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', new globalThis.Uint8Array(0), null, form);
       return;
     }
     // POST: the entries become the request body, encoded per `enctype`
@@ -1170,7 +1162,7 @@
       body = encodeTextPlain(formData, label);
       contentType = 'text/plain';
     } else {
-      body = urlEncode(formData, label);
+      body = encoder.encode(urlEncode(formData, label));
       contentType = 'application/x-www-form-urlencoded';
     }
     host.__tbFormNavigate(action, target, 'POST', body, contentType, form);

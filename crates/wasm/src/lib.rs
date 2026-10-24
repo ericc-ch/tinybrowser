@@ -14,8 +14,8 @@ use std::time::SystemTime;
 use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, schemeful_same_site};
 use renderer::{
     BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost, RendererEvent,
-    StorageChange, StorageHost, StorageKind,
+    EmbeddedRenderer, HistoryHandling, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
+    RendererEvent, StorageChange, StorageHost, StorageKind,
 };
 use url::Url;
 use webstorage::StorageArea;
@@ -33,7 +33,9 @@ mod bindings {
     export!(Component with_types_in self);
 }
 
-use bindings::exports::tinybrowser::browser::engine::{Event, FrameEvent, Guest, GuestTab};
+use bindings::exports::tinybrowser::browser::engine::{
+    Event, FrameEvent, Guest, GuestTab, HistoryHandling as HostHistoryHandling,
+};
 use bindings::tinybrowser::browser::types::{FetchError, FetchKind, FetchRequest, FetchResponse};
 
 /// Redirect hops a single dial may follow.
@@ -191,8 +193,15 @@ fn to_event(event: RendererEvent) -> Event {
         RendererEvent::HistoryUpdated {
             url,
             state,
-            replace,
-        } => Event::HistoryUpdated((url, state, replace)),
+            handling,
+        } => Event::HistoryUpdated((
+            url,
+            state,
+            match handling {
+                HistoryHandling::Push => HostHistoryHandling::Push,
+                HistoryHandling::Replace => HostHistoryHandling::Replace,
+            },
+        )),
         RendererEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
         RendererEvent::Load => Event::Load,
         RendererEvent::DomContentLoaded => Event::DomContentLoaded,
@@ -626,7 +635,7 @@ impl BrowsingContextHost for WasmServices {
         None
     }
 
-    fn window_post_message(&self, _tab: u64, _payload: &str) {}
+    fn window_post_message(&self, _tab: u64, _origin: &str, _target: &str, _payload: &str) {}
 
     fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
         None

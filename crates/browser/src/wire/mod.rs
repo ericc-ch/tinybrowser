@@ -7,7 +7,8 @@
 //! Both ends of this conversation live in this crate — the host end in
 //! [`crate::link`], the child end in [`crate::child`] — so the message
 //! vocabulary and the framing sit next to both. Payloads that describe a page
-//! ([`FrameId`], [`Mount`](renderer::Mount), [`RendererEvent`], [`DialRequest`])
+//! ([`FrameId`], [`Mount`](renderer::Mount), [`BrowserEvent`](renderer::BrowserEvent),
+//! [`DialRequest`])
 //! come from the engine crate and stay there; this module only carries them.
 
 pub mod channel;
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange::{Frame, RequestId};
 use renderer::{
-    DialFailure, DialOutcome, DialRequest, FrameId, RemoteValue, RendererEvent, StorageChange,
+    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, RemoteValue, StorageChange,
     StorageError, StorageKind, TabError,
 };
 
@@ -59,6 +60,10 @@ pub enum Command {
     },
     /// Delivers one remote `message` event, encoded by the sender's realm.
     WindowMessage {
+        /// The sender's serialized origin at post time.
+        origin: String,
+        /// The normalized target origin the sender asked for.
+        target_origin: String,
         /// `__tbEncode` payload from the posting window.
         payload: String,
     },
@@ -229,7 +234,13 @@ pub enum RendererNotice {
         /// Frame that emitted the event.
         frame: FrameId,
         /// The event.
-        event: RendererEvent,
+        event: BrowserEvent,
+    },
+    /// The renderer did work the browser has no state for, but its waiter
+    /// predicates still have to run.
+    Activity {
+        /// Top-level document that produced the work.
+        assignment: RendererAssignmentId,
     },
 }
 
@@ -360,6 +371,10 @@ pub enum BrowsingContextCall {
     WindowMessage {
         /// Target tab identity.
         tab: u64,
+        /// The sender's serialized origin at post time.
+        origin: String,
+        /// The normalized target origin the sender asked for.
+        target_origin: String,
         /// `__tbEncode` payload from the sender's realm.
         payload: String,
     },

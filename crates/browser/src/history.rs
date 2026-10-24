@@ -1,5 +1,6 @@
 //! One tab's session-history entries and active document identity.
 
+use renderer::HistoryHandling;
 use renderer::HistorySnapshot as RendererHistorySnapshot;
 use url::Url;
 
@@ -180,22 +181,25 @@ impl SessionHistory {
         true
     }
 
-    pub(crate) fn update(&mut self, url: Url, state: String, replace: bool) {
-        if replace {
-            let current = &mut self.entries[self.current];
-            current.url = url;
-            current.state = Some(state);
-        } else {
-            self.entries.truncate(self.current + 1);
-            self.entries.push(Entry {
-                id: EntryId(self.next_entry),
-                url,
-                title: self.entries[self.current].title.clone(),
-                state: Some(state),
-                document: self.entries[self.current].document,
-            });
-            self.current += 1;
-            self.next_entry = self.next_entry.saturating_add(1);
+    pub(crate) fn update(&mut self, url: Url, state: String, handling: HistoryHandling) {
+        match handling {
+            HistoryHandling::Replace => {
+                let current = &mut self.entries[self.current];
+                current.url = url;
+                current.state = Some(state);
+            }
+            HistoryHandling::Push => {
+                self.entries.truncate(self.current + 1);
+                self.entries.push(Entry {
+                    id: EntryId(self.next_entry),
+                    url,
+                    title: self.entries[self.current].title.clone(),
+                    state: Some(state),
+                    document: self.entries[self.current].document,
+                });
+                self.current += 1;
+                self.next_entry = self.next_entry.saturating_add(1);
+            }
         }
     }
 

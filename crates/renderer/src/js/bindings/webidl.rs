@@ -348,7 +348,7 @@ fn is_css_name_continue(character: char) -> bool {
 /// Integer conversion from a `double`
 /// (<https://webidl.spec.whatwg.org/#abstract-opdef-converttoint>): NaN and
 /// infinities become 0, then the truncated value wraps modulo 2^32.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "`rem_euclid` returns a value in [0, 2^32), so the cast is exact and non-negative"

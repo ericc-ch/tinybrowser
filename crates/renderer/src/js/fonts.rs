@@ -40,10 +40,6 @@ fn descriptors(
         .collect()
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn register_font(ctx: Ctx<'_>, family: String, data: Vec<u8>) -> Result<u32> {
     if data.is_empty() {
         return Ok(0);
@@ -85,10 +81,6 @@ fn register_font(ctx: Ctx<'_>, family: String, data: Vec<u8>) -> Result<u32> {
     Ok(token)
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn unregister_font(ctx: Ctx<'_>, token: u32) -> Result<()> {
     let world = world(&ctx)?;
     let mut world = world.borrow_mut();
