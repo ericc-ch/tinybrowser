@@ -326,6 +326,9 @@ impl Document {
             return;
         }
         let mut dial = QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.url);
+        let (referrer, referrer_policy) = self.subresource_referrer(Some(element), &url);
+        dial.req.referrer = referrer;
+        dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
@@ -370,14 +373,22 @@ impl Document {
         dial.req.content_type = fetch.content_type;
         dial.req.headers = fetch.headers;
         dial.req.referrer = fetch.referrer;
+        // An empty request policy means the client's policy container decides:
+        // resolve it here so every redirect hop re-determines with the same
+        // policy the initial request used
+        // (<https://fetch.spec.whatwg.org/#main-fetch>,
+        // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+        dial.req.referrer_policy = fetch.referrer_policy.or_else(|| {
+            let world = self.world.borrow();
+            let policy = world.state.referrer_policy.clone();
+            (!policy.is_empty()).then_some(policy)
+        });
         dial.req.cors = fetch.cors;
         dial.req.keepalive = fetch.keepalive;
         dial.req.body_len = fetch.body_len;
         dial.req.integrity = fetch.integrity;
         dial.req.cache = Some(fetch.cache);
         dial.req.stream_body = fetch.stream_body;
-        dial.req.referrer_source = fetch.referrer_source;
-        dial.req.referrer_policy = fetch.referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

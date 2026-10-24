@@ -2016,7 +2016,9 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
         if !name.eq_ignore_ascii_case("referrer") {
             return;
         }
-        parse_referrer_policy(crate::dom::tree::attr(base, id.node, "content").unwrap_or_default())
+        crate::js::parse_referrer_policy(
+            crate::dom::tree::attr(base, id.node, "content").unwrap_or_default(),
+        )
     };
     let Some(policy) = policy else {
         return;
@@ -2034,28 +2036,6 @@ pub(super) fn apply_meta_csp(ctx: &Ctx<'_>, id: NodeId) {
         return;
     };
     world.borrow_mut().apply_meta_policy(id);
-}
-
-/// A referrer-policy `content` value normalized to its canonical token,
-/// or `None` when the value names no policy. The legacy meta values map to
-/// their modern tokens
-/// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
-pub(super) fn parse_referrer_policy(content: &str) -> Option<String> {
-    let token = content.trim().to_ascii_lowercase();
-    match token.as_str() {
-        "never" | "no-referrer" => Some("no-referrer".to_owned()),
-        "default" => Some("strict-origin-when-cross-origin".to_owned()),
-        "always" => Some("unsafe-url".to_owned()),
-        "origin-when-crossorigin" => Some("origin-when-cross-origin".to_owned()),
-        "no-referrer-when-downgrade"
-        | "origin"
-        | "origin-when-cross-origin"
-        | "same-origin"
-        | "strict-origin"
-        | "strict-origin-when-cross-origin"
-        | "unsafe-url" => Some(token),
-        _ => None,
-    }
 }
 
 /// [Prepares](https://html.spec.whatwg.org/multipage/webappapis.html#prepare-the-script-element)

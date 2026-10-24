@@ -502,10 +502,9 @@ pub struct DialRequest {
     /// Ask the browser to return headers first and stream the decoded body.
     #[serde(default)]
     pub stream_body: bool,
-    /// Source document URL for recomputing the referrer on redirects.
-    #[serde(default)]
-    pub referrer_source: Option<String>,
-    /// Referrer policy attached to the request.
+    /// The request's referrer policy, re-determining the `Referer` on every
+    /// redirect hop. Empty means the document's policy
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     #[serde(default)]
     pub referrer_policy: Option<String>,
 }

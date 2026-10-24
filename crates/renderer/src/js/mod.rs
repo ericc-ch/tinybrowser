@@ -176,7 +176,9 @@ pub(crate) struct JsFetchRequest {
     pub integrity: Option<String>,
     pub cache: String,
     pub stream_body: bool,
-    pub referrer_source: Option<String>,
+    /// The request's referrer policy (`init.referrerPolicy` or a cloned
+    /// `Request`'s), for redirect-hop re-determination; empty means the
+    /// document's policy.
     pub referrer_policy: Option<String>,
 }
 
@@ -1043,7 +1045,6 @@ impl JsRealm {
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "default".to_owned());
                     let stream_body = parts.next().is_some_and(|value| value == "1");
-                    let referrer_source = parts.next().filter(|value| !value.is_empty());
                     let referrer_policy = parts.next().filter(|value| !value.is_empty());
                     let cors = mode.map(|mode| crate::protocol::CorsRequest {
                         mode,
@@ -1066,7 +1067,6 @@ impl JsRealm {
                             integrity,
                             cache,
                             stream_body,
-                            referrer_source,
                             referrer_policy,
                         })));
                     Ok::<(), rquickjs::Error>(())
@@ -1788,7 +1788,6 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             integrity: None,
             cache: None,
             stream_body: false,
-            referrer_source: None,
             referrer_policy: None,
         });
     match outcome {
@@ -1939,6 +1938,29 @@ pub(crate) fn error_stack_top(ctx: &Ctx<'_>) -> Option<(String, u32, u32)> {
     CreatorInfo::user_frame(&stack).map(|creator| (creator.url, creator.line, creator.column))
 }
 
+/// A referrer-policy keyword value normalized to its canonical token, or
+/// `None` when the value names no policy. The legacy meta values map to their
+/// modern tokens
+/// (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-meta>,
+/// <https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+pub(crate) fn parse_referrer_policy(content: &str) -> Option<String> {
+    let token = content.trim().to_ascii_lowercase();
+    match token.as_str() {
+        "never" | "no-referrer" => Some("no-referrer".to_owned()),
+        "default" => Some("strict-origin-when-cross-origin".to_owned()),
+        "always" => Some("unsafe-url".to_owned()),
+        "origin-when-crossorigin" => Some("origin-when-cross-origin".to_owned()),
+        "no-referrer-when-downgrade"
+        | "origin"
+        | "origin-when-cross-origin"
+        | "same-origin"
+        | "strict-origin"
+        | "strict-origin-when-cross-origin"
+        | "unsafe-url" => Some(token),
+        _ => None,
+    }
+}
+
 /// The pure policy decision behind [`fetch_referrer`], split out so unit
 /// tests need no `World`: credentials and fragments never leave,
 /// local-scheme documents send nothing, unknown tokens fail closed to the
@@ -1948,62 +1970,11 @@ pub(crate) fn referrer_for_policy(
     document_url: &Url,
     request_url: &str,
 ) -> Option<String> {
-    let policy = if policy.is_empty() {
-        "strict-origin-when-cross-origin"
-    } else {
-        policy
-    };
-    if policy.eq_ignore_ascii_case("no-referrer") || policy.eq_ignore_ascii_case("never") {
-        return None;
-    }
-    if !matches!(document_url.scheme(), "http" | "https") {
-        return None;
-    }
     // Same-origin relative fetches (`fetch("api")`) resolve against the
     // document; parsing standalone would drop the `Referer` even under
     // `unsafe-url`.
     let request = document_url.join(request_url).ok()?;
-    let downgrade = document_url.scheme() == "https" && matches!(request.scheme(), "http" | "ws");
-    let same_origin = document_url.scheme() == request.scheme()
-        && document_url.host_str() == request.host_str()
-        && document_url.port_or_known_default() == request.port_or_known_default();
-    // The source with credentials and fragment stripped, for the full-URL
-    // policies.
-    let mut stripped = document_url.clone();
-    let _ = stripped.set_username("");
-    let _ = stripped.set_password(None);
-    stripped.set_fragment(None);
-    // The source's origin, serialized as a URL: always with the `/` path,
-    // as browsers send it (`Referer: https://example.com/`).
-    let origin = format!("{}/", document_url.origin().ascii_serialization());
-    if policy.eq_ignore_ascii_case("unsafe-url") {
-        Some(stripped.to_string())
-    } else if policy.eq_ignore_ascii_case("origin") {
-        Some(origin)
-    } else if policy.eq_ignore_ascii_case("same-origin") {
-        same_origin.then(|| stripped.to_string())
-    } else if policy.eq_ignore_ascii_case("origin-when-cross-origin") {
-        Some(if same_origin {
-            stripped.to_string()
-        } else {
-            origin
-        })
-    } else if policy.eq_ignore_ascii_case("strict-origin") {
-        (!downgrade).then_some(origin)
-    } else if policy.eq_ignore_ascii_case("no-referrer-when-downgrade") {
-        (!downgrade).then(|| stripped.to_string())
-    } else {
-        // `strict-origin-when-cross-origin` and anything unrecognized: the
-        // strict default. Unknown tokens fail closed to the default rather
-        // than leaking the full URL.
-        if downgrade {
-            None
-        } else if same_origin {
-            Some(stripped.to_string())
-        } else {
-            Some(origin)
-        }
-    }
+    net::referrer_for_policy(policy, document_url, &request)
 }
 
 fn eval_classic<'js, V: FromJs<'js>>(ctx: &rquickjs::Ctx<'js>, source: &str) -> Result<V, JsError> {
@@ -2192,6 +2163,23 @@ mod tests {
         );
         // Unparseable request URLs send nothing rather than leaking.
         assert_eq!(referrer("", doc, "http://["), None);
+        // A source URL serialized over 4096 characters culls to the origin,
+        // whatever the policy — even `unsafe-url`.
+        let long = format!("https://example.com:8443/{}?q=1", "A".repeat(4200));
+        assert_eq!(
+            referrer("unsafe-url", &long, "https://other.test/x"),
+            Some("https://example.com:8443/".to_owned())
+        );
+        assert_eq!(
+            referrer("", &long, "https://example.com:8443/other"),
+            Some("https://example.com:8443/".to_owned())
+        );
+        // Just under the cap, the full URL survives.
+        let near = format!("https://example.com:8443/{}", "A".repeat(4000));
+        assert_eq!(
+            referrer("unsafe-url", &near, "https://other.test/x"),
+            Some(near.clone())
+        );
     }
 
     #[test]

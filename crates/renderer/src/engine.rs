@@ -747,21 +747,32 @@ impl Engine {
         }
     }
 
-    /// The referrer a navigation sends: the navigating element's policy when it
-    /// names one, the initiator document's otherwise
+    /// The referrer a navigation sends, with the policy the network
+    /// re-determines from on every redirect hop: the navigating element's
+    /// policy when it names one, the initiator document's otherwise
     /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>,
     /// <https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
-    fn navigation_referrer(&self, initiator: FrameId, policy: &str, url: &Url) -> Option<String> {
-        self.frames.get(&initiator).and_then(|document| {
-            let world = document.world();
-            let world = world.borrow();
-            let policy = if policy.is_empty() {
-                world.state.referrer_policy.as_str()
-            } else {
-                policy
-            };
-            crate::js::referrer_for_policy(policy, &world.document_url, url.as_str())
-        })
+    fn navigation_referrer(
+        &self,
+        initiator: FrameId,
+        policy: &str,
+        url: &Url,
+    ) -> (Option<String>, Option<String>) {
+        self.frames
+            .get(&initiator)
+            .map(|document| {
+                let world = document.world();
+                let world = world.borrow();
+                let source = world.base_url.as_ref().unwrap_or(&world.document_url);
+                let policy = if policy.is_empty() {
+                    world.state.referrer_policy.clone()
+                } else {
+                    policy.to_owned()
+                };
+                let referrer = crate::js::referrer_for_policy(&policy, source, url.as_str());
+                (referrer, (!policy.is_empty()).then_some(policy))
+            })
+            .unwrap_or((None, None))
     }
 
     /// The policy a local-scheme document inherits from its initiator
@@ -948,7 +959,7 @@ impl Engine {
                 // navigation is a no-referrer navigation regardless of
                 // policy
                 // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-                let referrer =
+                let (referrer, referrer_policy) =
                     self.navigation_referrer(initiator, &navigation.referrer_policy, url);
                 // The embedder's `frame-src` gate re-checks every redirect hop,
                 // and the ancestor URLs back the child response's
@@ -987,8 +998,7 @@ impl Engine {
                             integrity: None,
                             cache: None,
                             stream_body: false,
-                            referrer_source: None,
-                            referrer_policy: None,
+                            referrer_policy,
                         },
                         ancestors,
                     );

@@ -122,7 +122,6 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             integrity: None,
             cache: None,
             stream_body: false,
-            referrer_source: None,
             referrer_policy: None,
         },
         Box::new(move |outcome| {

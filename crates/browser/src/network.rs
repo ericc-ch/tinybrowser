@@ -1106,9 +1106,6 @@ fn outbound_request(
     outbound.initiator = Some(initiator.clone());
     outbound.deadline = Some(deadline);
     outbound
-        .referrer_source
-        .clone_from(&request.referrer_source);
-    outbound
         .referrer_policy
         .clone_from(&request.referrer_policy);
     Ok(outbound)
@@ -1423,7 +1420,6 @@ mod tests {
             integrity: None,
             cache: None,
             stream_body: false,
-            referrer_source: None,
             referrer_policy: None,
         }
     }
