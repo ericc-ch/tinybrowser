@@ -43,32 +43,81 @@ pub(crate) fn read_request_path(stream: &mut TcpStream) -> Option<String> {
             }
         }
     }
-    let head = String::from_utf8_lossy(&head);
-    let mut request_line = head.lines().next()?.split_whitespace();
-    let _method = request_line.next()?;
-    request_line.next().map(str::to_owned)
+    // Only the request line matters, so decode up to its line break and leave
+    // the (possibly non-UTF-8) header bytes alone.
+    let line = match head.windows(2).position(|window| window == b"\r\n") {
+        Some(end) => &head[..end],
+        None => &head[..],
+    };
+    let line = String::from_utf8_lossy(line);
+    line.split_whitespace().nth(1).map(str::to_owned)
 }
 
-/// Serves one body on an ephemeral port for every connection it gets, reading
-/// each request head first. The thread runs until the test process exits; a
-/// test that only loads the page once simply never sees a second connection.
-pub(crate) fn serve(body: &'static [u8], content_type: &'static str) -> std::net::SocketAddr {
+/// Binds an ephemeral loopback port for a test server. The caller learns the
+/// address before starting the server, so a page it serves can name its own
+/// origin.
+pub(crate) fn server() -> (TcpListener, std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
-    let addr = listener.local_addr().expect("server addr");
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    let address = listener.local_addr().expect("server addr");
+    (listener, address)
+}
+
+/// Serves one response per request path for every connection the listener
+/// gets, reading each request head first. An unknown path gets an empty 404.
+/// The thread runs until the test process exits.
+pub(crate) fn serve_on(listener: TcpListener, routes: Vec<(&'static str, Vec<u8>)>) {
+    serve_on_after(listener, routes, Duration::ZERO);
+}
+
+/// [`serve_on`] with a delay before each response, so a test can observe a
+/// request that is still in flight.
+pub(crate) fn serve_on_after(
+    listener: TcpListener,
+    routes: Vec<(&'static str, Vec<u8>)>,
+    delay: Duration,
+) {
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            if read_request_path(&mut stream).is_none() {
+            let Some(path) = read_request_path(&mut stream) else {
                 continue;
-            }
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.write_all(body);
+            };
+            let response = routes.iter().find(|(route, _)| *route == path).map_or_else(
+                || {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                },
+                |(_, response)| response.clone(),
+            );
+            thread::sleep(delay);
+            let _ = stream.write_all(&response);
         }
     });
-    addr
+}
+
+/// A `200` response with `body` and `content_type`.
+pub(crate) fn ok(content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+/// A `302` response to `location`.
+pub(crate) fn redirect(location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// Serves one body at `/` on an ephemeral port for every connection it gets.
+pub(crate) fn serve(body: &'static [u8], content_type: &'static str) -> std::net::SocketAddr {
+    let (listener, address) = server();
+    serve_on(listener, vec![("/", ok(content_type, body))]);
+    address
 }
 
 /// Creates a target, attaches to it, and waits for `Page.loadEventFired`
@@ -112,6 +161,34 @@ pub(crate) fn wait_for_load(client: &mut cdp::Client, session: &str, timeout: Du
         }
         assert!(Instant::now() < deadline, "no load event for {session}");
     }
+}
+
+/// Evaluates `expression` in `session`, awaiting a promise and returning the
+/// value through the protocol's JSON projection.
+pub(crate) fn evaluate(
+    client: &mut cdp::Client,
+    session: &str,
+    expression: &str,
+) -> serde_json::Value {
+    client
+        .call(
+            "Runtime.evaluate",
+            &json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+            Some(session),
+        )
+        .expect("evaluate")["result"]["value"]
+        .clone()
+}
+
+/// Starts the daemon, loads `url` in a new target, and returns the fixture
+/// that owns the daemon plus the attached session.
+pub(crate) fn open_page(prefix: &str, url: &str) -> (Fixture, cdp::Client, String) {
+    let mut fixture = Fixture::new(prefix);
+    fixture.spawn_daemon();
+    fixture.wait_json();
+    let mut client = fixture.connect();
+    let session = load_page(&mut client, url, Duration::from_secs(10));
+    (fixture, client, session)
 }
 
 pub struct Fixture {
