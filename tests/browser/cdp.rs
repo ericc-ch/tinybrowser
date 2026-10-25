@@ -532,4 +532,18 @@ fn dom_attributes_require_an_element_and_an_identifier() {
             .contains("nodeId, backendNodeId, or objectId"),
         "{missing}"
     );
+
+    let unknown = client
+        .call(
+            "DOM.getAttributes",
+            &json!({"nodeId": 999_999}),
+            Some(&session),
+        )
+        .expect_err("unknown node");
+    assert!(
+        unknown
+            .to_string()
+            .contains("Could not find node with given id"),
+        "{unknown}"
+    );
 }
