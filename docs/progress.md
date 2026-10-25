@@ -24,32 +24,34 @@ test262 43126 / 53660 = 80.4%
 
 Total 56.2% = pass / (tests - skip)
 
-### referrer-policy/ (non-worker), 2026-10-24
+### referrer-policy/ (non-worker), 2026-10-25
 
 Chrome 157 (WPT 9f868fd7) passes 892 of the 899 files that run here once
 worker variants and their generated directories are set aside; tinybrowser
-passes 872. Each remaining Chrome-passing file is blocked on one engine
-feature, not on referrer plumbing:
+passes 885. The remaining non-worker files each need a feature this engine
+does not have:
 
-- 8 `css-integration/image/`: Blitz does not fetch CSS-referenced images
-  (`content: url()`, the `background` content attribute), so the request the
-  test reports never happens.
-- 2 SVG (`external-stylesheet`, `processing-instruction`): same gap for SVG
-  paint servers (`fill`, `mask`, ...), plus `xml-stylesheet` PIs.
-- 2 `css-integration/{font-face,child-css}/processing-instruction.html`:
-  `xml-stylesheet` processing instructions do not load stylesheets.
+- 2 SVG (`css-integration/svg/{external-stylesheet,processing-instruction}`):
+  paint servers (`fill: url()`, `stroke: url()`) are not fetched, and this
+  Servo build does not generate `filter: url()`, `marker-*`, or a computed
+  `clip-path: url()`, so 7 of the 9 paint properties in each file cannot
+  reach a request. The other four `css-integration/svg/` files fail the same
+  seven subtests and are Chrome failures too.
 - `generic/sandboxed-iframe-with-opaque-origin.html`: `iframe sandbox` is not
-  implemented.
-- `generic/iframe-upgrade-request-to-cross-origin.sub.html`: CSP
-  `upgrade-insecure-requests` is not implemented.
+  implemented (`DOMTokenList` `sandbox` and the sandboxing flag set).
 - `generic/inheritance/{iframe-inheritance-history-about-blank,
   iframe-inheritance-javascript-child,popup-inheritance-about-blank}.html`:
-  named-window navigation/history, `javascript:` child frames, and
-  cross-window DOM access.
-- `generic/meta-referrer-domparser.html`: `Document.parseHTMLUnsafe` is absent
-  from the WebIDL generator (static operations).
+  `Location` writes (`contentWindow.location = "javascript:..."`),
+  `window.open()` popups with a real cross-window `document`, and
+  `window.open(url, "named-iframe")` targeting with child `history.back()`.
 - `generic/subresource-test/worker-messaging.html`: dedicated workers
   (out of the non-worker target).
+
+The rest of the directory's Chrome failures (`iframe-inheritance-history-
+about-srcdoc.html`, `popup-inheritance-form-submission.html`, `workers.html`,
+the four SVG files above) fail here too, so they cost nothing against the
+Chrome score. `iframe-upgrade-request-to-cross-origin` passes here and fails
+in Chrome.
 
 `css-integration/svg/` is the one harness-policy exception: each file sleeps
 800 ms per subtest (7.2 s total) before checking, above the 3 s default, so

@@ -321,6 +321,9 @@ pub(crate) struct Document {
     net_provider: std::sync::Arc<crate::render::TinyNetProvider>,
     /// Blitz link/form navigations, drained into frame navigations on tick.
     blitz_nav: std::sync::Arc<crate::render::TinyNav>,
+    /// Blitz shell: a mutation that changes rendered output asks for a frame,
+    /// which is this document's cue to resolve style and layout.
+    blitz_shell: std::sync::Arc<crate::render::TinyShell>,
     /// Blitz subresource fetches awaiting carrier dials.
     blitz_fetch_rx:
         std::sync::mpsc::Receiver<(crate::render::BlitzFetch, crate::render::CountingHandler)>,
@@ -625,6 +628,7 @@ impl Document {
             wake: Arc::clone(&runtime.wake),
             net_provider,
             blitz_nav,
+            blitz_shell: std::sync::Arc::new(crate::render::TinyShell::new()),
             blitz_fetch_rx: blitz_rx,
             blitz_handlers: HashMap::new(),
             blitz_request_urls: HashMap::new(),
@@ -1929,7 +1933,8 @@ impl Document {
                 as std::sync::Arc<dyn blitz_traits::net::NetProvider>),
             navigation_provider: Some(std::sync::Arc::clone(&self.blitz_nav)
                 as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>),
-            shell_provider: Some(std::sync::Arc::new(crate::render::TinyShell)),
+            shell_provider: Some(std::sync::Arc::clone(&self.blitz_shell)
+                as std::sync::Arc<dyn blitz_traits::shell::ShellProvider>),
             base_url: Some(crate::render::blitz_base_url(&base_url)),
             font_ctx: Some(self.shared_font_ctx()),
             ..blitz_dom::DocumentConfig::default()

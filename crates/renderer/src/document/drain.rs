@@ -42,6 +42,15 @@ impl Document {
             // its deadline. A task outside a drain still opens its own turn.
             let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
             self.run_task(task);
+            // A mutation that changes rendered output asks the shell for a
+            // frame. Before the document fires `load`, the load-time resolve
+            // settles the tree; afterwards this is the only cue that starts the
+            // image fetches a newly inserted style sheet or `style` attribute
+            // introduced, so the tree stays current for the turn's follow-up
+            // reads.
+            if self.load_fired && self.blitz_shell.take_redraw() {
+                self.settle_blitz_layout();
+            }
             // The task may have changed script-visible state with no timer,
             // fetch, or navigation event to follow — a page that settles a
             // webdriver async-script callback in its last task and then goes
