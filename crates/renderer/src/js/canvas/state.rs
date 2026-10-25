@@ -2555,22 +2555,13 @@ impl Canvas2D {
     /// the spec's default when it is missing or invalid.
     pub(crate) fn to_jpeg(&self, quality: f32) -> Option<Vec<u8>> {
         let pixels = self.read_pixels(0, 0, self.width, self.height)?;
-        let mut jpeg = Vec::new();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "quality is clamped to 0..=1 and scaled to 1..=100"
-        )]
-        let quality = (quality.clamp(0.0, 1.0) * 100.0).round().clamp(1.0, 100.0) as u8;
-        image::ImageEncoder::write_image(
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
+        encode_jpeg(
             &pixels,
             self.width,
             self.height,
             image::ExtendedColorType::Rgba8,
+            quality,
         )
-        .ok()?;
-        Some(jpeg)
     }
 
     /// A transparent PNG for a canvas that never had a context. Streams one
@@ -2600,22 +2591,13 @@ impl Canvas2D {
     pub(crate) fn blank_jpeg(width: u32, height: u32, quality: f32) -> Option<Vec<u8>> {
         let pixels = crate::js::world::canvas_bytes(width, height)?;
         let pixels = pixels / 4 * 3;
-        let mut jpeg = Vec::new();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "quality is clamped to 0..=1 and scaled to 1..=100"
-        )]
-        let quality = (quality.clamp(0.0, 1.0) * 100.0).round().clamp(1.0, 100.0) as u8;
-        image::ImageEncoder::write_image(
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
+        encode_jpeg(
             &vec![0; pixels],
             width,
             height,
             image::ExtendedColorType::Rgb8,
+            quality,
         )
-        .ok()?;
-        Some(jpeg)
     }
 
     /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
@@ -3701,6 +3683,38 @@ fn box_blur_vertical(data: &mut [u8], width: usize, height: usize, radius: usize
         }
     }
     data.copy_from_slice(&out);
+}
+
+/// Encodes one JPEG image. `quality` is in `0..=1`; the spec default is
+/// applied before this point (`canvas_quality`).
+fn encode_jpeg(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    color: image::ExtendedColorType,
+    quality: f32,
+) -> Option<Vec<u8>> {
+    let mut jpeg = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, jpeg_quality(quality)),
+        pixels,
+        width,
+        height,
+        color,
+    )
+    .ok()?;
+    Some(jpeg)
+}
+
+/// The JPEG encoder's `1..=100` quality for a `0..=1` canvas quality
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "quality is clamped to 0..=1 and scaled to 1..=100"
+)]
+fn jpeg_quality(quality: f32) -> u8 {
+    (quality.clamp(0.0, 1.0) * 100.0).round().clamp(1.0, 100.0) as u8
 }
 
 #[cfg(test)]

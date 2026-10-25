@@ -203,17 +203,23 @@ fn canvas_to_data_url<'js>(
     ))
 }
 
+/// Encodes a canvas for `toBlob`/`convertToBlob`: the settled bytes plus the
+/// encoding actually used, so page script never re-derives the type (which
+/// would run `ToString` a second time; `type` converts once, here).
 fn canvas_to_blob_bytes<'js>(
     ctx: Ctx<'js>,
     source: Value<'js>,
     mime: Opt<Value<'js>>,
     quality: Opt<Value<'js>>,
-) -> Result<Vec<u8>> {
+) -> Result<Object<'js>> {
     let format = canvas_format(&canvas_mime(&ctx, mime.0.as_ref())?);
     let quality = canvas_quality(&ctx, quality.0.as_ref())?;
-    Ok(canvas_image(&ctx, &source, format, quality)?
-        .map(|image| image.bytes)
-        .unwrap_or_default())
+    let image = canvas_image(&ctx, &source, format, quality)?;
+    let (bytes, format) = image.map_or((Vec::new(), format), |image| (image.bytes, image.format));
+    let blob = Object::new(ctx)?;
+    blob.set("bytes", bytes)?;
+    blob.set("type", format.mime())?;
+    Ok(blob)
 }
 
 /// `OffscreenCanvas.transferToImageBitmap()`: snapshot the bitmap, clear the

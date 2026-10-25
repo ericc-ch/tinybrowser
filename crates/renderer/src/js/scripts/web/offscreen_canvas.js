@@ -169,11 +169,9 @@
         return Promise.reject(new TypeError('options must be an object'));
       }
       try {
-        const type = options && options.type !== undefined ? String(options.type) : 'image/png';
-        const mime = type.toLowerCase() === 'image/jpeg' ? 'image/jpeg' : 'image/png';
-        const bytes = globalThis.__tbCanvasToBlobBytes(
+        const { bytes, type: mime } = globalThis.__tbCanvasToBlobBytes(
           state.canvas,
-          type,
+          options ? options.type : undefined,
           options ? options.quality : undefined,
         );
         if (bytes.length === 0) {

@@ -59,16 +59,13 @@ fn serve(listener: TcpListener, routes: Vec<(&'static str, Vec<u8>)>) {
             let Some(path) = read_request_path(&mut stream) else {
                 continue;
             };
-            let response = routes
-                .iter()
-                .find(|(route, _)| *route == path)
-                .map_or_else(
-                    || {
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            .to_vec()
-                    },
-                    |(_, response)| response.clone(),
-                );
+            let response = routes.iter().find(|(route, _)| *route == path).map_or_else(
+                || {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                },
+                |(_, response)| response.clone(),
+            );
             let _ = stream.write_all(&response);
         }
     });
@@ -113,11 +110,26 @@ fn cross_origin_redirect_taints_the_canvas() {
         vec![
             ("/", ok("text/html", body.as_bytes())),
             ("/pixel.png", ok("image/png", &pixel)),
-            ("/redirect.png", redirect(&format!("http://{cross}/pixel.png"))),
+            (
+                "/redirect.png",
+                redirect(&format!("http://{cross}/pixel.png")),
+            ),
         ],
     );
 
-    let mut fixture = Fixture::new("tinybrowser-canvas-taint");
+    let (fixture, mut client, session) = open_page("tinybrowser-canvas-taint", page);
+    let result = evaluate(&mut client, &session, PROBE);
+    let result = result.as_str().expect("result");
+    let result: serde_json::Value = serde_json::from_str(result).expect("json");
+    assert_eq!(result["redirected"], json!("SecurityError"));
+    assert_eq!(result["same"], json!("clean"));
+    drop(fixture);
+}
+
+/// Starts the daemon, loads `page`'s root in a new target, and returns the
+/// fixture that owns the daemon.
+fn open_page(prefix: &str, page: SocketAddr) -> (Fixture, cdp::Client, String) {
+    let mut fixture = Fixture::new(prefix);
     fixture.spawn_daemon();
     let _ = fixture.wait_json();
     let mut client = fixture.connect();
@@ -126,16 +138,47 @@ fn cross_origin_redirect_taints_the_canvas() {
         &format!("http://{page}/"),
         Duration::from_secs(10),
     );
+    (fixture, client, session)
+}
 
-    let evaluated = client
+fn evaluate(client: &mut cdp::Client, session: &str, expression: &str) -> serde_json::Value {
+    client
         .call(
             "Runtime.evaluate",
-            &json!({"expression": PROBE, "returnByValue": true, "awaitPromise": true}),
-            Some(&session),
+            &json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+            Some(session),
         )
-        .expect("evaluate");
-    let result = evaluated["result"]["value"].as_str().expect("result");
-    let result: serde_json::Value = serde_json::from_str(result).expect("json");
-    assert_eq!(result["redirected"], json!("SecurityError"));
-    assert_eq!(result["same"], json!("clean"));
+        .expect("evaluate")["result"]["value"]
+        .clone()
+}
+
+#[test]
+fn blob_encoders_convert_the_type_once() {
+    let (page_listener, page) = bind();
+    serve(
+        page_listener,
+        vec![("/", ok("text/html", b"<!doctype html><canvas id=canvas>"))],
+    );
+    let (fixture, mut client, session) = open_page("tinybrowser-canvas-blob", page);
+
+    let result = evaluate(
+        &mut client,
+        &session,
+        r"(() => {
+          const converted = (run) => new Promise((resolve) => {
+            let conversions = 0;
+            const type = { toString() { conversions += 1; return 'image/png'; } };
+            run(type).then(() => resolve(conversions));
+          });
+          const context = document.getElementById('canvas').getContext('2d');
+          const offscreen = new OffscreenCanvas(1, 1);
+          offscreen.getContext('2d');
+          return Promise.all([
+            converted((type) => new Promise((resolve) => context.canvas.toBlob(resolve, type))),
+            converted((type) => offscreen.convertToBlob({ type })),
+          ]);
+        })()",
+    );
+    assert_eq!(result, json!([1, 1]));
+    drop(fixture);
 }
