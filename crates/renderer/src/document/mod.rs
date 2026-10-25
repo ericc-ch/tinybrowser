@@ -321,7 +321,7 @@ fn materialize_iframe_document(
 
 /// The sandboxing flags the `iframe` at `container` imposes, from the
 /// `sandbox` content attribute of that element in its own document.
-fn sandboxing_flags(
+pub(crate) fn sandboxing_flags(
     world_rc: &Rc<RefCell<World>>,
     container: crate::dom::tree::NodeId,
 ) -> crate::js::world::SandboxFlags {

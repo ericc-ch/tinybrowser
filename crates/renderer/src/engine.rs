@@ -1204,6 +1204,19 @@ impl Engine {
             let Some((chosen, container)) = chosen else {
                 continue;
             };
+            // The container's `sandbox` attribute decides the flag set for the
+            // document this navigation loads, so it is read again here rather
+            // than only when the frame was created
+            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+            if let (Some(embedder), Some(container)) =
+                (self.runtime.shared.borrow().tree.parent(chosen), container)
+                && let Some(embedder) = self.frames.get(&embedder)
+            {
+                let flags = crate::document::sandboxing_flags(&embedder.world(), container);
+                if let Some(child) = self.frames.get(&chosen) {
+                    child.world().borrow_mut().sandbox = flags;
+                }
+            }
             self.navigate_frame(chosen, initiator, &navigation);
             if let Some(container) = container {
                 self.publish_frame_document(container, chosen);
