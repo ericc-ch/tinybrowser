@@ -56,6 +56,14 @@ The remaining Chrome failures (`popup-inheritance-form-submission.html`,
 against the Chrome score. `iframe-upgrade-request-to-cross-origin` passes here
 and fails in Chrome.
 
+The 30 generated `script-tag-dynamic-import` files used to time out at the
+7.2 s budget, each with 12 subtests unreported. Nothing was slow: the renderer
+drain reported idle while a module evaluation sat in a realm's outbox, so the
+next test case only started when the harness timeout arrived. The session now
+asks whether ready work remains after publishing, and the drain reconciles once
+more before declaring itself idle. See the `renderer: stop parking the drain`
+commit.
+
 `css-integration/svg/` is the one harness-policy exception: each file sleeps
 800 ms per subtest (7.2 s total) before checking, above the 3 s default, so
 those files get a 6 s budget (8 s with grace, still under testharness.js's
