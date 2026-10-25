@@ -166,14 +166,20 @@ impl From<rquickjs::Error> for JsError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct JsFetchId(i32);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PageTimerId(i32);
+
 pub(crate) struct TimeoutRequest {
     pub delay: Duration,
-    pub js_id: i32,
+    pub js_id: PageTimerId,
 }
 
 pub(crate) struct JsFetchRequest {
     pub url: String,
-    pub js_id: crate::document::JsFetchId,
+    pub js_id: JsFetchId,
     pub method: String,
     pub body: Vec<u8>,
     pub content_type: Option<String>,
@@ -414,16 +420,16 @@ impl JsRealm {
         })
     }
 
-    pub(crate) fn fire_timer(&self, js_id: i32) -> Result<(), JsError> {
+    pub(crate) fn fire_timer(&self, js_id: PageTimerId) -> Result<(), JsError> {
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let timeouts: Array = bridge::object(&ctx)?.get("__tb_timeouts")?;
-                let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
+                let idx = usize::try_from(js_id.0).map_err(|_| JsError::BadTimerId)?;
                 // A cancelled timer already left the queue: firing is a
                 // no-op, not a `TypeError`
                 // (<https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers>).
                 let value: Value = timeouts.get(idx)?;
-                timeouts.as_object().remove(js_id)?;
+                timeouts.as_object().remove(js_id.0)?;
                 if value.is_undefined() || value.is_null() {
                     return Ok(());
                 }
@@ -465,13 +471,13 @@ impl JsRealm {
 
     pub(crate) fn finish_js_fetch(
         &self,
-        js_id: i32,
+        js_id: JsFetchId,
         outcome: Option<crate::protocol::DialOutcome>,
     ) -> Result<(), JsError> {
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let cbs: Object = bridge::object(&ctx)?.get("__tb_fetchCbs")?;
-                let Some(func) = cbs.get::<_, Option<Function>>(js_id)? else {
+                let Some(func) = cbs.get::<_, Option<Function>>(js_id.0)? else {
                     return Ok(());
                 };
                 // The header list stays as served: sniffing picks the
@@ -976,7 +982,7 @@ impl JsRealm {
                     .borrow_mut()
                     .push_back(RealmRequest::Timer(TimeoutRequest {
                         delay: Duration::from_millis(u64::from(millis(delay))),
-                        js_id,
+                        js_id: PageTimerId(js_id),
                     }));
             }),
         )?;
@@ -987,7 +993,7 @@ impl JsRealm {
             Func::from(move |js_id: i32| {
                 cancel_outbox
                     .borrow_mut()
-                    .push_back(RealmRequest::ClearTimer(js_id));
+                    .push_back(RealmRequest::ClearTimer(PageTimerId(js_id)));
             }),
         )?;
 
@@ -1066,7 +1072,7 @@ impl JsRealm {
                         .borrow_mut()
                         .push_back(RealmRequest::Fetch(Box::new(JsFetchRequest {
                             url,
-                            js_id: crate::document::JsFetchId::from_script(js_id),
+                            js_id: JsFetchId(js_id),
                             method,
                             body: body.to_vec(),
                             content_type,
@@ -1090,9 +1096,7 @@ impl JsRealm {
             Func::from(move |js_id: i32| {
                 cancel_fetch_outbox
                     .borrow_mut()
-                    .push_back(RealmRequest::AbortFetch(
-                        crate::document::JsFetchId::from_script(js_id),
-                    ));
+                    .push_back(RealmRequest::AbortFetch(JsFetchId(js_id)));
             }),
         )?;
         Ok(())

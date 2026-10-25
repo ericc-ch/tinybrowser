@@ -2,13 +2,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{
-    DialContext, Document, ImageUpdate, JsFetchId, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer,
-    TimerId,
-};
+use super::{DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::dom::tree::NodeId;
-use crate::js::RealmRequest;
-use crate::protocol::{BrowserEvent, RendererEvent};
+use crate::js::{JsFetchId, RealmRequest};
+use crate::protocol::{BrowserEvent, RendererEvent, TimerId};
 
 /// Upper bound on realm requests applied in one turn. Host callbacks can
 /// enqueue more work while a request runs, so a turn must not loop forever.
@@ -95,8 +92,7 @@ impl Document {
     }
 
     pub(crate) fn schedule_timer(&mut self, delay: Duration) -> TimerId {
-        let id = TimerId::new(self.next_timer_id);
-        self.next_timer_id = self.next_timer_id.saturating_add(1);
+        let id = self.next_timer_id.take_next();
         self.timers.insert(
             id,
             Timer {

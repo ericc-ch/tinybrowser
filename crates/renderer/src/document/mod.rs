@@ -8,7 +8,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant as WallClock;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 use blitz_traits::net::NetHandler;
@@ -18,12 +17,13 @@ use url::Url;
 use crate::Parsed;
 use crate::ReadyState;
 use crate::js::{
-    DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, PolicyContainer, World,
+    DocumentStreamCommand, FrameNavigation, FrameRuntime, JsFetchId, JsRuntimeHandle, PageTimerId,
+    PolicyContainer, World,
 };
 use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
 use crate::protocol::{
     BrowserEvent, BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent,
-    ResponseHead, ScriptFailure, TabError,
+    ResponseHead, ScriptFailure, TabError, TimerId,
 };
 
 use self::dials::DialLedger;
@@ -60,45 +60,14 @@ const MAX_PENDING_JS_FETCHES: usize = 256;
 /// Retained events before a document reports overflow.
 const MAX_PENDING_EVENTS: usize = 2048;
 
-/// Identity of one started dial in this document's ledger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct DialId(u64);
 
 impl DialId {
-    fn next(&mut self) -> Self {
+    fn take_next(&mut self) -> Self {
         let id = *self;
         self.0 += 1;
         id
-    }
-}
-
-/// Identity of one page `fetch` as the page script named it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct JsFetchId(i32);
-
-impl JsFetchId {
-    pub(crate) const fn from_script(id: i32) -> Self {
-        Self(id)
-    }
-
-    pub(crate) const fn script(self) -> i32 {
-        self.0
-    }
-}
-
-/// Identity of one host timer in this document's timer table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TimerId(u32);
-
-impl TimerId {
-    const fn new(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    /// The id as the WIT boundary spells it.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
     }
 }
 
@@ -358,7 +327,7 @@ struct Timer {
     when: Option<Instant>,
     fired: bool,
     /// The script-visible id, when this timer belongs to a realm.
-    js_id: Option<i32>,
+    js_id: Option<PageTimerId>,
 }
 
 /// Builds and queues the initial `about:blank` document for one connected
@@ -564,7 +533,7 @@ pub(crate) struct Document {
     url: Url,
     tasks: VecDeque<Task>,
     timers: HashMap<TimerId, Timer>,
-    next_timer_id: u32,
+    next_timer_id: TimerId,
     /// Every queued, in-flight, and cancelled dial for this document.
     dials: DialLedger,
     /// `<img>` elements awaiting Blitz image state. They delay the document
@@ -624,7 +593,7 @@ pub(crate) struct Document {
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
     /// Live JS timers by the id script holds. The timer owns the page id.
-    js_timers: HashMap<i32, TimerId>,
+    js_timers: HashMap<PageTimerId, TimerId>,
     /// One count for every operation delaying this document's `load` event.
     load_delay: LoadDelay,
     /// Whether init scripts were deferred because the realm was created while
@@ -870,7 +839,7 @@ impl Document {
             url: document_url,
             tasks: VecDeque::new(),
             timers: HashMap::new(),
-            next_timer_id: 1,
+            next_timer_id: TimerId::default(),
             dials: DialLedger::new(Arc::clone(&runtime.stop), Arc::clone(&runtime.wake)),
             image_selected_src: HashMap::new(),
             in_flight_images: HashMap::new(),
@@ -3653,7 +3622,7 @@ impl Document {
         id: JsFetchId,
         outcome: Option<DialOutcome>,
     ) {
-        self.fire_js(|js| js.finish_js_fetch(id.script(), outcome));
+        self.fire_js(|js| js.finish_js_fetch(id, outcome));
     }
 
     /// Runs the post-parsing steps of "the end": set readiness to

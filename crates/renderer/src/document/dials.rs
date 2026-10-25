@@ -17,8 +17,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use tokio::sync::Notify;
 
-use super::{CompletedDial, DialContext, DialId, JsFetchId, LoadDelay, LoadDelayGuard, QueuedDial};
-use crate::js::Stop;
+use super::{CompletedDial, DialContext, DialId, LoadDelay, LoadDelayGuard, QueuedDial};
+use crate::js::{JsFetchId, Stop};
 use crate::protocol::{DialCancellation, DialCompletion, DialRequest};
 
 /// One queued dial and the load-event delay its request already holds.
@@ -63,7 +63,7 @@ impl DialLedger {
             rx,
             queued: VecDeque::new(),
             in_flight: HashMap::new(),
-            next_id: DialId(0),
+            next_id: DialId::default(),
             stop,
             wake,
         }
@@ -94,7 +94,7 @@ impl DialLedger {
         delay: Option<LoadDelayGuard>,
         start: &dyn Fn(DialRequest, DialCompletion) -> DialCancellation,
     ) {
-        let id = self.next_id.next();
+        let id = self.next_id.take_next();
         let completed = self.tx.clone();
         let wake = Arc::clone(&self.wake);
         let stop = Arc::clone(&self.stop);

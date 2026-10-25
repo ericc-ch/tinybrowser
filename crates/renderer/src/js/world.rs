@@ -1418,9 +1418,9 @@ impl EventTargetState {
 /// the engine's stream queue because applying them republishes the frame.
 pub(crate) enum RealmRequest {
     Timer(super::TimeoutRequest),
-    ClearTimer(i32),
+    ClearTimer(super::PageTimerId),
     Fetch(Box<super::JsFetchRequest>),
-    AbortFetch(crate::document::JsFetchId),
+    AbortFetch(super::JsFetchId),
     Script(NodeId),
     Image(NodeId),
     HistoryPush {
