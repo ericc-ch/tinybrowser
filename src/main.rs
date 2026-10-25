@@ -35,6 +35,9 @@ fn main() -> ExitCode {
         Ok(cli::Outcome::Run(cli)) => {
             if let Err(error) = install_logger(&cli) {
                 eprintln!("error: {error}");
+                if let Some(source) = std::error::Error::source(&error) {
+                    eprintln!("  caused by: {source}");
+                }
                 return ExitCode::from(2);
             }
             let code = run(&cli);

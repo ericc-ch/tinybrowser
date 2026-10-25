@@ -34,7 +34,7 @@ mod format;
 
 use std::fmt;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -105,27 +105,40 @@ impl fmt::Display for ParseLevelError {
 
 impl std::error::Error for ParseLevelError {}
 
-/// A log file the process logger could not open.
+/// Why the process logger could not be installed.
 #[derive(Debug)]
-pub struct InstallError {
-    path: PathBuf,
-    source: io::Error,
+pub enum InstallError {
+    /// A logger is already installed in this process.
+    AlreadyInstalled,
+    /// The log file could not be opened.
+    Open {
+        /// The path the logger tried to open.
+        path: PathBuf,
+        /// The operating-system failure.
+        source: io::Error,
+    },
+    /// The log file opened, but its writer thread could not start.
+    SpawnWriter(io::Error),
 }
 
 impl fmt::Display for InstallError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "cannot open log file {}: {}",
-            self.path.display(),
-            self.source
-        )
+        match self {
+            Self::AlreadyInstalled => formatter.write_str("logger already installed"),
+            Self::Open { path, .. } => {
+                write!(formatter, "cannot open log file {}", path.display())
+            }
+            Self::SpawnWriter(_) => formatter.write_str("cannot start the log writer"),
+        }
     }
 }
 
 impl std::error::Error for InstallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        match self {
+            Self::Open { source, .. } | Self::SpawnWriter(source) => Some(source),
+            Self::AlreadyInstalled => None,
+        }
     }
 }
 
@@ -135,26 +148,28 @@ impl std::error::Error for InstallError {
 /// through the queue.
 ///
 /// `clock` supplies the wall time for every record, including the panic
-/// record, so a process can install a deterministic clock in tests.
-///
-/// A second install is ignored.
+/// record.
 ///
 /// # Errors
-/// Returns [`InstallError`] when `file` cannot be opened; the composition root
-/// decides whether that is fatal.
+/// Returns [`InstallError`] when this process already has a logger or when the
+/// file sink cannot be opened or started. The composition root decides whether
+/// that is fatal.
 pub fn install(
     level: Level,
     file: Option<PathBuf>,
     clock: fn() -> SystemTime,
 ) -> Result<(), InstallError> {
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if LOGGER.get().is_some() {
-        return Ok(());
+        return Err(InstallError::AlreadyInstalled);
     }
     let logger = Logger::new(level, file, clock)?;
-    if LOGGER.set(logger).is_err() {
-        return Ok(());
-    }
-    crash::install();
+    LOGGER
+        .set(logger)
+        .map_err(|_| InstallError::AlreadyInstalled)?;
+    crash::install(LOGGER.get().ok_or(InstallError::AlreadyInstalled)?);
     Ok(())
 }
 
@@ -170,11 +185,7 @@ impl Logger {
         path: Option<PathBuf>,
         clock: fn() -> SystemTime,
     ) -> Result<Self, InstallError> {
-        let file = path
-            .map(|path| {
-                file::FileSink::new(path.clone()).map_err(|source| InstallError { path, source })
-            })
-            .transpose()?;
+        let file = path.map(file::FileSink::new).transpose()?;
         Ok(Self { level, clock, file })
     }
 
@@ -218,20 +229,7 @@ fn write_console(line: &str) {
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
-
-/// The installed logger's clock, read by the panic hook so both paths stamp a
-/// record the same way.
-pub(crate) fn clock() -> fn() -> SystemTime {
-    LOGGER.get().map_or(SystemTime::now, |logger| logger.clock)
-}
-
-/// The installed logger's file, read by the panic hook so the hook and the
-/// sink share one destination.
-pub(crate) fn log_path() -> Option<&'static Path> {
-    LOGGER
-        .get()
-        .and_then(|logger| logger.file.as_ref().map(file::FileSink::path))
-}
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Whether the installed logger accepts `level`; `false` when none is installed.
 #[must_use]
@@ -384,13 +382,40 @@ mod tests {
     }
 
     #[test]
-    fn unopenable_file_is_an_error() {
-        let logger = Logger::new(
-            Level::Info,
-            Some(PathBuf::from("/proc/tinybrowser-cannot-exist/log")),
-            SystemTime::now,
+    fn unopenable_file_reports_its_path() {
+        let path = PathBuf::from("/proc/tinybrowser-cannot-exist/log");
+        let logger = Logger::new(Level::Info, Some(path.clone()), SystemTime::now);
+        assert!(matches!(
+            logger,
+            Err(InstallError::Open { path: failed, .. }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn second_install_is_an_error() {
+        install(Level::Info, None, SystemTime::now).expect("first install");
+        assert!(matches!(
+            install(Level::Info, None, SystemTime::now),
+            Err(InstallError::AlreadyInstalled)
+        ));
+    }
+
+    #[test]
+    fn records_stamp_with_the_injected_clock() {
+        let dir =
+            std::env::temp_dir().join(format!("tinybrowser-log-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("log");
+        let logger = Logger::new(Level::Info, Some(path.clone()), || SystemTime::UNIX_EPOCH)
+            .expect("logger");
+        logger.log(Level::Info, "test", format_args!("stamped"));
+        assert!(logger.flush());
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            contents.contains("1970-01-01T00:00:00.000Z INFO test stamped"),
+            "{contents}"
         );
-        assert!(logger.is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -401,11 +426,5 @@ mod tests {
             "value"
         });
         assert!(!evaluated, "a filtered macro must not run its arguments");
-    }
-
-    #[test]
-    fn console_only_logger_flushes_trivially() {
-        let logger = Logger::new(Level::Info, None, SystemTime::now).expect("logger");
-        assert!(logger.flush());
     }
 }

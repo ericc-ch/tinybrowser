@@ -33,12 +33,17 @@ impl Drop for TempDir {
 fn the_installed_hook_records_a_panic_in_the_log_file() {
     let dir = TempDir::new();
     let path = dir.path().join("log");
-    logging::install(Level::Error, Some(path.clone()), std::time::SystemTime::now)
-        .expect("install");
+    logging::install(Level::Error, Some(path.clone()), || {
+        std::time::SystemTime::UNIX_EPOCH
+    })
+    .expect("install");
     let caught = std::panic::catch_unwind(|| panic!("hook probe {}", 7));
     assert!(caught.is_err());
     let contents = std::fs::read_to_string(&path).expect("read");
-    assert!(contents.contains(" ERROR panic "), "{contents}");
+    assert!(
+        contents.contains("1970-01-01T00:00:00.000Z ERROR panic "),
+        "{contents}"
+    );
     assert!(contents.contains("hook probe 7"), "{contents}");
     assert!(contents.contains("panic_hook.rs:"), "{contents}");
 }

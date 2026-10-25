@@ -10,11 +10,11 @@
 
 use std::io::Write as _;
 
-pub(crate) fn install() {
-    std::panic::set_hook(Box::new(record));
+pub(crate) fn install(logger: &'static crate::Logger) {
+    std::panic::set_hook(Box::new(move |info| record(logger, info)));
 }
 
-fn record(info: &std::panic::PanicHookInfo<'_>) {
+fn record(logger: &crate::Logger, info: &std::panic::PanicHookInfo<'_>) {
     let message = info
         .payload()
         .downcast_ref::<&str>()
@@ -33,13 +33,13 @@ fn record(info: &std::panic::PanicHookInfo<'_>) {
         },
     );
     let line = crate::format::record(
-        (crate::clock())(),
+        (logger.clock)(),
         crate::Level::Error,
         "panic",
         format_args!("{location} {message}"),
     );
     crate::write_console(&line);
-    if let Some(path) = crate::log_path() {
+    if let Some(path) = logger.file.as_ref().map(crate::file::FileSink::path) {
         append(path, &line);
     }
 }
