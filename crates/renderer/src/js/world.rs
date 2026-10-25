@@ -1009,6 +1009,12 @@ pub(crate) struct World {
     sticky_activation: bool,
     brands: HashMap<String, Persistent<Object<'static>>>,
     pub(crate) bridge: Option<Persistent<Object<'static>>>,
+    /// The realm's `Location` object. `window.location` is
+    /// `[LegacyUnforgeable]` and returns the same object on every read, but the
+    /// global accessor's closure must not hold the object: a JS value captured
+    /// by a Rust closure outlives the context teardown and trips `QuickJS`'s
+    /// live-object assertion. A `Persistent` dies with the realm instead.
+    pub(crate) location_object: Option<Persistent<Object<'static>>>,
     /// Containers whose insertion steps already fired `load` (src-less
     /// iframes). A later container navigation clears the entry when it
     /// starts, so that navigation's own `load` still fires; `finish_frame_load`
@@ -1409,6 +1415,7 @@ impl World {
             sticky_activation: false,
             brands: HashMap::new(),
             bridge: None,
+            location_object: None,
             insertion_load_fired: HashSet::new(),
             pristine_number: None,
             pristine_boolean: None,
@@ -2557,6 +2564,7 @@ impl World {
         self.weak_references = None;
         self.deliver_mutations_fn = None;
         self.bridge = None;
+        self.location_object = None;
     }
 
     /// The cached `[SameObject]` member for `(id, member)`, when this
