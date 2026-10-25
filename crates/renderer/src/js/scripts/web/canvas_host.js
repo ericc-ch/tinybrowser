@@ -10,13 +10,6 @@
     return;
   }
 
-  function normalizedType(type) {
-    // `type` is an optional DOMString, so a missing argument uses image/png
-    // and any other value goes through ToString.
-    const text = type === undefined ? 'image/png' : String(type);
-    return text.toLowerCase() === 'image/jpeg' ? 'image/jpeg' : 'image/png';
-  }
-
   Object.defineProperty(prototype, 'toDataURL', {
     configurable: true,
     writable: true,
@@ -32,12 +25,11 @@
       if (typeof callback !== 'function') {
         throw new TypeError('toBlob needs a callback');
       }
-      const mime = normalizedType(type);
-      const bytes = globalThis.__tbCanvasToBlobBytes(this, type, quality);
-      // The renderer returns no bytes for a zero-sized canvas; the spec asks
-      // for null rather than an empty Blob.
-      const blob = bytes.length === 0 ? null : new Blob([new Uint8Array(bytes)], { type: mime });
-      setTimeout(() => callback(blob), 0);
+      // `type` converts to a string once, in the renderer, which returns the
+      // encoding it settled on. `null` is the spec's encoding-failure result.
+      const blob = globalThis.__tbCanvasToBlobBytes(this, type, quality);
+      const result = blob === null ? null : new Blob([blob.bytes], { type: blob.type });
+      setTimeout(() => callback(result), 0);
     },
   });
 })();

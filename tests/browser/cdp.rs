@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::fixture::Fixture;
+use crate::fixture::{Fixture, evaluate};
 use serde_json::json;
 
 fn start() -> (Fixture, cdp::Client) {
@@ -237,17 +237,6 @@ fn get_properties_reports_descriptors_and_releases_groups() {
 
 #[test]
 fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
-    fn evaluate(client: &mut cdp::Client, session: &str, expression: &str) -> serde_json::Value {
-        client
-            .call(
-                "Runtime.evaluate",
-                &json!({"expression": expression, "returnByValue": true}),
-                Some(session),
-            )
-            .expect("evaluate")["result"]["value"]
-            .clone()
-    }
-
     let server_addr = crate::fixture::serve(b"<!doctype html><p>hi</p>", "text/html");
 
     let (_fixture, mut client) = start();

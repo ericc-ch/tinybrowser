@@ -67,12 +67,14 @@ TLS_SCHEMES = ("https", "https-local", "https-public", "wss", "h2")
 HTTP_ONLY = ("http", "ws")
 
 # wptrunner `--exclude` is a URL prefix, so `--exclude=worker` misses
-# `.any.worker.html` variants generated from `.any.js` and the security-features
+# `.any.worker.html` variants generated from `.any.js`, the security-features
 # generator's `worker-classic.http.html` / `sharedworker-module.https.html`
-# subresource files.
+# subresource files, and the canvas generator's `.w.html` variant under
+# `html/canvas/` (the same OffscreenCanvas test run in a Worker).
 WORKER_VARIANT = re.compile(
     r"(?:^|[/.])(any\.)?(sharedworker|serviceworker|worker)(-(classic|module))?"
     r"(\.[a-z0-9]+)*\.html$"
+    r"|^/html/canvas/.+\.w\.html$"
 )
 
 # File-level statuses with their own bucket; anything else not-a-pass is
@@ -2407,6 +2409,16 @@ def _selftest() -> None:
     assert is_worker_variant_url("/x.any.sharedworker.html")
     assert is_worker_variant_url("/x.any.serviceworker.html")
     assert is_worker_variant_url("/x.any.worker-module.html")
+    assert is_worker_variant_url(
+        "/html/canvas/offscreen/layers/2d.layer.clearRect.full.w.html"
+    )
+    assert is_worker_variant_url(
+        "/html/canvas/offscreen/layers/2d.layer.clearRect.full.w.html?foo=1"
+    )
+    assert not is_worker_variant_url(
+        "/html/canvas/offscreen/layers/2d.layer.clearRect.full.html"
+    )
+    assert not is_worker_variant_url("/dom/misc/file.w.html")
     assert is_worker_variant_url(
         "/referrer-policy/gen/top.http-rp/unset/worker-classic.http.html"
     )

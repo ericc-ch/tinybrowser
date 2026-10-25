@@ -169,19 +169,17 @@
         return Promise.reject(new TypeError('options must be an object'));
       }
       try {
-        const type = options && options.type !== undefined ? String(options.type) : 'image/png';
-        const mime = type.toLowerCase() === 'image/jpeg' ? 'image/jpeg' : 'image/png';
-        const bytes = globalThis.__tbCanvasToBlobBytes(
+        const blob = globalThis.__tbCanvasToBlobBytes(
           state.canvas,
-          type,
+          options ? options.type : undefined,
           options ? options.quality : undefined,
         );
-        if (bytes.length === 0) {
+        if (blob === null) {
           return Promise.reject(
             new DOMException('the OffscreenCanvas could not be serialized', 'IndexSizeError'),
           );
         }
-        return Promise.resolve(new Blob([new Uint8Array(bytes)], { type: mime }));
+        return Promise.resolve(new Blob([blob.bytes], { type: blob.type }));
       } catch (error) {
         return Promise.reject(error);
       }

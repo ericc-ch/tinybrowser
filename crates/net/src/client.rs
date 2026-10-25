@@ -439,6 +439,7 @@ impl Agent {
             response_type: crate::cors::ResponseType::Basic,
             previous_url: None,
             origin_tainted: false,
+            crossed_origin: false,
         };
         // Defaults every browser request carries. They live here, not in the
         // renderer, so XHR and subresources get the same values and page
@@ -576,6 +577,13 @@ impl Agent {
         if taint != crate::cors::ResponseType::Basic {
             hop.response_type = taint;
         }
+        // Tainting is sticky: a no-cors request that crosses an origin is
+        // opaque, and a later hop back to the request's origin does not make
+        // it basic again
+        // (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>).
+        if url.origin() != dial.cors.origin {
+            hop.crossed_origin = true;
+        }
         // The redirect-taint: once a hop crosses an origin that is neither
         // the previous URL's nor the request's own, the serialized origin
         // becomes `null` for this and every later hop
@@ -662,6 +670,7 @@ impl Agent {
             redirect_count: 0,
             filtering: hop.response_type,
             referrer: None,
+            crossed_origin: hop.crossed_origin,
         };
         // Set-Cookie must be read before CORS filtering removes it, and only
         // when credentials mode admits them for this origin.
@@ -886,6 +895,12 @@ struct Hop {
     /// request's own
     /// (<https://fetch.spec.whatwg.org/#serializing-a-request-origin>).
     origin_tainted: bool,
+    /// Whether any hop's URL origin differs from the request's origin. A
+    /// `no-cors` request that crosses it gets an opaque response, and the
+    /// tainting never resets, so a chain that returns to the request's origin
+    /// stays opaque
+    /// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>).
+    crossed_origin: bool,
 }
 
 impl Hop {
@@ -1265,6 +1280,7 @@ pub struct Response {
     redirect_count: u32,
     filtering: crate::cors::ResponseType,
     referrer: Option<Url>,
+    crossed_origin: bool,
 }
 
 impl Response {
@@ -1285,6 +1301,14 @@ impl Response {
     #[must_use]
     pub fn response_type(&self) -> crate::cors::ResponseType {
         self.filtering
+    }
+
+    /// Whether any hop's URL origin differed from the request's origin, which
+    /// is what a `no-cors` request turns into an opaque response
+    /// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>).
+    #[must_use]
+    pub fn crossed_origin(&self) -> bool {
+        self.crossed_origin
     }
 
     /// Response fields, including each `Set-Cookie`.

@@ -2,6 +2,7 @@
 //! --test browser cdp::` filters inside it, and helpers in `fixture` are
 //! dead-code checked against the whole tree instead of per binary.
 
+mod canvas;
 mod cdp;
 mod daemon;
 mod fixture;

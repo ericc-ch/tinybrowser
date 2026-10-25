@@ -231,7 +231,7 @@ fn navigate_returns_after_load_not_after_timers() {
     let server_addr = server_listener.local_addr().expect("server addr");
     let server = thread::spawn(move || {
         let (mut navigation, _) = server_listener.accept().expect("navigation");
-        crate::fixture::read_request_head(&mut navigation);
+        crate::fixture::read_request_path(&mut navigation).expect("request head");
         let body = b"<!doctype html><script>window.early = 1; setTimeout(function() { window.late = 1; }, 30000);</script>";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -286,7 +286,7 @@ fn new_window_uses_builder_resolve_map() {
     let server_addr = server_listener.local_addr().expect("server addr");
     let server = thread::spawn(move || {
         let (mut navigation, _) = server_listener.accept().expect("navigation");
-        crate::fixture::read_request_head(&mut navigation);
+        crate::fixture::read_request_path(&mut navigation).expect("request head");
         let body = b"<!doctype html><title>mapped</title>";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

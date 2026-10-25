@@ -173,6 +173,7 @@ impl Document {
                                 headers: vec![("content-type".to_owned(), content_type)],
                                 body: Ok(body),
                                 response_type: net::cors::ResponseType::Basic,
+                                crossed_origin: false,
                                 redirect_count: 0,
                                 referrer: None,
                                 stream: None,

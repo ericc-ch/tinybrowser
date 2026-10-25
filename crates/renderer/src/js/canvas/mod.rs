@@ -95,33 +95,20 @@ impl CanvasImageFormat {
     }
 }
 
-struct CanvasImage {
-    bytes: Vec<u8>,
-    format: CanvasImageFormat,
-}
-
 /// The `type` argument of `toDataURL`/`toBlob`/`convertToBlob`, converted with
-/// `ToString` and compared ASCII case-insensitively. An unsupported type falls
-/// back to PNG
+/// `ToString` once and compared ASCII case-insensitively. An unsupported type
+/// falls back to PNG
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
-fn canvas_mime<'js>(ctx: &Ctx<'js>, mime: Option<&Value<'js>>) -> Result<String> {
-    let Some(mime) = mime else {
-        return Ok("image/png".to_owned());
+fn canvas_format<'js>(ctx: &Ctx<'js>, mime: Option<&Value<'js>>) -> Result<CanvasImageFormat> {
+    let Some(mime) = mime.filter(|mime| !mime.is_undefined()) else {
+        return Ok(CanvasImageFormat::Png);
     };
-    if mime.is_undefined() {
-        return Ok("image/png".to_owned());
-    }
-    Ok(DomString::from_js(ctx, mime.clone())?
-        .0
-        .to_ascii_lowercase())
-}
-
-fn canvas_format(mime: &str) -> CanvasImageFormat {
-    if mime == "image/jpeg" {
+    let mime = DomString::from_js(ctx, mime.clone())?;
+    Ok(if mime.0.eq_ignore_ascii_case("image/jpeg") {
         CanvasImageFormat::Jpeg
     } else {
         CanvasImageFormat::Png
-    }
+    })
 }
 
 /// JPEG `quality` is in `0..=1`; anything else uses the 0.92 default
@@ -141,15 +128,16 @@ fn canvas_quality<'js>(ctx: &Ctx<'js>, quality: Option<&Value<'js>>) -> Result<f
     }
 }
 
-/// Encodes a canvas bitmap. `None` means a zero-sized canvas or a canvas that
-/// never had a context and could not be encoded, which serializes as `data:,`
-/// or an empty blob.
+/// Encodes a canvas bitmap. `None` is the spec's "encoding failed" branch: a
+/// zero-sized canvas, or an encoder that could not produce bytes, serializes
+/// as `data:,` or a null Blob
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
 fn canvas_image<'js>(
     ctx: &Ctx<'js>,
     source: &Value<'js>,
     format: CanvasImageFormat,
     quality: f32,
-) -> Result<Option<CanvasImage>> {
+) -> Result<Option<Vec<u8>>> {
     let Some(id) = canvas_host_node(ctx, source)? else {
         return Ok(None);
     };
@@ -182,7 +170,7 @@ fn canvas_image<'js>(
         (CanvasImageFormat::Png, None) => Canvas2D::blank_png(width, height),
         (CanvasImageFormat::Jpeg, None) => Canvas2D::blank_jpeg(width, height, quality),
     };
-    Ok(bytes.map(|bytes| CanvasImage { bytes, format }))
+    Ok(bytes)
 }
 
 fn canvas_to_data_url<'js>(
@@ -191,29 +179,36 @@ fn canvas_to_data_url<'js>(
     mime: Opt<Value<'js>>,
     quality: Opt<Value<'js>>,
 ) -> Result<String> {
-    let format = canvas_format(&canvas_mime(&ctx, mime.0.as_ref())?);
+    let format = canvas_format(&ctx, mime.0.as_ref())?;
     let quality = canvas_quality(&ctx, quality.0.as_ref())?;
-    let Some(image) = canvas_image(&ctx, &source, format, quality)? else {
+    let Some(bytes) = canvas_image(&ctx, &source, format, quality)? else {
         return Ok("data:,".to_owned());
     };
     Ok(format!(
         "data:{};base64,{}",
-        image.format.mime(),
-        base64::engine::general_purpose::STANDARD.encode(image.bytes)
+        format.mime(),
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
 }
 
+/// Encodes a canvas for `toBlob`/`convertToBlob` as `{ bytes, type }`; `null`
+/// is the spec's "encoding failed" branch. The type is the encoding the
+/// renderer settled on, so the page never re-derives it.
 fn canvas_to_blob_bytes<'js>(
     ctx: Ctx<'js>,
     source: Value<'js>,
     mime: Opt<Value<'js>>,
     quality: Opt<Value<'js>>,
-) -> Result<Vec<u8>> {
-    let format = canvas_format(&canvas_mime(&ctx, mime.0.as_ref())?);
+) -> Result<Option<Object<'js>>> {
+    let format = canvas_format(&ctx, mime.0.as_ref())?;
     let quality = canvas_quality(&ctx, quality.0.as_ref())?;
-    Ok(canvas_image(&ctx, &source, format, quality)?
-        .map(|image| image.bytes)
-        .unwrap_or_default())
+    let Some(bytes) = canvas_image(&ctx, &source, format, quality)? else {
+        return Ok(None);
+    };
+    let blob = Object::new(ctx.clone())?;
+    blob.set("bytes", TypedArray::new(ctx, bytes)?)?;
+    blob.set("type", format.mime())?;
+    Ok(Some(blob))
 }
 
 /// `OffscreenCanvas.transferToImageBitmap()`: snapshot the bitmap, clear the
@@ -2614,6 +2609,12 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
             )
         };
         let zero_size = size.is_some_and(|(width, height)| width == 0 || height == 0);
+        // A pending request is not fully decodable, so `drawImage` draws
+        // nothing: reassigning `src` starts a new request whose state is
+        // unavailable, and the previous request's pixels are not what the
+        // element's image data names any more
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#check-the-usability-of-the-image-argument>,
+        // <https://html.spec.whatwg.org/multipage/images.html#img-not-fully-decodable>).
         if loading {
             return Ok(ImageLookup::NotReady);
         }
@@ -2634,16 +2635,14 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
                 });
             }
         }
-        let mut lookup = world
+        let tracked_origin_clean = world.borrow().images.origin_clean.get(&id).copied();
+        let lookup = world
             .borrow()
             .with_document(id, |parsed| {
-                source_element(ctx, id, parsed, zero_size, broken)
+                source_element(ctx, id, parsed, zero_size, broken, tracked_origin_clean)
             })
             .flatten()
             .unwrap_or(ImageLookup::Unsupported);
-        if let ImageLookup::Decoded(image) = &mut lookup {
-            image.origin_clean &= image_origin_clean(&world.borrow(), id);
-        }
         return Ok(lookup);
     }
     if let Some(object) = value.as_object()
@@ -2672,37 +2671,16 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     }))
 }
 
-/// Whether the image element's settled request is origin-clean for canvas:
-/// same-origin, or loaded through a CORS check (`crossorigin` content
-/// attribute; the network refuses a CORS-mode load without a valid
-/// `Access-Control-Allow-Origin`, so a settled CORS-mode load is clean).
-/// `data:` images are treated as clean, like browsers do; a URL that does not
-/// parse is treated as cross-origin
-/// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-fn image_origin_clean(world: &crate::js::world::World, id: NodeId) -> bool {
-    world.images.cors_clean.contains(&id) || image_is_same_origin(world, id)
-}
-
-fn image_is_same_origin(world: &crate::js::world::World, id: NodeId) -> bool {
-    let Some(src) = world.images.current_src.get(&id) else {
-        return true;
-    };
-    let Ok(url) = url::Url::parse(src) else {
-        return false;
-    };
-    if url.scheme() == "data" {
-        return true;
-    }
-    world.origin == url.origin()
-}
-
-/// Looks up a canvas, SVG image, or HTML image element by node id.
+/// Looks up a canvas, SVG image, or HTML image element by node id. An HTML
+/// image's canvas taint is `origin_clean`, recorded when its response
+/// settled; a canvas is its own bitmap and carries no taint of its own.
 fn source_element(
     ctx: &Ctx<'_>,
     id: NodeId,
     parsed: &crate::Parsed,
     zero_size: bool,
     broken: bool,
+    origin_clean: Option<bool>,
 ) -> Option<ImageLookup> {
     let element = parsed.document.base.get_node(id.node)?;
     let data = element.data.downcast_element()?;
@@ -2743,7 +2721,10 @@ fn source_element(
                 width: raster.width,
                 height: raster.height,
                 pixels: raster.data.as_ref().to_vec(),
-                origin_clean: true,
+                // Blitz does not decode SVG `<image>` resources, so this is
+                // unreachable today; if it starts, fail closed rather than
+                // claim the pixels are clean.
+                origin_clean: false,
             }),
             None if broken => ImageLookup::Invalid,
             None if zero_size || !connected || !has_source => ImageLookup::NotReady,
@@ -2770,7 +2751,12 @@ fn source_element(
         if zero_size {
             return Some(ImageLookup::NotReady);
         }
-        return Some(svg_source_image(svg).map_or(ImageLookup::NotReady, ImageLookup::Decoded));
+        return Some(
+            svg_source_image(svg).map_or(ImageLookup::NotReady, |mut image| {
+                image.origin_clean = origin_clean.unwrap_or(false);
+                ImageLookup::Decoded(image)
+            }),
+        );
     }
     let has_source = data.attrs().iter().any(|attribute| {
         attribute.name.local.as_str() == "src" && !attribute.value.trim().is_empty()
@@ -2781,7 +2767,9 @@ fn source_element(
             width: raster.width,
             height: raster.height,
             pixels: raster.data.as_ref().to_vec(),
-            origin_clean: true,
+            // Only the settled request's taint record speaks for the pixels;
+            // an unrecorded request is treated as cross-origin.
+            origin_clean: origin_clean.unwrap_or(false),
         })),
         // A connected missing resource is invalid; a zero-sized image, a
         // detached image, or one with no source is not ready.

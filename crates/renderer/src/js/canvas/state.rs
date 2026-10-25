@@ -2555,22 +2555,24 @@ impl Canvas2D {
     /// the spec's default when it is missing or invalid.
     pub(crate) fn to_jpeg(&self, quality: f32) -> Option<Vec<u8>> {
         let pixels = self.read_pixels(0, 0, self.width, self.height)?;
-        let mut jpeg = Vec::new();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "quality is clamped to 0..=1 and scaled to 1..=100"
-        )]
-        let quality = (quality.clamp(0.0, 1.0) * 100.0).round().clamp(1.0, 100.0) as u8;
-        image::ImageEncoder::write_image(
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
-            &pixels,
+        // JPEG has no alpha channel: composite the straight source over opaque
+        // black, the spec's rule for formats without one
+        // (<https://html.spec.whatwg.org/multipage/canvas.html#a-serialisation-of-the-bitmap-as-a-file>).
+        let mut rgb = Vec::with_capacity(pixels.len() / 4 * 3);
+        for pixel in pixels.as_chunks::<4>().0 {
+            let alpha = u16::from(pixel[3]);
+            for channel in &pixel[..3] {
+                let value = (u16::from(*channel) * alpha + 127) / 255;
+                rgb.push(u8::try_from(value).unwrap_or(u8::MAX));
+            }
+        }
+        encode_jpeg(
+            &rgb,
             self.width,
             self.height,
-            image::ExtendedColorType::Rgba8,
+            image::ExtendedColorType::Rgb8,
+            quality,
         )
-        .ok()?;
-        Some(jpeg)
     }
 
     /// A transparent PNG for a canvas that never had a context. Streams one
@@ -2600,22 +2602,13 @@ impl Canvas2D {
     pub(crate) fn blank_jpeg(width: u32, height: u32, quality: f32) -> Option<Vec<u8>> {
         let pixels = crate::js::world::canvas_bytes(width, height)?;
         let pixels = pixels / 4 * 3;
-        let mut jpeg = Vec::new();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "quality is clamped to 0..=1 and scaled to 1..=100"
-        )]
-        let quality = (quality.clamp(0.0, 1.0) * 100.0).round().clamp(1.0, 100.0) as u8;
-        image::ImageEncoder::write_image(
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality),
+        encode_jpeg(
             &vec![0; pixels],
             width,
             height,
             image::ExtendedColorType::Rgb8,
+            quality,
         )
-        .ok()?;
-        Some(jpeg)
     }
 
     /// Straight RGBA pixels for `getImageData`, with out-of-bounds areas
@@ -3703,6 +3696,39 @@ fn box_blur_vertical(data: &mut [u8], width: usize, height: usize, radius: usize
     data.copy_from_slice(&out);
 }
 
+/// Encodes one JPEG image. `quality` is in `0..=1`; the spec default is
+/// applied before this point (`canvas_quality`).
+fn encode_jpeg(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    color: image::ExtendedColorType,
+    quality: f32,
+) -> Option<Vec<u8>> {
+    let mut jpeg = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, jpeg_quality(quality)),
+        pixels,
+        width,
+        height,
+        color,
+    )
+    .ok()?;
+    Some(jpeg)
+}
+
+/// The JPEG encoder's `1..=100` quality for a canvas quality that is already
+/// in `0..=1` (`canvas_quality`)
+/// (<https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-todataurl>).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "quality is clamped to 0..=1 and scaled to 1..=100"
+)]
+fn jpeg_quality(quality: f32) -> u8 {
+    (quality * 100.0).round().clamp(1.0, 100.0) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3895,6 +3921,15 @@ mod tests {
         let png = Canvas2D::blank_png(2, 2).expect("blank PNG");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         let jpeg = Canvas2D::blank_jpeg(2, 2, 0.92).expect("blank JPEG");
+        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+    }
+
+    #[test]
+    fn jpeg_encodes_rgba_pixels_over_black() {
+        let mut canvas = Canvas2D::new(2, 2);
+        canvas.set_fill_style(StyleValue::Color([255, 0, 0, 128]));
+        canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
+        let jpeg = canvas.to_jpeg(0.92).expect("JPEG");
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
     }
 
