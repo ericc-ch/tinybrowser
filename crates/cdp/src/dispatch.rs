@@ -554,8 +554,8 @@ pub(crate) async fn run_script(
         ScriptMethod::DomQuerySelector => dom_query_selector(tab, params).await,
         ScriptMethod::DomQuerySelectorAll => dom_query_selector_all(tab, params).await,
         ScriptMethod::DomDescribeNode => dom_describe_node(tab, params).await,
-        ScriptMethod::DomGetOuterHtml => dom_node_string(tab, params, "outerHTML").await,
-        ScriptMethod::DomGetAttributes => dom_node_string(tab, params, "attributes").await,
+        ScriptMethod::DomGetOuterHtml => dom_outer_html(tab, params).await,
+        ScriptMethod::DomGetAttributes => dom_attributes(tab, params).await,
         ScriptMethod::DomResolveNode => dom_resolve_node(tab, params).await,
         ScriptMethod::DomGetNodeForLocation => dom_node_for_location(tab, params).await,
         ScriptMethod::DomGetBoxModel => dom_box_model(tab, params).await,
@@ -1249,23 +1249,33 @@ pub(crate) async fn dom_describe_node(
     dom_eval(tab, &script).await
 }
 
-/// `DOM.getOuterHTML` and `DOM.getAttributes` share the stored-node lookup.
-pub(crate) async fn dom_node_string(
+/// `DOM.getOuterHTML`: the stored node's serialized markup.
+pub(crate) async fn dom_outer_html(
     tab: &TabHandle,
     params: &Value,
-    field: &str,
 ) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r#"(function(){
+    const TEMPLATE: &str = r"(function(){
       const n = host.__tb_dom_nodes[__NODE__];
-      if (!n) return host.stringify({__proto__: null, __FIELD__: null});
-      if ("__FIELD__" === "outerHTML") return host.stringify({__proto__: null, outerHTML: n.outerHTML === undefined ? "" : n.outerHTML});
+      if (!n) return host.stringify({__proto__: null, outerHTML: null});
+      return host.stringify({__proto__: null, outerHTML: n.outerHTML === undefined ? '' : n.outerHTML});
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    dom_eval(tab, &script).await
+}
+
+/// `DOM.getAttributes`: the stored element's attribute names and values.
+pub(crate) async fn dom_attributes(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r"(function(){
+      const n = host.__tb_dom_nodes[__NODE__];
+      if (!n) return host.stringify({__proto__: null, attributes: null});
       const attributes = host.array();
       if (n.attributes) for (const a of n.attributes) { host.push(attributes, a.name, a.value); }
       return host.stringify({__proto__: null, attributes: attributes});
-    })()"#;
-    let script = TEMPLATE
-        .replace("__NODE__", &requested_node(params).to_string())
-        .replace("__FIELD__", field);
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
     dom_eval(tab, &script).await
 }
 
