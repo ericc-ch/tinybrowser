@@ -7,14 +7,15 @@ mod client;
 pub mod cors;
 mod error;
 mod protocol;
+pub mod referrer;
 mod resolve;
 mod transport;
 
 pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-pub use protocol::{
-    HeaderError, HeaderMap, InvalidMethod, Method, combined_header, referrer_for_policy,
-    referrer_policy_from_header,
+pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method, combined_header};
+pub use referrer::{
+    Referrer, ReferrerClient, ReferrerPolicy, determine_referrer, is_potentially_trustworthy,
 };
 pub use transport::Proxy;

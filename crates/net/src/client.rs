@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
+use crate::referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, Proxy, basic_authorization};
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder};
@@ -461,16 +462,17 @@ impl Agent {
                 .append(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
         }
         let mut url = request.url;
-        // The referrer determined for the original request, which the
-        // renderer computed from the document; each redirect hop re-runs the
-        // determination with the previous hop's referrer as the source
-        // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-        let mut referrer: Option<String> = hop
-            .headers
-            .value("referer")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let mut referrer_policy = request.referrer_policy.clone();
+        // The referrer source and policy are typed request state, and main
+        // fetch runs "Determine request's Referrer" before the first hop as
+        // well as on every redirect
+        // (<https://fetch.spec.whatwg.org/#main-fetch>,
+        // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+        let mut referrer = request.referrer;
+        let mut referrer_policy = request.referrer_policy;
+        let referrer_client = request.referrer_client;
+        let mut determined =
+            determine_referrer(referrer_policy, referrer_client.as_ref(), &referrer, &url);
+        Self::write_referer(&mut hop.headers, determined.as_ref())?;
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
         let mut budget = self.engine.budget_at();
@@ -483,6 +485,10 @@ impl Agent {
                 .exchange(&dial, &url, &mut hop, cross_site_redirect, budget)
                 .await?;
             response.redirect_count = followed;
+            // The referrer this hop went out with. A navigation stores it as
+            // the new document's referrer, and a redirect changes it exactly
+            // the way the header changed.
+            response.referrer.clone_from(&determined);
             let hop_status = response.status();
             if self.max_redirects == 0 {
                 cors_gate(&response, &dial, &hop)?;
@@ -495,17 +501,18 @@ impl Agent {
             // A redirect response's `Referrer-Policy` field updates the
             // request's policy for the remaining hops
             // (<https://w3c.github.io/webappsec-referrer-policy/#set-requests-referrer-policy-on-redirect>).
-            let redirect_policy = response
-                .headers()
-                .value("referrer-policy")
-                .and_then(|value| value.to_str().ok())
-                .and_then(crate::referrer_policy_from_header);
+            let redirect_policy = ReferrerPolicy::from_header(
+                response
+                    .headers()
+                    .get_all("referrer-policy")
+                    .filter_map(|value| std::str::from_utf8(value).ok()),
+            );
             let next = match classify_response(response, &url, &dial, &hop)? {
                 HopOutcome::Final(response) => return Ok(*response),
                 HopOutcome::Redirect { next } => next,
             };
             if let Some(policy) = redirect_policy {
-                referrer_policy = Some(policy);
+                referrer_policy = policy;
             }
             if followed == self.max_redirects {
                 return Err(NetError::Limit(LimitExceeded::Redirect));
@@ -524,28 +531,32 @@ impl Agent {
             // source; a `no referrer` result stops the chain
             // (<https://fetch.spec.whatwg.org/#main-fetch>,
             // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-            if let Some(source) = referrer.as_deref()
-                && let Ok(source_url) = Url::parse(source)
-            {
-                match crate::referrer_for_policy(
-                    referrer_policy.as_deref().unwrap_or_default(),
-                    &source_url,
-                    &next,
-                ) {
-                    Some(determined) => {
-                        referrer = Some(determined.clone());
-                        hop.headers.remove("referer");
-                        let _ = hop.headers.insert("referer", determined.into_bytes());
-                    }
-                    None => {
-                        referrer = None;
-                        hop.headers.remove("referer");
-                    }
-                }
-            }
+            referrer = match determined.take() {
+                Some(url) => Referrer::Url(url),
+                None => Referrer::NoReferrer,
+            };
+            determined =
+                determine_referrer(referrer_policy, referrer_client.as_ref(), &referrer, &next);
+            Self::write_referer(&mut hop.headers, determined.as_ref())?;
             url = next;
             followed += 1;
         }
+    }
+
+    /// Writes the `Referer` field from the typed determination, replacing any
+    /// value left by the previous hop. A caller-supplied value never survives:
+    /// the page cannot spell the header, and the browser boundary does not
+    /// pass one through.
+    fn write_referer(headers: &mut HeaderMap, referrer: Option<&Url>) -> Result<(), NetError> {
+        match referrer {
+            Some(referrer) => {
+                let value = HeaderValue::from_str(referrer.as_str())
+                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+                headers.set(header::REFERER, value);
+            }
+            None => headers.remove("referer"),
+        }
+        Ok(())
     }
 
     /// One HTTP hop: the response-tainting gate, the CORS request rules, the
@@ -648,6 +659,7 @@ impl Agent {
             content_encoding,
             redirect_count: 0,
             filtering: hop.response_type,
+            referrer: None,
         };
         // Set-Cookie must be read before CORS filtering removes it, and only
         // when credentials mode admits them for this origin.
@@ -697,11 +709,16 @@ pub struct Request {
     /// (`1` for the first redirect) before the hop is followed. `false`
     /// rejects the dial. Unset follows every redirect the cap allows.
     pub on_redirect: Option<RedirectGate>,
-    /// The request's referrer policy, re-determining the `Referer` on every
-    /// redirect hop. Empty means the default
-    /// `strict-origin-when-cross-origin`
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-    pub referrer_policy: Option<String>,
+    /// Fetch's request referrer: a client, an explicit URL, or no referrer
+    /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+    pub referrer: Referrer,
+    /// The concrete policy main fetch resolves before the first hop. Empty
+    /// policies are filled from the client's policy container, so this is
+    /// never unset here.
+    pub referrer_policy: ReferrerPolicy,
+    /// The client environment for [`Referrer::Client`]: the document origin
+    /// and its `srcdoc`-walked URL. Left unset when no environment exists.
+    pub referrer_client: Option<ReferrerClient>,
 }
 
 impl std::fmt::Debug for Request {
@@ -717,7 +734,9 @@ impl std::fmt::Debug for Request {
             .field("deadline", &self.deadline)
             .field("cors", &self.cors)
             .field("on_redirect", &self.on_redirect.is_some())
+            .field("referrer", &self.referrer)
             .field("referrer_policy", &self.referrer_policy)
+            .field("referrer_client", &self.referrer_client)
             .finish()
     }
 }
@@ -744,7 +763,9 @@ impl Request {
             deadline: None,
             cors,
             on_redirect: None,
-            referrer_policy: None,
+            referrer: Referrer::NoReferrer,
+            referrer_policy: ReferrerPolicy::default(),
+            referrer_client: None,
         }
     }
 }
@@ -1241,6 +1262,7 @@ pub struct Response {
     content_encoding: Vec<String>,
     redirect_count: u32,
     filtering: crate::cors::ResponseType,
+    referrer: Option<Url>,
 }
 
 impl Response {
@@ -1279,6 +1301,15 @@ impl Response {
     #[must_use]
     pub fn redirect_count(&self) -> u32 {
         self.redirect_count
+    }
+
+    /// The stripped referrer this response's final hop was sent with, after
+    /// `Determine request's Referrer` ran for that hop. A navigation stores it
+    /// as the new document's own referrer
+    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+    #[must_use]
+    pub fn referrer(&self) -> Option<&Url> {
+        self.referrer.as_ref()
     }
 
     /// Consumes the response and returns its decoded body stream.

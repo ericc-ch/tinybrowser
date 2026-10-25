@@ -6,7 +6,10 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 
 ### blitz (third_party/blitz, master)
 
-- workspace `image` dependency gains the `bmp` feature. The image crate ships BMP in-tree, so this adds no crate; PNG/GIF/WebP/JPEG were already enabled. WPT's security-features endpoints encode their payload as a BMP (`common/security-features/subresource/image.py`), so every referrer-policy `img-tag` generated test failed on an undecodable image. Upstream pins `default-features = false` with no codecs declared.
+- e92ec16af respond to an image request under the URL it was made with, not the response URL. `pending_images` is keyed by the request URL, so a redirected delivery never matched and the image stayed pending forever. Stylesheets keep the resolved URL, which is the response URL their origin-clean check needs.
+- 46d832aab give a style sheet's requests the sheet's referrer and policy. A resource a sheet references sends the sheet's URL as its referrer and applies the sheet response's `Referrer-Policy`, not the document's (`https://w3c.github.io/webappsec-referrer-policy/#integration-with-css`). `Request` carries the sheet URL, and the loaders thread each sheet's location through parsing, `@import` nesting, and `@font-face` fetches.
+
+The BMP decode feature is not a fork change: which formats an engine carries is the embedder's compile-time choice, enabled through `crates/renderer`'s `image` dependency and unified here (commit 095af30a2 reverts the fork's own toggle).
 
 - c62d5c63 resolve_url returns None instead of panicking. A relative ref against a non-base (observed: foo.jpg against data:text/css) panicked the engine; unresolvable URLs now skip the fetch and form submission returns early.
 - 7189584d real doctype, processing-instruction, and CDATA nodes. These are real DOM nodes; a tree that cannot represent them forces every embedder to rebuild them from source with side tables.

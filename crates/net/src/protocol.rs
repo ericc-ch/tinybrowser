@@ -2,62 +2,6 @@ use std::borrow::Cow;
 use std::fmt;
 
 use hyper::header::{HeaderName, HeaderValue};
-use url::Url;
-
-/// One invocation of "Determine request's referrer": `policy` is the
-/// request's referrer policy, `source` the referrer source — the document's
-/// URL on the first determination, and the referrer the previous hop sent on
-/// every later one, because HTTP-redirect fetch re-invokes main fetch and the
-/// algorithm's "a URL" branch makes the previous referrer the new source —
-/// and `target` the request's current URL. Returns the `Referer` value, or
-/// `None` for no referrer
-/// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-#[must_use]
-pub fn referrer_for_policy(policy: &str, source: &Url, target: &Url) -> Option<String> {
-    let policy = if policy.is_empty() {
-        "strict-origin-when-cross-origin"
-    } else {
-        policy
-    };
-    if policy == "no-referrer" {
-        return None;
-    }
-    if !matches!(source.scheme(), "http" | "https") {
-        return None;
-    }
-    // The source with credentials and fragment stripped, for the full-URL
-    // policies ("Strip url for use as a referrer").
-    let mut stripped = source.clone();
-    let _ = stripped.set_username("");
-    let _ = stripped.set_password(None);
-    stripped.set_fragment(None);
-    // The source's origin, serialized as a URL: always with the `/` path,
-    // as browsers send it (`Referer: https://example.com/`).
-    let origin = format!("{}/", stripped.origin().ascii_serialization());
-    // A serialized referrer URL longer than 4096 characters culls to the
-    // origin, whatever the policy — even `unsafe-url`.
-    let referrer_url = if stripped.as_str().len() > 4096 {
-        origin.clone()
-    } else {
-        stripped.to_string()
-    };
-    let downgrade = source.scheme() == "https" && !matches!(target.scheme(), "https" | "wss");
-    let same_origin = source.origin() == target.origin();
-    match policy {
-        "origin" => Some(origin),
-        "unsafe-url" => Some(referrer_url),
-        "strict-origin" => (!downgrade).then_some(origin),
-        "same-origin" => same_origin.then_some(referrer_url),
-        "origin-when-cross-origin" => Some(if same_origin { referrer_url } else { origin }),
-        "no-referrer-when-downgrade" => (!downgrade).then_some(referrer_url),
-        // `strict-origin-when-cross-origin` and anything unrecognized: the
-        // strict default. Unknown tokens fail closed to the default rather
-        // than leaking the full URL.
-        _ if downgrade => None,
-        _ if same_origin => Some(referrer_url),
-        _ => Some(origin),
-    }
-}
 
 #[must_use]
 /// Joins every occurrence of a list header's values with `", "`, the way a
@@ -70,34 +14,6 @@ pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<Stri
     } else {
         Some(values.join(", "))
     }
-}
-
-/// Reads a `Referrer-Policy` field as the last recognized policy token
-/// (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
-/// Unknown tokens and empty list members are ignored, so a trailing unknown
-/// token never resets a policy the document already had.
-#[must_use]
-pub fn referrer_policy_from_header(value: &str) -> Option<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .rev()
-        .find(|token| {
-            !token.is_empty()
-                && matches!(
-                    token.to_ascii_lowercase().as_str(),
-                    "no-referrer"
-                        | "no-referrer-when-downgrade"
-                        | "same-origin"
-                        | "origin"
-                        | "strict-origin"
-                        | "origin-when-cross-origin"
-                        | "strict-origin-when-cross-origin"
-                        | "unsafe-url"
-                        | "never"
-                )
-        })
-        .map(str::to_owned)
 }
 
 pub(crate) fn is_token_char(c: char) -> bool {
@@ -332,61 +248,7 @@ impl fmt::Display for Method {
 mod tests {
     use hyper::header::{HeaderName, HeaderValue};
 
-    use super::{HeaderMap, referrer_for_policy, referrer_policy_from_header};
-    use url::Url;
-
-    /// The `Referer` each hop of a redirect chain sends: the source of hop N
-    /// is the referrer hop N-1 sent, so the chain demotes to the origin the
-    /// moment it leaves the source's origin and never re-widens
-    /// (<https://fetch.spec.whatwg.org/#main-fetch>,
-    /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-    #[test]
-    fn redirect_chain_redetermines_from_the_previous_referrer() {
-        let policy = "strict-origin-when-cross-origin";
-        let doc = Url::parse("http://web-platform.test:8000/page.html").expect("doc");
-        // same-origin start, swap-origin redirect to a cross origin: the
-        // first hop sends the full URL, the cross hop demotes it to the
-        // origin, and the referrer never re-widens.
-        let hop1 = referrer_for_policy(policy, &doc, &Url::parse("http://web-platform.test:8000/x").expect("u"))
-            .expect("referrer");
-        assert_eq!(hop1, "http://web-platform.test:8000/page.html");
-        let hop2 = referrer_for_policy(
-            policy,
-            &Url::parse(&hop1).expect("hop1"),
-            &Url::parse("http://www1.web-platform.test:8000/x").expect("u"),
-        )
-        .expect("referrer");
-        assert_eq!(hop2, "http://web-platform.test:8000/");
-        // cross-origin start, swap-origin redirect back to the source's
-        // origin: the origin referrer survives the same-origin hop unchanged.
-        let hop1 = referrer_for_policy(
-            policy,
-            &doc,
-            &Url::parse("http://www1.web-platform.test:8000/x").expect("u"),
-        )
-        .expect("referrer");
-        assert_eq!(hop1, "http://web-platform.test:8000/");
-        let hop2 = referrer_for_policy(
-            policy,
-            &Url::parse(&hop1).expect("hop1"),
-            &Url::parse("http://web-platform.test:8000/x").expect("u"),
-        )
-        .expect("referrer");
-        assert_eq!(hop2, "http://web-platform.test:8000/");
-        // `no-referrer` never starts, and a determined `no referrer` stops
-        // the chain because Fetch skips the determination on it.
-        assert_eq!(
-            referrer_for_policy("no-referrer", &doc, &Url::parse("http://web-platform.test/x").expect("u")),
-            None
-        );
-        // The 4096-character cull applies before the policy switch, so even
-        // `unsafe-url` sends the origin.
-        let long = Url::parse(&format!("http://a.test/{}", "A".repeat(4200))).expect("long");
-        assert_eq!(
-            referrer_for_policy("unsafe-url", &long, &Url::parse("http://b.test/x").expect("u")),
-            Some("http://a.test/".to_owned())
-        );
-    }
+    use super::HeaderMap;
 
     #[test]
     fn insert_appends_and_set_replaces_in_place() {
@@ -407,23 +269,6 @@ mod tests {
             ["x-one", "x-two"]
         );
         assert_eq!(map.get_all("x-one").collect::<Vec<_>>(), [b"d"]);
-    }
-
-    #[test]
-    fn referrer_policy_header_uses_the_last_recognized_token() {
-        assert_eq!(
-            referrer_policy_from_header("no-referrer, origin").as_deref(),
-            Some("origin")
-        );
-        assert_eq!(
-            referrer_policy_from_header("origin, not-a-policy").as_deref(),
-            Some("origin")
-        );
-        assert_eq!(referrer_policy_from_header("not-a-policy").as_deref(), None);
-        assert_eq!(
-            referrer_policy_from_header("same-origin, , unsafe-url").as_deref(),
-            Some("unsafe-url")
-        );
     }
 
     #[test]
