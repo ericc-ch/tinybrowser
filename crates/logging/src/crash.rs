@@ -9,15 +9,8 @@
 //! The hook must not panic: every step is best-effort.
 
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::sync::OnceLock;
 
-static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-pub(crate) fn install(path: Option<PathBuf>) {
-    if let Some(path) = path {
-        let _ = LOG_PATH.set(path);
-    }
+pub(crate) fn install() {
     std::panic::set_hook(Box::new(record));
 }
 
@@ -40,13 +33,13 @@ fn record(info: &std::panic::PanicHookInfo<'_>) {
         },
     );
     let line = crate::format::record(
-        std::time::SystemTime::now(),
+        (crate::clock())(),
         crate::Level::Error,
         "panic",
         format_args!("{location} {message}"),
     );
     crate::write_console(&line);
-    if let Some(path) = LOG_PATH.get() {
+    if let Some(path) = crate::log_path() {
         append(path, &line);
     }
 }

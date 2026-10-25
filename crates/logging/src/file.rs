@@ -28,6 +28,7 @@ enum Message {
 
 pub(crate) struct FileSink {
     tx: SyncSender<Message>,
+    path: PathBuf,
 }
 
 impl FileSink {
@@ -35,12 +36,18 @@ impl FileSink {
     pub(crate) fn new(path: PathBuf) -> io::Result<Self> {
         let file = open(&path)?;
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let writer_path = path.clone();
         // The handle is dropped: the writer lives until the process exits or
         // the sink disconnects, never joined.
         thread::Builder::new()
             .name("logging-file".to_owned())
-            .spawn(move || run(&rx, &path, file, ROTATE_BYTES))?;
-        Ok(Self { tx })
+            .spawn(move || run(&rx, &writer_path, file, ROTATE_BYTES))?;
+        Ok(Self { tx, path })
+    }
+
+    /// The live log file this sink appends to.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Queues one full line; a full queue drops it.

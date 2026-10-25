@@ -19,7 +19,12 @@
 //! hook that appends the panic record straight to the log file and stderr.
 //!
 //! ```
-//! logging::install(logging::Level::Debug, None);
+//! logging::install(
+//!     logging::Level::Debug,
+//!     None,
+//!     std::time::SystemTime::now,
+//! )
+//! .expect("logger");
 //! logging::info!(target: "example", "ready");
 //! ```
 
@@ -29,9 +34,10 @@ mod format;
 
 use std::fmt;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 /// Severity of one record, ordered from most to least severe.
 ///
@@ -99,33 +105,77 @@ impl fmt::Display for ParseLevelError {
 
 impl std::error::Error for ParseLevelError {}
 
+/// A log file the process logger could not open.
+#[derive(Debug)]
+pub struct InstallError {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl fmt::Display for InstallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot open log file {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Installs the process logger: records at or above `level` go to stderr and,
 /// when `file` is given, to that file from one background writer thread. Also
 /// installs the panic hook, which writes its record synchronously instead of
 /// through the queue.
 ///
-/// A file that cannot be opened is reported on stderr and skipped; logging
-/// never takes the process down. A second install is ignored.
-pub fn install(level: Level, file: Option<PathBuf>) {
-    crash::install(file.clone());
-    let _ = LOGGER.set(Logger::new(level, file));
+/// `clock` supplies the wall time for every record, including the panic
+/// record, so a process can install a deterministic clock in tests.
+///
+/// A second install is ignored.
+///
+/// # Errors
+/// Returns [`InstallError`] when `file` cannot be opened; the composition root
+/// decides whether that is fatal.
+pub fn install(
+    level: Level,
+    file: Option<PathBuf>,
+    clock: fn() -> SystemTime,
+) -> Result<(), InstallError> {
+    if LOGGER.get().is_some() {
+        return Ok(());
+    }
+    let logger = Logger::new(level, file, clock)?;
+    if LOGGER.set(logger).is_err() {
+        return Ok(());
+    }
+    crash::install();
+    Ok(())
 }
 
 struct Logger {
     level: Level,
+    clock: fn() -> SystemTime,
     file: Option<file::FileSink>,
 }
 
 impl Logger {
-    fn new(level: Level, path: Option<PathBuf>) -> Self {
-        let file = path.and_then(|path| match file::FileSink::new(path.clone()) {
-            Ok(sink) => Some(sink),
-            Err(error) => {
-                eprintln!("logging: cannot open {}: {error}", path.display());
-                None
-            }
-        });
-        Self { level, file }
+    fn new(
+        level: Level,
+        path: Option<PathBuf>,
+        clock: fn() -> SystemTime,
+    ) -> Result<Self, InstallError> {
+        let file = path
+            .map(|path| {
+                file::FileSink::new(path.clone()).map_err(|source| InstallError { path, source })
+            })
+            .transpose()?;
+        Ok(Self { level, clock, file })
     }
 
     /// Whether a record at `level` passes the threshold.
@@ -136,12 +186,7 @@ impl Logger {
     /// Writes one record when `level` is enabled.
     fn log(&self, level: Level, target: &str, args: fmt::Arguments<'_>) {
         if self.enabled(level) {
-            self.emit(format::record(
-                std::time::SystemTime::now(),
-                level,
-                target,
-                args,
-            ));
+            self.emit(format::record((self.clock)(), level, target, args));
         }
     }
 
@@ -173,6 +218,20 @@ fn write_console(line: &str) {
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
+
+/// The installed logger's clock, read by the panic hook so both paths stamp a
+/// record the same way.
+pub(crate) fn clock() -> fn() -> SystemTime {
+    LOGGER.get().map_or(SystemTime::now, |logger| logger.clock)
+}
+
+/// The installed logger's file, read by the panic hook so the hook and the
+/// sink share one destination.
+pub(crate) fn log_path() -> Option<&'static Path> {
+    LOGGER
+        .get()
+        .and_then(|logger| logger.file.as_ref().map(file::FileSink::path))
+}
 
 /// Whether the installed logger accepts `level`; `false` when none is installed.
 #[must_use]
@@ -318,20 +377,20 @@ mod tests {
 
     #[test]
     fn threshold_filters_less_severe_records() {
-        let logger = Logger::new(Level::Info, None);
+        let logger = Logger::new(Level::Info, None, SystemTime::now).expect("logger");
         assert!(logger.enabled(Level::Error));
         assert!(logger.enabled(Level::Info));
         assert!(!logger.enabled(Level::Debug));
     }
 
     #[test]
-    fn unopenable_file_falls_back_to_console_only() {
+    fn unopenable_file_is_an_error() {
         let logger = Logger::new(
             Level::Info,
             Some(PathBuf::from("/proc/tinybrowser-cannot-exist/log")),
+            SystemTime::now,
         );
-        assert!(logger.file.is_none());
-        assert!(logger.enabled(Level::Error));
+        assert!(logger.is_err());
     }
 
     #[test]
@@ -346,7 +405,7 @@ mod tests {
 
     #[test]
     fn console_only_logger_flushes_trivially() {
-        let logger = Logger::new(Level::Info, None);
+        let logger = Logger::new(Level::Info, None, SystemTime::now).expect("logger");
         assert!(logger.flush());
     }
 }
