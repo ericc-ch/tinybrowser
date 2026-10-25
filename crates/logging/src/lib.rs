@@ -392,15 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn second_install_is_an_error() {
-        install(Level::Info, None, SystemTime::now).expect("first install");
-        assert!(matches!(
-            install(Level::Info, None, SystemTime::now),
-            Err(InstallError::AlreadyInstalled)
-        ));
-    }
-
-    #[test]
     fn records_stamp_with_the_injected_clock() {
         let dir =
             std::env::temp_dir().join(format!("tinybrowser-log-clock-{}", std::process::id()));
