@@ -28,22 +28,22 @@ Total 56.2% = pass / (tests - skip)
 
 Chrome 157 (WPT 9f868fd7) passes 892 of the 899 files that run here once
 worker variants and their generated directories are set aside; tinybrowser
-passes 885. The remaining non-worker files each need a feature this engine
-does not have:
+passes 887. Every remaining non-worker file Chrome passes needs a feature this
+engine does not have:
 
 - 2 SVG (`css-integration/svg/{external-stylesheet,processing-instruction}`):
   paint servers (`fill: url()`, `stroke: url()`) are not fetched, and this
   Servo build does not generate `filter: url()`, `marker-*`, or a computed
-  `clip-path: url()`, so 7 of the 9 paint properties in each file cannot
-  reach a request. The other four `css-integration/svg/` files fail the same
-  seven subtests and are Chrome failures too.
-- `generic/sandboxed-iframe-with-opaque-origin.html`: `iframe sandbox` is not
-  implemented (`DOMTokenList` `sandbox` and the sandboxing flag set).
+  `clip-path: url()`, so 7 of the 9 paint properties in each file cannot reach
+  a request. The other four `css-integration/svg/` files fail the same seven
+  subtests and are Chrome failures too. This is the ceiling: 891 of the 899
+  files is the most this engine can pass without a forked style engine.
 - `generic/inheritance/{iframe-inheritance-history-about-blank,
-  iframe-inheritance-javascript-child,popup-inheritance-about-blank}.html`:
-  `Location` writes (`contentWindow.location = "javascript:..."`),
-  `window.open()` popups with a real cross-window `document`, and
-  `window.open(url, "named-iframe")` targeting with child `history.back()`.
+  popup-inheritance-about-blank}.html`: `window.open()` needs a second
+  top-level browsing context whose `document`, `opener`, and storage are
+  scriptable from the opener, and the history file needs
+  `window.open(url, "named-iframe")` targeting with a child `history.back()`.
+  A renderer hosts exactly one top-level traversable today.
 - `generic/subresource-test/worker-messaging.html`: dedicated workers
   (out of the non-worker target).
 
