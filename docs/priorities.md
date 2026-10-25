@@ -100,11 +100,6 @@ Ordered by reach × current gap:
    `dom/traversal` 11.1% behind universal DOM reach; parser work stays
    in `domparsing`.
 
-referrer-policy is no longer on this list: the generated-file timeouts
-were a drain bug, not a slow path, and the non-worker suite is at 890 of
-897 files (see `docs/progress.md`). What remains there is the style-engine
-ceiling and the architectural follow-ups, not WPT points.
-
 `encoding` (68–79%) and `messaging` (82.1%) pass enough that they need
 targeted fixes, not a push.
 
