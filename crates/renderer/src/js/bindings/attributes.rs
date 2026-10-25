@@ -28,11 +28,19 @@ use crate::js::events::{
     listener_options, remove_capture, remove_listener_parsed, report_exception,
 };
 
-/// `DOMTokenList` for `Element.classList`
-/// (<https://dom.spec.whatwg.org/#interface-domtokenlist>).
+/// A `DOMTokenList` bound to one attribute of an element: `Element.classList`
+/// and `HTMLIFrameElement.sandbox` are the same interface over different
+/// attributes
+/// (<https://dom.spec.whatwg.org/#interface-domtokenlist>,
+/// <https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-sandbox>).
 #[derive(Trace, rquickjs::JsLifetime)]
 pub struct JsTokenList {
     pub(crate) element: Handle,
+    /// The content attribute whose tokens this list holds. The update steps
+    /// write the attribute, so the list must know which one it came from
+    /// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
+    #[qjs(skip_trace)]
+    pub(crate) attribute: LocalName,
 }
 
 include!(concat!(env!("OUT_DIR"), "/DOMTokenList.rs"));
@@ -53,7 +61,7 @@ impl JsTokenList {
 impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     // https://dom.spec.whatwg.org/#dom-domtokenlist-length
     fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
-        Ok(class_tokens(ctx, self.live_element(ctx)?)?.len())
+        Ok(token_list_tokens(ctx, self.live_element(ctx)?, &self.attribute)?.len())
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-value
@@ -64,7 +72,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
             .borrow()
             .document(element)
             .and_then(|parsed| {
-                crate::dom::tree::attr(&parsed.document.base, element.node, "class")
+                crate::dom::tree::attr(&parsed.document.base, element.node, self.attribute.as_ref())
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_default();
@@ -72,12 +80,17 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     }
 
     fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        write_class(ctx, self.live_element(ctx)?, &value.to_string()?)
+        write_tokens(
+            ctx,
+            self.live_element(ctx)?,
+            &self.attribute,
+            &value.to_string()?,
+        )
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-item
     fn item(&self, ctx: Ctx<'js>, index: u32) -> Result<Option<rquickjs::String<'js>>> {
-        let tokens = class_tokens(&ctx, self.live_element(&ctx)?)?;
+        let tokens = token_list_tokens(&ctx, self.live_element(&ctx)?, &self.attribute)?;
         match usize::try_from(index)
             .ok()
             .and_then(|index| tokens.get(index))
@@ -92,7 +105,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         // `contains` does not validate its argument
         // (<https://dom.spec.whatwg.org/#dom-domtokenlist-contains>).
         let token = token.to_string()?;
-        Ok(class_tokens(&ctx, self.live_element(&ctx)?)?.contains(&token))
+        Ok(token_list_tokens(&ctx, self.live_element(&ctx)?, &self.attribute)?.contains(&token))
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-add
@@ -104,7 +117,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         for token in &tokens {
             validate_token(&ctx, token)?;
         }
-        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
+        let mut current = token_list_tokens(&ctx, self.live_element(&ctx)?, &self.attribute)?;
         for token in tokens {
             if !current.contains(&token) {
                 current.push(token);
@@ -112,7 +125,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         }
         // The update steps run even when no token was added, normalizing
         // the attribute (<https://dom.spec.whatwg.org/#dom-domtokenlist-add>).
-        write_class_tokens(&ctx, self.live_element(&ctx)?, &current)
+        write_token_list(&ctx, self.live_element(&ctx)?, &self.attribute, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-remove
@@ -124,11 +137,11 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         for token in &tokens {
             validate_token(&ctx, token)?;
         }
-        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
+        let mut current = token_list_tokens(&ctx, self.live_element(&ctx)?, &self.attribute)?;
         for token in tokens {
             current.retain(|existing| existing != &token);
         }
-        write_class_tokens(&ctx, self.live_element(&ctx)?, &current)
+        write_token_list(&ctx, self.live_element(&ctx)?, &self.attribute, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-toggle
@@ -140,7 +153,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     ) -> Result<bool> {
         let token = token.to_string()?;
         validate_token(&ctx, &token)?;
-        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
+        let mut current = token_list_tokens(&ctx, self.live_element(&ctx)?, &self.attribute)?;
         let present = current.contains(&token);
         let should_be_present = force.unwrap_or(!present);
         if should_be_present != present {
@@ -149,7 +162,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
             } else {
                 current.retain(|existing| existing != &token);
             }
-            write_class_tokens(&ctx, self.live_element(&ctx)?, &current)?;
+            write_token_list(&ctx, self.live_element(&ctx)?, &self.attribute, &current)?;
         }
         Ok(should_be_present)
     }
@@ -164,7 +177,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
         let old = old.to_string()?;
         let new = new.to_string()?;
         validate_token_pair(&ctx, &old, &new)?;
-        let mut current = class_tokens(&ctx, self.live_element(&ctx)?)?;
+        let mut current = token_list_tokens(&ctx, self.live_element(&ctx)?, &self.attribute)?;
         if !current.contains(&old) {
             return Ok(false);
         }
@@ -181,7 +194,7 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
                 deduped.push(token);
             }
         }
-        write_class_tokens(&ctx, self.live_element(&ctx)?, &deduped)?;
+        write_token_list(&ctx, self.live_element(&ctx)?, &self.attribute, &deduped)?;
         Ok(true)
     }
 
@@ -196,15 +209,17 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     }
 }
 
-/// The element's class tokens: an ordered set, so duplicates collapse.
-fn class_tokens(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<String>> {
+/// The element's tokens for `attribute`: an ordered set, so duplicates
+/// collapse.
+fn token_list_tokens(ctx: &Ctx<'_>, id: NodeId, attribute: &LocalName) -> Result<Vec<String>> {
     let world = world(ctx)?;
     let mut tokens: Vec<String> = Vec::new();
     for token in world
         .borrow()
         .document(id)
         .and_then(|parsed| {
-            crate::dom::tree::attr(&parsed.document.base, id.node, "class").map(ToOwned::to_owned)
+            crate::dom::tree::attr(&parsed.document.base, id.node, attribute.as_ref())
+                .map(ToOwned::to_owned)
         })
         .unwrap_or_default()
         .split_ascii_whitespace()
@@ -254,23 +269,28 @@ fn validate_token_pair(ctx: &Ctx<'_>, old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes the token list back as the class attribute. The update steps set
-/// the attribute even when the list serializes to the empty string; when the
+/// Writes the token list back as `attribute`. The update steps set the
+/// attribute even when the list serializes to the empty string; when the
 /// attribute does not exist and the value is empty they do nothing
 /// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
-fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()> {
+fn write_token_list(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    attribute: &LocalName,
+    tokens: &[String],
+) -> Result<()> {
     if tokens.is_empty()
         && world(ctx)?.borrow().document(id).is_none_or(|parsed| {
-            crate::dom::tree::attr(&parsed.document.base, id.node, "class").is_none()
+            crate::dom::tree::attr(&parsed.document.base, id.node, attribute.as_ref()).is_none()
         })
     {
         return Ok(());
     }
-    write_class(ctx, id, &tokens.join(" "))
+    write_tokens(ctx, id, attribute, &tokens.join(" "))
 }
 
-fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
-    set_attribute_sync(ctx, id, "class", value)
+fn write_tokens(ctx: &Ctx<'_>, id: NodeId, attribute: &LocalName, value: &str) -> Result<()> {
+    set_attribute_sync(ctx, id, attribute.as_ref(), value)
 }
 
 /// One `Attr` platform object

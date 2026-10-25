@@ -1671,6 +1671,7 @@ impl JsNode {
             self.handle.0,
             JsTokenList {
                 element: self.handle,
+                attribute: markup5ever::local_name!("class"),
             },
         )?;
         let value = Class::into_value(class);

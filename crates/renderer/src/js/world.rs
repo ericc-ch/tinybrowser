@@ -141,6 +141,8 @@ impl<K: Eq + Hash> WrapperCache<K> {
 pub(crate) enum SameObject {
     /// `Element.classList`.
     ClassList,
+    /// `HTMLIFrameElement.sandbox`.
+    Sandbox,
     /// `Element.attributes`.
     Attributes,
     /// `HTMLElement.style`.
@@ -159,8 +161,9 @@ pub(crate) enum SameObject {
 
 impl SameObject {
     /// Every member, for rekeying the cache on adoption.
-    pub(crate) const ALL: [SameObject; 8] = [
+    pub(crate) const ALL: [SameObject; 9] = [
         SameObject::ClassList,
+        SameObject::Sandbox,
         SameObject::Attributes,
         SameObject::Style,
         SameObject::Dataset,
@@ -879,6 +882,46 @@ pub(crate) struct PolicyContainer {
     pub(crate) referrer_policy: Option<ReferrerPolicy>,
 }
 
+/// The sandboxing flags one `iframe` gives its documents, read from the
+/// container's `sandbox` attribute. Only the flags this engine enforces are
+/// modelled: a sandboxed origin and disabled scripting
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SandboxFlags {
+    /// Without `allow-same-origin`, every document in the frame gets a new
+    /// opaque origin
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
+    pub(crate) sandboxed_origin: bool,
+    /// Without `allow-scripts`, script elements do not execute, event handler
+    /// content attributes do not run, and a `javascript:` navigation does
+    /// nothing
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
+    pub(crate) scripting_disabled: bool,
+}
+
+impl SandboxFlags {
+    /// The flags a token list names. The attribute is a set of space-separated
+    /// ASCII case-insensitive keywords; any other token is ignored
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+    pub(crate) fn parse(attribute: Option<&str>) -> Self {
+        let Some(attribute) = attribute else {
+            return Self::default();
+        };
+        let mut flags = Self {
+            sandboxed_origin: true,
+            scripting_disabled: true,
+        };
+        for token in attribute.split_ascii_whitespace() {
+            if token.eq_ignore_ascii_case("allow-same-origin") {
+                flags.sandboxed_origin = false;
+            } else if token.eq_ignore_ascii_case("allow-scripts") {
+                flags.scripting_disabled = false;
+            }
+        }
+        flags
+    }
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -928,6 +971,10 @@ pub(crate) struct World {
     pub(crate) origin: url::Origin,
     /// This document's policy container.
     pub(crate) policy: PolicyContainer,
+    /// The sandboxing flags this frame's documents obey, from the `iframe`
+    /// `sandbox` attribute that created it
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing-flag-set>).
+    pub(crate) sandbox: SandboxFlags,
     pub(crate) history: crate::protocol::HistorySnapshot,
     /// The realm's outgoing work, drained once per turn by the document.
     pub(crate) outbox: Outbox,
@@ -1346,6 +1393,7 @@ impl World {
             document_url,
             base_url: None,
             policy: PolicyContainer::default(),
+            sandbox: SandboxFlags::default(),
             history: crate::protocol::HistorySnapshot::default(),
             outbox: Rc::new(RefCell::new(VecDeque::new())),
             queued_images: RefCell::new(HashSet::new()),

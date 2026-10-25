@@ -334,6 +334,12 @@ impl Document {
     /// A connected `<script src>` element queued its prepare steps from
     /// script; the fetch starts here.
     fn queue_dynamic_script(&mut self, element: NodeId) {
+        // Scripting is disabled in a sandboxed frame without `allow-scripts`:
+        // a script element never executes, however it was inserted
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
+        if self.world.borrow().sandbox.scripting_disabled {
+            return;
+        }
         let Some((src, started)) = self.world.borrow().with_document(element, |parsed| {
             (
                 crate::dom::tree::attr(&parsed.document.base, element.node, "src")

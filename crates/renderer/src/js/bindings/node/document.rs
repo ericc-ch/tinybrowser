@@ -605,6 +605,11 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
         self.content_document(ctx.clone())
     }
 
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-sandbox
+    fn get_sandbox(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.sandbox(ctx)
+    }
+
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
     fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.content_window(ctx.clone())
@@ -1435,6 +1440,38 @@ impl JsNode {
             }
             None => Ok(Value::new_null(ctx)),
         }
+    }
+
+    /// `HTMLIFrameElement.sandbox`: the `DOMTokenList` over the `sandbox`
+    /// content attribute. `[SameObject]` keeps one list per element, so
+    /// `iframe.sandbox === iframe.sandbox` and a mutation through one handle
+    /// shows through the other
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-sandbox>).
+    pub(super) fn sandbox<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(ctx)?;
+        if let Some(saved) = world_rc
+            .borrow()
+            .same_object(self.handle.0, SameObject::Sandbox)
+            && let Some(value) = deref_weak(ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let list = host::instance_for_node(
+            ctx,
+            self.handle.0,
+            crate::js::bindings::JsTokenList {
+                element: self.handle,
+                attribute: markup5ever::local_name!("sandbox"),
+            },
+        )?;
+        let value = rquickjs::Class::into_value(list);
+        let weak = make_weak(ctx, value.clone())?;
+        world_rc.borrow_mut().intern_same_object(
+            self.handle.0,
+            SameObject::Sandbox,
+            Persistent::save(ctx, weak),
+        );
+        Ok(value)
     }
 }
 #[allow(

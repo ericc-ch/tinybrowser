@@ -287,6 +287,15 @@ fn materialize_iframe_document(
             world.viewport_size.get(),
         )
     };
+    // The container's `sandbox` attribute decides the flag set for every
+    // document this frame loads
+    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+    let sandbox = sandboxing_flags(world_rc, container);
+    let origin = if sandbox.sandboxed_origin {
+        url::Origin::new_opaque()
+    } else {
+        origin
+    };
     let mut document = Document::with_shared(frame, &runtime, &init_scripts);
     document.set_viewport_size(viewport);
     document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
@@ -294,8 +303,12 @@ fn materialize_iframe_document(
     // chain the same way the referrer source is
     // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
     document.set_document_referrer(referrer_url.as_str());
-    let inherited = world_rc.borrow().policy.clone();
-    document.world().borrow_mut().policy = inherited;
+    {
+        let world_handle = document.world();
+        let mut world = world_handle.borrow_mut();
+        world.policy = world_rc.borrow().policy.clone();
+        world.sandbox = sandbox;
+    }
     if let Some(root) = document.document_root() {
         world_rc
             .borrow()
@@ -304,6 +317,31 @@ fn materialize_iframe_document(
             .set_frame_document(container, root);
     }
     new_frames.borrow_mut().push((frame, container, document));
+}
+
+/// The sandboxing flags the `iframe` at `container` imposes, from the
+/// `sandbox` content attribute of that element in its own document.
+fn sandboxing_flags(
+    world_rc: &Rc<RefCell<World>>,
+    container: crate::dom::tree::NodeId,
+) -> crate::js::world::SandboxFlags {
+    let world = world_rc.borrow();
+    let Some(parsed) = world.document(container) else {
+        return crate::js::world::SandboxFlags::default();
+    };
+    let base = &parsed.document.base;
+    if !crate::dom::tree::is_html_element(base, container.node, "iframe") {
+        return crate::js::world::SandboxFlags::default();
+    }
+    let attribute = crate::dom::tree::attr(base, container.node, "sandbox");
+    crate::js::world::SandboxFlags::parse(attribute)
+}
+
+/// One parse-time step over a document's element tree, in tree order.
+enum ParseStep {
+    Base(crate::dom::tree::NodeId),
+    Meta(crate::dom::tree::NodeId),
+    Script(crate::dom::tree::NodeId),
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
@@ -1084,7 +1122,8 @@ impl Document {
             return;
         };
         let blank = Url::parse("about:blank").expect("about:blank is a valid URL");
-        self.set_document_url(blank, inherited_origin);
+        let origin = self.sandboxed_origin(inherited_origin);
+        self.set_document_url(blank, origin);
         self.world.borrow_mut().base_url = Some(base);
     }
 
@@ -1130,7 +1169,8 @@ impl Document {
     ) {
         let url = Url::parse("about:srcdoc").expect("about:srcdoc parses");
         self.http_status = 0;
-        self.set_document_url(url, Some(origin));
+        let origin = self.sandboxed_origin(Some(origin));
+        self.set_document_url(url, origin);
         {
             let mut world = self.world.borrow_mut();
             world.base_url = Some(base.clone());
@@ -1204,7 +1244,9 @@ impl Document {
         source: &str,
         policy: &crate::csp::List,
     ) {
-        if script.is_empty() {
+        // A `javascript:` navigation does nothing while scripting is disabled
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
+        if script.is_empty() || self.world.borrow().sandbox.scripting_disabled {
             return;
         }
         let violations = Self::navigation_script_violations(policy, &self.url, source);
@@ -1220,6 +1262,18 @@ impl Document {
             Ok(result) if !result.is_empty() => self.load_html(&result),
             Ok(_) => {}
             Err(_) => self.record_event(RendererEvent::ScriptFailed),
+        }
+    }
+
+    /// The origin a document this frame creates gets: a new opaque origin when
+    /// the frame is sandboxed without `allow-same-origin`. Same-document URL
+    /// updates keep the origin they already have, so they bypass this
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
+    fn sandboxed_origin(&self, origin: Option<url::Origin>) -> Option<url::Origin> {
+        if self.world.borrow().sandbox.sandboxed_origin {
+            Some(url::Origin::new_opaque())
+        } else {
+            origin
         }
     }
 
@@ -1566,9 +1620,12 @@ impl Document {
         // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
         // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
         match Url::parse(&head.url) {
-            Ok(url) => self.set_document_url(url, origin),
+            Ok(url) => {
+                let origin = self.sandboxed_origin(origin);
+                self.set_document_url(url, origin);
+            }
             Err(_) => {
-                if let Some(origin) = origin {
+                if let Some(origin) = self.sandboxed_origin(origin) {
                     self.set_document_url(self.url.clone(), Some(origin));
                 }
             }
@@ -2537,6 +2594,55 @@ impl Document {
         .into_bytes()
     }
 
+    /// The document's `<base>`, referrer-policy `<meta>`, CSP `<meta>`, and
+    /// script elements in tree order: the steps a parse owes once its tree
+    /// exists. A script element only joins the walk while scripting is
+    /// enabled, so a sandboxed frame still applies its meta referrer policy
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    fn parse_steps(&self) -> Vec<ParseStep> {
+        let world = self.world.borrow();
+        let Some(parsed) = world.main_document() else {
+            return Vec::new();
+        };
+        let base = &parsed.document.base;
+        let document = parsed.id;
+        let mut steps = Vec::new();
+        let mut stack = vec![base.root_node().id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = base.get_node(id) else {
+                continue;
+            };
+            let node_id = crate::dom::tree::NodeId { document, node: id };
+            // A `<meta name=referrer>` applies its policy in the same
+            // insertion steps as a CSP meta
+            // (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+            let referrer_meta = crate::dom::tree::is_html_element(base, id, "meta")
+                && crate::dom::tree::attr(base, id, "name")
+                    .is_some_and(|name| name.eq_ignore_ascii_case("referrer"));
+            if referrer_meta || crate::csp::meta_policy(base, id).is_some() {
+                steps.push(ParseStep::Meta(node_id));
+            }
+            // A `<base href>` changes the base URL for the elements parsed
+            // after it, so the walk carries the first one it meets. A script's
+            // request URL is fixed when the parser reaches its end tag, which
+            // tree order reproduces: a `<base>` later in the document must not
+            // rewrite an earlier script's URL
+            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+            if crate::dom::tree::is_html_element(base, id, "base")
+                && crate::dom::tree::attr(base, id, "href").is_some()
+            {
+                steps.push(ParseStep::Base(node_id));
+            }
+            if crate::dom::tree::is_html_element(base, id, "script")
+                && !world.sandbox.scripting_disabled
+            {
+                steps.push(ParseStep::Script(node_id));
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        steps
+    }
+
     /// Runs every not-yet-executed script in tree order, stopping (returning
     /// true) when a `src` fetch starts: the fetch completion resumes the
     /// walk, so later scripts still run in order
@@ -2545,53 +2651,10 @@ impl Document {
     /// <https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext>
     /// <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>
     fn run_scripts(&mut self) -> bool {
-        enum Step {
-            Base(crate::dom::tree::NodeId),
-            Meta(crate::dom::tree::NodeId),
-            Script(crate::dom::tree::NodeId),
-        }
-        let steps: Vec<Step> = {
-            let world = self.world.borrow();
-            let Some(parsed) = world.main_document() else {
-                return false;
-            };
-            let base = &parsed.document.base;
-            let document = parsed.id;
-            let mut steps = Vec::new();
-            let mut stack = vec![base.root_node().id];
-            while let Some(id) = stack.pop() {
-                let Some(node) = base.get_node(id) else {
-                    continue;
-                };
-                let node_id = crate::dom::tree::NodeId { document, node: id };
-                // A `<meta name=referrer>` applies its policy in the same
-                // insertion steps as a CSP meta
-                // (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
-                let referrer_meta = crate::dom::tree::is_html_element(base, id, "meta")
-                    && crate::dom::tree::attr(base, id, "name")
-                        .is_some_and(|name| name.eq_ignore_ascii_case("referrer"));
-                if referrer_meta || crate::csp::meta_policy(base, id).is_some() {
-                    steps.push(Step::Meta(node_id));
-                }
-                // A `<base href>` changes the base URL for the elements parsed
-                // after it, so the walk carries the first one it meets. A
-                // script's request URL is fixed when the parser reaches its
-                // end tag, which tree order reproduces: a `<base>` later in
-                // the document must not rewrite an earlier script's URL
-                // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
-                if crate::dom::tree::is_html_element(base, id, "base")
-                    && crate::dom::tree::attr(base, id, "href").is_some()
-                {
-                    steps.push(Step::Base(node_id));
-                }
-                if crate::dom::tree::is_html_element(base, id, "script") {
-                    steps.push(Step::Script(node_id));
-                }
-                stack.extend(node.children.iter().rev().copied());
-            }
-            steps
-        };
-        let has_script = steps.iter().any(|step| matches!(step, Step::Script(_)));
+        let steps = self.parse_steps();
+        let has_script = steps
+            .iter()
+            .any(|step| matches!(step, ParseStep::Script(_)));
         if has_script && !self.ensure_js_ok() {
             return false;
         }
@@ -2600,7 +2663,7 @@ impl Document {
         let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         for step in steps {
             let id = match step {
-                Step::Base(id) => {
+                ParseStep::Base(id) => {
                     if !base_seen {
                         base_seen = true;
                         if let Some(href) = self.base_element_href(id) {
@@ -2609,12 +2672,12 @@ impl Document {
                     }
                     continue;
                 }
-                Step::Meta(id) => {
+                ParseStep::Meta(id) => {
                     self.apply_meta_referrer(id);
                     self.apply_meta_csp(id);
                     continue;
                 }
-                Step::Script(id) => id,
+                ParseStep::Script(id) => id,
             };
             if !self.executed_scripts.insert(id) {
                 continue;
