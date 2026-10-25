@@ -26,12 +26,10 @@
         throw new TypeError('toBlob needs a callback');
       }
       // `type` converts to a string once, in the renderer, which returns the
-      // encoding it settled on.
-      const { bytes, type: mime } = globalThis.__tbCanvasToBlobBytes(this, type, quality);
-      // The renderer returns no bytes for a zero-sized canvas; the spec asks
-      // for null rather than an empty Blob.
-      const blob = bytes.length === 0 ? null : new Blob([new Uint8Array(bytes)], { type: mime });
-      setTimeout(() => callback(blob), 0);
+      // encoding it settled on. `null` is the spec's encoding-failure result.
+      const blob = globalThis.__tbCanvasToBlobBytes(this, type, quality);
+      const result = blob === null ? null : new Blob([blob.bytes], { type: blob.type });
+      setTimeout(() => callback(result), 0);
     },
   });
 })();

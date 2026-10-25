@@ -1328,14 +1328,17 @@ pub(crate) struct ImageState {
     /// Elements whose current request already dispatched its `error` event,
     /// so a later scan does not repeat it.
     pub(crate) error_reported: HashSet<NodeId>,
-    /// Elements whose settled request is origin-clean for canvas: the
-    /// response URL after redirects is same-origin with the document, or the
-    /// request loaded through a CORS check (`crossorigin` content attribute;
-    /// the network refuses a CORS-mode load without a valid
-    /// `Access-Control-Allow-Origin`). Every other settled load taints the
-    /// canvas
+    /// Whether each element's displayed request is origin-clean for canvas.
+    /// The entry belongs to the *current* request: a `src` change starts a
+    /// pending request but leaves the old pixels on screen, so the bit moves
+    /// only when the new request settles
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-    pub(crate) origin_clean: HashSet<NodeId>,
+    pub(crate) origin_clean: HashMap<NodeId, bool>,
+    /// Taint of the last settled request for a URL, keyed by the request URL.
+    /// Blitz can hand an element already-decoded pixels from its cache, with
+    /// no delivery for that element; this is where the taint for that URL
+    /// survives. Cleared with the document.
+    pub(crate) url_taint: HashMap<String, bool>,
 }
 
 impl ImageState {
@@ -1348,6 +1351,7 @@ impl ImageState {
         self.broken.clear();
         self.error_reported.clear();
         self.origin_clean.clear();
+        self.url_taint.clear();
     }
 }
 
@@ -2599,9 +2603,13 @@ impl World {
         self.input_files.get(&id).map(Vec::as_slice)
     }
 
-    /// Starts a fetch for `url`. If the current request is still available,
-    /// keep its pixels and `currentSrc` until this request commits
-    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    /// Starts a `src` update for `url`. The stale image data stays on the
+    /// element so layout keeps painting it, but the current request is now
+    /// unavailable: `drawImage` and `naturalWidth` see nothing until it
+    /// settles, and the canvas taint belongs to the new request, not the old
+    /// pixels
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
+    /// <https://html.spec.whatwg.org/multipage/images.html#img-not-fully-decodable>).
     pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
         self.images.loading.insert(element);
         self.images.broken.remove(&element);
@@ -2612,19 +2620,22 @@ impl World {
         }
     }
 
-    /// Records Blitz's decoded dimensions for `element`'s current request.
+    /// Records Blitz's decoded dimensions and canvas taint for `element`'s
+    /// current request.
     pub(crate) fn store_image_dims(
         &mut self,
         element: NodeId,
         width: u32,
         height: u32,
         url: String,
+        origin_clean: bool,
     ) {
         self.images.loading.remove(&element);
         self.images.broken.remove(&element);
         self.images.sizes.remove(&element);
         self.images.current_src.insert(element, url);
         self.images.sizes.insert(element, (width, height));
+        self.images.origin_clean.insert(element, origin_clean);
     }
 
     /// The current request finished without usable pixels. `url` is the
@@ -2634,6 +2645,7 @@ impl World {
         self.images.loading.remove(&element);
         self.images.sizes.remove(&element);
         self.images.current_src.insert(element, url);
+        self.images.origin_clean.insert(element, false);
         self.images.broken.insert(element);
     }
 
@@ -2661,19 +2673,6 @@ impl World {
         self.images.error_reported.remove(&element);
         self.images.origin_clean.remove(&element);
         self.images.sizes.remove(&element);
-    }
-
-    /// Whether a settled image response is same-origin with this document.
-    /// The response URL after redirects decides, not the URL the author
-    /// wrote. A `data:` image is clean, like in browsers, and a URL that does
-    /// not parse is cross-origin
-    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>,
-    /// <https://fetch.spec.whatwg.org/#concept-response-cors-same-origin>).
-    pub(crate) fn image_response_is_same_origin(&self, response_url: &str) -> bool {
-        let Ok(url) = Url::parse(response_url) else {
-            return false;
-        };
-        url.scheme() == "data" || self.origin == url.origin()
     }
 
     pub(crate) fn clear_images(&mut self) {

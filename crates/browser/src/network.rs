@@ -258,6 +258,7 @@ fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOut
     merged.status = 200;
     merged.final_url = response.final_url().to_string();
     merged.referrer = response.referrer().map(ToString::to_string);
+    merged.crossed_origin = response.crossed_origin();
     for (name, value) in response.headers().iter() {
         let value = isomorphic_decode(value);
         if let Some((_, existing)) = merged
@@ -598,6 +599,7 @@ impl TabNetworkHandle {
             // headers (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
             let status_text = response.status_text().to_owned();
             let referrer = response.referrer().map(ToString::to_string);
+            let crossed_origin = response.crossed_origin();
             let body = read_response_body(request, response, response_type).await?;
             Ok(DialOutcome {
                 status: if response_type.is_opaque() { 0 } else { status },
@@ -614,6 +616,7 @@ impl TabNetworkHandle {
                 headers,
                 body,
                 response_type,
+                crossed_origin,
                 redirect_count,
                 referrer,
                 stream: None,
@@ -699,6 +702,7 @@ impl TabNetworkHandle {
             headers,
             body: Ok(Vec::new()),
             response_type,
+            crossed_origin: response.crossed_origin(),
             redirect_count: response.redirect_count(),
             referrer: response.referrer().map(ToString::to_string),
             stream: None,
@@ -1361,6 +1365,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         headers: Vec::new(),
         body: Ok(Vec::new()),
         response_type: net::cors::ResponseType::Basic,
+        crossed_origin: false,
         redirect_count: 0,
         referrer: None,
         stream: None,
@@ -1487,6 +1492,7 @@ mod tests {
                 headers: Vec::new(),
                 body: Ok(Vec::new()),
                 response_type,
+                crossed_origin: false,
                 redirect_count: 0,
                 referrer: None,
                 stream: None,

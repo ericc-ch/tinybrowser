@@ -661,6 +661,12 @@ pub struct DialOutcome {
     /// same-origin and subresource responses.
     #[serde(default)]
     pub response_type: net::cors::ResponseType,
+    /// Whether any redirect hop's URL origin differed from the request origin.
+    /// A `no-cors` request that crosses an origin gets an opaque response and
+    /// never returns to basic, so this is the taint a subresource keeps
+    /// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>).
+    #[serde(default)]
+    pub crossed_origin: bool,
     /// Redirect hops followed before this response.
     #[serde(default)]
     pub redirect_count: u32,
@@ -694,6 +700,7 @@ impl DialOutcome {
             headers,
             body: Ok(body),
             response_type: net::cors::ResponseType::Basic,
+            crossed_origin: false,
             redirect_count: 0,
             referrer: None,
             stream: None,

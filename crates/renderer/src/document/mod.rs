@@ -486,6 +486,24 @@ enum ParseStep {
     Script(crate::dom::tree::NodeId),
 }
 
+/// What settled an image request: a response, or a failure with no usable
+/// pixels.
+#[derive(Clone, Copy)]
+enum ImageSettle {
+    /// The response arrived and decoded; `origin_clean` is its canvas taint.
+    Loaded { origin_clean: bool },
+    /// The request failed; the element's current request becomes broken.
+    Failed,
+}
+
+/// Raw subresource bytes by URL, with the canvas taint the response settled
+/// with, so a repeat Blitz fetch for a URL reuses both instead of dialing.
+#[derive(Clone)]
+struct SubresourceBody {
+    bytes: Vec<u8>,
+    origin_clean: bool,
+}
+
 /// One document: tree, task list, `QuickJS` realm, and browser services.
 #[expect(
     clippy::struct_excessive_bools,
@@ -512,9 +530,9 @@ pub(crate) struct Document {
     /// Request URL for each filed Blitz handler, so an image delivery settles
     /// the `<img>` waiters selected for that URL.
     blitz_request_urls: HashMap<u64, String>,
-    /// Raw subresource bytes by URL, so a repeat Blitz fetch for a URL reuses
-    /// bytes instead of dialing again.
-    subresource_bytes: HashMap<String, Vec<u8>>,
+    /// Subresource bodies by URL, with the canvas taint each settled with, so
+    /// a repeat Blitz fetch for a URL reuses both instead of dialing again.
+    subresource_bytes: HashMap<String, SubresourceBody>,
     /// Referrer policy each fetched CSS style sheet's response carried, keyed
     /// by the URL the sheet was located at. A request the sheet initiates uses
     /// it and the sheet's URL, not the document's own
@@ -3414,12 +3432,22 @@ impl Document {
                 self.response_url_blocked(&outcome.final_url, request_url, destination, None)
             });
         let body = outcome.body.as_ref().ok();
-        if !blocked
-            && (200..300).contains(&outcome.status)
-            && let Some(body) = body
-        {
-            self.subresource_bytes
-                .insert(outcome.final_url.clone(), body.clone());
+        let succeeded = !blocked && (200..300).contains(&outcome.status) && body.is_some();
+        // A `no-cors` image stays clean only while the request stays on this
+        // origin; one cross-origin hop makes the response opaque for the rest
+        // of the chain, even if it redirects back. A `crossorigin` image that
+        // arrived passed its CORS check
+        // (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>,
+        // <https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+        let origin_clean = cors_clean || !outcome.crossed_origin;
+        if succeeded && let Some(body) = body {
+            self.subresource_bytes.insert(
+                outcome.final_url.clone(),
+                SubresourceBody {
+                    bytes: body.clone(),
+                    origin_clean,
+                },
+            );
         }
         // A style sheet's response is the policy source for every request the
         // sheet initiates: its own `Referrer-Policy` when it sent one, else the
@@ -3455,7 +3483,19 @@ impl Document {
             return;
         };
         let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
-        if blocked || body.is_none() {
+        if succeeded {
+            Box::new(handler).bytes(
+                outcome.final_url.clone(),
+                blitz_traits::net::Bytes::from(body.cloned().unwrap_or_default()),
+            );
+            if destination == Some(crate::csp::Destination::Img) {
+                self.world
+                    .borrow_mut()
+                    .images
+                    .url_taint
+                    .insert(request_url.clone(), origin_clean);
+            }
+        } else {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
             let element = Url::parse(&request_url)
                 .ok()
@@ -3469,17 +3509,19 @@ impl Document {
                     self.tasks.push_back(Task::NodeError(element));
                 }
             }
-        } else {
-            Box::new(handler).bytes(
-                outcome.final_url.clone(),
-                blitz_traits::net::Bytes::from(body.cloned().unwrap_or_default()),
-            );
         }
         // The arrival changes style or layout; apply it now so the tree is
         // current for the next capture instead of waiting for one to pump
         // the resolve loop.
         self.settle_blitz_layout();
-        self.settle_image_waiters(&request_url, &outcome.final_url, cors_clean);
+        self.settle_image_waiters(
+            &request_url,
+            if succeeded {
+                ImageSettle::Loaded { origin_clean }
+            } else {
+                ImageSettle::Failed
+            },
+        );
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
@@ -3536,7 +3578,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&request_url, &request_url, false);
+                    self.settle_image_waiters(&request_url, ImageSettle::Failed);
                 }
             }
         }
@@ -3815,17 +3857,29 @@ impl Document {
     fn drain_blitz_fetches(&mut self) {
         while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
             let url = fetch.url.as_str().to_owned();
-            if let Some(bytes) = self.subresource_bytes.get(&url).cloned() {
-                Box::new(handler).bytes(url.clone(), blitz_traits::net::Bytes::from(bytes));
+            let destination = subresource_destination(fetch.kind);
+            if let Some(cached) = self.subresource_bytes.get(&url).cloned() {
+                Box::new(handler).bytes(url.clone(), blitz_traits::net::Bytes::from(cached.bytes));
+                if destination == Some(crate::csp::Destination::Img) {
+                    self.world
+                        .borrow_mut()
+                        .images
+                        .url_taint
+                        .insert(url.clone(), cached.origin_clean);
+                }
                 self.settle_blitz_layout();
-                self.settle_image_waiters(&url, &url, false);
+                self.settle_image_waiters(
+                    &url,
+                    ImageSettle::Loaded {
+                        origin_clean: cached.origin_clean,
+                    },
+                );
                 continue;
             }
             // Per-destination policy: a blocked stylesheet, image, or font is
             // never dialed; the handler receives empty bytes so Blitz
             // releases the resource as failed
             // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
-            let destination = subresource_destination(fetch.kind);
             let element = self.subresource_target(&fetch.url);
             if let Some(destination) = destination {
                 let violations = self.subresource_violations(&fetch.url, destination);
@@ -3851,7 +3905,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&url, &url, false);
+                    self.settle_image_waiters(&url, ImageSettle::Failed);
                     continue;
                 }
             }
@@ -4097,6 +4151,7 @@ impl Document {
         element: crate::dom::tree::NodeId,
         update: ImageUpdate,
     ) {
+        let inserted = matches!(update, ImageUpdate::Inserted);
         match update {
             ImageUpdate::Inserted
                 if self.in_flight_images.contains_key(&element)
@@ -4145,11 +4200,36 @@ impl Document {
         self.world
             .borrow_mut()
             .begin_image(element, selected.clone());
-        if let Some((width, height)) = self.blitz_image_dims(element) {
+        // A fresh element can already have pixels: Blitz answers an insertion
+        // from its image cache before the lifecycle scan reaches it. A `src`
+        // change cannot use the same shortcut, because the node still holds
+        // the previous request's pixels and Blitz does not say which URL they
+        // belong to; that request settles through its dial instead.
+        if inserted && let Some((width, height)) = self.blitz_image_dims(element) {
             self.image_selected_src.remove(&element);
-            self.world
-                .borrow_mut()
-                .store_image_dims(element, width, height, selected);
+            // Blitz can hand back pixels it decoded before this element had a
+            // waiter (a delivery that beat the scan, or its image cache). The
+            // taint recorded for the URL covers the first case; a URL with no
+            // record that stays on this origin never crossed one.
+            let origin_clean = {
+                let world = self.world.borrow();
+                world
+                    .images
+                    .url_taint
+                    .get(&selected)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        Url::parse(&selected)
+                            .is_ok_and(|url| url.scheme() == "data" || url.origin() == world.origin)
+                    })
+            };
+            self.world.borrow_mut().store_image_dims(
+                element,
+                width,
+                height,
+                selected,
+                origin_clean,
+            );
             self.tasks.push_back(Task::NodeLoad(element));
             return;
         }
@@ -4171,19 +4251,12 @@ impl Document {
         }
     }
 
-    /// Settles the in-flight image elements waiting on `url`: decoded
-    /// dimensions fire `load`, anything else fires `error`. `response_url` is
-    /// the settled response's URL after redirects; the elements it belongs to
-    /// become origin-clean for canvas when that URL is same-origin with this
-    /// document, or when `cors_clean` says the request went out in CORS mode
-    /// and survived the check
-    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-    fn settle_image_waiters(&mut self, url: &str, response_url: &str, cors_clean: bool) {
-        let same_origin = self
-            .world
-            .borrow()
-            .image_response_is_same_origin(response_url);
-        let origin_clean = cors_clean || same_origin;
+    /// Settles the in-flight image elements waiting on `url`. `settle` carries
+    /// the taint decision for a delivered response, or `Failed` when the
+    /// request never produced pixels; decoded dimensions fire `load`, anything
+    /// else fires `error`
+    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
+    fn settle_image_waiters(&mut self, url: &str, settle: ImageSettle) {
         let waiting: Vec<crate::dom::tree::NodeId> = self
             .in_flight_images
             .keys()
@@ -4197,13 +4270,18 @@ impl Document {
         for element in &waiting {
             self.in_flight_images.remove(element);
             let selected = self.image_selected_src.remove(element).unwrap_or_default();
-            if origin_clean {
-                self.world.borrow_mut().images.origin_clean.insert(*element);
-            }
             if let Some((width, height)) = self.blitz_image_dims(*element) {
-                self.world
-                    .borrow_mut()
-                    .store_image_dims(*element, width, height, selected);
+                let origin_clean = match settle {
+                    ImageSettle::Loaded { origin_clean } => origin_clean,
+                    ImageSettle::Failed => false,
+                };
+                self.world.borrow_mut().store_image_dims(
+                    *element,
+                    width,
+                    height,
+                    selected,
+                    origin_clean,
+                );
                 self.fire_js(|js| js.fire_node_load(*element));
             } else {
                 self.world.borrow_mut().fail_image(*element, selected);

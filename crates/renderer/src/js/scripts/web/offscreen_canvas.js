@@ -169,17 +169,17 @@
         return Promise.reject(new TypeError('options must be an object'));
       }
       try {
-        const { bytes, type: mime } = globalThis.__tbCanvasToBlobBytes(
+        const blob = globalThis.__tbCanvasToBlobBytes(
           state.canvas,
           options ? options.type : undefined,
           options ? options.quality : undefined,
         );
-        if (bytes.length === 0) {
+        if (blob === null) {
           return Promise.reject(
             new DOMException('the OffscreenCanvas could not be serialized', 'IndexSizeError'),
           );
         }
-        return Promise.resolve(new Blob([new Uint8Array(bytes)], { type: mime }));
+        return Promise.resolve(new Blob([blob.bytes], { type: blob.type }));
       } catch (error) {
         return Promise.reject(error);
       }
