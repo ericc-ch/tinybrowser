@@ -38,11 +38,12 @@ a browser that implements the mapping algorithm.
 
 ## Missing surfaces
 
-No workers or service-workers. Canvas `getContext` returns a same-object
-2d or bitmaprenderer object limited to `fillRect` and `getImageData`;
-WebGL returns null. Sync XHR is rejected, customized built-in elements
-are rejected. Shadow-scoped styles and composed-event retargeting are
-upstream gaps (docs/upstream.md).
+No workers or service-workers. Canvas `getContext` returns a working 2D
+context (paths, text, gradients, patterns, filters, layers); the
+`bitmaprenderer` context exists but transfers nothing until `ImageBitmap`
+decoding lands; WebGL returns null. Sync XHR is rejected, customized
+built-in elements are rejected. Shadow-scoped styles and composed-event
+retargeting are upstream gaps (docs/upstream.md).
 
 `Request` exposes `blob()` only of the body-consumption methods; `text`,
 `json`, `arrayBuffer`, and `bytes` are missing. A `text/plain` document

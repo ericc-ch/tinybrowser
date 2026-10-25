@@ -80,28 +80,30 @@ Sources:
 
 Ordered by reach × current gap:
 
-1. **referrer-policy** — 66.6% reach against 16.5% WPT, the widest gap
-   left in P0. 592 of its 1392 files time out, so the first work item is
-   the generated-file path that cannot finish inside the budget.
-2. **css layout + cssom** — standing workstream, not one push:
+1. **css layout + cssom** — standing workstream, not one push:
    `display` 93.2%, `matchMedia()` 66.2%, `getBoundingClientRect()`
    71.0% against 44.1% for css; `css/cssom-view` 17.1%, `css/cssom`
    29.5%.
-3. **cookies** — read on 78.7% of pages against 32.6% WPT. SameSite,
+2. **cookies** — read on 78.7% of pages against 32.6% WPT. SameSite,
    partitioned cookies, and `CookieStore` (11.9%, 0/48).
-4. **csp** — 68.9% reach against 26.6%. A response-header path with a
+3. **csp** — 68.9% reach against 26.6%. A response-header path with a
    small surface.
-5. **fetch** — 72.7% reach against 34.8%. The Body/Headers/stream
+4. **fetch** — 72.7% reach against 34.8%. The Body/Headers/stream
    rewrite took `fetch/api` from 26.2% to 71.8%; what remains is
    `sendBeacon()` (52.6% of pages, still 0/16), `fetch/metadata` 1/87,
    `fetch/h1-parsing` 1/20, and `fetch/http-cache` 1/15.
-6. **html forms and semantics** — 81.0% of pages have a form; html is
+5. **html forms and semantics** — 81.0% of pages have a form; html is
    46.7%, but `html/semantics` is 32.2% and `html/webappapis` 20.4%.
    Controls, submission, and script/timer plumbing.
-7. **selectors** — 84.2% reach against `css/selectors` 51.0%.
-8. **dom parsing and events** — `dom/events` 28.0% and
+6. **selectors** — 84.2% reach against `css/selectors` 51.0%.
+7. **dom parsing and events** — `dom/events` 28.0% and
    `dom/traversal` 11.1% behind universal DOM reach; parser work stays
    in `domparsing`.
+
+referrer-policy is no longer on this list: the generated-file timeouts
+were a drain bug, not a slow path, and the non-worker suite is at 890 of
+897 files (see `docs/progress.md`). What remains there is the style-engine
+ceiling and the architectural follow-ups, not WPT points.
 
 `encoding` (68–79%) and `messaging` (82.1%) pass enough that they need
 targeted fixes, not a push.
