@@ -7,6 +7,7 @@ Policy: upstream bugs stay upstream. Our code stays simple; these fail closed as
 ### blitz (third_party/blitz, master)
 
 - e92ec16af respond to an image request under the URL it was made with, not the response URL. `pending_images` is keyed by the request URL, so a redirected delivery never matched and the image stayed pending forever. Stylesheets keep the resolved URL, which is the response URL their origin-clean check needs.
+- da340bdd0 load style sheets from `xml-stylesheet` processing instructions. A `<?xml-stylesheet?>` instruction names a sheet exactly as `<link rel=stylesheet>` does, and an HTML tree keeps the instruction for compatibility with XML-authored sheets (`https://www.w3.org/TR/xml-stylesheet/`), so it has to load. The instruction owns its sheet without element storage, so the owner map records it and the unload path updates the stylist directly.
 - 46d832aab give a style sheet's requests the sheet's referrer and policy. A resource a sheet references sends the sheet's URL as its referrer and applies the sheet response's `Referrer-Policy`, not the document's (`https://w3c.github.io/webappsec-referrer-policy/#integration-with-css`). `Request` carries the sheet URL, and the loaders thread each sheet's location through parsing, `@import` nesting, and `@font-face` fetches.
 
 The BMP decode feature is not a fork change: which formats an engine carries is the embedder's compile-time choice, enabled through `crates/renderer`'s `image` dependency and unified here (commit 095af30a2 reverts the fork's own toggle).

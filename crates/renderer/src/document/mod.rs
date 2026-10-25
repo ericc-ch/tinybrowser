@@ -973,6 +973,78 @@ impl Document {
         self.world.borrow_mut().forget_image(element);
     }
 
+    /// Queues one dial after applying CSP `upgrade-insecure-requests` to it.
+    ///
+    /// The rewrite happens at the top of main fetch, before the request leaves
+    /// the renderer: an `http` request URL becomes `https`, and an explicit
+    /// `http` referrer follows. A nested navigation always upgrades because
+    /// the embedder's security state depends on it; a top-level navigation
+    /// upgrades only a host in the document's upgrade set, which is the
+    /// protected resource's own host and port. Every other request upgrades
+    /// unconditionally
+    /// (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
+    fn queue_dial(&mut self, mut dial: QueuedDial) {
+        if self.world.borrow().policy.csp.upgrades_insecure_requests() {
+            let nested = matches!(dial.context, DialContext::FrameLoad { embedder: Some(_) });
+            let upgrades = if dial.req.kind == crate::protocol::DialKind::FrameLoad && !nested {
+                // A top-level navigation must target the protected resource's
+                // own host and port, so a policy cannot upgrade a link to a
+                // third party
+                // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
+                Self::same_host_port(&dial.req.url, self.url.as_str())
+            } else {
+                true
+            };
+            if upgrades {
+                Self::upgrade_scheme(&mut dial.req.url);
+                if let net::Referrer::Url(url) = &mut dial.req.referrer
+                    && url.scheme() == "http"
+                {
+                    let _ = url.set_scheme("https");
+                }
+            }
+        }
+        // A navigation request advertises the client's upgrade capability so a
+        // server can feature-detect it
+        // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-requests-http-request-header-field>).
+        if dial.req.kind == crate::protocol::DialKind::FrameLoad
+            && !dial
+                .req
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("upgrade-insecure-requests"))
+        {
+            dial.req
+                .headers
+                .push(("Upgrade-Insecure-Requests".to_owned(), "1".to_owned()));
+        }
+        self.dials.queue(dial, &self.load_delay);
+    }
+
+    /// Whether `left` and `right` name the same host and port
+    /// (<https://url.spec.whatwg.org/#concept-url-host>).
+    fn same_host_port(left: &str, right: &str) -> bool {
+        let (Ok(left), Ok(right)) = (Url::parse(left), Url::parse(right)) else {
+            return false;
+        };
+        left.host_str() == right.host_str()
+            && left.port_or_known_default() == right.port_or_known_default()
+    }
+
+    /// Rewrites one serialized URL's scheme from `http` to `https`, leaving
+    /// every other scheme alone.
+    fn upgrade_scheme(spec: &mut String) {
+        let Ok(mut url) = Url::parse(spec) else {
+            return;
+        };
+        if url.scheme() != "http" {
+            return;
+        }
+        if url.set_scheme("https").is_ok() {
+            *spec = url.to_string();
+        }
+    }
+
     /// Starts one frame-load dial. `req` is the wire request, with the method,
     /// body, `Content-Type`, referrer, and the embedder's `frame-src` redirect
     /// gate already on it; `ancestors` are the ancestor URLs the child
@@ -989,15 +1061,12 @@ impl Document {
         req.read_body = true;
         self.dials.cancel_frame_loads();
         self.initial_blank = false;
-        self.dials.queue(
-            QueuedDial {
-                context: DialContext::FrameLoad { embedder },
-                req,
-                ancestors,
-                integrity: None,
-            },
-            &self.load_delay,
-        );
+        self.queue_dial(QueuedDial {
+            context: DialContext::FrameLoad { embedder },
+            req,
+            ancestors,
+            integrity: None,
+        });
     }
 
     /// Gives a blank document the URL `about:blank` and the creator's base
@@ -2420,7 +2489,7 @@ impl Document {
         "POST".clone_into(&mut dial.req.method);
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
     }
 
     /// The Reporting API envelope for a violation, with the
@@ -2653,7 +2722,7 @@ impl Document {
             self.redirect_gate(crate::csp::Destination::Script),
         ));
         dial.integrity = self.script_integrity(id);
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
         true
     }
 
@@ -3452,7 +3521,7 @@ impl Document {
                 });
             }
             dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
-            self.dials.queue(dial, &self.load_delay);
+            self.queue_dial(dial);
         }
     }
 

@@ -372,7 +372,7 @@ impl Document {
         // the set of scripts that will execute as soon as possible, and
         // `load` waits for that set to drain
         // (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
     }
 
     fn fail_js_fetch(&mut self, js_id: i32) {
@@ -431,7 +431,7 @@ impl Document {
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
     }
 
     fn due_timer(&mut self) -> Option<u32> {
