@@ -27,7 +27,9 @@ use crate::js::Stop;
 pub const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
 
 use crate::documents::DocumentStore;
-use crate::js::{FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime};
+use crate::js::{
+    FrameNavigation, NavigationTarget, PolicyContainer, RealmRegistry, SharedJsRuntime,
+};
 use crate::messaging::{Delivery, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError};
 use crate::storage::PendingStorageEvent;
@@ -117,16 +119,14 @@ impl Engine {
                         .get(&parent)
                         .and_then(|document| document.frame_src(container));
                     if let Some(src) = src {
-                        let navigation = FrameNavigation::get(
-                            NavigationTarget::Container(container),
-                            src,
-                        )
-                        .with_referrer_policy(
-                            self.frames
-                                .get(&parent)
-                                .map(|document| document.frame_referrer_policy(container))
-                                .unwrap_or_default(),
-                        );
+                        let navigation =
+                            FrameNavigation::get(NavigationTarget::Container(container), src)
+                                .with_referrer_policy(
+                                    self.frames
+                                        .get(&parent)
+                                        .map(|document| document.frame_referrer_policy(container))
+                                        .unwrap_or_default(),
+                                );
                         self.navigate_frame(child, parent, &navigation);
                     }
                 }
@@ -184,6 +184,10 @@ impl Engine {
         self.remove_descendants(frame);
         let document = self.frame_mut(frame)?;
         document.set_history(&head.history);
+        // A browser-initiated navigation has no source document, so the new
+        // document reports no referrer
+        // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+        document.set_document_referrer("");
         document.install_head(head, None);
         Ok(())
     }
@@ -439,11 +443,13 @@ impl Engine {
                 if std::time::Instant::now() >= deadline {
                     return self.has_ready_work();
                 }
-                let more = match self.frames.get_mut(&frame) {
-                    Some(document) => document.drain_step(),
-                    None => false,
-                };
-                if more {
+                let step = self
+                    .frames
+                    .get_mut(&frame)
+                    .map_or_else(crate::document::DrainStep::default, |document| {
+                        document.drain_step()
+                    });
+                if step.ran || step.more {
                     ran = true;
                     self.reconcile_frames();
                 }
@@ -755,49 +761,44 @@ impl Engine {
         }
     }
 
-    /// The referrer a navigation sends, with the policy the network
-    /// re-determines from on every redirect hop: the navigating element's
-    /// policy when it names one, the initiator document's otherwise
+    /// The request referrer and policy a navigation sends: the navigating
+    /// element's policy when it names one, the initiator document's otherwise.
+    /// The client environment resolves the source in the browser
     /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>,
     /// <https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
     fn navigation_referrer(
         &self,
         initiator: FrameId,
-        policy: &str,
-        url: &Url,
-    ) -> (Option<String>, Option<String>) {
-        self.frames
-            .get(&initiator)
-            .map(|document| {
+        policy: Option<net::ReferrerPolicy>,
+    ) -> (net::Referrer, net::ReferrerPolicy) {
+        match self.frames.get(&initiator) {
+            Some(document) => {
                 let world = document.world();
                 let world = world.borrow();
-                let source = world.base_url.as_ref().unwrap_or(&world.document_url);
-                let policy = if policy.is_empty() {
-                    world.state.referrer_policy.clone()
-                } else {
-                    policy.to_owned()
-                };
-                let referrer = crate::js::referrer_for_policy(&policy, source, url.as_str());
-                (referrer, (!policy.is_empty()).then_some(policy))
-            })
-            .unwrap_or((None, None))
+                (
+                    net::Referrer::Client,
+                    policy.or(world.policy.referrer_policy).unwrap_or_default(),
+                )
+            }
+            None => (net::Referrer::NoReferrer, policy.unwrap_or_default()),
+        }
     }
 
     /// The policy a local-scheme document inherits from its initiator
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
-    fn inherited_policy(&self, parent: FrameId) -> crate::csp::List {
+    fn inherited_policy(&self, parent: FrameId) -> PolicyContainer {
         self.frames
             .get(&parent)
-            .map(|document| document.world().borrow().csp.clone())
+            .map(|document| document.world().borrow().policy.clone())
             .unwrap_or_default()
     }
 
     /// Gives a frame's freshly installed local-scheme document the
-    /// initiator's policy.
+    /// initiator's policy container.
     fn inherit_policy(&self, child: FrameId, parent: FrameId) {
         let policy = self.inherited_policy(parent);
         if let Some(document) = self.frames.get(&child) {
-            document.world().borrow_mut().csp = policy;
+            document.world().borrow_mut().policy = policy;
         }
     }
 
@@ -807,6 +808,7 @@ impl Engine {
         let inherited = self.frames.get(&parent).map(|document| {
             (
                 document.inherited_url(),
+                document.referrer_url().to_string(),
                 document.world().borrow().origin.clone(),
             )
         });
@@ -822,7 +824,10 @@ impl Engine {
             return;
         };
         match inherited {
-            Some((url, origin)) => document.load_about_blank(Some(&url), Some(origin)),
+            Some((url, referrer, origin)) => {
+                document.load_about_blank(Some(&url), Some(origin));
+                document.set_document_referrer(&referrer);
+            }
             None => document.load_about_blank(Some("about:blank"), None),
         }
         self.inherit_policy(child, parent);
@@ -878,7 +883,7 @@ impl Engine {
             };
             let world = document.world();
             let world = world.borrow();
-            world.csp.check_request(
+            world.policy.csp.check_request(
                 &world.origin,
                 &world.document_url,
                 url,
@@ -955,20 +960,27 @@ impl Engine {
             "javascript" => self.load_javascript_frame_url(child, initiator, url),
             "blob" => self.load_blob_frame(child, initiator, url),
             "http" | "https" => {
-                // The document the navigation started from, which supplies the
-                // request's initiator.
-                let source = self
-                    .frames
-                    .get(&initiator)
-                    .and_then(|document| Url::parse(document.document_url()).ok())
-                    .unwrap_or_else(|| url.clone());
+                // The document the navigation started from supplies both the
+                // authorized origin and the client URL. The origin is
+                // inherited, not derived from the document URL: an
+                // `about:srcdoc` document has no HTTP URL of its own
+                // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+                let (origin, referrer_url) = self.frames.get(&initiator).map_or_else(
+                    || (url.origin(), url.to_string()),
+                    |document| {
+                        (
+                            document.dial_initiator(),
+                            document.referrer_url().to_string(),
+                        )
+                    },
+                );
                 // Top-level navigations send the source document's referrer
                 // like subresource requests do; without this every
                 // navigation is a no-referrer navigation regardless of
                 // policy
                 // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
                 let (referrer, referrer_policy) =
-                    self.navigation_referrer(initiator, &navigation.referrer_policy, url);
+                    self.navigation_referrer(initiator, navigation.referrer_policy);
                 // The embedder's `frame-src` gate re-checks every redirect hop,
                 // and the ancestor URLs back the child response's
                 // `frame-ancestors` check at commit — both only when the
@@ -990,7 +1002,8 @@ impl Engine {
                         crate::protocol::DialRequest {
                             kind: crate::protocol::DialKind::FrameLoad,
                             url: url.to_string(),
-                            initiator: source.to_string(),
+                            initiator: origin.ascii_serialization(),
+                            referrer_url,
                             // The frame's document always reads the body.
                             read_body: true,
                             method: navigation.method.clone(),
@@ -1050,7 +1063,7 @@ impl Engine {
         let policy = self
             .frames
             .get(&initiator)
-            .map(|document| document.world().borrow().csp.clone())
+            .map(|document| document.world().borrow().policy.csp.clone())
             .unwrap_or_default();
         if let Some(document) = self.frames.get_mut(&child) {
             if initial {
@@ -1072,25 +1085,25 @@ impl Engine {
             let world = world.borrow();
             (
                 document.base_url(),
+                world.referrer_url.clone(),
                 world.origin.clone(),
-                world.state.referrer_policy.clone(),
+                world.policy.clone(),
             )
         });
-        let policy = self.inherited_policy(parent);
         let Some(document) = self.frames.get_mut(&child) else {
             return;
         };
-        match inherited {
-            Some((base, origin, referrer_policy)) => {
-                document.load_frame_srcdoc(&base, origin, &policy, &referrer_policy, markup);
-            }
-            None => document.load_frame_srcdoc(
-                &Url::parse("about:blank").expect("about:blank parses"),
+        if let Some((base, referrer_url, origin, policy)) = inherited {
+            document.load_frame_srcdoc(&base, &referrer_url, origin, &policy, markup);
+        } else {
+            let blank = Url::parse("about:blank").expect("about:blank parses");
+            document.load_frame_srcdoc(
+                &blank,
+                &blank,
                 url::Origin::new_opaque(),
-                &policy,
-                "",
+                &PolicyContainer::default(),
                 markup,
-            ),
+            );
         }
     }
 
@@ -1099,9 +1112,15 @@ impl Engine {
     /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
     fn load_data_frame(&mut self, child: FrameId, parent: FrameId, url: &Url) {
         let policy = self.inherited_policy(parent);
+        let referrer = self
+            .frames
+            .get(&parent)
+            .map(|document| document.referrer_url().to_string())
+            .unwrap_or_default();
         let Some((content_type, body)) = decode_data_url(url.as_str()) else {
             if let Some(document) = self.frames.get_mut(&child) {
                 document.load_about_blank(None, None);
+                document.set_document_referrer(&referrer);
             }
             self.inherit_policy(child, parent);
             return;
@@ -1110,7 +1129,9 @@ impl Engine {
             // A `data:` URL inherits the initiator's policy container
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
             let mut head = ResponseHead::non_http(url.to_string(), Some(content_type));
-            head.inherited_policy = Some(policy);
+            head.inherited_policy = Some(policy.csp.clone());
+            head.inherited_referrer_policy = policy.referrer_policy;
+            document.set_document_referrer(&referrer);
             document.install_frame_response(&head, &body, None);
         }
     }
@@ -1133,13 +1154,20 @@ impl Engine {
             return;
         };
         let policy = self.inherited_policy(parent);
+        let referrer = self
+            .frames
+            .get(&parent)
+            .map(|document| document.referrer_url().to_string())
+            .unwrap_or_default();
         if let Some(document) = self.frames.get_mut(&child) {
             // A `blob:` URL inherits the initiator's policy container, and the
             // child's origin is the store entry's creator
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
             let mut head =
                 ResponseHead::non_http(url.to_string(), content_type.as_deref().map(String::from));
-            head.inherited_policy = Some(policy);
+            head.inherited_policy = Some(policy.csp.clone());
+            head.inherited_referrer_policy = policy.referrer_policy;
+            document.set_document_referrer(&referrer);
             document.install_frame_response(&head, contents.as_bytes(), Some(origin));
         }
     }

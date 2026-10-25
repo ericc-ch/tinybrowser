@@ -1957,7 +1957,8 @@ mod realm_tests {
         let policy = Rc::clone(&world);
         let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
 
-        policy.borrow_mut().csp = crate::csp::List::from_headers(Some("script-src 'self'"), None);
+        policy.borrow_mut().policy.csp =
+            crate::csp::List::from_headers(Some("script-src 'self'"), None);
         let denied = realm
             .eval(
                 r#"
@@ -1990,7 +1991,7 @@ mod realm_tests {
             .expect("eval");
         assert_eq!(spoofed, "EvalError,false");
 
-        policy.borrow_mut().csp =
+        policy.borrow_mut().policy.csp =
             crate::csp::List::from_headers(Some("script-src 'self' 'unsafe-eval'"), None);
         let allowed = realm
             .eval(r#"[eval("1 + 1"), Function("return 2")()].join(",");"#)

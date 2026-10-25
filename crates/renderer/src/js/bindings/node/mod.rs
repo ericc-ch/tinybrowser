@@ -6,7 +6,7 @@ use crate::dom::tree::NodeId;
 use crate::js::world::Handle;
 
 pub(super) mod core;
-pub(super) mod document;
+pub(crate) mod document;
 pub(super) mod element;
 pub(super) mod forms;
 pub(super) mod html_elements;

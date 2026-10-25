@@ -1751,7 +1751,7 @@ fn handler_attribute_allowed<'js>(
     let violations = {
         let world = bindings::world(ctx)?;
         let world = world.borrow();
-        world.csp.check_inline(
+        world.policy.csp.check_inline(
             &world.document_url,
             &crate::csp::InlineScript {
                 source,

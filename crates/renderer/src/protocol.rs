@@ -281,9 +281,13 @@ pub struct ResponseHead {
     /// A violated policy's `report-to` directive resolves its endpoint names
     /// against it (<https://w3c.github.io/reporting/#header>).
     pub reporting_endpoints: Option<String>,
-    /// `Referrer-Policy` response header, which seeds the document policy
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-header>).
-    pub referrer_policy: Option<String>,
+    /// `Referrer-Policy` response header, parsed once at the head
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
+    pub referrer_policy: Option<net::ReferrerPolicy>,
+    /// `Refresh` response header value, decoded as ISO-8859-1. The document
+    /// creation algorithm runs the shared declarative refresh steps on it
+    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+    pub refresh: Option<String>,
     /// `X-Content-Type-Options: nosniff` on the response.
     pub no_sniff: bool,
     /// The body came from HTTP, so the Apache `text/plain` check applies.
@@ -301,6 +305,9 @@ pub struct ResponseHead {
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
     /// When set it replaces the head's CSP header derivation.
     pub inherited_policy: Option<crate::csp::List>,
+    /// The referrer policy a local-scheme response (`data:`, `blob:`)
+    /// inherits from its initiator, installed with `inherited_policy`.
+    pub inherited_referrer_policy: Option<net::ReferrerPolicy>,
 }
 
 impl ResponseHead {
@@ -331,13 +338,26 @@ impl ResponseHead {
                 "content-security-policy-report-only",
             ),
             reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
-            referrer_policy: crate::csp::combined_header(headers, "referrer-policy"),
+            // The policy parser needs the field values one by one: extraction
+            // fails as a whole when one value is malformed, which joining
+            // with ", " would hide
+            // (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
+            referrer_policy: net::ReferrerPolicy::from_header(
+                headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
+                    .map(|(_, value)| value.as_str()),
+            ),
+            refresh: headers.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("refresh").then(|| value.clone())
+            }),
             no_sniff: crate::sniff::headers_nosniff(headers),
             http_response: true,
             history: HistorySnapshot::default(),
             viewport: None,
             init_scripts: Vec::new(),
             inherited_policy: None,
+            inherited_referrer_policy: None,
         }
     }
 
@@ -355,12 +375,14 @@ impl ResponseHead {
             content_security_policy_report_only: None,
             reporting_endpoints: None,
             referrer_policy: None,
+            refresh: None,
             no_sniff: false,
             http_response: false,
             history: HistorySnapshot::default(),
             viewport: None,
             init_scripts: Vec::new(),
             inherited_policy: None,
+            inherited_referrer_policy: None,
         }
     }
 }
@@ -407,8 +429,10 @@ pub enum DialKind {
     /// A `<link rel=stylesheet>` sheet, which delays the load event
     /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
     Stylesheet,
-    /// An `<img>` resource.
+    /// An `<img>` resource, or a CSS image such as `content: url()`.
     Image,
+    /// A web font a CSS `@font-face` rule names.
+    Font,
     /// A child frame's navigation.
     FrameLoad,
     /// A legacy `report-uri` violation report POST. Fire-and-forget: the
@@ -470,10 +494,17 @@ pub struct DialRequest {
     /// Author-supplied request headers, in insertion order.
     #[serde(default)]
     pub headers: Vec<(String, String)>,
-    /// Browser-generated `Referer` URL. `None` omits the header
+    /// Fetch's request referrer: a client, an explicit URL, or no referrer.
+    /// The browser resolves "client" against the authorized initiator and
+    /// verifies an explicit URL is same-origin with it
+    /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+    #[serde(default)]
+    pub referrer: net::Referrer,
+    /// The document URL the `"client"` branch reads, walked out of `srcdoc`
+    /// to the container document
     /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
     #[serde(default)]
-    pub referrer: Option<String>,
+    pub referrer_url: String,
     /// Caller deadline in milliseconds. `0` keeps the carrier timeout.
     /// A synchronous XHR uses its `timeout` attribute here
     /// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>).
@@ -507,11 +538,12 @@ pub struct DialRequest {
     /// Ask the browser to return headers first and stream the decoded body.
     #[serde(default)]
     pub stream_body: bool,
-    /// The request's referrer policy, re-determining the `Referer` on every
-    /// redirect hop. Empty means the document's policy
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    /// The concrete policy main fetch determines under. The renderer resolves
+    /// the element's attribute or the document's policy before queueing, so
+    /// this is never unset
+    /// (<https://fetch.spec.whatwg.org/#concept-request-referrer-policy>).
     #[serde(default)]
-    pub referrer_policy: Option<String>,
+    pub referrer_policy: net::ReferrerPolicy,
 }
 
 /// The CORS parameters a page `fetch`/XHR sends over the wire. The browser
@@ -566,6 +598,11 @@ pub struct DialOutcome {
     /// Redirect hops followed before this response.
     #[serde(default)]
     pub redirect_count: u32,
+    /// The stripped referrer the final hop was sent with, when it sent one.
+    /// A navigated document reports it as `document.referrer`
+    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+    #[serde(default)]
+    pub referrer: Option<String>,
     /// Browser-side stream handle for a progressive body. The body is empty
     /// in the head outcome and chunks arrive through the network host.
     #[serde(default)]
@@ -592,6 +629,7 @@ impl DialOutcome {
             body: Ok(body),
             response_type: net::cors::ResponseType::Basic,
             redirect_count: 0,
+            referrer: None,
             stream: None,
         }
     }

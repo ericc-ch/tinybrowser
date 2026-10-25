@@ -1094,10 +1094,6 @@ impl Tab {
             return;
         }
         match event {
-            // Nothing to record; the coordinator re-checks JS-truth waiters
-            // after every renderer event, which is the whole point of this
-            // variant.
-            RendererEvent::Turn => {}
             RendererEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
                     self.history.navigate(url.clone(), None);
@@ -1147,6 +1143,9 @@ impl Tab {
             RendererEvent::HistoryTraversal { delta } => {
                 self.traverse_history(*delta).await;
             }
+            // `Turn` records nothing: the coordinator re-checks its JS-truth
+            // waiters after every renderer event, which is the whole point of
+            // that variant. Other events have no tab-level effect here.
             _ => {}
         }
     }

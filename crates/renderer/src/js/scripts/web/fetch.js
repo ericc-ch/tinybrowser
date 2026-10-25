@@ -1154,30 +1154,6 @@ const __tbParseRange = (value, length) => {
   if (end >= length) end = length - 1;
   return { start, end };
 };
-// Credentials, fragments, scheme downgrades, and the strict default all live
-// in the host policy helper so the fetch path and the document path cannot
-// disagree (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-const __tbReferrerForPolicy = (source, target, policy) => {
-  if (source === '' || source === null || source === undefined) return '';
-  const referrer = host.__tbReferrerForPolicy(String(source), String(target), String(policy));
-  return referrer === null || referrer === undefined ? '' : String(referrer);
-};
-const __tbDetermineReferrer = (data, target) => {
-  // With no explicit policy the client's document policy decides; the host
-  // helper owns the scheme, downgrade, and credential rules
-  // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-  if (data.referrer === 'about:client' && data.referrerPolicy === '') {
-    const referrer = host.__tbReferrer(target);
-    return referrer === null || referrer === undefined ? '' : referrer;
-  }
-  let source = data.referrer;
-  if (source === 'about:client') {
-    source = host.__tbResolveUrl('', undefined);
-    if (source === null) return '';
-  }
-  const policy = data.referrerPolicy === '' ? 'strict-origin-when-cross-origin' : data.referrerPolicy;
-  return __tbReferrerForPolicy(source, target, policy);
-};
 globalThis.fetch = function(input, init) {
   let request;
   try {
@@ -1193,7 +1169,11 @@ globalThis.fetch = function(input, init) {
   const mode = data.mode;
   const credentials = data.credentials;
   const redirect = data.redirect;
-  const referrer = __tbDetermineReferrer(data, url);
+  // The host resolves "about:client" against the authorized document and runs
+  // "Determine request's Referrer" per hop; JS only carries the request's
+  // referrer value
+  // (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+  const referrer = data.referrer;
   const signal = data.signal;
   const keepalive = data.keepalive;
   return new Promise(function(resolve, reject) {

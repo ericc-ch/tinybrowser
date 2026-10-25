@@ -1888,6 +1888,27 @@ fn sanitize_current(
     })
 }
 
+/// A `meta` element re-runs its pragma algorithms when `name`, `content`, or
+/// `http-equiv` changes: `name=referrer` resets the document policy and
+/// `http-equiv=refresh` starts a refresh
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>,
+/// <https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+fn refresh_meta_pragmas(ctx: &Ctx<'_>, element: NodeId, local: &str) {
+    if !matches!(local, "name" | "content" | "http-equiv") {
+        return;
+    }
+    let is_meta = world_for_node(ctx, element).is_ok_and(|owner| {
+        owner.borrow().document(element).is_some_and(|parsed| {
+            crate::dom::tree::is_html_element(&parsed.document.base, element.node, "meta")
+        })
+    });
+    if !is_meta {
+        return;
+    }
+    crate::js::bindings::node::document::apply_meta_referrer(ctx, element);
+    crate::js::bindings::node::document::apply_meta_refresh(ctx, element);
+}
+
 /// After an attribute change, runs the element's attribute-change hooks: an
 /// `iframe`'s `src` drives its browsing context's navigation
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>),
@@ -1901,6 +1922,7 @@ pub(crate) fn after_attribute_change(
     local: &str,
     previous: Option<&str>,
 ) -> Result<()> {
+    refresh_meta_pragmas(ctx, element, local);
     if let Some(typ) = local.strip_prefix("on")
         && !typ.is_empty()
         && typ
@@ -2004,35 +2026,51 @@ pub(crate) fn after_attribute_change(
         return Ok(());
     }
     if is_iframe {
-        // The iframe's own `referrerpolicy` attribute governs its navigation
-        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-referrerpolicy>).
-        let referrer_policy = world
-            .borrow()
-            .document(element)
-            .and_then(|parsed| {
-                crate::dom::tree::attr(&parsed.document.base, element.node, "referrerpolicy")
-                    .and_then(crate::js::parse_referrer_policy)
-            })
-            .unwrap_or_default();
-        match srcdoc {
-            Some(markup) => world
-                .borrow_mut()
-                .queue_frame_navigation(FrameNavigation::srcdoc(
-                    NavigationTarget::Container(element),
-                    markup,
-                )),
-            None => world
-                .borrow_mut()
-                .queue_frame_navigation(
-                    FrameNavigation::get(NavigationTarget::Container(element), spec)
-                        .with_referrer_policy(referrer_policy),
-                ),
-        }
+        navigate_from_attribute_change(ctx, element, true, &spec, srcdoc)?;
     } else {
+        navigate_from_attribute_change(ctx, element, false, &spec, None)?;
+    }
+    Ok(())
+}
+
+/// Starts what a `src`/`srcdoc` change on a connected element triggers: an
+/// `iframe` reprocesses its attributes and navigates, a `script` runs its
+/// prepare steps
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>,
+/// <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+fn navigate_from_attribute_change(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    is_iframe: bool,
+    spec: &str,
+    srcdoc: Option<String>,
+) -> Result<()> {
+    let world = world(ctx)?;
+    if !is_iframe {
         // `src` set on a connected classic script runs the prepare steps,
         // including the fetch when the element is not already started.
         world.borrow_mut().queue_script(element);
+        return Ok(());
     }
+    if let Some(markup) = srcdoc {
+        world
+            .borrow_mut()
+            .queue_frame_navigation(FrameNavigation::srcdoc(
+                NavigationTarget::Container(element),
+                markup,
+            ));
+        return Ok(());
+    }
+    // The iframe's own `referrerpolicy` attribute governs its navigation
+    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-referrerpolicy>).
+    let referrer_policy = world.borrow().document(element).and_then(|parsed| {
+        crate::dom::tree::attr(&parsed.document.base, element.node, "referrerpolicy")
+            .and_then(net::ReferrerPolicy::from_attribute)
+    });
+    world.borrow_mut().queue_frame_navigation(
+        FrameNavigation::get(NavigationTarget::Container(element), spec.to_owned())
+            .with_referrer_policy(referrer_policy),
+    );
     Ok(())
 }
 

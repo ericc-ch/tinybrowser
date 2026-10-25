@@ -11,14 +11,24 @@ use crate::protocol::RendererEvent;
 /// enqueue more work while a request runs, so a turn must not loop forever.
 const MAX_REALM_REQUESTS_PER_TURN: usize = 1024;
 
+/// One [`Document::drain_step`] outcome. `ran` reports that a task executed,
+/// so the engine reconciles its side effects (a queued navigation, a new
+/// iframe) even when the step had no follow-up work. `more` reports that the
+/// document already has follow-up work.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DrainStep {
+    pub(crate) ran: bool,
+    pub(crate) more: bool,
+}
 
 impl Document {
-    /// Runs one batch of ready work and reports whether more may follow.
+    /// Runs one batch of ready work.
     ///
     /// The engine calls this instead of draining the whole document at once so
     /// it can reconcile frame documents between tasks: a task that inserts an
-    /// iframe must be visible to the next task's `contentDocument` read.
-    pub(crate) fn drain_step(&mut self) -> bool {
+    /// iframe must be visible to the next task's `contentDocument` read, and a
+    /// navigation queued by the last task must still be applied.
+    pub(crate) fn drain_step(&mut self) -> DrainStep {
         self.adopt_dial_completions();
         while let Some(id) = self.due_timer() {
             self.tasks.push_back(Task::Timer(id));
@@ -38,11 +48,17 @@ impl Document {
             // quiet must still wake a `run_until_js_true` waiter.
             self.record_event(RendererEvent::Turn);
             let fired = self.check_load();
-            return !self.stop.is_set()
-                && (fired || self.has_pending_frame_loads() || self.has_ready_work());
+            return DrainStep {
+                ran: true,
+                more: !self.stop.is_set()
+                    && (fired || self.has_pending_frame_loads() || self.has_ready_work()),
+            };
         }
         let fired = self.check_load();
-        !self.stop.is_set() && (fired || self.has_pending_frame_loads())
+        DrainStep {
+            ran: false,
+            more: !self.stop.is_set() && (fired || self.has_pending_frame_loads()),
+        }
     }
 
     /// Whether a task is queued or a timer is already due.
@@ -78,7 +94,7 @@ impl Document {
             .min()
     }
 
-    fn schedule_timer(&mut self, delay: Duration) -> u32 {
+    pub(crate) fn schedule_timer(&mut self, delay: Duration) -> u32 {
         let id = self.next_timer_id;
         self.next_timer_id = self.next_timer_id.saturating_add(1);
         self.timers.insert(
@@ -162,6 +178,7 @@ impl Document {
                                 body: Ok(body),
                                 response_type: net::cors::ResponseType::Basic,
                                 redirect_count: 0,
+                                referrer: None,
                                 stream: None,
                             },
                         });
@@ -190,6 +207,10 @@ impl Document {
         match task {
             Task::Timer(id) => {
                 self.record_event(RendererEvent::Timer(id));
+                if self.refresh_timer == Some(id) {
+                    self.refresh_timer = None;
+                    self.fire_refresh();
+                }
                 if let Some(timer) = self.timers.remove(&id)
                     && let Some(js_id) = timer.js_id
                 {
@@ -265,6 +286,9 @@ impl Document {
             RealmRequest::Fetch(fetch) => self.queue_js_fetch(*fetch),
             RealmRequest::AbortFetch(js_id) => self.dials.cancel_fetch(js_id),
             RealmRequest::Script(element) => self.queue_dynamic_script(element),
+            RealmRequest::DeclarativeRefresh(value) => {
+                self.start_declarative_refresh(&value);
+            }
             RealmRequest::Image(element) => {
                 self.world.borrow_mut().image_update_started(element);
                 self.queue_image(element, true);
@@ -331,9 +355,13 @@ impl Document {
             self.tasks.push_back(Task::NodeError(element));
             return;
         }
-        let mut dial =
-            QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.dial_initiator());
-        let (referrer, referrer_policy) = self.subresource_referrer(Some(element), &url);
+        let (referrer, referrer_policy) = self.subresource_referrer(Some(element));
+        let mut dial = QueuedDial::new(
+            DialContext::ClassicScript { element },
+            &url,
+            &self.dial_initiator(),
+            &self.referrer_url(),
+        );
         dial.req.referrer = referrer;
         dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
@@ -374,23 +402,26 @@ impl Document {
             self.fail_js_fetch(fetch.js_id);
             return;
         }
-        let mut dial =
-            QueuedDial::new(DialContext::JsFetch { id: fetch.js_id }, &url, &self.dial_initiator());
+        let mut dial = QueuedDial::new(
+            DialContext::JsFetch { id: fetch.js_id },
+            &url,
+            &self.dial_initiator(),
+            &self.referrer_url(),
+        );
         dial.req.method = fetch.method;
         dial.req.body = fetch.body;
         dial.req.content_type = fetch.content_type;
         dial.req.headers = fetch.headers;
         dial.req.referrer = fetch.referrer;
-        // An empty request policy means the client's policy container decides:
-        // resolve it here so every redirect hop re-determines with the same
-        // policy the initial request used
+        // An unset request policy means the client's policy container
+        // decides: resolve it here so every redirect hop re-determines with
+        // the same policy the initial request used
         // (<https://fetch.spec.whatwg.org/#main-fetch>,
         // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-        dial.req.referrer_policy = fetch.referrer_policy.or_else(|| {
-            let world = self.world.borrow();
-            let policy = world.state.referrer_policy.clone();
-            (!policy.is_empty()).then_some(policy)
-        });
+        dial.req.referrer_policy = fetch
+            .referrer_policy
+            .or(self.world.borrow().policy.referrer_policy)
+            .unwrap_or_default();
         dial.req.cors = fetch.cors;
         dial.req.keepalive = fetch.keepalive;
         dial.req.body_len = fetch.body_len;

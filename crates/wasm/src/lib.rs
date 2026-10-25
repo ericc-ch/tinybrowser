@@ -197,14 +197,14 @@ fn to_event(event: RendererEvent) -> Event {
             replace,
         } => Event::HistoryUpdated((url, state, replace)),
         RendererEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
-        RendererEvent::Load => Event::Load,
+        // `Turn` is filtered out before this match and never reaches the
+        // host; it shares `Load`'s payload-less shape.
+        RendererEvent::Load | RendererEvent::Turn => Event::Load,
         RendererEvent::DomContentLoaded => Event::DomContentLoaded,
         RendererEvent::Timer(id) => Event::Timer(id),
         RendererEvent::Fetch { status } => Event::Fetch(status),
         RendererEvent::FetchFailed => Event::FetchFailed,
         RendererEvent::ScriptFailed => Event::ScriptFailed,
-        // Filtered out before this match; unreachable without one.
-        RendererEvent::Turn => Event::Load,
     }
 }
 
@@ -288,6 +288,7 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
             DialKind::ModuleScript => FetchKind::ModuleScript,
             DialKind::Stylesheet => FetchKind::Stylesheet,
             DialKind::Image => FetchKind::Image,
+            DialKind::Font => FetchKind::Font,
             DialKind::FrameLoad => FetchKind::FrameLoad,
             // Unreachable: `start_dial` completes reports without a hop.
             DialKind::CspReport => unreachable!("report-uri has no transport hop"),

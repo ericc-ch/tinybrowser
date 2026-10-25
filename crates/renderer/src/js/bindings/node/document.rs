@@ -100,13 +100,8 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-referrer
-    // No navigation passes a referrer into the document yet, so this is
-    // always the empty string. Tracking the navigation referrer per
-    // document would make this (and the violation event's `referrer`)
-    // report the real value.
     fn get_referrer(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
-        let _ = ctx;
-        Ok(crate::dom_string::DomString::default())
+        Ok(crate::js::bindings::document::document_referrer_string(ctx, self.handle.0).into())
     }
 
     // https://dom.spec.whatwg.org/#dom-document-compatmode
@@ -2001,7 +1996,7 @@ pub(super) fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> R
 /// `meta name=referrer` insertion steps set the document's policy
 /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>,
 /// <https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-meta>).
-pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
+pub(crate) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
     let policy = {
         let world = world(ctx);
         let Ok(world) = world else {
@@ -2016,7 +2011,7 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
         if !name.eq_ignore_ascii_case("referrer") {
             return;
         }
-        crate::js::parse_referrer_policy(
+        net::ReferrerPolicy::from_meta(
             crate::dom::tree::attr(base, id.node, "content").unwrap_or_default(),
         )
     };
@@ -2026,7 +2021,37 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
     let Ok(world) = world(ctx) else {
         return;
     };
-    world.borrow_mut().state.referrer_policy = policy;
+    world.borrow_mut().policy.referrer_policy = Some(policy);
+}
+
+/// `meta http-equiv=refresh` insertion or attribute change runs the shared
+/// declarative refresh steps with the element's current content
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+pub(crate) fn apply_meta_refresh(ctx: &Ctx<'_>, id: NodeId) {
+    let Ok(world) = world(ctx) else {
+        return;
+    };
+    let value = {
+        let world = world.borrow();
+        let Some(parsed) = world.document(id) else {
+            return;
+        };
+        let base = &parsed.document.base;
+        let Some(equiv) = crate::dom::tree::attr(base, id.node, "http-equiv") else {
+            return;
+        };
+        if !equiv.eq_ignore_ascii_case("refresh") {
+            return;
+        }
+        let Some(content) = crate::dom::tree::attr(base, id.node, "content") else {
+            return;
+        };
+        if content.is_empty() {
+            return;
+        }
+        content.to_owned()
+    };
+    world.borrow_mut().queue_declarative_refresh(value);
 }
 
 /// `meta http-equiv=content-security-policy` insertion appends one policy
@@ -2101,7 +2126,7 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
-        world.csp.check_inline(
+        world.policy.csp.check_inline(
             &world.document_url,
             &crate::csp::InlineScript {
                 source: &source,

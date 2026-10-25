@@ -8,6 +8,7 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use blitz_traits::node_id::NodeId as BlitzNodeId;
+use net::ReferrerPolicy;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
@@ -582,10 +583,10 @@ pub(crate) struct FrameNavigation {
     pub(crate) body: Vec<u8>,
     /// `Content-Type` for `body`, when there is one.
     pub(crate) content_type: Option<String>,
-    /// The navigating element's `hyperlink referrer policy`, empty when the
+    /// The navigating element's `hyperlink referrer policy`, `None` when the
     /// element has none and the initiator document's policy stays in force
     /// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
-    pub(crate) referrer_policy: String,
+    pub(crate) referrer_policy: Option<ReferrerPolicy>,
 }
 
 impl FrameNavigation {
@@ -598,7 +599,7 @@ impl FrameNavigation {
             method: "GET".to_owned(),
             body: Vec::new(),
             content_type: None,
-            referrer_policy: String::new(),
+            referrer_policy: None,
         }
     }
 
@@ -613,7 +614,7 @@ impl FrameNavigation {
 
     /// The policy this navigation's referrer is determined under, overriding
     /// the initiator document's for this navigation alone.
-    pub(crate) fn with_referrer_policy(mut self, policy: String) -> Self {
+    pub(crate) fn with_referrer_policy(mut self, policy: Option<ReferrerPolicy>) -> Self {
         self.referrer_policy = policy;
         self
     }
@@ -868,6 +869,16 @@ pub(crate) struct FontRegistration {
     pub(crate) fonts: Vec<FontFamilyEntry>,
 }
 
+/// The document's policy container: CSP list and referrer policy. A
+/// local-scheme document inherits one clone, and a response replaces both
+/// fields once, so no load path can leave the two out of sync
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#policy-containers>).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PolicyContainer {
+    pub(crate) csp: crate::csp::List,
+    pub(crate) referrer_policy: Option<ReferrerPolicy>,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -894,6 +905,17 @@ pub(crate) struct World {
     /// observers through the union drain.
     owned: HashSet<u32>,
     pub document_url: Url,
+    /// The URL the `"client"` referrer branch reads. It is the document URL,
+    /// except for an `iframe srcdoc` document, where the spec walks to the
+    /// container document's URL
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    pub(crate) referrer_url: Url,
+    /// The document's own referrer: the serialization of the navigation
+    /// request's referrer once `Determine request's Referrer` ran, or the
+    /// creator's URL for a document made locally. `document.referrer` reads
+    /// it, and policy never un-redacts it
+    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+    pub(crate) document_referrer: String,
     /// The creator document's base URL while this document is an `iframe
     /// srcdoc document`. Its own URL cannot be a base, so its fallback base
     /// URL — what relative URLs resolve against — is the creator's
@@ -904,8 +926,8 @@ pub(crate) struct World {
     /// blob lookups and same-origin checks must reuse this value
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     pub(crate) origin: url::Origin,
-    /// Active Content Security Policy list for this document.
-    pub(crate) csp: crate::csp::List,
+    /// This document's policy container.
+    pub(crate) policy: PolicyContainer,
     pub(crate) history: crate::protocol::HistorySnapshot,
     /// The realm's outgoing work, drained once per turn by the document.
     pub(crate) outbox: Outbox,
@@ -1106,6 +1128,11 @@ pub(crate) enum RealmRequest {
         delta: i32,
     },
     CspViolation(NodeId, Vec<crate::csp::Violation>),
+    /// A `meta http-equiv=refresh` value the document should run the shared
+    /// declarative refresh steps on. The realm cannot schedule a navigation
+    /// itself; the document owns the timer
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+    DeclarativeRefresh(String),
     HtmlWrite(HtmlWrite),
     DocumentStream(DocumentStreamCommand),
 }
@@ -1122,9 +1149,6 @@ pub(crate) type Outbox = Rc<RefCell<VecDeque<RealmRequest>>>;
 /// call sites no longer list fields.
 #[derive(Default)]
 pub(crate) struct DocumentState {
-    /// Document referrer policy from a `meta name=referrer` insertion
-    /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
-    pub(crate) referrer_policy: String,
     /// `meta` elements whose policy was already appended.
     pub(crate) applied_csp_metas: HashSet<NodeId>,
     frame_navigations: Vec<FrameNavigation>,
@@ -1181,7 +1205,6 @@ impl DocumentState {
     /// (`owned`) survive, so `nonce_slots` and `creator_stacks` are pruned by
     /// id in [`Self::forget_document`] instead.
     fn reset(&mut self) {
-        self.referrer_policy.clear();
         self.applied_csp_metas.clear();
         self.frame_navigations.clear();
         self.parser_inserted.clear();
@@ -1318,9 +1341,11 @@ impl World {
             document: None,
             owned: HashSet::new(),
             origin: document_url.origin(),
+            referrer_url: document_url.clone(),
+            document_referrer: String::new(),
             document_url,
             base_url: None,
-            csp: crate::csp::List::default(),
+            policy: PolicyContainer::default(),
             history: crate::protocol::HistorySnapshot::default(),
             outbox: Rc::new(RefCell::new(VecDeque::new())),
             queued_images: RefCell::new(HashSet::new()),
@@ -1813,6 +1838,7 @@ impl World {
     /// would not match its parent
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
     pub(crate) fn set_url_with_origin(&mut self, url: Url, origin: url::Origin) {
+        self.referrer_url = url.clone();
         self.document_url = url;
         self.origin = origin;
     }
@@ -2014,6 +2040,15 @@ impl World {
             .push_back(RealmRequest::Script(element));
     }
 
+    /// Queues a declarative refresh value from a `meta http-equiv=refresh` the
+    /// realm inserted or changed. The document owns the timer and the
+    /// navigation.
+    pub(crate) fn queue_declarative_refresh(&mut self, value: String) {
+        self.outbox
+            .borrow_mut()
+            .push_back(RealmRequest::DeclarativeRefresh(value));
+    }
+
     /// Queues violations for targets the caller cannot dispatch into (the
     /// module loader runs inside `QuickJS`).
     pub(crate) fn queue_csp_violations(
@@ -2101,7 +2136,7 @@ impl World {
         if let Some(content) = content
             && self.state.applied_csp_metas.insert(id)
         {
-            self.csp.push_meta(&content);
+            self.policy.csp.push_meta(&content);
         }
     }
 

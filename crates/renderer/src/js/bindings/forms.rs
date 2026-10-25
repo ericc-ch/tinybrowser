@@ -321,7 +321,7 @@ pub(super) fn form_navigate<'js>(
         content_type,
         // A form submission carries no policy of its own yet, so the initiator
         // document's referrer policy decides.
-        referrer_policy: String::new(),
+        referrer_policy: None,
     };
     world_rc.borrow_mut().queue_frame_navigation(navigation);
     Ok(())

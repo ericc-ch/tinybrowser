@@ -3,7 +3,7 @@
 //! Tab coordinators receive [`TabNetworkHandle`]. They do not expose or own
 //! [`net::Agent`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -257,6 +257,7 @@ fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOut
     let mut merged = cached.clone();
     merged.status = 200;
     merged.final_url = response.final_url().to_string();
+    merged.referrer = response.referrer().map(ToString::to_string);
     for (name, value) in response.headers().iter() {
         let value = isomorphic_decode(value);
         if let Some((_, existing)) = merged
@@ -360,6 +361,7 @@ impl NetworkContext {
             cache: Arc::clone(&self.cache),
             streams: Arc::clone(&self.streams),
             next_stream: Arc::clone(&self.next_stream),
+            sheets: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -415,6 +417,15 @@ pub(crate) struct TabNetworkHandle {
     cache: ResponseCache,
     streams: StreamMap,
     next_stream: Arc<AtomicU64>,
+    /// Style sheet URLs this tab's network served: final URL and request URL,
+    /// fragments stripped. A request a sheet initiates sends the sheet's URL
+    /// as its referrer, which is cross-origin to both the document and the
+    /// target, so the browser authorizes an explicit referrer against this set
+    /// instead of the document's origin. Only URLs that really were style
+    /// sheets for this tab can be forged into a referrer, so a renderer cannot
+    /// claim an arbitrary origin's URL
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    sheets: Arc<Mutex<HashSet<Url>>>,
 }
 
 impl TabNetworkHandle {
@@ -539,15 +550,11 @@ impl TabNetworkHandle {
             request.url
         );
         let call = async {
-            let budget = if request.timeout_ms == 0 {
-                PAGE_FETCH_TIMEOUT
-            } else {
-                PAGE_FETCH_TIMEOUT.min(Duration::from_millis(request.timeout_ms))
-            };
+            let budget = Self::dial_budget(request);
             let deadline = Instant::now() + budget;
             let _global = Self::acquire(&self.permits.global, deadline).await?;
             let _tab = Self::acquire(&self.tab, deadline).await?;
-            let mut outbound = outbound_request(request, initiator, deadline)?;
+            let mut outbound = self.build_outbound(request, initiator, deadline)?;
             if let Some(etag) = conditional.as_deref() {
                 let _ = outbound
                     .headers
@@ -590,6 +597,7 @@ impl TabNetworkHandle {
             // An opaque response hides its body as well as its status and
             // headers (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
             let status_text = response.status_text().to_owned();
+            let referrer = response.referrer().map(ToString::to_string);
             let body = read_response_body(request, response, response_type).await?;
             Ok(DialOutcome {
                 status: if response_type.is_opaque() { 0 } else { status },
@@ -607,6 +615,7 @@ impl TabNetworkHandle {
                 body,
                 response_type,
                 redirect_count,
+                referrer,
                 stream: None,
             })
         };
@@ -616,6 +625,9 @@ impl TabNetworkHandle {
             result = call => result,
         };
         self.remember_response(request, initiator, owner, &mode, &result);
+        if let Ok(outcome) = &result {
+            self.remember_sheet(request, outcome.status, &outcome.final_url);
+        }
         trace_dial_result(request, started, &result);
         result
     }
@@ -635,15 +647,11 @@ impl TabNetworkHandle {
         let conditional = cache.etag;
         let stored = cache.stored;
         let cache_key = cache_key(request, initiator, owner);
-        let budget = if request.timeout_ms == 0 {
-            PAGE_FETCH_TIMEOUT
-        } else {
-            PAGE_FETCH_TIMEOUT.min(Duration::from_millis(request.timeout_ms))
-        };
+        let budget = Self::dial_budget(request);
         let deadline = Instant::now() + budget;
         let _global = Self::acquire(&self.permits.global, deadline).await?;
         let _tab = Self::acquire(&self.tab, deadline).await?;
-        let mut outbound = outbound_request(request, initiator, deadline)?;
+        let mut outbound = self.build_outbound(request, initiator, deadline)?;
         if let Some(etag) = conditional.as_deref() {
             let _ = outbound
                 .headers
@@ -692,11 +700,13 @@ impl TabNetworkHandle {
             body: Ok(Vec::new()),
             response_type,
             redirect_count: response.redirect_count(),
+            referrer: response.referrer().map(ToString::to_string),
             stream: None,
         };
         if response_type.is_opaque() {
             return Ok(outcome);
         }
+        self.remember_sheet(request, outcome.status, &outcome.final_url);
         let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.streams
@@ -916,6 +926,55 @@ impl TabNetworkHandle {
         );
     }
 
+    /// The deadline budget one page dial gets: the per-call cap, lowered by
+    /// the request's own `timeout_ms` when it set one.
+    fn dial_budget(request: &DialRequest) -> Duration {
+        if request.timeout_ms == 0 {
+            PAGE_FETCH_TIMEOUT
+        } else {
+            PAGE_FETCH_TIMEOUT.min(Duration::from_millis(request.timeout_ms))
+        }
+    }
+
+    /// Records a successful style sheet response's URLs, so a later explicit
+    /// referrer naming the sheet can be authorized. A sheet that failed or
+    /// never arrived is not recorded: nothing it contained can issue a request
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    fn remember_sheet(&self, request: &DialRequest, status: u16, final_url: &str) {
+        if request.kind != DialKind::Stylesheet || !(200..300).contains(&status) {
+            return;
+        }
+        let mut sheets = self
+            .sheets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for spec in [request.url.as_str(), final_url] {
+            if let Ok(mut url) = Url::parse(spec) {
+                // A referrer never carries a fragment, and the sheet URL the
+                // renderer names is the one it was loaded from
+                // (<https://w3c.github.io/webappsec-referrer-policy/#strip-url>).
+                url.set_fragment(None);
+                sheets.insert(url);
+            }
+        }
+    }
+
+    /// Builds one outbound request with this tab's style sheet set as the
+    /// explicit-referrer authority. The lock is taken and released inside the
+    /// call, so no guard lives across an await.
+    fn build_outbound(
+        &self,
+        request: &DialRequest,
+        initiator: &Url,
+        deadline: Instant,
+    ) -> Result<Request, DialFailure> {
+        let sheets = self
+            .sheets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        outbound_request(request, initiator, deadline, &sheets)
+    }
+
     async fn acquire(
         semaphore: &Arc<Semaphore>,
         deadline: Instant,
@@ -1020,6 +1079,7 @@ fn outbound_request(
     request: &DialRequest,
     initiator: &Url,
     deadline: Instant,
+    sheets: &HashSet<Url>,
 ) -> Result<Request, DialFailure> {
     let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
     let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
@@ -1069,6 +1129,7 @@ fn outbound_request(
         DialKind::ClassicScript | DialKind::ModuleScript => "script",
         DialKind::Stylesheet => "style",
         DialKind::Image => "image",
+        DialKind::Font => "font",
         DialKind::FrameLoad => "iframe",
         DialKind::CspReport => "report",
     };
@@ -1088,27 +1149,51 @@ fn outbound_request(
             .headers
             .insert("Sec-Fetch-Mode", mode.as_bytes().to_vec());
     }
-    if let Some(referrer) = &request.referrer
-        // Defense in depth: the renderer computes this per `referrer_for_policy`,
-        // but the network boundary re-validates so a compromised renderer cannot
-        // leak a cross-origin `Referer`.
-        && is_safe_referrer(referrer, &request.url)
-    {
-        outbound
-            .headers
-            .insert("Referer", referrer.as_bytes())
-            .map_err(|_| DialFailure::Connect)?;
-    }
     if !request.body.is_empty() {
         outbound.body = Some(request.body.clone());
     }
     outbound.initiator_kind = InitiatorKind::Fetch;
     outbound.initiator = Some(initiator.clone());
     outbound.deadline = Some(deadline);
-    outbound
-        .referrer_policy
-        .clone_from(&request.referrer_policy);
+    // The renderer picks the referrer kind and policy; the browser owns the
+    // client environment and the origin check. A referrer URL that is neither
+    // the authorized initiator's origin nor a style sheet this tab loaded is a
+    // renderer bug or forgery, so it fails closed to no referrer instead of
+    // leaking. A sheet-initiated request names the sheet's URL, which can be
+    // cross-origin to both the document and the target
+    // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
+    // <https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    let referrer_client = Url::parse(&request.referrer_url)
+        .ok()
+        .filter(|url| url.origin() == initiator.origin())
+        .map(|url| net::ReferrerClient {
+            origin: initiator.origin(),
+            url,
+        });
+    outbound.referrer = match &request.referrer {
+        net::Referrer::Url(url) if referrer_authorized(url, initiator, sheets) => {
+            net::Referrer::Url(url.clone())
+        }
+        net::Referrer::Url(_) => net::Referrer::NoReferrer,
+        referrer => referrer.clone(),
+    };
+    outbound.referrer_policy = request.referrer_policy;
+    outbound.referrer_client = referrer_client;
     Ok(outbound)
+}
+
+/// Whether an explicit referrer URL is one the renderer may name: same origin
+/// as the authorized initiator, or a style sheet this tab's network served.
+/// The sheet arm is what authorizes CSS-initiated requests, whose referrer is
+/// the sheet's URL on whatever host the sheet came from
+/// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+fn referrer_authorized(referrer: &Url, initiator: &Url, sheets: &HashSet<Url>) -> bool {
+    if referrer.origin() == initiator.origin() {
+        return true;
+    }
+    let mut stripped = referrer.clone();
+    stripped.set_fragment(None);
+    sheets.contains(&stripped)
 }
 
 /// Copies a page dial's fetch parameters onto the `net` request. The origin
@@ -1277,6 +1362,7 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         body: Ok(Vec::new()),
         response_type: net::cors::ResponseType::Basic,
         redirect_count: 0,
+        referrer: None,
         stream: None,
     })
 }
@@ -1373,25 +1459,6 @@ fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
     (!values.is_empty()).then(|| values.join(", "))
 }
 
-/// Network-boundary `Referer` check: rejects only a true downgrade (https
-/// referrer to an http/ws target) or a referrer that is not a stripped
-/// http(s) URL. The cross-origin send decision belongs to the renderer's
-/// `referrer_for_policy`; this layer must not second-guess it (an http to
-/// http cross-origin `Referer` is legitimate under several policies, and
-/// WPT servers are plain http).
-fn is_safe_referrer(referrer: &str, request_url: &str) -> bool {
-    let (Ok(from), Ok(to)) = (Url::parse(referrer), Url::parse(request_url)) else {
-        return false;
-    };
-    if !matches!(from.scheme(), "http" | "https") {
-        return false;
-    }
-    if from.scheme() == "https" && matches!(to.scheme(), "http" | "ws") {
-        return false;
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1407,7 +1474,8 @@ mod tests {
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
-            referrer: None,
+            referrer: net::Referrer::NoReferrer,
+            referrer_url: "http://a.test/page".to_owned(),
             timeout_ms: 0,
             csp: None,
             cors: Some(renderer::CorsRequest {
@@ -1420,7 +1488,7 @@ mod tests {
             integrity: None,
             cache: None,
             stream_body: false,
-            referrer_policy: None,
+            referrer_policy: net::ReferrerPolicy::default(),
         }
     }
 
@@ -1435,6 +1503,7 @@ mod tests {
                 body: Ok(Vec::new()),
                 response_type,
                 redirect_count: 0,
+                referrer: None,
                 stream: None,
             },
             stored_at: Instant::now(),
@@ -1537,29 +1606,6 @@ mod tests {
             TabNetworkHandle::acquire(&permits, Instant::now() + Duration::from_millis(50))
                 .await
                 .expect("permit after release");
-    }
-
-    #[test]
-    fn unsafe_referrer_survives_plain_http_cross_origin() {
-        // WPT servers are plain http: an http referrer to another http
-        // origin must keep its header; only a true downgrade is dropped.
-        assert!(is_safe_referrer(
-            "http://a.test/page",
-            "http://b.test/other"
-        ));
-        assert!(is_safe_referrer(
-            "https://a.test/page",
-            "https://b.test/other"
-        ));
-        assert!(!is_safe_referrer(
-            "https://a.test/page",
-            "http://b.test/other"
-        ));
-        assert!(!is_safe_referrer(
-            "data:text/plain,x",
-            "http://b.test/other"
-        ));
-        assert!(!is_safe_referrer("not a url", "http://b.test/other"));
     }
 
     #[test]

@@ -36,7 +36,7 @@ use rquickjs::{
 };
 use url::Url;
 
-pub(crate) use world::{CreatorInfo, RealmRequest, World};
+pub(crate) use world::{CreatorInfo, PolicyContainer, RealmRequest, World};
 
 /// Shared `QuickJS` heap cap. Forty live subframe realms need more than
 /// 32MB (measured: `Document-createElement-namespace.html`, 40 parallel
@@ -169,7 +169,7 @@ pub(crate) struct JsFetchRequest {
     pub body: Vec<u8>,
     pub content_type: Option<String>,
     pub headers: Vec<(String, String)>,
-    pub referrer: Option<String>,
+    pub referrer: net::Referrer,
     pub cors: Option<crate::protocol::CorsRequest>,
     pub keepalive: bool,
     pub body_len: u64,
@@ -177,9 +177,8 @@ pub(crate) struct JsFetchRequest {
     pub cache: String,
     pub stream_body: bool,
     /// The request's referrer policy (`init.referrerPolicy` or a cloned
-    /// `Request`'s), for redirect-hop re-determination; empty means the
-    /// document's policy.
-    pub referrer_policy: Option<String>,
+    /// `Request`'s); `None` means the document's policy decides.
+    pub referrer_policy: Option<net::ReferrerPolicy>,
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -381,7 +380,10 @@ impl JsRealm {
                         let evaluate: Function = ctx.eval(format!(
                             "(function(host) {{ 'use strict'; return (\n{source}\n); }})"
                         ))?;
-                        evaluate.call((bridge::object(&ctx)?,))?
+                        match evaluate.call((bridge::object(&ctx)?,)) {
+                            Ok(value) => value,
+                            Err(error) => return Err(caught_error(&ctx, error)),
+                        }
                     }
                 };
                 decode_value(&ctx, value)
@@ -963,31 +965,6 @@ impl JsRealm {
         Ok(())
     }
 
-    /// Referrer decisions shared by the document loader and the fetch shim.
-    fn install_referrer_host_functions(
-        ctx: &Ctx<'_>,
-        world: &Rc<RefCell<World>>,
-    ) -> Result<(), JsError> {
-        let referrer_world = world.clone();
-        bridge::object(ctx)?.set(
-            "__tbReferrer",
-            Func::from(move |request_url: String| {
-                let world = referrer_world.borrow();
-                fetch_referrer(&world, &request_url)
-            }),
-        )?;
-        bridge::object(ctx)?.set(
-            "__tbReferrerForPolicy",
-            Func::from(
-                |source: String, target: String, policy: String| -> Option<String> {
-                    let source = Url::parse(&source).ok()?;
-                    referrer_for_policy(&policy, &source, &target)
-                },
-            ),
-        )?;
-        Ok(())
-    }
-
     /// Timer and fetch submission hooks the JS shim calls.
     fn install_task_host_functions(
         &self,
@@ -996,7 +973,6 @@ impl JsRealm {
     ) -> Result<(), JsError> {
         let outbox = Rc::clone(&self.world.borrow().outbox);
         Self::install_timer_host_functions(ctx, &outbox)?;
-        Self::install_referrer_host_functions(ctx, world)?;
         install_header_policy_host_functions(ctx)?;
         install_mime_host_functions(ctx)?;
         install_sync_fetch(ctx, world)?;
@@ -1015,10 +991,14 @@ impl JsRealm {
                       options: Vec<String>| {
                     let headers = header_pairs(headers)?;
                     // `options` is [referrer, mode, credentials, redirect];
-                    // an empty referrer means "omit the header", and a missing
-                    // mode means the caller is not a CORS-enabled `fetch`.
+                    // `""` means no referrer, `about:client` the document, and
+                    // a URL an explicit source. A missing mode means the
+                    // caller is not a CORS-enabled `fetch`.
                     let mut parts = options.into_iter();
-                    let referrer = parts.next().filter(|value| !value.is_empty());
+                    let referrer = parts
+                        .next()
+                        .and_then(|value| net::Referrer::from_idl(&value))
+                        .unwrap_or_default();
                     let mode = parts.next().map(|mode| match mode.as_str() {
                         "same-origin" => net::cors::RequestMode::SameOrigin,
                         "no-cors" => net::cors::RequestMode::NoCors,
@@ -1045,7 +1025,9 @@ impl JsRealm {
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "default".to_owned());
                     let stream_body = parts.next().is_some_and(|value| value == "1");
-                    let referrer_policy = parts.next().filter(|value| !value.is_empty());
+                    let referrer_policy = parts
+                        .next()
+                        .and_then(|value| net::ReferrerPolicy::parse(&value));
                     let cors = mode.map(|mode| crate::protocol::CorsRequest {
                         mode,
                         credentials,
@@ -1114,7 +1096,7 @@ impl JsRealm {
                     return false;
                 };
                 let world = csp_world.borrow();
-                let violations = world.csp.check_request(
+                let violations = world.policy.csp.check_request(
                     &world.origin,
                     &world.document_url,
                     &url,
@@ -1590,7 +1572,7 @@ struct SyncPageFetch {
     body: Vec<u8>,
     content_type: Option<String>,
     headers: Vec<(String, String)>,
-    referrer: Option<String>,
+    referrer: net::Referrer,
     with_credentials: bool,
     timeout: f64,
 }
@@ -1705,7 +1687,10 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                 // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
                 // <https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
                 let mut options = options.into_iter();
-                let referrer = options.next().filter(|value| !value.is_empty());
+                let referrer = options
+                    .next()
+                    .and_then(|value| net::Referrer::from_idl(&value))
+                    .unwrap_or_default();
                 let with_credentials = options.next().is_some_and(|value| value == "1");
                 Ok::<_, rquickjs::Error>(sync_page_fetch(
                     &sync_world.borrow(),
@@ -1763,7 +1748,8 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         .dial_sync(crate::protocol::DialRequest {
             kind: crate::protocol::DialKind::JsFetch,
             url: request.url,
-            initiator: world.document_url.to_string(),
+            initiator: world.origin.ascii_serialization(),
+            referrer_url: world.referrer_url.to_string(),
             read_body: true,
             method: request.method,
             body: request.body,
@@ -1788,7 +1774,7 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             integrity: None,
             cache: None,
             stream_body: false,
-            referrer_policy: None,
+            referrer_policy: world.policy.referrer_policy.unwrap_or_default(),
         });
     match outcome {
         // The header list stays as served; nothing is sniffed into it
@@ -1820,21 +1806,6 @@ fn sync_fetch_value(
     rquickjs::prelude::List((status, body, url, headers))
 }
 
-/// The `Referer` header for a page `fetch()` to `request_url`, decided at
-/// call time from the document's referrer policy
-/// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-/// Credentials and fragments never leave; local-scheme (`about:`, `blob:`,
-/// `data:`) documents send nothing; an empty policy means
-/// `strict-origin-when-cross-origin`.
-fn fetch_referrer(world: &World, request_url: &str) -> Option<String> {
-    // An `about:srcdoc` document's requests carry the creator's URL as the
-    // referrer source — `about:srcdoc` itself is a local scheme, and the
-    // local-scheme rule below would send nothing where browsers send the
-    // embedding document's URL.
-    let source = world.base_url.as_ref().unwrap_or(&world.document_url);
-    referrer_for_policy(&world.state.referrer_policy, source, request_url)
-}
-
 /// The violations compiling `source` produces against the document's policies,
 /// with the calling script's location captured while the compile call is on
 /// the stack and the `securitypolicyviolation` events fired
@@ -1851,7 +1822,7 @@ fn csp_eval_violations(
     let caller = error_stack_top(ctx);
     let mut violations = {
         let world = world.borrow();
-        world.csp.check_inline(
+        world.policy.csp.check_inline(
             &world.document_url,
             &crate::csp::InlineScript {
                 source,
@@ -1938,63 +1909,38 @@ pub(crate) fn error_stack_top(ctx: &Ctx<'_>) -> Option<(String, u32, u32)> {
     CreatorInfo::user_frame(&stack).map(|creator| (creator.url, creator.line, creator.column))
 }
 
-/// A referrer-policy keyword value normalized to its canonical token, or
-/// `None` when the value names no policy. The legacy meta values map to their
-/// modern tokens
-/// (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-meta>,
-/// <https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
-pub(crate) fn parse_referrer_policy(content: &str) -> Option<String> {
-    let token = content.trim().to_ascii_lowercase();
-    match token.as_str() {
-        "never" | "no-referrer" => Some("no-referrer".to_owned()),
-        "default" => Some("strict-origin-when-cross-origin".to_owned()),
-        "always" => Some("unsafe-url".to_owned()),
-        "origin-when-crossorigin" => Some("origin-when-cross-origin".to_owned()),
-        "no-referrer-when-downgrade"
-        | "origin"
-        | "origin-when-cross-origin"
-        | "same-origin"
-        | "strict-origin"
-        | "strict-origin-when-cross-origin"
-        | "unsafe-url" => Some(token),
-        _ => None,
-    }
-}
-
-/// The pure policy decision behind [`fetch_referrer`], split out so unit
-/// tests need no `World`: credentials and fragments never leave,
-/// local-scheme documents send nothing, unknown tokens fail closed to the
-/// strict default.
-pub(crate) fn referrer_for_policy(
-    policy: &str,
-    document_url: &Url,
-    request_url: &str,
-) -> Option<String> {
-    // Same-origin relative fetches (`fetch("api")`) resolve against the
-    // document; parsing standalone would drop the `Referer` even under
-    // `unsafe-url`.
-    let request = document_url.join(request_url).ok()?;
-    net::referrer_for_policy(policy, document_url, &request)
-}
-
 fn eval_classic<'js, V: FromJs<'js>>(ctx: &rquickjs::Ctx<'js>, source: &str) -> Result<V, JsError> {
     let mut options = EvalOptions::default();
     options.strict = false;
     ctx.eval_with_options(source, options)
         .map_err(|error| match error {
-            rquickjs::Error::Exception => {
-                let caught = ctx.catch();
-                JsError::engine(match caught.into_exception() {
-                    Some(exception) => format!(
-                        "{} | {}",
-                        exception.message().unwrap_or_default(),
-                        exception.stack().unwrap_or_default()
-                    ),
-                    None => String::from("uncaught exception"),
-                })
-            }
+            rquickjs::Error::Exception => JsError::engine(
+                exception_text(ctx.catch()).unwrap_or_else(|| "uncaught exception".into()),
+            ),
             other => JsError::engine(other),
         })
+}
+
+/// A caught exception's message and stack, the diagnostic a host script's
+/// failure or a compile error reports.
+fn exception_text(caught: Value<'_>) -> Option<String> {
+    let exception = caught.into_exception()?;
+    Some(format!(
+        "{} | {}",
+        exception.message().unwrap_or_default(),
+        exception.stack().unwrap_or_default()
+    ))
+}
+
+/// Converts a host script's engine error, keeping the thrown value's message
+/// instead of `rquickjs`'s generic `Exception generated by QuickJS`.
+fn caught_error(ctx: &rquickjs::Ctx<'_>, error: rquickjs::Error) -> JsError {
+    if !error.is_exception() {
+        return JsError::from(error);
+    }
+    JsError::engine(
+        exception_text(ctx.catch()).unwrap_or_else(|| String::from("uncaught exception")),
+    )
 }
 
 /// Reports one uncaught exception to the realm's window: the `error` event and
@@ -2102,85 +2048,6 @@ pub(crate) fn js_number(id: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::CreatorInfo;
-    use super::referrer_for_policy;
-    use url::Url;
-
-    /// The referrer for one policy/document/request triple, without a
-    /// `World`, so the matrix stays a pure unit test.
-    fn referrer(policy: &str, document: &str, request: &str) -> Option<String> {
-        referrer_for_policy(
-            policy,
-            &Url::parse(document).expect("document url"),
-            request,
-        )
-    }
-
-    // The policy matrix of
-    // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>.
-    #[test]
-    fn referrer_policy_matrix() {
-        let doc = "https://user:pass@example.com:8443/path?q=1#frag";
-        // Default (empty) is strict-origin-when-cross-origin.
-        assert_eq!(
-            referrer("", doc, "https://example.com:8443/other"),
-            Some("https://example.com:8443/path?q=1".to_owned())
-        );
-        assert_eq!(
-            referrer("", doc, "https://other.test/x"),
-            Some("https://example.com:8443/".to_owned())
-        );
-        assert_eq!(referrer("", doc, "http://example.com:8443/x"), None);
-        // Credentials and fragments never leave, under any policy.
-        assert_eq!(
-            referrer("unsafe-url", doc, "https://other.test/x"),
-            Some("https://example.com:8443/path?q=1".to_owned())
-        );
-        assert_eq!(
-            referrer("origin", doc, "https://other.test/x"),
-            Some("https://example.com:8443/".to_owned())
-        );
-        assert_eq!(
-            referrer("same-origin", doc, "https://example.com:8443/other"),
-            Some("https://example.com:8443/path?q=1".to_owned())
-        );
-        assert_eq!(referrer("same-origin", doc, "https://other.test/x"), None);
-        assert_eq!(
-            referrer("origin-when-cross-origin", doc, "https://other.test/x"),
-            Some("https://example.com:8443/".to_owned())
-        );
-        assert_eq!(
-            referrer("no-referrer", doc, "https://example.com:8443/other"),
-            None
-        );
-        assert_eq!(
-            referrer("no-referrer-when-downgrade", doc, "http://example.com/x"),
-            None
-        );
-        // Local-scheme documents send nothing.
-        assert_eq!(
-            referrer("unsafe-url", "about:blank", "https://other.test/x"),
-            None
-        );
-        // Unparseable request URLs send nothing rather than leaking.
-        assert_eq!(referrer("", doc, "http://["), None);
-        // A source URL serialized over 4096 characters culls to the origin,
-        // whatever the policy — even `unsafe-url`.
-        let long = format!("https://example.com:8443/{}?q=1", "A".repeat(4200));
-        assert_eq!(
-            referrer("unsafe-url", &long, "https://other.test/x"),
-            Some("https://example.com:8443/".to_owned())
-        );
-        assert_eq!(
-            referrer("", &long, "https://example.com:8443/other"),
-            Some("https://example.com:8443/".to_owned())
-        );
-        // Just under the cap, the full URL survives.
-        let near = format!("https://example.com:8443/{}", "A".repeat(4000));
-        assert_eq!(
-            referrer("unsafe-url", &near, "https://other.test/x"),
-            Some(near.clone())
-        );
-    }
 
     #[test]
     fn stack_top_frame_parses() {
