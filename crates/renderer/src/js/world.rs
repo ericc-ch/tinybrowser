@@ -2442,6 +2442,11 @@ impl World {
         std::mem::take(&mut self.state.frame_navigations)
     }
 
+    /// Whether a queued navigation has not been handed to the engine yet.
+    pub(crate) fn has_frame_navigations(&self) -> bool {
+        !self.state.frame_navigations.is_empty()
+    }
+
     pub(crate) fn queue_image_update(&mut self, element: NodeId) {
         // Keep `currentSrc` and decoded pixels until the new request starts.
         // Mark unavailable now so `complete` is false while the update waits

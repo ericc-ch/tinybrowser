@@ -1103,6 +1103,9 @@ impl Document {
         state: &LocalDocumentState,
         srcdoc: Option<&str>,
     ) {
+        // A traversed-to entry is always a document the frame navigated to,
+        // never the blank created at insertion.
+        self.initial_blank = false;
         self.world.borrow_mut().sandbox = state.sandbox;
         if let Some(markup) = srcdoc {
             let base = state.base_url.as_ref().unwrap_or(&state.url);
@@ -1348,13 +1351,19 @@ impl Document {
         self.world.borrow_mut().base_url = Some(base);
     }
 
-    /// Loads the frame's initial `about:blank`, with `inherited_url` as its
+    /// Installs an `about:blank` document, with `inherited_url` as its
     /// fallback base URL and `inherited_origin` as the captured origin. The
     /// document URL stays `about:blank`: it is what `location.href` reports,
     /// while relative URLs still resolve against the creator's base URL
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>,
     /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>,
     /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    ///
+    /// This installs a blank for either a frame's first document or a
+    /// navigation to `about:blank`, so it leaves [`Self::initial_blank`]
+    /// alone: [`Self::load_about_blank_tree`] marks the first document, and a
+    /// navigation to `about:blank` is a session history entry like any other
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
     pub(crate) fn load_about_blank(
         &mut self,
         inherited_url: Option<&str>,
@@ -1369,7 +1378,6 @@ impl Document {
         // No HTTP response stands behind a blank document.
         self.http_status = 0;
         self.load_html("");
-        self.initial_blank = true;
         self.ensure_js_ok();
     }
 

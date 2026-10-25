@@ -731,13 +731,27 @@ impl Engine {
                 }
             }
             if !ran {
+                // A pass that ran no task can still have adopted realm work:
+                // stepping the document moves its outbox into a navigation or
+                // a history traversal, which only a reconcile applies. Report
+                // idle only once the reconcile finds nothing.
+                if self.reconcile_frames() {
+                    continue;
+                }
                 break;
             }
         }
         false
     }
 
-    fn has_ready_work(&self) -> bool {
+    /// Whether a drain would run anything: a queued task, a queued dial, work
+    /// waiting in a realm's outbox, or a timer that is already due.
+    ///
+    /// A caller that may enter JavaScript outside a drain (evaluating a JS
+    /// predicate, for instance) can leave tasks behind, so it asks this before
+    /// waiting for the next event.
+    #[must_use]
+    pub fn has_ready_work(&self) -> bool {
         self.frames.values().any(Document::has_ready_work)
     }
 
@@ -847,7 +861,11 @@ impl Engine {
             .min()
     }
 
-    fn reconcile_frames(&mut self) {
+    /// Applies everything the documents produced outside their task queues:
+    /// adopted frames, navigations, history traversals, deliveries, and the
+    /// load events they unblock. Returns whether anything was applied.
+    fn reconcile_frames(&mut self) -> bool {
+        let mut applied = false;
         loop {
             let adopted = self.adopt_pending_frames();
             let removed = self.runtime.shared.borrow_mut().take_removed_frames();
@@ -916,7 +934,9 @@ impl Engine {
             if !had_work && !fired_load {
                 break;
             }
+            applied = true;
         }
+        applied
     }
 
     /// Applies iframe connection transitions.
@@ -1582,8 +1602,9 @@ impl Engine {
     fn apply_navigations(&mut self, navigations: Vec<(FrameId, FrameNavigation)>) {
         for (queued_on, mut navigation) in navigations {
             // A cross-frame `Location` setter queues on the target but is
-            // initiated by the incumbent document: target resolution, the
-            // referrer, and the sandbox rules all read the source
+            // initiated by the incumbent document: the referrer, the policy
+            // container, and the sandbox rules read the source while the
+            // target name resolves against the frame the call was made on
             // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
             let initiator = navigation.source.unwrap_or(queued_on);
             let chosen = {
@@ -1597,7 +1618,7 @@ impl Engine {
                         .contains(*frame)
                         .then(|| (*frame, tree.container(*frame))),
                     NavigationTarget::Target(target) => tree
-                        .choose_navigable(target, initiator)
+                        .choose_navigable(target, queued_on)
                         .map(|frame| (frame, tree.container(frame))),
                 }
             };
@@ -2164,6 +2185,55 @@ mod messaging_tests {
                 .expect("hits"),
             "1",
             "`/` must resolve to the sender's origin, and a document is same origin with itself"
+        );
+    }
+
+    #[test]
+    fn an_about_blank_navigation_keeps_its_own_history_entry() {
+        let mut engine = engine();
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &mount(
+                    "http://a.test/",
+                    "<!doctype html><iframe name=f srcdoc=\"<p>one</p>\"></iframe>",
+                ),
+            )
+            .expect("mount");
+        let _ready = engine.drain_ready();
+        // Navigating by name to `about:blank` is a navigation like any other:
+        // it adds a session history entry instead of replacing the frame's
+        // initial blank, so going back returns to it
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
+        engine
+            .eval_in(FrameId::MAIN, "window.open('about:blank', 'f')")
+            .expect("blank navigation");
+        let _ready = engine.drain_ready();
+        engine
+            .eval_in(
+                FrameId::MAIN,
+                "document.querySelector('iframe').srcdoc = '<p>two</p>'",
+            )
+            .expect("srcdoc navigation");
+        let _ready = engine.drain_ready();
+        let iframe = "document.querySelector('iframe').contentWindow";
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, &format!("String({iframe}.history.length)"))
+                .expect("length"),
+            "3",
+            "the first srcdoc load, the blank navigation, and the second srcdoc load are three entries"
+        );
+        engine
+            .eval_in(FrameId::MAIN, &format!("{iframe}.history.back()"))
+            .expect("back");
+        let _ready = engine.drain_ready();
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, &format!("String({iframe}.location.href)"))
+                .expect("href"),
+            "about:blank",
+            "going back restores the blank document the navigation created"
         );
     }
 }

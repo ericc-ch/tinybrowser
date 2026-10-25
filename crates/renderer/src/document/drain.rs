@@ -58,6 +58,11 @@ impl Document {
         if !self.tasks.is_empty() || self.dials.has_queued() {
             return true;
         }
+        // A queued navigation or history traversal is engine work the next
+        // reconcile applies, even though no task carries it.
+        if !self.frame_traversals.is_empty() || self.world.borrow().has_frame_navigations() {
+            return true;
+        }
         if self.world.borrow().has_outbox_work() {
             return true;
         }

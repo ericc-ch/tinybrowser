@@ -137,14 +137,21 @@ fn navigate_location(owner: &Rc<RefCell<World>>, spec: String, source: Option<Fr
     owner.borrow_mut().queue_frame_navigation(navigation);
 }
 
-/// Parses `value` relative to the owner document's URL, throwing the
-/// `SyntaxError` the `href` setter requires when it is not a valid URL
+/// Parses `value` the way the `href` setter does, relative to the entry
+/// settings object's API base URL, and throws the `SyntaxError` the setter
+/// requires when it is not a valid URL
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
-fn parse_location(ctx: &Ctx<'_>, owner: &Rc<RefCell<World>>, value: &str) -> Result<url::Url> {
-    owner
-        .borrow()
-        .document_url
-        .join(value)
+///
+/// The navigation keeps the caller's own string, so the target document
+/// resolves it again against the same base; this call only decides whether the
+/// assignment throws.
+fn parse_location(ctx: &Ctx<'_>, caller: &Rc<RefCell<World>>, value: &str) -> Result<url::Url> {
+    let caller = caller.borrow();
+    let base = caller
+        .base_url
+        .clone()
+        .unwrap_or_else(|| caller.document_url.clone());
+    base.join(value)
         .map_err(|_| super::throw_dom(ctx, "SyntaxError", "invalid URL"))
 }
 
@@ -160,10 +167,11 @@ fn set_component(owner: &Rc<RefCell<World>>, component: Component, value: Value<
     // document supplies the referrer, policy, and sandbox rules when a script
     // in one frame assigns another frame's `location`
     // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
-    let source = world(&ctx)?.borrow().frame();
+    let caller = world(&ctx)?;
+    let source = caller.borrow().frame();
     if matches!(component, Component::Href) {
-        let url = parse_location(&ctx, owner, &value)?;
-        navigate_location(owner, url.as_str().to_owned(), Some(source));
+        let _ = parse_location(&ctx, &caller, &value)?;
+        navigate_location(owner, value, Some(source));
         return Ok(());
     }
     let mut url = owner.borrow().document_url.clone();
