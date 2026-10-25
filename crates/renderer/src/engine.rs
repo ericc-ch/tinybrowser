@@ -8,7 +8,7 @@
 //! ([`crate::messaging`]).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::RemoteValue;
-use crate::document::{Document, WindowMessage};
+use crate::document::{CreatedFrame, Document, LocalDocumentState, WindowMessage};
 use crate::js::FrameRuntime;
 use crate::js::Stop;
 
@@ -34,6 +34,44 @@ use crate::messaging::{Delivery, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError};
 use crate::storage::PendingStorageEvent;
 
+/// One child navigable's session history, owned by the engine that hosts its
+/// documents. The browser tab holds the main frame's entries; a child's
+/// entries restore the document they held, including its policy container
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
+#[derive(Default)]
+struct FrameHistory {
+    entries: Vec<FrameHistoryEntry>,
+    index: usize,
+}
+
+struct FrameHistoryEntry {
+    /// The navigation that produced the entry, replayed when its document has
+    /// no local snapshot (a network or `data:` load).
+    navigation: Option<FrameNavigation>,
+    /// The saved state of an `about:blank` or `about:srcdoc` document.
+    state: Option<LocalDocumentState>,
+}
+
+impl FrameHistory {
+    /// Adds an entry after the active one, dropping the forward branch.
+    fn push(&mut self, entry: FrameHistoryEntry) {
+        self.entries.truncate(self.index.saturating_add(1));
+        self.entries.push(entry);
+        self.index = self.entries.len().saturating_sub(1);
+    }
+
+    /// Moves the active index by `delta` and returns the entry to install.
+    /// `go(0)` reloads the active entry.
+    fn target(&mut self, delta: i32) -> Option<&FrameHistoryEntry> {
+        let target = self.index.saturating_add_signed(delta as isize);
+        if target >= self.entries.len() {
+            return None;
+        }
+        self.index = target;
+        self.entries.get(target)
+    }
+}
+
 /// One renderer process's page engine.
 ///
 /// The main frame is the tab's top-level document; child frames share the
@@ -47,6 +85,9 @@ pub struct Engine {
     /// Page-scoped init scripts shared by every frame's world, with their
     /// identifiers (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
     init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
+    /// Session history of every child navigable and auxiliary context this
+    /// engine hosts.
+    frame_history: HashMap<FrameId, FrameHistory>,
 }
 
 impl Engine {
@@ -78,6 +119,7 @@ impl Engine {
             frames,
             js_runtime,
             init_scripts,
+            frame_history: HashMap::new(),
         }
     }
 
@@ -93,16 +135,34 @@ impl Engine {
         let mut batch = Vec::new();
         loop {
             for (&parent, document) in &mut self.frames {
-                for (child, container, document) in document.take_new_frames() {
-                    batch.push((parent, child, container, document));
+                for created in document.take_new_frames() {
+                    batch.push((parent, created));
                 }
             }
             if batch.is_empty() {
                 return adopted;
             }
             adopted = true;
-            for (parent, child, container, document) in batch.drain(..) {
-                self.frames.insert(child, document);
+            for (parent, created) in batch.drain(..) {
+                let (frame, container, document) = match created {
+                    CreatedFrame::Child {
+                        frame,
+                        container,
+                        document,
+                    } => (frame, container, document),
+                    CreatedFrame::Auxiliary { frame, document } => {
+                        self.frames.insert(frame, document);
+                        // The auxiliary document was created inside the opening
+                        // script, so its realm could only start now.
+                        if let Some(document) = self.frames.get_mut(&frame) {
+                            document.ensure_js_ok();
+                        }
+                        self.seed_frame_history(frame);
+                        continue;
+                    }
+                };
+                self.frames.insert(frame, document);
+                self.seed_frame_history(frame);
                 // `srcdoc` takes priority over `src`
                 // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
                 let srcdoc = self
@@ -112,7 +172,8 @@ impl Engine {
                 if let Some(markup) = srcdoc {
                     let navigation =
                         FrameNavigation::srcdoc(NavigationTarget::Container(container), markup);
-                    self.navigate_frame(child, parent, &navigation);
+                    self.navigate_frame(frame, parent, &navigation);
+                    self.record_navigation(frame, parent, &navigation);
                 } else {
                     let src = self
                         .frames
@@ -127,16 +188,136 @@ impl Engine {
                                         .map(|document| document.frame_referrer_policy(container))
                                         .unwrap_or_default(),
                                 );
-                        self.navigate_frame(child, parent, &navigation);
+                        self.navigate_frame(frame, parent, &navigation);
+                        self.record_navigation(frame, parent, &navigation);
                     }
                 }
                 if let Some(document) = self.frames.get_mut(&parent) {
                     document.mark_frame_load_pending(container);
-                    document.flush_frame_proxy_sets(child);
+                    document.flush_frame_proxy_sets(frame);
                 }
-                self.publish_frame_document(container, child);
+                self.publish_frame_document(container, frame);
             }
         }
+    }
+
+    /// Starts a child or auxiliary frame's history with the document it was
+    /// created on.
+    fn seed_frame_history(&mut self, frame: FrameId) {
+        self.record_frame_history(frame, None, true);
+    }
+
+    /// Adds one committed navigation to the frame's own session history.
+    ///
+    /// A local-scheme document is saved whole, so traversing back to it
+    /// restores its origin, policy container, and referrer instead of
+    /// re-fetching; every other entry keeps the request to replay
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
+    fn record_navigation(
+        &mut self,
+        frame: FrameId,
+        initiator: FrameId,
+        navigation: &FrameNavigation,
+    ) {
+        // An `iframe` whose `src` is empty keeps the document it already has;
+        // that is not a navigation and adds no entry.
+        if navigation.srcdoc.is_none()
+            && navigation.spec.is_empty()
+            && matches!(&navigation.target, NavigationTarget::Container(_))
+        {
+            return;
+        }
+        let snapshot = navigation.srcdoc.is_some()
+            || self
+                .frames
+                .get(&initiator)
+                .and_then(|document| document.resolve_frame_url(&navigation.spec))
+                .is_some_and(|url| {
+                    url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc")
+                });
+        self.record_frame_history(frame, Some(navigation.clone()), snapshot);
+    }
+
+    /// Appends one entry and publishes the new length and position to the
+    /// frame's `history` object.
+    fn record_frame_history(
+        &mut self,
+        frame: FrameId,
+        navigation: Option<FrameNavigation>,
+        snapshot: bool,
+    ) {
+        if frame == FrameId::MAIN {
+            return;
+        }
+        let state = snapshot
+            .then(|| self.frames.get(&frame).map(Document::local_document_state))
+            .flatten();
+        self.frame_history
+            .entry(frame)
+            .or_default()
+            .push(FrameHistoryEntry { navigation, state });
+        self.sync_frame_history(frame);
+    }
+
+    /// Publishes the frame's own entry count and position, so
+    /// `history.length` and `history.state` agree with the entries the engine
+    /// traverses.
+    fn sync_frame_history(&mut self, frame: FrameId) {
+        let Some(history) = self.frame_history.get(&frame) else {
+            return;
+        };
+        let snapshot = crate::protocol::HistorySnapshot {
+            length: history.entries.len(),
+            index: history.index,
+            state: None,
+        };
+        if let Some(document) = self.frames.get_mut(&frame) {
+            document.set_history(&snapshot);
+        }
+    }
+
+    /// Applies `history.back()`/`go()` calls from child frames and auxiliary
+    /// contexts.
+    fn apply_frame_traversals(&mut self, traversals: Vec<(FrameId, i32)>) {
+        for (frame, delta) in traversals {
+            self.traverse_frame_history(frame, delta);
+        }
+    }
+
+    /// Installs the entry `delta` names: its saved document when it has one,
+    /// or a fresh navigation for a network entry.
+    fn traverse_frame_history(&mut self, frame: FrameId, delta: i32) {
+        let Some((navigation, state)) = self.frame_history.get_mut(&frame).and_then(|history| {
+            history
+                .target(delta)
+                .map(|entry| (entry.navigation.clone(), entry.state.clone()))
+        }) else {
+            return;
+        };
+        let (embedder, container) = {
+            let shared = self.runtime.shared.borrow();
+            (shared.tree.parent(frame), shared.tree.container(frame))
+        };
+        if let Some(state) = state {
+            let Some(document) = self.frames.get_mut(&frame) else {
+                return;
+            };
+            let srcdoc = navigation
+                .as_ref()
+                .and_then(|navigation| navigation.srcdoc.as_deref());
+            document.restore_local_document(&state, srcdoc);
+            if let (Some(embedder), Some(container)) = (embedder, container) {
+                self.mark_frame_load_pending(container, embedder);
+            }
+            if let Some(container) = container {
+                self.publish_frame_document(container, frame);
+            }
+        } else if let Some(navigation) = navigation {
+            // The entry stores the request, not the response: replay it as a
+            // fresh load under the entry's referrer policy.
+            self.navigate_frame(frame, embedder.unwrap_or(frame), &navigation);
+        }
+        self.sync_frame_history(frame);
     }
 
     /// The document of one frame.
@@ -578,16 +759,23 @@ impl Engine {
                     .borrow_mut()
                     .forget_frame_world(*frame);
                 self.frames.remove(frame);
+                self.frame_history.remove(frame);
             }
             let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
             let mut iframe_lifecycle = Vec::new();
             let mut image_lifecycle = Vec::new();
             let mut navigations = Vec::new();
+            let mut traversals = Vec::new();
             let mut streams = Vec::new();
+            let mut ran_scripts = false;
             for frame in frame_ids {
                 let Some(document) = self.frames.get_mut(&frame) else {
                     continue;
                 };
+                // A script appended to a document another realm created could
+                // not run there; its document's realm starts here, so its
+                // effects belong to this turn.
+                ran_scripts |= document.run_deferred_scripts();
                 let (iframes, images) = document.take_lifecycle();
                 iframe_lifecycle.extend(iframes.into_iter().map(|event| (frame, event)));
                 image_lifecycle.extend(images.into_iter().map(|event| (frame, event)));
@@ -597,20 +785,29 @@ impl Engine {
                         .into_iter()
                         .map(|navigation| (frame, navigation)),
                 );
+                traversals.extend(
+                    document
+                        .take_frame_traversals()
+                        .into_iter()
+                        .map(|delta| (frame, delta)),
+                );
                 if let Some(closed) = document.take_stream_publish() {
                     streams.push((frame, closed));
                 }
             }
             let deliveries = self.runtime.shared.borrow_mut().take_deliveries();
             let had_work = adopted
+                || ran_scripts
                 || !iframe_lifecycle.is_empty()
                 || !image_lifecycle.is_empty()
                 || !navigations.is_empty()
+                || !traversals.is_empty()
                 || !streams.is_empty()
                 || !deliveries.is_empty();
             self.apply_iframe_lifecycle(iframe_lifecycle);
             self.apply_image_lifecycle(image_lifecycle);
             self.apply_navigations(navigations);
+            self.apply_frame_traversals(traversals);
             self.publish_streams(streams);
             self.apply_deliveries(deliveries);
             self.flush_embedder_csp();
@@ -686,6 +883,7 @@ impl Engine {
         self.runtime.shared.borrow_mut().tree.remove(child);
         // Dropping the document closes its ports and its realm.
         self.frames.remove(&child);
+        self.frame_history.remove(&child);
     }
 
     fn remove_descendants(&mut self, parent: FrameId) {
@@ -1196,6 +1394,9 @@ impl Engine {
                     NavigationTarget::Container(container) => tree
                         .frame_for_container(*container)
                         .map(|frame| (frame, Some(*container))),
+                    NavigationTarget::Frame(frame) => tree
+                        .contains(*frame)
+                        .then(|| (*frame, tree.container(*frame))),
                     NavigationTarget::Target(target) => tree
                         .choose_navigable(target, initiator)
                         .map(|frame| (frame, tree.container(frame))),
@@ -1218,6 +1419,7 @@ impl Engine {
                 }
             }
             self.navigate_frame(chosen, initiator, &navigation);
+            self.record_navigation(chosen, initiator, &navigation);
             if let Some(container) = container {
                 self.publish_frame_document(container, chosen);
             }

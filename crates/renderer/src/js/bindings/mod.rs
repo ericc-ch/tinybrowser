@@ -20,6 +20,10 @@ mod inner_text;
 mod messaging;
 mod mutation;
 mod node;
+/// Runs an inline classic script in the realm that owns its document; a
+/// document without a realm yet queues it through
+/// [`World::queue_deferred_script`](crate::js::world::World::queue_deferred_script).
+pub(crate) use node::document::prepare_classic_script;
 mod parsing;
 mod range;
 mod webidl;

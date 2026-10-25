@@ -346,6 +346,20 @@ impl JsRealm {
         })
     }
 
+    /// Runs one classic inline script that was inserted from another realm
+    /// before this document had a realm.
+    pub(crate) fn run_deferred_inline_script(
+        &self,
+        id: crate::dom::tree::NodeId,
+    ) -> Result<(), JsError> {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
+            self.context.with(|ctx| {
+                bindings::prepare_classic_script(&ctx, id)?;
+                Ok(())
+            })
+        })
+    }
+
     pub(crate) fn eval_inline_module(&self, name: &str, source: &str) -> Result<(), JsError> {
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
@@ -1370,6 +1384,52 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                     .broadcast_post(&origin, &name, &payload, channel);
             },
         ),
+    )?;
+    install_auxiliary_host_functions(ctx, world)?;
+    Ok(())
+}
+
+/// The hooks an auxiliary top-level context needs: opening one, reading its
+/// opener, and closing it. A same-origin `window.open` result stays in this
+/// renderer, so these never cross the browser tab seam.
+fn install_auxiliary_host_functions(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+) -> Result<(), JsError> {
+    let open = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbOpenAuxiliary",
+        Func::from(move |url: String, name: String| {
+            World::open_auxiliary(&open, &url, &name).map(|frame| crate::js::js_number(frame.get()))
+        }),
+    )?;
+
+    let opener = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbWindowOpenerFrame",
+        Func::from(move || {
+            let world = opener.borrow();
+            let frame = world.frame();
+            let shared = world.runtime.shared.borrow();
+            shared
+                .tree
+                .opener(frame)
+                .filter(|opener| shared.tree.is_alive(*opener))
+                .map(|opener| crate::js::js_number(opener.get()))
+        }),
+    )?;
+
+    let close = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbCloseWindow",
+        Func::from(move || {
+            let world = close.borrow();
+            world
+                .runtime
+                .shared
+                .borrow_mut()
+                .close_auxiliary(world.frame());
+        }),
     )?;
     Ok(())
 }

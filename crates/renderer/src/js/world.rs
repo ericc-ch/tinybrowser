@@ -561,15 +561,20 @@ impl RealmRegistry {
 /// A child frame navigation queued from inside a script, applied after it
 /// stops: the `iframe`'s `src` changed (or the element just connected).
 /// Where a queued navigation lands.
+#[derive(Clone)]
 pub(crate) enum NavigationTarget {
     /// The child frame whose container is this node.
     Container(NodeId),
+    /// The frame with this identity, chosen by `window.open` before the
+    /// navigation was queued.
+    Frame(FrameId),
     /// The `target` of a link or form: the empty string, a keyword (`_self`,
     /// `_parent`, `_top`, `_blank`), or a browsing context name. The engine
     /// applies the rules for choosing a navigable once the script stops.
     Target(String),
 }
 
+#[derive(Clone)]
 pub(crate) struct FrameNavigation {
     /// The frame to navigate.
     pub(crate) target: NavigationTarget,
@@ -850,10 +855,20 @@ pub(crate) struct WeakReferences {
     pub(crate) deref: Persistent<Function<'static>>,
 }
 
-/// Builds a frame document when an `iframe` connects. Installed by the
-/// `document` layer, which owns document creation; the realm calls it without
-/// naming a document type.
-pub(crate) type FrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, NodeId)>;
+/// Builds a child navigable's initial document for one `iframe`.
+pub(crate) type ChildFrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, NodeId)>;
+
+/// Builds an auxiliary top-level context's initial document.
+pub(crate) type AuxiliaryFrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId)>;
+
+/// Builds the documents the `document` layer owns when a realm asks for one.
+/// Installed by that layer, so the realm asks for a browsing context's
+/// document without naming a document type.
+#[derive(Clone)]
+pub(crate) struct FrameHost {
+    pub(crate) child: ChildFrameHost,
+    pub(crate) auxiliary: AuxiliaryFrameHost,
+}
 
 /// One face's width, style, and weight, as fontique identifies it.
 pub(crate) type FontFaceKey = (
@@ -938,7 +953,12 @@ pub(crate) struct World {
     /// Frames whose browsing context was registered inside a script but whose
     /// realm cannot be created until JS execution has stopped.
     pending_frames: Vec<(FrameId, NodeId)>,
-    /// Creates a child frame's document when an `iframe` connects. The
+    /// Classic inline scripts inserted into this document from another realm
+    /// while this realm did not exist yet. The engine runs them through
+    /// `prepare_classic_script` once the realm is created.
+    deferred_scripts: Vec<NodeId>,
+    /// Creates a child frame's document when an `iframe` connects, and an
+    /// auxiliary context's initial document when `window.open` runs. The
     /// `document` layer installs this hook; the realm asks for a document and
     /// never names one.
     frame_host: Option<FrameHost>,
@@ -1377,6 +1397,19 @@ impl Drop for World {
     }
 }
 
+/// Queues a navigation for an auxiliary frame this realm opened or selected by
+/// name. The engine applies it after the script that opened the window stops,
+/// once the auxiliary document exists
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
+fn queue_auxiliary_navigation(world_rc: &Rc<RefCell<World>>, frame: FrameId, spec: &str) {
+    world_rc
+        .borrow_mut()
+        .queue_frame_navigation(FrameNavigation::get(
+            NavigationTarget::Frame(frame),
+            spec.to_owned(),
+        ));
+}
+
 impl World {
     pub(crate) fn new(
         document_url: Url,
@@ -1390,6 +1423,7 @@ impl World {
             init_scripts,
             viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),
             pending_frames: Vec::new(),
+            deferred_scripts: Vec::new(),
             frame_host: None,
             document: None,
             owned: HashSet::new(),
@@ -1648,7 +1682,9 @@ impl World {
         }
         let container = self.runtime.shared.borrow().tree.container(self.frame);
         let Some(container) = container else {
-            return false;
+            // An auxiliary context has no container; it stays attached until
+            // its browsing context is closed.
+            return self.runtime.shared.borrow().tree.contains(self.frame);
         };
         self.owner_world(container).is_some_and(|owner| {
             owner
@@ -1721,7 +1757,9 @@ impl World {
         let frame = {
             let mut shared = self.runtime.shared.borrow_mut();
             let frame = shared.allocate_frame();
-            shared.tree.add(self.frame, frame, container, before);
+            shared
+                .tree
+                .add_container(self.frame, frame, container, before);
             if !name.is_empty() {
                 shared.tree.set_name(frame, name);
             }
@@ -1802,7 +1840,7 @@ impl World {
                 .push((frame, container));
             return false;
         };
-        host(world_rc, frame, container);
+        (host.child)(world_rc, frame, container);
         true
     }
 
@@ -1810,6 +1848,99 @@ impl World {
     /// `iframe`s. Called by the `document` layer when the frame is created.
     pub(crate) fn set_frame_host(&mut self, host: FrameHost) {
         self.frame_host = Some(host);
+    }
+
+    /// Opens an auxiliary top-level browsing context, or returns the one a
+    /// `target` name already selects
+    /// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
+    ///
+    /// `None` means this renderer cannot host the result: the caller falls back
+    /// to the browser tab that hosts cross-origin contexts. The navigation of a
+    /// context this renderer hosts is queued and applied after the caller's
+    /// script stops, so the auxiliary document exists first.
+    pub(crate) fn open_auxiliary(
+        world_rc: &Rc<RefCell<World>>,
+        spec: &str,
+        name: &str,
+    ) -> Option<FrameId> {
+        let current = world_rc.borrow().frame;
+        // `window.open()` with no URL navigates to about:blank; a fresh
+        // auxiliary context is already on that document.
+        let spec = if spec.is_empty() { "about:blank" } else { spec };
+        let named = !name.is_empty() && !name.eq_ignore_ascii_case("_blank");
+        let existing = named.then(|| {
+            world_rc
+                .borrow()
+                .runtime
+                .shared
+                .borrow()
+                .tree
+                .choose_navigable(name, current)
+        });
+        if let Some(frame) = existing.flatten() {
+            queue_auxiliary_navigation(world_rc, frame, spec);
+            return Some(frame);
+        }
+        if !world_rc.borrow().may_host_auxiliary(spec) {
+            return None;
+        }
+        let (frame, host) = {
+            let world = world_rc.borrow();
+            let shared = world.runtime.shared.clone();
+            let mut shared = shared.borrow_mut();
+            if shared.tree.len() >= MAX_FRAMES {
+                return None;
+            }
+            let frame = shared.allocate_frame();
+            shared.tree.add_auxiliary(current, frame);
+            if named {
+                shared.tree.set_name(frame, name.to_owned());
+            }
+            (frame, world.frame_host.clone())
+        };
+        let Some(host) = host else {
+            world_rc
+                .borrow()
+                .runtime
+                .shared
+                .borrow_mut()
+                .tree
+                .remove(frame);
+            return None;
+        };
+        (host.auxiliary)(world_rc, frame);
+        if spec != "about:blank" {
+            queue_auxiliary_navigation(world_rc, frame, spec);
+        }
+        Some(frame)
+    }
+
+    /// Whether a new auxiliary context for `spec` belongs in this renderer.
+    ///
+    /// A blank document or one on the opener's own origin keeps the opener's
+    /// realm reachable as `window.opener` and as a same-origin `WindowProxy`;
+    /// every other URL stays with the browser tab's cross-origin context
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+    fn may_host_auxiliary(&self, spec: &str) -> bool {
+        let Ok(url) = Url::parse(spec) else {
+            return false;
+        };
+        if url.scheme() == "about" {
+            return true;
+        }
+        url.origin() == self.origin
+    }
+
+    /// Queues a classic inline script that could not run in the realm that
+    /// inserted it (`window.open`'s document has no realm until the opening
+    /// script returns).
+    pub(crate) fn queue_deferred_script(&mut self, id: NodeId) {
+        self.deferred_scripts.push(id);
+    }
+
+    /// Takes the inline scripts waiting for this realm to exist.
+    pub(crate) fn take_deferred_scripts(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.deferred_scripts)
     }
 
     /// Takes every registered frame waiting for a document, for the frame host

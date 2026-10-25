@@ -660,6 +660,10 @@ const __tbFrameProxy = frame => {
       const sameOrigin = host.__tbFrameGlobal(frame);
       if (sameOrigin == null) {
         if (host.__tbFrameRegistered(frame)) {
+          // A document exists before its realm does: `window.open`'s initial
+          // about:blank and an `iframe` inserted in a running script. Its
+          // wrapper belongs to this realm until the target realm starts.
+          if (property === 'document') return host.__tbFrameDocument(frame);
           // Loading same-origin (realm pending) and navigated-away
           // cross-origin both yield `undefined` here; conflation is
           // intentional for the polling pattern (`child.document` becomes
@@ -1101,6 +1105,11 @@ Object.defineProperty(globalThis, 'name', {
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
     if (name !== '' && namedWindows.has(name)) return namedWindows.get(name);
+    // A context this renderer hosts keeps same-origin access to the opener: an
+    // auxiliary context for a blank or same-origin URL, or the navigable a
+    // name already selects. A cross-origin popup stays a browser tab.
+    const frame = host.__tbOpenAuxiliary(spec, name);
+    if (frame !== null && frame !== undefined) return __tbFrameProxy(frame);
     const tab = host.__tbWindowOpen(spec, name, featureString);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
@@ -1111,9 +1120,16 @@ Object.defineProperty(globalThis, 'name', {
     return proxy;
   };
 
+  // https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close
+  // A script may only close a context it opened. Closing a child iframe or the
+  // tab's own top-level frame is a no-op, which the host checks.
+  globalThis.close = function close() { host.__tbCloseWindow(); };
+
   // https://html.spec.whatwg.org/multipage/window-object.html#dom-opener
   Object.defineProperty(globalThis, 'opener', {
     get() {
+      const frame = host.__tbWindowOpenerFrame();
+      if (frame !== null && frame !== undefined) return __tbFrameProxy(frame);
       const tab = host.__tbWindowOpener();
       return tab === null || tab === undefined ? null : remoteWindow(tab);
     },

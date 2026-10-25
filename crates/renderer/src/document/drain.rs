@@ -315,7 +315,14 @@ impl Document {
                 });
             }
             RealmRequest::HistoryTraverse { delta } => {
-                self.record_event(RendererEvent::HistoryTraversal { delta });
+                if self.frame == crate::protocol::FrameId::MAIN {
+                    self.record_event(RendererEvent::HistoryTraversal { delta });
+                } else {
+                    // A child navigable keeps its own entries in the engine,
+                    // which owns its documents; the browser tab holds only the
+                    // main frame's.
+                    self.frame_traversals.push(delta);
+                }
             }
             RealmRequest::CspViolation(target, violations) => {
                 self.fire_csp_violations(target, &violations);

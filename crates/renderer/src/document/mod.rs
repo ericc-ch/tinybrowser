@@ -39,9 +39,22 @@ mod load;
 
 pub(crate) use crate::js::ScriptValue;
 
-/// A child frame document this document created for the engine to adopt:
-/// frame, `iframe` container, and the document itself.
-pub(crate) type CreatedFrame = (FrameId, crate::dom::tree::NodeId, Document);
+/// A frame document this document created for the engine to adopt.
+///
+/// A child navigable is owned by the `iframe` that asked for it; an auxiliary
+/// context has no container and keeps the frame that opened it
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
+pub(crate) enum CreatedFrame {
+    Child {
+        frame: FrameId,
+        container: crate::dom::tree::NodeId,
+        document: Document,
+    },
+    Auxiliary {
+        frame: FrameId,
+        document: Document,
+    },
+}
 
 /// Concurrent `fetch` jobs one document may keep in flight.
 const MAX_PENDING_JS_FETCHES: usize = 256;
@@ -245,6 +258,25 @@ pub(crate) enum ImageLifecycle {
     Disconnected(crate::dom::tree::NodeId),
 }
 
+/// The state a local-scheme document needs to be installed again: a
+/// session-history entry for an `about:blank` or `about:srcdoc` document
+/// restores the document it held instead of re-fetching it
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
+#[derive(Clone)]
+pub(crate) struct LocalDocumentState {
+    /// The document URL, `about:blank` or `about:srcdoc`.
+    pub(crate) url: Url,
+    /// The fallback base URL the creator supplied.
+    pub(crate) base_url: Option<Url>,
+    /// The document's own referrer, unredacted.
+    pub(crate) referrer: String,
+    /// The URL `"client"` referrers resolve against.
+    pub(crate) referrer_url: Url,
+    pub(crate) origin: url::Origin,
+    pub(crate) policy: PolicyContainer,
+    pub(crate) sandbox: crate::js::world::SandboxFlags,
+}
+
 struct Timer {
     when: Instant,
     fired: bool,
@@ -316,7 +348,51 @@ fn materialize_iframe_document(
             .borrow_mut()
             .set_frame_document(container, root);
     }
-    new_frames.borrow_mut().push((frame, container, document));
+    new_frames.borrow_mut().push(CreatedFrame::Child {
+        frame,
+        container,
+        document,
+    });
+}
+
+/// Builds the initial `about:blank` document of an auxiliary top-level
+/// context opened by `world_rc`'s realm
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
+///
+/// The document inherits its creator's origin, policy container, sandboxing
+/// flags, base URL, and viewport, and reports the creator's full URL as its
+/// referrer. Its URL stays `about:blank`. The realm is deferred, because
+/// `window.open` runs inside the opener's realm and a nested `QuickJS` realm
+/// cannot be entered there; the engine creates it when it adopts the frame.
+fn materialize_auxiliary_document(
+    world_rc: &Rc<RefCell<World>>,
+    frame: FrameId,
+    new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
+) {
+    let (runtime, url, origin, policy, sandbox, init_scripts, viewport) = {
+        let world = world_rc.borrow();
+        (
+            world.runtime.clone(),
+            world.document_url.clone(),
+            world.origin.clone(),
+            world.policy.clone(),
+            world.sandbox,
+            Rc::clone(&world.init_scripts),
+            world.viewport_size.get(),
+        )
+    };
+    let mut document = Document::with_shared(frame, &runtime, &init_scripts);
+    document.set_viewport_size(viewport);
+    document.load_about_blank_tree(Some(url.as_str()), Some(origin));
+    {
+        let world_handle = document.world();
+        let mut world = world_handle.borrow_mut();
+        world.policy = policy;
+        world.sandbox = sandbox;
+    }
+    new_frames
+        .borrow_mut()
+        .push(CreatedFrame::Auxiliary { frame, document });
 }
 
 /// The sandboxing flags the `iframe` at `container` imposes, from the
@@ -424,6 +500,11 @@ pub(crate) struct Document {
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
     /// Each value is that container's delay token.
     pending_frame_loads: HashMap<crate::dom::tree::NodeId, LoadDelayGuard>,
+    /// Traversals of this frame's own session history, queued by
+    /// `history.back()`/`go()`. The engine owns a child navigable's entries,
+    /// so it applies them after the script stops; the main frame's traversal
+    /// belongs to the browser tab.
+    frame_traversals: Vec<i32>,
     /// Child frame documents this document's realm created for the engine to
     /// adopt
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
@@ -646,14 +727,25 @@ impl Document {
         )));
         runtime.registry.borrow_mut().insert_frame(frame, &world);
         // Document creation belongs to this layer: the realm asks the frame
-        // host for a child document and never names a document type.
+        // host for a child or auxiliary document and never names a document
+        // type.
         let new_frames: Rc<RefCell<Vec<CreatedFrame>>> = Rc::new(RefCell::new(Vec::new()));
-        world.borrow_mut().set_frame_host(Rc::new({
-            let new_frames = Rc::clone(&new_frames);
-            move |world_rc: &Rc<RefCell<World>>, frame, container| {
-                materialize_iframe_document(world_rc, frame, container, &new_frames);
-            }
-        }));
+        world
+            .borrow_mut()
+            .set_frame_host(crate::js::world::FrameHost {
+                child: Rc::new({
+                    let new_frames = Rc::clone(&new_frames);
+                    move |world_rc: &Rc<RefCell<World>>, frame, container| {
+                        materialize_iframe_document(world_rc, frame, container, &new_frames);
+                    }
+                }),
+                auxiliary: Rc::new({
+                    let new_frames = Rc::clone(&new_frames);
+                    move |world_rc: &Rc<RefCell<World>>, frame| {
+                        materialize_auxiliary_document(world_rc, frame, &new_frames);
+                    }
+                }),
+            });
         // Blitz subresources enqueue here and ride carrier dials: the
         // renderer owns no network runtime of its own.
         let (blitz_tx, blitz_rx) = std::sync::mpsc::channel();
@@ -687,6 +779,7 @@ impl Document {
             stylesheet_generation: 0,
             initial_blank: true,
             pending_frame_loads: HashMap::new(),
+            frame_traversals: Vec::new(),
             new_frames,
             load_fired: false,
             will_declaratively_refresh: false,
@@ -874,7 +967,11 @@ impl Document {
             document.load_about_blank(Some(base_url.as_str()), Some(origin.clone()));
             document.set_document_referrer(referrer_url.as_str());
             document.world().borrow_mut().policy = inherited.clone();
-            loaded.push((frame, container, document));
+            loaded.push(CreatedFrame::Child {
+                frame,
+                container,
+                document,
+            });
         }
         self.new_frames.borrow_mut().extend(loaded);
     }
@@ -907,6 +1004,50 @@ impl Document {
     pub(crate) fn set_document_referrer(&mut self, referrer: &str) {
         let mut world = self.world.borrow_mut();
         referrer.clone_into(&mut world.document_referrer);
+    }
+
+    /// The state this document needs to be installed again from a
+    /// session-history entry.
+    pub(crate) fn local_document_state(&self) -> LocalDocumentState {
+        let world = self.world.borrow();
+        LocalDocumentState {
+            url: self.url.clone(),
+            base_url: world.base_url.clone(),
+            referrer: world.document_referrer.clone(),
+            referrer_url: world.referrer_url.clone(),
+            origin: world.origin.clone(),
+            policy: world.policy.clone(),
+            sandbox: world.sandbox,
+        }
+    }
+
+    /// Installs this frame's saved local-scheme document again, without a
+    /// navigation request: a history traversal reuses the entry's document
+    /// state (origin, policy container, referrer) exactly as it was created
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step>).
+    pub(crate) fn restore_local_document(
+        &mut self,
+        state: &LocalDocumentState,
+        srcdoc: Option<&str>,
+    ) {
+        self.world.borrow_mut().sandbox = state.sandbox;
+        if let Some(markup) = srcdoc {
+            let base = state.base_url.as_ref().unwrap_or(&state.url);
+            self.load_frame_srcdoc(
+                base,
+                &state.referrer_url,
+                state.origin.clone(),
+                &state.policy,
+                markup,
+            );
+            return;
+        }
+        self.load_about_blank(
+            state.base_url.as_ref().map(Url::as_str),
+            Some(state.origin.clone()),
+        );
+        self.set_document_referrer(&state.referrer);
+        self.world.borrow_mut().policy = state.policy.clone();
     }
 
     pub(crate) fn take_lifecycle(&mut self) -> (Vec<IframeLifecycle>, Vec<ImageLifecycle>) {
@@ -984,6 +1125,11 @@ impl Document {
             )
         }));
         navigations
+    }
+
+    /// Takes the traversals of this frame's own session history.
+    pub(crate) fn take_frame_traversals(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.frame_traversals)
     }
 
     pub(crate) fn take_stream_publish(&mut self) -> Option<bool> {
@@ -1811,6 +1957,30 @@ impl Document {
             self.record_event(RendererEvent::ScriptFailed);
             return false;
         }
+        true
+    }
+
+    /// Runs inline scripts that were inserted from another realm while this
+    /// document had none, now that its realm can exist. Returns whether any
+    /// script was taken, so the engine reconciles what it did.
+    pub(crate) fn run_deferred_scripts(&mut self) -> bool {
+        let scripts = self.world.borrow_mut().take_deferred_scripts();
+        if scripts.is_empty() {
+            return false;
+        }
+        if !self.ensure_js_ok() {
+            return true;
+        }
+        for id in scripts {
+            let failed = self
+                .js
+                .as_ref()
+                .is_none_or(|js| js.run_deferred_inline_script(id).is_err());
+            if failed {
+                self.record_event(RendererEvent::ScriptFailed);
+            }
+        }
+        self.adopt_js_work();
         true
     }
 

@@ -363,6 +363,8 @@ fn post_message_to_a_busy_tab_does_not_block_the_sender() {
         stream.write_all(body).expect("write body");
     });
 
+    // The popup must cross an origin boundary to stay a browser tab.
+    let (peer_port, peer_server) = serve_page("peer");
     let mut fixture = Fixture::new("tinybrowser-renderer-messaging");
     fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
     let _ = fixture.wait_json();
@@ -385,11 +387,16 @@ fn post_message_to_a_busy_tab_does_not_block_the_sender() {
         eval(
             &mut client,
             &sender,
-            "window.__peer = window.open('about:blank', 'peer'); !!window.__peer"
+            &format!(
+                "window.__peer = window.open('http://localhost:{peer_port}/', 'peer'); !!window.__peer"
+            )
         )
         .unwrap(),
         "true"
     );
+    // A cross-origin popup stays a browser tab, so this test exercises the
+    // inter-tab messaging seam; a same-origin `about:blank` popup now shares
+    // the opener's renderer instead.
     let receiver = target_ids(&mut client)
         .into_iter()
         .find(|target| *target != sender && !initial.contains(target))
@@ -455,6 +462,7 @@ fn post_message_to_a_busy_tab_does_not_block_the_sender() {
     let _ = probe_rx.recv_timeout(Duration::from_secs(5));
     probing_thread.join().expect("probing thread");
     server.join().expect("server");
+    peer_server.join().expect("peer server");
 }
 
 #[test]
@@ -475,6 +483,8 @@ fn window_messages_are_limited_to_related_tabs() {
         stream.write_all(body).expect("write body");
     });
 
+    // The popup must cross an origin boundary to stay a browser tab.
+    let (peer_port, peer_server) = serve_page("peer");
     let mut fixture = Fixture::new("tinybrowser-renderer-related");
     fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
     let _ = fixture.wait_json();
@@ -516,7 +526,9 @@ fn window_messages_are_limited_to_related_tabs() {
         eval(
             &mut client,
             &sender,
-            "window.__peer = window.open('about:blank', 'peer'); !!window.__peer"
+            &format!(
+                "window.__peer = window.open('http://localhost:{peer_port}/', 'peer'); !!window.__peer"
+            )
         )
         .unwrap(),
         "true"
@@ -535,6 +547,7 @@ fn window_messages_are_limited_to_related_tabs() {
         std::thread::sleep(Duration::from_millis(25));
     }
     server.join().expect("server");
+    peer_server.join().expect("peer server");
 }
 
 #[test]
@@ -587,6 +600,27 @@ fn legal_storage_values_do_not_kill_the_renderer() {
     );
     assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
     server.join().expect("server");
+}
+
+/// Serves one HTML page on a fresh loopback port, for a popup that must cross
+/// an origin boundary.
+fn serve_page(title: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        let body = format!("<!doctype html><title>{title}</title>");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write head");
+        stream.write_all(body.as_bytes()).expect("write body");
+    });
+    (port, handle)
 }
 
 fn wait_for_load(client: &mut cdp::Client, timeout: Duration) {

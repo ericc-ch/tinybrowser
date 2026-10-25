@@ -30,6 +30,21 @@ pub(crate) const MAX_FRAMES: usize = 256;
 /// worker boundary) is refused instead of misdecoded.
 pub(crate) const PAYLOAD_VERSION: &str = "tb1:";
 
+/// How a frame came to exist, which decides its parent and container.
+///
+/// A child navigable is owned by a navigable container element
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#child-navigable>);
+/// an auxiliary browsing context is its own top-level traversable and keeps
+/// the browsing context that opened it
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#auxiliary-browsing-context>).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FrameOrigin {
+    /// The `container` element in `parent`'s document owns this frame.
+    Container { parent: FrameId, container: NodeId },
+    /// `window.open` created this frame as an auxiliary top-level context.
+    Auxiliary { opener: FrameId },
+}
+
 /// The browsing context tree of one tab.
 ///
 /// `children` order is container tree order, which is what `window.length`
@@ -40,13 +55,11 @@ pub(crate) const PAYLOAD_VERSION: &str = "tb1:";
 /// <https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
 #[derive(Default)]
 pub(crate) struct FrameTree {
-    /// Each frame's parent browsing context.
-    parents: HashMap<FrameId, FrameId>,
-    /// Each frame's direct children, in container tree order.
+    /// How each frame other than the main frame came to exist.
+    origins: HashMap<FrameId, FrameOrigin>,
+    /// Each frame's direct child navigables, in container tree order.
     children: HashMap<FrameId, Vec<FrameId>>,
-    /// Each child frame's owning `iframe`.
-    containers: HashMap<FrameId, NodeId>,
-    /// Reverse of `containers`, for `contentWindow`.
+    /// Reverse of the `Container` origins, for `contentWindow`.
     owners: HashMap<NodeId, FrameId>,
     /// Browsing context names (`window.name`)
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-name>).
@@ -57,27 +70,35 @@ impl FrameTree {
     /// How many frames the tree holds, so spawns can respect the cap without
     /// walking it.
     pub(crate) fn len(&self) -> usize {
-        self.containers.len()
+        self.origins.len()
     }
 
-    /// Adds `child` under `parent`, owned by `container`, sorting before
+    /// Adds `child` as a child navigable owned by `container`, sorting before
     /// `before` (or last when `None`) so the siblings match container tree
     /// order rather than creation order.
-    pub(crate) fn add(
+    pub(crate) fn add_container(
         &mut self,
         parent: FrameId,
         child: FrameId,
         container: NodeId,
         before: Option<FrameId>,
     ) {
-        self.parents.insert(child, parent);
-        self.containers.insert(child, container);
+        self.origins
+            .insert(child, FrameOrigin::Container { parent, container });
         self.owners.insert(container, child);
         let siblings = self.children.entry(parent).or_default();
         match before.and_then(|target| siblings.iter().position(|frame| *frame == target)) {
             Some(index) => siblings.insert(index, child),
             None => siblings.push(child),
         }
+        self.names.entry(child).or_default();
+    }
+
+    /// Adds `child` as an auxiliary top-level context opened by `opener`
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
+    pub(crate) fn add_auxiliary(&mut self, opener: FrameId, child: FrameId) {
+        self.origins
+            .insert(child, FrameOrigin::Auxiliary { opener });
         self.names.entry(child).or_default();
     }
 
@@ -113,36 +134,58 @@ impl FrameTree {
         self.names.insert(frame, name);
     }
 
-    /// Removes one frame and returns its `(parent, container)`.
-    pub(crate) fn remove(&mut self, child: FrameId) -> Option<(FrameId, NodeId)> {
-        let parent = self.parents.remove(&child)?;
-        if let Some(siblings) = self.children.get_mut(&parent) {
-            siblings.retain(|frame| *frame != child);
+    /// Removes one frame and returns how it came to exist.
+    pub(crate) fn remove(&mut self, child: FrameId) -> Option<FrameOrigin> {
+        let origin = self.origins.remove(&child)?;
+        if let FrameOrigin::Container { parent, container } = origin {
+            if let Some(siblings) = self.children.get_mut(&parent) {
+                siblings.retain(|frame| *frame != child);
+            }
+            self.owners.remove(&container);
         }
         self.children.remove(&child);
-        let container = self.containers.remove(&child)?;
-        self.owners.remove(&container);
         self.names.remove(&child);
-        Some((parent, container))
+        Some(origin)
     }
 
     /// Whether the tree holds `frame`.
     pub(crate) fn contains(&self, frame: FrameId) -> bool {
-        self.containers.contains_key(&frame)
-    }
-    /// The parent browsing context of `frame`, when it is a child frame.
-    pub(crate) fn parent(&self, frame: FrameId) -> Option<FrameId> {
-        self.parents.get(&frame).copied()
+        self.origins.contains_key(&frame)
     }
 
-    /// The direct children of `frame`, in container tree order.
+    /// Whether `frame` is a browsing context this renderer still hosts. The
+    /// main frame has no tree entry: it lives as long as the renderer does.
+    pub(crate) fn is_alive(&self, frame: FrameId) -> bool {
+        frame == FrameId::MAIN || self.contains(frame)
+    }
+
+    /// The parent browsing context of `frame`, when it is a child navigable.
+    pub(crate) fn parent(&self, frame: FrameId) -> Option<FrameId> {
+        match self.origins.get(&frame) {
+            Some(FrameOrigin::Container { parent, .. }) => Some(*parent),
+            Some(FrameOrigin::Auxiliary { .. }) | None => None,
+        }
+    }
+
+    /// The browsing context that opened `frame`, when it is auxiliary.
+    pub(crate) fn opener(&self, frame: FrameId) -> Option<FrameId> {
+        match self.origins.get(&frame) {
+            Some(FrameOrigin::Auxiliary { opener }) => Some(*opener),
+            Some(FrameOrigin::Container { .. }) | None => None,
+        }
+    }
+
+    /// The direct child navigables of `frame`, in container tree order.
     pub(crate) fn children(&self, frame: FrameId) -> &[FrameId] {
         self.children.get(&frame).map_or(&[], Vec::as_slice)
     }
 
     /// The `iframe` that owns `frame`.
     pub(crate) fn container(&self, frame: FrameId) -> Option<NodeId> {
-        self.containers.get(&frame).copied()
+        match self.origins.get(&frame) {
+            Some(FrameOrigin::Container { container, .. }) => Some(*container),
+            Some(FrameOrigin::Auxiliary { .. }) | None => None,
+        }
     }
 
     /// The child frame of `container`, when its browsing context exists.
@@ -154,9 +197,10 @@ impl FrameTree {
     /// choosing a navigable
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
     ///
-    /// `None` is the spec's "will not find a navigable" option: the rules asked
-    /// for a new top-level traversable, and a tab is one top-level traversable
-    /// with no popups, so the caller navigates nothing.
+    /// `None` is the spec's "will not find a navigable" option, or "new": the
+    /// rules asked for a new top-level traversable. `window.open` turns that
+    /// answer into an auxiliary context for a URL this renderer can host and
+    /// falls back to a browser tab otherwise.
     pub(crate) fn choose_navigable(&self, target: &str, current: FrameId) -> Option<FrameId> {
         if target.is_empty() || target.eq_ignore_ascii_case("_self") {
             return Some(current);
@@ -170,9 +214,11 @@ impl FrameTree {
         if target.eq_ignore_ascii_case("_blank") {
             return None;
         }
-        [current, self.top_level(current)]
+        let top = self.top_level(current);
+        [current, top]
             .into_iter()
             .find_map(|subtree| self.find_by_target_name(subtree, target))
+            .or_else(|| self.find_by_auxiliary_name(top, target))
     }
 
     /// The top-level traversable of `frame`
@@ -191,8 +237,9 @@ impl FrameTree {
     /// The searched subtrees are implementation-defined, and the spec's first
     /// option is «traversable, current», searched in reverse: `choose_navigable`
     /// therefore passes this frame first, then the traversable. The browsing
-    /// context group search that follows the subtrees is unreachable here: a
-    /// renderer hosts one top-level traversable and creates no other.
+    /// context group search that follows the subtrees covers the auxiliary
+    /// contexts this renderer hosts; contexts in another renderer process are
+    /// searched by the browser tab's host instead.
     fn find_by_target_name(&self, subtree: FrameId, target: &str) -> Option<FrameId> {
         // The inclusive descendant navigables of a document put the document's
         // own navigable first, then each container's subtree in container tree
@@ -203,6 +250,27 @@ impl FrameTree {
         self.children(subtree)
             .iter()
             .find_map(|child| self.find_by_target_name(*child, target))
+    }
+
+    /// The browsing context group search: every auxiliary top-level context
+    /// this renderer hosts, excluding `current`.
+    ///
+    /// Auxiliary contexts created by `window.open` here are same-origin by
+    /// construction, so `current` is familiar with all of them
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#familiar>).
+    fn find_by_auxiliary_name(&self, current: FrameId, target: &str) -> Option<FrameId> {
+        let mut auxiliaries: Vec<FrameId> = self
+            .origins
+            .iter()
+            .filter_map(|(frame, origin)| {
+                matches!(origin, FrameOrigin::Auxiliary { .. }).then_some(*frame)
+            })
+            .collect();
+        auxiliaries.sort();
+        auxiliaries
+            .into_iter()
+            .filter(|frame| *frame != current)
+            .find_map(|frame| self.find_by_target_name(frame, target))
     }
 }
 
@@ -644,10 +712,26 @@ impl Shared {
             removed.push(child);
         }
         for child in &removed {
-            let container = self.tree.remove(*child).map(|(_, container)| container);
+            let container = self.tree.remove(*child).and_then(|origin| match origin {
+                FrameOrigin::Container { container, .. } => Some(container),
+                FrameOrigin::Auxiliary { .. } => None,
+            });
             self.close_frame_ports(*child);
             self.removed_frames.push((*child, container));
         }
+    }
+
+    /// Removes an auxiliary top-level context its own script closed, with every
+    /// child navigable it owns. A child iframe or the main frame cannot close
+    /// its browsing context this way.
+    pub(crate) fn close_auxiliary(&mut self, frame: FrameId) {
+        if self.tree.opener(frame).is_none() {
+            return;
+        }
+        self.detach_child_frames(frame);
+        self.tree.remove(frame);
+        self.close_frame_ports(frame);
+        self.removed_frames.push((frame, None));
     }
 
     /// Takes the frames whose documents the engine must drop.
@@ -659,6 +743,7 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::FrameTree;
+    use crate::dom::tree::NodeId;
     use crate::protocol::FrameId;
 
     /// The tree every case reads, as `(parent, child)` edges and the names the
@@ -666,14 +751,17 @@ mod tests {
     /// child `4`, `3` with child `5`; `2` and `4` share the name `alpha`, so
     /// the search order is visible in the result.
     ///
-    /// Containers are omitted: only the shape and the names matter to choosing
-    /// a navigable, and nothing here navigates.
+    /// Containers are synthetic: only the shape and the names matter to
+    /// choosing a navigable, and nothing here navigates.
     fn tree() -> FrameTree {
         let mut tree = FrameTree::default();
         for (parent, child) in [(1, 2), (1, 3), (2, 4), (3, 5)] {
             let (parent, child) = (FrameId::new(parent), FrameId::new(child));
-            tree.parents.insert(child, parent);
-            tree.children.entry(parent).or_default().push(child);
+            let container = NodeId {
+                document: 0,
+                node: crate::dom::tree::BlitzId::from_u64(child.get()),
+            };
+            tree.add_container(parent, child, container, None);
         }
         for (frame, name) in [(2, "alpha"), (3, "beta"), (4, "alpha"), (5, "gamma")] {
             tree.names.insert(FrameId::new(frame), name.to_owned());
@@ -721,5 +809,20 @@ mod tests {
         assert_eq!(chosen("gamma", 1), 5);
         // A name nothing holds asks for a new top-level traversable.
         assert_eq!(chosen("missing", 1), 0);
+    }
+
+    #[test]
+    fn an_auxiliary_context_is_its_own_top_level_and_is_found_by_name() {
+        let mut tree = tree();
+        let popup = FrameId::new(9);
+        tree.add_auxiliary(FrameId::new(1), popup);
+        tree.set_name(popup, "popup".to_owned());
+        assert_eq!(tree.top_level(popup), popup);
+        assert_eq!(tree.parent(popup), None);
+        assert_eq!(tree.container(popup), None);
+        assert_eq!(tree.opener(popup), Some(FrameId::new(1)));
+        assert_eq!(tree.choose_navigable("popup", FrameId::new(4)), Some(popup));
+        assert_eq!(tree.choose_navigable("_parent", popup), Some(popup));
+        assert_eq!(tree.choose_navigable("_top", popup), Some(popup));
     }
 }

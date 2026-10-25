@@ -2103,7 +2103,7 @@ pub(super) fn apply_meta_csp(ctx: &Ctx<'_>, id: NodeId) {
 /// [Prepares](https://html.spec.whatwg.org/multipage/webappapis.html#prepare-the-script-element)
 /// a classic inline script. Empty scripts return without setting already
 /// started. External and module scripts are not prepared here.
-pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+pub(crate) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     enum Kind {
         Inline(String, u32),
         External,
@@ -2132,7 +2132,20 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     // (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
     world(ctx)?.borrow_mut().clear_parser_inserted(id);
     let (source, base_line) = match kind {
-        Kind::Inline(source, line) => (source, line),
+        Kind::Inline(source, line) => {
+            // An inline script inserted into another document's realm cannot
+            // run here: that document's realm does not exist yet, because a
+            // `QuickJS` realm cannot be created while this script runs (the
+            // common case is a script appended to a `window.open()` document).
+            // Keep it for the document's own realm to run.
+            let caller = world(ctx)?;
+            let owner = world_for_node(ctx, id)?;
+            if !Rc::ptr_eq(&caller, &owner) {
+                owner.borrow_mut().queue_deferred_script(id);
+                return Ok(());
+            }
+            (source, line)
+        }
         Kind::External => {
             // Parser-inserted scripts never reach this path; the parser
             // runs them from `Document::run_scripts`. The fetch for a
