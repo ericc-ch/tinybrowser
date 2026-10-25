@@ -1328,12 +1328,14 @@ pub(crate) struct ImageState {
     /// Elements whose current request already dispatched its `error` event,
     /// so a later scan does not repeat it.
     pub(crate) error_reported: HashSet<NodeId>,
-    /// Elements whose settled request loaded through a CORS check
-    /// (`crossorigin` content attribute; the network refuses a CORS-mode
-    /// load without a valid `Access-Control-Allow-Origin`). A load that is
-    /// not same-origin and not here taints the canvas
+    /// Elements whose settled request is origin-clean for canvas: the
+    /// response URL after redirects is same-origin with the document, or the
+    /// request loaded through a CORS check (`crossorigin` content attribute;
+    /// the network refuses a CORS-mode load without a valid
+    /// `Access-Control-Allow-Origin`). Every other settled load taints the
+    /// canvas
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-    pub(crate) cors_clean: HashSet<NodeId>,
+    pub(crate) origin_clean: HashSet<NodeId>,
 }
 
 impl ImageState {
@@ -1345,7 +1347,7 @@ impl ImageState {
         self.current_src.clear();
         self.broken.clear();
         self.error_reported.clear();
-        self.cors_clean.clear();
+        self.origin_clean.clear();
     }
 }
 
@@ -2604,7 +2606,7 @@ impl World {
         self.images.loading.insert(element);
         self.images.broken.remove(&element);
         self.images.error_reported.remove(&element);
-        self.images.cors_clean.remove(&element);
+        self.images.origin_clean.remove(&element);
         if !self.images.sizes.contains_key(&element) {
             self.images.current_src.insert(element, url);
         }
@@ -2657,8 +2659,21 @@ impl World {
         self.images.current_src.remove(&element);
         self.images.broken.remove(&element);
         self.images.error_reported.remove(&element);
-        self.images.cors_clean.remove(&element);
+        self.images.origin_clean.remove(&element);
         self.images.sizes.remove(&element);
+    }
+
+    /// Whether a settled image response is same-origin with this document.
+    /// The response URL after redirects decides, not the URL the author
+    /// wrote. A `data:` image is clean, like in browsers, and a URL that does
+    /// not parse is cross-origin
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>,
+    /// <https://fetch.spec.whatwg.org/#concept-response-cors-same-origin>).
+    pub(crate) fn image_response_is_same_origin(&self, response_url: &str) -> bool {
+        let Ok(url) = Url::parse(response_url) else {
+            return false;
+        };
+        url.scheme() == "data" || self.origin == url.origin()
     }
 
     pub(crate) fn clear_images(&mut self) {

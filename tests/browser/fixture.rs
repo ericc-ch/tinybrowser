@@ -9,25 +9,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
-/// Reads one HTTP/1.1 request head and discards it. Test servers call this
-/// before replying: closing a socket with unread data sends RST, which can
-/// abort the response delivery. `false` means the connection failed before a
-/// complete head arrived; the server loop moves on to the next connection.
-pub(crate) fn read_request_head(stream: &mut TcpStream) -> bool {
+/// Reads one HTTP/1.1 request head and returns its request target, discarding
+/// the rest. Test servers call this before replying: closing a socket with
+/// unread data sends RST, which can abort the response delivery. `None` means
+/// the connection failed or the request line was malformed; the server loop
+/// moves on to the next connection.
+pub(crate) fn read_request_path(stream: &mut TcpStream) -> Option<String> {
     // Short polls instead of one long blocking read: under load the request
     // can lag the accept, and a single long read hides which side stalled.
-    let Ok(()) = stream.set_read_timeout(Some(Duration::from_millis(100))) else {
-        return false;
-    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok()?;
     let mut head = Vec::new();
     let mut chunk = [0_u8; 512];
     let deadline = Instant::now() + Duration::from_secs(10);
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {
         if Instant::now() >= deadline {
-            return false;
+            return None;
         }
         match stream.read(&mut chunk) {
-            Ok(0) => return false,
+            Ok(0) => return None,
             Ok(n) => head.extend_from_slice(&chunk[..n]),
             // A poll timeout surfaces as `WouldBlock` or `TimedOut` depending
             // on the platform.
@@ -38,11 +39,14 @@ pub(crate) fn read_request_head(stream: &mut TcpStream) -> bool {
                 ) => {}
             Err(error) => {
                 eprintln!("test server read failed: {error}");
-                return false;
+                return None;
             }
         }
     }
-    true
+    let head = String::from_utf8_lossy(&head);
+    let mut request_line = head.lines().next()?.split_whitespace();
+    let _method = request_line.next()?;
+    request_line.next().map(str::to_owned)
 }
 
 /// Serves one body on an ephemeral port for every connection it gets, reading
@@ -57,7 +61,7 @@ pub(crate) fn serve(body: &'static [u8], content_type: &'static str) -> std::net
     );
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            if !read_request_head(&mut stream) {
+            if read_request_path(&mut stream).is_none() {
                 continue;
             }
             let _ = stream.write_all(response.as_bytes());

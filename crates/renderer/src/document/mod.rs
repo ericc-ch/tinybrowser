@@ -3479,7 +3479,7 @@ impl Document {
         // current for the next capture instead of waiting for one to pump
         // the resolve loop.
         self.settle_blitz_layout();
-        self.settle_image_waiters(&request_url, cors_clean);
+        self.settle_image_waiters(&request_url, &outcome.final_url, cors_clean);
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
@@ -3536,7 +3536,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&request_url, false);
+                    self.settle_image_waiters(&request_url, &request_url, false);
                 }
             }
         }
@@ -3818,7 +3818,7 @@ impl Document {
             if let Some(bytes) = self.subresource_bytes.get(&url).cloned() {
                 Box::new(handler).bytes(url.clone(), blitz_traits::net::Bytes::from(bytes));
                 self.settle_blitz_layout();
-                self.settle_image_waiters(&url, false);
+                self.settle_image_waiters(&url, &url, false);
                 continue;
             }
             // Per-destination policy: a blocked stylesheet, image, or font is
@@ -3851,7 +3851,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&url, false);
+                    self.settle_image_waiters(&url, &url, false);
                     continue;
                 }
             }
@@ -4172,11 +4172,18 @@ impl Document {
     }
 
     /// Settles the in-flight image elements waiting on `url`: decoded
-    /// dimensions fire `load`, anything else fires `error`. `cors_clean`
-    /// marks the elements' settled request as origin-clean for canvas: the
-    /// request went out in CORS mode and survived the check. Every other
-    /// settle path passes `false`, which falls back to the same-origin rule.
-    fn settle_image_waiters(&mut self, url: &str, cors_clean: bool) {
+    /// dimensions fire `load`, anything else fires `error`. `response_url` is
+    /// the settled response's URL after redirects; the elements it belongs to
+    /// become origin-clean for canvas when that URL is same-origin with this
+    /// document, or when `cors_clean` says the request went out in CORS mode
+    /// and survived the check
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+    fn settle_image_waiters(&mut self, url: &str, response_url: &str, cors_clean: bool) {
+        let same_origin = self
+            .world
+            .borrow()
+            .image_response_is_same_origin(response_url);
+        let origin_clean = cors_clean || same_origin;
         let waiting: Vec<crate::dom::tree::NodeId> = self
             .in_flight_images
             .keys()
@@ -4190,8 +4197,8 @@ impl Document {
         for element in &waiting {
             self.in_flight_images.remove(element);
             let selected = self.image_selected_src.remove(element).unwrap_or_default();
-            if cors_clean {
-                self.world.borrow_mut().images.cors_clean.insert(*element);
+            if origin_clean {
+                self.world.borrow_mut().images.origin_clean.insert(*element);
             }
             if let Some((width, height)) = self.blitz_image_dims(*element) {
                 self.world

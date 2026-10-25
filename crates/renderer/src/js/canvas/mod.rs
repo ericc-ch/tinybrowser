@@ -2672,28 +2672,14 @@ fn source_image<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<ImageLookup> {
     }))
 }
 
-/// Whether the image element's settled request is origin-clean for canvas:
-/// same-origin, or loaded through a CORS check (`crossorigin` content
-/// attribute; the network refuses a CORS-mode load without a valid
-/// `Access-Control-Allow-Origin`, so a settled CORS-mode load is clean).
-/// `data:` images are treated as clean, like browsers do; a URL that does not
-/// parse is treated as cross-origin
+/// Whether the image element's settled request is origin-clean for canvas.
+/// The document records the answer when the response settles, because
+/// origin-cleanliness follows the response URL after redirects, not the URL
+/// the author wrote. A source with no image request of its own (a canvas
+/// element, an unsupported element) carries no taint
 /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
 fn image_origin_clean(world: &crate::js::world::World, id: NodeId) -> bool {
-    world.images.cors_clean.contains(&id) || image_is_same_origin(world, id)
-}
-
-fn image_is_same_origin(world: &crate::js::world::World, id: NodeId) -> bool {
-    let Some(src) = world.images.current_src.get(&id) else {
-        return true;
-    };
-    let Ok(url) = url::Url::parse(src) else {
-        return false;
-    };
-    if url.scheme() == "data" {
-        return true;
-    }
-    world.origin == url.origin()
+    world.images.origin_clean.contains(&id) || !world.images.current_src.contains_key(&id)
 }
 
 /// Looks up a canvas, SVG image, or HTML image element by node id.
