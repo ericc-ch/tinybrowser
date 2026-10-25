@@ -31,6 +31,15 @@ explicit approval. Update the docs/progress.md total after scoring.
 Timeout policy (DEFAULT/LONG/EXTRA seconds) lives at the top of
 tinybrowser_wpt.py.
 
+A test file whose own timers outlast DEFAULT_TIMEOUT cannot be sped up
+from the engine: `referrer-policy/css-integration/svg/` sleeps 800 ms
+per subtest (nine serially) before it checks anything. SLOW_TEST_PREFIXES
+in tinybrowser_wpt.py gives those directories SLOW_TEST_TIMEOUT, still
+below testharness.js's 10 s clock so the runner kill lands first. That
+list is only for waits written into test code, never for a slow engine
+path; an entry whose reason expired falls back to the default budget and
+its files fail visibly.
+
 Enabled: testharness (multi-window, same-site frames), crashtest,
 reftest (screenshot compare, 800x600), test262 (generated wrappers),
 HTTPS (--ssl-type=openssl; WSS unrun), testdriver (click/keys/cookies/

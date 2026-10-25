@@ -67,9 +67,12 @@ TLS_SCHEMES = ("https", "https-local", "https-public", "wss", "h2")
 HTTP_ONLY = ("http", "ws")
 
 # wptrunner `--exclude` is a URL prefix, so `--exclude=worker` misses
-# `.any.worker.html` / `.worker.html` variants generated from `.any.js`.
+# `.any.worker.html` variants generated from `.any.js` and the security-features
+# generator's `worker-classic.http.html` / `sharedworker-module.https.html`
+# subresource files.
 WORKER_VARIANT = re.compile(
-    r"\.(any\.)?(sharedworker|serviceworker|worker)(-module)?\.html$"
+    r"(?:^|[/.])(any\.)?(sharedworker|serviceworker|worker)(-(classic|module))?"
+    r"(\.[a-z0-9]+)*\.html$"
 )
 
 # File-level statuses with their own bucket; anything else not-a-pass is
@@ -2404,6 +2407,13 @@ def _selftest() -> None:
     assert is_worker_variant_url("/x.any.sharedworker.html")
     assert is_worker_variant_url("/x.any.serviceworker.html")
     assert is_worker_variant_url("/x.any.worker-module.html")
+    assert is_worker_variant_url(
+        "/referrer-policy/gen/top.http-rp/unset/worker-classic.http.html"
+    )
+    assert is_worker_variant_url(
+        "/referrer-policy/gen/top.http-rp/unset/sharedworker-module.https.sub.html"
+    )
+    assert not is_worker_variant_url("/workers/Worker-basic.html")
     assert not is_worker_variant_url("/dom/events/Event-isTrusted.any.html")
     assert not is_worker_variant_url("/dom/events/Event-isTrusted.any.html?foo=1")
     assert not is_worker_variant_url("/dom/events/Event-dispatch-click.tentative.html")
