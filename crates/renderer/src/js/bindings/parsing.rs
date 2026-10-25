@@ -327,11 +327,10 @@ pub(super) fn install_xhr_parse(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Installs the parser behind `Document.parseHTMLUnsafe` and
-/// `Document.parseHTML`, which `scripts/web/dom.js` installs as statics: the
-/// `WebIDL` generator does not emit static operations yet. Both parse with the
-/// caller's environment settings object's URL and scripting disabled, exactly
-/// as `DOMParser` does
+/// Installs the parser behind `Document.parseHTMLUnsafe`, which
+/// `scripts/web/dom.js` installs as a static: the `WebIDL` generator does not
+/// emit static operations yet. It parses with the caller's environment settings
+/// object's URL and scripting disabled, exactly as `DOMParser` does
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-parsehtmlunsafe>).
 pub(super) fn install_document_parse(ctx: &Ctx<'_>) -> Result<()> {
     crate::js::bridge::object(ctx)?
@@ -342,11 +341,8 @@ pub(super) fn install_document_parse(ctx: &Ctx<'_>) -> Result<()> {
 /// `Document.parseHTMLUnsafe`'s parse: a new document with the caller's URL
 /// and no scripting
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-parsehtmlunsafe>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn parse_html_document<'js>(ctx: Ctx<'js>, source: rquickjs::String<'js>) -> Result<Value<'js>> {
+fn parse_html_document<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Value<'js>> {
+    let source = source.get::<rquickjs::String>()?;
     let url = world(&ctx)?.borrow().document_url.as_str().to_owned();
     parse_string_document(&ctx, &source, "text/html", &url)
 }

@@ -630,7 +630,7 @@ fn hyperlink_referrer_policy(
     {
         return Some(net::ReferrerPolicy::NoReferrer);
     }
-    attr(base, node, "referrerpolicy").and_then(net::ReferrerPolicy::from_attribute)
+    attr(base, node, "referrerpolicy").and_then(net::ReferrerPolicy::parse)
 }
 
 /// The label element's activation behavior: a click on the label or a

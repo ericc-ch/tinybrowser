@@ -32,8 +32,6 @@ pub(crate) mod dial;
 mod dials;
 mod drain;
 
-pub(crate) use drain::DrainStep;
-
 mod intern;
 mod load;
 
@@ -150,6 +148,11 @@ pub(crate) enum DialContext {
         /// The embedding document, when this navigation is a nested browsing
         /// context. `None` for the top-level document.
         embedder: Option<FrameId>,
+        /// The flags the container's `sandbox` attribute and the embedder's
+        /// active set impose. They take effect when the response commits, not
+        /// when the navigation starts
+        /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#determine-navigation-params>).
+        sandbox: crate::js::world::SandboxFlags,
     },
     /// A Blitz subresource (stylesheet, image, font) fetch. The response
     /// handler waits in [`Document::blitz_handlers`] under this id; delivery
@@ -307,7 +310,9 @@ pub(crate) struct LocalDocumentState {
 }
 
 struct Timer {
-    when: Instant,
+    /// `None` when the delay overflows the clock: the timer never fires
+    /// (<https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout>).
+    when: Option<Instant>,
     fired: bool,
     /// The script-visible id, when this timer belongs to a realm.
     js_id: Option<i32>,
@@ -331,45 +336,50 @@ fn subresource_destination(
     }
 }
 
+/// Builds and queues the initial `about:blank` document for one connected
+/// `iframe` so `contentDocument` is available in the inserting script
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+///
+/// The nested realm is deferred: `QuickJS` cannot enter a new context while
+/// the parent script still runs.
 fn materialize_iframe_document(
     world_rc: &Rc<RefCell<World>>,
     frame: FrameId,
     container: crate::dom::tree::NodeId,
     new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
 ) {
-    let (runtime, base_url, referrer_url, origin, init_scripts, viewport) = {
+    let (runtime, base_url, referrer_url, init_scripts, viewport) = {
         let world = world_rc.borrow();
         (
             world.runtime.clone(),
             world.document_url.clone(),
             world.referrer_url.clone(),
-            world.origin.clone(),
             Rc::clone(&world.init_scripts),
             world.viewport_size.get(),
         )
     };
-    // The container's `sandbox` attribute decides the flag set for every
-    // document this frame loads
-    // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+    // The container's `sandbox` attribute, unioned with the embedder's active
+    // flags, decides the flag set for every document this frame loads
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
     let sandbox = sandboxing_flags(world_rc, container);
-    let origin = if sandbox.sandboxed_origin {
+    let origin = if sandbox.origin_is_opaque() {
         url::Origin::new_opaque()
     } else {
-        origin
+        world_rc.borrow().origin.clone()
     };
     let mut document = Document::with_shared(frame, &runtime, &init_scripts);
     document.set_viewport_size(viewport);
-    document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
-    // The initial blank reports its creator's URL, walked out of a `srcdoc`
-    // chain the same way the referrer source is
-    // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
-    document.set_document_referrer(referrer_url.as_str());
     {
         let world_handle = document.world();
         let mut world = world_handle.borrow_mut();
         world.policy = world_rc.borrow().policy.clone();
         world.sandbox = sandbox;
     }
+    document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
+    // The initial blank reports its creator's URL, walked out of a `srcdoc`
+    // chain the same way the referrer source is
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
+    document.set_document_referrer(referrer_url.as_str());
     if let Some(root) = document.document_root() {
         world_rc
             .borrow()
@@ -396,6 +406,7 @@ fn materialize_iframe_document(
 fn materialize_auxiliary_document(
     world_rc: &Rc<RefCell<World>>,
     frame: FrameId,
+    options: crate::js::world::AuxiliaryOptions,
     new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
 ) {
     let (runtime, url, origin, policy, sandbox, init_scripts, viewport) = {
@@ -405,41 +416,55 @@ fn materialize_auxiliary_document(
             world.document_url.clone(),
             world.origin.clone(),
             world.policy.clone(),
-            world.sandbox,
+            world.sandbox.auxiliary_flags(),
             Rc::clone(&world.init_scripts),
             world.viewport_size.get(),
         )
     };
     let mut document = Document::with_shared(frame, &runtime, &init_scripts);
     document.set_viewport_size(viewport);
-    document.load_about_blank_tree(Some(url.as_str()), Some(origin));
+    // The sandbox flags are installed before the blank document is built: an
+    // inherited sandboxed-origin flag decides the origin `load_about_blank_tree`
+    // captures
+    // (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
     {
         let world_handle = document.world();
         let mut world = world_handle.borrow_mut();
         world.policy = policy;
         world.sandbox = sandbox;
     }
+    let origin = if sandbox.origin_is_opaque() {
+        url::Origin::new_opaque()
+    } else {
+        origin
+    };
+    document.load_about_blank_tree(Some(url.as_str()), Some(origin));
+    if options.noreferrer {
+        document.set_document_referrer("");
+    }
     new_frames
         .borrow_mut()
         .push(CreatedFrame::Auxiliary { frame, document });
 }
 
-/// The sandboxing flags the `iframe` at `container` imposes, from the
-/// `sandbox` content attribute of that element in its own document.
+/// The sandboxing flags the `iframe` at `container` imposes: its `sandbox`
+/// content attribute unioned with the active flags of the document that owns
+/// it
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
 pub(crate) fn sandboxing_flags(
     world_rc: &Rc<RefCell<World>>,
     container: crate::dom::tree::NodeId,
 ) -> crate::js::world::SandboxFlags {
     let world = world_rc.borrow();
     let Some(parsed) = world.document(container) else {
-        return crate::js::world::SandboxFlags::default();
+        return world.sandbox;
     };
     let base = &parsed.document.base;
     if !crate::dom::tree::is_html_element(base, container.node, "iframe") {
-        return crate::js::world::SandboxFlags::default();
+        return world.sandbox;
     }
     let attribute = crate::dom::tree::attr(base, container.node, "sandbox");
-    crate::js::world::SandboxFlags::parse(attribute)
+    crate::js::world::SandboxFlags::parse(attribute).union(world.sandbox)
 }
 
 /// One parse-time step over a document's element tree, in tree order.
@@ -771,8 +796,10 @@ impl Document {
                 }),
                 auxiliary: Rc::new({
                     let new_frames = Rc::clone(&new_frames);
-                    move |world_rc: &Rc<RefCell<World>>, frame| {
-                        materialize_auxiliary_document(world_rc, frame, &new_frames);
+                    move |world_rc: &Rc<RefCell<World>>,
+                          frame,
+                          options: crate::js::world::AuxiliaryOptions| {
+                        materialize_auxiliary_document(world_rc, frame, options, &new_frames);
                     }
                 }),
             });
@@ -880,7 +907,7 @@ impl Document {
         let world = self.world.borrow();
         world.document(container).and_then(|parsed| {
             crate::dom::tree::attr(&parsed.document.base, container.node, "referrerpolicy")
-                .and_then(net::ReferrerPolicy::from_attribute)
+                .and_then(net::ReferrerPolicy::parse)
         })
     }
 
@@ -988,15 +1015,31 @@ impl Document {
         let mut loaded = Vec::with_capacity(pending.len());
         let inherited = self.world.borrow().policy.clone();
         for (frame, container) in pending {
+            // Parser-created and script-created frames share this funnel's
+            // rule: the container's `sandbox` attribute unioned with this
+            // document's active flags decides the set, and an opaque origin
+            // when the origin flag is in it
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+            let sandbox = sandboxing_flags(&self.world, container);
+            let origin = if sandbox.origin_is_opaque() {
+                url::Origin::new_opaque()
+            } else {
+                origin.clone()
+            };
             let mut document = Document::with_shared(frame, &runtime, &init_scripts);
             // Frames created from parsed markup share the tab's viewport too.
             // This path runs before page script, so the realm can exist for
             // `contentWindow` in the following classic script
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
             document.set_viewport_size(viewport);
-            document.load_about_blank(Some(base_url.as_str()), Some(origin.clone()));
+            {
+                let world_handle = document.world();
+                let mut world = world_handle.borrow_mut();
+                world.policy = inherited.clone();
+                world.sandbox = sandbox;
+            }
+            document.load_about_blank(Some(base_url.as_str()), Some(origin));
             document.set_document_referrer(referrer_url.as_str());
-            document.world().borrow_mut().policy = inherited.clone();
             loaded.push(CreatedFrame::Child {
                 frame,
                 container,
@@ -1191,19 +1234,25 @@ impl Document {
         self.world.borrow_mut().forget_image(element);
     }
 
-    /// Queues one dial after applying CSP `upgrade-insecure-requests` to it.
+    /// Applies CSP `upgrade-insecure-requests` to the request URL of one queued
+    /// dial.
     ///
     /// The rewrite happens at the top of main fetch, before the request leaves
-    /// the renderer: an `http` request URL becomes `https`, and an explicit
-    /// `http` referrer follows. A nested navigation always upgrades because
-    /// the embedder's security state depends on it; a top-level navigation
-    /// upgrades only a host in the document's upgrade set, which is the
-    /// protected resource's own host and port. Every other request upgrades
-    /// unconditionally
+    /// the renderer: an `http` request URL becomes `https`. A nested navigation
+    /// always upgrades because the embedder's security state depends on it; a
+    /// top-level navigation upgrades only a host in the document's upgrade set,
+    /// which is the protected resource's own host and port. Every other request
+    /// upgrades unconditionally
     /// (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
     fn queue_dial(&mut self, mut dial: QueuedDial) {
         if self.world.borrow().policy.csp.upgrades_insecure_requests() {
-            let nested = matches!(dial.context, DialContext::FrameLoad { embedder: Some(_) });
+            let nested = matches!(
+                dial.context,
+                DialContext::FrameLoad {
+                    embedder: Some(_),
+                    ..
+                }
+            );
             let upgrades = if dial.req.kind == crate::protocol::DialKind::FrameLoad && !nested {
                 // A top-level navigation must target the protected resource's
                 // own host and port, so a policy cannot upgrade a link to a
@@ -1215,11 +1264,6 @@ impl Document {
             };
             if upgrades {
                 Self::upgrade_scheme(&mut dial.req.url);
-                if let net::Referrer::Url(url) = &mut dial.req.referrer
-                    && url.scheme() == "http"
-                {
-                    let _ = url.set_scheme("https");
-                }
             }
         }
         // A navigation request advertises the client's upgrade capability so a
@@ -1274,13 +1318,14 @@ impl Document {
         embedder: Option<FrameId>,
         mut req: crate::protocol::DialRequest,
         ancestors: Vec<Url>,
+        sandbox: crate::js::world::SandboxFlags,
     ) {
         req.kind = crate::protocol::DialKind::FrameLoad;
         req.read_body = true;
         self.dials.cancel_frame_loads();
         self.initial_blank = false;
         self.queue_dial(QueuedDial {
-            context: DialContext::FrameLoad { embedder },
+            context: DialContext::FrameLoad { embedder, sandbox },
             req,
             ancestors,
             integrity: None,
@@ -1422,7 +1467,7 @@ impl Document {
     ) {
         // A `javascript:` navigation does nothing while scripting is disabled
         // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
-        if script.is_empty() || self.world.borrow().sandbox.scripting_disabled {
+        if script.is_empty() || self.world.borrow().sandbox.scripts_disabled() {
             return;
         }
         let violations = Self::navigation_script_violations(policy, &self.url, source);
@@ -1446,7 +1491,7 @@ impl Document {
     /// updates keep the origin they already have, so they bypass this
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
     fn sandboxed_origin(&self, origin: Option<url::Origin>) -> Option<url::Origin> {
-        if self.world.borrow().sandbox.sandboxed_origin {
+        if self.world.borrow().sandbox.origin_is_opaque() {
             Some(url::Origin::new_opaque())
         } else {
             origin
@@ -2882,7 +2927,7 @@ impl Document {
                 steps.push(ParseStep::Base(node_id));
             }
             if crate::dom::tree::is_html_element(base, id, "script")
-                && !world.sandbox.scripting_disabled
+                && !world.sandbox.scripts_disabled()
             {
                 steps.push(ParseStep::Script(node_id));
             }
@@ -3025,14 +3070,14 @@ impl Document {
             return false;
         }
         self.parser_blocked_script = Some(id);
-        let (referrer, referrer_policy) = self.subresource_referrer(Some(id));
+        let referrer_policy = self.subresource_referrer(Some(id));
         let mut dial = QueuedDial::new(
             DialContext::ClassicScript { element: id },
             &url,
             &self.dial_initiator(),
             &self.referrer_url(),
         );
-        dial.req.referrer = referrer;
+        dial.req.referrer = net::Referrer::Client;
         dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
@@ -3063,18 +3108,17 @@ impl Document {
     fn subresource_referrer(
         &self,
         element: Option<crate::dom::tree::NodeId>,
-    ) -> (net::Referrer, net::ReferrerPolicy) {
+    ) -> net::ReferrerPolicy {
         let world = self.world.borrow();
-        let policy = element
+        element
             .and_then(|element| {
                 world.document(element).and_then(|parsed| {
                     crate::dom::tree::attr(&parsed.document.base, element.node, "referrerpolicy")
-                        .and_then(net::ReferrerPolicy::from_attribute)
+                        .and_then(net::ReferrerPolicy::parse)
                 })
             })
             .or(world.policy.referrer_policy)
-            .unwrap_or_default();
-        (net::Referrer::Client, policy)
+            .unwrap_or_default()
     }
 
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
@@ -3241,7 +3285,7 @@ impl Document {
                     self.resume_scripts();
                 }
             }
-            DialContext::FrameLoad { embedder } => {
+            DialContext::FrameLoad { embedder, sandbox } => {
                 // A redirect the embedder's `frame-src` refuses is not loaded.
                 // Report-only still reports and then loads.
                 // <https://w3c.github.io/webappsec-csp/#should-block-response>
@@ -3252,6 +3296,10 @@ impl Document {
                 {
                     // Leave the current document in place.
                 } else if let Ok(url) = Url::parse(&outcome.final_url) {
+                    // The flags enter the frame with the document they
+                    // govern, so a failed or cancelled navigation leaves the
+                    // current document under its own flags.
+                    self.world.borrow_mut().sandbox = sandbox;
                     self.commit_frame_response(&outcome, &url, embedder, &ancestors);
                 }
             }
@@ -3623,7 +3671,13 @@ impl Document {
     /// wins; a later one is ignored
     /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
     fn start_declarative_refresh(&mut self, value: &str) {
-        if self.will_declaratively_refresh {
+        if self.will_declaratively_refresh
+            || self
+                .world
+                .borrow()
+                .sandbox
+                .contains(crate::js::world::SandboxFlags::AUTOMATIC_FEATURES)
+        {
             return;
         }
         let document_url = self.world.borrow().document_url.clone();
@@ -3797,7 +3851,7 @@ impl Document {
                         .unwrap_or_default();
                     (net::Referrer::Url(sheet), policy)
                 }
-                None => self.subresource_referrer(element),
+                None => (net::Referrer::Client, self.subresource_referrer(element)),
             };
             let mut dial = QueuedDial::new(
                 DialContext::BlitzResource {
@@ -4093,9 +4147,8 @@ impl Document {
         }
     }
 
-    /// Settles every waiter selected for `url` from Blitz's decoded state:
-    /// decoded dimensions fire `load`, anything else fires `error`.
-    /// Settles the in-flight image elements waiting on `url`. `cors_clean`
+    /// Settles the in-flight image elements waiting on `url`: decoded
+    /// dimensions fire `load`, anything else fires `error`. `cors_clean`
     /// marks the elements' settled request as origin-clean for canvas: the
     /// request went out in CORS mode and survived the check. Every other
     /// settle path passes `false`, which falls back to the same-origin rule.

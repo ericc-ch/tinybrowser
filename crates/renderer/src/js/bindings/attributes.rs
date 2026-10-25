@@ -199,15 +199,42 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-supports
-    fn supports(&self, ctx: Ctx<'js>, _token: rquickjs::String<'js>) -> Result<bool> {
-        // The spec ends with "throw a TypeError"
-        // (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
-        Err(Exception::throw_type(
-            &ctx,
-            "DOMTokenList has no supported tokens",
-        ))
+    fn supports(&self, ctx: Ctx<'js>, token: rquickjs::String<'js>) -> Result<bool> {
+        // `iframe.sandbox` is the one token list with supported tokens
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+        let attribute: &str = self.attribute.as_ref();
+        let Some(supported) = (attribute == "sandbox").then_some(SANDBOX_TOKENS) else {
+            // The spec ends with "throw a TypeError"
+            // (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
+            return Err(Exception::throw_type(
+                &ctx,
+                "DOMTokenList has no supported tokens",
+            ));
+        };
+        let token = token.to_string()?;
+        Ok(supported.contains(&token.as_str()))
     }
 }
+
+/// The keywords the `sandbox` content attribute supports. Token matching is
+/// exact: `supports` is not ASCII case-insensitive
+/// (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
+const SANDBOX_TOKENS: &[&str] = &[
+    "allow-downloads",
+    "allow-forms",
+    "allow-modals",
+    "allow-orientation-lock",
+    "allow-pointer-lock",
+    "allow-popups",
+    "allow-popups-to-escape-sandbox",
+    "allow-presentation",
+    "allow-same-origin",
+    "allow-scripts",
+    "allow-storage-access-by-user-activation",
+    "allow-top-navigation",
+    "allow-top-navigation-by-user-activation",
+    "allow-top-navigation-to-custom-protocols",
+];
 
 /// The element's tokens for `attribute`: an ordered set, so duplicates
 /// collapse.
@@ -2106,7 +2133,7 @@ fn navigate_from_attribute_change(
     // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-referrerpolicy>).
     let referrer_policy = world.borrow().document(element).and_then(|parsed| {
         crate::dom::tree::attr(&parsed.document.base, element.node, "referrerpolicy")
-            .and_then(net::ReferrerPolicy::from_attribute)
+            .and_then(net::ReferrerPolicy::parse)
     });
     world.borrow_mut().queue_frame_navigation(
         FrameNavigation::get(NavigationTarget::Container(element), spec.to_owned())

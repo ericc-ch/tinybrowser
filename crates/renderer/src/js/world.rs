@@ -595,6 +595,38 @@ pub(crate) struct FrameNavigation {
     /// element has none and the initiator document's policy stays in force
     /// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
     pub(crate) referrer_policy: Option<ReferrerPolicy>,
+    /// The sandboxing flags the target frame's container imposes on the
+    /// document this navigation commits, carried here so a failed or replaced
+    /// navigation never changes the current document's flags
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#determine-navigation-params>).
+    pub(crate) sandbox: SandboxFlags,
+    /// `window.open(..., 'noreferrer')`: the navigation is a no-referrer
+    /// navigation, whatever the policy would otherwise send
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-open>).
+    pub(crate) no_referrer: bool,
+    /// The document that started the navigation when it is not the one the
+    /// navigation was queued on: a cross-frame `Location` setter takes its
+    /// referrer, policy container, and sandbox rules from the incumbent
+    /// document, not from the target
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+    pub(crate) source: Option<FrameId>,
+}
+
+/// The feature tokens one `window.open` call applies to the context it opens.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AuxiliaryOptions {
+    /// `noopener`: return no proxy and drop the opener relationship.
+    pub(crate) noopener: bool,
+    /// `noreferrer`: imply `noopener` and send no referrer.
+    pub(crate) noreferrer: bool,
+}
+
+impl AuxiliaryOptions {
+    /// `noopener` and `noreferrer` both sever the opener link; only
+    /// `noreferrer` also drops the referrer.
+    pub(crate) fn severs_opener(self) -> bool {
+        self.noopener || self.noreferrer
+    }
 }
 
 impl FrameNavigation {
@@ -608,6 +640,9 @@ impl FrameNavigation {
             body: Vec::new(),
             content_type: None,
             referrer_policy: None,
+            sandbox: SandboxFlags::default(),
+            no_referrer: false,
+            source: None,
         }
     }
 
@@ -624,6 +659,26 @@ impl FrameNavigation {
     /// the initiator document's for this navigation alone.
     pub(crate) fn with_referrer_policy(mut self, policy: Option<ReferrerPolicy>) -> Self {
         self.referrer_policy = policy;
+        self
+    }
+
+    /// The sandboxing flags the target frame's container imposes at commit.
+    pub(crate) fn with_sandbox(mut self, sandbox: SandboxFlags) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// Marks this navigation as sending no referrer (`window.open`'s
+    /// `noreferrer` feature).
+    pub(crate) fn without_referrer(mut self) -> Self {
+        self.no_referrer = true;
+        self
+    }
+
+    /// Records the document that started the navigation when it is not the
+    /// document the navigation runs on.
+    pub(crate) fn with_source(mut self, source: FrameId) -> Self {
+        self.source = Some(source);
         self
     }
 }
@@ -808,6 +863,80 @@ fn opaque_url_matches(
 }
 
 #[cfg(test)]
+mod sandbox_flag_tests {
+    use super::SandboxFlags;
+
+    #[test]
+    fn an_absent_attribute_sets_no_flags() {
+        assert!(!SandboxFlags::parse(None).contains(SandboxFlags::ORIGIN));
+        assert!(!SandboxFlags::parse(None).scripts_disabled());
+    }
+
+    #[test]
+    fn a_bare_sandbox_sets_every_flag_the_standard_lists() {
+        let flags = SandboxFlags::parse(Some(""));
+        for flag in [
+            SandboxFlags::NAVIGATION,
+            SandboxFlags::AUXILIARY_NAVIGATION,
+            SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
+            SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
+            SandboxFlags::ORIGIN,
+            SandboxFlags::FORMS,
+            SandboxFlags::POINTER_LOCK,
+            SandboxFlags::SCRIPTS,
+            SandboxFlags::AUTOMATIC_FEATURES,
+            SandboxFlags::DOCUMENT_DOMAIN,
+            SandboxFlags::PROPAGATES_TO_AUXILIARY,
+            SandboxFlags::MODALS,
+            SandboxFlags::ORIENTATION_LOCK,
+            SandboxFlags::PRESENTATION,
+            SandboxFlags::DOWNLOADS,
+            SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+        ] {
+            assert!(flags.contains(flag), "flag {flag:#x} must be set");
+        }
+    }
+
+    #[test]
+    fn keywords_clear_exactly_the_flags_they_name() {
+        let flags = SandboxFlags::parse(Some("allow-scripts allow-same-origin"));
+        assert!(!flags.scripts_disabled());
+        assert!(!flags.origin_is_opaque());
+        // `allow-scripts` also relaxes automatic features
+        assert!(!flags.contains(SandboxFlags::AUTOMATIC_FEATURES));
+        assert!(flags.contains(SandboxFlags::AUXILIARY_NAVIGATION));
+        // Keywords are ASCII case-insensitive
+        assert!(
+            !SandboxFlags::parse(Some("ALLOW-POPUPS")).contains(SandboxFlags::AUXILIARY_NAVIGATION)
+        );
+        assert!(
+            !SandboxFlags::parse(Some("allow-top-navigation"))
+                .contains(SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION)
+        );
+    }
+
+    #[test]
+    fn an_embedder_sandbox_is_unioned_into_the_child() {
+        let parent = SandboxFlags::parse(Some("allow-scripts"));
+        let child = SandboxFlags::parse(Some("allow-same-origin")).union(parent);
+        assert!(child.scripts_disabled());
+        assert!(child.origin_is_opaque());
+    }
+
+    #[test]
+    fn sandbox_propagation_lets_an_escaping_popup_out() {
+        let propagating = SandboxFlags::parse(Some("allow-popups"));
+        assert!(propagating.auxiliary_flags().origin_is_opaque());
+        let escaping = SandboxFlags::parse(Some("allow-popups-to-escape-sandbox"));
+        assert_eq!(
+            escaping.auxiliary_flags(),
+            SandboxFlags::default(),
+            "an escaping popup starts unsandboxed"
+        );
+    }
+}
+
+#[cfg(test)]
 mod origin_match_tests {
     use super::{Url, opaque_url_matches};
 
@@ -859,7 +988,7 @@ pub(crate) struct WeakReferences {
 pub(crate) type ChildFrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, NodeId)>;
 
 /// Builds an auxiliary top-level context's initial document.
-pub(crate) type AuxiliaryFrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId)>;
+pub(crate) type AuxiliaryFrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, AuxiliaryOptions)>;
 
 /// Builds the documents the `document` layer owns when a realm asks for one.
 /// Installed by that layer, so the realm asks for a browsing context's
@@ -897,43 +1026,145 @@ pub(crate) struct PolicyContainer {
     pub(crate) referrer_policy: Option<ReferrerPolicy>,
 }
 
-/// The sandboxing flags one `iframe` gives its documents, read from the
-/// container's `sandbox` attribute. Only the flags this engine enforces are
-/// modelled: a sandboxed origin and disabled scripting
-/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
-#[derive(Clone, Copy, Default)]
-pub(crate) struct SandboxFlags {
-    /// Without `allow-same-origin`, every document in the frame gets a new
-    /// opaque origin
-    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
-    pub(crate) sandboxed_origin: bool,
-    /// Without `allow-scripts`, script elements do not execute, event handler
-    /// content attributes do not run, and a `javascript:` navigation does
-    /// nothing
-    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
-    pub(crate) scripting_disabled: bool,
-}
+/// A sandboxing flag set: the flags one `iframe` (and its ancestors) impose on
+/// the documents it loads, parsed from the `sandbox` content attribute
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing-flag-set>).
+///
+/// Every flag the standard defines is modelled, so a feature added later reads
+/// the flag that gates it instead of counting as allowed. Only the flags this
+/// engine currently has a gate for change observable behaviour.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct SandboxFlags(u32);
 
 impl SandboxFlags {
-    /// The flags a token list names. The attribute is a set of space-separated
-    /// ASCII case-insensitive keywords; any other token is ignored
-    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+    /// `iframe sandbox`: no navigating any other browsing context.
+    pub(crate) const NAVIGATION: u32 = 1 << 0;
+    /// `allow-popups`: creating new auxiliary browsing contexts.
+    pub(crate) const AUXILIARY_NAVIGATION: u32 = 1 << 1;
+    /// `allow-top-navigation`: navigating the top-level context without
+    /// transient activation.
+    pub(crate) const TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION: u32 = 1 << 2;
+    /// `allow-top-navigation` or `allow-top-navigation-by-user-activation`:
+    /// navigating the top-level context with transient activation.
+    pub(crate) const TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION: u32 = 1 << 3;
+    /// `allow-same-origin`: an opaque origin, no cookies or web storage.
+    pub(crate) const ORIGIN: u32 = 1 << 4;
+    /// `allow-forms`: form submission.
+    pub(crate) const FORMS: u32 = 1 << 5;
+    /// `allow-pointer-lock`.
+    const POINTER_LOCK: u32 = 1 << 6;
+    /// `allow-scripts`: script execution, event handler content attributes,
+    /// and `javascript:` navigations.
+    pub(crate) const SCRIPTS: u32 = 1 << 7;
+    /// `allow-scripts`: features that trigger automatically, such as
+    /// declarative refresh, autoplay, and autofocus.
+    pub(crate) const AUTOMATIC_FEATURES: u32 = 1 << 8;
+    /// The `document.domain` setter is always blocked while sandboxed.
+    const DOCUMENT_DOMAIN: u32 = 1 << 9;
+    /// `allow-popups-to-escape-sandbox`: the sandbox propagates into
+    /// auxiliary contexts.
+    const PROPAGATES_TO_AUXILIARY: u32 = 1 << 10;
+    /// `allow-modals`.
+    const MODALS: u32 = 1 << 11;
+    /// `allow-orientation-lock`.
+    const ORIENTATION_LOCK: u32 = 1 << 12;
+    /// `allow-presentation`.
+    const PRESENTATION: u32 = 1 << 13;
+    /// `allow-downloads`.
+    const DOWNLOADS: u32 = 1 << 14;
+    /// `allow-top-navigation-to-custom-protocols`.
+    const CUSTOM_PROTOCOLS_NAVIGATION: u32 = 1 << 15;
+
+    /// Parses one `sandbox` attribute value, or returns the empty set when the
+    /// attribute is absent
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#parse-a-sandboxing-directive>).
     pub(crate) fn parse(attribute: Option<&str>) -> Self {
         let Some(attribute) = attribute else {
             return Self::default();
         };
-        let mut flags = Self {
-            sandboxed_origin: true,
-            scripting_disabled: true,
-        };
+        let mut flags = Self(
+            Self::NAVIGATION
+                | Self::AUXILIARY_NAVIGATION
+                | Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+                | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+                | Self::ORIGIN
+                | Self::FORMS
+                | Self::POINTER_LOCK
+                | Self::SCRIPTS
+                | Self::AUTOMATIC_FEATURES
+                | Self::DOCUMENT_DOMAIN
+                | Self::PROPAGATES_TO_AUXILIARY
+                | Self::MODALS
+                | Self::ORIENTATION_LOCK
+                | Self::PRESENTATION
+                | Self::DOWNLOADS
+                | Self::CUSTOM_PROTOCOLS_NAVIGATION,
+        );
         for token in attribute.split_ascii_whitespace() {
-            if token.eq_ignore_ascii_case("allow-same-origin") {
-                flags.sandboxed_origin = false;
-            } else if token.eq_ignore_ascii_case("allow-scripts") {
-                flags.scripting_disabled = false;
+            let token = token.to_ascii_lowercase();
+            match token.as_str() {
+                "allow-popups" => {
+                    flags.0 &= !(Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION);
+                }
+                "allow-top-navigation" => {
+                    flags.0 &= !(Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+                        | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+                        | Self::CUSTOM_PROTOCOLS_NAVIGATION);
+                }
+                "allow-top-navigation-by-user-activation" => {
+                    flags.0 &= !Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION;
+                }
+                "allow-same-origin" => flags.0 &= !Self::ORIGIN,
+                "allow-forms" => flags.0 &= !Self::FORMS,
+                "allow-pointer-lock" => flags.0 &= !Self::POINTER_LOCK,
+                "allow-scripts" => flags.0 &= !(Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
+                "allow-popups-to-escape-sandbox" => flags.0 &= !Self::PROPAGATES_TO_AUXILIARY,
+                "allow-modals" => flags.0 &= !Self::MODALS,
+                "allow-orientation-lock" => flags.0 &= !Self::ORIENTATION_LOCK,
+                "allow-presentation" => flags.0 &= !Self::PRESENTATION,
+                "allow-downloads" => flags.0 &= !Self::DOWNLOADS,
+                "allow-top-navigation-to-custom-protocols" => {
+                    flags.0 &= !Self::CUSTOM_PROTOCOLS_NAVIGATION;
+                }
+                _ => {}
             }
         }
         flags
+    }
+
+    pub(crate) fn contains(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
+
+    /// The union of two flag sets, which is how an `iframe`'s directive and the
+    /// embedder's active set combine
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether scripts are blocked
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
+    pub(crate) fn scripts_disabled(self) -> bool {
+        self.contains(Self::SCRIPTS)
+    }
+
+    /// Whether this document gets a fresh opaque origin
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
+    pub(crate) fn origin_is_opaque(self) -> bool {
+        self.contains(Self::ORIGIN)
+    }
+
+    /// The flags an auxiliary context this document opens inherits: the whole
+    /// set while the sandbox propagates, nothing after
+    /// `allow-popups-to-escape-sandbox`
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandbox-propagates-to-auxiliary-browsing-contexts-flag>).
+    pub(crate) fn auxiliary_flags(self) -> Self {
+        if self.contains(Self::PROPAGATES_TO_AUXILIARY) {
+            self
+        } else {
+            Self::default()
+        }
     }
 }
 
@@ -1397,19 +1628,6 @@ impl Drop for World {
     }
 }
 
-/// Queues a navigation for an auxiliary frame this realm opened or selected by
-/// name. The engine applies it after the script that opened the window stops,
-/// once the auxiliary document exists
-/// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
-fn queue_auxiliary_navigation(world_rc: &Rc<RefCell<World>>, frame: FrameId, spec: &str) {
-    world_rc
-        .borrow_mut()
-        .queue_frame_navigation(FrameNavigation::get(
-            NavigationTarget::Frame(frame),
-            spec.to_owned(),
-        ));
-}
-
 impl World {
     pub(crate) fn new(
         document_url: Url,
@@ -1850,6 +2068,13 @@ impl World {
         self.frame_host = Some(host);
     }
 
+    /// Whether a sandboxed document may create an auxiliary context
+    /// (`allow-popups`)
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+    pub(crate) fn allows_auxiliary_navigation(&self) -> bool {
+        !self.sandbox.contains(SandboxFlags::AUXILIARY_NAVIGATION)
+    }
+
     /// Opens an auxiliary top-level browsing context, or returns the one a
     /// `target` name already selects
     /// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
@@ -1862,6 +2087,7 @@ impl World {
         world_rc: &Rc<RefCell<World>>,
         spec: &str,
         name: &str,
+        options: AuxiliaryOptions,
     ) -> Option<FrameId> {
         let current = world_rc.borrow().frame;
         // `window.open()` with no URL navigates to about:blank; a fresh
@@ -1878,10 +2104,17 @@ impl World {
                 .choose_navigable(name, current)
         });
         if let Some(frame) = existing.flatten() {
-            queue_auxiliary_navigation(world_rc, frame, spec);
+            let mut navigation =
+                FrameNavigation::get(NavigationTarget::Frame(frame), spec.to_owned());
+            if options.noreferrer {
+                navigation = navigation.without_referrer();
+            }
+            world_rc.borrow_mut().queue_frame_navigation(navigation);
             return Some(frame);
         }
-        if !world_rc.borrow().may_host_auxiliary(spec) {
+        if !world_rc.borrow().allows_auxiliary_navigation()
+            || !world_rc.borrow().may_host_auxiliary(spec)
+        {
             return None;
         }
         let (frame, host) = {
@@ -1892,7 +2125,9 @@ impl World {
                 return None;
             }
             let frame = shared.allocate_frame();
-            shared.tree.add_auxiliary(current, frame);
+            shared
+                .tree
+                .add_auxiliary(current, frame, !options.severs_opener());
             if named {
                 shared.tree.set_name(frame, name.to_owned());
             }
@@ -1908,9 +2143,14 @@ impl World {
                 .remove(frame);
             return None;
         };
-        (host.auxiliary)(world_rc, frame);
+        (host.auxiliary)(world_rc, frame, options);
         if spec != "about:blank" {
-            queue_auxiliary_navigation(world_rc, frame, spec);
+            let mut navigation =
+                FrameNavigation::get(NavigationTarget::Frame(frame), spec.to_owned());
+            if options.noreferrer {
+                navigation = navigation.without_referrer();
+            }
+            world_rc.borrow_mut().queue_frame_navigation(navigation);
         }
         Some(frame)
     }

@@ -11,24 +11,17 @@ use crate::protocol::{BrowserEvent, RendererEvent};
 /// enqueue more work while a request runs, so a turn must not loop forever.
 const MAX_REALM_REQUESTS_PER_TURN: usize = 1024;
 
-/// One [`Document::drain_step`] outcome. `ran` reports that a task executed,
-/// so the engine reconciles its side effects (a queued navigation, a new
-/// iframe) even when the step had no follow-up work. `more` reports that the
-/// document already has follow-up work.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct DrainStep {
-    pub(crate) ran: bool,
-    pub(crate) more: bool,
-}
-
 impl Document {
-    /// Runs one batch of ready work.
+    /// Runs one batch of ready work and reports whether the engine must
+    /// reconcile and run another pass: a task ran (its side effects include a
+    /// queued navigation or a new iframe the next task must see), or the
+    /// document already has follow-up work.
     ///
     /// The engine calls this instead of draining the whole document at once so
     /// it can reconcile frame documents between tasks: a task that inserts an
     /// iframe must be visible to the next task's `contentDocument` read, and a
     /// navigation queued by the last task must still be applied.
-    pub(crate) fn drain_step(&mut self) -> DrainStep {
+    pub(crate) fn drain_step(&mut self) -> bool {
         self.adopt_dial_completions();
         while let Some(id) = self.due_timer() {
             self.tasks.push_back(Task::Timer(id));
@@ -39,10 +32,7 @@ impl Document {
         self.adopt_dial_completions();
         let Some(task) = self.tasks.pop_front() else {
             let fired = self.check_load();
-            return DrainStep {
-                ran: false,
-                more: !self.stop.is_set() && (fired || self.has_pending_frame_loads()),
-            };
+            return !self.stop.is_set() && (fired || self.has_pending_frame_loads());
         };
         // Joins the drain's turn when one is open, so serial tasks share
         // its deadline. A task outside a drain still opens its own turn.
@@ -56,12 +46,11 @@ impl Document {
         if self.load_fired && self.blitz_shell.take_redraw() {
             self.settle_blitz_layout();
         }
-        let fired = self.check_load();
-        DrainStep {
-            ran: true,
-            more: !self.stop.is_set()
-                && (fired || self.has_pending_frame_loads() || self.has_ready_work()),
-        }
+        self.check_load();
+        // A task ran even when nothing is left: the engine still reconciles the
+        // queued navigations and child frames it produced
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).
+        !self.stop.is_set()
     }
 
     /// Whether a task is queued or a timer is already due.
@@ -75,7 +64,7 @@ impl Document {
         let now = Instant::now();
         self.timers
             .values()
-            .any(|timer| !timer.fired && timer.when <= now)
+            .any(|timer| !timer.fired && timer.when.is_some_and(|when| when <= now))
     }
 
     fn adopt_dial_completions(&mut self) {
@@ -93,7 +82,7 @@ impl Document {
         self.timers
             .values()
             .filter(|timer| !timer.fired)
-            .map(|timer| timer.when)
+            .filter_map(|timer| timer.when)
             .min()
     }
 
@@ -103,7 +92,7 @@ impl Document {
         self.timers.insert(
             id,
             Timer {
-                when: Instant::now() + delay,
+                when: Instant::now().checked_add(delay),
                 fired: false,
                 js_id: None,
             },
@@ -338,7 +327,7 @@ impl Document {
         // Scripting is disabled in a sandboxed frame without `allow-scripts`:
         // a script element never executes, however it was inserted
         // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
-        if self.world.borrow().sandbox.scripting_disabled {
+        if self.world.borrow().sandbox.scripts_disabled() {
             return;
         }
         let Some((src, started)) = self.world.borrow().with_document(element, |parsed| {
@@ -371,14 +360,14 @@ impl Document {
             self.tasks.push_back(Task::NodeError(element));
             return;
         }
-        let (referrer, referrer_policy) = self.subresource_referrer(Some(element));
+        let referrer_policy = self.subresource_referrer(Some(element));
         let mut dial = QueuedDial::new(
             DialContext::ClassicScript { element },
             &url,
             &self.dial_initiator(),
             &self.referrer_url(),
         );
-        dial.req.referrer = referrer;
+        dial.req.referrer = net::Referrer::Client;
         dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
@@ -455,7 +444,7 @@ impl Document {
         let (id, timer) = self
             .timers
             .iter_mut()
-            .filter(|(_, timer)| !timer.fired && timer.when <= now)
+            .filter(|(_, timer)| !timer.fired && timer.when.is_some_and(|when| when <= now))
             .min_by_key(|(_, timer)| timer.when)?;
         timer.fired = true;
         Some(*id)

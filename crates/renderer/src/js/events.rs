@@ -1752,7 +1752,7 @@ fn call_handler_attribute<'js>(
     // Scripting is disabled in a sandboxed frame without `allow-scripts`, and
     // an event handler content attribute is script
     // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
-    if bindings::world(ctx)?.borrow().sandbox.scripting_disabled {
+    if bindings::world(ctx)?.borrow().sandbox.scripts_disabled() {
         return Ok(());
     }
     let name = format!("on{typ}");

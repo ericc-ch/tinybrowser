@@ -1401,7 +1401,7 @@ fn chrome_navigation_request(request: &mut Request, url: &Url) {
     identity_header(request, "Sec-Fetch-Mode", "navigate");
     identity_header(request, "Sec-Fetch-User", "?1");
     identity_header(request, "Sec-Fetch-Dest", "document");
-    if sends_default_ua_client_hints(url) {
+    if net::referrer::is_potentially_trustworthy(url) {
         for (name, value) in [
             ("Sec-CH-UA", crate::SEC_CH_UA),
             ("Sec-CH-UA-Mobile", crate::SEC_CH_UA_MOBILE),
@@ -1421,21 +1421,6 @@ fn identity_header(request: &mut Request, name: &str, value: &str) {
         .headers
         .insert(name, value)
         .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes");
-}
-
-fn sends_default_ua_client_hints(url: &Url) -> bool {
-    if url.scheme() == "https" {
-        return true;
-    }
-    match url.host() {
-        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
-        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
-        Some(url::Host::Domain(host)) => {
-            let host = host.to_ascii_lowercase();
-            host == "localhost" || host.ends_with(".localhost")
-        }
-        None => false,
-    }
 }
 
 /// Header values are byte sequences; each byte is exposed as the same code
@@ -1610,16 +1595,16 @@ mod tests {
 
     #[test]
     fn default_ua_client_hints_are_limited_to_trustworthy_urls() {
-        assert!(sends_default_ua_client_hints(
+        assert!(net::referrer::is_potentially_trustworthy(
             &Url::parse("https://example.com/").expect("https")
         ));
-        assert!(!sends_default_ua_client_hints(
+        assert!(!net::referrer::is_potentially_trustworthy(
             &Url::parse("http://example.com/").expect("http")
         ));
-        assert!(sends_default_ua_client_hints(
+        assert!(net::referrer::is_potentially_trustworthy(
             &Url::parse("http://127.0.0.1/").expect("loopback")
         ));
-        assert!(sends_default_ua_client_hints(
+        assert!(net::referrer::is_potentially_trustworthy(
             &Url::parse("http://localhost/").expect("localhost")
         ));
     }

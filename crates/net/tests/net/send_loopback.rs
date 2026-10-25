@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use net::{
-    Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Proxy, Request,
-    TimeoutKind, TransportError,
+    Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Proxy, Referrer,
+    ReferrerPolicy, Request, TimeoutKind, TransportError,
 };
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -394,6 +394,38 @@ async fn max_redirects_cap_returns_limit_exceeded() {
     ));
     assert_eq!(server.requests().len(), 3);
     server.assert_clean();
+}
+
+/// `strict-origin-when-cross-origin` determines the referrer again on every
+/// redirect hop: the first hop sends the full source URL, the cross-origin hop
+/// sends only its origin
+/// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>,
+/// <https://fetch.spec.whatwg.org/#http-redirect-fetch>).
+#[tokio::test]
+async fn redirect_hops_re_determine_the_referrer() {
+    let landed = scripted([canned_ok(&[("Content-Type", "text/plain")], b"landed")]);
+    let landed_url = landed.url("/landed");
+    let start = scripted([canned_redirect(302, landed_url.as_str())]);
+    let source = start.url("/page");
+    let mut request = Request::new(Method::GET, start.url("/start"));
+    request.referrer = Referrer::Url(source.clone());
+    request.referrer_policy = ReferrerPolicy::StrictOriginWhenCrossOrigin;
+    default_agent().send(request).await.expect("redirect chain");
+    let first = &start.requests()[0];
+    assert_eq!(
+        first.header("referer"),
+        Some(source.as_str()),
+        "a same-origin hop sends the stripped source URL"
+    );
+    let second = &landed.requests()[0];
+    let origin = source.join("/").expect("origin URL");
+    assert_eq!(
+        second.header("referer"),
+        Some(origin.as_str()),
+        "a cross-origin hop sends only the previous hop's origin"
+    );
+    start.assert_clean();
+    landed.assert_clean();
 }
 
 /// The redirect gate sees the next URL and the hop count before that hop is

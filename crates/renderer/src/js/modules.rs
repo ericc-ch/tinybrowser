@@ -95,7 +95,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         let element_policy = world.state.current_script.and_then(|id| {
             let parsed = world.document(id)?;
             crate::dom::tree::attr(&parsed.document.base, id.node, "referrerpolicy")
-                .and_then(net::ReferrerPolicy::from_attribute)
+                .and_then(net::ReferrerPolicy::parse)
         });
         (
             world.runtime.services.clone(),

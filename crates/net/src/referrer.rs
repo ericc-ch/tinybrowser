@@ -119,26 +119,6 @@ impl ReferrerPolicy {
         }
         Self::parse(token)
     }
-
-    /// A `referrerpolicy` content attribute: an enumerated attribute whose
-    /// keywords are the policy tokens exactly, with the invalid value default
-    /// being "unset" (inherit the document policy)
-    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
-    ///
-    /// Enumerated attributes do not trim whitespace.
-    #[must_use]
-    pub fn from_attribute(value: &str) -> Option<Self> {
-        Self::parse(value)
-    }
-
-    /// The protocol token, for wire logging and `Referrer-Policy` rewrites.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        POLICY_TOKENS
-            .iter()
-            .find(|(_, policy)| *policy == self)
-            .map_or("strict-origin-when-cross-origin", |(token, _)| token)
-    }
 }
 
 /// One `Referrer-Policy` field value split into RFC 9110 list members
@@ -192,16 +172,6 @@ impl Referrer {
             return Some(Self::Client);
         }
         Url::parse(value).ok().map(Self::Url)
-    }
-
-    /// Inverse of [`Referrer::from_idl`], for `Request.referrer`.
-    #[must_use]
-    pub fn to_idl(&self) -> String {
-        match self {
-            Self::NoReferrer => String::new(),
-            Self::Client => "about:client".to_owned(),
-            Self::Url(url) => url.to_string(),
-        }
     }
 }
 
@@ -311,13 +281,17 @@ fn strip_url(url: &Url, origin_only: bool) -> Option<Url> {
 /// Whether `url` is potentially trustworthy
 /// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
 ///
-/// HTTPS and WSS are trustworthy, as are file URLs and loopback or
-/// `localhost` hosts over HTTP/WS. This is the only downgrade definition in
-/// the crate; the header, cookie, and client-hint paths share it.
+/// `about:blank` and `about:srcdoc` inherit their creator's context, `data:`
+/// is trustworthy by definition, and every other URL is judged by its origin:
+/// HTTPS and WSS, file URLs, and loopback or `localhost` hosts over HTTP/WS.
+/// The header, cookie, and client-hint paths share this one definition.
 #[must_use]
 pub fn is_potentially_trustworthy(url: &Url) -> bool {
+    if url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc") {
+        return true;
+    }
     match url.scheme() {
-        "https" | "wss" | "file" => true,
+        "https" | "wss" | "file" | "data" => true,
         "http" | "ws" => match url.host() {
             Some(Host::Ipv4(address)) => address.is_loopback(),
             Some(Host::Ipv6(address)) => address.is_loopback(),
@@ -327,6 +301,13 @@ pub fn is_potentially_trustworthy(url: &Url) -> bool {
             }
             None => false,
         },
+        // `blob:` carries its creator's origin, so it is trustworthy exactly
+        // when that origin is.
+        "blob" => url
+            .as_str()
+            .strip_prefix("blob:")
+            .and_then(|inner| Url::parse(inner).ok())
+            .is_some_and(|inner| is_potentially_trustworthy(&inner)),
         _ => false,
     }
 }

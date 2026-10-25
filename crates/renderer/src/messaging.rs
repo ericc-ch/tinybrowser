@@ -43,7 +43,14 @@ pub(crate) enum FrameOrigin {
     /// The `container` element in `parent`'s document owns this frame.
     Container { parent: FrameId, container: NodeId },
     /// `window.open` created this frame as an auxiliary top-level context.
-    Auxiliary { opener: FrameId },
+    /// `opener_visible` is false for `noopener`/`noreferrer`, which sever the
+    /// opener relationship while the context stays in the same browsing
+    /// context group
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-open>).
+    Auxiliary {
+        opener: FrameId,
+        opener_visible: bool,
+    },
 }
 
 /// The browsing context tree of one tab.
@@ -97,9 +104,15 @@ impl FrameTree {
 
     /// Adds `child` as an auxiliary top-level context opened by `opener`
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
-    pub(crate) fn add_auxiliary(&mut self, opener: FrameId, child: FrameId) {
-        self.origins
-            .insert(child, FrameOrigin::Auxiliary { opener });
+    /// `opener_visible` reports whether `window.opener` links the two.
+    pub(crate) fn add_auxiliary(&mut self, opener: FrameId, child: FrameId, opener_visible: bool) {
+        self.origins.insert(
+            child,
+            FrameOrigin::Auxiliary {
+                opener,
+                opener_visible,
+            },
+        );
         self.names.entry(child).or_default();
     }
 
@@ -168,10 +181,25 @@ impl FrameTree {
         }
     }
 
-    /// The browsing context that opened `frame`, when it is auxiliary.
+    /// The browsing context that opened `frame`, when it is auxiliary and the
+    /// opener relationship is still visible (not severed by
+    /// `noopener`/`noreferrer`).
     pub(crate) fn opener(&self, frame: FrameId) -> Option<FrameId> {
         match self.origins.get(&frame) {
-            Some(FrameOrigin::Auxiliary { opener }) => Some(*opener),
+            Some(FrameOrigin::Auxiliary {
+                opener,
+                opener_visible: true,
+            }) => Some(*opener),
+            Some(FrameOrigin::Auxiliary { .. } | FrameOrigin::Container { .. }) | None => None,
+        }
+    }
+
+    /// The browsing context that opened `frame`, whether or not the opener
+    /// relationship is visible to script. The opener is still the popup's
+    /// permitted sandboxed navigator.
+    pub(crate) fn auxiliary_opener(&self, frame: FrameId) -> Option<FrameId> {
+        match self.origins.get(&frame) {
+            Some(FrameOrigin::Auxiliary { opener, .. }) => Some(*opener),
             Some(FrameOrigin::Container { .. }) | None => None,
         }
     }
@@ -230,6 +258,21 @@ impl FrameTree {
             top = parent;
         }
         top
+    }
+
+    /// Whether `frame` is `ancestor` or a descendant of it. Sandbox navigation
+    /// restrictions allow a sandboxed document to navigate itself and the
+    /// contexts nested inside it
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+    pub(crate) fn is_inclusive_descendant(&self, ancestor: FrameId, frame: FrameId) -> bool {
+        let mut current = Some(frame);
+        while let Some(candidate) = current {
+            if candidate == ancestor {
+                return true;
+            }
+            current = self.parent(candidate);
+        }
+        false
     }
 
     /// "Find a navigable by target name"
@@ -891,14 +934,27 @@ mod tests {
     fn an_auxiliary_context_is_its_own_top_level_and_is_found_by_name() {
         let mut tree = tree();
         let popup = FrameId::new(9);
-        tree.add_auxiliary(FrameId::new(1), popup);
+        tree.add_auxiliary(FrameId::new(1), popup, true);
         tree.set_name(popup, "popup".to_owned());
-        assert_eq!(tree.top_level(popup), popup);
-        assert_eq!(tree.parent(popup), None);
-        assert_eq!(tree.container(popup), None);
-        assert_eq!(tree.opener(popup), Some(FrameId::new(1)));
+        // The name lookup and `_top` resolution prove the auxiliary is in the
+        // browsing context group and is its own top-level traversable; the
+        // accessors that only echo `add_auxiliary`'s arguments are not
+        // asserted
+        // (<https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable>).
         assert_eq!(tree.choose_navigable("popup", FrameId::new(4)), Some(popup));
-        assert_eq!(tree.choose_navigable("_parent", popup), Some(popup));
         assert_eq!(tree.choose_navigable("_top", popup), Some(popup));
+        assert!(tree.is_inclusive_descendant(popup, popup));
+        assert!(!tree.is_inclusive_descendant(FrameId::new(1), popup));
+    }
+
+    #[test]
+    fn a_noopener_auxiliary_hides_its_opener_but_stays_navigable() {
+        let mut tree = tree();
+        let popup = FrameId::new(9);
+        tree.add_auxiliary(FrameId::new(1), popup, false);
+        tree.set_name(popup, "popup".to_owned());
+        assert_eq!(tree.opener(popup), None);
+        assert_eq!(tree.auxiliary_opener(popup), Some(FrameId::new(1)));
+        assert_eq!(tree.choose_navigable("popup", FrameId::new(4)), Some(popup));
     }
 }

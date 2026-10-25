@@ -271,17 +271,21 @@ pub(super) fn form_navigate<'js>(
         return Ok(());
     }
     let world_rc = world(&ctx)?;
-    let navigation = FrameNavigation {
-        target: crate::js::NavigationTarget::Target(target),
-        spec: url,
-        srcdoc: None,
-        method,
-        body: body.to_vec(),
-        content_type,
-        // A form submission carries no policy of its own yet, so the initiator
-        // document's referrer policy decides.
-        referrer_policy: None,
-    };
+    // A sandboxed document without `allow-forms` blocks form submission
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-forms-browsing-context-flag>).
+    if world_rc
+        .borrow()
+        .sandbox
+        .contains(crate::js::world::SandboxFlags::FORMS)
+    {
+        return Ok(());
+    }
+    let mut navigation = FrameNavigation::get(crate::js::NavigationTarget::Target(target), url);
+    navigation.method = method;
+    navigation.body = body.to_vec();
+    navigation.content_type = content_type;
+    // A form submission carries no policy of its own yet, so the initiator
+    // document's referrer policy decides.
     world_rc.borrow_mut().queue_frame_navigation(navigation);
     Ok(())
 }

@@ -62,10 +62,23 @@ impl FrameHistory {
         self.index = self.entries.len().saturating_sub(1);
     }
 
+    /// Replaces the active entry, which is what a navigation whose target
+    /// document is the initial `about:blank` does
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
+    fn replace(&mut self, entry: FrameHistoryEntry) {
+        if let Some(slot) = self.entries.get_mut(self.index) {
+            *slot = entry;
+        } else {
+            self.push(entry);
+        }
+    }
+
     /// Moves the active index by `delta` and returns the entry to install.
-    /// `go(0)` reloads the active entry.
+    /// `go(0)` reloads the active entry; a delta that leaves the list does
+    /// nothing and keeps the active index
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#traverse-the-history-by-a-delta>).
     fn target(&mut self, delta: i32) -> Option<&FrameHistoryEntry> {
-        let target = self.index.saturating_add_signed(delta as isize);
+        let target = self.index.checked_add_signed(delta as isize)?;
         if target >= self.entries.len() {
             return None;
         }
@@ -176,6 +189,15 @@ impl Engine {
                 };
                 self.frames.insert(frame, document);
                 self.seed_frame_history(frame);
+                // The container's `sandbox` attribute and the embedder's
+                // active flags decide every document this frame loads
+                // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+                let sandbox = self
+                    .frames
+                    .get(&parent)
+                    .map_or_else(crate::js::world::SandboxFlags::default, |document| {
+                        crate::document::sandboxing_flags(&document.world(), container)
+                    });
                 // `srcdoc` takes priority over `src`
                 // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
                 let srcdoc = self
@@ -184,9 +206,10 @@ impl Engine {
                     .and_then(|document| document.frame_srcdoc(container));
                 if let Some(markup) = srcdoc {
                     let navigation =
-                        FrameNavigation::srcdoc(NavigationTarget::Container(container), markup);
+                        FrameNavigation::srcdoc(NavigationTarget::Container(container), markup)
+                            .with_sandbox(sandbox);
                     self.navigate_frame(frame, parent, &navigation);
-                    self.record_navigation(frame, parent, &navigation);
+                    self.record_navigation(frame, parent, &navigation, true);
                 } else {
                     let src = self
                         .frames
@@ -200,9 +223,10 @@ impl Engine {
                                         .get(&parent)
                                         .map(|document| document.frame_referrer_policy(container))
                                         .unwrap_or_default(),
-                                );
+                                )
+                                .with_sandbox(sandbox);
                         self.navigate_frame(frame, parent, &navigation);
-                        self.record_navigation(frame, parent, &navigation);
+                        self.record_navigation(frame, parent, &navigation, true);
                     }
                 }
                 if let Some(document) = self.frames.get_mut(&parent) {
@@ -217,7 +241,7 @@ impl Engine {
     /// Starts a child or auxiliary frame's history with the document it was
     /// created on.
     fn seed_frame_history(&mut self, frame: FrameId) {
-        self.record_frame_history(frame, None, true);
+        self.record_frame_history(frame, None, true, false);
     }
 
     /// Adds one committed navigation to the frame's own session history.
@@ -231,6 +255,7 @@ impl Engine {
         frame: FrameId,
         initiator: FrameId,
         navigation: &FrameNavigation,
+        replace: bool,
     ) {
         // An `iframe` whose `src` is empty keeps the document it already has;
         // that is not a navigation and adds no entry.
@@ -248,7 +273,7 @@ impl Engine {
                 .is_some_and(|url| {
                     url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc")
                 });
-        self.record_frame_history(frame, Some(navigation.clone()), snapshot);
+        self.record_frame_history(frame, Some(navigation.clone()), snapshot, replace);
     }
 
     /// Appends one entry and publishes the new length and position to the
@@ -258,6 +283,7 @@ impl Engine {
         frame: FrameId,
         navigation: Option<FrameNavigation>,
         snapshot: bool,
+        replace: bool,
     ) {
         if frame == FrameId::MAIN {
             return;
@@ -265,10 +291,13 @@ impl Engine {
         let state = snapshot
             .then(|| self.frames.get(&frame).map(Document::local_document_state))
             .flatten();
-        self.frame_history
-            .entry(frame)
-            .or_default()
-            .push(FrameHistoryEntry { navigation, state });
+        let entry = FrameHistoryEntry { navigation, state };
+        let history = self.frame_history.entry(frame).or_default();
+        if replace {
+            history.replace(entry);
+        } else {
+            history.push(entry);
+        }
         self.sync_frame_history(frame);
     }
 
@@ -692,13 +721,11 @@ impl Engine {
                 if std::time::Instant::now() >= deadline {
                     return self.has_ready_work();
                 }
-                let step = self
+                let more = self
                     .frames
                     .get_mut(&frame)
-                    .map_or_else(crate::document::DrainStep::default, |document| {
-                        document.drain_step()
-                    });
-                if step.ran || step.more {
+                    .is_some_and(Document::drain_step);
+                if more {
                     ran = true;
                     self.reconcile_frames();
                 }
@@ -995,6 +1022,7 @@ impl Engine {
         // to `about:srcdoc` with the attribute's value as the document source
         // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
         if let Some(markup) = &navigation.srcdoc {
+            self.install_sandbox(child, navigation);
             self.load_frame_srcdoc(child, initiator, markup);
             if let (Some(embedder), Some(container)) = (embedder, container) {
                 self.mark_frame_load_pending(container, embedder);
@@ -1024,6 +1052,7 @@ impl Engine {
                 // A frame the engine just created is already on that document;
                 // reloading it would throw away its realm and anything a script
                 // has already set on it.
+                self.install_sandbox(child, navigation);
                 self.keep_initial_blank(child, initiator);
             }
             if let (Some(embedder), Some(container)) = (embedder, container) {
@@ -1037,6 +1066,52 @@ impl Engine {
         }
     }
 
+    /// Whether `initiator`'s active sandboxing flag set lets it navigate
+    /// `chosen`. A sandboxed document may always navigate itself and the
+    /// contexts nested in it; the top-level context needs
+    /// `allow-top-navigation`; a sibling or ancestor needs no sandboxed
+    /// navigation flag; and a popup the document opened is its permitted
+    /// sandboxed navigator
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-navigation-browsing-context-flag>).
+    fn sandbox_allows_navigation(&self, initiator: FrameId, chosen: FrameId) -> bool {
+        if initiator == chosen {
+            return true;
+        }
+        let Some(source) = self.frames.get(&initiator) else {
+            return true;
+        };
+        let (flags, activated) = {
+            let world = source.world();
+            let world = world.borrow();
+            (world.sandbox, world.user_activation_active())
+        };
+        let shared = self.runtime.shared.borrow();
+        let tree = &shared.tree;
+        if tree.is_inclusive_descendant(initiator, chosen)
+            || tree.auxiliary_opener(chosen) == Some(initiator)
+        {
+            return true;
+        }
+        if tree.top_level(initiator) == chosen {
+            let flag = if activated {
+                crate::js::world::SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+            } else {
+                crate::js::world::SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+            };
+            return !flags.contains(flag);
+        }
+        !flags.contains(crate::js::world::SandboxFlags::NAVIGATION)
+    }
+
+    /// Installs the flags a navigation commits on `child`'s document. Local
+    /// schemes install synchronously, so this runs immediately before the
+    /// install; an HTTP response carries the flags until its commit.
+    fn install_sandbox(&mut self, child: FrameId, navigation: &FrameNavigation) {
+        if let Some(document) = self.frames.get(&child) {
+            document.world().borrow_mut().sandbox = navigation.sandbox;
+        }
+    }
+
     /// The request referrer and policy a navigation sends: the navigating
     /// element's policy when it names one, the initiator document's otherwise.
     /// The client environment resolves the source in the browser
@@ -1045,8 +1120,12 @@ impl Engine {
     fn navigation_referrer(
         &self,
         initiator: FrameId,
-        policy: Option<net::ReferrerPolicy>,
+        navigation: &FrameNavigation,
     ) -> (net::Referrer, net::ReferrerPolicy) {
+        if navigation.no_referrer {
+            return (net::Referrer::NoReferrer, net::ReferrerPolicy::NoReferrer);
+        }
+        let policy = navigation.referrer_policy;
         match self.frames.get(&initiator) {
             Some(document) => {
                 let world = document.world();
@@ -1058,6 +1137,30 @@ impl Engine {
             }
             None => (net::Referrer::NoReferrer, policy.unwrap_or_default()),
         }
+    }
+
+    /// The referrer a local-scheme document reports. It is the navigation's
+    /// determined referrer, exactly as an HTTP navigation's `document.referrer`
+    /// is the header the browser sent, so a `no-referrer` or `origin` policy
+    /// cannot leak the parent's path to a `data:` or `blob:` child
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    fn local_frame_referrer(
+        &self,
+        initiator: FrameId,
+        navigation: &FrameNavigation,
+        target: &Url,
+    ) -> String {
+        let (referrer, policy) = self.navigation_referrer(initiator, navigation);
+        let client = self.frames.get(&initiator).map(|document| {
+            let world = document.world();
+            let world = world.borrow();
+            net::ReferrerClient {
+                origin: world.origin.clone(),
+                url: world.referrer_url.clone(),
+            }
+        });
+        net::determine_referrer(policy, client.as_ref(), &referrer, target)
+            .map_or_else(String::new, |url| url.to_string())
     }
 
     /// The policy a local-scheme document inherits from its initiator
@@ -1231,10 +1334,19 @@ impl Engine {
             })
             .flatten();
         match url.scheme() {
-            "about" => self.keep_initial_blank(child, initiator),
-            "data" => self.load_data_frame(child, initiator, url),
+            "about" => {
+                self.install_sandbox(child, navigation);
+                self.keep_initial_blank(child, initiator);
+            }
+            "data" => {
+                self.install_sandbox(child, navigation);
+                self.load_data_frame(child, initiator, url, navigation);
+            }
             "javascript" => self.load_javascript_frame_url(child, initiator, url),
-            "blob" => self.load_blob_frame(child, initiator, url),
+            "blob" => {
+                self.install_sandbox(child, navigation);
+                self.load_blob_frame(child, initiator, url, navigation);
+            }
             "http" | "https" => {
                 // The document the navigation started from supplies both the
                 // authorized origin and the client URL. The origin is
@@ -1255,8 +1367,7 @@ impl Engine {
                 // navigation is a no-referrer navigation regardless of
                 // policy
                 // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-                let (referrer, referrer_policy) =
-                    self.navigation_referrer(initiator, navigation.referrer_policy);
+                let (referrer, referrer_policy) = self.navigation_referrer(initiator, navigation);
                 // The embedder's `frame-src` gate re-checks every redirect hop,
                 // and the ancestor URLs back the child response's
                 // `frame-ancestors` check at commit — both only when the
@@ -1298,6 +1409,7 @@ impl Engine {
                             referrer_policy,
                         },
                         ancestors,
+                        navigation.sandbox,
                     );
                 }
             }
@@ -1386,13 +1498,15 @@ impl Engine {
     /// A `data:` frame URL decodes in-process. A malformed URL fails the
     /// navigation and leaves the frame on its current document
     /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
-    fn load_data_frame(&mut self, child: FrameId, parent: FrameId, url: &Url) {
+    fn load_data_frame(
+        &mut self,
+        child: FrameId,
+        parent: FrameId,
+        url: &Url,
+        navigation: &FrameNavigation,
+    ) {
         let policy = self.inherited_policy(parent);
-        let referrer = self
-            .frames
-            .get(&parent)
-            .map(|document| document.referrer_url().to_string())
-            .unwrap_or_default();
+        let referrer = self.local_frame_referrer(parent, navigation, url);
         let Some((content_type, body)) = decode_data_url(url.as_str()) else {
             if let Some(document) = self.frames.get_mut(&child) {
                 document.load_about_blank(None, None);
@@ -1415,7 +1529,13 @@ impl Engine {
     /// A `blob:` frame URL reads the parent's Blob URL Store. A missing entry
     /// is a network error. The child's origin is the entry's creator
     /// (<https://w3c.github.io/FileAPI/#blob-url-entry>).
-    fn load_blob_frame(&mut self, child: FrameId, parent: FrameId, url: &Url) {
+    fn load_blob_frame(
+        &mut self,
+        child: FrameId,
+        parent: FrameId,
+        url: &Url,
+        navigation: &FrameNavigation,
+    ) {
         let mut key = url.clone();
         key.set_fragment(None);
         let loaded = self.frames.get(&parent).and_then(|document| {
@@ -1430,11 +1550,7 @@ impl Engine {
             return;
         };
         let policy = self.inherited_policy(parent);
-        let referrer = self
-            .frames
-            .get(&parent)
-            .map(|document| document.referrer_url().to_string())
-            .unwrap_or_default();
+        let referrer = self.local_frame_referrer(parent, navigation, url);
         if let Some(document) = self.frames.get_mut(&child) {
             // A `blob:` URL inherits the initiator's policy container, and the
             // child's origin is the store entry's creator
@@ -1464,7 +1580,12 @@ impl Engine {
     }
 
     fn apply_navigations(&mut self, navigations: Vec<(FrameId, FrameNavigation)>) {
-        for (initiator, navigation) in navigations {
+        for (queued_on, mut navigation) in navigations {
+            // A cross-frame `Location` setter queues on the target but is
+            // initiated by the incumbent document: target resolution, the
+            // referrer, and the sandbox rules all read the source
+            // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+            let initiator = navigation.source.unwrap_or(queued_on);
             let chosen = {
                 let shared = self.runtime.shared.borrow();
                 let tree = &shared.tree;
@@ -1483,21 +1604,30 @@ impl Engine {
             let Some((chosen, container)) = chosen else {
                 continue;
             };
-            // The container's `sandbox` attribute decides the flag set for the
-            // document this navigation loads, so it is read again here rather
-            // than only when the frame was created
-            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
-            if let (Some(embedder), Some(container)) =
-                (self.runtime.shared.borrow().tree.parent(chosen), container)
+            if !self.sandbox_allows_navigation(initiator, chosen) {
+                continue;
+            }
+            // The target container's `sandbox` attribute and its embedder's
+            // active flags travel with the navigation and take effect when the
+            // document commits, so a navigation that fails or is blocked leaves
+            // the current document under its own flags
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+            if let Some(container) = container
+                && let Some(embedder) = self.runtime.shared.borrow().tree.parent(chosen)
                 && let Some(embedder) = self.frames.get(&embedder)
             {
-                let flags = crate::document::sandboxing_flags(&embedder.world(), container);
-                if let Some(child) = self.frames.get(&chosen) {
-                    child.world().borrow_mut().sandbox = flags;
-                }
+                navigation.sandbox =
+                    crate::document::sandboxing_flags(&embedder.world(), container);
             }
+            // A navigation whose target is still the initial `about:blank`
+            // replaces that entry instead of adding a second one
+            // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
+            let replace = self
+                .frames
+                .get(&chosen)
+                .is_some_and(Document::is_initial_blank);
             self.navigate_frame(chosen, initiator, &navigation);
-            self.record_navigation(chosen, initiator, &navigation);
+            self.record_navigation(chosen, initiator, &navigation, replace);
             if let Some(container) = container {
                 self.publish_frame_document(container, chosen);
             }
@@ -1779,6 +1909,55 @@ impl Drop for Engine {
         self.frames.clear();
         self.runtime.registry.borrow_mut().clear();
         self.js_runtime.collect();
+    }
+}
+
+#[cfg(test)]
+mod frame_history_tests {
+    use super::{FrameHistory, FrameHistoryEntry};
+
+    fn history(len: usize) -> FrameHistory {
+        let mut history = FrameHistory::default();
+        for _ in 0..len {
+            history.push(FrameHistoryEntry {
+                navigation: None,
+                state: None,
+            });
+        }
+        history.index = 0;
+        history
+    }
+
+    #[test]
+    fn a_delta_past_the_ends_does_nothing() {
+        let mut history = history(3);
+        assert!(history.target(-1).is_none());
+        assert_eq!(history.index, 0, "a refused traversal keeps the entry");
+        assert!(history.target(3).is_none());
+        assert_eq!(history.index, 0);
+        assert!(history.target(2).is_some());
+        assert_eq!(history.index, 2);
+        assert!(history.target(1).is_none());
+        assert_eq!(history.index, 2);
+    }
+
+    #[test]
+    fn go_zero_reloads_the_active_entry() {
+        let mut history = history(2);
+        assert!(history.target(1).is_some());
+        assert!(history.target(0).is_some());
+        assert_eq!(history.index, 1);
+    }
+
+    #[test]
+    fn replace_keeps_the_entry_count() {
+        let mut history = history(1);
+        history.replace(FrameHistoryEntry {
+            navigation: None,
+            state: None,
+        });
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.index, 0);
     }
 }
 

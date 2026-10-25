@@ -90,100 +90,62 @@ impl Component {
         }
     }
 
-    /// Replaces this component of `url` with `value`, the way the IDL setter
-    /// does. Returns whether the URL changed, so assigning the value the
-    /// document already has does not reload it
+    /// Replaces this component of `url` with `value`, using the URL Standard's
+    /// quirks setters, which are the algorithms the IDL setters name
+    /// (<https://url.spec.whatwg.org/#example-635b7a2a>). Returns whether the
+    /// URL changed, so assigning the value the document already has does not
+    /// reload it
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-location-interface>).
     fn replace(self, url: &mut url::Url, value: &str) -> bool {
         let before = url.as_str().to_owned();
         match self {
-            Self::Pathname => url.set_path(value),
-            Self::Search => {
-                url.set_query(
-                    (!value.is_empty()).then(|| value.strip_prefix('?').unwrap_or(value)),
-                );
-            }
+            Self::Pathname => url::quirks::set_pathname(url, value),
+            Self::Search => url::quirks::set_search(url, value),
             Self::Protocol => {
-                if url
-                    .set_scheme(value.strip_suffix(':').unwrap_or(value))
-                    .is_err()
-                {
-                    return false;
-                }
+                let _ = url::quirks::set_protocol(url, value);
             }
             Self::Host => {
-                let (host, port) = split_host_port(value);
-                if !replace_host(url, host) {
-                    return false;
-                }
-                if let Some(port) = port {
-                    match port.parse() {
-                        Ok(port) => {
-                            if url.set_port(Some(port)).is_err() {
-                                return false;
-                            }
-                        }
-                        Err(_) => return false,
-                    }
-                }
+                let _ = url::quirks::set_host(url, value);
             }
             Self::Hostname => {
-                if !replace_host(url, value) {
-                    return false;
-                }
+                let _ = url::quirks::set_hostname(url, value);
             }
             Self::Port => {
-                let ok = if value.is_empty() {
-                    url.set_port(None).is_ok()
-                } else {
-                    value
-                        .parse()
-                        .is_ok_and(|port| url.set_port(Some(port)).is_ok())
-                };
-                if !ok {
-                    return false;
-                }
+                let _ = url::quirks::set_port(url, value);
             }
-            // `href` names a whole URL and `hash` has no same-document
-            // navigation to run; neither replaces a component.
+            // `href` names a whole URL; `origin` is read-only. `hash` needs
+            // "navigate to a fragment", which this engine has no algorithm for,
+            // and a full reload would be the wrong answer.
             Self::Href | Self::Hash | Self::Origin => return false,
         }
         url.as_str() != before
     }
 }
 
-/// Splits a `host[:port]` pair, keeping an IPv6 literal's brackets whole.
-fn split_host_port(value: &str) -> (&str, Option<&str>) {
-    let host_len = if value.starts_with('[') {
-        value.find(']').map_or(value.len(), |end| end + 1)
-    } else {
-        value.find(':').unwrap_or(value.len())
-    };
-    let (host, rest) = value.split_at(host_len);
-    (host, rest.strip_prefix(':'))
-}
-
-/// Sets `url`'s host from the IDL `host`/`hostname` value, parsed as a host.
-/// An invalid host leaves the URL alone: the setter performs no navigation
-/// (<https://url.spec.whatwg.org/#concept-host-parser>).
-fn replace_host(url: &mut url::Url, value: &str) -> bool {
-    let Ok(host) = url::Host::parse(value) else {
-        return false;
-    };
-    url.set_host(Some(&host.to_string())).is_ok()
-}
-
 /// Queues a navigation of `owner`'s frame to `spec`, which is what assigning
 /// to `Location.href`, to any other navigating `Location` component, and to a
 /// window's `location` does
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
-fn navigate_location(owner: &Rc<RefCell<World>>, spec: String) {
+fn navigate_location(owner: &Rc<RefCell<World>>, spec: String, source: Option<FrameId>) {
+    let mut navigation = crate::js::world::FrameNavigation::get(
+        crate::js::world::NavigationTarget::Target("_self".to_owned()),
+        spec,
+    );
+    if let Some(source) = source {
+        navigation = navigation.with_source(source);
+    }
+    owner.borrow_mut().queue_frame_navigation(navigation);
+}
+
+/// Parses `value` relative to the owner document's URL, throwing the
+/// `SyntaxError` the `href` setter requires when it is not a valid URL
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+fn parse_location(ctx: &Ctx<'_>, owner: &Rc<RefCell<World>>, value: &str) -> Result<url::Url> {
     owner
-        .borrow_mut()
-        .queue_frame_navigation(crate::js::world::FrameNavigation::get(
-            crate::js::world::NavigationTarget::Target("_self".to_owned()),
-            spec,
-        ));
+        .borrow()
+        .document_url
+        .join(value)
+        .map_err(|_| super::throw_dom(ctx, "SyntaxError", "invalid URL"))
 }
 
 /// The `Location` setter shared by every component that navigates.
@@ -194,13 +156,19 @@ fn navigate_location(owner: &Rc<RefCell<World>>, spec: String) {
 fn set_component(owner: &Rc<RefCell<World>>, component: Component, value: Value<'_>) -> Result<()> {
     let ctx = value.ctx().clone();
     let value = super::webidl::webidl_to_string(&ctx, value)?;
+    // The entry settings object supplies the resolution base; the incumbent
+    // document supplies the referrer, policy, and sandbox rules when a script
+    // in one frame assigns another frame's `location`
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+    let source = world(&ctx)?.borrow().frame();
     if matches!(component, Component::Href) {
-        navigate_location(owner, value);
+        let url = parse_location(&ctx, owner, &value)?;
+        navigate_location(owner, url.as_str().to_owned(), Some(source));
         return Ok(());
     }
     let mut url = owner.borrow().document_url.clone();
     if component.replace(&mut url, &value) {
-        navigate_location(owner, url.as_str().to_owned());
+        navigate_location(owner, url.as_str().to_owned(), Some(source));
     }
     Ok(())
 }

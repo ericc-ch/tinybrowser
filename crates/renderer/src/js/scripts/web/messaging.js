@@ -1119,20 +1119,42 @@ Object.defineProperty(globalThis, 'name', {
     if (spec === null || spec === undefined) return null;
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
-    if (name !== '' && namedWindows.has(name)) return namedWindows.get(name);
+    // Window features are a comma-separated list of name[=value] pairs; the
+    // two that change this algorithm are `noopener` and `noreferrer`
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+    const tokens = new Set(
+      featureString
+        .split(',')
+        .map((feature) => feature.split('=')[0].trim().toLowerCase())
+        .filter((feature) => feature !== ''),
+    );
+    const noopener = tokens.has('noopener') || tokens.has('noreferrer');
+    const noreferrer = tokens.has('noreferrer');
+    const special = name === '' || name.startsWith('_');
+    // Without `allow-popups` a sandboxed document cannot create an auxiliary
+    // context at all, whether this renderer or the browser would host it
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
+    const creates =
+      name === '' ||
+      name === '_blank' ||
+      (!name.startsWith('_') && !namedWindows.has(name));
+    if (creates && !host.__tbMayOpenPopup()) return null;
+    if (!special && namedWindows.has(name)) return namedWindows.get(name);
     // A context this renderer hosts keeps same-origin access to the opener: an
     // auxiliary context for a blank or same-origin URL, or the navigable a
     // name already selects. A cross-origin popup stays a browser tab.
-    const frame = host.__tbOpenAuxiliary(spec, name);
-    if (frame !== null && frame !== undefined) return __tbFrameProxy(frame);
+    const frame = host.__tbOpenAuxiliary(spec, name, noopener, noreferrer);
+    if (frame !== null && frame !== undefined) {
+      return noopener ? null : __tbFrameProxy(frame);
+    }
     const tab = host.__tbWindowOpen(spec, name, featureString);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
-    if (name !== '') {
+    if (!special) {
       namedWindows.set(name, proxy);
       tabNames.set(tab, name);
     }
-    return proxy;
+    return noopener ? null : proxy;
   };
 
   // https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close

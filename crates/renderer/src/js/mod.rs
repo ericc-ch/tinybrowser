@@ -1421,9 +1421,26 @@ fn install_auxiliary_host_functions(
     let open = world.clone();
     bridge::object(ctx)?.set(
         "__tbOpenAuxiliary",
-        Func::from(move |url: String, name: String| {
-            World::open_auxiliary(&open, &url, &name).map(|frame| crate::js::js_number(frame.get()))
-        }),
+        Func::from(
+            move |url: String, name: String, noopener: bool, noreferrer: bool| {
+                World::open_auxiliary(
+                    &open,
+                    &url,
+                    &name,
+                    crate::js::world::AuxiliaryOptions {
+                        noopener,
+                        noreferrer,
+                    },
+                )
+                .map(|frame| crate::js::js_number(frame.get()))
+            },
+        ),
+    )?;
+
+    let popups = world.clone();
+    bridge::object(ctx)?.set(
+        "__tbMayOpenPopup",
+        Func::from(move || popups.borrow().allows_auxiliary_navigation()),
     )?;
 
     let opener = world.clone();
