@@ -1420,7 +1420,7 @@ pub(crate) enum RealmRequest {
     Timer(super::TimeoutRequest),
     ClearTimer(i32),
     Fetch(Box<super::JsFetchRequest>),
-    AbortFetch(i32),
+    AbortFetch(crate::document::JsFetchId),
     Script(NodeId),
     Image(NodeId),
     HistoryPush {

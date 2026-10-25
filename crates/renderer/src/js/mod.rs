@@ -173,7 +173,7 @@ pub(crate) struct TimeoutRequest {
 
 pub(crate) struct JsFetchRequest {
     pub url: String,
-    pub js_id: i32,
+    pub js_id: crate::document::JsFetchId,
     pub method: String,
     pub body: Vec<u8>,
     pub content_type: Option<String>,
@@ -1066,7 +1066,7 @@ impl JsRealm {
                         .borrow_mut()
                         .push_back(RealmRequest::Fetch(Box::new(JsFetchRequest {
                             url,
-                            js_id,
+                            js_id: crate::document::JsFetchId::from_script(js_id),
                             method,
                             body: body.to_vec(),
                             content_type,
@@ -1090,7 +1090,9 @@ impl JsRealm {
             Func::from(move |js_id: i32| {
                 cancel_fetch_outbox
                     .borrow_mut()
-                    .push_back(RealmRequest::AbortFetch(js_id));
+                    .push_back(RealmRequest::AbortFetch(
+                        crate::document::JsFetchId::from_script(js_id),
+                    ));
             }),
         )?;
         Ok(())

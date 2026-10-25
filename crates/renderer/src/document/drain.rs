@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
+use super::{
+    DialContext, Document, ImageUpdate, JsFetchId, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer,
+    TimerId,
+};
 use crate::dom::tree::NodeId;
 use crate::js::RealmRequest;
 use crate::protocol::{BrowserEvent, RendererEvent};
@@ -91,8 +94,8 @@ impl Document {
             .min()
     }
 
-    pub(crate) fn schedule_timer(&mut self, delay: Duration) -> u32 {
-        let id = self.next_timer_id;
+    pub(crate) fn schedule_timer(&mut self, delay: Duration) -> TimerId {
+        let id = TimerId::new(self.next_timer_id);
         self.next_timer_id = self.next_timer_id.saturating_add(1);
         self.timers.insert(
             id,
@@ -385,7 +388,7 @@ impl Document {
         self.queue_dial(dial);
     }
 
-    fn fail_js_fetch(&mut self, js_id: i32) {
+    fn fail_js_fetch(&mut self, js_id: JsFetchId) {
         self.record_event(RendererEvent::FetchFailed);
         self.settle_js_fetch(js_id, None);
     }
@@ -444,7 +447,7 @@ impl Document {
         self.queue_dial(dial);
     }
 
-    fn due_timer(&mut self) -> Option<u32> {
+    fn due_timer(&mut self) -> Option<TimerId> {
         let now = Instant::now();
         let (id, timer) = self
             .timers

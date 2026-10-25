@@ -197,7 +197,7 @@ pub enum RendererEvent {
     /// An outcome the browser acts on.
     Browser(BrowserEvent),
     /// A host timer whose delay elapsed.
-    Timer(u32),
+    Timer(crate::document::TimerId),
     /// A `fetch` or navigation job finished with this HTTP status.
     Fetch {
         /// HTTP status.

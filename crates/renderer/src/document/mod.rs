@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant as WallClock;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 use blitz_traits::net::NetHandler;
@@ -59,12 +60,54 @@ const MAX_PENDING_JS_FETCHES: usize = 256;
 /// Retained events before a document reports overflow.
 const MAX_PENDING_EVENTS: usize = 2048;
 
+/// Identity of one started dial in this document's ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DialId(u64);
+
+impl DialId {
+    fn next(&mut self) -> Self {
+        let id = *self;
+        self.0 += 1;
+        id
+    }
+}
+
+/// Identity of one page `fetch` as the page script named it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct JsFetchId(i32);
+
+impl JsFetchId {
+    pub(crate) const fn from_script(id: i32) -> Self {
+        Self(id)
+    }
+
+    pub(crate) const fn script(self) -> i32 {
+        self.0
+    }
+}
+
+/// Identity of one host timer in this document's timer table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TimerId(u32);
+
+impl TimerId {
+    const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// The id as the WIT boundary spells it.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 enum Task {
-    Timer(u32),
+    Timer(TimerId),
     /// Boxed: a completed dial carries the request and response with it, and
     /// the variant otherwise dominates every other task's size.
-    DialFinished(u64, Box<CompletedDial>),
-    DialFailed(u64, DialContext),
+    DialFinished(DialId, Box<CompletedDial>),
+    DialFailed(DialId, DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
     /// One cross-tab `message` from another renderer. The sender's origin and
@@ -136,7 +179,7 @@ pub(crate) struct WindowMessage {
 #[derive(Clone, Copy)]
 pub(crate) enum DialContext {
     JsFetch {
-        id: i32,
+        id: JsFetchId,
     },
     ClassicScript {
         element: crate::dom::tree::NodeId,
@@ -520,7 +563,7 @@ pub(crate) struct Document {
     shared: SharedHandle,
     url: Url,
     tasks: VecDeque<Task>,
-    timers: HashMap<u32, Timer>,
+    timers: HashMap<TimerId, Timer>,
     next_timer_id: u32,
     /// Every queued, in-flight, and cancelled dial for this document.
     dials: DialLedger,
@@ -574,14 +617,14 @@ pub(crate) struct Document {
     /// when the value was parsed.
     pending_refresh: Option<(Url, std::time::Duration)>,
     /// The timer a refresh is waiting on, so a new navigation can cancel it.
-    refresh_timer: Option<u32>,
+    refresh_timer: Option<TimerId>,
     /// The URL an armed refresh navigates to when its timer fires.
     refresh_target: Option<Url>,
     events: Vec<RendererEvent>,
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
     /// Live JS timers by the id script holds. The timer owns the page id.
-    js_timers: HashMap<i32, u32>,
+    js_timers: HashMap<i32, TimerId>,
     /// One count for every operation delaying this document's `load` event.
     load_delay: LoadDelay,
     /// Whether init scripts were deferred because the realm was created while
@@ -3605,8 +3648,12 @@ impl Document {
         }
     }
 
-    pub(in crate::document) fn settle_js_fetch(&mut self, id: i32, outcome: Option<DialOutcome>) {
-        self.fire_js(|js| js.finish_js_fetch(id, outcome));
+    pub(in crate::document) fn settle_js_fetch(
+        &mut self,
+        id: JsFetchId,
+        outcome: Option<DialOutcome>,
+    ) {
+        self.fire_js(|js| js.finish_js_fetch(id.script(), outcome));
     }
 
     /// Runs the post-parsing steps of "the end": set readiness to
