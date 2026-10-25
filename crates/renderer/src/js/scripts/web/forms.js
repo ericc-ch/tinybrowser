@@ -1046,24 +1046,16 @@
       .replace(/\r/g, '%0D')
       .replace(/\n/g, '%0A')
       .replace(/"/g, '%22');
-  // The navigation body crosses to Rust as a Latin-1 string, one char per
-  // byte, so file bytes survive unchanged while text is UTF-8 encoded first.
+  // Text is encoded once; the navigation body crosses as a `Uint8Array`.
   const encoder = new TextEncoder();
-  const toLatin1 = bytes => {
-    // Chunked: per-byte `+=` is quadratic on large multipart bodies.
-    const parts = __tbPrivateArray();
-    for (let start = 0; start < bytes.length; start += 4096) {
-      __tbArray.push(parts, __tbApply(__tbIDLFromCharCode, null, __tbBytesCopy(bytes, start, start + 4096)));
-    }
-    return __tbArray.join(parts, '');
-  };
   const concatBytes = chunks => {
     let total = 0;
-    for (const chunk of chunks) total += chunk.length;
-    const out = new Uint8Array(total);
+    for (let index = 0; index < chunks.length; index++) total += chunks[index].length;
+    const out = new __tbUint8Array(total);
     let offset = 0;
-    for (const chunk of chunks) {
-      out.set(chunk, offset);
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index];
+      for (let byte = 0; byte < chunk.length; byte++) out[offset + byte] = chunk[byte];
       offset += chunk.length;
     }
     return out;
@@ -1071,47 +1063,53 @@
 
   const encodeMultipart = (formData, label) => {
     const boundary = `----tinybrowser${Math.random().toString(16).slice(2)}`;
-    const chunks = [];
-    const push = text => chunks.push(encoder.encode(text));
+    const chunks = __tbPrivateArray();
+    const push = text => __tbArray.push(chunks, encoder.encode(text));
     for (const entry of formData) {
       const name = escapeMultipartName(entry[0]);
       const value = entry[1];
       push(`--${boundary}\r\n`);
       if (value !== null && typeof value === 'object' && typeof value.name === 'string') {
         push(`Content-Disposition: form-data; name="`);
-        chunks.push(charsetBytes(name, label));
+        __tbArray.push(chunks, charsetBytes(name, label));
         push(`"; filename="`);
-        chunks.push(charsetBytes(escapeMultipartFilename(value.name), label));
+        __tbArray.push(chunks, charsetBytes(escapeMultipartFilename(value.name), label));
         push(`"\r\nContent-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`);
         const data = __tbBlobData.get(value);
-        chunks.push(data === undefined ? encoder.encode(String(value)) : data.bytes);
+        __tbArray.push(chunks, data === undefined ? encoder.encode(String(value)) : data.bytes);
         push('\r\n');
       } else {
         push(`Content-Disposition: form-data; name="`);
-        chunks.push(charsetBytes(name, label));
+        __tbArray.push(chunks, charsetBytes(name, label));
         push(`"\r\n\r\n`);
-        chunks.push(charsetBytes(String(value).replace(/\r\n|\r|\n/g, '\r\n'), label));
+        __tbArray.push(
+          chunks,
+          charsetBytes(String(value).replace(/\r\n|\r|\n/g, '\r\n'), label),
+        );
         push('\r\n');
       }
     }
     push(`--${boundary}--\r\n`);
     return {
-      body: toLatin1(concatBytes(chunks)),
+      body: concatBytes(chunks),
       contentType: `multipart/form-data; boundary=${boundary}`,
     };
   };
 
   const encodeTextPlain = (formData, label) => {
-    let body = '';
+    const chunks = __tbPrivateArray();
     for (const entry of formData) {
       const name = charsetBytes(String(entry[0]).replace(/\r\n|\r|\n/g, '\r\n'), label);
       const value = charsetBytes(
         entryValueString(entry[1]).replace(/\r\n|\r|\n/g, '\r\n'),
         label,
       );
-      body += `${toLatin1(name)}=${toLatin1(value)}\r\n`;
+      __tbArray.push(chunks, name);
+      __tbArray.push(chunks, encoder.encode('='));
+      __tbArray.push(chunks, value);
+      __tbArray.push(chunks, encoder.encode('\r\n'));
     }
-    return body;
+    return concatBytes(chunks);
   };
 
   const methodKeyword = raw => {
@@ -1157,7 +1155,7 @@
       const withoutFragment = hash === -1 ? action : action.slice(0, hash);
       const query = withoutFragment.indexOf('?');
       const base = query === -1 ? withoutFragment : withoutFragment.slice(0, query);
-      host.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', '', null, form);
+      host.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', new __tbUint8Array(0), null, form);
       return;
     }
     // POST: the entries become the request body, encoded per `enctype`
@@ -1170,7 +1168,7 @@
       body = encodeTextPlain(formData, label);
       contentType = 'text/plain';
     } else {
-      body = urlEncode(formData, label);
+      body = encoder.encode(urlEncode(formData, label));
       contentType = 'application/x-www-form-urlencoded';
     }
     host.__tbFormNavigate(action, target, 'POST', body, contentType, form);

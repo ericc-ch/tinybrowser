@@ -31,7 +31,9 @@ use crate::js::{
     FrameNavigation, NavigationTarget, PolicyContainer, RealmRegistry, SharedJsRuntime,
 };
 use crate::messaging::{Delivery, SharedHandle};
-use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError};
+use crate::protocol::{
+    BrowserEvent, BrowserServices, FrameId, Mount, RendererEvent, ResponseHead, TabError,
+};
 use crate::storage::PendingStorageEvent;
 
 /// One child navigable's session history, owned by the engine that hosts its
@@ -88,6 +90,16 @@ pub struct Engine {
     /// Session history of every child navigable and auxiliary context this
     /// engine hosts.
     frame_history: HashMap<FrameId, FrameHistory>,
+    /// JS-truth predicates the browser waits on, evaluated after each drain.
+    js_waiters: Vec<JsWaiter>,
+}
+
+/// One JS-truth predicate: the browser registers it once and hears only when
+/// it evaluates to `true`, so it never polls the page.
+struct JsWaiter {
+    id: u64,
+    frame: FrameId,
+    source: crate::protocol::ScriptSource,
 }
 
 impl Engine {
@@ -120,6 +132,7 @@ impl Engine {
             js_runtime,
             init_scripts,
             frame_history: HashMap::new(),
+            js_waiters: Vec::new(),
         }
     }
 
@@ -579,6 +592,61 @@ impl Engine {
         Ok(events)
     }
 
+    /// Removes and returns every pending event the browser acts on, with its
+    /// frame. Renderer-internal progress is discarded: it has no browser-side
+    /// state and never crosses the IPC boundary.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::RendererUnavailable`] when a frame retained more events
+    /// than its limit; the queue empties and the excess is lost.
+    pub fn take_browser_events(&mut self) -> Result<Vec<(FrameId, BrowserEvent)>, TabError> {
+        Ok(self
+            .take_events()?
+            .into_iter()
+            .filter_map(|(frame, event)| event.into_browser().map(|event| (frame, event)))
+            .collect())
+    }
+
+    /// Registers a JS-truth predicate for [`Self::settle_js_waiters`].
+    pub fn add_js_waiter(
+        &mut self,
+        id: u64,
+        frame: FrameId,
+        source: crate::protocol::ScriptSource,
+    ) {
+        self.js_waiters.push(JsWaiter { id, frame, source });
+    }
+
+    /// Drops a waiter that the browser no longer needs.
+    pub fn cancel_js_waiter(&mut self, id: u64) {
+        self.js_waiters.retain(|waiter| waiter.id != id);
+    }
+
+    /// Evaluates every registered predicate and returns the ids that became
+    /// true. The browser hears only those ids, so it never polls page state.
+    pub fn settle_js_waiters(&mut self) -> Vec<u64> {
+        if self.js_waiters.is_empty() {
+            return Vec::new();
+        }
+        let waiters = std::mem::take(&mut self.js_waiters);
+        let mut settled = Vec::new();
+        let mut pending = Vec::with_capacity(waiters.len());
+        for waiter in waiters {
+            let hit = matches!(
+                self.execute_remote_in(waiter.frame, waiter.source.as_ref(), None),
+                Ok(RemoteValue::Bool(true))
+            );
+            if hit {
+                settled.push(waiter.id);
+            } else {
+                pending.push(waiter);
+            }
+        }
+        self.js_waiters = pending;
+        settled
+    }
+
     /// Runs every immediately ready task in every frame until the shared
     /// script deadline. Never blocks.
     ///
@@ -648,10 +716,11 @@ impl Engine {
 
     /// Queues one remote `postMessage` payload on the main frame's task
     /// source; the frame dispatches a trusted `message` event with a null
-    /// source.
-    pub fn receive_remote_window_message(&mut self, payload: String) {
+    /// source after checking the intended target origin against whichever
+    /// document runs the task.
+    pub fn receive_remote_window_message(&mut self, message: crate::protocol::PostedMessage) {
         if let Some(document) = self.frames.get_mut(&FrameId::MAIN) {
-            document.push_remote_message(payload);
+            document.push_remote_message(message);
         }
     }
 
@@ -686,7 +755,12 @@ impl Engine {
         source: Option<u64>,
     ) {
         for document in self.frames.values_mut() {
-            if document.origin_string() != origin {
+            // Two opaque origins never share a `BroadcastChannel`
+            // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+            // Their serialization is `"null"` for every document, so matching
+            // it would deliver across unrelated opaque documents.
+            let target = document.origin_string();
+            if target != origin || target == "null" {
                 continue;
             }
             if !document.world().borrow().is_attached() {
@@ -880,7 +954,11 @@ impl Engine {
         }
         self.runtime.registry.borrow_mut().forget_frame(container);
         self.runtime.registry.borrow_mut().forget_frame_world(child);
-        self.runtime.shared.borrow_mut().tree.remove(child);
+        {
+            let mut shared = self.runtime.shared.borrow_mut();
+            shared.tree.remove(child);
+            shared.forget_document(child);
+        }
         // Dropping the document closes its ports and its realm.
         self.frames.remove(&child);
         self.frame_history.remove(&child);
@@ -1432,8 +1510,6 @@ impl Engine {
             if let Some(container) = container {
                 self.publish_frame_document(container, frame);
                 if closed {
-                    // The written document is a fresh load: it supersedes the
-                    // insertion firing, so its own `load` must fire.
                     let parent = self.runtime.shared.borrow().tree.parent(frame);
                     if let Some(parent) = parent {
                         self.mark_frame_load_pending(container, parent);
@@ -1443,33 +1519,32 @@ impl Engine {
         }
     }
 
-    /// Routes finished sends to their target frame's task queue, re-checking
-    /// the target origin at delivery time
+    /// Routes finished sends to their target frame's task queue. The message
+    /// queues on the document it was posted to, and the intended target origin
+    /// is checked when the task runs
     /// ([window post message steps](https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps)).
     fn apply_deliveries(&mut self, deliveries: Vec<Delivery>) {
         for delivery in deliveries {
             match delivery {
                 Delivery::WindowMessage {
                     target,
+                    document,
                     source,
                     origin,
                     target_origin,
                     payload,
                     ports,
                 } => {
-                    let allowed = self.frames.get(&target).is_some_and(|document| {
-                        target_origin == "*" || target_origin == document.origin_string()
-                    });
-                    // Blink re-checks the intended target origin against the
-                    // recipient's origin at delivery time and drops the
-                    // message on mismatch
-                    // (LocalDOMWindow::DispatchMessageEventWithOriginCheck).
-                    match (allowed, self.frames.get_mut(&target)) {
-                        (true, Some(document)) => {
+                    // A task is not runnable once its document is not fully
+                    // active
+                    // (<https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable>).
+                    match self.frames.get_mut(&target) {
+                        Some(document_now) if document_now.matches_document(document) => {
                             Self::route_endpoints(&self.runtime.shared, &ports, target);
-                            document.push_window_message(WindowMessage {
+                            document_now.push_window_message(WindowMessage {
                                 source,
                                 origin,
+                                target_origin,
                                 payload,
                                 ports,
                             });
@@ -1761,5 +1836,155 @@ mod data_url_tests {
     fn rejects_a_percent_encoded_body_just_over_the_cap() {
         let raw = percent_encoded(MAX_RESPONSE_BODY_BYTES + 1);
         assert!(decode_data_url_bounded(&raw).is_none());
+    }
+}
+
+#[cfg(test)]
+mod messaging_tests {
+    use super::{Engine, FrameId, Mount, ResponseHead};
+    use crate::test_services::NullServices;
+    use std::sync::Arc;
+
+    fn engine() -> Engine {
+        Engine::new(
+            Arc::new(NullServices),
+            Arc::new(crate::js::Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        )
+    }
+
+    fn mount(url: &str, body: &str) -> Mount {
+        Mount {
+            head: ResponseHead {
+                url: url.to_owned(),
+                ..ResponseHead::default()
+            },
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn message_posted_before_navigation_never_fires_in_the_replacement_document() {
+        let mut engine = engine();
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &mount("https://example.test/one", "<!doctype html><p>one"),
+            )
+            .expect("mount");
+        let _ready = engine.drain_ready();
+        // Post through the real host path: the delivery captures the target
+        // window's document at post time
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>).
+        engine
+            .eval_in(FrameId::MAIN, "postMessage('queued', '*')")
+            .expect("post");
+        // A navigation commits before the engine routes the delivery: the new
+        // document listens for `message`, and the sender's message must not
+        // reach it.
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &mount(
+                    "https://example.test/two",
+                    "<!doctype html><script>window.__ready = true; window.__hits = 0; window.onmessage = function () { window.__hits++; };</script>",
+                ),
+            )
+            .expect("replace");
+        let _ready = engine.drain_ready();
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "String(window.__hits)")
+                .expect("hits"),
+            "0",
+            "the replacement document must not receive the old document's message"
+        );
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "String(window.__ready)")
+                .expect("ready"),
+            "true",
+            "the new document must have run its script"
+        );
+    }
+
+    #[test]
+    fn remote_message_checks_the_target_origin_and_reports_the_sender_origin() {
+        let mut engine = engine();
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &mount(
+                    "https://example.test/",
+                    "<!doctype html><script>window.__hits = 0; window.__origin = ''; window.onmessage = function (event) { window.__hits++; window.__origin = event.origin; };</script>",
+                ),
+            )
+            .expect("mount");
+        let _ready = engine.drain_ready();
+        let payload = r#"tb1:{"root":0,"nodes":[["string","cross-tab"]]}"#.to_owned();
+        // A target origin that names a different document is checked when the
+        // task runs, so the message never reaches this realm.
+        engine.receive_remote_window_message(crate::protocol::PostedMessage {
+            origin: "https://other.test".to_owned(),
+            target_origin: "https://different.test".to_owned(),
+            payload: payload.clone(),
+        });
+        let _ready = engine.drain_ready();
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "String(window.__hits)")
+                .expect("hits"),
+            "0",
+            "a mismatched target origin must not deliver"
+        );
+        // The matching target origin delivers, and `event.origin` is the
+        // sender's origin at post time, not an empty string.
+        engine.receive_remote_window_message(crate::protocol::PostedMessage {
+            origin: "https://other.test".to_owned(),
+            target_origin: "https://example.test".to_owned(),
+            payload,
+        });
+        let _ready = engine.drain_ready();
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "String(window.__hits)")
+                .expect("hits"),
+            "1",
+            "the matching target origin must deliver"
+        );
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "window.__origin")
+                .expect("origin"),
+            "https://other.test",
+            "the delivered event carries the sender's origin"
+        );
+    }
+
+    #[test]
+    fn slash_target_origin_resolves_to_the_sender_origin_with_its_identity() {
+        let mut engine = engine();
+        // A `data:` document's origin is opaque, and `/` on an opaque sender
+        // still delivers to the sender itself: same origin with itself.
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &mount(
+                    "data:text/html,opaque",
+                    "<!doctype html><script>window.__hits = 0; window.onmessage = function () { window.__hits++; };</script>",
+                ),
+            )
+            .expect("mount");
+        engine
+            .eval_in(FrameId::MAIN, "window.postMessage('self', '/');")
+            .expect("post");
+        let _ready = engine.drain_ready();
+        assert_eq!(
+            engine
+                .eval_in(FrameId::MAIN, "String(window.__hits)")
+                .expect("hits"),
+            "1",
+            "`/` must resolve to the sender's origin, and a document is same origin with itself"
+        );
     }
 }

@@ -4,6 +4,15 @@
 //! integer ids so a `Function` never crosses the JS boundary. Invocation
 //! uses `Function::call` on the renderer thread.
 
+// The rquickjs native-function ABI hands every host function and method its
+// `Ctx` and JS arguments by value, so the lint fires on the whole binding
+// layer. Borrowing them is the fork-side fix, tracked for the rquickjs fork in
+// `docs/upstream.md`; one scoped allowance stands in until then.
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "the rquickjs native-function ABI passes Ctx and JS arguments by value"
+)]
+
 mod bindings;
 mod blob;
 mod bridge;
@@ -698,14 +707,20 @@ impl JsRealm {
     }
 
     /// Dispatches one cross-tab `message` event in this realm; the source is
-    /// `null` because the posting window lives in another renderer.
+    /// `null` because the posting window lives in another renderer, and
+    /// `origin` is the sender's serialized origin at post time.
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>)
-    pub(crate) fn deliver_remote_message(&self, payload: &str) -> Result<(), JsError> {
+    pub(crate) fn deliver_remote_message(
+        &self,
+        origin: &str,
+        payload: &str,
+    ) -> Result<(), JsError> {
+        let origin = origin.to_owned();
         let payload = payload.to_owned();
         self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let deliver: Function = bridge::object(&ctx)?.get("__tbDeliverRemoteMessage")?;
-                deliver.call::<_, ()>((payload,))?;
+                deliver.call::<_, ()>((origin, payload))?;
                 Ok(())
             })
         })
@@ -999,7 +1014,7 @@ impl JsRealm {
                 move |url: String,
                       js_id: i32,
                       method: String,
-                      body: Vec<u8>,
+                      body: TypedArray<'_, u8>,
                       content_type: Option<String>,
                       headers: Vec<Vec<String>>,
                       options: Vec<String>| {
@@ -1053,7 +1068,7 @@ impl JsRealm {
                             url,
                             js_id,
                             method,
-                            body,
+                            body: body.to_vec(),
                             content_type,
                             headers,
                             referrer,
@@ -1245,35 +1260,38 @@ fn install_history_host_functions(
     let snapshot = world.borrow().history.clone();
     bridge::object(ctx)?.set("__tbHistoryLength", snapshot.length.max(1))?;
     bridge::object(ctx)?.set("__tbHistoryState", snapshot.state)?;
-    let update_world = world.clone();
+    // One host function per history step, so no boolean crosses the JS
+    // boundary to say which.
+    let update = |handling: crate::protocol::HistoryHandling| {
+        let update_world = world.clone();
+        move |ctx: Ctx<'_>, url: String, state: String| {
+            let next =
+                Url::parse(&url).map_err(|_| Exception::throw_type(&ctx, "Invalid history URL"))?;
+            let mut world = update_world.borrow_mut();
+            if !world.url_matches_origin(&next) {
+                return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
+            }
+            world.document_url = next;
+            // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
+            world.history.apply(state.clone(), handling);
+            world
+                .outbox
+                .borrow_mut()
+                .push_back(RealmRequest::HistoryPush {
+                    url,
+                    state,
+                    handling,
+                });
+            Ok::<usize, rquickjs::Error>(world.history.length)
+        }
+    };
     bridge::object(ctx)?.set(
-        "__tbHistoryUpdate",
-        Func::from(
-            move |ctx: Ctx<'_>, url: String, state: String, replace: bool| {
-                let next = Url::parse(&url)
-                    .map_err(|_| Exception::throw_type(&ctx, "Invalid history URL"))?;
-                let mut world = update_world.borrow_mut();
-                if !world.url_matches_origin(&next) {
-                    return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
-                }
-                world.document_url = next;
-                world.history.state = Some(state.clone());
-                if !replace {
-                    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
-                    world.history.index = world.history.index.saturating_add(1);
-                    world.history.length = world.history.index.saturating_add(1);
-                }
-                world
-                    .outbox
-                    .borrow_mut()
-                    .push_back(RealmRequest::HistoryPush {
-                        url,
-                        state,
-                        replace,
-                    });
-                Ok::<usize, rquickjs::Error>(world.history.length)
-            },
-        ),
+        "__tbHistoryPush",
+        Func::from(update(crate::protocol::HistoryHandling::Push)),
+    )?;
+    bridge::object(ctx)?.set(
+        "__tbHistoryReplace",
+        Func::from(update(crate::protocol::HistoryHandling::Replace)),
     )?;
     let traverse_world = world.clone();
     bridge::object(ctx)?.set(
@@ -1344,12 +1362,16 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     let post_message = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowPostMessage",
-        Func::from(move |tab: u64, payload: String| {
-            post_message
-                .borrow()
-                .runtime
-                .services
-                .window_post_message(tab, &payload);
+        Func::from(move |tab: u64, target_origin: String, payload: String| {
+            let world = post_message.borrow();
+            world.runtime.services.window_post_message(
+                tab,
+                crate::protocol::PostedMessage {
+                    origin: world.origin_string(),
+                    target_origin,
+                    payload,
+                },
+            );
         }),
     )?;
 
@@ -1746,7 +1768,7 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
         Func::from(
             move |url: String,
                   method: String,
-                  body: Vec<u8>,
+                  body: TypedArray<'_, u8>,
                   content_type: Option<String>,
                   headers: Vec<Vec<String>>,
                   options: Vec<String>,
@@ -1767,7 +1789,7 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                     SyncPageFetch {
                         url,
                         method,
-                        body,
+                        body: body.to_vec(),
                         content_type,
                         headers,
                         referrer,

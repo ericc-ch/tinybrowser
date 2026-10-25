@@ -321,10 +321,6 @@ pub(super) type AttrArgument<'js> = Class<'js, JsAttr<'js>>;
 /// (<https://dom.spec.whatwg.org/#interface-attr>), so it is a third payload
 /// of the one `EventTarget` contract. Listeners key on the Attr registry
 /// identity, which never changes even when the attribute moves documents.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "generated dispatch passes Ctx by value and the receiver object by value"
-)]
 impl<'js> event_target_generated::EventTarget<'js> for JsAttr<'js> {
     fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
         Err(rquickjs::Exception::throw_type(ctx, "Illegal constructor"))
@@ -409,11 +405,6 @@ impl super::host::SharedClass for JsAttr<'_> {
     }
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
-)]
 impl<'object> JsAttr<'object> {
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
     pub(super) fn node_value<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
@@ -454,9 +445,13 @@ impl<'object> JsAttr<'object> {
         self.set_node_value(ctx, value)
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
     )]
     pub(super) fn node_type(&self, _ctx: &Ctx<'_>) -> Result<u16> {
         Ok(2)
@@ -480,18 +475,26 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isconnected
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
     )]
     pub(super) fn is_connected(&self, _ctx: &Ctx<'_>) -> Result<bool> {
         Ok(false)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-parentnode
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
     )]
     pub(super) fn parent_node<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         Ok(Value::new_null(ctx.clone()))
@@ -529,9 +532,13 @@ impl<'object> JsAttr<'object> {
         Ok(list)
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
     )]
     pub(super) fn has_child_nodes(&self, _ctx: Ctx<'_>) -> Result<bool> {
         Ok(false)
@@ -547,9 +554,13 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-normalize
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
     )]
     pub(super) fn normalize(&self, _ctx: Ctx<'_>) -> Result<()> {
         Ok(())
@@ -576,7 +587,7 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share a fallible call shape"
     )]
@@ -633,6 +644,10 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
+    )]
     pub(super) fn append_child<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -653,6 +668,10 @@ impl<'object> JsAttr<'object> {
         self.append_child(ctx, node)
     }
     // https://dom.spec.whatwg.org/#concept-node-pre-remove
+    #[expect(
+        clippy::unused_self,
+        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
+    )]
     pub(super) fn remove_child<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -1114,11 +1133,6 @@ pub struct JsNamedNodeMap {
 
 include!(concat!(env!("OUT_DIR"), "/NamedNodeMap.rs"));
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
-)]
 impl JsNamedNodeMap {
     /// The element this map belongs to. Adoption keeps the map object, so
     /// every operation follows the adopted copy
@@ -1903,9 +1917,16 @@ fn sanitize_current(
     value: &str,
 ) -> String {
     let world = world.borrow();
-    world.document(element).map_or_else(String::new, |parsed| {
-        crate::dom::input::sanitize(&parsed.document.base, element.node, kind, value)
-    })
+    world
+        .document_mut(element)
+        .map_or_else(String::new, |mut parsed| {
+            crate::dom::input::sanitize_with_device(
+                &mut parsed.document.base,
+                element.node,
+                kind,
+                value,
+            )
+        })
 }
 
 /// A `meta` element re-runs its pragma algorithms when `name`, `content`, or

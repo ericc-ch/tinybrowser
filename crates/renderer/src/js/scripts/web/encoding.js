@@ -16,7 +16,7 @@ const __tbToLatin1 = bytes => {
   return __tbArray.join(parts, '');
 };
 const __tbUtf8Encode = value => host.__tbUtf8Encode(__tbIDLString(value));
-const __tbUtf8Decode = bytes => host.__tbDecode(__tbToLatin1(bytes), 'utf-8', false, true);
+const __tbUtf8Decode = bytes => host.__tbDecode(bytes, 'utf-8', false, true);
 const __tbEncoding = label => {
   const name = host.__tbEncodingName(String(label));
   return name === null || name === undefined
@@ -24,7 +24,7 @@ const __tbEncoding = label => {
     : String(__tbApply(__tbStringToLowerCase, name, []));
 };
 const __tbDecodeBytes = (bytes, encoding, fatal, ignoreBOM) =>
-  host.__tbDecode(__tbToLatin1(bytes), encoding, fatal, ignoreBOM);
+  host.__tbDecode(bytes, encoding, fatal, ignoreBOM);
 // https://w3c.github.io/FileAPI/#convert-line-endings-to-native: LF is the
 // native line ending on this platform, so CR and CRLF collapse to LF.
 const __tbNativeEndings = value => String(value).replace(/\r\n?|\n/g, '\n');
@@ -90,9 +90,8 @@ globalThis.TextDecoder = class TextDecoder {
   get ignoreBOM() { return __tbBrand(this, __tbDecoderData).ignoreBOM; }
   decode(input, options) {
     const data = __tbBrand(this, __tbDecoderData);
-    let latin1 = '';
+    let bytes = new __tbUint8Array(0);
     if (input !== undefined && input !== null) {
-      let bytes;
       if (__tbIsArrayBufferView(input)) {
         // Snapshot once: a resizable buffer observed through unpinned
         // getters could change between reads.
@@ -102,12 +101,11 @@ globalThis.TextDecoder = class TextDecoder {
         bytes = new __tbUint8Array(buffer, offset, length);
       } else if (input instanceof ArrayBuffer) bytes = new __tbUint8Array(input);
       else throw new TypeError('The input argument must be an ArrayBuffer or ArrayBufferView');
-      latin1 = __tbToLatin1(bytes);
     }
     // WebIDL dictionary: missing and null options both mean non-streaming,
     // any other value converts with ToBoolean.
     const stream = options !== undefined && options !== null && Boolean(options.stream);
-    return host.__tbDecoderDecode(data.decoder, latin1, data.fatal, stream);
+    return host.__tbDecoderDecode(data.decoder, bytes, data.fatal, stream);
   }
 };
 Object.defineProperty(globalThis.TextDecoder.prototype, Symbol.toStringTag, { value: 'TextDecoder', writable: false, enumerable: false, configurable: true });

@@ -11,7 +11,7 @@ use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, Transpor
 use crate::protocol::{HeaderMap, Method};
 use crate::referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 use crate::resolve::HostMap;
-use crate::transport::{CallBudget, HttpEngine, Proxy, basic_authorization};
+use crate::transport::{CallBudget, HopBudget, HttpEngine, Proxy, basic_authorization};
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder};
 use bytes::Bytes;
 use cookies::{CookieJar, CookieOp, RetrievalKind};
@@ -311,7 +311,7 @@ impl Agent {
         hop: &Hop,
         headers: &HeaderMap,
         wire: &Url,
-        budget: CallBudget,
+        budget: HopBudget,
     ) -> Result<(), NetError> {
         let method = &hop.method;
         let unsafe_names = crate::cors::unsafe_request_header_names(headers);
@@ -368,7 +368,7 @@ impl Agent {
         hop: &Hop,
         wire: &Url,
         headers: &mut HeaderMap,
-        budget: CallBudget,
+        budget: HopBudget,
     ) -> Result<(), NetError> {
         let serialized_origin = hop.serialized_origin(settings);
         let origin_header = HeaderValue::from_str(&serialized_origin)
@@ -475,9 +475,11 @@ impl Agent {
         Self::write_referer(&mut hop.headers, determined.as_ref())?;
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
-        let mut budget = self.engine.budget_at();
+        let mut budget = self.engine.call_budget();
+        // The request's own deadline only tightens the engine's global
+        // timeout; a later deadline must not stretch it.
         if let Some(deadline) = request.deadline {
-            budget.global = Some(deadline);
+            budget.tighten_global(deadline);
         }
 
         loop {
@@ -587,10 +589,10 @@ impl Agent {
         hop.previous_url = Some(url.clone());
         if budget.is_expired() {
             return Err(NetError::Transport(TransportError::Timeout(
-                budget.timeout_kind(TimeoutKind::Global),
+                TimeoutKind::Global,
             )));
         }
-        let budget = budget.with_hop_start(self.engine.timeout_per_call);
+        let budget = budget.start_hop();
         let mut wire = url.clone();
         wire.set_fragment(None);
         let cross_origin = dial.cors.origin != wire.origin();
@@ -1173,7 +1175,7 @@ impl Body {
 /// Raw socket body before content decoders.
 struct RawBody {
     inner: hyper::body::Incoming,
-    budget: CallBudget,
+    budget: HopBudget,
     current: Option<Bytes>,
     offset: usize,
     shared_error: Arc<Mutex<Option<NetError>>>,

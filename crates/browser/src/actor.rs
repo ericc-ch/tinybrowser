@@ -11,15 +11,16 @@ use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
 use renderer::{
-    DialFailure, FrameId, HistorySnapshot as RendererHistorySnapshot, MAX_RESPONSE_BODY_BYTES,
-    Mount, RemoteValue, RendererEvent, ResourceLimit, ResponseHead, ScriptSource, TabError,
+    BrowserEvent, DialFailure, FrameId, HistorySnapshot as RendererHistorySnapshot,
+    MAX_RESPONSE_BODY_BYTES, Mount, RemoteValue, ResourceLimit, ResponseHead, ScriptSource,
+    TabError,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
-use crate::assignment::Assignment;
+use crate::assignment::{Assignment, RendererWake};
 use crate::exchange::{self, RequestId, ServerInput};
 use crate::history::{HistorySnapshot, SessionHistory};
 use crate::manager::RendererProcessManager;
@@ -193,13 +194,34 @@ enum TabOutcome {
     Shutdown,
 }
 
-/// One pending `RunUntilLoadTimeout` (`source` is `None`) or `RunUntilJsTrue`
-/// (`source` holds the predicate) wait.
+/// One pending `RunUntilLoadTimeout` or `RunUntilJsTrue` wait.
 struct Waiter {
     id: RequestId,
     deadline: Instant,
-    source: Option<(FrameId, renderer::ScriptSource)>,
+    kind: WaiterKind,
     reply: ReplySender<bool>,
+}
+
+/// What a waiter is waiting for. A JS-truth waiter lives in the renderer,
+/// which evaluates its predicate after each drain and reports the id back.
+enum WaiterKind {
+    Load,
+    Js {
+        /// Identity the renderer knows this waiter by.
+        renderer_id: u64,
+        /// Frame whose realm runs the predicate, so a navigation can retire it.
+        frame: FrameId,
+    },
+}
+
+impl Waiter {
+    /// The renderer-side identity, for waiters that have one.
+    fn renderer_waiter(&self) -> Option<u64> {
+        match self.kind {
+            WaiterKind::Load => None,
+            WaiterKind::Js { renderer_id, .. } => Some(renderer_id),
+        }
+    }
 }
 
 /// Async value-only handle to one tab coordinator.
@@ -516,13 +538,20 @@ impl TabHandle {
     }
 }
 
+/// One cross-tab `postMessage` in flight through the browser. The browser has
+/// authorized the sender's origin; the target's realm checks the target origin
+/// when the delivery task runs.
+pub(crate) struct RemoteWindowMessage {
+    pub(crate) message: renderer::PostedMessage,
+}
+
 /// Join handle and delivery mailbox for one tab coordinator task.
 pub(crate) struct TabTask {
     pub handle: TabHandle,
     /// Ordered `postMessage` deliveries for this tab. Senders enqueue without
     /// waiting; the coordinator drains it in order, so a busy target never
     /// blocks the sender's renderer or the browser owner task.
-    deliveries: mpsc::Sender<String>,
+    deliveries: mpsc::Sender<RemoteWindowMessage>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -545,7 +574,7 @@ impl TabTask {
     }
 
     /// The tab's `postMessage` mailbox.
-    pub(crate) fn deliveries(&self) -> mpsc::Sender<String> {
+    pub(crate) fn deliveries(&self) -> mpsc::Sender<RemoteWindowMessage> {
         self.deliveries.clone()
     }
 
@@ -587,7 +616,7 @@ struct Tab {
     renderer: Option<Arc<Assignment>>,
     pending_mount: Option<Mount>,
     site: Option<Site>,
-    events_rx: Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
+    events_rx: Option<mpsc::Receiver<RendererWake>>,
     document_url: Url,
     /// Emulated viewport size in device pixels
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Emulation/#method-setDeviceMetricsOverride>).
@@ -838,12 +867,15 @@ impl Tab {
     }
 
     /// Routes one remote `postMessage` payload into this tab's main frame.
-    async fn deliver_window_message(&mut self, payload: String) -> Result<(), TabError> {
+    async fn deliver_window_message(
+        &mut self,
+        RemoteWindowMessage { message }: RemoteWindowMessage,
+    ) -> Result<(), TabError> {
         if self.renderer.is_none() {
             self.mount_virtual().await?;
         }
         match self
-            .renderer_request(RendererCommand::WindowMessage { payload })
+            .renderer_request(RendererCommand::WindowMessage(message))
             .await?
         {
             Reply::Unit(result) => result,
@@ -1089,12 +1121,12 @@ impl Tab {
         true
     }
 
-    async fn handle_renderer_event(&mut self, frame: FrameId, event: &RendererEvent) {
+    async fn handle_renderer_event(&mut self, frame: FrameId, event: &BrowserEvent) {
         if frame != FrameId::MAIN {
             return;
         }
         match event {
-            RendererEvent::Navigated { url } => {
+            BrowserEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
                     self.history.navigate(url.clone(), None);
                     self.document_url = url;
@@ -1107,7 +1139,7 @@ impl Tab {
                 self.navigation_failed = false;
                 self.record_event(TabEvent::Navigated).await;
             }
-            RendererEvent::Load => {
+            BrowserEvent::Load => {
                 // A `load` for the document a navigation replaced can arrive
                 // after the carrier committed the new response. Only the
                 // document the tab is navigating to may settle the wait.
@@ -1124,29 +1156,25 @@ impl Tab {
                 self.document_loaded = true;
                 self.record_event(TabEvent::Load).await;
             }
-            RendererEvent::DomContentLoaded => {
+            BrowserEvent::DomContentLoaded => {
                 self.record_event(TabEvent::DomContentLoaded).await;
             }
-            RendererEvent::HistoryUpdated {
+            BrowserEvent::HistoryUpdated {
                 url,
                 state,
-                replace,
+                handling,
             } => {
                 if let Ok(url) = Url::parse(url)
                     && url.origin() == self.document_url.origin()
                 {
-                    self.history.update(url.clone(), state.clone(), *replace);
+                    self.history.update(url.clone(), state.clone(), *handling);
                     self.document_url = url;
                     self.record_event(TabEvent::SameDocumentNavigation).await;
                 }
             }
-            RendererEvent::HistoryTraversal { delta } => {
+            BrowserEvent::HistoryTraversal { delta } => {
                 self.traverse_history(*delta).await;
             }
-            // `Turn` records nothing: the coordinator re-checks its JS-truth
-            // waiters after every renderer event, which is the whole point of
-            // that variant. Other events have no tab-level effect here.
-            _ => {}
         }
     }
 
@@ -1222,15 +1250,15 @@ enum Wake {
     // Boxed: a navigation outcome carries response bodies and headers, and
     // the unboxed form trips `large_enum_variant` next to the small arms.
     Navigation(Box<Option<(u64, Result<NavOutcome, DialFailure>)>>),
-    Renderer(Option<(FrameId, RendererEvent)>),
-    Delivery(Option<String>),
+    Renderer(Option<RendererWake>),
+    Delivery(Option<RemoteWindowMessage>),
     WaiterDeadline,
 }
 
 async fn coordinator_loop(
     mut server: TabServer,
     mut tab: Tab,
-    delivery_rx: mpsc::Receiver<String>,
+    delivery_rx: mpsc::Receiver<RemoteWindowMessage>,
 ) {
     let mut waiters = Vec::new();
     let mut delivery_rx = Some(delivery_rx);
@@ -1267,7 +1295,19 @@ async fn coordinator_loop(
             Wake::Command(Some(ServerInput::Cancel { id })) => {
                 // A caller dropped its future. Drop the waiter now; a command
                 // still in the queue is covered by `retain_waiter`.
-                waiters.retain(|waiter| waiter.id != id && !waiter.reply.is_closed());
+                let mut canceled = Vec::new();
+                waiters.retain(|waiter| {
+                    let keep = waiter.id != id && !waiter.reply.is_closed();
+                    if !keep {
+                        canceled.push(waiter.renderer_waiter());
+                    }
+                    keep
+                });
+                for renderer_id in canceled.into_iter().flatten() {
+                    let _result = tab
+                        .renderer_request(RendererCommand::CancelWait { id: renderer_id })
+                        .await;
+                }
             }
             Wake::Command(Some(ServerInput::RequestChunk | ServerInput::RequestEnd))
             | Wake::WaiterDeadline => {}
@@ -1277,21 +1317,24 @@ async fn coordinator_loop(
                     tab.handle_navigation(epoch, result).await;
                 }
             }
-            Wake::Renderer(Some((frame, event))) => {
-                let navigated = matches!(event, RendererEvent::Navigated { .. });
+            Wake::Renderer(Some(RendererWake::WaiterSettled(id))) => {
+                settle_waiter(&server, &mut waiters, id).await;
+            }
+            Wake::Renderer(Some(RendererWake::Event(frame, event))) => {
+                let navigated = matches!(event, BrowserEvent::Navigated { .. });
                 tab.handle_renderer_event(frame, &event).await;
                 if navigated {
                     // The frame's realm is gone, so its JS-truth waiters cannot
-                    // settle; resolve them instead of polling to the deadline.
-                    resolve_frame_waiters(&server, &mut waiters, frame).await;
+                    // settle; resolve them instead of waiting to the deadline.
+                    resolve_frame_waiters(&mut tab, &server, &mut waiters, frame).await;
                 }
             }
             Wake::Renderer(None) => {
                 tab.drop_renderer();
-                fail_waiters(&server, &mut waiters, &TabError::ActorStopped).await;
+                fail_waiters(&mut tab, &server, &mut waiters, &TabError::ActorStopped).await;
             }
-            Wake::Delivery(Some(payload)) => {
-                let _result = tab.deliver_window_message(payload).await;
+            Wake::Delivery(Some(message)) => {
+                let _result = tab.deliver_window_message(message).await;
             }
             Wake::Delivery(None) => {
                 // Every delivery sender is gone; stop selecting on the lane.
@@ -1304,15 +1347,17 @@ async fn coordinator_loop(
 }
 
 async fn next_renderer_event(
-    events: &mut Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
-) -> Option<(FrameId, RendererEvent)> {
+    events: &mut Option<mpsc::Receiver<RendererWake>>,
+) -> Option<RendererWake> {
     match events {
         Some(receiver) => receiver.recv().await,
         None => pending().await,
     }
 }
 
-async fn next_delivery(deliveries: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+async fn next_delivery(
+    deliveries: &mut Option<mpsc::Receiver<RemoteWindowMessage>>,
+) -> Option<RemoteWindowMessage> {
     match deliveries {
         Some(receiver) => receiver.recv().await,
         None => pending().await,
@@ -1455,7 +1500,7 @@ impl Command {
                 timeout,
                 reply,
             } => {
-                if retain_js_waiter(waiters, id, frame, source, timeout, reply) {
+                if serve_js_waiter(tab, waiters, id, frame, source, timeout, reply).await {
                     return TabOutcome::Retained;
                 }
             }
@@ -1564,6 +1609,42 @@ async fn screenshot_frame(
         .await
 }
 
+/// Registers one JS-truth waiter in the renderer and retains the browser-side
+/// side of it. Returns whether the waiter was retained.
+async fn serve_js_waiter(
+    tab: &mut Tab,
+    waiters: &mut Vec<Waiter>,
+    id: RequestId,
+    frame: FrameId,
+    source: renderer::ScriptSource,
+    timeout: Duration,
+    reply: ReplySender<bool>,
+) -> bool {
+    let renderer_id = id.get();
+    let registered = tab
+        .renderer_request(RendererCommand::WaitForJs {
+            id: renderer_id,
+            frame,
+            source,
+        })
+        .await;
+    match registered {
+        Ok(_) => {
+            if retain_js_waiter(waiters, id, frame, renderer_id, timeout, reply) {
+                return true;
+            }
+            let _result = tab
+                .renderer_request(RendererCommand::CancelWait { id: renderer_id })
+                .await;
+            false
+        }
+        Err(error) => {
+            let _result = reply.send(Err(error));
+            false
+        }
+    }
+}
+
 fn retain_load_waiter(
     waiters: &mut Vec<Waiter>,
     id: RequestId,
@@ -1577,7 +1658,7 @@ fn retain_load_waiter(
             deadline: Instant::now() + timeout,
             // Completing is driven by `document_loaded`: a `load` from the
             // document a navigation is replacing is filtered by URL.
-            source: None,
+            kind: WaiterKind::Load,
             reply,
         },
     )
@@ -1587,7 +1668,7 @@ fn retain_js_waiter(
     waiters: &mut Vec<Waiter>,
     id: RequestId,
     frame: FrameId,
-    source: renderer::ScriptSource,
+    renderer_id: u64,
     timeout: Duration,
     reply: ReplySender<bool>,
 ) -> bool {
@@ -1596,7 +1677,7 @@ fn retain_js_waiter(
         Waiter {
             id,
             deadline: Instant::now() + timeout,
-            source: Some((frame, source)),
+            kind: WaiterKind::Js { renderer_id, frame },
             reply,
         },
     )
@@ -1619,8 +1700,18 @@ fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter) -> bool {
     false
 }
 
-async fn fail_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, error: &TabError) {
+async fn fail_waiters(
+    tab: &mut Tab,
+    server: &TabServer,
+    waiters: &mut Vec<Waiter>,
+    error: &TabError,
+) {
     for waiter in waiters.drain(..) {
+        if let Some(id) = waiter.renderer_waiter() {
+            let _result = tab
+                .renderer_request(RendererCommand::CancelWait { id })
+                .await;
+        }
         let _result = waiter.reply.send(Err(error.clone()));
         let _ack = server.reply(waiter.id, ()).await;
     }
@@ -1629,14 +1720,23 @@ async fn fail_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, error: &Tab
 /// Resolves the `RunUntilJs` waiters for a frame that just navigated: the
 /// predicate ran against the old realm and cannot settle, so reply `false`
 /// instead of polling to the deadline.
-async fn resolve_frame_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, frame: FrameId) {
+async fn resolve_frame_waiters(
+    tab: &mut Tab,
+    server: &TabServer,
+    waiters: &mut Vec<Waiter>,
+    frame: FrameId,
+) {
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
-        if waiter
-            .source
-            .as_ref()
-            .is_some_and(|(wait_frame, _)| *wait_frame == frame)
-        {
+        let navigated = matches!(
+            waiter.kind,
+            WaiterKind::Js {
+                frame: wait_frame,
+                ..
+            } if wait_frame == frame
+        );
+        if navigated {
+            cancel_renderer_waiter(tab, &waiter).await;
             let _result = waiter.reply.send(Ok(false));
             let _ack = server.reply(waiter.id, ()).await;
         } else {
@@ -1653,33 +1753,22 @@ async fn resolve_waiters(tab: &mut Tab, server: &TabServer, waiters: &mut Vec<Wa
         // The caller dropped its future; its `Cancel` (or the exchange closing)
         // already released the request, so there is nothing left to answer.
         if waiter.reply.is_closed() {
+            cancel_renderer_waiter(tab, &waiter).await;
             continue;
         }
-        let result = match waiter.source.clone() {
+        let result = match waiter.kind {
             // A load wait finishes as soon as the tab stops waiting, before
             // its deadline is considered.
-            None if !tab.waiting_for_load() => Some(Ok(true)),
-            None if now >= waiter.deadline => Some(Ok(false)),
-            None => None,
-            Some((frame, source)) => {
-                if now >= waiter.deadline {
-                    Some(Ok(false))
-                } else if matches!(
-                    tab.renderer_request(RendererCommand::ExecuteScript {
-                        frame,
-                        source,
-                        timeout_ms: None
-                    })
-                    .await,
-                    Ok(Reply::Value(Ok(RemoteValue::Bool(true))))
-                ) {
-                    Some(Ok(true))
-                } else {
-                    None
-                }
-            }
+            WaiterKind::Load if !tab.waiting_for_load() => Some(Ok(true)),
+            // A JS waiter is settled by the renderer; only its deadline is the
+            // browser's business.
+            WaiterKind::Load | WaiterKind::Js { .. } if now >= waiter.deadline => Some(Ok(false)),
+            WaiterKind::Load | WaiterKind::Js { .. } => None,
         };
         if let Some(result) = result {
+            if result == Ok(false) {
+                cancel_renderer_waiter(tab, &waiter).await;
+            }
             let _result = waiter.reply.send(result);
             let _ack = server.reply(waiter.id, ()).await;
         } else {
@@ -1687,6 +1776,27 @@ async fn resolve_waiters(tab: &mut Tab, server: &TabServer, waiters: &mut Vec<Wa
         }
     }
     *waiters = pending;
+}
+
+/// Resolves one renderer-reported waiter, if the browser still knows it.
+async fn settle_waiter(server: &TabServer, waiters: &mut Vec<Waiter>, renderer_id: u64) {
+    let Some(index) = waiters
+        .iter()
+        .position(|waiter| waiter.renderer_waiter() == Some(renderer_id))
+    else {
+        return;
+    };
+    let waiter = waiters.remove(index);
+    let _result = waiter.reply.send(Ok(true));
+    let _ack = server.reply(waiter.id, ()).await;
+}
+
+async fn cancel_renderer_waiter(tab: &mut Tab, waiter: &Waiter) {
+    if let Some(id) = waiter.renderer_waiter() {
+        let _result = tab
+            .renderer_request(RendererCommand::CancelWait { id })
+            .await;
+    }
 }
 
 fn renderer_unavailable(message: &str) -> TabError {

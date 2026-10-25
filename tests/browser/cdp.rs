@@ -1,12 +1,9 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::TcpStream;
+use std::time::Duration;
 
-use common::Fixture;
+use crate::fixture::Fixture;
 use serde_json::json;
-
-mod common;
 
 fn start() -> (Fixture, cdp::Client) {
     let mut fixture = Fixture::new("tinybrowser-cdp");
@@ -239,100 +236,65 @@ fn get_properties_reports_descriptors_and_releases_groups() {
 }
 
 #[test]
-fn clear_browser_cookies_is_available_on_both_target_kinds() {
-    let (_fixture, mut client) = start();
+fn clear_browser_cookies_deletes_page_cookies_from_both_target_kinds() {
+    fn evaluate(client: &mut cdp::Client, session: &str, expression: &str) -> serde_json::Value {
+        client
+            .call(
+                "Runtime.evaluate",
+                &json!({"expression": expression, "returnByValue": true}),
+                Some(session),
+            )
+            .expect("evaluate")["result"]["value"]
+            .clone()
+    }
 
+    let server_addr = crate::fixture::serve(b"<!doctype html><p>hi</p>", "text/html");
+
+    let (_fixture, mut client) = start();
+    let session = crate::fixture::load_page(
+        &mut client,
+        &format!("http://{server_addr}/"),
+        Duration::from_secs(10),
+    );
+
+    let set_cookie = "document.cookie = 'a=1; path=/'";
+    let read_cookie = "document.cookie";
+
+    // The root browser target clears the whole jar.
+    evaluate(&mut client, &session, set_cookie);
+    assert_eq!(evaluate(&mut client, &session, read_cookie), json!("a=1"));
     client
         .call("Network.clearBrowserCookies", &json!({}), None)
         .expect("clear cookies from the root browser target");
+    assert_eq!(
+        evaluate(&mut client, &session, read_cookie),
+        json!(""),
+        "root clear must delete the page's cookies"
+    );
 
-    let created = client
-        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
-        .expect("create");
-    let target_id = created["targetId"].as_str().expect("id").to_owned();
-    let attached = client
-        .call(
-            "Target.attachToTarget",
-            &json!({"targetId": target_id, "flatten": true}),
-            None,
-        )
-        .expect("attach");
-    let session = attached["sessionId"].as_str().expect("session").to_owned();
+    // The page session clears the same jar.
+    evaluate(&mut client, &session, set_cookie);
+    assert_eq!(evaluate(&mut client, &session, read_cookie), json!("a=1"));
     client
         .call("Network.clearBrowserCookies", &json!({}), Some(&session))
         .expect("clear cookies from a page session");
+    assert_eq!(
+        evaluate(&mut client, &session, read_cookie),
+        json!(""),
+        "page-session clear must delete the page's cookies"
+    );
 }
 
 #[test]
 fn page_navigate_loads_http_document() {
-    fn read_target(stream: &mut TcpStream) -> String {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("read timeout");
-        let mut head = Vec::new();
-        let mut chunk = [0_u8; 512];
-        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-            let read = stream.read(&mut chunk).expect("read");
-            assert_ne!(read, 0);
-            head.extend_from_slice(&chunk[..read]);
-        }
-        String::from_utf8_lossy(&head)
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .expect("target")
-            .to_owned()
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
-    let server_addr = listener.local_addr().expect("server addr");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let _ = read_target(&mut stream);
-        let body = b"<!doctype html><p id=ok>hi</p>";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).expect("head");
-        stream.write_all(body).expect("body");
-    });
+    let server_addr = crate::fixture::serve(b"<!doctype html><p id=ok>hi</p>", "text/html");
 
     let (_fixture, mut client) = start();
-    let created = client
-        .call("Target.createTarget", &json!({"url": "about:blank"}), None)
-        .expect("create");
-    let target_id = created["targetId"].as_str().expect("id").to_owned();
-    let attached = client
-        .call(
-            "Target.attachToTarget",
-            &json!({"targetId": target_id, "flatten": true}),
-            None,
-        )
-        .expect("attach");
-    let session = attached["sessionId"].as_str().expect("session").to_owned();
-    client
-        .call("Page.enable", &json!({}), Some(&session))
-        .expect("enable Page events");
-    client
-        .call(
-            "Page.navigate",
-            &json!({"url": format!("http://{server_addr}/")}),
-            Some(&session),
-        )
-        .expect("navigate");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let load = loop {
-        let event = client
-            .read_event(Duration::from_millis(500))
-            .expect("read event")
-            .expect("load event");
-        if event["method"] == json!("Page.loadEventFired") {
-            break event;
-        }
-        assert!(Instant::now() < deadline, "no load event: {event}");
-    };
-    assert_eq!(load["sessionId"], json!(session));
+    let session = crate::fixture::load_page(
+        &mut client,
+        &format!("http://{server_addr}/"),
+        Duration::from_secs(2),
+    );
     let evaluated = client
         .call(
             "Runtime.evaluate",
@@ -341,7 +303,6 @@ fn page_navigate_loads_http_document() {
         )
         .expect("eval");
     assert_eq!(evaluated["result"]["value"], json!("hi"));
-    server.join().expect("server");
 }
 
 fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {

@@ -30,16 +30,10 @@ pub(crate) struct QueuedEntry {
 /// One started dial and the resources it releases on settle.
 pub(crate) struct InFlightDial {
     context: DialContext,
-    delay: Option<LoadDelayGuard>,
+    /// Held from dial start until `settle` drops the entry, which is what
+    /// delays the document's `load` event.
+    _delay: Option<LoadDelayGuard>,
     cancel: DialCancellation,
-}
-
-impl InFlightDial {
-    /// Releases the load-event delay once the document has run the completion
-    /// task.
-    pub(crate) fn settle(self) {
-        drop(self.delay);
-    }
 }
 
 pub(crate) struct DialLedger {
@@ -54,8 +48,6 @@ pub(crate) struct DialLedger {
     /// completion task runs, so cancellation can still find adopted work.
     in_flight: HashMap<u64, InFlightDial>,
     next_id: u64,
-    js_fetches: usize,
-    queued_js_fetches: usize,
     /// A frame that is shutting down drops completions instead of waking the
     /// session for work nobody will run.
     stop: Arc<Stop>,
@@ -72,8 +64,6 @@ impl DialLedger {
             queued: VecDeque::new(),
             in_flight: HashMap::new(),
             next_id: 0,
-            js_fetches: 0,
-            queued_js_fetches: 0,
             stop,
             wake,
         }
@@ -84,20 +74,13 @@ impl DialLedger {
     /// cannot silently stop delaying `load`.
     pub(crate) fn queue(&mut self, dial: QueuedDial, delay: &LoadDelay) {
         let guard = delays_load(dial.context).then(|| delay.guard());
-        if matches!(dial.context, DialContext::JsFetch { .. }) {
-            self.queued_js_fetches += 1;
-        }
         self.queued.push_back(QueuedEntry { dial, delay: guard });
     }
 
     /// Pops one queued dial. A `data:` completion can reset the document and
     /// replace this ledger, so the caller must not hold a batch across it.
     pub(crate) fn pop_queued(&mut self) -> Option<QueuedEntry> {
-        let entry = self.queued.pop_front()?;
-        if matches!(entry.dial.context, DialContext::JsFetch { .. }) {
-            self.queued_js_fetches -= 1;
-        }
-        Some(entry)
+        self.queued.pop_front()
     }
 
     pub(crate) fn has_queued(&self) -> bool {
@@ -117,9 +100,6 @@ impl DialLedger {
         let wake = Arc::clone(&self.wake);
         let stop = Arc::clone(&self.stop);
         let context = dial.context;
-        if matches!(context, DialContext::JsFetch { .. }) {
-            self.js_fetches += 1;
-        }
         let request = dial.req.clone();
         let cancel = start(
             request,
@@ -137,7 +117,7 @@ impl DialLedger {
             id,
             InFlightDial {
                 context,
-                delay,
+                _delay: delay,
                 cancel,
             },
         );
@@ -157,19 +137,27 @@ impl DialLedger {
         completed
     }
 
-    /// Removes a dial whose completion task is running. `None` means the dial
+    /// Settles the dial whose completion task is running: the entry drops
+    /// here, which releases its `load`-event delay. `false` means the dial
     /// was cancelled after its completion was adopted.
-    pub(crate) fn take_finished(&mut self, id: u64) -> Option<InFlightDial> {
-        let dial = self.in_flight.remove(&id)?;
-        if matches!(dial.context, DialContext::JsFetch { .. }) {
-            self.js_fetches -= 1;
-        }
-        Some(dial)
+    pub(crate) fn settle(&mut self, id: u64) -> bool {
+        self.in_flight.remove(&id).is_some()
+    }
+
+    /// Every dial's context, queued or in flight or waiting for its
+    /// completion task.
+    fn contexts(&self) -> impl Iterator<Item = &DialContext> {
+        self.queued
+            .iter()
+            .map(|entry| &entry.dial.context)
+            .chain(self.in_flight.values().map(|dial| &dial.context))
     }
 
     /// Page fetches in flight, queued, or waiting for their completion task.
     pub(crate) fn pending_js_fetches(&self) -> usize {
-        self.js_fetches + self.queued_js_fetches
+        self.contexts()
+            .filter(|context| matches!(context, DialContext::JsFetch { .. }))
+            .count()
     }
 
     /// Whether a frame navigation is queued, in flight, or waiting for its
@@ -178,15 +166,8 @@ impl DialLedger {
     /// for that old document in the meantime
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#the-document-object>).
     pub(crate) fn has_pending_frame_load(&self) -> bool {
-        let is_frame_load =
-            |context: &DialContext| matches!(context, DialContext::FrameLoad { .. });
-        self.queued
-            .iter()
-            .any(|entry| is_frame_load(&entry.dial.context))
-            || self
-                .in_flight
-                .values()
-                .any(|dial| is_frame_load(&dial.context))
+        self.contexts()
+            .any(|context| matches!(context, DialContext::FrameLoad { .. }))
     }
 
     /// Drops a queued or in-flight page fetch for one JS id, running its
@@ -203,24 +184,10 @@ impl DialLedger {
     }
 
     fn cancel_where(&mut self, matches: impl Fn(&DialContext) -> bool) {
-        let queued_js = self
-            .queued
-            .iter()
-            .filter(|entry| {
-                matches!(&entry.dial.context, DialContext::JsFetch { .. })
-                    && matches(&entry.dial.context)
-            })
-            .count();
-        self.queued_js_fetches -= queued_js;
         self.queued.retain(|entry| !matches(&entry.dial.context));
-        let mut removed_js = 0;
         for (_, dial) in self.in_flight.extract_if(|_, dial| matches(&dial.context)) {
-            if matches!(dial.context, DialContext::JsFetch { .. }) {
-                removed_js += 1;
-            }
             (dial.cancel)();
         }
-        self.js_fetches -= removed_js;
     }
 
     /// Aborts the whole document: every queued and started dial is cancelled

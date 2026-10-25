@@ -1,14 +1,12 @@
 //! Subcommand selection and flag parsing at the binary boundary.
 
-mod common;
-
-use common::Fixture;
+use crate::fixture::Fixture;
 
 fn run(fixture: &Fixture, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
         .args(args)
-        .env("XDG_RUNTIME_DIR", &fixture.runtime)
-        .env("XDG_DATA_HOME", &fixture.data)
+        .env("XDG_RUNTIME_DIR", fixture.runtime())
+        .env("XDG_DATA_HOME", fixture.data())
         .output()
         .expect("run")
 }
@@ -168,7 +166,7 @@ fn profile_and_resolve_stay_on_their_commands() {
 #[test]
 fn log_file_flag_names_the_log_file() {
     let fixture = Fixture::new("tinybrowser-log-file");
-    let path = fixture.data.join("explicit.log");
+    let path = fixture.data().join("explicit.log");
     // The logger is installed before the command runs, so the file's existence
     // pins that --log-file reached `logging::install`. The exit code is the
     // no-command help path, which `no_command_prints_help` already asserts.

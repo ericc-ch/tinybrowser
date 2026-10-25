@@ -1,9 +1,7 @@
-mod common;
-
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::Fixture;
+use crate::fixture::Fixture;
 
 fn pid_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
@@ -32,7 +30,7 @@ fn daemon_registers_loopback_and_second_start_reuses_it() {
 
     fixture.spawn_daemon();
     let status = fixture
-        .children
+        .children()
         .last_mut()
         .expect("second daemon")
         .wait()
@@ -46,7 +44,7 @@ fn daemon_registers_loopback_and_second_start_reuses_it() {
 #[test]
 fn stale_lock_is_replaced() {
     let mut fixture = Fixture::new("tinybrowser-daemon");
-    let dir = fixture.runtime.join("tinybrowser/default");
+    let dir = fixture.runtime().join("tinybrowser/default");
     std::fs::create_dir_all(&dir).expect("dir");
     std::fs::write(dir.join("lock"), "999999\n").expect("stale lock");
     std::fs::write(
@@ -85,11 +83,11 @@ fn overlapping_daemons_share_one_endpoint() {
     let second_id = fixture.spawn_daemon();
     let deadline = Instant::now() + Duration::from_secs(5);
     let winner_pid = loop {
-        let first_exited = fixture.children[0]
+        let first_exited = fixture.children()[0]
             .try_wait()
             .expect("first wait")
             .is_some();
-        let second_exited = fixture.children[1]
+        let second_exited = fixture.children()[1]
             .try_wait()
             .expect("second wait")
             .is_some();

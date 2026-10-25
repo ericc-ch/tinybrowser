@@ -32,10 +32,6 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
 /// UTF-8 encodes `input` after IDL string conversion, replacing unpaired
 /// surrogates as the Encoding Standard's encoder does
 /// (<https://encoding.spec.whatwg.org/#utf-8-encoder>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn utf8_encode<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<TypedArray<'js, u8>> {
     let units = super::bindings::webidl_to_units(&ctx, input)?;
     let text = String::from_utf16_lossy(&units);
@@ -46,10 +42,6 @@ fn utf8_encode<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<TypedArray<'js, 
 /// UTF-8 encode-into: fill at most `max` bytes and report how many UTF-16
 /// code units were consumed
 /// (<https://encoding.spec.whatwg.org/#dom-textencoder-encodeinto>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn encode_into<'js>(ctx: Ctx<'js>, source: Value<'js>, max: usize) -> Result<Object<'js>> {
     let units = super::bindings::webidl_to_units(&ctx, source)?;
     let (read, written, bytes) = if max == 0 {
@@ -72,19 +64,14 @@ fn encode_into<'js>(ctx: Ctx<'js>, source: Value<'js>, max: usize) -> Result<Obj
 /// Single-shot only: every caller passes a whole buffer, so the input is
 /// always final and nothing carries forward
 /// (<https://encoding.spec.whatwg.org/#concept-encoding-get>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn decode(
-    ctx: Ctx<'_>,
-    source: String,
+fn decode<'js>(
+    ctx: Ctx<'js>,
+    source: TypedArray<'js, u8>,
     label: String,
     fatal: bool,
     ignore_bom: bool,
 ) -> Result<String> {
-    let bytes = bytes_from_latin1(&source)
-        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+    let bytes = source.to_vec();
     let encoding = resolve_label(&ctx, &label)?;
     let mut decoder = if ignore_bom {
         encoding.new_decoder_without_bom_handling()
@@ -102,17 +89,13 @@ fn decode(
 /// (<https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-documents>,
 /// <https://xhr.spec.whatwg.org/#response-xml>).
 ///
-/// `source` is the isomorphic Latin-1 projection of the raw response bytes
-/// (`__tbToLatin1(responseBytes)`): every byte 0-255 maps 1:1, so
-/// `bytes_from_latin1` round-trips losslessly and fatal decoding below sees
-/// the true bytes.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Result<String> {
-    let bytes = bytes_from_latin1(&source)
-        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+/// Fatal decoding below sees the response's true bytes, not a re-encoding.
+fn decode_xml_response<'js>(
+    ctx: Ctx<'js>,
+    source: TypedArray<'js, u8>,
+    content_type: String,
+) -> Result<String> {
+    let bytes = source.to_vec();
     let header = (!content_type.trim().is_empty()).then_some(content_type.as_str());
     let (encoding, bom_len) =
         crate::sniff::sniff_encoding(&bytes, header, true).unwrap_or((encoding_rs::UTF_8, 0));
@@ -131,10 +114,6 @@ fn decode_xml_response(ctx: Ctx<'_>, source: String, content_type: String) -> Re
 /// is what buffers a trailing partial sequence; a fresh decoder per call
 /// would silently drop it
 /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
     let encoding = resolve_label(&ctx, &label)?;
     let world_rc = super::bindings::world(&ctx)?;
@@ -156,19 +135,14 @@ fn decoder_init(ctx: Ctx<'_>, label: String, ignore_bom: bool) -> Result<u64> {
 /// the bytes behind the error stay queued in `carry`, so later calls
 /// continue after the error
 /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn decoder_decode(
-    ctx: Ctx<'_>,
+fn decoder_decode<'js>(
+    ctx: Ctx<'js>,
     id: u64,
-    source: String,
+    source: TypedArray<'js, u8>,
     fatal: bool,
     stream: bool,
 ) -> Result<String> {
-    let bytes = bytes_from_latin1(&source)
-        .ok_or_else(|| Exception::throw_type(&ctx, "The encoded data was not valid."))?;
+    let bytes = source.to_vec();
     let world_rc = super::bindings::world(&ctx)?;
     let mut world = world_rc.borrow_mut();
     let Some(session) = world.state.decoders.get_mut(&id) else {
@@ -207,10 +181,6 @@ fn decoder_decode(
 
 /// Drops session `id`. Best-effort: after realm teardown there is no world
 /// left, and the realm drop itself reclaims every session.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn decoder_free(ctx: Ctx<'_>, id: u64) {
     if let Ok(world) = super::bindings::world(&ctx) {
         world.borrow_mut().state.decoders.remove(&id);
@@ -232,10 +202,6 @@ fn resolve_label(ctx: &Ctx<'_>, label: &str) -> Result<&'static Encoding> {
 /// Takes the value, not a string: a lone surrogate has no UTF-8 form for a
 /// Rust `String` to cross in, so the Latin1 check runs on UTF-16 units and
 /// reports `None` for the caller's `InvalidCharacterError`.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn atob<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, input)? else {
         return Ok(None);
@@ -246,10 +212,6 @@ fn atob<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
 
 /// Latin-1-only `btoa`
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#atob>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn btoa<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, input)? else {
         return Ok(None);
@@ -260,10 +222,6 @@ fn btoa<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
 }
 
 /// Standard base64 of isomorphic-latin1 bytes, for `FileReader` data URLs.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn base64_encode<'js>(ctx: Ctx<'js>, source: Value<'js>) -> Result<Option<String>> {
     let Some(bytes) = latin1_bytes(&ctx, source)? else {
         return Ok(None);
@@ -344,16 +302,6 @@ fn reserve_output(decoder: &mut encoding_rs::Decoder, output: &mut String, remai
             .unwrap_or(remaining.saturating_mul(3))
             .max(4),
     );
-}
-
-/// Isomorphic decode: each code point below 256 becomes that byte
-/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
-fn bytes_from_latin1(text: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(text.len());
-    for character in text.chars() {
-        bytes.push(u8::try_from(u32::from(character)).ok()?);
-    }
-    Some(bytes)
 }
 
 fn latin1_from_bytes(bytes: &[u8]) -> String {

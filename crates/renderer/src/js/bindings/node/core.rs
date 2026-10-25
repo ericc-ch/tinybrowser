@@ -933,11 +933,6 @@ impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js>
     }
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     pub(super) fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
         // https://dom.spec.whatwg.org/#dom-node-nodetype
@@ -1523,7 +1518,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share one fallible call shape"
     )]

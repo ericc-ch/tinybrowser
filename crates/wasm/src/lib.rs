@@ -13,9 +13,9 @@ use std::time::SystemTime;
 
 use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, schemeful_same_site};
 use renderer::{
-    BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost, RendererEvent,
-    StorageChange, StorageHost, StorageKind,
+    BrowserEvent, BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome,
+    DialRequest, EmbeddedRenderer, HistoryHandling, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount,
+    NetworkHost, RendererEvent, StorageChange, StorageHost, StorageKind,
 };
 use url::Url;
 use webstorage::StorageArea;
@@ -33,7 +33,9 @@ mod bindings {
     export!(Component with_types_in self);
 }
 
-use bindings::exports::tinybrowser::browser::engine::{Event, FrameEvent, Guest, GuestTab};
+use bindings::exports::tinybrowser::browser::engine::{
+    Event, FrameEvent, Guest, GuestTab, HistoryHandling as HostHistoryHandling,
+};
 use bindings::tinybrowser::browser::types::{FetchError, FetchKind, FetchRequest, FetchResponse};
 
 /// Redirect hops a single dial may follow.
@@ -155,9 +157,6 @@ impl GuestTab for Tab {
             .map(|events| {
                 events
                     .into_iter()
-                    // A turn is internal host coordination; the wasm event
-                    // surface has no consumer for it.
-                    .filter(|(_, event)| !matches!(event, RendererEvent::Turn))
                     .map(|(frame, event)| FrameEvent {
                         frame: frame.get(),
                         event: to_event(event),
@@ -190,17 +189,24 @@ impl Tab {
 /// The renderer's event vocabulary, restricted to what this component emits.
 fn to_event(event: RendererEvent) -> Event {
     match event {
-        RendererEvent::Navigated { url } => Event::Navigated(url),
-        RendererEvent::HistoryUpdated {
-            url,
-            state,
-            replace,
-        } => Event::HistoryUpdated((url, state, replace)),
-        RendererEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
-        // `Turn` is filtered out before this match and never reaches the
-        // host; it shares `Load`'s payload-less shape.
-        RendererEvent::Load | RendererEvent::Turn => Event::Load,
-        RendererEvent::DomContentLoaded => Event::DomContentLoaded,
+        RendererEvent::Browser(event) => match event {
+            BrowserEvent::Navigated { url } => Event::Navigated(url),
+            BrowserEvent::HistoryUpdated {
+                url,
+                state,
+                handling,
+            } => Event::HistoryUpdated((
+                url,
+                state,
+                match handling {
+                    HistoryHandling::Push => HostHistoryHandling::Push,
+                    HistoryHandling::Replace => HostHistoryHandling::Replace,
+                },
+            )),
+            BrowserEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
+            BrowserEvent::Load => Event::Load,
+            BrowserEvent::DomContentLoaded => Event::DomContentLoaded,
+        },
         RendererEvent::Timer(id) => Event::Timer(id),
         RendererEvent::Fetch { status } => Event::Fetch(status),
         RendererEvent::FetchFailed => Event::FetchFailed,
@@ -632,7 +638,7 @@ impl BrowsingContextHost for WasmServices {
         None
     }
 
-    fn window_post_message(&self, _tab: u64, _payload: &str) {}
+    fn window_post_message(&self, _tab: u64, _message: renderer::PostedMessage) {}
 
     fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
         None

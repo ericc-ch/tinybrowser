@@ -951,10 +951,6 @@ fn sequential_tabindex(base: &blitz_dom::BaseDocument, node: BlitzId) -> Option<
 /// button group is one focusable area: its checked member, else its first
 /// member, represents the group
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
     let world_rc = super::world(&ctx)?;
     let (focusables, representative_of, current) = {
@@ -1065,10 +1061,6 @@ fn focus_next(ctx: Ctx<'_>, backward: bool) -> Result<()> {
 /// this for pointer presses, space presses, and the label's associated
 /// control, and clear it when focus moves away
 /// (<https://drafts.csswg.org/selectors/#the-active-pseudo>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn set_active<'js>(ctx: Ctx<'js>, element: Value<'js>, active: bool) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Ok(());
@@ -1091,30 +1083,18 @@ fn set_active<'js>(ctx: Ctx<'js>, element: Value<'js>, active: bool) -> Result<(
 
 /// Whether the current realm has unexpired transient activation
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation-isactive>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn user_activation_active(ctx: Ctx<'_>) -> Result<bool> {
     Ok(super::world(&ctx)?.borrow().user_activation_active())
 }
 
 /// Whether the current realm was ever activated
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-useractivation-hasbeenactive>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn user_activation_sticky(ctx: Ctx<'_>) -> Result<bool> {
     Ok(super::world(&ctx)?.borrow().user_activation_sticky())
 }
 
 /// Consumes the current realm's transient activation
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn consume_user_activation(ctx: Ctx<'_>) -> Result<bool> {
     Ok(super::world(&ctx)?.borrow_mut().consume_user_activation())
 }
@@ -1122,10 +1102,6 @@ fn consume_user_activation(ctx: Ctx<'_>) -> Result<bool> {
 /// Runs the activation behavior for an element the input paths clicked, so a
 /// real click toggles a checkbox or submits a form
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Ok(());
@@ -1151,10 +1127,6 @@ fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
 /// so routing the change through the IDL setter would make the edit invisible
 /// to them
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#input-events>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullString) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Err(Exception::throw_type(&ctx, "argument is not an element"));
@@ -1185,8 +1157,12 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
                 return Ok(());
             };
             if kind.value_mode() == crate::dom::input::ValueMode::Current {
-                let sanitized =
-                    crate::dom::input::sanitize(&parsed.document.base, node.node, kind, &value.0);
+                let sanitized = crate::dom::input::sanitize_with_device(
+                    &mut parsed.document.base,
+                    node.node,
+                    kind,
+                    &value.0,
+                );
                 parsed
                     .document
                     .base
@@ -1212,10 +1188,6 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
 
 /// The `WebDriver` "element click" step: a trusted click at the element, with
 /// focus moved to it first when it is focusable.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Err(Exception::throw_type(&ctx, "not an element"));

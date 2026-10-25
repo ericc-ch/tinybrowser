@@ -221,8 +221,13 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             };
             let interface = lower(&database, &implementation, kind, &implemented)
                 .map_err(|error| Error(format!("{}: {error}", implementation.interface)))?;
-            let syntax = syn::parse2(crate::emit::interface(&interface))
-                .map_err(|error| Error(format!("invalid generated contract: {error}")))?;
+            let generated = crate::emit::interface(&interface);
+            let syntax = syn::parse2(generated).map_err(|error| {
+                Error(format!(
+                    "invalid generated contract for {}: {error}",
+                    implementation.interface
+                ))
+            })?;
             Ok(Binding {
                 interface: implementation.interface,
                 rust: prettyplease::unparse(&syntax),

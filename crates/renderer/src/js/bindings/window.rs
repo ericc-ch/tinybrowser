@@ -286,10 +286,6 @@ fn window_world_for_call<'js>(ctx: &Ctx<'js>, this: &Value<'js>) -> Result<Rc<Re
     world_for_window_this(ctx, object)
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(crate) fn window_add_event_listener<'js>(
     ctx: Ctx<'js>,
     this: This<Value<'js>>,
@@ -308,10 +304,6 @@ pub(crate) fn window_add_event_listener<'js>(
     )
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(crate) fn window_remove_event_listener<'js>(
     ctx: Ctx<'js>,
     this: This<Value<'js>>,
@@ -330,10 +322,6 @@ pub(crate) fn window_remove_event_listener<'js>(
     )
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(crate) fn window_dispatch_event<'js>(
     ctx: Ctx<'js>,
     this: This<Value<'js>>,
@@ -343,10 +331,6 @@ pub(crate) fn window_dispatch_event<'js>(
     events::dispatch_event_for_window(&ctx, &world, &event)
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(crate) fn window_dispatch_trusted_event<'js>(
     ctx: Ctx<'js>,
     event: Class<'js, JsEvent>,

@@ -120,10 +120,6 @@ pub(crate) fn evaluate(ctx: &Ctx<'_>, source: &str) -> Result<()> {
 /// the empty string rather than a fake location.
 pub(crate) const ENGINE_FILENAME: &str = "tinybrowser-shim";
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs native-function ABI supplies an owned Ctx"
-)]
 pub(crate) fn evaluate_page(ctx: Ctx<'_>, source: String) -> Result<Value<'_>> {
     let mut options = EvalOptions::default();
     options.strict = false;

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::mpsc;
 
-use crate::actor::{TabHandle, TabId, TabTask};
+use crate::actor::{RemoteWindowMessage, TabHandle, TabId, TabTask};
 use crate::context::BrowserContext;
 use crate::exchange::ServerInput;
 use crate::manager::RendererProcessManager;
@@ -52,12 +52,12 @@ impl TabRegistry {
             .copied()
     }
 
-    /// Queues one `postMessage` payload on the target tab's mailbox. Returns
+    /// Queues one `postMessage` delivery on the target tab's mailbox. Returns
     /// false when the tab is gone, its coordinator stopped, or the mailbox is
     /// full. A full mailbox drops the message instead of blocking: the caller
     /// is the sender's renderer service task, and waiting there would stall
     /// every service call for that renderer until the target drains.
-    pub(crate) fn deliver(&self, id: TabId, payload: String) -> bool {
+    pub(crate) fn deliver(&self, id: TabId, message: RemoteWindowMessage) -> bool {
         let sender = self
             .tabs
             .lock()
@@ -65,7 +65,7 @@ impl TabRegistry {
             .get(&id)
             .map(TabTask::deliveries);
         match sender {
-            Some(sender) => match sender.try_send(payload) {
+            Some(sender) => match sender.try_send(message) {
                 Ok(()) => {
                     logging::debug!(
                         target: "browser::tabs",

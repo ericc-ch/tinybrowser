@@ -666,11 +666,6 @@ impl<'js> html_frame_element_generated::HTMLFrameElement<'js> for JsNode {
     }
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-activeelement
     pub(super) fn active_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
@@ -701,10 +696,6 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share one fallible call shape"
-    )]
     pub(super) fn default_view<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         // Return this document's browsing-context WindowProxy, not the
         // calling realm's `globalThis`
@@ -723,7 +714,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated operations share one fallible call shape"
     )]
@@ -1197,7 +1188,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-url
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
@@ -1206,7 +1197,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-documenturi
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
@@ -1215,7 +1206,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-document-baseuri
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
@@ -1232,7 +1223,7 @@ impl JsNode {
     }
 
     /// <https://encoding.spec.whatwg.org/#dom-document-characterset>
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
@@ -1240,7 +1231,7 @@ impl JsNode {
         Ok(document_character_set(ctx, self.handle.0))
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
@@ -1248,7 +1239,7 @@ impl JsNode {
         Ok(document_character_set(ctx, self.handle.0))
     }
 
-    #[allow(
+    #[expect(
         clippy::unnecessary_wraps,
         reason = "generated getters share one fallible call shape"
     )]
@@ -1474,10 +1465,7 @@ impl JsNode {
         Ok(value)
     }
 }
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Rest by value"
-)]
+
 pub(in crate::js::bindings) fn construct_node<'js>(
     ctx: Ctx<'js>,
     name: WebIdlString,
@@ -1487,10 +1475,6 @@ pub(in crate::js::bindings) fn construct_node<'js>(
     construct_node_in_owner(&ctx, &owner, &name, args)
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Rest by value"
-)]
 pub(in crate::js::bindings) fn construct_node_in_frame<'js>(
     ctx: Ctx<'js>,
     frame: f64,
@@ -1500,7 +1484,7 @@ pub(in crate::js::bindings) fn construct_node_in_frame<'js>(
     if !frame.is_finite() || frame < 0.0 || frame.fract() != 0.0 || frame > f64::from(u32::MAX) {
         return Err(Exception::throw_type(&ctx, "no document"));
     }
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "the value is range-checked to a non-negative u32 above"
@@ -1596,10 +1580,6 @@ pub(in crate::js::bindings) fn install_custom_construction(ctx: &Ctx<'_>) -> Res
     Ok(())
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Value by value"
-)]
 pub(super) fn push_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
     let id = host_node_id(&ctx, &value)
         .ok_or_else(|| Exception::throw_type(&ctx, "custom element candidate is not an element"))?;
@@ -1614,10 +1594,6 @@ pub(super) fn push_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) ->
     Ok(())
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx and Value by value"
-)]
 pub(super) fn discard_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
     let Some(id) = host_node_id(&ctx, &value) else {
         return Ok(());
@@ -2321,11 +2297,6 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
-)]
 impl JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
     pub(super) fn get_scripts<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {

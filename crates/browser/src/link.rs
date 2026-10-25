@@ -25,7 +25,7 @@ use crate::wire::{
     MessagingCall, NetworkCall, RendererAssignmentId, RendererCall, RendererNotice, RendererReply,
     Reply, ResponseStart, ServiceCall, ServiceReply, StorageCall, ToRenderer,
 };
-use renderer::{FrameId, Mount, RendererEvent, StorageChange, StorageKind, TabError};
+use renderer::{BrowserEvent, FrameId, Mount, StorageChange, StorageKind, TabError};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
@@ -501,6 +501,9 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
                 frame,
                 event,
             }) => route_event(&context, assignment, frame, &event),
+            ServerInput::Notify(RendererNotice::WaiterSettled { assignment, id }) => {
+                route_waiter_settled(&context, assignment, id)
+            }
             ServerInput::Notify(RendererNotice::Ready)
             | ServerInput::RequestChunk
             | ServerInput::RequestEnd
@@ -517,18 +520,10 @@ fn route_event(
     context: &ServiceContext,
     assignment: RendererAssignmentId,
     frame: FrameId,
-    event: &RendererEvent,
+    event: &BrowserEvent,
 ) -> Result<(), RendererViolation> {
-    let Some(assignment) = context
-        .registry
-        .resolve(assignment)
-        .filter(|assignment| assignment.hosted_by(context.renderer))
-    else {
-        return if context.registry.was_released(assignment) {
-            Ok(())
-        } else {
-            Err(RendererViolation)
-        };
+    let Some(assignment) = live_assignment(context, assignment)? else {
+        return Ok(());
     };
     if assignment.publish_event(frame, event) {
         Err(RendererViolation)
@@ -537,8 +532,46 @@ fn route_event(
     }
 }
 
+/// Routes a settled JS waiter. It shares the event route's authorization: a
+/// renderer may only speak for an assignment it hosts.
+fn route_waiter_settled(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+    id: u64,
+) -> Result<(), RendererViolation> {
+    if let Some(assignment) = live_assignment(context, assignment)?
+        && assignment.publish_waiter_settled(id)
+    {
+        return Err(RendererViolation);
+    }
+    Ok(())
+}
+
+/// The live assignment `id` names. `None` means it was already released and
+/// the notice is stale, which is not a violation.
+fn live_assignment(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+) -> Result<Option<Arc<Assignment>>, RendererViolation> {
+    let Some(assignment) = context
+        .registry
+        .resolve(assignment)
+        .filter(|assignment| assignment.hosted_by(context.renderer))
+    else {
+        return if context.registry.was_released(assignment) {
+            Ok(None)
+        } else {
+            Err(RendererViolation)
+        };
+    };
+    Ok(Some(assignment))
+}
+
 /// Whether `spec` names an opaque document's origin: its serialization is
-/// `null`, or it is a non-HTTP(S) URL whose origin is opaque.
+/// `null`, or it is a non-HTTP(S) URL whose origin is opaque. Opaque documents
+/// share their tab's renderer but never match its site lock, so their dials
+/// must fail as network errors rather than kill it. An unparseable initiator
+/// is not opaque: that is corruption or forgery, still a violation.
 fn is_opaque_initiator(spec: &str) -> bool {
     spec == "null"
         || url::Url::parse(spec).is_ok_and(|url| !matches!(url.scheme(), "http" | "https"))
@@ -775,16 +808,26 @@ async fn route_window_call(
             let opener = context.tabs.opener(assignment.tab).map(TabId::get);
             send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
-        BrowsingContextCall::WindowMessage { tab, payload } => {
+        BrowsingContextCall::WindowMessage { tab, message } => {
             // A page can only hold a `WindowProxy` for a related window: its
             // own, its opener, or a tab it opened. An unrelated target is a
             // forged call and is ignored.
+            // `MessageEvent.origin` is what a receiving page authenticates
+            // with, so the sender's claim must stay inside this renderer's
+            // site lock. An opaque origin has no authority to claim: its
+            // serialized `null` passes through, and no tuple-origin document
+            // admits it.
+            if message.origin != "null" && assignment.site.authorize(&message.origin).is_none() {
+                return Err(RendererViolation);
+            }
             let target = TabId::new(tab);
             if message_related(context, assignment, target) {
                 // Enqueue on the target's mailbox and return: the spec's
                 // `postMessage` is asynchronous, and waiting here would let a
                 // busy target block this renderer.
-                let _queued = context.tabs.deliver(target, payload);
+                let _queued = context
+                    .tabs
+                    .deliver(target, crate::actor::RemoteWindowMessage { message });
             }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }

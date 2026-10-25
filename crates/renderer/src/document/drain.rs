@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{DialContext, Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
+use super::{DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::dom::tree::NodeId;
 use crate::js::RealmRequest;
-use crate::protocol::RendererEvent;
+use crate::protocol::{BrowserEvent, RendererEvent};
 
 /// Upper bound on realm requests applied in one turn. Host callbacks can
 /// enqueue more work while a request runs, so a turn must not loop forever.
@@ -37,36 +37,30 @@ impl Document {
         self.drain_blitz_fetches();
         self.launch_queued_dials();
         self.adopt_dial_completions();
-        if let Some(task) = self.tasks.pop_front() {
-            // Joins the drain's turn when one is open, so serial tasks share
-            // its deadline. A task outside a drain still opens its own turn.
-            let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
-            self.run_task(task);
-            // A mutation that changes rendered output asks the shell for a
-            // frame. Before the document fires `load`, the load-time resolve
-            // settles the tree; afterwards this is the only cue that starts the
-            // image fetches a newly inserted style sheet or `style` attribute
-            // introduced, so the tree stays current for the turn's follow-up
-            // reads.
-            if self.load_fired && self.blitz_shell.take_redraw() {
-                self.settle_blitz_layout();
-            }
-            // The task may have changed script-visible state with no timer,
-            // fetch, or navigation event to follow — a page that settles a
-            // webdriver async-script callback in its last task and then goes
-            // quiet must still wake a `run_until_js_true` waiter.
-            self.record_event(RendererEvent::Turn);
+        let Some(task) = self.tasks.pop_front() else {
             let fired = self.check_load();
             return DrainStep {
-                ran: true,
-                more: !self.stop.is_set()
-                    && (fired || self.has_pending_frame_loads() || self.has_ready_work()),
+                ran: false,
+                more: !self.stop.is_set() && (fired || self.has_pending_frame_loads()),
             };
+        };
+        // Joins the drain's turn when one is open, so serial tasks share
+        // its deadline. A task outside a drain still opens its own turn.
+        let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
+        self.run_task(task);
+        // A mutation that changes rendered output asks the shell for a frame.
+        // Before the document fires `load`, the load-time resolve settles the
+        // tree; afterwards this is the only cue that starts the image fetches
+        // a newly inserted style sheet or `style` attribute introduced, so the
+        // tree stays current for the turn's follow-up reads.
+        if self.load_fired && self.blitz_shell.take_redraw() {
+            self.settle_blitz_layout();
         }
         let fired = self.check_load();
         DrainStep {
-            ran: false,
-            more: !self.stop.is_set() && (fired || self.has_pending_frame_loads()),
+            ran: true,
+            more: !self.stop.is_set()
+                && (fired || self.has_pending_frame_loads() || self.has_ready_work()),
         }
     }
 
@@ -229,20 +223,18 @@ impl Document {
                 self.adopt_js_work();
             }
             Task::DialFinished(id, done) => {
-                if let Some(dial) = self.dials.take_finished(id) {
-                    dial.settle();
+                if self.dials.settle(id) {
                     self.finish_dial(*done);
                 }
             }
             Task::DialFailed(id, fail) => {
-                if let Some(dial) = self.dials.take_finished(id) {
-                    dial.settle();
+                if self.dials.settle(id) {
                     self.fail_dial(fail);
                 }
             }
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
-            Task::RemoteMessage(payload) => self.deliver_remote_message(&payload),
+            Task::RemoteMessage(message) => self.deliver_remote_message(&message),
             Task::BroadcastMessage {
                 origin,
                 name,
@@ -300,23 +292,25 @@ impl Document {
             }
             RealmRequest::Image(element) => {
                 self.world.borrow_mut().image_update_started(element);
-                self.queue_image(element, true);
+                self.queue_image(element, ImageUpdate::SrcChanged);
             }
             RealmRequest::HistoryPush {
                 url,
                 state,
-                replace,
+                handling,
             } => {
                 self.apply_document_url_same_origin(&url);
-                self.record_event(RendererEvent::HistoryUpdated {
+                self.record_event(RendererEvent::Browser(BrowserEvent::HistoryUpdated {
                     url,
                     state,
-                    replace,
-                });
+                    handling,
+                }));
             }
             RealmRequest::HistoryTraverse { delta } => {
                 if self.frame == crate::protocol::FrameId::MAIN {
-                    self.record_event(RendererEvent::HistoryTraversal { delta });
+                    self.record_event(RendererEvent::Browser(BrowserEvent::HistoryTraversal {
+                        delta,
+                    }));
                 } else {
                     // A child navigable keeps its own entries in the engine,
                     // which owns its documents; the browser tab holds only the

@@ -556,10 +556,6 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
 /// (<https://drafts.csswg.org/cssom/#resolved-values>). `getComputedStyle`
 /// falls back to the inline style and then to initial values on an empty
 /// result.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn resolved_style<'js>(
     ctx: Ctx<'js>,
     element: Value<'js>,
@@ -587,10 +583,6 @@ fn resolved_style<'js>(
 
 /// The active document's viewport size in CSS pixels, for the live `window`
 /// metrics (<https://drafts.csswg.org/cssom-view/#dom-window-innerwidth>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
     let (width, height) = world(&ctx).ok().map_or_else(
         || crate::engine::DEFAULT_VIEWPORT,
@@ -644,12 +636,8 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
 /// owns the id. Element commands use this so references returned by
 /// `execute_script` work as well as Find Element results
 /// (<https://w3c.github.io/webdriver/#elements>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
 pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "WebDriver element ids are small non-negative integers"
@@ -1767,94 +1755,8 @@ mod realm_tests {
     use crate::js::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::messaging::Shared;
-    use crate::protocol::{
-        BrowserServices, BrowsingContextHost, DialCompletion, DialRequest, FrameId, MessagingHost,
-        NetworkHost, StorageHost, StorageKind,
-    };
-
-    struct NullServices;
-
-    impl NetworkHost for NullServices {
-        fn start_dial(
-            &self,
-            _request: DialRequest,
-            completion: DialCompletion,
-        ) -> crate::protocol::DialCancellation {
-            completion(Err(crate::protocol::DialFailure::Connect));
-            Box::new(|| {})
-        }
-
-        fn cookies_for(&self, _url: &Url) -> String {
-            String::new()
-        }
-
-        fn set_cookie(&self, _value: &str, _url: &Url) {}
-    }
-
-    impl StorageHost for NullServices {
-        fn storage_get(&self, _kind: StorageKind, _origin: &str, _key: &str) -> Option<String> {
-            None
-        }
-
-        fn storage_keys(&self, _kind: StorageKind, _origin: &str) -> Vec<String> {
-            Vec::new()
-        }
-
-        fn storage_set(
-            &self,
-            _kind: StorageKind,
-            _origin: &str,
-            _url: &str,
-            _key: &str,
-            _value: &str,
-            _source: FrameId,
-        ) -> Result<Option<crate::protocol::StorageChange>, crate::protocol::StorageError> {
-            Ok(None)
-        }
-
-        fn storage_remove(
-            &self,
-            _kind: StorageKind,
-            _origin: &str,
-            _url: &str,
-            _key: &str,
-            _source: FrameId,
-        ) -> Option<crate::protocol::StorageChange> {
-            None
-        }
-
-        fn storage_clear(
-            &self,
-            _kind: StorageKind,
-            _origin: &str,
-            _url: &str,
-            _source: FrameId,
-        ) -> Option<crate::protocol::StorageChange> {
-            None
-        }
-    }
-
-    impl BrowsingContextHost for NullServices {
-        fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
-            None
-        }
-
-        fn window_close(&self, _tab: u64) {}
-
-        fn window_opener(&self) -> Option<u64> {
-            None
-        }
-
-        fn window_post_message(&self, _tab: u64, _payload: &str) {}
-
-        fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
-            None
-        }
-    }
-
-    impl MessagingHost for NullServices {
-        fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
-    }
+    use crate::protocol::{BrowserServices, FrameId};
+    use crate::test_services::NullServices;
 
     fn world_with_document(
         js_runtime: &SharedJsRuntime,
