@@ -17,12 +17,13 @@ use url::Url;
 use crate::Parsed;
 use crate::ReadyState;
 use crate::js::{
-    DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, PolicyContainer, World,
+    DocumentStreamCommand, FrameNavigation, FrameRuntime, JsFetchId, JsRuntimeHandle, PageTimerId,
+    PolicyContainer, World,
 };
 use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
 use crate::protocol::{
     BrowserEvent, BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent,
-    ResponseHead, ScriptFailure, TabError,
+    ResponseHead, ScriptFailure, TabError, TimerId,
 };
 
 use self::dials::DialLedger;
@@ -59,12 +60,23 @@ const MAX_PENDING_JS_FETCHES: usize = 256;
 /// Retained events before a document reports overflow.
 const MAX_PENDING_EVENTS: usize = 2048;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct DialId(u64);
+
+impl DialId {
+    fn take_next(&mut self) -> Self {
+        let id = *self;
+        self.0 += 1;
+        id
+    }
+}
+
 enum Task {
-    Timer(u32),
+    Timer(TimerId),
     /// Boxed: a completed dial carries the request and response with it, and
     /// the variant otherwise dominates every other task's size.
-    DialFinished(u64, Box<CompletedDial>),
-    DialFailed(u64, DialContext),
+    DialFinished(DialId, Box<CompletedDial>),
+    DialFailed(DialId, DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
     /// One cross-tab `message` from another renderer. The sender's origin and
@@ -136,7 +148,7 @@ pub(crate) struct WindowMessage {
 #[derive(Clone, Copy)]
 pub(crate) enum DialContext {
     JsFetch {
-        id: i32,
+        id: JsFetchId,
     },
     ClassicScript {
         element: crate::dom::tree::NodeId,
@@ -315,7 +327,7 @@ struct Timer {
     when: Option<Instant>,
     fired: bool,
     /// The script-visible id, when this timer belongs to a realm.
-    js_id: Option<i32>,
+    js_id: Option<PageTimerId>,
 }
 
 /// Builds and queues the initial `about:blank` document for one connected
@@ -520,8 +532,8 @@ pub(crate) struct Document {
     shared: SharedHandle,
     url: Url,
     tasks: VecDeque<Task>,
-    timers: HashMap<u32, Timer>,
-    next_timer_id: u32,
+    timers: HashMap<TimerId, Timer>,
+    next_timer_id: TimerId,
     /// Every queued, in-flight, and cancelled dial for this document.
     dials: DialLedger,
     /// `<img>` elements awaiting Blitz image state. They delay the document
@@ -574,14 +586,14 @@ pub(crate) struct Document {
     /// when the value was parsed.
     pending_refresh: Option<(Url, std::time::Duration)>,
     /// The timer a refresh is waiting on, so a new navigation can cancel it.
-    refresh_timer: Option<u32>,
+    refresh_timer: Option<TimerId>,
     /// The URL an armed refresh navigates to when its timer fires.
     refresh_target: Option<Url>,
     events: Vec<RendererEvent>,
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
     /// Live JS timers by the id script holds. The timer owns the page id.
-    js_timers: HashMap<i32, u32>,
+    js_timers: HashMap<PageTimerId, TimerId>,
     /// One count for every operation delaying this document's `load` event.
     load_delay: LoadDelay,
     /// Whether init scripts were deferred because the realm was created while
@@ -827,7 +839,7 @@ impl Document {
             url: document_url,
             tasks: VecDeque::new(),
             timers: HashMap::new(),
-            next_timer_id: 1,
+            next_timer_id: TimerId::default(),
             dials: DialLedger::new(Arc::clone(&runtime.stop), Arc::clone(&runtime.wake)),
             image_selected_src: HashMap::new(),
             in_flight_images: HashMap::new(),
@@ -3605,7 +3617,11 @@ impl Document {
         }
     }
 
-    pub(in crate::document) fn settle_js_fetch(&mut self, id: i32, outcome: Option<DialOutcome>) {
+    pub(in crate::document) fn settle_js_fetch(
+        &mut self,
+        id: JsFetchId,
+        outcome: Option<DialOutcome>,
+    ) {
         self.fire_js(|js| js.finish_js_fetch(id, outcome));
     }
 

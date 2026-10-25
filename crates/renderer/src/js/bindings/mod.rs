@@ -2359,7 +2359,9 @@ mod realm_tests {
             .borrow_mut()
             .outbox
             .borrow_mut()
-            .push_back(crate::js::RealmRequest::ClearTimer(7));
+            .push_back(crate::js::RealmRequest::ClearTimer(crate::js::PageTimerId(
+                7,
+            )));
         world
             .borrow_mut()
             .queue_write("x".repeat(7 * 1024 * 1024))
@@ -2370,7 +2372,9 @@ mod realm_tests {
         ));
         assert!(matches!(
             world.borrow().pop_outbox(),
-            Some(crate::js::RealmRequest::ClearTimer(7))
+            Some(crate::js::RealmRequest::ClearTimer(crate::js::PageTimerId(
+                7
+            )))
         ));
         assert!(
             world

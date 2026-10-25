@@ -414,3 +414,136 @@ fn json_discovery_page_socket_close_target_and_browser_close() {
     let after_browser = client.call("Browser.getVersion", &json!({}), None);
     assert!(after_browser.is_err(), "getVersion after Browser.close");
 }
+
+#[test]
+fn dom_outer_html_serializes_elements_and_documents() {
+    let (_fixture, mut client) = start();
+    let server_addr = crate::fixture::serve(
+        b"<!doctype html><html><body><p id=\"x\" class=\"a\">hi</p></body></html>",
+        "text/html",
+    );
+    let session = crate::fixture::load_page(
+        &mut client,
+        &format!("http://{server_addr}/"),
+        Duration::from_secs(10),
+    );
+
+    let document = client
+        .call("DOM.getDocument", &json!({}), Some(&session))
+        .expect("document");
+    let root = document["root"]["nodeId"].as_u64().expect("root id");
+    let found = client
+        .call(
+            "DOM.querySelector",
+            &json!({"nodeId": root, "selector": "p"}),
+            Some(&session),
+        )
+        .expect("query");
+    let paragraph = found["nodeId"].as_u64().expect("paragraph id");
+
+    let element = client
+        .call(
+            "DOM.getOuterHTML",
+            &json!({"nodeId": paragraph}),
+            Some(&session),
+        )
+        .expect("element outerHTML");
+    assert_eq!(
+        element,
+        json!({"outerHTML": "<p id=\"x\" class=\"a\">hi</p>"})
+    );
+
+    let whole = client
+        .call("DOM.getOuterHTML", &json!({"nodeId": root}), Some(&session))
+        .expect("document outerHTML");
+    let html = whole["outerHTML"].as_str().expect("document html");
+    assert!(html.contains("<p id=\"x\" class=\"a\">hi</p>"), "{html}");
+
+    let unknown = client
+        .call(
+            "DOM.getOuterHTML",
+            &json!({"nodeId": 999_999}),
+            Some(&session),
+        )
+        .expect_err("unknown node");
+    assert!(
+        unknown
+            .to_string()
+            .contains("Could not find node with given id"),
+        "{unknown}"
+    );
+}
+
+#[test]
+fn dom_attributes_require_an_element_and_an_identifier() {
+    let (_fixture, mut client) = start();
+    let server_addr = crate::fixture::serve(
+        b"<!doctype html><html><body><p id=\"x\" class=\"a\">hi</p></body></html>",
+        "text/html",
+    );
+    let session = crate::fixture::load_page(
+        &mut client,
+        &format!("http://{server_addr}/"),
+        Duration::from_secs(10),
+    );
+
+    let document = client
+        .call("DOM.getDocument", &json!({}), Some(&session))
+        .expect("document");
+    let root = document["root"]["nodeId"].as_u64().expect("root id");
+    let found = client
+        .call(
+            "DOM.querySelector",
+            &json!({"nodeId": root, "selector": "p"}),
+            Some(&session),
+        )
+        .expect("query");
+    let paragraph = found["nodeId"].as_u64().expect("paragraph id");
+
+    let attributes = client
+        .call(
+            "DOM.getAttributes",
+            &json!({"nodeId": paragraph}),
+            Some(&session),
+        )
+        .expect("attributes");
+    assert_eq!(attributes, json!({"attributes": ["id", "x", "class", "a"]}));
+
+    let document_error = client
+        .call(
+            "DOM.getAttributes",
+            &json!({"nodeId": root}),
+            Some(&session),
+        )
+        .expect_err("document has no attributes");
+    assert!(
+        document_error
+            .to_string()
+            .contains("Node is not an Element"),
+        "{document_error}"
+    );
+
+    let missing = client
+        .call("DOM.getAttributes", &json!({}), Some(&session))
+        .expect_err("missing identifier");
+    assert!(
+        missing
+            .to_string()
+            .contains("nodeId, backendNodeId, or objectId"),
+        "{missing}"
+    );
+
+    let unknown = client
+        .call(
+            "DOM.getAttributes",
+            &json!({"nodeId": 999_999}),
+            Some(&session),
+        )
+        .expect_err("unknown node");
+    assert!(
+        unknown
+            .to_string()
+            .contains("Could not find node with given id"),
+        "{unknown}"
+    );
+}

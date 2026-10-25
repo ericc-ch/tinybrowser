@@ -192,12 +192,30 @@ pub enum HistoryHandling {
 /// The IPC wire carries only [`BrowserEvent`]; timer, fetch, and script
 /// failures are renderer-side progress that no host acts on, so they never
 /// cross the process boundary.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Identity of one host timer in a document's timer table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TimerId(u64);
+
+impl TimerId {
+    pub(crate) fn take_next(&mut self) -> Self {
+        let id = *self;
+        self.0 += 1;
+        id
+    }
+
+    /// The id as the WIT boundary spells it.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RendererEvent {
     /// An outcome the browser acts on.
     Browser(BrowserEvent),
     /// A host timer whose delay elapsed.
-    Timer(u32),
+    Timer(TimerId),
     /// A `fetch` or navigation job finished with this HTTP status.
     Fetch {
         /// HTTP status.

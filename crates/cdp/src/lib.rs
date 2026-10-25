@@ -495,6 +495,52 @@ struct Outcome {
     close: bool,
 }
 
+enum RuntimeEntry {
+    Evaluate,
+    CallFunctionOn,
+}
+
+impl RuntimeEntry {
+    fn source(self, params: &Value) -> Result<RuntimeSource, DispatchError> {
+        match self {
+            Self::Evaluate => {
+                let expression = params
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DispatchError::Failed("missing expression".into()))?;
+                Ok(RuntimeSource::Evaluate {
+                    expression: expression.to_owned(),
+                })
+            }
+            Self::CallFunctionOn => {
+                let declaration = params
+                    .get("functionDeclaration")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DispatchError::Failed("missing functionDeclaration".into()))?;
+                Ok(RuntimeSource::CallFunctionOn {
+                    declaration: declaration.to_owned(),
+                    object_id: params
+                        .get("objectId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    arguments: arguments_expression(params),
+                })
+            }
+        }
+    }
+}
+
+enum RuntimeSource {
+    Evaluate {
+        expression: String,
+    },
+    CallFunctionOn {
+        declaration: String,
+        object_id: Option<String>,
+        arguments: String,
+    },
+}
+
 impl Conn {
     fn take_queued_events(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.events)
@@ -873,13 +919,13 @@ impl Conn {
                     .unwrap_or(false);
                 Ok(json!({}))
             }
-            PageHandler::RuntimeEvaluate | PageHandler::RuntimeCallFunctionOn => {
-                let method = if matches!(handler, PageHandler::RuntimeEvaluate) {
-                    "Runtime.evaluate"
-                } else {
-                    "Runtime.callFunctionOn"
-                };
-                self.dispatch_runtime(method, params, tab).await
+            PageHandler::RuntimeEvaluate => {
+                self.dispatch_runtime(RuntimeEntry::Evaluate.source(params)?, params, tab)
+                    .await
+            }
+            PageHandler::RuntimeCallFunctionOn => {
+                self.dispatch_runtime(RuntimeEntry::CallFunctionOn.source(params)?, params, tab)
+                    .await
             }
             PageHandler::RuntimeEnable => {
                 self.push_session_event(
@@ -1199,7 +1245,7 @@ impl Conn {
     /// semantics. Handles are retained in private renderer realm state.
     async fn dispatch_runtime(
         &mut self,
-        method: &str,
+        source: RuntimeSource,
         params: &Value,
         tab: &TabHandle,
     ) -> Result<Value, DispatchError> {
@@ -1228,28 +1274,26 @@ impl Conn {
                 .map_err(|_| DispatchError::Failed("timeout is out of range".into()))?,
             None => AWAIT_PROMISE_TIMEOUT,
         };
-        let source = if method == "Runtime.evaluate" {
-            let expression = params
-                .get("expression")
-                .and_then(Value::as_str)
-                .ok_or_else(|| DispatchError::Failed("missing expression".into()))?;
+        let source = match source {
             // `expression` is a script (statements allowed); indirect eval keeps
             // its completion value without parenthesizing a trailing `;`.
-            format!("host.evaluatePage({})", json_string(expression))
-        } else {
-            let declaration = params
-                .get("functionDeclaration")
-                .and_then(Value::as_str)
-                .ok_or_else(|| DispatchError::Failed("missing functionDeclaration".into()))?;
-            let receiver = match params.get("objectId").and_then(Value::as_str) {
-                Some(id) => format!("host.__tb_handles[{}]", json_string(id)),
-                None => "undefined".to_owned(),
-            };
-            let arguments = arguments_expression(params);
-            format!(
-                "host.apply(host.evaluatePage({}), {receiver}, {arguments})",
-                json_string(&format!("({declaration})"))
-            )
+            RuntimeSource::Evaluate { expression } => {
+                format!("host.evaluatePage({})", json_string(&expression))
+            }
+            RuntimeSource::CallFunctionOn {
+                declaration,
+                object_id,
+                arguments,
+            } => {
+                let receiver = object_id.map_or_else(
+                    || "undefined".to_owned(),
+                    |id| format!("host.__tb_handles[{}]", json_string(&id)),
+                );
+                format!(
+                    "host.apply(host.evaluatePage({}), {receiver}, {arguments})",
+                    json_string(&format!("({declaration})"))
+                )
+            }
         };
         if return_by_value {
             let id = self.next_evaluation;

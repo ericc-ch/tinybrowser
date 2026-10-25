@@ -207,7 +207,7 @@ fn to_event(event: RendererEvent) -> Event {
             BrowserEvent::Load => Event::Load,
             BrowserEvent::DomContentLoaded => Event::DomContentLoaded,
         },
-        RendererEvent::Timer(id) => Event::Timer(id),
+        RendererEvent::Timer(id) => Event::Timer(id.get()),
         RendererEvent::Fetch { status } => Event::Fetch(status),
         RendererEvent::FetchFailed => Event::FetchFailed,
         RendererEvent::ScriptFailed => Event::ScriptFailed,

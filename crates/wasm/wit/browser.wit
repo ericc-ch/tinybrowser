@@ -160,7 +160,7 @@ interface engine {
         /// A frame reached `readyState = "complete"` and dispatched `load`.
         load,
         /// A host timer whose delay elapsed.
-        timer(u32),
+        timer(u64),
         /// A `fetch` or classic-script job finished with this HTTP status.
         fetch(u16),
         /// `send` or the body read failed.

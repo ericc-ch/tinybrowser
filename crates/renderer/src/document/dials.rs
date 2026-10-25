@@ -17,8 +17,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use tokio::sync::Notify;
 
-use super::{CompletedDial, DialContext, LoadDelay, LoadDelayGuard, QueuedDial};
-use crate::js::Stop;
+use super::{CompletedDial, DialContext, DialId, LoadDelay, LoadDelayGuard, QueuedDial};
+use crate::js::{JsFetchId, Stop};
 use crate::protocol::{DialCancellation, DialCompletion, DialRequest};
 
 /// One queued dial and the load-event delay its request already holds.
@@ -40,14 +40,14 @@ pub(crate) struct DialLedger {
     /// Completions from every started dial, keyed by ledger entry so adoption
     /// frees the right cancellation handle. Both ends stay private: a caller
     /// that could clone the sender could outlive the ledger's accounting.
-    tx: Sender<(u64, Result<CompletedDial, DialContext>)>,
-    rx: Receiver<(u64, Result<CompletedDial, DialContext>)>,
+    tx: Sender<(DialId, Result<CompletedDial, DialContext>)>,
+    rx: Receiver<(DialId, Result<CompletedDial, DialContext>)>,
     /// Dials waiting for the drain to start them.
     queued: VecDeque<QueuedEntry>,
     /// Started dials, keyed by a ledger-local id. An entry stays here until its
     /// completion task runs, so cancellation can still find adopted work.
-    in_flight: HashMap<u64, InFlightDial>,
-    next_id: u64,
+    in_flight: HashMap<DialId, InFlightDial>,
+    next_id: DialId,
     /// A frame that is shutting down drops completions instead of waking the
     /// session for work nobody will run.
     stop: Arc<Stop>,
@@ -63,7 +63,7 @@ impl DialLedger {
             rx,
             queued: VecDeque::new(),
             in_flight: HashMap::new(),
-            next_id: 0,
+            next_id: DialId::default(),
             stop,
             wake,
         }
@@ -94,8 +94,7 @@ impl DialLedger {
         delay: Option<LoadDelayGuard>,
         start: &dyn Fn(DialRequest, DialCompletion) -> DialCancellation,
     ) {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.next_id.take_next();
         let completed = self.tx.clone();
         let wake = Arc::clone(&self.wake);
         let stop = Arc::clone(&self.stop);
@@ -126,7 +125,7 @@ impl DialLedger {
     /// Collects finished dials in completion order (oldest first). The
     /// `InFlightDial` stays filed, so its guard still delays `load` until the
     /// task that handles the completion actually runs.
-    pub(crate) fn adopt(&mut self) -> Vec<(u64, Result<CompletedDial, DialContext>)> {
+    pub(crate) fn adopt(&mut self) -> Vec<(DialId, Result<CompletedDial, DialContext>)> {
         let mut completed = Vec::new();
         while let Ok((id, outcome)) = self.rx.try_recv() {
             if !self.in_flight.contains_key(&id) {
@@ -140,7 +139,7 @@ impl DialLedger {
     /// Settles the dial whose completion task is running: the entry drops
     /// here, which releases its `load`-event delay. `false` means the dial
     /// was cancelled after its completion was adopted.
-    pub(crate) fn settle(&mut self, id: u64) -> bool {
+    pub(crate) fn settle(&mut self, id: DialId) -> bool {
         self.in_flight.remove(&id).is_some()
     }
 
@@ -172,7 +171,7 @@ impl DialLedger {
 
     /// Drops a queued or in-flight page fetch for one JS id, running its
     /// cancellation handle.
-    pub(crate) fn cancel_fetch(&mut self, id: i32) {
+    pub(crate) fn cancel_fetch(&mut self, id: JsFetchId) {
         self.cancel_where(
             |context| matches!(context, DialContext::JsFetch { id: fetch_id } if *fetch_id == id),
         );

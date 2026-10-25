@@ -554,8 +554,8 @@ pub(crate) async fn run_script(
         ScriptMethod::DomQuerySelector => dom_query_selector(tab, params).await,
         ScriptMethod::DomQuerySelectorAll => dom_query_selector_all(tab, params).await,
         ScriptMethod::DomDescribeNode => dom_describe_node(tab, params).await,
-        ScriptMethod::DomGetOuterHtml => dom_node_string(tab, params, "outerHTML").await,
-        ScriptMethod::DomGetAttributes => dom_node_string(tab, params, "attributes").await,
+        ScriptMethod::DomGetOuterHtml => dom_outer_html(tab, params).await,
+        ScriptMethod::DomGetAttributes => dom_attributes(tab, params).await,
         ScriptMethod::DomResolveNode => dom_resolve_node(tab, params).await,
         ScriptMethod::DomGetNodeForLocation => dom_node_for_location(tab, params).await,
         ScriptMethod::DomGetBoxModel => dom_box_model(tab, params).await,
@@ -1139,6 +1139,24 @@ fn requested_node(params: &Value) -> u64 {
     params.get("nodeId").and_then(Value::as_u64).unwrap_or(1)
 }
 
+/// A page-side expression resolving the node a DOM method requires, from any
+/// of `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
+fn required_node_expression(params: &Value) -> Result<String, DispatchError> {
+    if params.get("objectId").and_then(Value::as_str).is_some()
+        || params
+            .get("backendNodeId")
+            .and_then(Value::as_u64)
+            .is_some()
+        || params.get("nodeId").and_then(Value::as_u64).is_some()
+    {
+        Ok(requested_node_expression(params))
+    } else {
+        Err(DispatchError::InvalidParams(
+            "nodeId, backendNodeId, or objectId",
+        ))
+    }
+}
+
 /// A page-side expression resolving the node a DOM method targets, from any of
 /// `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
 fn requested_node_expression(params: &Value) -> String {
@@ -1249,23 +1267,36 @@ pub(crate) async fn dom_describe_node(
     dom_eval(tab, &script).await
 }
 
-/// `DOM.getOuterHTML` and `DOM.getAttributes` share the stored-node lookup.
-pub(crate) async fn dom_node_string(
+pub(crate) async fn dom_outer_html(
     tab: &TabHandle,
     params: &Value,
-    field: &str,
 ) -> Result<Value, DispatchError> {
-    const TEMPLATE: &str = r#"(function(){
-      const n = host.__tb_dom_nodes[__NODE__];
-      if (!n) return host.stringify({__proto__: null, __FIELD__: null});
-      if ("__FIELD__" === "outerHTML") return host.stringify({__proto__: null, outerHTML: n.outerHTML === undefined ? "" : n.outerHTML});
+    const TEMPLATE: &str = r"(function(){
+      const n = __NODE__;
+      if (!n) throw new Error('Could not find node with given id');
+      const html = n.nodeType === 9
+        ? (n.documentElement ? n.documentElement.outerHTML : '')
+        : n.outerHTML;
+      if (html === undefined) throw new Error('Node does not support outerHTML');
+      return host.stringify({__proto__: null, outerHTML: html});
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &required_node_expression(params)?);
+    dom_eval(tab, &script).await
+}
+
+pub(crate) async fn dom_attributes(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r"(function(){
+      const n = __NODE__;
+      if (!n) throw new Error('Could not find node with given id');
+      if (n.nodeType !== 1) throw new Error('Node is not an Element');
       const attributes = host.array();
-      if (n.attributes) for (const a of n.attributes) { host.push(attributes, a.name, a.value); }
+      for (const a of n.attributes) { host.push(attributes, a.name, a.value); }
       return host.stringify({__proto__: null, attributes: attributes});
-    })()"#;
-    let script = TEMPLATE
-        .replace("__NODE__", &requested_node(params).to_string())
-        .replace("__FIELD__", field);
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &required_node_expression(params)?);
     dom_eval(tab, &script).await
 }
 

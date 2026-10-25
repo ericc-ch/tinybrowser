@@ -19,7 +19,12 @@
 //! hook that appends the panic record straight to the log file and stderr.
 //!
 //! ```
-//! logging::install(logging::Level::Debug, None);
+//! logging::install(
+//!     logging::Level::Debug,
+//!     None,
+//!     std::time::SystemTime::now,
+//! )
+//! .expect("logger");
 //! logging::info!(target: "example", "ready");
 //! ```
 
@@ -32,6 +37,7 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 /// Severity of one record, ordered from most to least severe.
 ///
@@ -99,33 +105,88 @@ impl fmt::Display for ParseLevelError {
 
 impl std::error::Error for ParseLevelError {}
 
+/// Why the process logger could not be installed.
+#[derive(Debug)]
+pub enum InstallError {
+    /// A logger is already installed in this process.
+    AlreadyInstalled,
+    /// The log file could not be opened.
+    Open {
+        /// The path the logger tried to open.
+        path: PathBuf,
+        /// The operating-system failure.
+        source: io::Error,
+    },
+    /// The log file opened, but its writer thread could not start.
+    SpawnWriter(io::Error),
+}
+
+impl fmt::Display for InstallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyInstalled => formatter.write_str("logger already installed"),
+            Self::Open { path, .. } => {
+                write!(formatter, "cannot open log file {}", path.display())
+            }
+            Self::SpawnWriter(_) => formatter.write_str("cannot start the log writer"),
+        }
+    }
+}
+
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Open { source, .. } | Self::SpawnWriter(source) => Some(source),
+            Self::AlreadyInstalled => None,
+        }
+    }
+}
+
 /// Installs the process logger: records at or above `level` go to stderr and,
 /// when `file` is given, to that file from one background writer thread. Also
 /// installs the panic hook, which writes its record synchronously instead of
 /// through the queue.
 ///
-/// A file that cannot be opened is reported on stderr and skipped; logging
-/// never takes the process down. A second install is ignored.
-pub fn install(level: Level, file: Option<PathBuf>) {
-    crash::install(file.clone());
-    let _ = LOGGER.set(Logger::new(level, file));
+/// `clock` supplies the wall time for every record, including the panic
+/// record.
+///
+/// # Errors
+/// Returns [`InstallError`] when this process already has a logger or when the
+/// file sink cannot be opened or started. The composition root decides whether
+/// that is fatal.
+pub fn install(
+    level: Level,
+    file: Option<PathBuf>,
+    clock: fn() -> SystemTime,
+) -> Result<(), InstallError> {
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if LOGGER.get().is_some() {
+        return Err(InstallError::AlreadyInstalled);
+    }
+    let logger = Logger::new(level, file, clock)?;
+    LOGGER
+        .set(logger)
+        .map_err(|_| InstallError::AlreadyInstalled)?;
+    crash::install(LOGGER.get().ok_or(InstallError::AlreadyInstalled)?);
+    Ok(())
 }
 
 struct Logger {
     level: Level,
+    clock: fn() -> SystemTime,
     file: Option<file::FileSink>,
 }
 
 impl Logger {
-    fn new(level: Level, path: Option<PathBuf>) -> Self {
-        let file = path.and_then(|path| match file::FileSink::new(path.clone()) {
-            Ok(sink) => Some(sink),
-            Err(error) => {
-                eprintln!("logging: cannot open {}: {error}", path.display());
-                None
-            }
-        });
-        Self { level, file }
+    fn new(
+        level: Level,
+        path: Option<PathBuf>,
+        clock: fn() -> SystemTime,
+    ) -> Result<Self, InstallError> {
+        let file = path.map(file::FileSink::new).transpose()?;
+        Ok(Self { level, clock, file })
     }
 
     /// Whether a record at `level` passes the threshold.
@@ -136,12 +197,7 @@ impl Logger {
     /// Writes one record when `level` is enabled.
     fn log(&self, level: Level, target: &str, args: fmt::Arguments<'_>) {
         if self.enabled(level) {
-            self.emit(format::record(
-                std::time::SystemTime::now(),
-                level,
-                target,
-                args,
-            ));
+            self.emit(format::record((self.clock)(), level, target, args));
         }
     }
 
@@ -173,6 +229,7 @@ fn write_console(line: &str) {
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Whether the installed logger accepts `level`; `false` when none is installed.
 #[must_use]
@@ -318,20 +375,38 @@ mod tests {
 
     #[test]
     fn threshold_filters_less_severe_records() {
-        let logger = Logger::new(Level::Info, None);
+        let logger = Logger::new(Level::Info, None, SystemTime::now).expect("logger");
         assert!(logger.enabled(Level::Error));
         assert!(logger.enabled(Level::Info));
         assert!(!logger.enabled(Level::Debug));
     }
 
     #[test]
-    fn unopenable_file_falls_back_to_console_only() {
-        let logger = Logger::new(
-            Level::Info,
-            Some(PathBuf::from("/proc/tinybrowser-cannot-exist/log")),
+    fn unopenable_file_reports_its_path() {
+        let path = PathBuf::from("/proc/tinybrowser-cannot-exist/log");
+        let logger = Logger::new(Level::Info, Some(path.clone()), SystemTime::now);
+        assert!(matches!(
+            logger,
+            Err(InstallError::Open { path: failed, .. }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn records_stamp_with_the_injected_clock() {
+        let dir =
+            std::env::temp_dir().join(format!("tinybrowser-log-clock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("log");
+        let logger = Logger::new(Level::Info, Some(path.clone()), || SystemTime::UNIX_EPOCH)
+            .expect("logger");
+        logger.log(Level::Info, "test", format_args!("stamped"));
+        assert!(logger.flush());
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            contents.contains("1970-01-01T00:00:00.000Z INFO test stamped"),
+            "{contents}"
         );
-        assert!(logger.file.is_none());
-        assert!(logger.enabled(Level::Error));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -342,11 +417,5 @@ mod tests {
             "value"
         });
         assert!(!evaluated, "a filtered macro must not run its arguments");
-    }
-
-    #[test]
-    fn console_only_logger_flushes_trivially() {
-        let logger = Logger::new(Level::Info, None);
-        assert!(logger.flush());
     }
 }

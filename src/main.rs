@@ -33,7 +33,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(cli::Outcome::Run(cli)) => {
-            install_logger(&cli);
+            if let Err(error) = install_logger(&cli) {
+                eprintln!("error: {error}");
+                if let Some(source) = std::error::Error::source(&error) {
+                    eprintln!("  caused by: {source}");
+                }
+                return ExitCode::from(2);
+            }
             let code = run(&cli);
             if !logging::flush() {
                 logging::error!(target: "logging", "file log did not flush before exit");
@@ -81,7 +87,7 @@ fn run(cli: &Cli) -> ExitCode {
 }
 
 /// Installs the process logger for the mode and flags this invocation selected.
-fn install_logger(cli: &Cli) {
+fn install_logger(cli: &Cli) -> Result<(), logging::InstallError> {
     let requested = cli.log_level.or(if cli.verbose {
         Some(Level::Debug)
     } else {
@@ -94,7 +100,7 @@ fn install_logger(cli: &Cli) {
         }
         Some(Command::Renderer) | None => None,
     });
-    logging::install(level, file);
+    logging::install(level, file, std::time::SystemTime::now)
 }
 
 /// Level passed to a spawned daemon or renderer, when no flag overrides it.

@@ -9,19 +9,12 @@
 //! The hook must not panic: every step is best-effort.
 
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::sync::OnceLock;
 
-static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-pub(crate) fn install(path: Option<PathBuf>) {
-    if let Some(path) = path {
-        let _ = LOG_PATH.set(path);
-    }
-    std::panic::set_hook(Box::new(record));
+pub(crate) fn install(logger: &'static crate::Logger) {
+    std::panic::set_hook(Box::new(move |info| record(logger, info)));
 }
 
-fn record(info: &std::panic::PanicHookInfo<'_>) {
+fn record(logger: &crate::Logger, info: &std::panic::PanicHookInfo<'_>) {
     let message = info
         .payload()
         .downcast_ref::<&str>()
@@ -40,13 +33,13 @@ fn record(info: &std::panic::PanicHookInfo<'_>) {
         },
     );
     let line = crate::format::record(
-        std::time::SystemTime::now(),
+        (logger.clock)(),
         crate::Level::Error,
         "panic",
         format_args!("{location} {message}"),
     );
     crate::write_console(&line);
-    if let Some(path) = LOG_PATH.get() {
+    if let Some(path) = logger.file.as_ref().map(crate::file::FileSink::path) {
         append(path, &line);
     }
 }

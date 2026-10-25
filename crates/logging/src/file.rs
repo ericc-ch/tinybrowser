@@ -28,19 +28,29 @@ enum Message {
 
 pub(crate) struct FileSink {
     tx: SyncSender<Message>,
+    path: PathBuf,
 }
 
 impl FileSink {
     /// Opens `path` (creating user-private parents) and starts the writer.
-    pub(crate) fn new(path: PathBuf) -> io::Result<Self> {
-        let file = open(&path)?;
+    pub(crate) fn new(path: PathBuf) -> Result<Self, crate::InstallError> {
+        let file = open(&path).map_err(|source| crate::InstallError::Open {
+            path: path.clone(),
+            source,
+        })?;
         let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
+        let writer_path = path.clone();
         // The handle is dropped: the writer lives until the process exits or
         // the sink disconnects, never joined.
         thread::Builder::new()
             .name("logging-file".to_owned())
-            .spawn(move || run(&rx, &path, file, ROTATE_BYTES))?;
-        Ok(Self { tx })
+            .spawn(move || run(&rx, &writer_path, file, ROTATE_BYTES))
+            .map_err(crate::InstallError::SpawnWriter)?;
+        Ok(Self { tx, path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Queues one full line; a full queue drops it.
