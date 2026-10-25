@@ -875,13 +875,15 @@ globalThis.Request = class Request {
         referrer = value;
       } else {
         const resolved = host.__tbResolveUrl(__tbToUSVString(value), undefined);
-        if (resolved === null) throw new TypeError('Invalid referrer');
-        // A referrer cross-origin to the current settings object is not
-        // exposed; it becomes "about:client"
+        if (resolved == null) throw new TypeError('Invalid referrer');
+        // A referrer cross-origin to the settings object is not exposed; it
+        // becomes "client". An opaque origin is never same origin, and it
+        // serializes as "null", so it needs its own check
         // (<https://fetch.spec.whatwg.org/#dom-request-referrer>).
-        const base = host.__tbResolveUrl('', undefined);
-        const baseOrigin = base === null ? null : new URL(base).origin;
-        referrer = baseOrigin !== null && new URL(resolved).origin === baseOrigin ? resolved : 'about:client';
+        const origin = host.__tbOrigin();
+        referrer = origin !== 'null' && new URL(resolved).origin === origin
+          ? resolved
+          : 'about:client';
       }
     } else {
       referrer = source === null ? 'about:client' : source.referrer;

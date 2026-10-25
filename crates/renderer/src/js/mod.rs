@@ -1134,6 +1134,7 @@ impl JsRealm {
         let object_url_contents = world.clone();
         let object_url_type = world.clone();
         let url_resolve = world.clone();
+        let document_origin = world.clone();
 
         bridge::object(ctx)?.set(
             "__cookieGet",
@@ -1206,6 +1207,15 @@ impl JsRealm {
                 };
                 resolved.map(|url| url.to_string())
             }),
+        )?;
+
+        // The serialized origin of this realm's settings object. A document's
+        // URL cannot supply it: `about:blank`, `about:srcdoc`, and `data:`
+        // documents carry an inherited tuple origin
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+        bridge::object(ctx)?.set(
+            "__tbOrigin",
+            Func::from(move || document_origin.borrow().origin_string()),
         )?;
         Ok(())
     }
