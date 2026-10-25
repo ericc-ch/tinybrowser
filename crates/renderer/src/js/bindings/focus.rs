@@ -1,6 +1,5 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
-use super::node::element;
 use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for_node, wrap_node};
 
 use markup5ever::{LocalName, Namespace, QualName};
@@ -238,7 +237,12 @@ fn has_activation(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
     let Some(element) = tree.data.downcast_element() else {
         return false;
     };
-    if element.name.ns != html_namespace() {
+    // An SVG `a` element has the same activation behavior as its HTML
+    // counterpart
+    // (<https://svgwg.org/svg2-draft/interact.html#SVGLinkElementEventHandling>).
+    let svg_anchor =
+        element.name.ns == crate::dom::tree::svg_namespace() && element.name.local.as_str() == "a";
+    if element.name.ns != html_namespace() && !svg_anchor {
         return false;
     }
     match element.name.local.as_str() {
@@ -613,22 +617,20 @@ pub(super) fn cannot_navigate(world: &World, node: NodeId) -> bool {
 /// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>):
 /// the `noreferrer` link type wins, otherwise the `referrerpolicy` content
 /// attribute, whose keywords are the referrer policies and whose invalid value
-/// default is the empty string. An empty policy leaves the initiator document's
-/// policy in force.
-fn hyperlink_referrer_policy(base: &blitz_dom::BaseDocument, node: BlitzId) -> String {
+/// default is unset. An unset policy leaves the initiator document's policy in
+/// force.
+fn hyperlink_referrer_policy(
+    base: &blitz_dom::BaseDocument,
+    node: BlitzId,
+) -> Option<net::ReferrerPolicy> {
     if attr(base, node, "rel")
         .unwrap_or_default()
         .split_ascii_whitespace()
         .any(|token| token.eq_ignore_ascii_case("noreferrer"))
     {
-        return "no-referrer".to_owned();
+        return Some(net::ReferrerPolicy::NoReferrer);
     }
-    element::reflect_enum(
-        attr(base, node, "referrerpolicy"),
-        element::REFERRER_POLICY_KEYWORDS,
-        "",
-        "",
-    )
+    attr(base, node, "referrerpolicy").and_then(net::ReferrerPolicy::parse)
 }
 
 /// The label element's activation behavior: a click on the label or a
@@ -738,84 +740,88 @@ fn is_interactive_content(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool
     }
 }
 
+/// What activating `node` does: the activation behavior, the form owner a
+/// submit/reset targets, and whether the behavior consumes transient
+/// activation.
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>)
+fn activation_behavior(world: &World, node: NodeId) -> Option<(Activation, Option<NodeId>, bool)> {
+    let parsed = world.document(node)?;
+    let base = &parsed.document.base;
+    let tree = base.get_node(node.node)?;
+    let element = tree.data.downcast_element()?;
+    // An SVG `a` element has the same follow-the-hyperlink activation
+    // behavior as its HTML counterpart
+    // (<https://svgwg.org/svg2-draft/interact.html#SVGLinkElementEventHandling>).
+    let svg_anchor =
+        element.name.ns == crate::dom::tree::svg_namespace() && element.name.local.as_str() == "a";
+    if element.name.ns != html_namespace() && !svg_anchor {
+        return None;
+    }
+    let mut consumes_activation = false;
+    let activation = match element.name.local.as_str() {
+        "input" => {
+            let kind = crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text);
+            // The input activation behavior shows the picker for these states,
+            // which consumes the transient activation
+            // (<https://html.spec.whatwg.org/multipage/input.html#input-activation-behavior>).
+            consumes_activation = matches!(
+                kind,
+                InputType::Color
+                    | InputType::Date
+                    | InputType::DatetimeLocal
+                    | InputType::File
+                    | InputType::Month
+                    | InputType::Time
+                    | InputType::Week
+            );
+            match kind {
+                // An image button submits with its coordinates; the submission
+                // shim decides whether to add them
+                // (<https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):activation-behavior>).
+                InputType::Submit | InputType::Image => Activation::Submit,
+                InputType::Reset => Activation::Reset,
+                InputType::Checkbox | InputType::Radio => Activation::ToggleCheckedness,
+                _ => Activation::None,
+            }
+        }
+        "button" => {
+            // A button with a command but no explicit `type` runs the command
+            // behavior instead of submitting
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
+            let explicit = attr(base, node.node, "type");
+            let has_command = attr(base, node.node, "command").is_some()
+                || attr(base, node.node, "commandfor").is_some();
+            if explicit.is_none() && has_command {
+                Activation::None
+            } else {
+                // `type` is an enumerated attribute: no trimming. The missing
+                // and invalid defaults are Auto (submit); button has an
+                // activation behavior that does nothing
+                // (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-button-type>).
+                match explicit {
+                    Some(value) if value.eq_ignore_ascii_case("reset") => Activation::Reset,
+                    Some(value) if value.eq_ignore_ascii_case("button") => Activation::None,
+                    _ => Activation::Submit,
+                }
+            }
+        }
+        // An anchor without `href` has no activation behavior.
+        "a" | "area" if attr(base, node.node, "href").is_some() => Activation::Link,
+        _ => Activation::None,
+    };
+    let form = form_owner_of(base, node.document, node.node);
+    Some((activation, form, consumes_activation))
+}
+
 /// The activation behavior of a clicked control: a submit button submits its
 /// form owner with itself as submitter, a reset button resets it, and a
 /// checkbox or radio updates its checkedness
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
 fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let world = world_for_node(ctx, node)?;
-    let (activation, form, consumes_activation) = {
-        let world = world.borrow();
-        let Some(parsed) = world.document(node) else {
-            return Ok(());
-        };
-        let base = &parsed.document.base;
-        let Some(tree) = base.get_node(node.node) else {
-            return Ok(());
-        };
-        let Some(element) = tree.data.downcast_element() else {
-            return Ok(());
-        };
-        if element.name.ns != html_namespace() {
-            return Ok(());
-        }
-        let mut consumes_activation = false;
-        let activation = match element.name.local.as_str() {
-            "input" => {
-                let kind =
-                    crate::dom::input::input_type(base, node.node).unwrap_or(InputType::Text);
-                // The input activation behavior shows the picker for these
-                // states, which consumes the transient activation
-                // (<https://html.spec.whatwg.org/multipage/input.html#input-activation-behavior>).
-                consumes_activation = matches!(
-                    kind,
-                    InputType::Color
-                        | InputType::Date
-                        | InputType::DatetimeLocal
-                        | InputType::File
-                        | InputType::Month
-                        | InputType::Time
-                        | InputType::Week
-                );
-                match kind {
-                    // An image button submits with its coordinates; the
-                    // submission shim decides whether to add them
-                    // (<https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):activation-behavior>).
-                    InputType::Submit | InputType::Image => Activation::Submit,
-                    InputType::Reset => Activation::Reset,
-                    InputType::Checkbox | InputType::Radio => Activation::ToggleCheckedness,
-                    _ => Activation::None,
-                }
-            }
-            "button" => {
-                // A button with a command but no explicit `type` runs the
-                // command behavior instead of submitting
-                // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
-                let explicit = crate::dom::tree::attr(base, node.node, "type");
-                let has_command = crate::dom::tree::attr(base, node.node, "command").is_some()
-                    || crate::dom::tree::attr(base, node.node, "commandfor").is_some();
-                if explicit.is_none() && has_command {
-                    Activation::None
-                } else {
-                    // `type` is an enumerated attribute: no trimming. The
-                    // missing and invalid defaults are Auto (submit); button
-                    // has an activation behavior that does nothing
-                    // (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-button-type>).
-                    match explicit {
-                        Some(value) if value.eq_ignore_ascii_case("reset") => Activation::Reset,
-                        Some(value) if value.eq_ignore_ascii_case("button") => Activation::None,
-                        _ => Activation::Submit,
-                    }
-                }
-            }
-            // An anchor without `href` has no activation behavior.
-            "a" | "area" if crate::dom::tree::attr(base, node.node, "href").is_some() => {
-                Activation::Link
-            }
-            _ => Activation::None,
-        };
-        let form = form_owner_of(base, node.document, node.node);
-        (activation, form, consumes_activation)
+    let Some((activation, form, consumes_activation)) = activation_behavior(&world.borrow(), node)
+    else {
+        return Ok(());
     };
     if consumes_activation {
         world.borrow_mut().consume_user_activation();

@@ -16,7 +16,9 @@ use url::Url;
 
 use crate::Parsed;
 use crate::ReadyState;
-use crate::js::{DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, World};
+use crate::js::{
+    DocumentStreamCommand, FrameNavigation, FrameRuntime, JsRuntimeHandle, PolicyContainer, World,
+};
 use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
 use crate::protocol::{
     BrowserEvent, BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent,
@@ -29,14 +31,28 @@ use self::load::{LoadDelay, LoadDelayGuard};
 pub(crate) mod dial;
 mod dials;
 mod drain;
+
 mod intern;
 mod load;
 
 pub(crate) use crate::js::ScriptValue;
 
-/// A child frame document this document created for the engine to adopt:
-/// frame, `iframe` container, and the document itself.
-pub(crate) type CreatedFrame = (FrameId, crate::dom::tree::NodeId, Document);
+/// A frame document this document created for the engine to adopt.
+///
+/// A child navigable is owned by the `iframe` that asked for it; an auxiliary
+/// context has no container and keeps the frame that opened it
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
+pub(crate) enum CreatedFrame {
+    Child {
+        frame: FrameId,
+        container: crate::dom::tree::NodeId,
+        document: Document,
+    },
+    Auxiliary {
+        frame: FrameId,
+        document: Document,
+    },
+}
 
 /// Concurrent `fetch` jobs one document may keep in flight.
 const MAX_PENDING_JS_FETCHES: usize = 256;
@@ -132,6 +148,11 @@ pub(crate) enum DialContext {
         /// The embedding document, when this navigation is a nested browsing
         /// context. `None` for the top-level document.
         embedder: Option<FrameId>,
+        /// The flags the container's `sandbox` attribute and the embedder's
+        /// active set impose. They take effect when the response commits, not
+        /// when the navigation starts
+        /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#determine-navigation-params>).
+        sandbox: crate::js::world::SandboxFlags,
     },
     /// A Blitz subresource (stylesheet, image, font) fetch. The response
     /// handler waits in [`Document::blitz_handlers`] under this id; delivery
@@ -175,7 +196,11 @@ impl QueuedDial {
             DialContext::JsFetch { .. } => crate::protocol::DialKind::JsFetch,
             DialContext::ClassicScript { .. } => crate::protocol::DialKind::ClassicScript,
             DialContext::FrameLoad { .. } => crate::protocol::DialKind::FrameLoad,
-            DialContext::BlitzResource { .. } => crate::protocol::DialKind::Image,
+            DialContext::BlitzResource { destination, .. } => match destination {
+                Some(crate::csp::Destination::StyleSheet) => crate::protocol::DialKind::Stylesheet,
+                Some(crate::csp::Destination::Font) => crate::protocol::DialKind::Font,
+                _ => crate::protocol::DialKind::Image,
+            },
             DialContext::CspReport => crate::protocol::DialKind::CspReport,
         }
     }
@@ -183,18 +208,24 @@ impl QueuedDial {
     /// A fresh GET dial: the shape of every dial but a form submission and a
     /// page `fetch`. The call sites that need more set the request's fields
     /// directly (`dial.req.…`).
-    pub(crate) fn new(context: DialContext, url: &Url, initiator: &Url) -> Self {
+    pub(crate) fn new(
+        context: DialContext,
+        url: &Url,
+        initiator: &url::Origin,
+        referrer_url: &Url,
+    ) -> Self {
         Self {
             req: crate::protocol::DialRequest {
                 kind: Self::dial_kind(&context),
                 url: url.to_string(),
-                initiator: initiator.to_string(),
+                initiator: initiator.ascii_serialization(),
+                referrer_url: referrer_url.to_string(),
                 read_body: true,
                 method: "GET".to_owned(),
                 body: Vec::new(),
                 content_type: None,
                 headers: Vec::new(),
-                referrer: None,
+                referrer: net::Referrer::NoReferrer,
                 timeout_ms: 0,
                 csp: None,
                 cors: None,
@@ -203,8 +234,7 @@ impl QueuedDial {
                 integrity: None,
                 cache: None,
                 stream_body: false,
-                referrer_source: None,
-                referrer_policy: None,
+                referrer_policy: net::ReferrerPolicy::default(),
             },
             context,
             ancestors: Vec::new(),
@@ -260,8 +290,29 @@ pub(crate) enum ImageLifecycle {
     Disconnected(crate::dom::tree::NodeId),
 }
 
+/// The state a local-scheme document needs to be installed again: a
+/// session-history entry for an `about:blank` or `about:srcdoc` document
+/// restores the document it held instead of re-fetching it
+/// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
+#[derive(Clone)]
+pub(crate) struct LocalDocumentState {
+    /// The document URL, `about:blank` or `about:srcdoc`.
+    pub(crate) url: Url,
+    /// The fallback base URL the creator supplied.
+    pub(crate) base_url: Option<Url>,
+    /// The document's own referrer, unredacted.
+    pub(crate) referrer: String,
+    /// The URL `"client"` referrers resolve against.
+    pub(crate) referrer_url: Url,
+    pub(crate) origin: url::Origin,
+    pub(crate) policy: PolicyContainer,
+    pub(crate) sandbox: crate::js::world::SandboxFlags,
+}
+
 struct Timer {
-    when: Instant,
+    /// `None` when the delay overflows the clock: the timer never fires
+    /// (<https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout>).
+    when: Option<Instant>,
     fired: bool,
     /// The script-visible id, when this timer belongs to a realm.
     js_id: Option<i32>,
@@ -285,27 +336,50 @@ fn subresource_destination(
     }
 }
 
+/// Builds and queues the initial `about:blank` document for one connected
+/// `iframe` so `contentDocument` is available in the inserting script
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
+///
+/// The nested realm is deferred: `QuickJS` cannot enter a new context while
+/// the parent script still runs.
 fn materialize_iframe_document(
     world_rc: &Rc<RefCell<World>>,
     frame: FrameId,
     container: crate::dom::tree::NodeId,
     new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
 ) {
-    let (runtime, base_url, origin, init_scripts, viewport) = {
+    let (runtime, base_url, referrer_url, init_scripts, viewport) = {
         let world = world_rc.borrow();
         (
             world.runtime.clone(),
             world.document_url.clone(),
-            world.origin.clone(),
+            world.referrer_url.clone(),
             Rc::clone(&world.init_scripts),
             world.viewport_size.get(),
         )
     };
+    // The container's `sandbox` attribute, unioned with the embedder's active
+    // flags, decides the flag set for every document this frame loads
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+    let sandbox = sandboxing_flags(world_rc, container);
+    let origin = if sandbox.origin_is_opaque() {
+        url::Origin::new_opaque()
+    } else {
+        world_rc.borrow().origin.clone()
+    };
     let mut document = Document::with_shared(frame, &runtime, &init_scripts);
     document.set_viewport_size(viewport);
+    {
+        let world_handle = document.world();
+        let mut world = world_handle.borrow_mut();
+        world.policy = world_rc.borrow().policy.clone();
+        world.sandbox = sandbox;
+    }
     document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
-    let inherited = world_rc.borrow().csp.clone();
-    document.world().borrow_mut().csp = inherited;
+    // The initial blank reports its creator's URL, walked out of a `srcdoc`
+    // chain the same way the referrer source is
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
+    document.set_document_referrer(referrer_url.as_str());
     if let Some(root) = document.document_root() {
         world_rc
             .borrow()
@@ -313,7 +387,91 @@ fn materialize_iframe_document(
             .borrow_mut()
             .set_frame_document(container, root);
     }
-    new_frames.borrow_mut().push((frame, container, document));
+    new_frames.borrow_mut().push(CreatedFrame::Child {
+        frame,
+        container,
+        document,
+    });
+}
+
+/// Builds the initial `about:blank` document of an auxiliary top-level
+/// context opened by `world_rc`'s realm
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
+///
+/// The document inherits its creator's origin, policy container, sandboxing
+/// flags, base URL, and viewport, and reports the creator's full URL as its
+/// referrer. Its URL stays `about:blank`. The realm is deferred, because
+/// `window.open` runs inside the opener's realm and a nested `QuickJS` realm
+/// cannot be entered there; the engine creates it when it adopts the frame.
+fn materialize_auxiliary_document(
+    world_rc: &Rc<RefCell<World>>,
+    frame: FrameId,
+    options: crate::js::world::AuxiliaryOptions,
+    new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
+) {
+    let (runtime, url, origin, policy, sandbox, init_scripts, viewport) = {
+        let world = world_rc.borrow();
+        (
+            world.runtime.clone(),
+            world.document_url.clone(),
+            world.origin.clone(),
+            world.policy.clone(),
+            world.sandbox.auxiliary_flags(),
+            Rc::clone(&world.init_scripts),
+            world.viewport_size.get(),
+        )
+    };
+    let mut document = Document::with_shared(frame, &runtime, &init_scripts);
+    document.set_viewport_size(viewport);
+    // The sandbox flags are installed before the blank document is built: an
+    // inherited sandboxed-origin flag decides the origin `load_about_blank_tree`
+    // captures
+    // (<https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context>).
+    {
+        let world_handle = document.world();
+        let mut world = world_handle.borrow_mut();
+        world.policy = policy;
+        world.sandbox = sandbox;
+    }
+    let origin = if sandbox.origin_is_opaque() {
+        url::Origin::new_opaque()
+    } else {
+        origin
+    };
+    document.load_about_blank_tree(Some(url.as_str()), Some(origin));
+    if options.noreferrer {
+        document.set_document_referrer("");
+    }
+    new_frames
+        .borrow_mut()
+        .push(CreatedFrame::Auxiliary { frame, document });
+}
+
+/// The sandboxing flags the `iframe` at `container` imposes: its `sandbox`
+/// content attribute unioned with the active flags of the document that owns
+/// it
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+pub(crate) fn sandboxing_flags(
+    world_rc: &Rc<RefCell<World>>,
+    container: crate::dom::tree::NodeId,
+) -> crate::js::world::SandboxFlags {
+    let world = world_rc.borrow();
+    let Some(parsed) = world.document(container) else {
+        return world.sandbox;
+    };
+    let base = &parsed.document.base;
+    if !crate::dom::tree::is_html_element(base, container.node, "iframe") {
+        return world.sandbox;
+    }
+    let attribute = crate::dom::tree::attr(base, container.node, "sandbox");
+    crate::js::world::SandboxFlags::parse(attribute).union(world.sandbox)
+}
+
+/// One parse-time step over a document's element tree, in tree order.
+enum ParseStep {
+    Base(crate::dom::tree::NodeId),
+    Meta(crate::dom::tree::NodeId),
+    Script(crate::dom::tree::NodeId),
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
@@ -331,6 +489,9 @@ pub(crate) struct Document {
     net_provider: std::sync::Arc<crate::render::TinyNetProvider>,
     /// Blitz link/form navigations, drained into frame navigations on tick.
     blitz_nav: std::sync::Arc<crate::render::TinyNav>,
+    /// Blitz shell: a mutation that changes rendered output asks for a frame,
+    /// which is this document's cue to resolve style and layout.
+    blitz_shell: std::sync::Arc<crate::render::TinyShell>,
     /// Blitz subresource fetches awaiting carrier dials.
     blitz_fetch_rx:
         std::sync::mpsc::Receiver<(crate::render::BlitzFetch, crate::render::CountingHandler)>,
@@ -342,6 +503,11 @@ pub(crate) struct Document {
     /// Raw subresource bytes by URL, so a repeat Blitz fetch for a URL reuses
     /// bytes instead of dialing again.
     subresource_bytes: HashMap<String, Vec<u8>>,
+    /// Referrer policy each fetched CSS style sheet's response carried, keyed
+    /// by the URL the sheet was located at. A request the sheet initiates uses
+    /// it and the sheet's URL, not the document's own
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    style_policies: HashMap<String, net::ReferrerPolicy>,
     /// The browsing context this document belongs to.
     frame: FrameId,
     /// The frame's persistent viewport in device pixels (the scale is fixed
@@ -388,12 +554,29 @@ pub(crate) struct Document {
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
     /// Each value is that container's delay token.
     pending_frame_loads: HashMap<crate::dom::tree::NodeId, LoadDelayGuard>,
+    /// Traversals of this frame's own session history, queued by
+    /// `history.back()`/`go()`. The engine owns a child navigable's entries,
+    /// so it applies them after the script stops; the main frame's traversal
+    /// belongs to the browser tab.
+    frame_traversals: Vec<i32>,
     /// Child frame documents this document's realm created for the engine to
     /// adopt
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable>).
     new_frames: Rc<RefCell<Vec<CreatedFrame>>>,
     /// Whether this document's `load` event has fired.
     load_fired: bool,
+    /// Whether the shared declarative refresh steps already ran for this
+    /// document; a later `Refresh` value is ignored
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+    will_declaratively_refresh: bool,
+    /// The target of a refresh waiting for the document to finish loading,
+    /// with its delay. The clock starts at the completely-loaded point, not
+    /// when the value was parsed.
+    pending_refresh: Option<(Url, std::time::Duration)>,
+    /// The timer a refresh is waiting on, so a new navigation can cancel it.
+    refresh_timer: Option<u32>,
+    /// The URL an armed refresh navigates to when its timer fires.
+    refresh_target: Option<Url>,
     events: Vec<RendererEvent>,
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
@@ -437,7 +620,11 @@ pub(crate) struct Document {
     response_policy: crate::csp::List,
     /// `Referrer-Policy` from the response being parsed, applied after the
     /// parser installs the new document (the state reset clears the realm).
-    response_referrer_policy: Option<String>,
+    response_referrer_policy: Option<net::ReferrerPolicy>,
+    /// The policy container a local-scheme document inherits, installed
+    /// atomically after the parser replaces the document's state
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#policy-containers>).
+    inherited_policy: Option<PolicyContainer>,
     /// When set, [`Document::install_parsed`] replaces the world's policy
     /// with the response headers. A script's `document.open()` leaves it
     /// unset so the existing policy survives.
@@ -478,6 +665,105 @@ impl Drop for Document {
     }
 }
 
+/// Parses one declarative refresh value: `"<seconds>"` or
+/// `"<seconds>; url=<url>"`, with or without the `url=` prefix, optional
+/// quotes, and any ASCII whitespace. `None` is the algorithm's early return,
+/// which means the value names nothing to refresh to. The target defaults to
+/// the document's own URL.
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+fn parse_declarative_refresh(
+    input: &str,
+    document_url: &Url,
+) -> Option<(Url, std::time::Duration)> {
+    let mut position = 0;
+    skip_ascii_whitespace(input, &mut position);
+    let time_start = position;
+    while next_char(input, position).is_some_and(|c| c.is_ascii_digit()) {
+        position += 1;
+    }
+    let time = if position == time_start {
+        if next_char(input, position) != Some('.') {
+            return None;
+        }
+        0
+    } else {
+        input[time_start..position]
+            .parse::<u64>()
+            .unwrap_or(u64::MAX)
+    };
+    while next_char(input, position).is_some_and(|c| c.is_ascii_digit() || c == '.') {
+        position += 1;
+    }
+    let mut target = document_url.clone();
+    if position < input.len() {
+        let separator = next_char(input, position)?;
+        if separator != ';' && separator != ',' && !separator.is_ascii_whitespace() {
+            return None;
+        }
+        skip_ascii_whitespace(input, &mut position);
+        if matches!(next_char(input, position), Some(';' | ',')) {
+            position += 1;
+        }
+        skip_ascii_whitespace(input, &mut position);
+    }
+    if position < input.len() {
+        let mut url_start = position;
+        // `url=` is optional and case-insensitive. A prefix without `=` falls
+        // through to the URL text itself, so `0; urlish` is a relative URL.
+        if starts_with_ascii_case(&input[position..], "url") {
+            let mut probe = position + 3;
+            skip_ascii_whitespace(input, &mut probe);
+            if next_char(input, probe) == Some('=') {
+                probe += 1;
+                skip_ascii_whitespace(input, &mut probe);
+                url_start = probe;
+            }
+        }
+        let mut text = input.get(url_start..)?;
+        let quote = match text.chars().next() {
+            Some(quote @ ('\'' | '"')) => {
+                text = &text[1..];
+                Some(quote)
+            }
+            _ => None,
+        };
+        let text = match quote {
+            Some(quote) => text.split_once(quote).map_or(text, |(before, _)| before),
+            None => text,
+        };
+        let text = text.trim();
+        // The document's own URL stands when the value names nothing.
+        target = if text.is_empty() {
+            document_url.clone()
+        } else {
+            document_url.join(text).ok()?
+        };
+        if target.scheme() == "javascript" {
+            return None;
+        }
+    }
+    Some((target, std::time::Duration::from_secs(time)))
+}
+
+fn skip_ascii_whitespace(input: &str, position: &mut usize) {
+    while let Some(rest) = input.get(*position..) {
+        match rest.chars().next() {
+            Some(character) if character.is_ascii_whitespace() => {
+                *position += character.len_utf8();
+            }
+            _ => break,
+        }
+    }
+}
+
+fn next_char(input: &str, position: usize) -> Option<char> {
+    input.get(position..)?.chars().next()
+}
+
+fn starts_with_ascii_case(input: &str, prefix: &str) -> bool {
+    input.len() >= prefix.len() && input[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
 impl Document {
     /// A document sharing its renderer process's `QuickJS` heap, wake handle,
     /// document store, realm registry, and frame tree.
@@ -496,14 +782,27 @@ impl Document {
         )));
         runtime.registry.borrow_mut().insert_frame(frame, &world);
         // Document creation belongs to this layer: the realm asks the frame
-        // host for a child document and never names a document type.
+        // host for a child or auxiliary document and never names a document
+        // type.
         let new_frames: Rc<RefCell<Vec<CreatedFrame>>> = Rc::new(RefCell::new(Vec::new()));
-        world.borrow_mut().set_frame_host(Rc::new({
-            let new_frames = Rc::clone(&new_frames);
-            move |world_rc: &Rc<RefCell<World>>, frame, container| {
-                materialize_iframe_document(world_rc, frame, container, &new_frames);
-            }
-        }));
+        world
+            .borrow_mut()
+            .set_frame_host(crate::js::world::FrameHost {
+                child: Rc::new({
+                    let new_frames = Rc::clone(&new_frames);
+                    move |world_rc: &Rc<RefCell<World>>, frame, container| {
+                        materialize_iframe_document(world_rc, frame, container, &new_frames);
+                    }
+                }),
+                auxiliary: Rc::new({
+                    let new_frames = Rc::clone(&new_frames);
+                    move |world_rc: &Rc<RefCell<World>>,
+                          frame,
+                          options: crate::js::world::AuxiliaryOptions| {
+                        materialize_auxiliary_document(world_rc, frame, options, &new_frames);
+                    }
+                }),
+            });
         // Blitz subresources enqueue here and ride carrier dials: the
         // renderer owns no network runtime of its own.
         let (blitz_tx, blitz_rx) = std::sync::mpsc::channel();
@@ -516,10 +815,12 @@ impl Document {
             wake: Arc::clone(&runtime.wake),
             net_provider,
             blitz_nav,
+            blitz_shell: std::sync::Arc::new(crate::render::TinyShell::new()),
             blitz_fetch_rx: blitz_rx,
             blitz_handlers: HashMap::new(),
             blitz_request_urls: HashMap::new(),
             subresource_bytes: HashMap::new(),
+            style_policies: HashMap::new(),
             frame,
             viewport_size: crate::engine::DEFAULT_VIEWPORT,
             shared: Rc::clone(&runtime.shared),
@@ -535,8 +836,13 @@ impl Document {
             stylesheet_generation: 0,
             initial_blank: true,
             pending_frame_loads: HashMap::new(),
+            frame_traversals: Vec::new(),
             new_frames,
             load_fired: false,
+            will_declaratively_refresh: false,
+            pending_refresh: None,
+            refresh_timer: None,
+            refresh_target: None,
             events: Vec::new(),
             events_overflowed: false,
             js: None,
@@ -554,6 +860,7 @@ impl Document {
             response_content_type: None,
             response_policy: crate::csp::List::default(),
             response_referrer_policy: None,
+            inherited_policy: None,
             embedder_csp_reports: Vec::new(),
             csp_from_response: false,
             reporting_endpoints: Vec::new(),
@@ -586,6 +893,22 @@ impl Document {
                 document: parsed.id,
                 node: parsed.document.base.root_node().id,
             })
+    }
+
+    /// The `iframe`'s `referrerpolicy` attribute parsed to a policy, or
+    /// `None` when absent or invalid, which leaves the document's policy in
+    /// force
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-referrerpolicy>).
+    #[must_use]
+    pub(crate) fn frame_referrer_policy(
+        &self,
+        container: crate::dom::tree::NodeId,
+    ) -> Option<net::ReferrerPolicy> {
+        let world = self.world.borrow();
+        world.document(container).and_then(|parsed| {
+            crate::dom::tree::attr(&parsed.document.base, container.node, "referrerpolicy")
+                .and_then(net::ReferrerPolicy::parse)
+        })
     }
 
     /// The `iframe`'s `src` attribute value, when the element has a
@@ -678,28 +1001,50 @@ impl Document {
         if pending.is_empty() {
             return;
         }
-        let (runtime, base_url, origin, init_scripts, viewport) = {
+        let (runtime, base_url, referrer_url, origin, init_scripts, viewport) = {
             let world = self.world.borrow();
             (
                 world.runtime.clone(),
                 world.document_url.clone(),
+                world.referrer_url.clone(),
                 world.origin.clone(),
                 Rc::clone(&world.init_scripts),
                 world.viewport_size.get(),
             )
         };
         let mut loaded = Vec::with_capacity(pending.len());
-        let inherited = self.world.borrow().csp.clone();
+        let inherited = self.world.borrow().policy.clone();
         for (frame, container) in pending {
+            // Parser-created and script-created frames share this funnel's
+            // rule: the container's `sandbox` attribute unioned with this
+            // document's active flags decides the set, and an opaque origin
+            // when the origin flag is in it
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-creation-sandboxing-flags>).
+            let sandbox = sandboxing_flags(&self.world, container);
+            let origin = if sandbox.origin_is_opaque() {
+                url::Origin::new_opaque()
+            } else {
+                origin.clone()
+            };
             let mut document = Document::with_shared(frame, &runtime, &init_scripts);
             // Frames created from parsed markup share the tab's viewport too.
             // This path runs before page script, so the realm can exist for
             // `contentWindow` in the following classic script
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:html-element-insertion-steps>).
             document.set_viewport_size(viewport);
-            document.load_about_blank(Some(base_url.as_str()), Some(origin.clone()));
-            document.world().borrow_mut().csp = inherited.clone();
-            loaded.push((frame, container, document));
+            {
+                let world_handle = document.world();
+                let mut world = world_handle.borrow_mut();
+                world.policy = inherited.clone();
+                world.sandbox = sandbox;
+            }
+            document.load_about_blank(Some(base_url.as_str()), Some(origin));
+            document.set_document_referrer(referrer_url.as_str());
+            loaded.push(CreatedFrame::Child {
+                frame,
+                container,
+                document,
+            });
         }
         self.new_frames.borrow_mut().extend(loaded);
     }
@@ -723,6 +1068,62 @@ impl Document {
     #[must_use]
     pub(crate) fn inherited_url(&self) -> String {
         self.url.as_str().to_owned()
+    }
+
+    /// Sets the referrer the active document reports. Local-scheme installs
+    /// have no navigation request to read one from; their document reports
+    /// the creator's URL instead
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
+    pub(crate) fn set_document_referrer(&mut self, referrer: &str) {
+        let mut world = self.world.borrow_mut();
+        referrer.clone_into(&mut world.document_referrer);
+    }
+
+    /// The state this document needs to be installed again from a
+    /// session-history entry.
+    pub(crate) fn local_document_state(&self) -> LocalDocumentState {
+        let world = self.world.borrow();
+        LocalDocumentState {
+            url: self.url.clone(),
+            base_url: world.base_url.clone(),
+            referrer: world.document_referrer.clone(),
+            referrer_url: world.referrer_url.clone(),
+            origin: world.origin.clone(),
+            policy: world.policy.clone(),
+            sandbox: world.sandbox,
+        }
+    }
+
+    /// Installs this frame's saved local-scheme document again, without a
+    /// navigation request: a history traversal reuses the entry's document
+    /// state (origin, policy container, referrer) exactly as it was created
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step>).
+    pub(crate) fn restore_local_document(
+        &mut self,
+        state: &LocalDocumentState,
+        srcdoc: Option<&str>,
+    ) {
+        // A traversed-to entry is always a document the frame navigated to,
+        // never the blank created at insertion.
+        self.initial_blank = false;
+        self.world.borrow_mut().sandbox = state.sandbox;
+        if let Some(markup) = srcdoc {
+            let base = state.base_url.as_ref().unwrap_or(&state.url);
+            self.load_frame_srcdoc(
+                base,
+                &state.referrer_url,
+                state.origin.clone(),
+                &state.policy,
+                markup,
+            );
+            return;
+        }
+        self.load_about_blank(
+            state.base_url.as_ref().map(Url::as_str),
+            Some(state.origin.clone()),
+        );
+        self.set_document_referrer(&state.referrer);
+        self.world.borrow_mut().policy = state.policy.clone();
     }
 
     pub(crate) fn take_lifecycle(&mut self) -> (Vec<IframeLifecycle>, Vec<ImageLifecycle>) {
@@ -802,6 +1203,11 @@ impl Document {
         navigations
     }
 
+    /// Takes the traversals of this frame's own session history.
+    pub(crate) fn take_frame_traversals(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.frame_traversals)
+    }
+
     pub(crate) fn take_stream_publish(&mut self) -> Option<bool> {
         self.stream_publish.take()
     }
@@ -831,6 +1237,79 @@ impl Document {
         self.world.borrow_mut().forget_image(element);
     }
 
+    /// Applies CSP `upgrade-insecure-requests` to the request URL of one queued
+    /// dial.
+    ///
+    /// The rewrite happens at the top of main fetch, before the request leaves
+    /// the renderer: an `http` request URL becomes `https`. A nested navigation
+    /// always upgrades because the embedder's security state depends on it; a
+    /// top-level navigation upgrades only a host in the document's upgrade set,
+    /// which is the protected resource's own host and port. Every other request
+    /// upgrades unconditionally
+    /// (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
+    fn queue_dial(&mut self, mut dial: QueuedDial) {
+        if self.world.borrow().policy.csp.upgrades_insecure_requests() {
+            let nested = matches!(
+                dial.context,
+                DialContext::FrameLoad {
+                    embedder: Some(_),
+                    ..
+                }
+            );
+            let upgrades = if dial.req.kind == crate::protocol::DialKind::FrameLoad && !nested {
+                // A top-level navigation must target the protected resource's
+                // own host and port, so a policy cannot upgrade a link to a
+                // third party
+                // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
+                Self::same_host_port(&dial.req.url, self.url.as_str())
+            } else {
+                true
+            };
+            if upgrades {
+                Self::upgrade_scheme(&mut dial.req.url);
+            }
+        }
+        // A navigation request advertises the client's upgrade capability so a
+        // server can feature-detect it
+        // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-requests-http-request-header-field>).
+        if dial.req.kind == crate::protocol::DialKind::FrameLoad
+            && !dial
+                .req
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("upgrade-insecure-requests"))
+        {
+            dial.req
+                .headers
+                .push(("Upgrade-Insecure-Requests".to_owned(), "1".to_owned()));
+        }
+        self.dials.queue(dial, &self.load_delay);
+    }
+
+    /// Whether `left` and `right` name the same host and port
+    /// (<https://url.spec.whatwg.org/#concept-url-host>).
+    fn same_host_port(left: &str, right: &str) -> bool {
+        let (Ok(left), Ok(right)) = (Url::parse(left), Url::parse(right)) else {
+            return false;
+        };
+        left.host_str() == right.host_str()
+            && left.port_or_known_default() == right.port_or_known_default()
+    }
+
+    /// Rewrites one serialized URL's scheme from `http` to `https`, leaving
+    /// every other scheme alone.
+    fn upgrade_scheme(spec: &mut String) {
+        let Ok(mut url) = Url::parse(spec) else {
+            return;
+        };
+        if url.scheme() != "http" {
+            return;
+        }
+        if url.set_scheme("https").is_ok() {
+            *spec = url.to_string();
+        }
+    }
+
     /// Starts one frame-load dial. `req` is the wire request, with the method,
     /// body, `Content-Type`, referrer, and the embedder's `frame-src` redirect
     /// gate already on it; `ancestors` are the ancestor URLs the child
@@ -842,20 +1321,18 @@ impl Document {
         embedder: Option<FrameId>,
         mut req: crate::protocol::DialRequest,
         ancestors: Vec<Url>,
+        sandbox: crate::js::world::SandboxFlags,
     ) {
         req.kind = crate::protocol::DialKind::FrameLoad;
         req.read_body = true;
         self.dials.cancel_frame_loads();
         self.initial_blank = false;
-        self.dials.queue(
-            QueuedDial {
-                context: DialContext::FrameLoad { embedder },
-                req,
-                ancestors,
-                integrity: None,
-            },
-            &self.load_delay,
-        );
+        self.queue_dial(QueuedDial {
+            context: DialContext::FrameLoad { embedder, sandbox },
+            req,
+            ancestors,
+            integrity: None,
+        });
     }
 
     /// Gives a blank document the URL `about:blank` and the creator's base
@@ -869,27 +1346,38 @@ impl Document {
             return;
         };
         let blank = Url::parse("about:blank").expect("about:blank is a valid URL");
-        self.set_document_url(blank, inherited_origin);
+        let origin = self.sandboxed_origin(inherited_origin);
+        self.set_document_url(blank, origin);
         self.world.borrow_mut().base_url = Some(base);
     }
 
-    /// Loads the frame's initial `about:blank`, with `inherited_url` as its
+    /// Installs an `about:blank` document, with `inherited_url` as its
     /// fallback base URL and `inherited_origin` as the captured origin. The
     /// document URL stays `about:blank`: it is what `location.href` reports,
     /// while relative URLs still resolve against the creator's base URL
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>,
     /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>,
     /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    ///
+    /// This installs a blank for either a frame's first document or a
+    /// navigation to `about:blank`, so it leaves [`Self::initial_blank`]
+    /// alone: [`Self::load_about_blank_tree`] marks the first document, and a
+    /// navigation to `about:blank` is a session history entry like any other
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
     pub(crate) fn load_about_blank(
         &mut self,
         inherited_url: Option<&str>,
         inherited_origin: Option<url::Origin>,
     ) {
         self.apply_blank_url(inherited_url, inherited_origin);
+        // A blank document's referrer is its creator's URL, unredacted by any
+        // policy: the initial `about:blank` was never fetched
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
+        self.world.borrow_mut().document_referrer =
+            inherited_url.map_or_else(String::new, ToOwned::to_owned);
         // No HTTP response stands behind a blank document.
         self.http_status = 0;
         self.load_html("");
-        self.initial_blank = true;
         self.ensure_js_ok();
     }
 
@@ -903,20 +1391,25 @@ impl Document {
     pub(crate) fn load_frame_srcdoc(
         &mut self,
         base: &Url,
+        referrer_url: &Url,
         origin: url::Origin,
-        policy: &crate::csp::List,
-        referrer_policy: &str,
+        policy: &PolicyContainer,
         markup: &str,
     ) {
         let url = Url::parse("about:srcdoc").expect("about:srcdoc parses");
         self.http_status = 0;
-        self.set_document_url(url, Some(origin));
+        let origin = self.sandboxed_origin(Some(origin));
+        self.set_document_url(url, origin);
         {
             let mut world = self.world.borrow_mut();
             world.base_url = Some(base.clone());
-            world.csp = policy.clone();
-            referrer_policy.clone_into(&mut world.state.referrer_policy);
+            world.referrer_url = referrer_url.clone();
+            // A `srcdoc` document's referrer is its creator's URL, like the
+            // initial `about:blank` it replaces
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
+            world.document_referrer = referrer_url.to_string();
         }
+        self.inherited_policy = Some(policy.clone());
         self.initial_blank = false;
         self.load_html(markup);
     }
@@ -933,6 +1426,10 @@ impl Document {
         inherited_origin: Option<url::Origin>,
     ) {
         self.apply_blank_url(inherited_url, inherited_origin);
+        // The initial blank reports its creator's URL as its referrer
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
+        self.world.borrow_mut().document_referrer =
+            inherited_url.map_or_else(String::new, ToOwned::to_owned);
         self.defer_js = true;
         self.load_html("");
         self.defer_js = false;
@@ -976,7 +1473,9 @@ impl Document {
         source: &str,
         policy: &crate::csp::List,
     ) {
-        if script.is_empty() {
+        // A `javascript:` navigation does nothing while scripting is disabled
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
+        if script.is_empty() || self.world.borrow().sandbox.scripts_disabled() {
             return;
         }
         let violations = Self::navigation_script_violations(policy, &self.url, source);
@@ -992,6 +1491,18 @@ impl Document {
             Ok(result) if !result.is_empty() => self.load_html(&result),
             Ok(_) => {}
             Err(_) => self.record_event(RendererEvent::ScriptFailed),
+        }
+    }
+
+    /// The origin a document this frame creates gets: a new opaque origin when
+    /// the frame is sandboxed without `allow-same-origin`. Same-document URL
+    /// updates keep the origin they already have, so they bypass this
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
+    fn sandboxed_origin(&self, origin: Option<url::Origin>) -> Option<url::Origin> {
+        if self.world.borrow().sandbox.origin_is_opaque() {
+            Some(url::Origin::new_opaque())
+        } else {
+            origin
         }
     }
 
@@ -1299,6 +1810,7 @@ impl Document {
             });
         }
         self.set_history(&mount.head.history);
+        self.set_document_referrer("");
         self.install_response(&mount.head, &mount.body, None);
         Ok(())
     }
@@ -1366,9 +1878,12 @@ impl Document {
         // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
         // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
         match Url::parse(&head.url) {
-            Ok(url) => self.set_document_url(url, origin),
+            Ok(url) => {
+                let origin = self.sandboxed_origin(origin);
+                self.set_document_url(url, origin);
+            }
             Err(_) => {
-                if let Some(origin) = origin {
+                if let Some(origin) = self.sandboxed_origin(origin) {
                     self.set_document_url(self.url.clone(), Some(origin));
                 }
             }
@@ -1404,14 +1919,18 @@ impl Document {
                 head.content_security_policy_report_only.as_deref(),
             )
         });
-        self.response_referrer_policy
-            .clone_from(&head.referrer_policy);
+        self.response_referrer_policy = head.inherited_referrer_policy.or(head.referrer_policy);
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
         self.mime_guard = crate::sniff::MimeGuard {
             no_sniff: head.no_sniff,
             http: head.http_response,
         };
+        // A response `Refresh` starts the document's one declarative refresh
+        // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+        if let Some(refresh) = &head.refresh {
+            self.start_declarative_refresh(refresh);
+        }
     }
 
     /// Installs a complete response head and body: [`Self::install_head`]
@@ -1553,6 +2072,30 @@ impl Document {
         true
     }
 
+    /// Runs inline scripts that were inserted from another realm while this
+    /// document had none, now that its realm can exist. Returns whether any
+    /// script was taken, so the engine reconciles what it did.
+    pub(crate) fn run_deferred_scripts(&mut self) -> bool {
+        let scripts = self.world.borrow_mut().take_deferred_scripts();
+        if scripts.is_empty() {
+            return false;
+        }
+        if !self.ensure_js_ok() {
+            return true;
+        }
+        for id in scripts {
+            let failed = self
+                .js
+                .as_ref()
+                .is_none_or(|js| js.run_deferred_inline_script(id).is_err());
+            if failed {
+                self.record_event(RendererEvent::ScriptFailed);
+            }
+        }
+        self.adopt_js_work();
+        true
+    }
+
     fn ensure_js(&mut self) -> Result<(), TabError> {
         if self.js.is_none() {
             self.js = Some(
@@ -1653,6 +2196,12 @@ impl Document {
             shared.detach_child_frames(self.frame);
         }
         self.load_fired = false;
+        self.will_declaratively_refresh = false;
+        self.pending_refresh = None;
+        if let Some(id) = self.refresh_timer.take() {
+            self.timers.remove(&id);
+        }
+        self.refresh_target = None;
         self.pending_frame_loads.clear();
         for (_, handler) in self.blitz_handlers.drain() {
             Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
@@ -1660,6 +2209,7 @@ impl Document {
         self.blitz_request_urls.clear();
         while self.blitz_fetch_rx.try_recv().is_ok() {}
         self.subresource_bytes.clear();
+        self.style_policies.clear();
         self.world.borrow_mut().clear_images();
         self.image_selected_src.clear();
         self.in_flight_images.clear();
@@ -1741,7 +2291,8 @@ impl Document {
                 as std::sync::Arc<dyn blitz_traits::net::NetProvider>),
             navigation_provider: Some(std::sync::Arc::clone(&self.blitz_nav)
                 as std::sync::Arc<dyn blitz_traits::navigation::NavigationProvider>),
-            shell_provider: Some(std::sync::Arc::new(crate::render::TinyShell)),
+            shell_provider: Some(std::sync::Arc::clone(&self.blitz_shell)
+                as std::sync::Arc<dyn blitz_traits::shell::ShellProvider>),
             base_url: Some(crate::render::blitz_base_url(&base_url)),
             font_ctx: Some(self.shared_font_ctx()),
             ..blitz_dom::DocumentConfig::default()
@@ -1780,7 +2331,7 @@ impl Document {
             // Style resolution and scripts both read the viewport; apply the
             // frame's size before the realm evaluates anything.
             self.apply_viewport();
-            self.install_response_csp();
+            self.install_policy();
             self.mark_parser_scripts();
             if skip_js {
                 return true;
@@ -1791,7 +2342,7 @@ impl Document {
             self.register_document(document);
             self.apply_viewport();
             self.bind_realm_document();
-            self.install_response_csp();
+            self.install_policy();
             self.mark_parser_scripts();
             true
         }
@@ -1829,20 +2380,16 @@ impl Document {
 
     /// Replaces the world's policy with the response headers when this parse
     /// came from a navigation. `document.open()` leaves the flag unset.
-    fn install_response_csp(&mut self) {
-        if !self.csp_from_response {
+    fn install_policy(&mut self) {
+        if self.csp_from_response {
+            self.world.borrow_mut().policy = PolicyContainer {
+                csp: self.response_policy.clone(),
+                referrer_policy: self.response_referrer_policy,
+            };
             return;
         }
-        let mut world = self.world.borrow_mut();
-        world.csp = self.response_policy.clone();
-        if let Some(policy) = self
-            .response_referrer_policy
-            .as_deref()
-            .and_then(net::referrer_policy_from_header)
-        {
-            policy.clone_into(&mut world.state.referrer_policy);
-        } else {
-            world.state.referrer_policy.clear();
+        if let Some(policy) = self.inherited_policy.take() {
+            self.world.borrow_mut().policy = policy;
         }
     }
 
@@ -2048,6 +2595,24 @@ impl Document {
         self.world.borrow_mut().apply_meta_policy(id);
     }
 
+    /// A parser-inserted `<meta name=referrer>` sets the document's policy,
+    /// mirroring the JS insertion path
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+    fn apply_meta_referrer(&mut self, id: crate::dom::tree::NodeId) {
+        let policy = self.world.borrow().document(id).and_then(|parsed| {
+            let base = &parsed.document.base;
+            let name = crate::dom::tree::attr(base, id.node, "name").unwrap_or_default();
+            if !name.eq_ignore_ascii_case("referrer") {
+                return None;
+            }
+            let content = crate::dom::tree::attr(base, id.node, "content").unwrap_or_default();
+            net::ReferrerPolicy::from_meta(content)
+        });
+        if let Some(policy) = policy {
+            self.world.borrow_mut().policy.referrer_policy = Some(policy);
+        }
+    }
+
     pub(in crate::document) fn inline_script_violations(
         &self,
         source: &str,
@@ -2060,7 +2625,7 @@ impl Document {
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
-        world.csp.check_inline(
+        world.policy.csp.check_inline(
             &self.url,
             &crate::csp::InlineScript {
                 source,
@@ -2107,7 +2672,7 @@ impl Document {
                 (nonce, integrity)
             },
         );
-        world.csp.check_request(
+        world.policy.csp.check_request(
             &world.origin,
             &world.document_url,
             url,
@@ -2278,11 +2843,16 @@ impl Document {
     /// Queues one violation report POST. The response is dropped and the
     /// dial never gates load.
     fn queue_report(&mut self, url: &Url, body: Vec<u8>, content_type: &str) {
-        let mut dial = QueuedDial::new(DialContext::CspReport, url, &self.url);
+        let mut dial = QueuedDial::new(
+            DialContext::CspReport,
+            url,
+            &self.dial_initiator(),
+            &self.referrer_url(),
+        );
         "POST".clone_into(&mut dial.req.method);
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
     }
 
     /// The Reporting API envelope for a violation, with the
@@ -2325,6 +2895,55 @@ impl Document {
         .into_bytes()
     }
 
+    /// The document's `<base>`, referrer-policy `<meta>`, CSP `<meta>`, and
+    /// script elements in tree order: the steps a parse owes once its tree
+    /// exists. A script element only joins the walk while scripting is
+    /// enabled, so a sandboxed frame still applies its meta referrer policy
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    fn parse_steps(&self) -> Vec<ParseStep> {
+        let world = self.world.borrow();
+        let Some(parsed) = world.main_document() else {
+            return Vec::new();
+        };
+        let base = &parsed.document.base;
+        let document = parsed.id;
+        let mut steps = Vec::new();
+        let mut stack = vec![base.root_node().id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = base.get_node(id) else {
+                continue;
+            };
+            let node_id = crate::dom::tree::NodeId { document, node: id };
+            // A `<meta name=referrer>` applies its policy in the same
+            // insertion steps as a CSP meta
+            // (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
+            let referrer_meta = crate::dom::tree::is_html_element(base, id, "meta")
+                && crate::dom::tree::attr(base, id, "name")
+                    .is_some_and(|name| name.eq_ignore_ascii_case("referrer"));
+            if referrer_meta || crate::csp::meta_policy(base, id).is_some() {
+                steps.push(ParseStep::Meta(node_id));
+            }
+            // A `<base href>` changes the base URL for the elements parsed
+            // after it, so the walk carries the first one it meets. A script's
+            // request URL is fixed when the parser reaches its end tag, which
+            // tree order reproduces: a `<base>` later in the document must not
+            // rewrite an earlier script's URL
+            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+            if crate::dom::tree::is_html_element(base, id, "base")
+                && crate::dom::tree::attr(base, id, "href").is_some()
+            {
+                steps.push(ParseStep::Base(node_id));
+            }
+            if crate::dom::tree::is_html_element(base, id, "script")
+                && !world.sandbox.scripts_disabled()
+            {
+                steps.push(ParseStep::Script(node_id));
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        steps
+    }
+
     /// Runs every not-yet-executed script in tree order, stopping (returning
     /// true) when a `src` fetch starts: the fetch completion resumes the
     /// walk, so later scripts still run in order
@@ -2333,46 +2952,33 @@ impl Document {
     /// <https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext>
     /// <https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>
     fn run_scripts(&mut self) -> bool {
-        enum Step {
-            Meta(crate::dom::tree::NodeId),
-            Script(crate::dom::tree::NodeId),
-        }
-        let steps: Vec<Step> = {
-            let world = self.world.borrow();
-            let Some(parsed) = world.main_document() else {
-                return false;
-            };
-            let base = &parsed.document.base;
-            let document = parsed.id;
-            let mut steps = Vec::new();
-            let mut stack = vec![base.root_node().id];
-            while let Some(id) = stack.pop() {
-                let Some(node) = base.get_node(id) else {
-                    continue;
-                };
-                let node_id = crate::dom::tree::NodeId { document, node: id };
-                if crate::csp::meta_policy(base, id).is_some() {
-                    steps.push(Step::Meta(node_id));
-                }
-                if crate::dom::tree::is_html_element(base, id, "script") {
-                    steps.push(Step::Script(node_id));
-                }
-                stack.extend(node.children.iter().rev().copied());
-            }
-            steps
-        };
-        let has_script = steps.iter().any(|step| matches!(step, Step::Script(_)));
+        let steps = self.parse_steps();
+        let has_script = steps
+            .iter()
+            .any(|step| matches!(step, ParseStep::Script(_)));
         if has_script && !self.ensure_js_ok() {
             return false;
         }
+        let mut parse_base = self.fallback_base_url();
+        let mut base_seen = false;
         let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         for step in steps {
             let id = match step {
-                Step::Meta(id) => {
+                ParseStep::Base(id) => {
+                    if !base_seen {
+                        base_seen = true;
+                        if let Some(href) = self.base_element_href(id) {
+                            parse_base = parse_base.join(&href).unwrap_or(parse_base);
+                        }
+                    }
+                    continue;
+                }
+                ParseStep::Meta(id) => {
+                    self.apply_meta_referrer(id);
                     self.apply_meta_csp(id);
                     continue;
                 }
-                Step::Script(id) => id,
+                ParseStep::Script(id) => id,
             };
             if !self.executed_scripts.insert(id) {
                 continue;
@@ -2411,7 +3017,7 @@ impl Document {
                     self.eval_classic(&source, Some(id), line, &filename);
                 }
                 Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
-                    if self.start_src_script(id, &src, launched) {
+                    if self.start_src_script(id, &src, launched, &parse_base) {
                         return true;
                     }
                 }
@@ -2456,11 +3062,12 @@ impl Document {
         id: crate::dom::tree::NodeId,
         src: &str,
         launched: bool,
+        base: &Url,
     ) -> bool {
         if launched {
             return false;
         }
-        let Ok(url) = self.resolve_dial_url(src) else {
+        let Ok(url) = Self::resolve_script_url(base, src) else {
             return false;
         };
         let violations = self.script_url_violations(&url, id);
@@ -2471,12 +3078,20 @@ impl Document {
             return false;
         }
         self.parser_blocked_script = Some(id);
-        let mut dial = QueuedDial::new(DialContext::ClassicScript { element: id }, &url, &self.url);
+        let referrer_policy = self.subresource_referrer(Some(id));
+        let mut dial = QueuedDial::new(
+            DialContext::ClassicScript { element: id },
+            &url,
+            &self.dial_initiator(),
+            &self.referrer_url(),
+        );
+        dial.req.referrer = net::Referrer::Client;
+        dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
         dial.integrity = self.script_integrity(id);
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
         true
     }
 
@@ -2490,6 +3105,30 @@ impl Document {
         })
     }
 
+    /// The request referrer and policy a page subresource sends: the
+    /// element's `referrerpolicy` content attribute when present and valid,
+    /// the document's policy otherwise, and the client environment as the
+    /// source. Sampled when the element starts its request, which is where
+    /// HTML creates the request, so a later `<meta name=referrer>` does not
+    /// rewrite an earlier element's policy
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy>,
+    /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    fn subresource_referrer(
+        &self,
+        element: Option<crate::dom::tree::NodeId>,
+    ) -> net::ReferrerPolicy {
+        let world = self.world.borrow();
+        element
+            .and_then(|element| {
+                world.document(element).and_then(|parsed| {
+                    crate::dom::tree::attr(&parsed.document.base, element.node, "referrerpolicy")
+                        .and_then(net::ReferrerPolicy::parse)
+                })
+            })
+            .or(world.policy.referrer_policy)
+            .unwrap_or_default()
+    }
+
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
         let url = self
             .resolve_frame_url(spec)
@@ -2500,6 +3139,24 @@ impl Document {
             return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
+    }
+
+    /// The origin a dial from this document claims as its initiator. The
+    /// inherited origin, never the URL: `<base href>` changes the base URL
+    /// but not the document origin, and the browser derives CORS and the
+    /// site lock from this value
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>,
+    /// <https://fetch.spec.whatwg.org/#concept-request-origin>).
+    pub(crate) fn dial_initiator(&self) -> url::Origin {
+        self.world.borrow().origin.clone()
+    }
+
+    /// The document URL the `"client"` referrer branch reads. For an
+    /// `iframe srcdoc` document this walks to the container document's URL,
+    /// which the world already captured
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    pub(crate) fn referrer_url(&self) -> Url {
+        self.world.borrow().referrer_url.clone()
     }
 
     /// This frame's base URL: the first `base` element's `href` resolved
@@ -2523,6 +3180,36 @@ impl Document {
             return document_url;
         };
         document_url.join(&href).unwrap_or(document_url)
+    }
+
+    /// The URL a document's `<base href>` elements resolve against: the
+    /// document URL, or the creator's base URL for an `about:srcdoc`
+    /// document
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fallback-base-url>).
+    fn fallback_base_url(&self) -> Url {
+        let world = self.world.borrow();
+        world.base_url.clone().unwrap_or_else(|| self.url.clone())
+    }
+
+    /// A `<base>` element's `href` value.
+    fn base_element_href(&self, id: crate::dom::tree::NodeId) -> Option<String> {
+        let world = self.world.borrow();
+        let parsed = world.document(id)?;
+        crate::dom::tree::attr(&parsed.document.base, id.node, "href").map(str::to_owned)
+    }
+
+    /// Resolves a parser-inserted script's `src` against the base URL in
+    /// effect where the parser reached it. Only schemes a dial can fetch are
+    /// script resources
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element>).
+    fn resolve_script_url(base: &Url, spec: &str) -> Result<Url, TabError> {
+        let url = Url::parse(spec)
+            .or_else(|_| base.join(spec))
+            .map_err(|_| TabError::InvalidUrl { spec: spec.into() })?;
+        if !matches!(url.scheme(), "http" | "https" | "data") {
+            return Err(TabError::InvalidUrl { spec: spec.into() });
+        }
+        Ok(url)
     }
 
     pub(in crate::document) fn finish_dial(&mut self, done: CompletedDial) {
@@ -2606,7 +3293,7 @@ impl Document {
                     self.resume_scripts();
                 }
             }
-            DialContext::FrameLoad { embedder } => {
+            DialContext::FrameLoad { embedder, sandbox } => {
                 // A redirect the embedder's `frame-src` refuses is not loaded.
                 // Report-only still reports and then loads.
                 // <https://w3c.github.io/webappsec-csp/#should-block-response>
@@ -2617,11 +3304,26 @@ impl Document {
                 {
                     // Leave the current document in place.
                 } else if let Ok(url) = Url::parse(&outcome.final_url) {
+                    // The flags enter the frame with the document they
+                    // govern, so a failed or cancelled navigation leaves the
+                    // current document under its own flags.
+                    self.world.borrow_mut().sandbox = sandbox;
                     self.commit_frame_response(&outcome, &url, embedder, &ancestors);
                 }
             }
             DialContext::BlitzResource { id, destination } => {
-                self.deliver_blitz_resource(id, destination, &outcome, &req.url, redirected);
+                let cors_clean = req
+                    .cors
+                    .as_ref()
+                    .is_some_and(|cors| cors.mode == net::cors::RequestMode::Cors);
+                self.deliver_blitz_resource(
+                    id,
+                    destination,
+                    &outcome,
+                    &req.url,
+                    redirected,
+                    cors_clean,
+                );
             }
             // Fire-and-forget: the endpoint already stored the report, if it
             // cares. A failure is invisible by design.
@@ -2672,12 +3374,20 @@ impl Document {
         let Ok(body) = &outcome.body else {
             return;
         };
+        // Set before the parse runs: the new document's own scripts read
+        // `document.referrer` while their inline scripts execute. The value is
+        // the referrer the browser actually sent on the final hop, so redirect
+        // policy and downgrade rules cannot disagree with the header
+        // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+        self.set_document_referrer(outcome.referrer.as_deref().unwrap_or_default());
         self.install_frame_response(&head, body, None);
     }
 
     /// Hands one Blitz subresource response to its handler. A redirect the
     /// policy refuses is a failed load: empty bytes, and an `error` on the
-    /// element when the tree has one.
+    /// element when the tree has one. `cors_clean` records that the request
+    /// went out in CORS mode and survived the check, which makes the loaded
+    /// image origin-clean for canvas.
     fn deliver_blitz_resource(
         &mut self,
         id: u64,
@@ -2685,6 +3395,7 @@ impl Document {
         outcome: &DialOutcome,
         request_url: &str,
         redirected: bool,
+        cors_clean: bool,
     ) {
         let blocked = redirected
             && destination.is_some_and(|destination| {
@@ -2697,6 +3408,36 @@ impl Document {
         {
             self.subresource_bytes
                 .insert(outcome.final_url.clone(), body.clone());
+        }
+        // A style sheet's response is the policy source for every request the
+        // sheet initiates: its own `Referrer-Policy` when it sent one, else the
+        // document policy the sheet inherited at fetch time. Record it under
+        // both the requested and the final URL, because Blitz files the sheet
+        // under the URL it asked for
+        // (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+        if destination == Some(crate::csp::Destination::StyleSheet)
+            && !blocked
+            && (200..300).contains(&outcome.status)
+        {
+            let inherited = self
+                .world
+                .borrow()
+                .policy
+                .referrer_policy
+                .unwrap_or_default();
+            let policy = net::ReferrerPolicy::from_header(
+                outcome
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
+                    .map(|(_, value)| value.as_str()),
+            )
+            .unwrap_or(inherited);
+            self.style_policies
+                .insert(outcome.final_url.clone(), policy);
+            if request_url != outcome.final_url {
+                self.style_policies.insert(request_url.to_owned(), policy);
+            }
         }
         let Some(handler) = self.blitz_handlers.remove(&id) else {
             return;
@@ -2726,7 +3467,7 @@ impl Document {
         // current for the next capture instead of waiting for one to pump
         // the resolve loop.
         self.settle_blitz_layout();
-        self.settle_image_waiters(&request_url);
+        self.settle_image_waiters(&request_url, cors_clean);
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
@@ -2783,7 +3524,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&request_url);
+                    self.settle_image_waiters(&request_url, false);
                 }
             }
         }
@@ -2933,6 +3674,58 @@ impl Document {
         }
     }
 
+    /// Runs the shared declarative refresh steps for one value, from a
+    /// `Refresh` response head or a `meta http-equiv=refresh`. The first value
+    /// wins; a later one is ignored
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+    fn start_declarative_refresh(&mut self, value: &str) {
+        if self.will_declaratively_refresh
+            || self
+                .world
+                .borrow()
+                .sandbox
+                .contains(crate::js::world::SandboxFlags::AUTOMATIC_FEATURES)
+        {
+            return;
+        }
+        let document_url = self.world.borrow().document_url.clone();
+        let Some((target, delay)) = parse_declarative_refresh(value, &document_url) else {
+            return;
+        };
+        self.will_declaratively_refresh = true;
+        self.pending_refresh = Some((target, delay));
+        self.arm_refresh();
+    }
+
+    /// Starts a pending refresh's clock. The delay is measured from the
+    /// document's completely-loaded point, or from the `meta` insertion when
+    /// the document already loaded
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+    fn arm_refresh(&mut self) {
+        if !self.load_fired || self.refresh_timer.is_some() {
+            return;
+        }
+        let Some((target, delay)) = self.pending_refresh.take() else {
+            return;
+        };
+        self.refresh_target = Some(target);
+        let id = self.schedule_timer(delay);
+        self.refresh_timer = Some(id);
+    }
+
+    /// Navigates this document's browsing context to its armed refresh target,
+    /// using this document as the navigation's source.
+    fn fire_refresh(&mut self) {
+        let Some(target) = self.refresh_target.take() else {
+            return;
+        };
+        let navigation = FrameNavigation::get(
+            crate::js::NavigationTarget::Target("_self".to_owned()),
+            target.to_string(),
+        );
+        self.world.borrow_mut().queue_frame_navigation(navigation);
+    }
+
     /// The single `load` check. Readiness must have reached `interactive`, the
     /// delay count must be zero, and any Blitz request that a completion just
     /// produced is made a dial first, so its guard exists before the count is
@@ -2951,6 +3744,7 @@ impl Document {
         }
         self.complete_ready_state();
         self.load_fired = true;
+        self.arm_refresh();
         self.record_event(RendererEvent::Browser(BrowserEvent::Load));
         self.fire_js(crate::js::JsRealm::fire_load);
         self.adopt_js_work();
@@ -3008,7 +3802,7 @@ impl Document {
             if let Some(bytes) = self.subresource_bytes.get(&url).cloned() {
                 Box::new(handler).bytes(url.clone(), blitz_traits::net::Bytes::from(bytes));
                 self.settle_blitz_layout();
-                self.settle_image_waiters(&url);
+                self.settle_image_waiters(&url, false);
                 continue;
             }
             // Per-destination policy: a blocked stylesheet, image, or font is
@@ -3016,11 +3810,10 @@ impl Document {
             // releases the resource as failed
             // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
             let destination = subresource_destination(fetch.kind);
+            let element = self.subresource_target(&fetch.url);
             if let Some(destination) = destination {
                 let violations = self.subresource_violations(&fetch.url, destination);
-                let target = self
-                    .subresource_target(&fetch.url)
-                    .or_else(|| self.document_node());
+                let target = element.or_else(|| self.document_node());
                 if !violations.is_empty()
                     && let Some(target) = target
                 {
@@ -3028,7 +3821,7 @@ impl Document {
                 }
                 if crate::csp::blocks(&violations) {
                     Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
-                    if let Some(element) = target {
+                    if let Some(element) = element {
                         if matches!(destination, crate::csp::Destination::Img) {
                             // The image lifecycle reports the error when the
                             // DOM walk reaches the element, so scripts that
@@ -3042,7 +3835,7 @@ impl Document {
                         }
                     }
                     self.settle_blitz_layout();
-                    self.settle_image_waiters(&url);
+                    self.settle_image_waiters(&url, false);
                     continue;
                 }
             }
@@ -3052,16 +3845,61 @@ impl Document {
             // provider never sees the document URL, so it stamps the target
             // as initiator and the document corrects it here
             // (<https://fetch.spec.whatwg.org/#concept-request-initiator>).
+            let (referrer, referrer_policy) = match fetch.style_sheet.clone() {
+                // A request a style sheet initiates uses the sheet's URL as
+                // its referrer and the policy that sheet's response carried,
+                // not the document's
+                // (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+                Some(sheet) => {
+                    let policy = self
+                        .style_policies
+                        .get(sheet.as_str())
+                        .copied()
+                        .or(self.world.borrow().policy.referrer_policy)
+                        .unwrap_or_default();
+                    (net::Referrer::Url(sheet), policy)
+                }
+                None => (net::Referrer::Client, self.subresource_referrer(element)),
+            };
             let mut dial = QueuedDial::new(
                 DialContext::BlitzResource {
                     id: fetch.id,
                     destination,
                 },
                 &fetch.url,
-                &self.url,
+                &self.dial_initiator(),
+                &self.referrer_url(),
             );
+            dial.req.referrer = referrer;
+            dial.req.referrer_policy = referrer_policy;
+            // An image with a `crossorigin` content attribute loads in CORS
+            // mode: the network sends `Origin` and refuses the load without a
+            // valid `Access-Control-Allow-Origin`; a load that survives marks
+            // the image origin-clean for canvas
+            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
+            // <https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+            if destination == Some(crate::csp::Destination::Img) {
+                dial.req.cors = element.and_then(|element| {
+                    let world = self.world.borrow();
+                    let parsed = world.main_document()?;
+                    let base = &parsed.document.base;
+                    let cross = crate::dom::tree::attr(base, element.node, "crossorigin");
+                    let credentials = match cross.map(str::trim) {
+                        Some(value) if value.eq_ignore_ascii_case("use-credentials") => {
+                            net::cors::CredentialsMode::Include
+                        }
+                        Some(_) => net::cors::CredentialsMode::SameOrigin,
+                        None => return None,
+                    };
+                    Some(crate::protocol::CorsRequest {
+                        mode: net::cors::RequestMode::Cors,
+                        credentials,
+                        redirect: net::cors::RedirectMode::Follow,
+                    })
+                });
+            }
             dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
-            self.dials.queue(dial, &self.load_delay);
+            self.queue_dial(dial);
         }
     }
 
@@ -3070,7 +3908,7 @@ impl Document {
         destination: crate::csp::Destination,
     ) -> crate::RedirectGate {
         let world = self.world.borrow();
-        crate::RedirectGate::new(world.csp.clone(), &world.origin, destination)
+        crate::RedirectGate::new(world.policy.csp.clone(), &world.origin, destination)
     }
 
     /// Records `frame-src` violations for a redirect and reports whether the
@@ -3155,7 +3993,7 @@ impl Document {
         };
         let violations = {
             let world = self.world.borrow();
-            world.csp.check_redirected_request(
+            world.policy.csp.check_redirected_request(
                 &world.origin,
                 &world.document_url,
                 &url,
@@ -3179,6 +4017,7 @@ impl Document {
     ) -> Vec<crate::csp::Violation> {
         let world = self.world.borrow();
         world
+            .policy
             .csp
             .check_request(&world.origin, &world.document_url, url, destination, None)
     }
@@ -3316,9 +4155,12 @@ impl Document {
         }
     }
 
-    /// Settles every waiter selected for `url` from Blitz's decoded state:
-    /// decoded dimensions fire `load`, anything else fires `error`.
-    fn settle_image_waiters(&mut self, url: &str) {
+    /// Settles the in-flight image elements waiting on `url`: decoded
+    /// dimensions fire `load`, anything else fires `error`. `cors_clean`
+    /// marks the elements' settled request as origin-clean for canvas: the
+    /// request went out in CORS mode and survived the check. Every other
+    /// settle path passes `false`, which falls back to the same-origin rule.
+    fn settle_image_waiters(&mut self, url: &str, cors_clean: bool) {
         let waiting: Vec<crate::dom::tree::NodeId> = self
             .in_flight_images
             .keys()
@@ -3332,6 +4174,9 @@ impl Document {
         for element in &waiting {
             self.in_flight_images.remove(element);
             let selected = self.image_selected_src.remove(element).unwrap_or_default();
+            if cors_clean {
+                self.world.borrow_mut().images.cors_clean.insert(*element);
+            }
             if let Some((width, height)) = self.blitz_image_dims(*element) {
                 self.world
                     .borrow_mut()

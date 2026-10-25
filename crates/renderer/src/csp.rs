@@ -352,6 +352,20 @@ pub(crate) fn parse_reporting_endpoints_value(combined: &str) -> Vec<(String, St
 }
 
 impl List {
+    /// Whether any enforced policy opts its document into upgrading insecure
+    /// requests
+    /// (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-requests>).
+    #[must_use]
+    pub(crate) fn upgrades_insecure_requests(&self) -> bool {
+        self.policies.iter().any(|policy| {
+            policy.disposition == Disposition::Enforce
+                && policy
+                    .directives
+                    .iter()
+                    .any(|(name, _)| name == "upgrade-insecure-requests")
+        })
+    }
+
     /// Header policies from a navigation response. Absent headers yield an
     /// empty list, which allows every request.
     #[must_use]

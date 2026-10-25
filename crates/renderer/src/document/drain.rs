@@ -12,11 +12,15 @@ use crate::protocol::{BrowserEvent, RendererEvent};
 const MAX_REALM_REQUESTS_PER_TURN: usize = 1024;
 
 impl Document {
-    /// Runs one batch of ready work and reports whether more may follow.
+    /// Runs one batch of ready work and reports whether the engine must
+    /// reconcile and run another pass: a task ran (its side effects include a
+    /// queued navigation or a new iframe the next task must see), or the
+    /// document already has follow-up work.
     ///
     /// The engine calls this instead of draining the whole document at once so
     /// it can reconcile frame documents between tasks: a task that inserts an
-    /// iframe must be visible to the next task's `contentDocument` read.
+    /// iframe must be visible to the next task's `contentDocument` read, and a
+    /// navigation queued by the last task must still be applied.
     pub(crate) fn drain_step(&mut self) -> bool {
         self.adopt_dial_completions();
         while let Some(id) = self.due_timer() {
@@ -34,13 +38,29 @@ impl Document {
         // its deadline. A task outside a drain still opens its own turn.
         let _turn = self.js.as_ref().map(crate::js::JsRealm::enter_turn);
         self.run_task(task);
-        let fired = self.check_load();
-        !self.stop.is_set() && (fired || self.has_pending_frame_loads() || self.has_ready_work())
+        // A mutation that changes rendered output asks the shell for a frame.
+        // Before the document fires `load`, the load-time resolve settles the
+        // tree; afterwards this is the only cue that starts the image fetches
+        // a newly inserted style sheet or `style` attribute introduced, so the
+        // tree stays current for the turn's follow-up reads.
+        if self.load_fired && self.blitz_shell.take_redraw() {
+            self.settle_blitz_layout();
+        }
+        self.check_load();
+        // A task ran even when nothing is left: the engine still reconciles the
+        // queued navigations and child frames it produced
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).
+        !self.stop.is_set()
     }
 
     /// Whether a task is queued or a timer is already due.
     pub(crate) fn has_ready_work(&self) -> bool {
         if !self.tasks.is_empty() || self.dials.has_queued() {
+            return true;
+        }
+        // A queued navigation or history traversal is engine work the next
+        // reconcile applies, even though no task carries it.
+        if !self.frame_traversals.is_empty() || self.world.borrow().has_frame_navigations() {
             return true;
         }
         if self.world.borrow().has_outbox_work() {
@@ -49,7 +69,7 @@ impl Document {
         let now = Instant::now();
         self.timers
             .values()
-            .any(|timer| !timer.fired && timer.when <= now)
+            .any(|timer| !timer.fired && timer.when.is_some_and(|when| when <= now))
     }
 
     fn adopt_dial_completions(&mut self) {
@@ -67,17 +87,17 @@ impl Document {
         self.timers
             .values()
             .filter(|timer| !timer.fired)
-            .map(|timer| timer.when)
+            .filter_map(|timer| timer.when)
             .min()
     }
 
-    fn schedule_timer(&mut self, delay: Duration) -> u32 {
+    pub(crate) fn schedule_timer(&mut self, delay: Duration) -> u32 {
         let id = self.next_timer_id;
         self.next_timer_id = self.next_timer_id.saturating_add(1);
         self.timers.insert(
             id,
             Timer {
-                when: Instant::now() + delay,
+                when: Instant::now().checked_add(delay),
                 fired: false,
                 js_id: None,
             },
@@ -155,6 +175,7 @@ impl Document {
                                 body: Ok(body),
                                 response_type: net::cors::ResponseType::Basic,
                                 redirect_count: 0,
+                                referrer: None,
                                 stream: None,
                             },
                         });
@@ -183,6 +204,10 @@ impl Document {
         match task {
             Task::Timer(id) => {
                 self.record_event(RendererEvent::Timer(id));
+                if self.refresh_timer == Some(id) {
+                    self.refresh_timer = None;
+                    self.fire_refresh();
+                }
                 if let Some(timer) = self.timers.remove(&id)
                     && let Some(js_id) = timer.js_id
                 {
@@ -256,6 +281,9 @@ impl Document {
             RealmRequest::Fetch(fetch) => self.queue_js_fetch(*fetch),
             RealmRequest::AbortFetch(js_id) => self.dials.cancel_fetch(js_id),
             RealmRequest::Script(element) => self.queue_dynamic_script(element),
+            RealmRequest::DeclarativeRefresh(value) => {
+                self.start_declarative_refresh(&value);
+            }
             RealmRequest::Image(element) => {
                 self.world.borrow_mut().image_update_started(element);
                 self.queue_image(element, ImageUpdate::SrcChanged);
@@ -273,9 +301,16 @@ impl Document {
                 }));
             }
             RealmRequest::HistoryTraverse { delta } => {
-                self.record_event(RendererEvent::Browser(BrowserEvent::HistoryTraversal {
-                    delta,
-                }));
+                if self.frame == crate::protocol::FrameId::MAIN {
+                    self.record_event(RendererEvent::Browser(BrowserEvent::HistoryTraversal {
+                        delta,
+                    }));
+                } else {
+                    // A child navigable keeps its own entries in the engine,
+                    // which owns its documents; the browser tab holds only the
+                    // main frame's.
+                    self.frame_traversals.push(delta);
+                }
             }
             RealmRequest::CspViolation(target, violations) => {
                 self.fire_csp_violations(target, &violations);
@@ -294,6 +329,12 @@ impl Document {
     /// A connected `<script src>` element queued its prepare steps from
     /// script; the fetch starts here.
     fn queue_dynamic_script(&mut self, element: NodeId) {
+        // Scripting is disabled in a sandboxed frame without `allow-scripts`:
+        // a script element never executes, however it was inserted
+        // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
+        if self.world.borrow().sandbox.scripts_disabled() {
+            return;
+        }
         let Some((src, started)) = self.world.borrow().with_document(element, |parsed| {
             (
                 crate::dom::tree::attr(&parsed.document.base, element.node, "src")
@@ -324,7 +365,15 @@ impl Document {
             self.tasks.push_back(Task::NodeError(element));
             return;
         }
-        let mut dial = QueuedDial::new(DialContext::ClassicScript { element }, &url, &self.url);
+        let referrer_policy = self.subresource_referrer(Some(element));
+        let mut dial = QueuedDial::new(
+            DialContext::ClassicScript { element },
+            &url,
+            &self.dial_initiator(),
+            &self.referrer_url(),
+        );
+        dial.req.referrer = net::Referrer::Client;
+        dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
@@ -333,7 +382,7 @@ impl Document {
         // the set of scripts that will execute as soon as possible, and
         // `load` waits for that set to drain
         // (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
     }
 
     fn fail_js_fetch(&mut self, js_id: i32) {
@@ -363,24 +412,36 @@ impl Document {
             self.fail_js_fetch(fetch.js_id);
             return;
         }
-        let mut dial = QueuedDial::new(DialContext::JsFetch { id: fetch.js_id }, &url, &self.url);
+        let mut dial = QueuedDial::new(
+            DialContext::JsFetch { id: fetch.js_id },
+            &url,
+            &self.dial_initiator(),
+            &self.referrer_url(),
+        );
         dial.req.method = fetch.method;
         dial.req.body = fetch.body;
         dial.req.content_type = fetch.content_type;
         dial.req.headers = fetch.headers;
         dial.req.referrer = fetch.referrer;
+        // An unset request policy means the client's policy container
+        // decides: resolve it here so every redirect hop re-determines with
+        // the same policy the initial request used
+        // (<https://fetch.spec.whatwg.org/#main-fetch>,
+        // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+        dial.req.referrer_policy = fetch
+            .referrer_policy
+            .or(self.world.borrow().policy.referrer_policy)
+            .unwrap_or_default();
         dial.req.cors = fetch.cors;
         dial.req.keepalive = fetch.keepalive;
         dial.req.body_len = fetch.body_len;
         dial.req.integrity = fetch.integrity;
         dial.req.cache = Some(fetch.cache);
         dial.req.stream_body = fetch.stream_body;
-        dial.req.referrer_source = fetch.referrer_source;
-        dial.req.referrer_policy = fetch.referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));
-        self.dials.queue(dial, &self.load_delay);
+        self.queue_dial(dial);
     }
 
     fn due_timer(&mut self) -> Option<u32> {
@@ -388,7 +449,7 @@ impl Document {
         let (id, timer) = self
             .timers
             .iter_mut()
-            .filter(|(_, timer)| !timer.fired && timer.when <= now)
+            .filter(|(_, timer)| !timer.fired && timer.when.is_some_and(|when| when <= now))
             .min_by_key(|(_, timer)| timer.when)?;
         timer.fired = true;
         Some(*id)

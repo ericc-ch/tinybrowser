@@ -178,7 +178,7 @@ mod tests {
         let config = blitz_dom::DocumentConfig {
             viewport: Some(viewport),
             net_provider: Some(net.clone()),
-            shell_provider: Some(Arc::new(TinyShell)),
+            shell_provider: Some(Arc::new(TinyShell::new())),
             ..blitz_dom::DocumentConfig::default()
         };
         let html = format!(

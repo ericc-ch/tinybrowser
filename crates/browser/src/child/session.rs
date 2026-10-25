@@ -371,6 +371,14 @@ fn drain_engines(
         if !publish(*assignment, engine, outbox) {
             return Drained::Failed;
         }
+        // Publishing evaluates the JS-truth predicates, and entering
+        // JavaScript runs pending microtasks: a module evaluation or an event
+        // handler can queue a task of its own. With that task left in the
+        // engine, reporting `Idle` would park this loop until an unrelated
+        // host event arrived.
+        if engine.has_ready_work() {
+            yielded = true;
+        }
     }
     if yielded {
         Drained::Yielded

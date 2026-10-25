@@ -48,6 +48,22 @@ pub(crate) fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     "about:blank".to_owned()
 }
 
+/// The document's own referrer for `document.referrer`. Only the frame's
+/// active document has one: a document a script created (a `DOMParser`
+/// result, a template's inert document) was never navigated to, so it reads
+/// the empty string
+/// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-referrer>).
+pub(crate) fn document_referrer_string(ctx: &Ctx<'_>, id: NodeId) -> String {
+    let Ok(owner) = world_for_node(ctx, id) else {
+        return String::new();
+    };
+    let world = owner.borrow();
+    if !world.is_main_document(id) {
+        return String::new();
+    }
+    world.document_referrer.clone()
+}
+
 /// The document's base URL: the first `base` element's `href` resolved
 /// against the fallback base URL, or the fallback itself
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).

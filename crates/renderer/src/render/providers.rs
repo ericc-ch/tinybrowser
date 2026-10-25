@@ -5,7 +5,7 @@
 //! fetches enqueue into the owning document's dial queue through a channel,
 //! and completions deliver Blitz handler bytes on the document's thread.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// One Blitz subresource fetch awaiting a carrier dial.
 pub(crate) struct BlitzFetch {
@@ -16,6 +16,11 @@ pub(crate) struct BlitzFetch {
     /// What the fetch is for, so the document can apply per-destination
     /// policy (<https://fetch.spec.whatwg.org/#concept-request-destination>).
     pub kind: blitz_traits::net::RequestKind,
+    /// The CSS style sheet that initiated the fetch, when one did. The
+    /// document sends the sheet's location as the referrer and applies the
+    /// sheet response's `Referrer-Policy`
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
+    pub style_sheet: Option<url::Url>,
 }
 
 /// Delivery target for one fetch: Blitz's response handler, counted so the
@@ -45,12 +50,18 @@ impl CountingHandler {
         in_flight: &std::sync::Arc<AtomicUsize>,
         url: url::Url,
         kind: blitz_traits::net::RequestKind,
+        style_sheet: Option<url::Url>,
         handler: Box<dyn blitz_traits::net::NetHandler>,
     ) -> (Self, BlitzFetch) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let fetch = BlitzFetch { id, url, kind };
+        let fetch = BlitzFetch {
+            id,
+            url,
+            kind,
+            style_sheet,
+        };
         (
             Self {
                 inner: Some(handler),
@@ -92,18 +103,45 @@ impl blitz_traits::net::NetProvider for TinyNetProvider {
         request: blitz_traits::net::Request,
         handler: Box<dyn blitz_traits::net::NetHandler>,
     ) {
-        let (counting, fetch) =
-            CountingHandler::file(&self.in_flight, request.url, request.kind, handler);
+        let (counting, fetch) = CountingHandler::file(
+            &self.in_flight,
+            request.url,
+            request.kind,
+            request.style_sheet,
+            handler,
+        );
         // The document drains the queue on its thread; a disconnected
         // receiver means teardown, and the count already covers the drop.
         let _ = self.tx.send((fetch, counting));
     }
 }
 
-/// No-op shell: one-shot screenshots re-resolve explicitly, never on redraw.
-pub(crate) struct TinyShell;
+/// No-op shell except for the redraw request: a DOM mutation that changes
+/// rendered output asks for a frame, which is the embedder's cue to resolve
+/// style and layout (and so start the image fetches style references).
+pub(crate) struct TinyShell {
+    redraw: AtomicBool,
+}
 
-impl blitz_traits::shell::ShellProvider for TinyShell {}
+impl TinyShell {
+    /// A shell whose redraw flag starts clear.
+    pub(crate) fn new() -> Self {
+        Self {
+            redraw: AtomicBool::new(false),
+        }
+    }
+
+    /// Takes the pending redraw request, clearing it.
+    pub(crate) fn take_redraw(&self) -> bool {
+        self.redraw.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl blitz_traits::shell::ShellProvider for TinyShell {
+    fn request_redraw(&self) {
+        self.redraw.store(true, Ordering::SeqCst);
+    }
+}
 
 /// Records navigations for the carrier to drain; screenshots never navigate.
 #[derive(Default)]

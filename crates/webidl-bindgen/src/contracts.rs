@@ -1655,8 +1655,14 @@ fn lower_attribute(
     }
     // Special shapes stay absent rather than falling through: a plain
     // method installation would lose `SameObject`/`PutForwards` semantics.
-    // This covers both `[Reflect]` and `[ReflectURL]` shapes.
-    if is_special_reflect_shape(member)
+    // This covers both `[Reflect]` and `[ReflectURL]` shapes. An implemented
+    // getter asks for the member explicitly and brings those semantics with
+    // it — `HTMLIFrameElement.sandbox` returns the `DOMTokenList` over its
+    // content attribute, which no generated reflection can build.
+    let implemented_getter =
+        implemented.contains_key(&format!("get_{}", snake_case(member.identifier.0)));
+    if !implemented_getter
+        && is_special_reflect_shape(member)
         && (reflect_content(member.attributes.as_ref(), member.identifier.0).is_some()
             || reflect_url_content(member.attributes.as_ref(), member.identifier.0).is_some())
     {

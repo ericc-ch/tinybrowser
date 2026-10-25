@@ -337,20 +337,21 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       }
       const type = __tbApply(__tbHeadersGet, data.headers, ['content-type']) === null ? payload.type : null;
       const fields = __tbArray.map(__tbHeadersList(data.headers), entry => [entry[0], entry[1]]);
-      const referrer = host.__tbReferrer(data.url);
-      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, [referrer === null || referrer === undefined ? '' : String(referrer), data.withCredentials ? '1' : '0'], data.timeout);
+      // XHR's referrer is the client document; the host resolves it against
+      // the authorized origin
+      // (<https://xhr.spec.whatwg.org/#the-send()-method>).
+      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, ['about:client', data.withCredentials ? '1' : '0'], data.timeout);
       if (result === null || result === undefined) {
         __tbXhrSyncError(data, 'The request failed due to a network error.');
       }
       __tbXhrFinish(this, data, generation, result[0], result[1], result[2], result[3], true);
       return;
     }
-    const referrer = host.__tbReferrer(data.url);
     data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, {
       mode: 'cors',
       credentials: data.withCredentials ? 'include' : 'same-origin',
       redirect: 'follow',
-    }, referrer, outcome => {
+    }, 'about:client', outcome => {
       if (outcome.bodyError) __tbXhrError(this, data, 'error');
       else __tbXhrFinish(this, data, generation, outcome.status, outcome.body, outcome.url, outcome.headers, false);
     });

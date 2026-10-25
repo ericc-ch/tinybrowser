@@ -111,3 +111,16 @@ globalThis.Image = function Image(width, height) {
   }
   return image;
 };
+
+// `Document.parseHTMLUnsafe` is a static operation; the WebIDL generator does
+// not emit those yet, so it installs here. It parses a new document with the
+// caller's environment settings object's URL and scripting disabled, exactly
+// like `DOMParser.parseFromString`
+// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-parsehtmlunsafe>).
+// `Document.parseHTML` stays absent until a `Sanitizer` can back its safe
+// default configuration: exposing it as an alias of the unsafe parser would
+// hand unsanitized markup to code that feature-detects it
+// (<https://wicg.github.io/sanitizer-api/#dom-document-parsehtml>).
+globalThis.Document.parseHTMLUnsafe = function parseHTMLUnsafe(html) {
+  return host.__tbParseHTMLDocument(html);
+};

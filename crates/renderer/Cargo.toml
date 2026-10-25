@@ -41,7 +41,7 @@ writeable = "0.6"
 # The engine waits on nothing itself: `time` for timer deadlines, `sync` for
 # the wake handle, `macros` for `select!`. A carrier brings its own runtime.
 tokio = { version = "1.53", default-features = false, features = ["time", "sync", "macros"] }
-url = "2"
+url = { version = "2", features = ["serde"] }
 # QuickJS-ng via rquickjs; `std` uses shipped linux bindings (no bindgen).
 rquickjs = { version = "0.14.0", default-features = false, features = ["std", "loader", "macro"] }
 # Value-only seam for script results crossing to a carrier.
@@ -83,8 +83,10 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std"] }
 # is already linked by anyrender-tiny-skia.
 skrifa = "0.44"
 # createImageBitmap decodes Blob bytes. Blitz already enables these formats
-# for <img>, so the decoders are in the binary either way.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# for <img>, so the decoders are in the binary either way. BMP is a decode
+# feature the engine opts into: WPT's security-features endpoints encode their
+# payloads as BMP, and the choice belongs to the embedder, not the Blitz fork.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 blitz-traits = "=0.3.0-beta.4"
 # Inflates the build-compressed JS shims (`js::blob`). Same instance `png`
 # already retains, so this adds no new crate to the binary.

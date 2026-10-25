@@ -294,6 +294,7 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
             DialKind::ModuleScript => FetchKind::ModuleScript,
             DialKind::Stylesheet => FetchKind::Stylesheet,
             DialKind::Image => FetchKind::Image,
+            DialKind::Font => FetchKind::Font,
             DialKind::FrameLoad => FetchKind::FrameLoad,
             // Unreachable: `start_dial` completes reports without a hop.
             DialKind::CspReport => unreachable!("report-uri has no transport hop"),

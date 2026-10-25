@@ -20,6 +20,10 @@ mod inner_text;
 mod messaging;
 mod mutation;
 mod node;
+/// Runs an inline classic script in the realm that owns its document; a
+/// document without a realm yet queues it through
+/// [`World::queue_deferred_script`](crate::js::world::World::queue_deferred_script).
+pub(crate) use node::document::prepare_classic_script;
 mod parsing;
 mod range;
 mod webidl;
@@ -542,6 +546,7 @@ fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
         rquickjs::prelude::Func::from(resolved_style),
     )?;
     parsing::install_xhr_parse(ctx)?;
+    parsing::install_document_parse(ctx)?;
     cssom_host::install(ctx)?;
     Ok(())
 }
@@ -1859,7 +1864,8 @@ mod realm_tests {
         let policy = Rc::clone(&world);
         let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
 
-        policy.borrow_mut().csp = crate::csp::List::from_headers(Some("script-src 'self'"), None);
+        policy.borrow_mut().policy.csp =
+            crate::csp::List::from_headers(Some("script-src 'self'"), None);
         let denied = realm
             .eval(
                 r#"
@@ -1892,7 +1898,7 @@ mod realm_tests {
             .expect("eval");
         assert_eq!(spoofed, "EvalError,false");
 
-        policy.borrow_mut().csp =
+        policy.borrow_mut().policy.csp =
             crate::csp::List::from_headers(Some("script-src 'self' 'unsafe-eval'"), None);
         let allowed = realm
             .eval(r#"[eval("1 + 1"), Function("return 2")()].join(",");"#)

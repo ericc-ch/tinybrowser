@@ -16,34 +16,6 @@ pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<Stri
     }
 }
 
-/// Reads a `Referrer-Policy` field as the last recognized policy token
-/// (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
-/// Unknown tokens and empty list members are ignored, so a trailing unknown
-/// token never resets a policy the document already had.
-#[must_use]
-pub fn referrer_policy_from_header(value: &str) -> Option<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .rev()
-        .find(|token| {
-            !token.is_empty()
-                && matches!(
-                    token.to_ascii_lowercase().as_str(),
-                    "no-referrer"
-                        | "no-referrer-when-downgrade"
-                        | "same-origin"
-                        | "origin"
-                        | "strict-origin"
-                        | "origin-when-cross-origin"
-                        | "strict-origin-when-cross-origin"
-                        | "unsafe-url"
-                        | "never"
-                )
-        })
-        .map(str::to_owned)
-}
-
 pub(crate) fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -276,7 +248,7 @@ impl fmt::Display for Method {
 mod tests {
     use hyper::header::{HeaderName, HeaderValue};
 
-    use super::{HeaderMap, referrer_policy_from_header};
+    use super::HeaderMap;
 
     #[test]
     fn insert_appends_and_set_replaces_in_place() {
@@ -297,23 +269,6 @@ mod tests {
             ["x-one", "x-two"]
         );
         assert_eq!(map.get_all("x-one").collect::<Vec<_>>(), [b"d"]);
-    }
-
-    #[test]
-    fn referrer_policy_header_uses_the_last_recognized_token() {
-        assert_eq!(
-            referrer_policy_from_header("no-referrer, origin").as_deref(),
-            Some("origin")
-        );
-        assert_eq!(
-            referrer_policy_from_header("origin, not-a-policy").as_deref(),
-            Some("origin")
-        );
-        assert_eq!(referrer_policy_from_header("not-a-policy").as_deref(), None);
-        assert_eq!(
-            referrer_policy_from_header("same-origin, , unsafe-url").as_deref(),
-            Some("unsafe-url")
-        );
     }
 
     #[test]

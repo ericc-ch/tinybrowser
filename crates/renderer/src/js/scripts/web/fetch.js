@@ -875,13 +875,15 @@ globalThis.Request = class Request {
         referrer = value;
       } else {
         const resolved = host.__tbResolveUrl(__tbToUSVString(value), undefined);
-        if (resolved === null) throw new TypeError('Invalid referrer');
-        // A referrer cross-origin to the current settings object is not
-        // exposed; it becomes "about:client"
+        if (resolved == null) throw new TypeError('Invalid referrer');
+        // A referrer cross-origin to the settings object is not exposed; it
+        // becomes "client". An opaque origin is never same origin, and it
+        // serializes as "null", so it needs its own check
         // (<https://fetch.spec.whatwg.org/#dom-request-referrer>).
-        const base = host.__tbResolveUrl('', undefined);
-        const baseOrigin = base === null ? null : new URL(base).origin;
-        referrer = baseOrigin !== null && new URL(resolved).origin === baseOrigin ? resolved : 'about:client';
+        const origin = host.__tbOrigin();
+        referrer = origin !== 'null' && new URL(resolved).origin === origin
+          ? resolved
+          : 'about:client';
       }
     } else {
       referrer = source === null ? 'about:client' : source.referrer;
@@ -1121,7 +1123,6 @@ const __tbQueuePageRequest = (url, method, body, headers, cors, referrer, callba
       cors.integrity === undefined ? '' : String(cors.integrity),
       cors.cache === undefined ? '' : String(cors.cache),
       cors.stream === true ? '1' : '0',
-      cors.referrerSource === undefined || cors.referrerSource === null ? '' : String(cors.referrerSource),
       cors.referrerPolicy === undefined ? '' : String(cors.referrerPolicy),
     ]);
   }).catch(() => {
@@ -1155,30 +1156,6 @@ const __tbParseRange = (value, length) => {
   if (end >= length) end = length - 1;
   return { start, end };
 };
-// Credentials, fragments, scheme downgrades, and the strict default all live
-// in the host policy helper so the fetch path and the document path cannot
-// disagree (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-const __tbReferrerForPolicy = (source, target, policy) => {
-  if (source === '' || source === null || source === undefined) return '';
-  const referrer = host.__tbReferrerForPolicy(String(source), String(target), String(policy));
-  return referrer === null || referrer === undefined ? '' : String(referrer);
-};
-const __tbDetermineReferrer = (data, target) => {
-  // With no explicit policy the client's document policy decides; the host
-  // helper owns the scheme, downgrade, and credential rules
-  // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-  if (data.referrer === 'about:client' && data.referrerPolicy === '') {
-    const referrer = host.__tbReferrer(target);
-    return referrer === null || referrer === undefined ? '' : referrer;
-  }
-  let source = data.referrer;
-  if (source === 'about:client') {
-    source = host.__tbResolveUrl('', undefined);
-    if (source === null) return '';
-  }
-  const policy = data.referrerPolicy === '' ? 'strict-origin-when-cross-origin' : data.referrerPolicy;
-  return __tbReferrerForPolicy(source, target, policy);
-};
 globalThis.fetch = function(input, init) {
   let request;
   try {
@@ -1194,7 +1171,11 @@ globalThis.fetch = function(input, init) {
   const mode = data.mode;
   const credentials = data.credentials;
   const redirect = data.redirect;
-  const referrer = __tbDetermineReferrer(data, url);
+  // The host resolves "about:client" against the authorized document and runs
+  // "Determine request's Referrer" per hop; JS only carries the request's
+  // referrer value
+  // (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+  const referrer = data.referrer;
   const signal = data.signal;
   const keepalive = data.keepalive;
   return new Promise(function(resolve, reject) {
@@ -1272,9 +1253,6 @@ globalThis.fetch = function(input, init) {
       cache: data.cache,
       // HEAD has no body, and SRI has to see the whole body before exposure.
       stream: method !== 'HEAD' && data.integrity === '',
-      referrerSource: data.referrer === 'about:client'
-        ? host.__tbResolveUrl('', undefined)
-        : data.referrer,
       referrerPolicy: data.referrerPolicy,
     }, referrer, outcome => {
       const status = outcome.status;

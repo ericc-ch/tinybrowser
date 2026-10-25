@@ -1718,7 +1718,7 @@ fn handler_attribute_allowed<'js>(
     let violations = {
         let world = bindings::world(ctx)?;
         let world = world.borrow();
-        world.csp.check_inline(
+        world.policy.csp.check_inline(
             &world.document_url,
             &crate::csp::InlineScript {
                 source,
@@ -1749,6 +1749,12 @@ fn call_handler_attribute<'js>(
     let Some(object) = target.and_then(|target| target.as_object()) else {
         return Ok(());
     };
+    // Scripting is disabled in a sandboxed frame without `allow-scripts`, and
+    // an event handler content attribute is script
+    // (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
+    if bindings::world(ctx)?.borrow().sandbox.scripts_disabled() {
+        return Ok(());
+    }
     let name = format!("on{typ}");
     let mut handler: Value = object.get(name.as_str())?;
     if handler.as_function().is_none()

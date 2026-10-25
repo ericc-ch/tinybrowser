@@ -55,7 +55,7 @@ fn module_request_blocked(
     };
     let violations = {
         let world = world_rc.borrow();
-        world.csp.check_request(
+        world.policy.csp.check_request(
             &world.origin,
             &world.document_url,
             &url,
@@ -85,13 +85,27 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     // QuickJS's host loader is synchronous, so the renderer waits here while
     // the browser process performs the network operation on its I/O runtime.
     let world_rc = super::bindings::world(ctx)?;
-    let (services, initiator, gate) = {
+    let (services, initiator, referrer_url, referrer_policy, gate) = {
         let world = world_rc.borrow();
+        // A module fetched on behalf of a classic script keeps that script
+        // element's `referrerpolicy`: dynamic `import()` inherits the policy of
+        // the script that initiated it, which is how a `<script src="data:..."
+        // referrerpolicy=origin>` controls the module it imports
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-a-single-module-script>).
+        let element_policy = world.state.current_script.and_then(|id| {
+            let parsed = world.document(id)?;
+            crate::dom::tree::attr(&parsed.document.base, id.node, "referrerpolicy")
+                .and_then(net::ReferrerPolicy::parse)
+        });
         (
             world.runtime.services.clone(),
-            world.document_url.to_string(),
+            world.origin.ascii_serialization(),
+            world.referrer_url.to_string(),
+            element_policy
+                .or(world.policy.referrer_policy)
+                .unwrap_or_default(),
             crate::RedirectGate::new(
-                world.csp.clone(),
+                world.policy.csp.clone(),
                 &world.origin,
                 crate::csp::Destination::Script,
             ),
@@ -108,12 +122,13 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             kind: DialKind::ModuleScript,
             url: name.to_owned(),
             initiator,
+            referrer_url,
             read_body: true,
             method: "GET".to_owned(),
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
-            referrer: None,
+            referrer: net::Referrer::Client,
             timeout_ms: 0,
             csp: Some(Box::new(gate)),
             cors: None,
@@ -122,8 +137,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             integrity: None,
             cache: None,
             stream_body: false,
-            referrer_source: None,
-            referrer_policy: None,
+            referrer_policy,
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);
@@ -141,7 +155,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     {
         let violations = {
             let world = world_rc.borrow();
-            world.csp.check_redirected_request(
+            world.policy.csp.check_redirected_request(
                 &world.origin,
                 &world.document_url,
                 &final_url,

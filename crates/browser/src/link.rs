@@ -567,12 +567,23 @@ fn live_assignment(
     Ok(Some(assignment))
 }
 
-/// Whether `spec` parses as a non-HTTP(S) URL. Opaque documents share
-/// their tab's renderer but never match its site lock, so their dials must
-/// fail as network errors rather than kill it. An unparseable initiator is
-/// not opaque: that is corruption or forgery, still a violation.
+/// Whether `spec` names an opaque document's origin: its serialization is
+/// `null`, or it is a non-HTTP(S) URL whose origin is opaque. Opaque documents
+/// share their tab's renderer but never match its site lock, so their dials
+/// must fail as network errors rather than kill it. An unparseable initiator
+/// is not opaque: that is corruption or forgery, still a violation.
 fn is_opaque_initiator(spec: &str) -> bool {
-    url::Url::parse(spec).is_ok_and(|url| !matches!(url.scheme(), "http" | "https"))
+    spec == "null"
+        || url::Url::parse(spec).is_ok_and(|url| !matches!(url.scheme(), "http" | "https"))
+}
+
+/// The initiator a dial from an opaque document goes out with. The `data:`
+/// URL's origin is opaque and never equal to the request's client environment,
+/// so the referrer and the same-origin credential rules treat it as the
+/// isolated origin it is. The serialized `Origin` header is `null`
+/// (<https://fetch.spec.whatwg.org/#concept-request-origin>).
+fn opaque_initiator() -> url::Url {
+    url::Url::parse("data:,").expect("data:, is a valid URL")
 }
 
 /// Routes one browser service call from a renderer. This is a dispatch table:
@@ -603,24 +614,16 @@ async fn route_service_call(
     };
     match call {
         ServiceCall::Network(NetworkCall::Dial(request)) => {
-            let Some(initiator) = assignment.site.authorize(&request.initiator) else {
-                // A renderer legitimately hosts opaque documents (`data:`,
-                // `blob:`, `about:blank`) whose initiators never match its
-                // site lock. Answer those dials with a network error — the
-                // fetch's own checks then decide exposure — instead of
-                // killing the renderer, which hangs every request from such
-                // a document. A forged HTTP(S) initiator is still a
-                // violation.
-                if is_opaque_initiator(&request.initiator) {
-                    send_reply(
-                        &context.responder,
-                        id,
-                        ServiceReply::Dial(Err(renderer::DialFailure::Connect)),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                return Err(RendererViolation);
+            // An opaque initiator (`data:`, `blob:` with an opaque creator, a
+            // sandboxed document) has no site to authorize. It may still
+            // fetch: the request goes out as `Origin: null`, with no
+            // credentials it would not otherwise send and no referrer, so it
+            // cannot claim the renderer's own site
+            // (<https://fetch.spec.whatwg.org/#concept-request-origin>).
+            let initiator = match assignment.site.authorize(&request.initiator) {
+                Some(initiator) => initiator,
+                None if is_opaque_initiator(&request.initiator) => opaque_initiator(),
+                None => return Err(RendererViolation),
             };
             let worker_network = assignment.network.clone();
             let responder = context.responder.clone();

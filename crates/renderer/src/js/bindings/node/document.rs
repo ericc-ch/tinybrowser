@@ -100,13 +100,8 @@ impl<'js> document_generated::Document<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-referrer
-    // No navigation passes a referrer into the document yet, so this is
-    // always the empty string. Tracking the navigation referrer per
-    // document would make this (and the violation event's `referrer`)
-    // report the real value.
     fn get_referrer(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
-        let _ = ctx;
-        Ok(crate::dom_string::DomString::default())
+        Ok(crate::js::bindings::document::document_referrer_string(ctx, self.handle.0).into())
     }
 
     // https://dom.spec.whatwg.org/#dom-document-compatmode
@@ -608,6 +603,11 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
     fn get_content_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.content_document(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-sandbox
+    fn get_sandbox(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.sandbox(ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
@@ -1432,6 +1432,38 @@ impl JsNode {
             None => Ok(Value::new_null(ctx)),
         }
     }
+
+    /// `HTMLIFrameElement.sandbox`: the `DOMTokenList` over the `sandbox`
+    /// content attribute. `[SameObject]` keeps one list per element, so
+    /// `iframe.sandbox === iframe.sandbox` and a mutation through one handle
+    /// shows through the other
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-sandbox>).
+    pub(super) fn sandbox<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(ctx)?;
+        if let Some(saved) = world_rc
+            .borrow()
+            .same_object(self.handle.0, SameObject::Sandbox)
+            && let Some(value) = deref_weak(ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let list = host::instance_for_node(
+            ctx,
+            self.handle.0,
+            crate::js::bindings::JsTokenList {
+                element: self.handle,
+                attribute: markup5ever::local_name!("sandbox"),
+            },
+        )?;
+        let value = rquickjs::Class::into_value(list);
+        let weak = make_weak(ctx, value.clone())?;
+        world_rc.borrow_mut().intern_same_object(
+            self.handle.0,
+            SameObject::Sandbox,
+            Persistent::save(ctx, weak),
+        );
+        Ok(value)
+    }
 }
 
 pub(in crate::js::bindings) fn construct_node<'js>(
@@ -1977,7 +2009,7 @@ pub(super) fn register_inserted_iframes(ctx: &Ctx<'_>, inserted: &[NodeId]) -> R
 /// `meta name=referrer` insertion steps set the document's policy
 /// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>,
 /// <https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-meta>).
-pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
+pub(crate) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
     let policy = {
         let world = world(ctx);
         let Ok(world) = world else {
@@ -1992,7 +2024,9 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
         if !name.eq_ignore_ascii_case("referrer") {
             return;
         }
-        parse_referrer_policy(crate::dom::tree::attr(base, id.node, "content").unwrap_or_default())
+        net::ReferrerPolicy::from_meta(
+            crate::dom::tree::attr(base, id.node, "content").unwrap_or_default(),
+        )
     };
     let Some(policy) = policy else {
         return;
@@ -2000,7 +2034,37 @@ pub(super) fn apply_meta_referrer(ctx: &Ctx<'_>, id: NodeId) {
     let Ok(world) = world(ctx) else {
         return;
     };
-    world.borrow_mut().state.referrer_policy = policy;
+    world.borrow_mut().policy.referrer_policy = Some(policy);
+}
+
+/// `meta http-equiv=refresh` insertion or attribute change runs the shared
+/// declarative refresh steps with the element's current content
+/// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-meta-http-equiv-refresh>).
+pub(crate) fn apply_meta_refresh(ctx: &Ctx<'_>, id: NodeId) {
+    let Ok(world) = world(ctx) else {
+        return;
+    };
+    let value = {
+        let world = world.borrow();
+        let Some(parsed) = world.document(id) else {
+            return;
+        };
+        let base = &parsed.document.base;
+        let Some(equiv) = crate::dom::tree::attr(base, id.node, "http-equiv") else {
+            return;
+        };
+        if !equiv.eq_ignore_ascii_case("refresh") {
+            return;
+        }
+        let Some(content) = crate::dom::tree::attr(base, id.node, "content") else {
+            return;
+        };
+        if content.is_empty() {
+            return;
+        }
+        content.to_owned()
+    };
+    world.borrow_mut().queue_declarative_refresh(value);
 }
 
 /// `meta http-equiv=content-security-policy` insertion appends one policy
@@ -2012,32 +2076,10 @@ pub(super) fn apply_meta_csp(ctx: &Ctx<'_>, id: NodeId) {
     world.borrow_mut().apply_meta_policy(id);
 }
 
-/// A referrer-policy `content` value normalized to its canonical token,
-/// or `None` when the value names no policy. The legacy meta values map to
-/// their modern tokens
-/// (<https://html.spec.whatwg.org/multipage/semantics.html#meta-referrer>).
-pub(super) fn parse_referrer_policy(content: &str) -> Option<String> {
-    let token = content.trim().to_ascii_lowercase();
-    match token.as_str() {
-        "never" | "no-referrer" => Some("no-referrer".to_owned()),
-        "default" => Some("strict-origin-when-cross-origin".to_owned()),
-        "always" => Some("unsafe-url".to_owned()),
-        "origin-when-crossorigin" => Some("origin-when-cross-origin".to_owned()),
-        "no-referrer-when-downgrade"
-        | "origin"
-        | "origin-when-cross-origin"
-        | "same-origin"
-        | "strict-origin"
-        | "strict-origin-when-cross-origin"
-        | "unsafe-url" => Some(token),
-        _ => None,
-    }
-}
-
 /// [Prepares](https://html.spec.whatwg.org/multipage/webappapis.html#prepare-the-script-element)
 /// a classic inline script. Empty scripts return without setting already
 /// started. External and module scripts are not prepared here.
-pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+pub(crate) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     enum Kind {
         Inline(String, u32),
         External,
@@ -2066,7 +2108,20 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     // (<https://html.spec.whatwg.org/multipage/scripting.html#parser-inserted>).
     world(ctx)?.borrow_mut().clear_parser_inserted(id);
     let (source, base_line) = match kind {
-        Kind::Inline(source, line) => (source, line),
+        Kind::Inline(source, line) => {
+            // An inline script inserted into another document's realm cannot
+            // run here: that document's realm does not exist yet, because a
+            // `QuickJS` realm cannot be created while this script runs (the
+            // common case is a script appended to a `window.open()` document).
+            // Keep it for the document's own realm to run.
+            let caller = world(ctx)?;
+            let owner = world_for_node(ctx, id)?;
+            if !Rc::ptr_eq(&caller, &owner) {
+                owner.borrow_mut().queue_deferred_script(id);
+                return Ok(());
+            }
+            (source, line)
+        }
         Kind::External => {
             // Parser-inserted scripts never reach this path; the parser
             // runs them from `Document::run_scripts`. The fetch for a
@@ -2097,7 +2152,7 @@ pub(super) fn prepare_classic_script(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
             || (String::new(), false),
             |parsed| crate::csp::element_nonce(&parsed.document.base, id.node, slot),
         );
-        world.csp.check_inline(
+        world.policy.csp.check_inline(
             &world.document_url,
             &crate::csp::InlineScript {
                 source: &source,

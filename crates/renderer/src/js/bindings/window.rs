@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use crate::dom::tree::NodeId;
 
-use rquickjs::{Class, Ctx, Exception, Object, Result, Value};
+use rquickjs::{Class, Ctx, Exception, Object, Persistent, Result, Value};
 
 use crate::js::events::JsEvent;
 use crate::js::world::{EventTargetKey, World};
@@ -47,28 +47,156 @@ fn world_for_window_this<'js>(ctx: &Ctx<'js>, this: &Object<'js>) -> Result<Rc<R
     if same_origin { Ok(target) } else { Ok(current) }
 }
 
-/// Installs the `Location` object. The engine has no navigation, so only the
-/// read-only URL components exist
+/// The URL components `Location` exposes.
+#[derive(Clone, Copy)]
+enum Component {
+    Pathname,
+    Href,
+    Search,
+    Hash,
+    Origin,
+    Protocol,
+    Host,
+    Hostname,
+    Port,
+}
+
+impl Component {
+    /// The component's value with the shape the IDL getters return.
+    fn read(self, world: &World) -> String {
+        let url = &world.document_url;
+        match self {
+            Self::Pathname => url.path().to_owned(),
+            Self::Href => url.as_str().to_owned(),
+            Self::Search => url
+                .query()
+                .filter(|query| !query.is_empty())
+                .map_or_else(String::new, |query| format!("?{query}")),
+            Self::Hash => url
+                .fragment()
+                .filter(|fragment| !fragment.is_empty())
+                .map_or_else(String::new, |fragment| format!("#{fragment}")),
+            // The settings object's origin, not the URL's: `about:blank`,
+            // `about:srcdoc`, and `data:` documents carry a captured origin
+            // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+            Self::Origin => world.origin.ascii_serialization(),
+            Self::Protocol => format!("{}:", url.scheme()),
+            Self::Host => match url.port() {
+                Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+                None => url.host_str().unwrap_or_default().to_owned(),
+            },
+            Self::Hostname => url.host_str().unwrap_or_default().to_owned(),
+            Self::Port => url.port().map_or_else(String::new, |port| port.to_string()),
+        }
+    }
+
+    /// Replaces this component of `url` with `value`, using the URL Standard's
+    /// quirks setters, which are the algorithms the IDL setters name
+    /// (<https://url.spec.whatwg.org/#example-635b7a2a>). Returns whether the
+    /// URL changed, so assigning the value the document already has does not
+    /// reload it
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-location-interface>).
+    fn replace(self, url: &mut url::Url, value: &str) -> bool {
+        let before = url.as_str().to_owned();
+        match self {
+            Self::Pathname => url::quirks::set_pathname(url, value),
+            Self::Search => url::quirks::set_search(url, value),
+            Self::Protocol => {
+                let _ = url::quirks::set_protocol(url, value);
+            }
+            Self::Host => {
+                let _ = url::quirks::set_host(url, value);
+            }
+            Self::Hostname => {
+                let _ = url::quirks::set_hostname(url, value);
+            }
+            Self::Port => {
+                let _ = url::quirks::set_port(url, value);
+            }
+            // `href` names a whole URL; `origin` is read-only. `hash` needs
+            // "navigate to a fragment", which this engine has no algorithm for,
+            // and a full reload would be the wrong answer.
+            Self::Href | Self::Hash | Self::Origin => return false,
+        }
+        url.as_str() != before
+    }
+}
+
+/// Queues a navigation of `owner`'s frame to `spec`, which is what assigning
+/// to `Location.href`, to any other navigating `Location` component, and to a
+/// window's `location` does
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+fn navigate_location(owner: &Rc<RefCell<World>>, spec: String, source: Option<FrameId>) {
+    let mut navigation = crate::js::world::FrameNavigation::get(
+        crate::js::world::NavigationTarget::Target("_self".to_owned()),
+        spec,
+    );
+    if let Some(source) = source {
+        navigation = navigation.with_source(source);
+    }
+    owner.borrow_mut().queue_frame_navigation(navigation);
+}
+
+/// Parses `value` the way the `href` setter does, relative to the entry
+/// settings object's API base URL, and throws the `SyntaxError` the setter
+/// requires when it is not a valid URL
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+///
+/// The navigation keeps the caller's own string, so the target document
+/// resolves it again against the same base; this call only decides whether the
+/// assignment throws.
+fn parse_location(ctx: &Ctx<'_>, caller: &Rc<RefCell<World>>, value: &str) -> Result<url::Url> {
+    let caller = caller.borrow();
+    let base = caller
+        .base_url
+        .clone()
+        .unwrap_or_else(|| caller.document_url.clone());
+    base.join(value)
+        .map_err(|_| super::throw_dom(ctx, "SyntaxError", "invalid URL"))
+}
+
+/// The `Location` setter shared by every component that navigates.
+///
+/// `href` names a whole URL, resolved when the navigation runs; every other
+/// component replaces itself in the current URL and navigates only when that
+/// changed something.
+fn set_component(owner: &Rc<RefCell<World>>, component: Component, value: Value<'_>) -> Result<()> {
+    let ctx = value.ctx().clone();
+    let value = super::webidl::webidl_to_string(&ctx, value)?;
+    // The entry settings object supplies the resolution base; the incumbent
+    // document supplies the referrer, policy, and sandbox rules when a script
+    // in one frame assigns another frame's `location`
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+    let caller = world(&ctx)?;
+    let source = caller.borrow().frame();
+    if matches!(component, Component::Href) {
+        let _ = parse_location(&ctx, &caller, &value)?;
+        navigate_location(owner, value, Some(source));
+        return Ok(());
+    }
+    let mut url = owner.borrow().document_url.clone();
+    if component.replace(&mut url, &value) {
+        navigate_location(owner, url.as_str().to_owned(), Some(source));
+    }
+    Ok(())
+}
+
+/// Installs the `Location` object
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-location-interface>).
+///
 /// Empty components return empty strings, as specified by
 /// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-search>
 /// and <https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-hash>.
+///
+/// Assigning to a window's `location` navigates, like `Location.href`. The
+/// `hash` setter stays read-only: its same-document branch needs "navigate to
+/// a fragment", which this engine has no algorithm for, and a full reload
+/// would be the wrong answer.
 pub(crate) fn install_location<'js>(
     ctx: &Ctx<'js>,
     globals: &Object<'js>,
     world: &Rc<RefCell<World>>,
 ) -> Result<()> {
-    enum Component {
-        Pathname,
-        Href,
-        Search,
-        Hash,
-        Origin,
-        Protocol,
-        Host,
-        Hostname,
-        Port,
-    }
     let components = [
         ("pathname", Component::Pathname),
         ("href", Component::Href),
@@ -83,36 +211,36 @@ pub(crate) fn install_location<'js>(
     let location = Object::new(ctx.clone())?;
     for (name, component) in components {
         let owner = Rc::clone(world);
+        let getter = Accessor::new_get(move || component.read(&owner.borrow()));
+        if matches!(component, Component::Hash | Component::Origin) {
+            location.prop(name, getter.enumerable())?;
+            continue;
+        }
+        let owner = Rc::clone(world);
         location.prop(
             name,
-            Accessor::new_get(move || {
-                let owner = owner.borrow();
-                let url = &owner.document_url;
-                match component {
-                    Component::Pathname => url.path().to_owned(),
-                    Component::Href => url.as_str().to_owned(),
-                    Component::Search => url
-                        .query()
-                        .filter(|query| !query.is_empty())
-                        .map_or_else(String::new, |query| format!("?{query}")),
-                    Component::Hash => url
-                        .fragment()
-                        .filter(|fragment| !fragment.is_empty())
-                        .map_or_else(String::new, |fragment| format!("#{fragment}")),
-                    Component::Origin => url.origin().ascii_serialization(),
-                    Component::Protocol => format!("{}:", url.scheme()),
-                    Component::Host => match url.port() {
-                        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
-                        None => url.host_str().unwrap_or_default().to_owned(),
-                    },
-                    Component::Hostname => url.host_str().unwrap_or_default().to_owned(),
-                    Component::Port => url.port().map_or_else(String::new, |port| port.to_string()),
-                }
-            })
-            .enumerable(),
+            getter
+                .set(move |value: Value<'js>| set_component(&owner, component, value))
+                .enumerable(),
         )?;
     }
-    globals.set("location", location)?;
+    world.borrow_mut().location_object = Some(Persistent::save(ctx, location));
+    let getter_owner = Rc::clone(world);
+    let setter_owner = Rc::clone(world);
+    globals.prop(
+        "location",
+        Accessor::new(
+            move |ctx: Ctx<'js>| -> Result<Value<'js>> {
+                let saved = getter_owner.borrow().location_object.clone();
+                let Some(saved) = saved else {
+                    return Err(Exception::throw_internal(&ctx, "location is gone"));
+                };
+                Ok(saved.restore(&ctx)?.into_value())
+            },
+            move |value: Value<'js>| set_component(&setter_owner, Component::Href, value),
+        )
+        .enumerable(),
+    )?;
     Ok(())
 }
 

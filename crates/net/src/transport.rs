@@ -341,6 +341,16 @@ impl HttpEngine {
             )
             .body(request_body)
             .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+        // Browsers state the HTTP/1.1 default explicitly. hyper leaves the
+        // field to the caller, and ALPN can only select HTTP/2 over TLS, so a
+        // cleartext URL is always the HTTP/1.1 connection this field belongs
+        // on (<https://www.rfc-editor.org/rfc/rfc9110#section-7.6.1>).
+        if wire_url.scheme() == "http" && headers.value("connection").is_none() {
+            request.headers_mut().append(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("keep-alive"),
+            );
+        }
         for (name, value) in headers.typed_iter() {
             request.headers_mut().append(name.clone(), value.clone());
         }
