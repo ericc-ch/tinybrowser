@@ -66,7 +66,7 @@ impl<'js> node_generated::Node<'js> for JsNode {
 
     // https://dom.spec.whatwg.org/#dom-node-baseuri
     fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
-        self.base_uri(ctx)
+        Ok(self.base_uri(ctx))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isconnected
@@ -164,8 +164,8 @@ impl<'js> node_generated::Node<'js> for JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
-    fn is_same_node(&self, ctx: Ctx<'js>, arg_0: Option<NodeReference>) -> Result<bool> {
-        self.is_same_node(ctx, arg_0)
+    fn is_same_node(&self, _ctx: Ctx<'js>, arg_0: Option<NodeReference>) -> Result<bool> {
+        Ok(self.is_same_node(arg_0))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
@@ -1518,12 +1518,8 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated operations share one fallible call shape"
-    )]
-    pub(super) fn is_same_node(&self, _ctx: Ctx<'_>, other: Option<NodeReference>) -> Result<bool> {
-        Ok(other == Some(NodeReference::Tree(self.handle.0)))
+    pub(super) fn is_same_node(&self, other: Option<NodeReference>) -> bool {
+        other == Some(NodeReference::Tree(self.handle.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isequalnode

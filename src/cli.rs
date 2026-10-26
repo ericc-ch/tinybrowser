@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 use std::path::PathBuf;
 
-use browser::{Profile, Proxy};
+use browser::{Profile, Proxy, ResolveRule};
 use logging::Level;
 
 /// Parsed command line: global flags plus an optional subcommand.
@@ -39,14 +39,22 @@ pub(crate) enum Command {
         port: u16,
         /// Named profile.
         profile: Profile,
-        /// HTTP CONNECT proxy, already parsed so credentials never exist as a
-        /// plain argument past this boundary.
-        proxy: Option<Proxy>,
-        /// Host-to-address rewrites.
-        resolve: Vec<String>,
-        /// Extra PEM certificate authorities.
-        tls_ca: Vec<PathBuf>,
+        /// Network flags, already parsed except the CA paths, which startup
+        /// reads before the browser opens.
+        network: WebdriverNetwork,
     },
+}
+
+/// The network flags `webdriver` understands.
+pub(crate) struct WebdriverNetwork {
+    /// HTTP CONNECT proxy, parsed so credentials never exist as a plain
+    /// argument past this boundary.
+    pub(crate) proxy: Option<Proxy>,
+    /// Host-to-address rewrites, first match wins.
+    pub(crate) resolve: Vec<ResolveRule>,
+    /// Extra certificate authorities, in flag order. Startup reads and parses
+    /// each file before the browser opens.
+    pub(crate) tls_ca: Vec<PathBuf>,
 }
 
 /// What argument scanning selected.
@@ -113,9 +121,7 @@ enum Partial {
     Webdriver {
         port: Option<u16>,
         profile: Option<Profile>,
-        proxy: Option<Proxy>,
-        resolve: Vec<String>,
-        tls_ca: Vec<PathBuf>,
+        network: WebdriverNetwork,
     },
 }
 
@@ -267,8 +273,9 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             "resolve" => {
                 let raw = self.value("resolve", "<PATTERN=ADDR>", inline)?;
                 match &mut self.command {
-                    Some(Partial::Webdriver { resolve, .. }) => {
-                        resolve.push(raw);
+                    Some(Partial::Webdriver { network, .. }) => {
+                        let rule = ResolveRule::parse(&raw).map_err(|error| error.to_string())?;
+                        network.resolve.push(rule);
                         Ok(None)
                     }
                     _ => Err("unexpected argument '--resolve' found".into()),
@@ -277,8 +284,8 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             "tls-ca" => {
                 let raw = self.value("tls-ca", "<PATH>", inline)?;
                 match &mut self.command {
-                    Some(Partial::Webdriver { tls_ca, .. }) => {
-                        tls_ca.push(PathBuf::from(raw));
+                    Some(Partial::Webdriver { network, .. }) => {
+                        network.tls_ca.push(PathBuf::from(raw));
                         Ok(None)
                     }
                     _ => Err("unexpected argument '--tls-ca' found".into()),
@@ -288,13 +295,13 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 let raw = self.value("proxy", "<URI>", inline)?;
                 let proxy = raw.parse::<Proxy>().map_err(|error| error.to_string())?;
                 match &mut self.command {
-                    Some(Partial::Webdriver { proxy: slot, .. }) => {
-                        if slot.is_some() {
+                    Some(Partial::Webdriver { network, .. }) => {
+                        if network.proxy.is_some() {
                             return Err(
                                 "the argument '--proxy <URI>' was provided more than once".into()
                             );
                         }
-                        *slot = Some(proxy);
+                        network.proxy = Some(proxy);
                         Ok(None)
                     }
                     _ => Err("unexpected argument '--proxy' found".into()),
@@ -335,9 +342,11 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 self.command = Some(Partial::Webdriver {
                     port: None,
                     profile: None,
-                    proxy: None,
-                    resolve: Vec::new(),
-                    tls_ca: Vec::new(),
+                    network: WebdriverNetwork {
+                        proxy: None,
+                        resolve: Vec::new(),
+                        tls_ca: Vec::new(),
+                    },
                 });
                 Ok(None)
             }
@@ -395,9 +404,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             Some(Partial::Webdriver {
                 port,
                 profile,
-                proxy,
-                resolve,
-                tls_ca,
+                network,
             }) => {
                 let Some(port) = port else {
                     return Err(
@@ -408,9 +415,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 Some(Command::Webdriver {
                     port,
                     profile: profile.unwrap_or_default(),
-                    proxy,
-                    resolve,
-                    tls_ca,
+                    network,
                 })
             }
         };

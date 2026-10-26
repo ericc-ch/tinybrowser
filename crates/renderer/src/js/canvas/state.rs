@@ -3925,12 +3925,21 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_encodes_rgba_pixels_over_black() {
+    fn jpeg_encodes_half_transparent_red_over_black() {
         let mut canvas = Canvas2D::new(2, 2);
         canvas.set_fill_style(StyleValue::Color([255, 0, 0, 128]));
         canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
         let jpeg = canvas.to_jpeg(0.92).expect("JPEG");
-        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+            .expect("decode the encoded JPEG")
+            .to_rgb8();
+        let [red, green, blue] = decoded.get_pixel(0, 0).0;
+        assert!(
+            red.abs_diff(128) <= 3,
+            "red = {red}, a dropped alpha is 255"
+        );
+        assert!(green <= 3, "green = {green}, a composite over white is 127");
+        assert!(blue <= 3, "blue = {blue}");
     }
 
     #[test]

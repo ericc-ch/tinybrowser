@@ -164,18 +164,28 @@ pub struct Proxy {
     auth: Option<HeaderValue>,
 }
 
+/// A proxy URI that is not an `http://` HTTP CONNECT authority with a host.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("proxy URI must be an http:// HTTP CONNECT authority")]
+pub struct InvalidProxy;
+
+/// A certificate file that is not a PEM-encoded certificate.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid certificate authority: {0}")]
+pub struct InvalidCa(#[source] native_tls::Error);
+
 impl Proxy {
-    fn parse(proxy: &str) -> Result<Self, ProtocolError> {
-        let url = Url::parse(proxy).map_err(|_| ProtocolError::InvalidProxy)?;
+    fn parse(proxy: &str) -> Result<Self, InvalidProxy> {
+        let url = Url::parse(proxy).map_err(|_| InvalidProxy)?;
         if url.scheme() != "http" {
-            return Err(ProtocolError::InvalidProxy);
+            return Err(InvalidProxy);
         }
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-            return Err(ProtocolError::InvalidProxy);
+            return Err(InvalidProxy);
         }
-        let host = url.host_str().ok_or(ProtocolError::InvalidProxy)?;
+        let host = url.host_str().ok_or(InvalidProxy)?;
         if url.password().is_some() && url.username().is_empty() {
-            return Err(ProtocolError::InvalidProxy);
+            return Err(InvalidProxy);
         }
         let port = url.port().unwrap_or(80);
         let destination = hyper::Uri::builder()
@@ -183,24 +193,24 @@ impl Proxy {
             .authority(format!("{host}:{port}"))
             .path_and_query("/")
             .build()
-            .map_err(|_| ProtocolError::InvalidProxy)?;
+            .map_err(|_| InvalidProxy)?;
         let auth = if url.username().is_empty() {
             None
         } else {
             let username = percent_decode_str(url.username())
                 .decode_utf8()
-                .map_err(|_| ProtocolError::InvalidProxy)?;
+                .map_err(|_| InvalidProxy)?;
             let password = url
                 .password()
                 .map(|password| {
                     percent_decode_str(password)
                         .decode_utf8()
-                        .map_err(|_| ProtocolError::InvalidProxy)
+                        .map_err(|_| InvalidProxy)
                 })
                 .transpose()?
                 .unwrap_or_default();
             let mut value = HeaderValue::from_str(&basic_authorization(&username, &password))
-                .map_err(|_| ProtocolError::InvalidProxy)?;
+                .map_err(|_| InvalidProxy)?;
             value.set_sensitive(true);
             Some(value)
         };
@@ -209,7 +219,7 @@ impl Proxy {
 }
 
 impl FromStr for Proxy {
-    type Err = ProtocolError;
+    type Err = InvalidProxy;
 
     fn from_str(proxy: &str) -> Result<Self, Self::Err> {
         Self::parse(proxy)
@@ -246,16 +256,36 @@ impl fmt::Debug for HttpEngine {
     }
 }
 
+/// A PEM certificate authority, already parsed for the TLS connector.
+///
+/// The configuration boundary builds these, so a malformed file is a usage
+/// error instead of a dial-time TLS failure.
+#[derive(Clone)]
+pub struct TrustedCa(native_tls::Certificate);
+
+impl TrustedCa {
+    /// Parses one PEM certificate.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidCa`] when `pem` is not a PEM-encoded certificate.
+    pub fn from_pem(pem: &[u8]) -> Result<Self, InvalidCa> {
+        native_tls::Certificate::from_pem(pem)
+            .map(Self)
+            .map_err(InvalidCa)
+    }
+}
+
 /// `native-tls` connector trusting `cas`.
 ///
 /// ALPN is configured here, not by `hyper-tls`: its `alpn` feature only reports
 /// the protocol the server picked. OpenSSL initialization failure is
 /// unrecoverable for TLS in this process, and `hyper-tls`'s own constructors
 /// panic on it for the same reason.
-fn tls_connector(cas: &[native_tls::Certificate]) -> tokio_native_tls::TlsConnector {
+fn tls_connector(cas: &[TrustedCa]) -> tokio_native_tls::TlsConnector {
     let mut tls = native_tls::TlsConnector::builder();
     for ca in cas {
-        tls.add_root_certificate(ca.clone());
+        tls.add_root_certificate(ca.0.clone());
     }
     let tls = tls
         .request_alpns(&["h2", "http/1.1"])
@@ -276,7 +306,7 @@ impl HttpEngine {
         proxy: Option<Proxy>,
         clock: Clock,
         host_map: HostMap,
-        tls_cas: &[native_tls::Certificate],
+        tls_cas: &[TrustedCa],
     ) -> Self {
         let resolver = HostResolver {
             host_map,

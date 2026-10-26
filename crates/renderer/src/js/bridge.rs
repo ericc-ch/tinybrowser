@@ -99,6 +99,27 @@ pub(crate) fn object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
         .restore(ctx)
 }
 
+/// A JS number that names a host id: a finite integer in `0..=u32::MAX`, the
+/// range every id this engine hands to script fits in.
+#[must_use]
+pub(crate) fn host_index(value: f64) -> Option<u32> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > f64::from(u32::MAX) {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the guard admits exactly the integers 0..=u32::MAX"
+    )]
+    Some(value as u32)
+}
+
+/// A JS number naming a frame, or `None` when it is not a host id.
+#[must_use]
+pub(crate) fn frame_id(value: f64) -> Option<crate::protocol::FrameId> {
+    host_index(value).map(|raw| crate::protocol::FrameId::new(u64::from(raw)))
+}
+
 pub(crate) fn evaluate(ctx: &Ctx<'_>, source: &str) -> Result<()> {
     let primordials = include_str!("scripts/primordials.js");
     let bindings = include_str!("scripts/bindings.js");

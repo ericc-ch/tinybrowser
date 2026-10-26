@@ -2909,8 +2909,9 @@ impl Document {
             },
         );
         format!(
-            "[{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":\"tinybrowser\",\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":{},\"lineNumber\":{},\"columnNumber\":{},\"sample\":{},\"disposition\":{},\"statusCode\":{}}}}}]",
+            "[{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":{},\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":{},\"lineNumber\":{},\"columnNumber\":{},\"sample\":{},\"disposition\":{},\"statusCode\":{}}}}}]",
             Self::json_string(&violation.document_uri),
+            Self::json_string(crate::USER_AGENT),
             Self::json_string(&violation.document_uri),
             Self::json_string(&violation.blocked_uri),
             Self::json_string(&violation.effective_directive),

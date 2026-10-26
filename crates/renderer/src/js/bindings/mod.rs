@@ -11,6 +11,7 @@ mod clone;
 mod collections;
 mod cssom_host;
 mod document;
+pub(crate) mod enumerated;
 mod exceptions;
 pub(crate) mod focus;
 pub(crate) mod forms;
@@ -525,6 +526,8 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 
 /// Registers the `__tb_*` host functions page scripts call into.
 fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
+    crate::js::bridge::object(ctx)?
+        .set("__tbUserAgent", rquickjs::prelude::Func::from(user_agent))?;
     crate::js::bridge::object(ctx)?.set(
         "__tb_deliver_mutations",
         rquickjs::prelude::Func::from(deliver_mutations),
@@ -591,6 +594,13 @@ fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
     vec![f64::from(width), f64::from(height)]
 }
 
+/// `navigator.userAgent`, from the same constant the browser sends as the
+/// request header
+/// (<https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-useragent>).
+fn user_agent() -> &'static str {
+    crate::USER_AGENT
+}
+
 /// Captures the pristine intrinsics and host entry points every later lookup
 /// must use instead of `ctx.globals()`.
 fn capture_host_primitives<'js>(
@@ -637,14 +647,11 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
 /// `execute_script` work as well as Find Element results
 /// (<https://w3c.github.io/webdriver/#elements>).
 pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "WebDriver element ids are small non-negative integers"
-    )]
-    let remote = remote_id as u64;
+    let Some(remote) = crate::js::bridge::host_index(remote_id) else {
+        return Ok(Value::new_null(ctx));
+    };
     let world = world(&ctx)?;
-    let Some(node) = world.borrow().node_for_remote(remote) else {
+    let Some(node) = world.borrow().node_for_remote(u64::from(remote)) else {
         return Ok(Value::new_null(ctx));
     };
     // Only a live, connected element is a valid element reference.

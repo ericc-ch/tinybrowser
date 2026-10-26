@@ -2,8 +2,6 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use crate::error::{NetError, ProtocolError};
-
 /// Resolution-phase failure. `hyper-util` wraps it in its own connect error;
 /// keeping a distinct type lets [`crate::transport`] classify the failure as
 /// DNS instead of guessing from the message text.
@@ -33,11 +31,47 @@ impl std::error::Error for ResolveFailure {
     }
 }
 
-/// One `--resolve=PATTERN=ADDR` rule. First match wins.
+/// A `--resolve` spec that is not `PATTERN=IPv4` or `PATTERN=fail`.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("resolve spec {0:?} must be PATTERN=IPv4 or PATTERN=fail")]
+pub struct InvalidResolveRule(Box<str>);
+
+/// One parsed `--resolve=PATTERN=ADDR` rule. First match wins.
+///
+/// The `PATTERN` is an exact host or a `*` glob; `ADDR` is an IPv4 literal or
+/// `fail`. Parsing happens at the configuration boundary, so an invalid spec
+/// is a usage error instead of a dial-time failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Rule {
+pub struct ResolveRule {
     pattern: Box<str>,
     target: Target,
+}
+
+impl ResolveRule {
+    /// Parses one `PATTERN=ADDR` spec.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidResolveRule`] carrying `spec` when it has no `=`, either half
+    /// is empty, or `ADDR` is neither an IPv4 literal nor `fail`.
+    pub fn parse(spec: &str) -> Result<Self, InvalidResolveRule> {
+        let Some((pattern, addr)) = spec.split_once('=') else {
+            return Err(InvalidResolveRule(spec.into()));
+        };
+        if pattern.is_empty() || addr.is_empty() {
+            return Err(InvalidResolveRule(spec.into()));
+        }
+        let pattern = pattern.to_ascii_lowercase().into_boxed_str();
+        let target = if addr.eq_ignore_ascii_case("fail") {
+            Target::Fail
+        } else {
+            let ip = addr
+                .parse::<Ipv4Addr>()
+                .map_err(|_| InvalidResolveRule(spec.into()))?;
+            Target::Addr(ip)
+        };
+        Ok(Self { pattern, target })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,18 +83,10 @@ pub(crate) enum Target {
 /// Ordered host rewrites. Empty means libc DNS. Cheap to clone.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HostMap {
-    rules: Arc<Vec<Rule>>,
+    rules: Arc<Vec<ResolveRule>>,
 }
 
 impl HostMap {
-    pub(crate) fn with_spec(&self, spec: &str) -> Result<Self, NetError> {
-        let mut rules = (*self.rules).clone();
-        rules.push(parse_rule(spec)?);
-        Ok(Self {
-            rules: Arc::new(rules),
-        })
-    }
-
     pub(crate) fn lookup(&self, host: &str) -> Option<Target> {
         if self.rules.is_empty() {
             return None;
@@ -73,25 +99,6 @@ impl HostMap {
         }
         None
     }
-}
-
-fn parse_rule(spec: &str) -> Result<Rule, NetError> {
-    let Some((pattern, addr)) = spec.split_once('=') else {
-        return Err(invalid_resolve(spec));
-    };
-    if pattern.is_empty() || addr.is_empty() {
-        return Err(invalid_resolve(spec));
-    }
-    let pattern = pattern.to_ascii_lowercase().into_boxed_str();
-    let target = if addr.eq_ignore_ascii_case("fail") {
-        Target::Fail
-    } else {
-        let ip = addr
-            .parse::<Ipv4Addr>()
-            .map_err(|_| invalid_resolve(spec))?;
-        Target::Addr(ip)
-    };
-    Ok(Rule { pattern, target })
 }
 
 fn glob_match(pattern: &str, host: &str) -> bool {
@@ -117,8 +124,10 @@ fn glob_match(pattern: &str, host: &str) -> bool {
     true
 }
 
-fn invalid_resolve(spec: &str) -> NetError {
-    NetError::Protocol(ProtocolError::InvalidResolve(
-        spec.to_owned().into_boxed_str(),
-    ))
+impl From<Vec<ResolveRule>> for HostMap {
+    fn from(rules: Vec<ResolveRule>) -> Self {
+        Self {
+            rules: Arc::new(rules),
+        }
+    }
 }

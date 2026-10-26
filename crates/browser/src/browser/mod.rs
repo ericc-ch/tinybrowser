@@ -180,9 +180,10 @@ pub(super) struct AddCookie {
 impl Browser {
     /// Opens the selected profile and starts its browser owner task.
     ///
-    /// This function validates network options, exclusively locks and restores
-    /// the profile, and starts renderer-process management. It must run inside
-    /// an active Tokio runtime. No tab is created automatically.
+    /// `options.network` must already be validated; this function does not
+    /// re-check it. It exclusively locks and restores the profile and starts
+    /// renderer-process management. It must run inside an active Tokio runtime.
+    /// No tab is created automatically.
     ///
     /// # Examples
     ///
@@ -203,14 +204,12 @@ impl Browser {
     /// # Errors
     ///
     /// Returns [`BrowserOpenError::RuntimeUnavailable`] outside a Tokio
-    /// runtime, [`BrowserOpenError::InvalidNetwork`] when a proxy, resolver, or
-    /// TLS option is invalid, or [`BrowserOpenError::Profile`] when the data
-    /// home or profile cannot be created, locked, restored, or quarantined.
+    /// runtime, or [`BrowserOpenError::Profile`] when the data home or profile
+    /// cannot be created, locked, restored, or quarantined.
     pub fn new(options: BrowserOptions) -> Result<Self, BrowserOpenError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| BrowserOpenError::RuntimeUnavailable)?;
-        let network =
-            NetworkContext::new(options.network).map_err(BrowserOpenError::InvalidNetwork)?;
+        let network = NetworkContext::new(options.network);
         let data_home = match options.data_home {
             Some(data_home) => data_home,
             None => default_data_home().map_err(BrowserOpenError::Profile)?,
@@ -415,8 +414,6 @@ pub enum BrowserOpenError {
     /// The data home or profile could not be created, locked, read, or
     /// quarantined.
     Profile(io::Error),
-    /// Network options failed validation.
-    InvalidNetwork(net::NetError),
     /// No Tokio runtime was active on the calling thread.
     RuntimeUnavailable,
 }
@@ -425,7 +422,6 @@ impl fmt::Display for BrowserOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Profile(error) => write!(formatter, "profile failed: {error}"),
-            Self::InvalidNetwork(error) => write!(formatter, "invalid network options: {error}"),
             Self::RuntimeUnavailable => formatter.write_str("browser runtime unavailable"),
         }
     }
@@ -435,7 +431,6 @@ impl std::error::Error for BrowserOpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Profile(error) => Some(error),
-            Self::InvalidNetwork(error) => Some(error),
             Self::RuntimeUnavailable => None,
         }
     }
@@ -444,9 +439,8 @@ impl std::error::Error for BrowserOpenError {
 impl From<BrowserOpenError> for io::Error {
     fn from(error: BrowserOpenError) -> Self {
         match error {
-            BrowserOpenError::Profile(error) => error,
-            BrowserOpenError::InvalidNetwork(error) => {
-                Self::new(io::ErrorKind::InvalidInput, error)
+            BrowserOpenError::Profile(error) => {
+                Self::new(error.kind(), format!("profile failed: {error}"))
             }
             BrowserOpenError::RuntimeUnavailable => Self::other("browser runtime unavailable"),
         }

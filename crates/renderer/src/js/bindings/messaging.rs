@@ -553,15 +553,7 @@ fn endpoint_owned(world: &Rc<RefCell<World>>, endpoint: u64) -> bool {
 
 /// A JS number naming a protocol id; ids are small non-negative integers.
 fn protocol_id(value: f64) -> Option<u64> {
-    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > f64::from(u32::MAX) {
-        return None;
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the value is range-checked to a non-negative u32 above"
-    )]
-    Some(value as u64)
+    crate::js::bridge::host_index(value).map(u64::from)
 }
 
 fn protocol_ids(values: Vec<f64>) -> Option<Vec<u64>> {

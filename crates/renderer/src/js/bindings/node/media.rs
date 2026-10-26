@@ -9,10 +9,10 @@ use crate::dom::tree::{NodeId, attr, html_namespace, is_connected};
 
 use super::JsNode;
 use super::element::{
-    LAZY_EAGER_KEYWORDS, PRELOAD_KEYWORDS, content_attr, reflect_cross_origin, reflect_double,
-    reflect_enum, reflect_limited_double, reflect_referrer_policy, reflect_ulong, set_cross_origin,
-    set_referrer_policy,
+    content_attr, reflect_cross_origin, reflect_double, reflect_limited_double,
+    reflect_referrer_policy, reflect_ulong, set_cross_origin, set_referrer_policy,
 };
+use crate::js::bindings::enumerated::{Decoding, Loading, Preload, reflect_enumerated};
 
 include!(concat!(env!("OUT_DIR"), "/HTMLMediaElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLVideoElement.rs"));
@@ -88,9 +88,8 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-preload
     fn get_preload(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enum(
+        let value = reflect_enumerated::<Preload>(
             content_attr(ctx, self.handle.0, "preload").as_deref(),
-            PRELOAD_KEYWORDS,
             "auto",
             "auto",
         );
@@ -104,9 +103,8 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
     fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enum(
+        let value = reflect_enumerated::<Loading>(
             content_attr(ctx, self.handle.0, "loading").as_deref(),
-            LAZY_EAGER_KEYWORDS,
             "eager",
             "eager",
         );
@@ -308,10 +306,8 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     // `decoding` defaults to `auto`
     // (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decoding>).
     fn get_decoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        const KEYWORDS: &[&str] = &["async", "sync", "auto"];
-        let value = reflect_enum(
+        let value = reflect_enumerated::<Decoding>(
             content_attr(ctx, self.handle.0, "decoding").as_deref(),
-            KEYWORDS,
             "auto",
             "auto",
         );
@@ -326,9 +322,8 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     // `loading` defaults to `eager`
     // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading>).
     fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enum(
+        let value = reflect_enumerated::<Loading>(
             content_attr(ctx, self.handle.0, "loading").as_deref(),
-            LAZY_EAGER_KEYWORDS,
             "eager",
             "eager",
         );

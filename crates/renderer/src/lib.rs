@@ -50,6 +50,12 @@ pub use protocol::{
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;
 
+/// Chrome-compatible identity, the one source for the request header,
+/// `navigator.userAgent`, and CSP reports.
+///
+/// TLS fingerprinting is a separate transport concern and is not changed here.
+pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+
 /// The current document readiness
 /// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

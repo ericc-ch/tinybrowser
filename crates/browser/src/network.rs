@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use net::{Agent, AgentOptions, InitiatorKind, Method, Request};
+use net::{Agent, AgentOptions, InitiatorKind, Method, Request, UserAgent};
 use renderer::{DialFailure, DialKind, DialOutcome, DialRequest};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
@@ -97,6 +97,8 @@ struct CacheRead {
 
 const CACHE_MAX_ENTRIES: usize = 64;
 const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+const DEFAULT_USER_AGENT: UserAgent = UserAgent::from_static(crate::USER_AGENT);
 
 fn insert_cached(
     cache: &mut HashMap<CacheKey, CachedResponse>,
@@ -330,26 +332,20 @@ impl NetworkContext {
     /// Builds the partition network from caller `options`. Defaults fill only
     /// where the caller left a field `None`: caller wins on `user_agent` and
     /// `timeout_per_call`.
-    ///
-    /// # Errors
-    ///
-    /// [`Agent::new`] rejects an invalid user agent, resolve spec, or TLS CA
-    /// value.
-    pub(crate) fn new(mut options: AgentOptions) -> Result<Self, net::NetError> {
+    pub(crate) fn new(mut options: AgentOptions) -> Self {
         if options.user_agent.is_none() {
-            options.user_agent = Some(crate::USER_AGENT.to_string());
+            options.user_agent = Some(DEFAULT_USER_AGENT);
         }
         if options.timeout_per_call.is_none() {
             options.timeout_per_call = Some(PAGE_FETCH_TIMEOUT);
         }
-        let agent = Agent::new(options)?;
-        Ok(Self {
-            agent,
+        Self {
+            agent: Agent::new(options),
             permits: NetworkPermits::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream: Arc::new(AtomicU64::new(1)),
-        })
+        }
     }
 
     /// Network capability for one tab, with its own per-tab cap.
@@ -1406,7 +1402,7 @@ fn chrome_navigation_request(request: &mut Request, url: &Url) {
     identity_header(request, "Sec-Fetch-Mode", "navigate");
     identity_header(request, "Sec-Fetch-User", "?1");
     identity_header(request, "Sec-Fetch-Dest", "document");
-    if net::referrer::is_potentially_trustworthy(url) {
+    if net::is_potentially_trustworthy(url) {
         for (name, value) in [
             ("Sec-CH-UA", crate::SEC_CH_UA),
             ("Sec-CH-UA-Mobile", crate::SEC_CH_UA_MOBILE),
@@ -1556,19 +1552,59 @@ mod tests {
     #[test]
     fn cache_evicts_the_oldest_entry_at_the_count_limit() {
         let mut cache = HashMap::new();
-        for index in 0..=CACHE_MAX_ENTRIES {
-            let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
-            request.url = format!("http://a.test/{index}");
-            let key = cache_key(
-                &request,
-                &Url::parse("http://a.test/page").expect("page URL"),
-                RendererAssignmentId::new(1),
-            );
+        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let keys: Vec<CacheKey> = (0..=CACHE_MAX_ENTRIES)
+            .map(|index| {
+                let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+                request.url = format!("http://a.test/{index}");
+                cache_key(&request, &initiator, RendererAssignmentId::new(1))
+            })
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
             let mut entry = cached(net::cors::ResponseType::Basic);
-            entry.stored_at = Instant::now() + Duration::from_secs(index as u64);
-            insert_cached(&mut cache, key, entry);
+            entry.stored_at =
+                Instant::now() + Duration::from_secs(u64::try_from(index).expect("entry index"));
+            insert_cached(&mut cache, key.clone(), entry);
         }
         assert_eq!(cache.len(), CACHE_MAX_ENTRIES);
+        assert!(
+            !cache.contains_key(&keys[0]),
+            "the oldest entry is the one evicted"
+        );
+        assert!(
+            cache.contains_key(&keys[CACHE_MAX_ENTRIES]),
+            "the entry just inserted survives"
+        );
+    }
+
+    #[test]
+    fn cache_evicts_by_body_bytes_from_the_oldest_entry() {
+        let bodies = CACHE_MAX_BYTES / renderer::MAX_RESPONSE_BODY_BYTES + 1;
+        let mut cache = HashMap::new();
+        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let keys: Vec<CacheKey> = (0..bodies)
+            .map(|index| {
+                let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+                request.url = format!("http://a.test/{index}");
+                cache_key(&request, &initiator, RendererAssignmentId::new(1))
+            })
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
+            let mut entry = cached(net::cors::ResponseType::Basic);
+            entry.outcome.body = Ok(vec![0; renderer::MAX_RESPONSE_BODY_BYTES]);
+            entry.stored_at =
+                Instant::now() + Duration::from_secs(u64::try_from(index).expect("entry index"));
+            insert_cached(&mut cache, key.clone(), entry);
+        }
+        assert_eq!(cache.len(), bodies - 1);
+        assert!(
+            !cache.contains_key(&keys[0]),
+            "the oldest body is the one evicted"
+        );
+        assert!(
+            cache.contains_key(&keys[bodies - 1]),
+            "the body just inserted stays"
+        );
     }
 
     #[tokio::test]
@@ -1600,18 +1636,33 @@ mod tests {
     }
 
     #[test]
-    fn default_ua_client_hints_are_limited_to_trustworthy_urls() {
-        assert!(net::referrer::is_potentially_trustworthy(
-            &Url::parse("https://example.com/").expect("https")
-        ));
-        assert!(!net::referrer::is_potentially_trustworthy(
-            &Url::parse("http://example.com/").expect("http")
-        ));
-        assert!(net::referrer::is_potentially_trustworthy(
-            &Url::parse("http://127.0.0.1/").expect("loopback")
-        ));
-        assert!(net::referrer::is_potentially_trustworthy(
-            &Url::parse("http://localhost/").expect("localhost")
-        ));
+    fn chrome_navigation_client_hints_are_limited_to_trustworthy_urls() {
+        let hints = [
+            "sec-ch-ua",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-platform",
+            "sec-ch-prefers-color-scheme",
+        ];
+        let secure = Url::parse("https://example.com/").expect("https url");
+        let mut secure_request = net::Request::new(net::Method::GET, secure.clone());
+        chrome_navigation_request(&mut secure_request, &secure);
+        for hint in hints {
+            assert!(
+                secure_request.headers.get(hint).is_some(),
+                "{hint} must reach a trustworthy URL"
+            );
+        }
+
+        let insecure = Url::parse("http://example.com/").expect("http url");
+        let mut insecure_request = net::Request::new(net::Method::GET, insecure.clone());
+        chrome_navigation_request(&mut insecure_request, &insecure);
+        for hint in hints {
+            assert!(
+                insecure_request.headers.get(hint).is_none(),
+                "{hint} must stay off plain http"
+            );
+        }
+        assert!(insecure_request.headers.get("sec-fetch-mode").is_some());
+        assert!(insecure_request.headers.get("accept").is_some());
     }
 }

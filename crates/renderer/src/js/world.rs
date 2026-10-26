@@ -897,6 +897,92 @@ mod sandbox_flag_tests {
         }
     }
 
+    fn all_flags() -> [u32; 16] {
+        [
+            SandboxFlags::NAVIGATION,
+            SandboxFlags::AUXILIARY_NAVIGATION,
+            SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
+            SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
+            SandboxFlags::ORIGIN,
+            SandboxFlags::FORMS,
+            SandboxFlags::POINTER_LOCK,
+            SandboxFlags::SCRIPTS,
+            SandboxFlags::AUTOMATIC_FEATURES,
+            SandboxFlags::DOCUMENT_DOMAIN,
+            SandboxFlags::PROPAGATES_TO_AUXILIARY,
+            SandboxFlags::MODALS,
+            SandboxFlags::ORIENTATION_LOCK,
+            SandboxFlags::PRESENTATION,
+            SandboxFlags::DOWNLOADS,
+            SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+        ]
+    }
+
+    #[test]
+    fn every_keyword_clears_exactly_the_flags_the_standard_names() {
+        let expected: &[(&str, &[u32])] = &[
+            (
+                "allow-popups",
+                &[
+                    SandboxFlags::AUXILIARY_NAVIGATION,
+                    SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+                ],
+            ),
+            (
+                "allow-top-navigation",
+                &[
+                    SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
+                    SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
+                    SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+                ],
+            ),
+            (
+                "allow-top-navigation-by-user-activation",
+                &[SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION],
+            ),
+            ("allow-same-origin", &[SandboxFlags::ORIGIN]),
+            ("allow-forms", &[SandboxFlags::FORMS]),
+            ("allow-pointer-lock", &[SandboxFlags::POINTER_LOCK]),
+            (
+                "allow-scripts",
+                &[SandboxFlags::SCRIPTS, SandboxFlags::AUTOMATIC_FEATURES],
+            ),
+            (
+                "allow-popups-to-escape-sandbox",
+                &[SandboxFlags::PROPAGATES_TO_AUXILIARY],
+            ),
+            ("allow-modals", &[SandboxFlags::MODALS]),
+            ("allow-orientation-lock", &[SandboxFlags::ORIENTATION_LOCK]),
+            ("allow-presentation", &[SandboxFlags::PRESENTATION]),
+            ("allow-downloads", &[SandboxFlags::DOWNLOADS]),
+            (
+                "allow-top-navigation-to-custom-protocols",
+                &[SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION],
+            ),
+        ];
+        for (keyword, cleared) in expected {
+            let flags = SandboxFlags::parse(Some(keyword));
+            for flag in all_flags() {
+                assert_eq!(
+                    flags.contains(flag),
+                    !cleared.contains(&flag),
+                    "{keyword}: flag {flag:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supports_ignores_ascii_case_and_rejects_unlisted_keywords() {
+        assert!(SandboxFlags::supports("allow-scripts"));
+        assert!(SandboxFlags::supports("ALLOW-SCRIPTS"));
+        assert!(SandboxFlags::supports("Allow-Same-Origin"));
+        assert!(!SandboxFlags::supports("allow-frames"));
+        assert!(!SandboxFlags::supports(
+            "allow-storage-access-by-user-activation"
+        ));
+    }
+
     #[test]
     fn keywords_clear_exactly_the_flags_they_name() {
         let flags = SandboxFlags::parse(Some("allow-scripts allow-same-origin"));
@@ -1075,6 +1161,57 @@ impl SandboxFlags {
     /// `allow-top-navigation-to-custom-protocols`.
     const CUSTOM_PROTOCOLS_NAVIGATION: u32 = 1 << 15;
 
+    /// The `sandbox` keywords and the flags each one clears. This is the only
+    /// list: [`Self::parse`] reads it and [`Self::supports`] answers from it,
+    /// so a keyword cannot be advertised without taking effect
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+    const TOKENS: &[(&str, Self)] = &[
+        (
+            "allow-popups",
+            Self(Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION),
+        ),
+        (
+            "allow-top-navigation",
+            Self(
+                Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+                    | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+                    | Self::CUSTOM_PROTOCOLS_NAVIGATION,
+            ),
+        ),
+        (
+            "allow-top-navigation-by-user-activation",
+            Self(Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION),
+        ),
+        ("allow-same-origin", Self(Self::ORIGIN)),
+        ("allow-forms", Self(Self::FORMS)),
+        ("allow-pointer-lock", Self(Self::POINTER_LOCK)),
+        (
+            "allow-scripts",
+            Self(Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
+        ),
+        (
+            "allow-popups-to-escape-sandbox",
+            Self(Self::PROPAGATES_TO_AUXILIARY),
+        ),
+        ("allow-modals", Self(Self::MODALS)),
+        ("allow-orientation-lock", Self(Self::ORIENTATION_LOCK)),
+        ("allow-presentation", Self(Self::PRESENTATION)),
+        ("allow-downloads", Self(Self::DOWNLOADS)),
+        (
+            "allow-top-navigation-to-custom-protocols",
+            Self(Self::CUSTOM_PROTOCOLS_NAVIGATION),
+        ),
+    ];
+
+    /// Whether `token` is a supported `sandbox` keyword. The comparison is
+    /// ASCII case-insensitive
+    /// (<https://dom.spec.whatwg.org/#concept-domtokenlist-validation>).
+    pub(crate) fn supports(token: &str) -> bool {
+        Self::TOKENS
+            .iter()
+            .any(|(keyword, _)| keyword.eq_ignore_ascii_case(token))
+    }
+
     /// Parses one `sandbox` attribute value, or returns the empty set when the
     /// attribute is absent
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#parse-a-sandboxing-directive>).
@@ -1101,32 +1238,11 @@ impl SandboxFlags {
                 | Self::CUSTOM_PROTOCOLS_NAVIGATION,
         );
         for token in attribute.split_ascii_whitespace() {
-            let token = token.to_ascii_lowercase();
-            match token.as_str() {
-                "allow-popups" => {
-                    flags.0 &= !(Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION);
-                }
-                "allow-top-navigation" => {
-                    flags.0 &= !(Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
-                        | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
-                        | Self::CUSTOM_PROTOCOLS_NAVIGATION);
-                }
-                "allow-top-navigation-by-user-activation" => {
-                    flags.0 &= !Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION;
-                }
-                "allow-same-origin" => flags.0 &= !Self::ORIGIN,
-                "allow-forms" => flags.0 &= !Self::FORMS,
-                "allow-pointer-lock" => flags.0 &= !Self::POINTER_LOCK,
-                "allow-scripts" => flags.0 &= !(Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
-                "allow-popups-to-escape-sandbox" => flags.0 &= !Self::PROPAGATES_TO_AUXILIARY,
-                "allow-modals" => flags.0 &= !Self::MODALS,
-                "allow-orientation-lock" => flags.0 &= !Self::ORIENTATION_LOCK,
-                "allow-presentation" => flags.0 &= !Self::PRESENTATION,
-                "allow-downloads" => flags.0 &= !Self::DOWNLOADS,
-                "allow-top-navigation-to-custom-protocols" => {
-                    flags.0 &= !Self::CUSTOM_PROTOCOLS_NAVIGATION;
-                }
-                _ => {}
+            if let Some((_, cleared)) = Self::TOKENS
+                .iter()
+                .find(|(keyword, _)| keyword.eq_ignore_ascii_case(token))
+            {
+                flags.0 &= !cleared.0;
             }
         }
         flags

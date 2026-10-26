@@ -19,9 +19,10 @@ use crate::dom::tree::{NodeId, attr, html_namespace};
 use super::JsNode;
 use super::document::document_first;
 use super::element::{
-    content_attr, reflect_clamped_ulong, reflect_cross_origin, reflect_enum,
-    reflect_referrer_policy, reflect_ulong, set_cross_origin, set_referrer_policy,
+    content_attr, reflect_clamped_ulong, reflect_cross_origin, reflect_referrer_policy,
+    reflect_ulong, set_cross_origin, set_referrer_policy,
 };
+use crate::js::bindings::enumerated::{LinkAs, TableScope, TrackKind, reflect_enumerated};
 
 include!(concat!(env!("OUT_DIR"), "/HTMLAnchorElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLAreaElement.rs"));
@@ -225,10 +226,8 @@ impl<'js> html_table_cell_element_generated::HTMLTableCellElement<'js> for JsNod
     // `scope` is an enumeration with an empty-string default
     // (<https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-scope>).
     fn get_scope(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        const KEYWORDS: &[&str] = &["row", "col", "rowgroup", "colgroup"];
-        let value = reflect_enum(
+        let value = reflect_enumerated::<TableScope>(
             content_attr(ctx, self.handle.0, "scope").as_deref(),
-            KEYWORDS,
             "",
             "",
         );
@@ -294,36 +293,8 @@ impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
     // destinations, defaulting to the empty string
     // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as>).
     fn get_as(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        const KEYWORDS: &[&str] = &[
-            "fetch",
-            "audio",
-            "audioworklet",
-            "document",
-            "embed",
-            "font",
-            "frame",
-            "iframe",
-            "image",
-            "json",
-            "manifest",
-            "object",
-            "paintworklet",
-            "report",
-            "script",
-            "serviceworker",
-            "sharedworker",
-            "style",
-            "track",
-            "video",
-            "worker",
-            "xslt",
-        ];
-        let value = reflect_enum(
-            content_attr(ctx, self.handle.0, "as").as_deref(),
-            KEYWORDS,
-            "",
-            "",
-        );
+        let value =
+            reflect_enumerated::<LinkAs>(content_attr(ctx, self.handle.0, "as").as_deref(), "", "");
         rquickjs::String::from_str(ctx.clone(), &value)
     }
 
@@ -383,16 +354,8 @@ impl<'js> html_track_element_generated::HTMLTrackElement<'js> for JsNode {
     // `kind` defaults to `subtitles`; unknown values read `metadata`
     // (<https://html.spec.whatwg.org/multipage/media.html#dom-track-kind>).
     fn get_kind(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        const KEYWORDS: &[&str] = &[
-            "subtitles",
-            "captions",
-            "descriptions",
-            "chapters",
-            "metadata",
-        ];
-        let value = reflect_enum(
+        let value = reflect_enumerated::<TrackKind>(
             content_attr(ctx, self.handle.0, "kind").as_deref(),
-            KEYWORDS,
             "subtitles",
             "metadata",
         );

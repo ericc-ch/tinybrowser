@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 
 use net::{
     Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Proxy, Referrer,
-    ReferrerPolicy, Request, TimeoutKind, TransportError,
+    ReferrerPolicy, Request, ResolveRule, TimeoutKind, TransportError, UserAgent,
 };
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_PROBE_FLAG: &str = "NET_CRATE_PROXY_PROBE";
 
 fn default_agent() -> Agent {
-    Agent::new(AgentOptions::default()).expect("default options are valid")
+    Agent::new(AgentOptions::default())
 }
 
 #[tokio::test]
@@ -114,7 +114,6 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             timeout_global: Some(Duration::from_millis(60)),
             ..AgentOptions::default()
         })
-        .expect("timeout options")
         .send(Request::new(Method::GET, server.url("/stall")))
         .await,
         Err(NetError::Transport(TransportError::Timeout(
@@ -157,7 +156,6 @@ async fn timeout_global_covers_every_redirect_hop() {
         timeout_global: Some(global),
         ..AgentOptions::default()
     })
-    .expect("timeout options")
     .send(Request::new(Method::GET, server.url("/start")))
     .await;
     let elapsed = started.elapsed();
@@ -189,7 +187,6 @@ async fn timeout_per_call_restarts_on_every_redirect_hop() {
         timeout_per_call: Some(per_call),
         ..AgentOptions::default()
     })
-    .expect("timeout options")
     .send(Request::new(Method::GET, server.url("/start")))
     .await;
     assert!(
@@ -216,7 +213,6 @@ async fn timeout_per_call_bounds_a_single_slow_hop() {
         timeout_per_call: Some(per_call),
         ..AgentOptions::default()
     })
-    .expect("timeout options")
     .send(Request::new(Method::GET, server.url("/start")))
     .await;
     let elapsed = started.elapsed();
@@ -329,10 +325,9 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()]);
     let agent = Agent::new(AgentOptions {
-        user_agent: Some("builder/default".to_owned()),
+        user_agent: Some(UserAgent::from_static("builder/default")),
         ..AgentOptions::default()
-    })
-    .expect("agent options");
+    });
     let mut request = Request::new(Method::POST, server.url("/shape#fragment"));
     request.headers.insert("X-Custom", "alpha").expect("header");
     request
@@ -373,7 +368,6 @@ async fn max_redirects_cap_returns_limit_exceeded() {
             max_redirects: 1,
             ..AgentOptions::default()
         })
-        .expect("cap options")
         .send(Request::new(Method::GET, empty.url("/empty")))
         .await,
         Err(NetError::Limit(LimitExceeded::Redirect))
@@ -387,7 +381,6 @@ async fn max_redirects_cap_returns_limit_exceeded() {
             max_redirects: 2,
             ..AgentOptions::default()
         })
-        .expect("cap options")
         .send(Request::new(Method::GET, server.url("/loop")))
         .await,
         Err(NetError::Limit(LimitExceeded::Redirect))
@@ -523,7 +516,6 @@ async fn connect_proxy_routes_https_and_reports_denials() {
         proxy: Some(proxy_config),
         ..AgentOptions::default()
     })
-    .expect("proxy")
     .send(Request::new(
         Method::GET,
         url::Url::parse("https://origin.test/").expect("https"),
@@ -554,7 +546,6 @@ async fn connect_proxy_routes_https_and_reports_denials() {
             ),
             ..AgentOptions::default()
         })
-        .expect("proxy")
         .send(Request::new(
             Method::GET,
             url::Url::parse("https://origin.test/").expect("https"),
@@ -580,7 +571,7 @@ fn proxy_parser_rejects_unsupported_or_ambiguous_authorities() {
     ] {
         assert_eq!(
             invalid.parse::<Proxy>().expect_err("invalid proxy"),
-            ProtocolError::InvalidProxy,
+            net::InvalidProxy,
             "{invalid:?}"
         );
     }
@@ -656,19 +647,6 @@ async fn environment_proxy_variables_are_ignored() {
             .expect("proxy probe");
         assert!(status.success());
     }
-}
-
-/// A `User-Agent` with a control byte is invalid configuration, not a header
-/// that silently disappears from every request.
-#[test]
-fn invalid_user_agent_is_rejected_at_construction() {
-    assert!(matches!(
-        Agent::new(AgentOptions {
-            user_agent: Some("tinybrowser\r\nInjected: yes".to_owned()),
-            ..AgentOptions::default()
-        }),
-        Err(NetError::Protocol(ProtocolError::InvalidUserAgent))
-    ));
 }
 
 #[tokio::test]
@@ -912,26 +890,23 @@ async fn redirect_taint_serializes_null_and_null_passes_the_cors_check() {
 
 #[tokio::test]
 async fn resolve_maps_hit_miss_and_fail() {
-    assert!(matches!(
-        Agent::new(AgentOptions {
-            resolve: vec!["not-a-spec".to_owned()],
-            ..AgentOptions::default()
-        }),
-        Err(NetError::Protocol(ProtocolError::InvalidResolve(spec)))
-            if spec.as_ref() == "not-a-spec"
-    ));
+    assert_eq!(
+        ResolveRule::parse("not-a-spec")
+            .expect_err("invalid spec")
+            .to_string(),
+        "resolve spec \"not-a-spec\" must be PATTERN=IPv4 or PATTERN=fail"
+    );
 
     let server = scripted([canned_ok(&[], b"mapped")]);
     let port = server.local_addr().port();
     let mapped = url::Url::parse(&format!("http://web-platform.test:{port}/")).expect("mapped URL");
     let agent = Agent::new(AgentOptions {
         resolve: vec![
-            "nonexistent.*.test=fail".to_owned(),
-            "*.test=127.0.0.1".to_owned(),
+            ResolveRule::parse("nonexistent.*.test=fail").expect("fail rule"),
+            ResolveRule::parse("*.test=127.0.0.1").expect("rewrite rule"),
         ],
         ..AgentOptions::default()
-    })
-    .expect("resolve specs");
+    });
     let response = agent
         .send(Request::new(Method::GET, mapped))
         .await

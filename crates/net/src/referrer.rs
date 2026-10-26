@@ -9,7 +9,9 @@
 //! <https://w3c.github.io/webappsec-referrer-policy/>
 
 use serde::{Deserialize, Serialize};
-use url::{Host, Origin, Url};
+use url::{Origin, Url};
+
+use crate::secure_context::is_potentially_trustworthy;
 
 /// A referrer policy
 /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
@@ -40,37 +42,44 @@ pub enum ReferrerPolicy {
     UnsafeUrl,
 }
 
-/// The eight policy tokens, in spec order.
-const POLICY_TOKENS: [(&str, ReferrerPolicy); 8] = [
-    ("no-referrer", ReferrerPolicy::NoReferrer),
-    (
-        "no-referrer-when-downgrade",
-        ReferrerPolicy::NoReferrerWhenDowngrade,
-    ),
-    ("same-origin", ReferrerPolicy::SameOrigin),
-    ("origin", ReferrerPolicy::Origin),
-    ("strict-origin", ReferrerPolicy::StrictOrigin),
-    (
-        "origin-when-cross-origin",
-        ReferrerPolicy::OriginWhenCrossOrigin,
-    ),
-    (
-        "strict-origin-when-cross-origin",
-        ReferrerPolicy::StrictOriginWhenCrossOrigin,
-    ),
-    ("unsafe-url", ReferrerPolicy::UnsafeUrl),
-];
-
 impl ReferrerPolicy {
+    /// Every policy, in spec order
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
+    pub const ALL: [Self; 8] = [
+        Self::NoReferrer,
+        Self::NoReferrerWhenDowngrade,
+        Self::SameOrigin,
+        Self::Origin,
+        Self::StrictOrigin,
+        Self::OriginWhenCrossOrigin,
+        Self::StrictOriginWhenCrossOrigin,
+        Self::UnsafeUrl,
+    ];
+
+    /// The policy's keyword, the one spelling used by the header parser, meta
+    /// content, and content-attribute reflection.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::NoReferrer => "no-referrer",
+            Self::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+            Self::SameOrigin => "same-origin",
+            Self::Origin => "origin",
+            Self::StrictOrigin => "strict-origin",
+            Self::OriginWhenCrossOrigin => "origin-when-cross-origin",
+            Self::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+            Self::UnsafeUrl => "unsafe-url",
+        }
+    }
+
     /// One policy token, ASCII case-insensitive and untrimmed. Enumerated
     /// attributes and header list members are trimmed by their own parsers,
     /// so a stray space is not a policy here.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
-        POLICY_TOKENS
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(token))
-            .map(|(_, policy)| *policy)
+        Self::ALL
+            .into_iter()
+            .find(|policy| policy.keyword().eq_ignore_ascii_case(token))
     }
 
     /// The last recognized token of a `Referrer-Policy` response field list
@@ -278,36 +287,43 @@ fn strip_url(url: &Url, origin_only: bool) -> Option<Url> {
     Some(stripped)
 }
 
-/// Whether `url` is potentially trustworthy
-/// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
-///
-/// `about:blank` and `about:srcdoc` inherit their creator's context, `data:`
-/// is trustworthy by definition, and every other URL is judged by its origin:
-/// HTTPS and WSS, file URLs, and loopback or `localhost` hosts over HTTP/WS.
-/// The header, cookie, and client-hint paths share this one definition.
-#[must_use]
-pub fn is_potentially_trustworthy(url: &Url) -> bool {
-    if url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc") {
-        return true;
+#[cfg(test)]
+mod tests {
+    use super::ReferrerPolicy;
+
+    #[test]
+    fn policy_keywords_are_the_spec_strings() {
+        for (policy, keyword) in [
+            (ReferrerPolicy::NoReferrer, "no-referrer"),
+            (
+                ReferrerPolicy::NoReferrerWhenDowngrade,
+                "no-referrer-when-downgrade",
+            ),
+            (ReferrerPolicy::SameOrigin, "same-origin"),
+            (ReferrerPolicy::Origin, "origin"),
+            (ReferrerPolicy::StrictOrigin, "strict-origin"),
+            (
+                ReferrerPolicy::OriginWhenCrossOrigin,
+                "origin-when-cross-origin",
+            ),
+            (
+                ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                "strict-origin-when-cross-origin",
+            ),
+            (ReferrerPolicy::UnsafeUrl, "unsafe-url"),
+        ] {
+            assert_eq!(policy.keyword(), keyword);
+            assert_eq!(ReferrerPolicy::parse(keyword), Some(policy));
+        }
     }
-    match url.scheme() {
-        "https" | "wss" | "file" | "data" => true,
-        "http" | "ws" => match url.host() {
-            Some(Host::Ipv4(address)) => address.is_loopback(),
-            Some(Host::Ipv6(address)) => address.is_loopback(),
-            Some(Host::Domain(host)) => {
-                let host = host.trim_end_matches('.').to_ascii_lowercase();
-                host == "localhost" || host.ends_with(".localhost")
-            }
-            None => false,
-        },
-        // `blob:` carries its creator's origin, so it is trustworthy exactly
-        // when that origin is.
-        "blob" => url
-            .as_str()
-            .strip_prefix("blob:")
-            .and_then(|inner| Url::parse(inner).ok())
-            .is_some_and(|inner| is_potentially_trustworthy(&inner)),
-        _ => false,
+
+    #[test]
+    fn parse_is_ascii_case_insensitive_and_untrimmed() {
+        assert_eq!(
+            ReferrerPolicy::parse("ORIGIN"),
+            Some(ReferrerPolicy::Origin)
+        );
+        assert_eq!(ReferrerPolicy::parse(" origin"), None);
+        assert_eq!(ReferrerPolicy::parse(""), None);
     }
 }
