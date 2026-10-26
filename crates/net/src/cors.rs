@@ -229,7 +229,7 @@ fn is_simple_range(value: &[u8]) -> bool {
 /// set these, and the browser adds them after the preflight decision, so they
 /// never appear in the CORS-unsafe request-header names.
 #[must_use]
-pub fn is_forbidden_request_header(name: &str) -> bool {
+pub fn is_forbidden_request_header_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name.starts_with("proxy-") || name.starts_with("sec-") {
         return true;
@@ -260,6 +260,16 @@ pub fn is_forbidden_request_header(name: &str) -> bool {
     )
 }
 
+/// Whether a page-supplied request header is forbidden: either its name is
+/// forbidden, or it is a method-override header naming a forbidden method
+/// (<https://fetch.spec.whatwg.org/#forbidden-request-header>). The JS
+/// `Headers` guard and the outbound network filter both answer with this one
+/// function, so they cannot disagree about the same header.
+#[must_use]
+pub fn is_forbidden_request_header(name: &str, value: &[u8]) -> bool {
+    is_forbidden_request_header_name(name) || is_forbidden_method_header(name, value)
+}
+
 /// Whether `method` is a forbidden method
 /// (<https://fetch.spec.whatwg.org/#forbidden-method>).
 #[must_use]
@@ -270,8 +280,10 @@ pub fn is_forbidden_method(method: &str) -> bool {
 }
 
 /// Whether a forbidden-method header carries a forbidden method in any
-/// comma-separated token
-/// (<https://fetch.spec.whatwg.org/#forbidden-method>).
+/// comma-separated member
+/// (<https://fetch.spec.whatwg.org/#forbidden-method>). Members are split on
+/// `,` and stripped of HTTP tab or space only; any other whitespace or trailing
+/// text leaves the member as written.
 #[must_use]
 pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
     if !matches!(
@@ -281,13 +293,8 @@ pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
         return false;
     }
     value.split(|&byte| byte == b',').any(|part| {
-        let token = part
-            .iter()
-            .copied()
-            .skip_while(|byte| *byte == b' ' || *byte == b'\t')
-            .take_while(|byte| *byte != b' ' && *byte != b'\t')
-            .collect::<Vec<u8>>();
-        std::str::from_utf8(&token).is_ok_and(is_forbidden_method)
+        std::str::from_utf8(part)
+            .is_ok_and(|member| is_forbidden_method(member.trim_matches([' ', '\t'])))
     })
 }
 
@@ -299,7 +306,7 @@ pub fn unsafe_request_header_names(headers: &HeaderMap) -> Vec<String> {
     let mut potentially_unsafe = Vec::new();
     let mut safelist_value_size = 0usize;
     for (name, value) in headers.iter() {
-        if is_forbidden_request_header(name) {
+        if is_forbidden_request_header_name(name) {
             continue;
         }
         if is_cors_safelisted_request_header(name, value) {
@@ -611,6 +618,30 @@ mod tests {
         // Every other name is refused, safelisted or not.
         assert!(!is_no_cors_safelisted_request_header("X-Custom", b"1"));
         assert!(!is_no_cors_safelisted_request_header("range", b"bytes 0-"));
+    }
+
+    #[test]
+    fn forbidden_headers_and_method_override_members() {
+        assert!(is_forbidden_request_header("Cookie", b"a"));
+        assert!(is_forbidden_request_header("sec-foo", b"x"));
+        assert!(is_forbidden_request_header("Proxy-Auth", b"x"));
+        assert!(!is_forbidden_request_header("x-custom", b"1"));
+        // Members split on `,` and strip only HTTP tab and space, so the whole
+        // member must be the method
+        // (<https://fetch.spec.whatwg.org/#forbidden-request-header>).
+        assert!(is_forbidden_method_header("x-http-method", b" trace , get"));
+        assert!(is_forbidden_method_header("x-http-method", b"\ttrack\t"));
+        assert!(is_forbidden_method_header("x-http-method", b"get,TRACK"));
+        assert!(!is_forbidden_method_header("x-method-override", b"get"));
+        assert!(!is_forbidden_method_header(
+            "X-HTTP-Method-Override",
+            b"connect foo"
+        ));
+        assert!(!is_forbidden_method_header(
+            "x-http-method-override",
+            b"connect\x0b"
+        ));
+        assert!(is_forbidden_request_header("x-http-method", b"get,TRACK"));
     }
 
     #[test]

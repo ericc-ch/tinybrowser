@@ -1727,7 +1727,12 @@ fn install_mime_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
 fn install_header_policy_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
     bridge::object(ctx)?.set(
         "__tbIsForbiddenRequestHeader",
-        Func::from(|name: String| net::cors::is_forbidden_request_header(&name)),
+        Func::from(|name: String, value: Option<String>| {
+            value.map_or_else(
+                || net::cors::is_forbidden_request_header_name(&name),
+                |value| net::cors::is_forbidden_request_header(&name, value.as_bytes()),
+            )
+        }),
     )?;
     bridge::object(ctx)?.set(
         "__tbIsCorsSafelistedHeader",
@@ -1744,12 +1749,6 @@ fn install_header_policy_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
     bridge::object(ctx)?.set(
         "__tbIsForbiddenMethod",
         Func::from(|method: String| net::cors::is_forbidden_method(&method)),
-    )?;
-    bridge::object(ctx)?.set(
-        "__tbIsForbiddenMethodHeader",
-        Func::from(|name: String, value: String| {
-            net::cors::is_forbidden_method_header(&name, value.as_bytes())
-        }),
     )?;
     bridge::object(ctx)?.set(
         "__tbIsCorsSafelistedMethod",

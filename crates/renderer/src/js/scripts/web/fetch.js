@@ -60,9 +60,8 @@ const __tbHeaderValue = value => {
 const __tbHttpTrim = value => value.replace(/^[\t ]+|[\t ]+$/g, '');
 // The policy tables live in `net::cors`; the renderer only applies the host
 // predicates, so JS and the preflight decision cannot drift.
-const __tbForbiddenRequestHeader = name => host.__tbIsForbiddenRequestHeader(name);
+const __tbForbiddenRequestHeader = (name, value) => host.__tbIsForbiddenRequestHeader(name, value);
 const __tbIsForbiddenMethod = value => host.__tbIsForbiddenMethod(value);
-const __tbForbiddenMethodHeader = (name, value) => host.__tbIsForbiddenMethodHeader(name, value);
 const __tbNoCorsSafelistedHeader = (name, value) => host.__tbIsNoCorsSafelistedHeader(name, value);
 const __tbHeadersRecord = headers => __tbBrand(headers, __tbHeadersData);
 const __tbHeadersList = headers => __tbHeadersRecord(headers).list;
@@ -138,8 +137,7 @@ const __tbHeadersAllowed = (record, name, value, existing) => {
       return name !== 'set-cookie' && name !== 'set-cookie2';
     case 'request':
     case 'request-no-cors':
-      if (__tbForbiddenRequestHeader(name)) return false;
-      if (__tbForbiddenMethodHeader(name, value)) return false;
+      if (__tbForbiddenRequestHeader(name, value)) return false;
       if (record.guard === 'request') return true;
       return __tbNoCorsSafelistedHeader(name, existing === null ? value : existing + ', ' + value);
     default:

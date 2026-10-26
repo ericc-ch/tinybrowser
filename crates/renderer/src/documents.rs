@@ -78,23 +78,7 @@ pub(crate) struct BlitzDocument {
 impl BlitzDocument {
     /// Builds an empty document from `config` (providers ride along).
     pub(crate) fn new(config: blitz_dom::DocumentConfig) -> Self {
-        Self {
-            base: blitz_dom::BaseDocument::new(config),
-            journal: Vec::new(),
-            next_journal_position: 1,
-            recording: false,
-            fragments: HashSet::new(),
-            pi_attributes: HashMap::new(),
-            started_scripts: HashSet::new(),
-            selectedness_normalized: HashSet::new(),
-            option_selectedness: HashMap::new(),
-            option_dirtiness: HashSet::new(),
-            pristine_values: HashSet::new(),
-            ranges: crate::dom::range::RangeTable::default(),
-            exact_text: HashMap::new(),
-            exact_attrs: HashMap::new(),
-            template_owners: HashMap::new(),
-        }
+        Self::from_base(blitz_dom::BaseDocument::new(config))
     }
 
     /// Wraps an already-parsed tree.
