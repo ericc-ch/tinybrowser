@@ -40,37 +40,44 @@ pub enum ReferrerPolicy {
     UnsafeUrl,
 }
 
-/// The eight policy tokens, in spec order.
-const POLICY_TOKENS: [(&str, ReferrerPolicy); 8] = [
-    ("no-referrer", ReferrerPolicy::NoReferrer),
-    (
-        "no-referrer-when-downgrade",
-        ReferrerPolicy::NoReferrerWhenDowngrade,
-    ),
-    ("same-origin", ReferrerPolicy::SameOrigin),
-    ("origin", ReferrerPolicy::Origin),
-    ("strict-origin", ReferrerPolicy::StrictOrigin),
-    (
-        "origin-when-cross-origin",
-        ReferrerPolicy::OriginWhenCrossOrigin,
-    ),
-    (
-        "strict-origin-when-cross-origin",
-        ReferrerPolicy::StrictOriginWhenCrossOrigin,
-    ),
-    ("unsafe-url", ReferrerPolicy::UnsafeUrl),
-];
-
 impl ReferrerPolicy {
+    /// Every policy, in spec order
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
+    pub const ALL: [Self; 8] = [
+        Self::NoReferrer,
+        Self::NoReferrerWhenDowngrade,
+        Self::SameOrigin,
+        Self::Origin,
+        Self::StrictOrigin,
+        Self::OriginWhenCrossOrigin,
+        Self::StrictOriginWhenCrossOrigin,
+        Self::UnsafeUrl,
+    ];
+
+    /// The policy's keyword, the one spelling used by the header parser, meta
+    /// content, and content-attribute reflection.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::NoReferrer => "no-referrer",
+            Self::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+            Self::SameOrigin => "same-origin",
+            Self::Origin => "origin",
+            Self::StrictOrigin => "strict-origin",
+            Self::OriginWhenCrossOrigin => "origin-when-cross-origin",
+            Self::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+            Self::UnsafeUrl => "unsafe-url",
+        }
+    }
+
     /// One policy token, ASCII case-insensitive and untrimmed. Enumerated
     /// attributes and header list members are trimmed by their own parsers,
     /// so a stray space is not a policy here.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
-        POLICY_TOKENS
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(token))
-            .map(|(_, policy)| *policy)
+        Self::ALL
+            .into_iter()
+            .find(|policy| policy.keyword().eq_ignore_ascii_case(token))
     }
 
     /// The last recognized token of a `Referrer-Policy` response field list
@@ -309,5 +316,61 @@ pub fn is_potentially_trustworthy(url: &Url) -> bool {
             .and_then(|inner| Url::parse(inner).ok())
             .is_some_and(|inner| is_potentially_trustworthy(&inner)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReferrerPolicy, is_potentially_trustworthy};
+    use url::Url;
+
+    fn trustworthy(value: &str) -> bool {
+        is_potentially_trustworthy(&Url::parse(value).expect("url"))
+    }
+
+    #[test]
+    fn trustworthy_urls_cover_secure_contexts_loopback_and_blobs() {
+        for value in [
+            "https://example.com/",
+            "wss://example.com/socket",
+            "file:///tmp/page.html",
+            "data:,hello",
+            "about:blank",
+            "about:srcdoc",
+            "blob:https://example.com/uuid",
+            "http://127.0.0.1/",
+            "http://localhost/",
+            "http://foo.localhost./",
+            "http://[::1]/",
+        ] {
+            assert!(trustworthy(value), "{value} is potentially trustworthy");
+        }
+    }
+
+    #[test]
+    fn untrustworthy_urls_are_plain_http_and_other_creators_blobs() {
+        for value in [
+            "http://example.com/",
+            "ws://example.com/socket",
+            "blob:http://example.com/uuid",
+            "http://192.0.2.1/",
+            "ftp://example.com/",
+        ] {
+            assert!(!trustworthy(value), "{value} is not trustworthy");
+        }
+    }
+
+    #[test]
+    fn policy_keywords_round_trip_through_the_parser() {
+        for policy in ReferrerPolicy::ALL {
+            assert_eq!(ReferrerPolicy::parse(policy.keyword()), Some(policy));
+        }
+        assert_eq!(
+            ReferrerPolicy::parse("ORIGIN"),
+            Some(ReferrerPolicy::Origin),
+            "tokens are ASCII case-insensitive"
+        );
+        assert_eq!(ReferrerPolicy::parse(" origin"), None, "no trimming here");
+        assert_eq!(ReferrerPolicy::parse(""), None, "empty inherits");
     }
 }

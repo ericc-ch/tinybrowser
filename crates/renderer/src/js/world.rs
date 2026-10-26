@@ -898,6 +898,18 @@ mod sandbox_flag_tests {
     }
 
     #[test]
+    fn every_supported_token_changes_the_flag_set() {
+        let bare = SandboxFlags::parse(Some(""));
+        for (token, _) in SandboxFlags::TOKENS {
+            assert_ne!(
+                SandboxFlags::parse(Some(token)),
+                bare,
+                "{token} is advertised by DOMTokenList.supports but clears no flag"
+            );
+        }
+    }
+
+    #[test]
     fn keywords_clear_exactly_the_flags_they_name() {
         let flags = SandboxFlags::parse(Some("allow-scripts allow-same-origin"));
         assert!(!flags.scripts_disabled());
@@ -1075,6 +1087,44 @@ impl SandboxFlags {
     /// `allow-top-navigation-to-custom-protocols`.
     const CUSTOM_PROTOCOLS_NAVIGATION: u32 = 1 << 15;
 
+    /// The `sandbox` keywords and the flags each one clears. This is the only
+    /// list: [`Self::parse`] reads it, and `DOMTokenList.supports('sandbox')`
+    /// answers from its keys, so a keyword cannot be advertised without taking
+    /// effect
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+    pub(crate) const TOKENS: &[(&str, u32)] = &[
+        (
+            "allow-popups",
+            Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION,
+        ),
+        (
+            "allow-top-navigation",
+            Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+                | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+                | Self::CUSTOM_PROTOCOLS_NAVIGATION,
+        ),
+        (
+            "allow-top-navigation-by-user-activation",
+            Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
+        ),
+        ("allow-same-origin", Self::ORIGIN),
+        ("allow-forms", Self::FORMS),
+        ("allow-pointer-lock", Self::POINTER_LOCK),
+        ("allow-scripts", Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
+        (
+            "allow-popups-to-escape-sandbox",
+            Self::PROPAGATES_TO_AUXILIARY,
+        ),
+        ("allow-modals", Self::MODALS),
+        ("allow-orientation-lock", Self::ORIENTATION_LOCK),
+        ("allow-presentation", Self::PRESENTATION),
+        ("allow-downloads", Self::DOWNLOADS),
+        (
+            "allow-top-navigation-to-custom-protocols",
+            Self::CUSTOM_PROTOCOLS_NAVIGATION,
+        ),
+    ];
+
     /// Parses one `sandbox` attribute value, or returns the empty set when the
     /// attribute is absent
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#parse-a-sandboxing-directive>).
@@ -1102,31 +1152,11 @@ impl SandboxFlags {
         );
         for token in attribute.split_ascii_whitespace() {
             let token = token.to_ascii_lowercase();
-            match token.as_str() {
-                "allow-popups" => {
-                    flags.0 &= !(Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION);
-                }
-                "allow-top-navigation" => {
-                    flags.0 &= !(Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
-                        | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
-                        | Self::CUSTOM_PROTOCOLS_NAVIGATION);
-                }
-                "allow-top-navigation-by-user-activation" => {
-                    flags.0 &= !Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION;
-                }
-                "allow-same-origin" => flags.0 &= !Self::ORIGIN,
-                "allow-forms" => flags.0 &= !Self::FORMS,
-                "allow-pointer-lock" => flags.0 &= !Self::POINTER_LOCK,
-                "allow-scripts" => flags.0 &= !(Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
-                "allow-popups-to-escape-sandbox" => flags.0 &= !Self::PROPAGATES_TO_AUXILIARY,
-                "allow-modals" => flags.0 &= !Self::MODALS,
-                "allow-orientation-lock" => flags.0 &= !Self::ORIENTATION_LOCK,
-                "allow-presentation" => flags.0 &= !Self::PRESENTATION,
-                "allow-downloads" => flags.0 &= !Self::DOWNLOADS,
-                "allow-top-navigation-to-custom-protocols" => {
-                    flags.0 &= !Self::CUSTOM_PROTOCOLS_NAVIGATION;
-                }
-                _ => {}
+            if let Some((_, cleared)) = Self::TOKENS
+                .iter()
+                .find(|(keyword, _)| *keyword == token.as_str())
+            {
+                flags.0 &= !*cleared;
             }
         }
         flags

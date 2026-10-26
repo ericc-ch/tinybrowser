@@ -2887,17 +2887,18 @@ pub(super) fn aria_set(
 /// `referrerpolicy` reflection, shared by every element that declares it:
 /// an enumerated attribute defaulting to the empty string
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy>).
+///
+/// The keywords come from [`net::ReferrerPolicy`], the type that parses the
+/// header and meta forms, so the reflection cannot disagree with them.
 pub(super) fn reflect_referrer_policy<'js>(
     ctx: &Ctx<'js>,
     id: NodeId,
 ) -> Result<rquickjs::String<'js>> {
-    let value = reflect_enum(
-        content_attr(ctx, id, "referrerpolicy").as_deref(),
-        REFERRER_POLICY_KEYWORDS,
-        "",
-        "",
-    );
-    rquickjs::String::from_str(ctx.clone(), &value)
+    let value = content_attr(ctx, id, "referrerpolicy")
+        .as_deref()
+        .and_then(net::ReferrerPolicy::parse)
+        .map_or("", net::ReferrerPolicy::keyword);
+    rquickjs::String::from_str(ctx.clone(), value)
 }
 
 pub(super) fn set_referrer_policy(
@@ -3017,17 +3018,6 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
 pub(super) const DIR_KEYWORDS: &[&str] = &["ltr", "rtl", "auto"];
 
 // Shared enumerated keyword tables for content-attribute reflection.
-pub(crate) const REFERRER_POLICY_KEYWORDS: &[&str] = &[
-    "",
-    "no-referrer",
-    "no-referrer-when-downgrade",
-    "same-origin",
-    "origin",
-    "strict-origin",
-    "origin-when-cross-origin",
-    "strict-origin-when-cross-origin",
-    "unsafe-url",
-];
 pub(super) const CROSS_ORIGIN_KEYWORDS: &[&str] = &["anonymous", "use-credentials"];
 pub(super) const PRELOAD_KEYWORDS: &[&str] = &["none", "metadata", "auto"];
 pub(super) const LAZY_EAGER_KEYWORDS: &[&str] = &["lazy", "eager"];

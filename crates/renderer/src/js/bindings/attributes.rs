@@ -202,8 +202,12 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     fn supports(&self, ctx: Ctx<'js>, token: rquickjs::String<'js>) -> Result<bool> {
         // `iframe.sandbox` is the one token list with supported tokens
         // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+        // The supported set is the parser's own table, so `supports` cannot
+        // advertise a keyword that changes nothing.
         let attribute: &str = self.attribute.as_ref();
-        let Some(supported) = (attribute == "sandbox").then_some(SANDBOX_TOKENS) else {
+        let Some(supported) =
+            (attribute == "sandbox").then_some(crate::js::world::SandboxFlags::TOKENS)
+        else {
             // The spec ends with "throw a TypeError"
             // (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
             return Err(Exception::throw_type(
@@ -212,29 +216,9 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
             ));
         };
         let token = token.to_string()?;
-        Ok(supported.contains(&token.as_str()))
+        Ok(supported.iter().any(|(keyword, _)| *keyword == token))
     }
 }
-
-/// The keywords the `sandbox` content attribute supports. Token matching is
-/// exact: `supports` is not ASCII case-insensitive
-/// (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
-const SANDBOX_TOKENS: &[&str] = &[
-    "allow-downloads",
-    "allow-forms",
-    "allow-modals",
-    "allow-orientation-lock",
-    "allow-pointer-lock",
-    "allow-popups",
-    "allow-popups-to-escape-sandbox",
-    "allow-presentation",
-    "allow-same-origin",
-    "allow-scripts",
-    "allow-storage-access-by-user-activation",
-    "allow-top-navigation",
-    "allow-top-navigation-by-user-activation",
-    "allow-top-navigation-to-custom-protocols",
-];
 
 /// The element's tokens for `attribute`: an ordered set, so duplicates
 /// collapse.
