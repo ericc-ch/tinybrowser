@@ -1949,8 +1949,6 @@ mod frame_history_tests {
         history
     }
 
-    /// An entry whose navigation spec names it, so a test can tell which entry
-    /// a history operation wrote.
     fn marker(spec: &str) -> FrameHistoryEntry {
         FrameHistoryEntry {
             navigation: Some(FrameNavigation::get(
@@ -1982,20 +1980,49 @@ mod frame_history_tests {
         assert_eq!(history.index, 1);
     }
 
+    fn active_spec(history: &mut FrameHistory) -> String {
+        history
+            .target(0)
+            .and_then(|entry| entry.navigation.as_ref())
+            .expect("active navigation")
+            .spec
+            .clone()
+    }
+
     #[test]
-    fn replace_keeps_the_entry_count() {
-        let mut history = history(1);
+    fn replace_overwrites_only_the_active_entry() {
+        let mut history = FrameHistory::default();
+        for spec in [
+            "http://marker.test/zero",
+            "http://marker.test/one",
+            "http://marker.test/two",
+        ] {
+            history.push(marker(spec));
+        }
+        // Step back to the middle entry, then replace it.
+        // Step back to the middle entry, then replace it.
+        assert!(history.target(-1).is_some());
         history.replace(marker("http://marker.test/replaced"));
-        assert_eq!(history.entries.len(), 1);
-        assert_eq!(history.index, 0);
+        assert_eq!(active_spec(&mut history), "http://marker.test/replaced");
         assert_eq!(
-            history.entries[0]
+            history
+                .target(-1)
+                .expect("left neighbour")
                 .navigation
                 .as_ref()
-                .expect("replacement entry")
+                .expect("navigation")
                 .spec,
-            "http://marker.test/replaced",
-            "the entry is overwritten, not left in place"
+            "http://marker.test/zero"
+        );
+        assert_eq!(
+            history
+                .target(2)
+                .expect("right neighbour")
+                .navigation
+                .as_ref()
+                .expect("navigation")
+                .spec,
+            "http://marker.test/two"
         );
     }
 
@@ -2003,15 +2030,45 @@ mod frame_history_tests {
     fn replace_pushes_when_the_history_is_empty() {
         let mut history = FrameHistory::default();
         history.replace(marker("http://marker.test/pushed"));
-        assert_eq!(history.entries.len(), 1);
-        assert_eq!(history.index, 0);
+        assert_eq!(active_spec(&mut history), "http://marker.test/pushed");
+        assert!(
+            history.target(-1).is_none(),
+            "the replacement is the first and only entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod navigator_tests {
+    use super::{Engine, FrameId, Mount, ResponseHead};
+    use crate::test_services::NullServices;
+    use std::sync::Arc;
+
+    #[test]
+    fn navigator_user_agent_is_the_shared_identity() {
+        let mut engine = Engine::new(
+            Arc::new(NullServices),
+            Arc::new(crate::js::Stop::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        engine
+            .mount_frame(
+                FrameId::MAIN,
+                &Mount {
+                    head: ResponseHead {
+                        url: "https://example.test/".to_owned(),
+                        ..ResponseHead::default()
+                    },
+                    body: b"<!doctype html><title>identity</title>".to_vec(),
+                },
+            )
+            .expect("mount");
+        let _ready = engine.drain_ready();
         assert_eq!(
-            history.entries[0]
-                .navigation
-                .as_ref()
-                .expect("pushed entry")
-                .spec,
-            "http://marker.test/pushed"
+            engine
+                .eval_in(FrameId::MAIN, "navigator.userAgent")
+                .expect("evaluate"),
+            crate::USER_AGENT
         );
     }
 }

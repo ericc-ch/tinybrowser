@@ -202,21 +202,17 @@ impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     fn supports(&self, ctx: Ctx<'js>, token: rquickjs::String<'js>) -> Result<bool> {
         // `iframe.sandbox` is the one token list with supported tokens
         // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
-        // The supported set is the parser's own table, so `supports` cannot
-        // advertise a keyword that changes nothing.
         let attribute: &str = self.attribute.as_ref();
-        let Some(supported) =
-            (attribute == "sandbox").then_some(crate::js::world::SandboxFlags::TOKENS)
-        else {
-            // The spec ends with "throw a TypeError"
-            // (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
+        if attribute != "sandbox" {
+            // Validation steps step 1: no supported tokens means a `TypeError`
+            // (<https://dom.spec.whatwg.org/#concept-domtokenlist-validation>).
             return Err(Exception::throw_type(
                 &ctx,
                 "DOMTokenList has no supported tokens",
             ));
-        };
+        }
         let token = token.to_string()?;
-        Ok(supported.iter().any(|(keyword, _)| *keyword == token))
+        Ok(crate::js::world::SandboxFlags::supports(&token))
     }
 }
 

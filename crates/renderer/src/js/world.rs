@@ -897,16 +897,90 @@ mod sandbox_flag_tests {
         }
     }
 
+    fn all_flags() -> [u32; 16] {
+        [
+            SandboxFlags::NAVIGATION,
+            SandboxFlags::AUXILIARY_NAVIGATION,
+            SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
+            SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
+            SandboxFlags::ORIGIN,
+            SandboxFlags::FORMS,
+            SandboxFlags::POINTER_LOCK,
+            SandboxFlags::SCRIPTS,
+            SandboxFlags::AUTOMATIC_FEATURES,
+            SandboxFlags::DOCUMENT_DOMAIN,
+            SandboxFlags::PROPAGATES_TO_AUXILIARY,
+            SandboxFlags::MODALS,
+            SandboxFlags::ORIENTATION_LOCK,
+            SandboxFlags::PRESENTATION,
+            SandboxFlags::DOWNLOADS,
+            SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+        ]
+    }
+
     #[test]
-    fn every_supported_token_changes_the_flag_set() {
-        let bare = SandboxFlags::parse(Some(""));
-        for (token, _) in SandboxFlags::TOKENS {
-            assert_ne!(
-                SandboxFlags::parse(Some(token)),
-                bare,
-                "{token} is advertised by DOMTokenList.supports but clears no flag"
-            );
+    fn every_keyword_clears_exactly_the_flags_the_standard_names() {
+        let expected: &[(&str, &[u32])] = &[
+            (
+                "allow-popups",
+                &[
+                    SandboxFlags::AUXILIARY_NAVIGATION,
+                    SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+                ],
+            ),
+            (
+                "allow-top-navigation",
+                &[
+                    SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
+                    SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
+                    SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+                ],
+            ),
+            (
+                "allow-top-navigation-by-user-activation",
+                &[SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION],
+            ),
+            ("allow-same-origin", &[SandboxFlags::ORIGIN]),
+            ("allow-forms", &[SandboxFlags::FORMS]),
+            ("allow-pointer-lock", &[SandboxFlags::POINTER_LOCK]),
+            (
+                "allow-scripts",
+                &[SandboxFlags::SCRIPTS, SandboxFlags::AUTOMATIC_FEATURES],
+            ),
+            (
+                "allow-popups-to-escape-sandbox",
+                &[SandboxFlags::PROPAGATES_TO_AUXILIARY],
+            ),
+            ("allow-modals", &[SandboxFlags::MODALS]),
+            ("allow-orientation-lock", &[SandboxFlags::ORIENTATION_LOCK]),
+            ("allow-presentation", &[SandboxFlags::PRESENTATION]),
+            ("allow-downloads", &[SandboxFlags::DOWNLOADS]),
+            (
+                "allow-top-navigation-to-custom-protocols",
+                &[SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION],
+            ),
+        ];
+        for (keyword, cleared) in expected {
+            let flags = SandboxFlags::parse(Some(keyword));
+            for flag in all_flags() {
+                assert_eq!(
+                    flags.contains(flag),
+                    !cleared.contains(&flag),
+                    "{keyword}: flag {flag:#x}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn supports_ignores_ascii_case_and_rejects_unlisted_keywords() {
+        assert!(SandboxFlags::supports("allow-scripts"));
+        assert!(SandboxFlags::supports("ALLOW-SCRIPTS"));
+        assert!(SandboxFlags::supports("Allow-Same-Origin"));
+        assert!(!SandboxFlags::supports("allow-frames"));
+        assert!(!SandboxFlags::supports(
+            "allow-storage-access-by-user-activation"
+        ));
     }
 
     #[test]
@@ -1088,42 +1162,55 @@ impl SandboxFlags {
     const CUSTOM_PROTOCOLS_NAVIGATION: u32 = 1 << 15;
 
     /// The `sandbox` keywords and the flags each one clears. This is the only
-    /// list: [`Self::parse`] reads it, and `DOMTokenList.supports('sandbox')`
-    /// answers from its keys, so a keyword cannot be advertised without taking
-    /// effect
+    /// list: [`Self::parse`] reads it and [`Self::supports`] answers from it,
+    /// so a keyword cannot be advertised without taking effect
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
-    pub(crate) const TOKENS: &[(&str, u32)] = &[
+    const TOKENS: &[(&str, Self)] = &[
         (
             "allow-popups",
-            Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION,
+            Self(Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION),
         ),
         (
             "allow-top-navigation",
-            Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
-                | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
-                | Self::CUSTOM_PROTOCOLS_NAVIGATION,
+            Self(
+                Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+                    | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+                    | Self::CUSTOM_PROTOCOLS_NAVIGATION,
+            ),
         ),
         (
             "allow-top-navigation-by-user-activation",
-            Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
+            Self(Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION),
         ),
-        ("allow-same-origin", Self::ORIGIN),
-        ("allow-forms", Self::FORMS),
-        ("allow-pointer-lock", Self::POINTER_LOCK),
-        ("allow-scripts", Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
+        ("allow-same-origin", Self(Self::ORIGIN)),
+        ("allow-forms", Self(Self::FORMS)),
+        ("allow-pointer-lock", Self(Self::POINTER_LOCK)),
+        (
+            "allow-scripts",
+            Self(Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
+        ),
         (
             "allow-popups-to-escape-sandbox",
-            Self::PROPAGATES_TO_AUXILIARY,
+            Self(Self::PROPAGATES_TO_AUXILIARY),
         ),
-        ("allow-modals", Self::MODALS),
-        ("allow-orientation-lock", Self::ORIENTATION_LOCK),
-        ("allow-presentation", Self::PRESENTATION),
-        ("allow-downloads", Self::DOWNLOADS),
+        ("allow-modals", Self(Self::MODALS)),
+        ("allow-orientation-lock", Self(Self::ORIENTATION_LOCK)),
+        ("allow-presentation", Self(Self::PRESENTATION)),
+        ("allow-downloads", Self(Self::DOWNLOADS)),
         (
             "allow-top-navigation-to-custom-protocols",
-            Self::CUSTOM_PROTOCOLS_NAVIGATION,
+            Self(Self::CUSTOM_PROTOCOLS_NAVIGATION),
         ),
     ];
+
+    /// Whether `token` is a supported `sandbox` keyword. The comparison is
+    /// ASCII case-insensitive
+    /// (<https://dom.spec.whatwg.org/#concept-domtokenlist-validation>).
+    pub(crate) fn supports(token: &str) -> bool {
+        Self::TOKENS
+            .iter()
+            .any(|(keyword, _)| keyword.eq_ignore_ascii_case(token))
+    }
 
     /// Parses one `sandbox` attribute value, or returns the empty set when the
     /// attribute is absent
@@ -1151,12 +1238,11 @@ impl SandboxFlags {
                 | Self::CUSTOM_PROTOCOLS_NAVIGATION,
         );
         for token in attribute.split_ascii_whitespace() {
-            let token = token.to_ascii_lowercase();
             if let Some((_, cleared)) = Self::TOKENS
                 .iter()
-                .find(|(keyword, _)| *keyword == token.as_str())
+                .find(|(keyword, _)| keyword.eq_ignore_ascii_case(token))
             {
-                flags.0 &= !*cleared;
+                flags.0 &= !cleared.0;
             }
         }
         flags
