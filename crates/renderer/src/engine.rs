@@ -1935,7 +1935,7 @@ impl Drop for Engine {
 
 #[cfg(test)]
 mod frame_history_tests {
-    use super::{FrameHistory, FrameHistoryEntry};
+    use super::{FrameHistory, FrameHistoryEntry, FrameId, FrameNavigation, NavigationTarget};
 
     fn history(len: usize) -> FrameHistory {
         let mut history = FrameHistory::default();
@@ -1947,6 +1947,18 @@ mod frame_history_tests {
         }
         history.index = 0;
         history
+    }
+
+    /// An entry whose navigation spec names it, so a test can tell which entry
+    /// a history operation wrote.
+    fn marker(spec: &str) -> FrameHistoryEntry {
+        FrameHistoryEntry {
+            navigation: Some(FrameNavigation::get(
+                NavigationTarget::Frame(FrameId::MAIN),
+                spec.to_owned(),
+            )),
+            state: None,
+        }
     }
 
     #[test]
@@ -1973,12 +1985,34 @@ mod frame_history_tests {
     #[test]
     fn replace_keeps_the_entry_count() {
         let mut history = history(1);
-        history.replace(FrameHistoryEntry {
-            navigation: None,
-            state: None,
-        });
+        history.replace(marker("http://marker.test/replaced"));
         assert_eq!(history.entries.len(), 1);
         assert_eq!(history.index, 0);
+        assert_eq!(
+            history.entries[0]
+                .navigation
+                .as_ref()
+                .expect("replacement entry")
+                .spec,
+            "http://marker.test/replaced",
+            "the entry is overwritten, not left in place"
+        );
+    }
+
+    #[test]
+    fn replace_pushes_when_the_history_is_empty() {
+        let mut history = FrameHistory::default();
+        history.replace(marker("http://marker.test/pushed"));
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.index, 0);
+        assert_eq!(
+            history.entries[0]
+                .navigation
+                .as_ref()
+                .expect("pushed entry")
+                .spec,
+            "http://marker.test/pushed"
+        );
     }
 }
 

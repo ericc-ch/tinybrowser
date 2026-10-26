@@ -3930,7 +3930,17 @@ mod tests {
         canvas.set_fill_style(StyleValue::Color([255, 0, 0, 128]));
         canvas.fill_rect(0.0, 0.0, 2.0, 2.0);
         let jpeg = canvas.to_jpeg(0.92).expect("JPEG");
-        assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+            .expect("decode the encoded JPEG")
+            .to_rgb8();
+        // Half-transparent red over opaque black is 128. The two wrong answers
+        // an encoder can produce are far away: 255 for a dropped alpha and
+        // 255/127 for a composite over white. JPEG is lossy, so compare with
+        // room for ringing.
+        let [red, green, blue] = decoded.get_pixel(0, 0).0;
+        assert!(red.abs_diff(128) <= 3, "red = {red}");
+        assert!(green <= 3, "green = {green}");
+        assert!(blue <= 3, "blue = {blue}");
     }
 
     #[test]
