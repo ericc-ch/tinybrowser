@@ -9,7 +9,9 @@
 //! <https://w3c.github.io/webappsec-referrer-policy/>
 
 use serde::{Deserialize, Serialize};
-use url::{Host, Origin, Url};
+use url::{Origin, Url};
+
+use crate::secure_context::is_potentially_trustworthy;
 
 /// A referrer policy
 /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
@@ -43,7 +45,7 @@ pub enum ReferrerPolicy {
 impl ReferrerPolicy {
     /// Every policy, in spec order
     /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
-    pub const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::NoReferrer,
         Self::NoReferrerWhenDowngrade,
         Self::SameOrigin,
@@ -285,92 +287,43 @@ fn strip_url(url: &Url, origin_only: bool) -> Option<Url> {
     Some(stripped)
 }
 
-/// Whether `url` is potentially trustworthy
-/// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
-///
-/// `about:blank` and `about:srcdoc` inherit their creator's context, `data:`
-/// is trustworthy by definition, and every other URL is judged by its origin:
-/// HTTPS and WSS, file URLs, and loopback or `localhost` hosts over HTTP/WS.
-/// The header, cookie, and client-hint paths share this one definition.
-#[must_use]
-pub fn is_potentially_trustworthy(url: &Url) -> bool {
-    if url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc") {
-        return true;
-    }
-    match url.scheme() {
-        "https" | "wss" | "file" | "data" => true,
-        "http" | "ws" => match url.host() {
-            Some(Host::Ipv4(address)) => address.is_loopback(),
-            Some(Host::Ipv6(address)) => address.is_loopback(),
-            Some(Host::Domain(host)) => {
-                let host = host.trim_end_matches('.').to_ascii_lowercase();
-                host == "localhost" || host.ends_with(".localhost")
-            }
-            None => false,
-        },
-        // `blob:` carries its creator's origin, so it is trustworthy exactly
-        // when that origin is.
-        "blob" => url
-            .as_str()
-            .strip_prefix("blob:")
-            .and_then(|inner| Url::parse(inner).ok())
-            .is_some_and(|inner| is_potentially_trustworthy(&inner)),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ReferrerPolicy, is_potentially_trustworthy};
-    use url::Url;
-
-    fn trustworthy(value: &str) -> bool {
-        is_potentially_trustworthy(&Url::parse(value).expect("url"))
-    }
+    use super::ReferrerPolicy;
 
     #[test]
-    fn trustworthy_urls_cover_secure_contexts_loopback_and_blobs() {
-        for value in [
-            "https://example.com/",
-            "wss://example.com/socket",
-            "file:///tmp/page.html",
-            "data:,hello",
-            "about:blank",
-            "about:srcdoc",
-            "blob:https://example.com/uuid",
-            "http://127.0.0.1/",
-            "http://localhost/",
-            "http://foo.localhost./",
-            "http://[::1]/",
+    fn policy_keywords_are_the_spec_strings() {
+        for (policy, keyword) in [
+            (ReferrerPolicy::NoReferrer, "no-referrer"),
+            (
+                ReferrerPolicy::NoReferrerWhenDowngrade,
+                "no-referrer-when-downgrade",
+            ),
+            (ReferrerPolicy::SameOrigin, "same-origin"),
+            (ReferrerPolicy::Origin, "origin"),
+            (ReferrerPolicy::StrictOrigin, "strict-origin"),
+            (
+                ReferrerPolicy::OriginWhenCrossOrigin,
+                "origin-when-cross-origin",
+            ),
+            (
+                ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                "strict-origin-when-cross-origin",
+            ),
+            (ReferrerPolicy::UnsafeUrl, "unsafe-url"),
         ] {
-            assert!(trustworthy(value), "{value} is potentially trustworthy");
+            assert_eq!(policy.keyword(), keyword);
+            assert_eq!(ReferrerPolicy::parse(keyword), Some(policy));
         }
     }
 
     #[test]
-    fn untrustworthy_urls_are_plain_http_and_other_creators_blobs() {
-        for value in [
-            "http://example.com/",
-            "ws://example.com/socket",
-            "blob:http://example.com/uuid",
-            "http://192.0.2.1/",
-            "ftp://example.com/",
-        ] {
-            assert!(!trustworthy(value), "{value} is not trustworthy");
-        }
-    }
-
-    #[test]
-    fn policy_keywords_round_trip_through_the_parser() {
-        for policy in ReferrerPolicy::ALL {
-            assert_eq!(ReferrerPolicy::parse(policy.keyword()), Some(policy));
-        }
+    fn parse_is_ascii_case_insensitive_and_untrimmed() {
         assert_eq!(
             ReferrerPolicy::parse("ORIGIN"),
-            Some(ReferrerPolicy::Origin),
-            "tokens are ASCII case-insensitive"
+            Some(ReferrerPolicy::Origin)
         );
-        assert_eq!(ReferrerPolicy::parse(" origin"), None, "no trimming here");
-        assert_eq!(ReferrerPolicy::parse(""), None, "empty inherits");
+        assert_eq!(ReferrerPolicy::parse(" origin"), None);
+        assert_eq!(ReferrerPolicy::parse(""), None);
     }
 }

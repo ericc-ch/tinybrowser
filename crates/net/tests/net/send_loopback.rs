@@ -325,7 +325,7 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()]);
     let agent = Agent::new(AgentOptions {
-        user_agent: Some(UserAgent::parse("builder/default").expect("valid user agent")),
+        user_agent: Some(UserAgent::from_static("builder/default")),
         ..AgentOptions::default()
     });
     let mut request = Request::new(Method::POST, server.url("/shape#fragment"));
@@ -571,7 +571,7 @@ fn proxy_parser_rejects_unsupported_or_ambiguous_authorities() {
     ] {
         assert_eq!(
             invalid.parse::<Proxy>().expect_err("invalid proxy"),
-            ProtocolError::InvalidProxy,
+            net::InvalidProxy,
             "{invalid:?}"
         );
     }
@@ -647,16 +647,6 @@ async fn environment_proxy_variables_are_ignored() {
             .expect("proxy probe");
         assert!(status.success());
     }
-}
-
-/// A `User-Agent` with a control byte is invalid configuration, not a header
-/// that silently disappears from every request.
-#[test]
-fn invalid_user_agent_is_rejected_at_the_boundary() {
-    assert!(matches!(
-        UserAgent::parse("tinybrowser\r\nInjected: yes"),
-        Err(ProtocolError::InvalidUserAgent)
-    ));
 }
 
 #[tokio::test]
@@ -900,11 +890,12 @@ async fn redirect_taint_serializes_null_and_null_passes_the_cors_check() {
 
 #[tokio::test]
 async fn resolve_maps_hit_miss_and_fail() {
-    assert!(matches!(
-        ResolveRule::parse("not-a-spec"),
-        Err(NetError::Protocol(ProtocolError::InvalidResolve(spec)))
-            if spec.as_ref() == "not-a-spec"
-    ));
+    assert_eq!(
+        ResolveRule::parse("not-a-spec")
+            .expect_err("invalid spec")
+            .to_string(),
+        "resolve spec \"not-a-spec\" must be PATTERN=IPv4 or PATTERN=fail"
+    );
 
     let server = scripted([canned_ok(&[], b"mapped")]);
     let port = server.local_addr().port();

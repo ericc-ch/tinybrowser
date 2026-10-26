@@ -48,17 +48,6 @@ pub enum ProtocolError {
     /// The URL, method, or assembled request was rejected.
     #[error("backend rejected the assembled request")]
     RejectedRequest,
-    /// Proxy URI is not an `http://` HTTP CONNECT authority with a host.
-    #[error("proxy URI must be an http:// HTTP CONNECT authority")]
-    InvalidProxy,
-    /// The configured `User-Agent` is not a valid HTTP field value (it contains
-    /// a control byte).
-    #[error("user agent is not a valid HTTP field value")]
-    InvalidUserAgent,
-    /// `--resolve=PATTERN=ADDR` is not `PATTERN=IPv4` or `PATTERN=fail`.
-    /// The payload is the offending raw spec, so callers can echo it.
-    #[error("resolve spec {0:?} must be PATTERN=IPv4 or PATTERN=fail")]
-    InvalidResolve(Box<str>),
 }
 
 /// Failure from [`crate::Agent::send`] or body reads.

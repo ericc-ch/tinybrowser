@@ -16,8 +16,8 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use browser::{AgentOptions, Browser, BrowserOptions, Profile, default_data_home};
-use cli::{Cli, Command};
+use browser::{AgentOptions, Browser, BrowserOptions, Profile, TrustedCa, default_data_home};
+use cli::{Cli, Command, WebdriverNetwork};
 use logging::Level;
 
 fn main() -> ExitCode {
@@ -38,7 +38,7 @@ fn main() -> ExitCode {
                 }
                 return ExitCode::from(2);
             }
-            let code = run(&cli);
+            let code = run(*cli);
             if !logging::flush() {
                 logging::error!(target: "logging", "file log did not flush before exit");
             }
@@ -51,8 +51,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> ExitCode {
-    match &cli.command {
+fn run(cli: Cli) -> ExitCode {
+    match cli.command {
         Some(Command::Renderer) => match browser::child::serve() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -62,16 +62,22 @@ fn run(cli: &Cli) -> ExitCode {
         },
         Some(Command::Daemon { profile }) => run_browser_process("daemon", async {
             let home = default_data_home()?;
-            daemon::run(profile, &home).await
+            daemon::run(&profile, &home).await
         }),
         Some(Command::Webdriver {
             port,
             profile,
             network,
-        }) => run_browser_process(
-            "webdriver",
-            serve_webdriver(*port, network.as_ref().clone(), profile),
-        ),
+        }) => {
+            let options = match network_options(network) {
+                Ok(options) => options,
+                Err(message) => {
+                    logging::error!(target: "cli", "{message}");
+                    return ExitCode::from(2);
+                }
+            };
+            run_browser_process("webdriver", serve_webdriver(port, options, &profile))
+        }
         None => {
             print!("{}", cli::HELP);
             ExitCode::from(2)
@@ -111,6 +117,28 @@ fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
             .join("logs")
             .join(format!("{}.log", profile.name().as_str())),
     )
+}
+
+/// Reads and parses the `--tls-ca` files, then assembles the network options
+/// the browser opens with.
+///
+/// Runs before the browser opens, so a missing path, an unreadable file, or a
+/// malformed certificate is a usage error instead of a dial-time failure.
+fn network_options(network: WebdriverNetwork) -> Result<AgentOptions, String> {
+    let mut tls_cas = Vec::with_capacity(network.tls_ca.len());
+    for path in &network.tls_ca {
+        let pem =
+            std::fs::read(path).map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
+        let ca = TrustedCa::from_pem(&pem)
+            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
+        tls_cas.push(ca);
+    }
+    Ok(AgentOptions {
+        proxy: network.proxy,
+        resolve: network.resolve,
+        tls_cas,
+        ..AgentOptions::default()
+    })
 }
 
 fn run_browser_process(

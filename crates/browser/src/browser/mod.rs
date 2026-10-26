@@ -180,9 +180,10 @@ pub(super) struct AddCookie {
 impl Browser {
     /// Opens the selected profile and starts its browser owner task.
     ///
-    /// This function validates network options, exclusively locks and restores
-    /// the profile, and starts renderer-process management. It must run inside
-    /// an active Tokio runtime. No tab is created automatically.
+    /// `options.network` must already be validated; this function does not
+    /// re-check it. It exclusively locks and restores the profile and starts
+    /// renderer-process management. It must run inside an active Tokio runtime.
+    /// No tab is created automatically.
     ///
     /// # Examples
     ///
@@ -438,7 +439,9 @@ impl std::error::Error for BrowserOpenError {
 impl From<BrowserOpenError> for io::Error {
     fn from(error: BrowserOpenError) -> Self {
         match error {
-            BrowserOpenError::Profile(error) => error,
+            BrowserOpenError::Profile(error) => {
+                Self::new(error.kind(), format!("profile failed: {error}"))
+            }
             BrowserOpenError::RuntimeUnavailable => Self::other("browser runtime unavailable"),
         }
     }

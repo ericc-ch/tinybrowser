@@ -525,6 +525,8 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 
 /// Registers the `__tb_*` host functions page scripts call into.
 fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
+    crate::js::bridge::object(ctx)?
+        .set("__tbUserAgent", rquickjs::prelude::Func::from(user_agent))?;
     crate::js::bridge::object(ctx)?.set(
         "__tb_deliver_mutations",
         rquickjs::prelude::Func::from(deliver_mutations),
@@ -589,6 +591,13 @@ fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
         |world| world.borrow().viewport_size.get(),
     );
     vec![f64::from(width), f64::from(height)]
+}
+
+/// `navigator.userAgent`, from the same constant the browser sends as the
+/// request header
+/// (<https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-useragent>).
+fn user_agent() -> &'static str {
+    crate::USER_AGENT
 }
 
 /// Captures the pristine intrinsics and host entry points every later lookup

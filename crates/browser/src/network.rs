@@ -98,30 +98,12 @@ struct CacheRead {
 const CACHE_MAX_ENTRIES: usize = 64;
 const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-/// The two caps [`insert_cached`] enforces. Tests pass their own so each limit
-/// is exercised without allocating a full cache.
-#[derive(Clone, Copy)]
-struct CacheLimits {
-    entries: usize,
-    bytes: usize,
-}
-
-const CACHE_LIMITS: CacheLimits = CacheLimits {
-    entries: CACHE_MAX_ENTRIES,
-    bytes: CACHE_MAX_BYTES,
-};
-
-/// The identity every partition sends unless the caller supplies one.
-///
-/// `UserAgent::from_static` runs in a `const`, so a byte the header field
-/// cannot carry fails the build instead of panicking when a browser opens.
 const DEFAULT_USER_AGENT: UserAgent = UserAgent::from_static(crate::USER_AGENT);
 
 fn insert_cached(
     cache: &mut HashMap<CacheKey, CachedResponse>,
     key: CacheKey,
     entry: CachedResponse,
-    limits: CacheLimits,
 ) {
     let body_len = entry.outcome.body.as_ref().map_or(0, Vec::len);
     if body_len > renderer::MAX_RESPONSE_BODY_BYTES {
@@ -131,7 +113,7 @@ fn insert_cached(
         .values()
         .map(|entry| entry.outcome.body.as_ref().map_or(0, Vec::len))
         .sum::<usize>();
-    while cache.len() >= limits.entries || total.saturating_add(body_len) > limits.bytes {
+    while cache.len() >= CACHE_MAX_ENTRIES || total.saturating_add(body_len) > CACHE_MAX_BYTES {
         let Some(oldest) = cache
             .iter()
             .min_by_key(|(_, entry)| entry.stored_at)
@@ -941,7 +923,6 @@ impl TabNetworkHandle {
                 stored_at: Instant::now(),
                 request_headers: request.headers.clone(),
             },
-            CACHE_LIMITS,
         );
     }
 
@@ -1301,7 +1282,6 @@ fn spawn_stream_body(
                                     stored_at: Instant::now(),
                                     request_headers,
                                 },
-                                CACHE_LIMITS,
                             );
                         }
                         let _ = tx.send(StreamMessage::End);
@@ -1422,7 +1402,7 @@ fn chrome_navigation_request(request: &mut Request, url: &Url) {
     identity_header(request, "Sec-Fetch-Mode", "navigate");
     identity_header(request, "Sec-Fetch-User", "?1");
     identity_header(request, "Sec-Fetch-Dest", "document");
-    if net::referrer::is_potentially_trustworthy(url) {
+    if net::is_potentially_trustworthy(url) {
         for (name, value) in [
             ("Sec-CH-UA", crate::SEC_CH_UA),
             ("Sec-CH-UA-Mobile", crate::SEC_CH_UA_MOBILE),
@@ -1571,13 +1551,9 @@ mod tests {
 
     #[test]
     fn cache_evicts_the_oldest_entry_at_the_count_limit() {
-        let limits = CacheLimits {
-            entries: 3,
-            bytes: usize::MAX,
-        };
         let mut cache = HashMap::new();
         let initiator = Url::parse("http://a.test/page").expect("page URL");
-        let keys: Vec<CacheKey> = (0..=limits.entries)
+        let keys: Vec<CacheKey> = (0..=CACHE_MAX_ENTRIES)
             .map(|index| {
                 let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
                 request.url = format!("http://a.test/{index}");
@@ -1586,49 +1562,49 @@ mod tests {
             .collect();
         for (index, key) in keys.iter().enumerate() {
             let mut entry = cached(net::cors::ResponseType::Basic);
-            entry.stored_at = Instant::now() + Duration::from_secs(index as u64);
-            insert_cached(&mut cache, key.clone(), entry, limits);
+            entry.stored_at =
+                Instant::now() + Duration::from_secs(u64::try_from(index).expect("entry index"));
+            insert_cached(&mut cache, key.clone(), entry);
         }
-        assert_eq!(cache.len(), limits.entries);
+        assert_eq!(cache.len(), CACHE_MAX_ENTRIES);
         assert!(
             !cache.contains_key(&keys[0]),
             "the oldest entry is the one evicted"
         );
         assert!(
-            cache.contains_key(&keys[limits.entries]),
+            cache.contains_key(&keys[CACHE_MAX_ENTRIES]),
             "the entry just inserted survives"
         );
     }
 
     #[test]
-    fn cache_evicts_from_the_oldest_entry_when_the_byte_cap_is_crossed() {
-        let limits = CacheLimits {
-            entries: CACHE_MAX_ENTRIES,
-            bytes: 8,
-        };
+    fn cache_evicts_by_body_bytes_from_the_oldest_entry() {
+        let bodies = CACHE_MAX_BYTES / renderer::MAX_RESPONSE_BODY_BYTES + 1;
         let mut cache = HashMap::new();
         let initiator = Url::parse("http://a.test/page").expect("page URL");
-        let keys: Vec<CacheKey> = (0..3)
+        let keys: Vec<CacheKey> = (0..bodies)
             .map(|index| {
                 let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
                 request.url = format!("http://a.test/{index}");
                 cache_key(&request, &initiator, RendererAssignmentId::new(1))
             })
             .collect();
-        // Three four-byte bodies: the third insert crosses the eight-byte cap,
-        // and the count limit is nowhere near.
         for (index, key) in keys.iter().enumerate() {
             let mut entry = cached(net::cors::ResponseType::Basic);
-            entry.outcome.body = Ok(vec![0; 4]);
-            entry.stored_at = Instant::now() + Duration::from_secs(index as u64);
-            insert_cached(&mut cache, key.clone(), entry, limits);
+            entry.outcome.body = Ok(vec![0; renderer::MAX_RESPONSE_BODY_BYTES]);
+            entry.stored_at =
+                Instant::now() + Duration::from_secs(u64::try_from(index).expect("entry index"));
+            insert_cached(&mut cache, key.clone(), entry);
         }
-        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.len(), bodies - 1);
         assert!(
             !cache.contains_key(&keys[0]),
             "the oldest body is the one evicted"
         );
-        assert!(cache.contains_key(&keys[2]), "the body just inserted stays");
+        assert!(
+            cache.contains_key(&keys[bodies - 1]),
+            "the body just inserted stays"
+        );
     }
 
     #[tokio::test]
@@ -1686,7 +1662,6 @@ mod tests {
                 "{hint} must stay off plain http"
             );
         }
-        // Everything that is not a client hint is sent either way.
         assert!(insecure_request.headers.get("sec-fetch-mode").is_some());
         assert!(insecure_request.headers.get("accept").is_some());
     }

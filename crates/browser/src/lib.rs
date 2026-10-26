@@ -35,12 +35,8 @@ pub use net::{
 pub use profile::{Profile, ProfileError, ProfileName, default_data_home};
 pub use renderer::{
     DEFAULT_VIEWPORT, FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest,
-    ScriptFailure, ScriptSource, TabError,
+    ScriptFailure, ScriptSource, TabError, USER_AGENT,
 };
-
-/// Chrome-compatible identity sent by the browser and exposed through CDP.
-/// TLS fingerprinting is a separate transport concern and is not changed here.
-pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 
 /// Low-entropy `Sec-CH-UA` brands, kept in lockstep with `navigator.userAgentData`
 /// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>).

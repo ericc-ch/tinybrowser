@@ -2,8 +2,6 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use crate::error::{NetError, ProtocolError};
-
 /// Resolution-phase failure. `hyper-util` wraps it in its own connect error;
 /// keeping a distinct type lets [`crate::transport`] classify the failure as
 /// DNS instead of guessing from the message text.
@@ -33,6 +31,11 @@ impl std::error::Error for ResolveFailure {
     }
 }
 
+/// A `--resolve` spec that is not `PATTERN=IPv4` or `PATTERN=fail`.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("resolve spec {0:?} must be PATTERN=IPv4 or PATTERN=fail")]
+pub struct InvalidResolveRule(Box<str>);
+
 /// One parsed `--resolve=PATTERN=ADDR` rule. First match wins.
 ///
 /// The `PATTERN` is an exact host or a `*` glob; `ADDR` is an IPv4 literal or
@@ -49,14 +52,14 @@ impl ResolveRule {
     ///
     /// # Errors
     ///
-    /// [`ProtocolError::InvalidResolve`] carrying `spec` when it has no `=`,
-    /// either half is empty, or `ADDR` is neither an IPv4 literal nor `fail`.
-    pub fn parse(spec: &str) -> Result<Self, NetError> {
+    /// [`InvalidResolveRule`] carrying `spec` when it has no `=`, either half
+    /// is empty, or `ADDR` is neither an IPv4 literal nor `fail`.
+    pub fn parse(spec: &str) -> Result<Self, InvalidResolveRule> {
         let Some((pattern, addr)) = spec.split_once('=') else {
-            return Err(invalid_resolve(spec));
+            return Err(InvalidResolveRule(spec.into()));
         };
         if pattern.is_empty() || addr.is_empty() {
-            return Err(invalid_resolve(spec));
+            return Err(InvalidResolveRule(spec.into()));
         }
         let pattern = pattern.to_ascii_lowercase().into_boxed_str();
         let target = if addr.eq_ignore_ascii_case("fail") {
@@ -64,7 +67,7 @@ impl ResolveRule {
         } else {
             let ip = addr
                 .parse::<Ipv4Addr>()
-                .map_err(|_| invalid_resolve(spec))?;
+                .map_err(|_| InvalidResolveRule(spec.into()))?;
             Target::Addr(ip)
         };
         Ok(Self { pattern, target })
@@ -84,14 +87,6 @@ pub struct HostMap {
 }
 
 impl HostMap {
-    /// Builds the map from already-parsed rules, keeping their order.
-    #[must_use]
-    pub fn from_rules(rules: Vec<ResolveRule>) -> Self {
-        Self {
-            rules: Arc::new(rules),
-        }
-    }
-
     pub(crate) fn lookup(&self, host: &str) -> Option<Target> {
         if self.rules.is_empty() {
             return None;
@@ -129,8 +124,10 @@ fn glob_match(pattern: &str, host: &str) -> bool {
     true
 }
 
-fn invalid_resolve(spec: &str) -> NetError {
-    NetError::Protocol(ProtocolError::InvalidResolve(
-        spec.to_owned().into_boxed_str(),
-    ))
+impl From<Vec<ResolveRule>> for HostMap {
+    fn from(rules: Vec<ResolveRule>) -> Self {
+        Self {
+            rules: Arc::new(rules),
+        }
+    }
 }

@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::iter::Peekable;
 use std::path::PathBuf;
 
-use browser::{AgentOptions, Profile, Proxy, ResolveRule, TrustedCa};
+use browser::{Profile, Proxy, ResolveRule};
 use logging::Level;
 
 /// Parsed command line: global flags plus an optional subcommand.
@@ -39,10 +39,22 @@ pub(crate) enum Command {
         port: u16,
         /// Named profile.
         profile: Profile,
-        /// Network configuration, every value parsed at the flag boundary so an
-        /// invalid one is a usage error before the daemon starts.
-        network: Box<AgentOptions>,
+        /// Network flags, already parsed except the CA paths, which startup
+        /// reads before the browser opens.
+        network: WebdriverNetwork,
     },
+}
+
+/// The network flags `webdriver` understands.
+pub(crate) struct WebdriverNetwork {
+    /// HTTP CONNECT proxy, parsed so credentials never exist as a plain
+    /// argument past this boundary.
+    pub(crate) proxy: Option<Proxy>,
+    /// Host-to-address rewrites, first match wins.
+    pub(crate) resolve: Vec<ResolveRule>,
+    /// Extra certificate authorities, in flag order. Startup reads and parses
+    /// each file before the browser opens.
+    pub(crate) tls_ca: Vec<PathBuf>,
 }
 
 /// What argument scanning selected.
@@ -109,7 +121,7 @@ enum Partial {
     Webdriver {
         port: Option<u16>,
         profile: Option<Profile>,
-        network: Box<AgentOptions>,
+        network: WebdriverNetwork,
     },
 }
 
@@ -262,9 +274,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 let raw = self.value("resolve", "<PATTERN=ADDR>", inline)?;
                 match &mut self.command {
                     Some(Partial::Webdriver { network, .. }) => {
-                        let rule = ResolveRule::parse(&raw).map_err(|_| {
-                            format!("invalid value '{raw}' for '--resolve <PATTERN=ADDR>'")
-                        })?;
+                        let rule = ResolveRule::parse(&raw).map_err(|error| error.to_string())?;
                         network.resolve.push(rule);
                         Ok(None)
                     }
@@ -275,12 +285,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 let raw = self.value("tls-ca", "<PATH>", inline)?;
                 match &mut self.command {
                     Some(Partial::Webdriver { network, .. }) => {
-                        let path = PathBuf::from(raw);
-                        let pem = std::fs::read(&path)
-                            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
-                        let ca = TrustedCa::from_pem(&pem)
-                            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
-                        network.tls_cas.push(ca);
+                        network.tls_ca.push(PathBuf::from(raw));
                         Ok(None)
                     }
                     _ => Err("unexpected argument '--tls-ca' found".into()),
@@ -337,7 +342,11 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 self.command = Some(Partial::Webdriver {
                     port: None,
                     profile: None,
-                    network: Box::new(AgentOptions::default()),
+                    network: WebdriverNetwork {
+                        proxy: None,
+                        resolve: Vec::new(),
+                        tls_ca: Vec::new(),
+                    },
                 });
                 Ok(None)
             }

@@ -10,7 +10,7 @@ use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
-use crate::resolve::{HostMap, ResolveRule};
+use crate::resolve::ResolveRule;
 use crate::transport::{CallBudget, HopBudget, HttpEngine, Proxy, TrustedCa, basic_authorization};
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder};
 use bytes::Bytes;
@@ -68,12 +68,13 @@ impl std::fmt::Debug for Clock {
     }
 }
 
-/// Constructor inputs for [`Agent::new`]. Every field is already parsed, so a
-/// bad value fails where the configuration was read instead of at the first
-/// request. `proxy` and `user_agent` never keep their source string here, and
-/// `tls_cas` holds parsed certificates.
+/// Constructor inputs for [`Agent::new`]. Every field is already validated, so
+/// a bad value fails where the configuration was read instead of at the first
+/// request. Debug output records whether a proxy is configured, not its URI or
+/// credentials.
 ///
-/// Debug output records whether a proxy is configured, not its URI or credentials.
+/// `user_agent` keeps only its validated field value, `proxy` only its parsed
+/// destination and credentials, and `tls_cas` only parsed certificates.
 #[derive(Clone)]
 pub struct AgentOptions {
     /// Default `User-Agent` for requests that do not set that header themselves.
@@ -95,26 +96,15 @@ pub struct AgentOptions {
     pub tls_cas: Vec<TrustedCa>,
 }
 
-/// A validated default `User-Agent` field value.
+/// A validated `User-Agent` field value.
 ///
-/// Built at the configuration boundary so an invalid value is a usage error,
-/// never a header that silently disappears from every request.
+/// The browser builds it once from the shared `USER_AGENT` constant and hands
+/// it to both the request header and the renderer's `navigator.userAgent`, so
+/// the two cannot disagree.
 #[derive(Clone, Debug)]
 pub struct UserAgent(HeaderValue);
 
 impl UserAgent {
-    /// Parses one field value.
-    ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::InvalidUserAgent`] when `value` contains a byte a field
-    /// value cannot carry.
-    pub fn parse(value: &str) -> Result<Self, ProtocolError> {
-        HeaderValue::from_str(value)
-            .map(Self)
-            .map_err(|_| ProtocolError::InvalidUserAgent)
-    }
-
     /// Wraps a value known to be valid at compile time, for a crate constant.
     ///
     /// # Panics
@@ -204,7 +194,7 @@ impl Agent {
                 timeout_per_call,
                 proxy,
                 clock,
-                HostMap::from_rules(resolve),
+                resolve.into(),
                 &tls_cas,
             ),
             ua: user_agent,
