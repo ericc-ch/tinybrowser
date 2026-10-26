@@ -29,13 +29,21 @@ pub fn is_potentially_trustworthy(url: &Url) -> bool {
             }
             None => false,
         },
-        // `blob:` carries its creator's origin, so it is trustworthy exactly
-        // when that origin is.
+        // `blob:` carries its creator's origin in the path, so it is trustworthy
+        // exactly when that origin is. Only a URL minted by
+        // `URL.createObjectURL()` has a blob URL entry, and its inner URL is the
+        // serialized *origin* — never another `blob:` URL. A nested
+        // `blob:blob:…` therefore names no entry and its origin is opaque
+        // (<https://url.spec.whatwg.org/#origin>), which also keeps this from
+        // recursing on attacker-chosen nesting.
         "blob" => url
             .as_str()
             .strip_prefix("blob:")
             .and_then(|inner| Url::parse(inner).ok())
-            .is_some_and(|inner| is_potentially_trustworthy(&inner)),
+            .is_some_and(|inner| {
+                matches!(inner.scheme(), "http" | "https" | "file")
+                    && is_potentially_trustworthy(&inner)
+            }),
         _ => false,
     }
 }
@@ -54,5 +62,17 @@ mod tests {
         // The branches WPT's `secure-contexts/` cannot reach end to end.
         assert!(trustworthy("about:srcdoc"));
         assert!(trustworthy("file:///tmp/page.html"));
+        assert!(trustworthy("blob:https://example.com/uuid"));
+        assert!(trustworthy("blob:http://localhost/uuid"));
+    }
+
+    #[test]
+    fn nested_blob_urls_have_an_opaque_origin() {
+        // Only `URL.createObjectURL` mints an entry, and it serializes an
+        // origin, never another `blob:` URL
+        // (<https://url.spec.whatwg.org/#origin>).
+        assert!(!trustworthy("blob:blob:https://example.com/uuid"));
+        assert!(!trustworthy("blob:blob:blob:https://example.com/uuid"));
+        assert!(!trustworthy("blob:data:,x"));
     }
 }
