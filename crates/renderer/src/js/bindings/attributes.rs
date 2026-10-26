@@ -452,18 +452,6 @@ impl<'object> JsAttr<'object> {
         self.set_node_value(ctx, value)
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share a fallible call shape"
-    )]
-    #[expect(
-        clippy::unused_self,
-        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
-    )]
-    pub(super) fn node_type(&self, _ctx: &Ctx<'_>) -> Result<u16> {
-        Ok(2)
-    }
-
     pub(super) fn node_name(&self, ctx: &Ctx<'_>) -> Result<String> {
         Ok(attr_state(ctx, self.scope.0, self.id)?.qualified)
     }
@@ -479,48 +467,6 @@ impl<'object> JsAttr<'object> {
         let home = attr_context(ctx, self.scope.0, self.id)?;
         let document = attr_state(&home, self.scope.0, self.id)?.document;
         Ok(super::document_base_url_string(&home, document).into())
-    }
-
-    // https://dom.spec.whatwg.org/#dom-node-isconnected
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share a fallible call shape"
-    )]
-    #[expect(
-        clippy::unused_self,
-        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
-    )]
-    pub(super) fn is_connected(&self, _ctx: &Ctx<'_>) -> Result<bool> {
-        Ok(false)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-node-parentnode
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share a fallible call shape"
-    )]
-    #[expect(
-        clippy::unused_self,
-        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
-    )]
-    pub(super) fn parent_node<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        Ok(Value::new_null(ctx.clone()))
-    }
-
-    pub(super) fn parent_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.parent_node(ctx)
-    }
-    pub(super) fn first_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.parent_node(ctx)
-    }
-    pub(super) fn last_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.parent_node(ctx)
-    }
-    pub(super) fn next_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.parent_node(ctx)
-    }
-    pub(super) fn previous_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.parent_node(ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-childnodes
@@ -539,18 +485,6 @@ impl<'object> JsAttr<'object> {
         Ok(list)
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated operations share a fallible call shape"
-    )]
-    #[expect(
-        clippy::unused_self,
-        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
-    )]
-    pub(super) fn has_child_nodes(&self, _ctx: Ctx<'_>) -> Result<bool> {
-        Ok(false)
-    }
-
     // https://dom.spec.whatwg.org/#dom-node-getrootnode
     pub(super) fn get_root_node<'js>(
         &self,
@@ -558,19 +492,6 @@ impl<'object> JsAttr<'object> {
         _options: super::node::core::node_generated::GetRootNodeOptions,
     ) -> Result<Value<'js>> {
         attr_wrapper(&ctx, self.id)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-node-normalize
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated operations share a fallible call shape"
-    )]
-    #[expect(
-        clippy::unused_self,
-        reason = "the Node dispatch shape requires the method; the operation ignores the wrapper"
-    )]
-    pub(super) fn normalize(&self, _ctx: Ctx<'_>) -> Result<()> {
-        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-node-clonenode
@@ -594,20 +515,12 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated operations share a fallible call shape"
-    )]
-    pub(super) fn is_same_node(
-        &self,
-        _ctx: Ctx<'_>,
-        other: Option<super::host::NodeReference>,
-    ) -> Result<bool> {
-        Ok(other
+    pub(super) fn is_same_node(&self, other: Option<super::host::NodeReference>) -> bool {
+        other
             == Some(super::host::NodeReference::Attribute {
                 scope: self.scope.0,
                 id: self.id,
-            }))
+            })
     }
 
     // https://dom.spec.whatwg.org/#concept-node-equals
@@ -627,12 +540,8 @@ impl<'object> JsAttr<'object> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-contains
-    pub(super) fn contains(
-        &self,
-        ctx: Ctx<'_>,
-        other: Option<super::host::NodeReference>,
-    ) -> Result<bool> {
-        self.is_same_node(ctx, other)
+    pub(super) fn contains(&self, other: Option<super::host::NodeReference>) -> bool {
+        self.is_same_node(other)
     }
 
     pub(super) fn compare_document_position(
@@ -774,8 +683,8 @@ impl<'object> JsAttr<'object> {
 /// reach `Node.prototype` through the prototype chain.
 impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     // https://dom.spec.whatwg.org/#dom-node-nodetype
-    fn get_node_type(&self, ctx: &Ctx<'js>) -> Result<u16> {
-        self.node_type(ctx)
+    fn get_node_type(&self, _ctx: &Ctx<'js>) -> Result<u16> {
+        Ok(2)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodename
@@ -790,8 +699,8 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isconnected
-    fn get_is_connected(&self, ctx: &Ctx<'js>) -> Result<bool> {
-        self.is_connected(ctx)
+    fn get_is_connected(&self, _ctx: &Ctx<'js>) -> Result<bool> {
+        Ok(false)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-ownerdocument
@@ -810,17 +719,17 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
 
     // https://dom.spec.whatwg.org/#dom-node-parentnode
     fn get_parent_node(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.parent_node(ctx)
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-parentelement
     fn get_parent_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.parent_element(ctx)
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-haschildnodes
-    fn has_child_nodes(&self, ctx: Ctx<'js>) -> Result<bool> {
-        self.has_child_nodes(ctx)
+    fn has_child_nodes(&self, _ctx: Ctx<'js>) -> Result<bool> {
+        Ok(false)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-childnodes
@@ -830,22 +739,22 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
 
     // https://dom.spec.whatwg.org/#dom-node-firstchild
     fn get_first_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.first_child(ctx)
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lastchild
     fn get_last_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.last_child(ctx)
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-previoussibling
     fn get_previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.previous_sibling(ctx)
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nextsibling
     fn get_next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        self.next_sibling(ctx)
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
@@ -869,8 +778,8 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-normalize
-    fn normalize(&self, ctx: Ctx<'js>) -> Result<()> {
-        self.normalize(ctx)
+    fn normalize(&self, _ctx: Ctx<'js>) -> Result<()> {
+        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-node-clonenode
@@ -890,10 +799,10 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     // https://dom.spec.whatwg.org/#dom-node-issamenode
     fn is_same_node(
         &self,
-        ctx: Ctx<'js>,
+        _ctx: Ctx<'js>,
         arg_0: Option<super::host::NodeReference>,
     ) -> Result<bool> {
-        self.is_same_node(ctx, arg_0)
+        Ok(self.is_same_node(arg_0))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
@@ -906,8 +815,8 @@ impl<'js> node_generated::Node<'js> for JsAttr<'js> {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-contains
-    fn contains(&self, ctx: Ctx<'js>, arg_0: Option<super::host::NodeReference>) -> Result<bool> {
-        self.contains(ctx, arg_0)
+    fn contains(&self, _ctx: Ctx<'js>, arg_0: Option<super::host::NodeReference>) -> Result<bool> {
+        Ok(self.contains(arg_0))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lookupprefix

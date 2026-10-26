@@ -14,7 +14,9 @@ use super::super::{
 };
 use super::forms::{fixup_option_on_insert, fixup_radio_on_insert};
 use crate::dom::adoption::materialize_children;
-
+use crate::js::bindings::enumerated::{
+    CrossOrigin, Dir, EnterKeyHint, Enumerated, InputMode, reflect_enumerated,
+};
 use std::collections::HashSet;
 
 use blitz_dom::NodeData;
@@ -505,7 +507,7 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
         let raw = content_attr(ctx, self.handle.0, "dir");
         rquickjs::String::from_str(
             ctx.clone(),
-            &reflect_enum(raw.as_deref(), DIR_KEYWORDS, "", ""),
+            &reflect_enumerated::<Dir>(raw.as_deref(), "", ""),
         )
     }
 
@@ -1266,10 +1268,8 @@ impl<'js> element_css_inline_style_generated::ElementCSSInlineStyle<'js> for JsN
 impl<'js> element_content_editable_generated::ElementContentEditable<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-enterkeyhint
     fn get_enter_key_hint(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        const KEYWORDS: &[&str] = &["enter", "done", "go", "next", "previous", "search", "send"];
-        let value = reflect_enum(
+        let value = reflect_enumerated::<EnterKeyHint>(
             content_attr(ctx, self.handle.0, "enterkeyhint").as_deref(),
-            KEYWORDS,
             "",
             "",
         );
@@ -1283,12 +1283,8 @@ impl<'js> element_content_editable_generated::ElementContentEditable<'js> for Js
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-inputmode
     fn get_input_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        const KEYWORDS: &[&str] = &[
-            "none", "text", "tel", "url", "email", "numeric", "decimal", "search",
-        ];
-        let value = reflect_enum(
+        let value = reflect_enumerated::<InputMode>(
             content_attr(ctx, self.handle.0, "inputmode").as_deref(),
-            KEYWORDS,
             "",
             "",
         );
@@ -2619,26 +2615,6 @@ pub(super) fn is_element_data(data: &NodeData) -> bool {
     matches!(data, NodeData::Element(_))
 }
 
-/// Enumerated reflection: an ASCII case-insensitive keyword match yields
-/// the canonical keyword, absence yields the missing default, and anything
-/// else yields the invalid default
-/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-pub(crate) fn reflect_enum(
-    raw: Option<&str>,
-    keywords: &[&str],
-    missing: &str,
-    invalid: &str,
-) -> String {
-    let Some(value) = raw else {
-        return missing.into();
-    };
-    let lowered = value.to_ascii_lowercase();
-    keywords
-        .iter()
-        .find(|keyword| **keyword == lowered)
-        .map_or(invalid.into(), |keyword| (*keyword).to_owned())
-}
-
 /// `unsigned long` reflection: a non-negative integer within `long` range,
 /// otherwise the default
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflecting-content-attributes-in-idl-attributes>).
@@ -2894,11 +2870,12 @@ pub(super) fn reflect_referrer_policy<'js>(
     ctx: &Ctx<'js>,
     id: NodeId,
 ) -> Result<rquickjs::String<'js>> {
-    let value = content_attr(ctx, id, "referrerpolicy")
-        .as_deref()
-        .and_then(net::ReferrerPolicy::parse)
-        .map_or("", net::ReferrerPolicy::keyword);
-    rquickjs::String::from_str(ctx.clone(), value)
+    let value = reflect_enumerated::<net::ReferrerPolicy>(
+        content_attr(ctx, id, "referrerpolicy").as_deref(),
+        "",
+        "",
+    );
+    rquickjs::String::from_str(ctx.clone(), &value)
 }
 
 pub(super) fn set_referrer_policy(
@@ -2922,16 +2899,15 @@ pub(super) fn reflect_cross_origin<'js>(
     let Some(value) = raw.as_deref() else {
         return Ok(None);
     };
-    let lowered = value.to_ascii_lowercase();
-    let canonical = if lowered.is_empty() || lowered == "anonymous" {
-        "anonymous"
+    let canonical = if value.is_empty() {
+        CrossOrigin::Anonymous
     } else {
-        CROSS_ORIGIN_KEYWORDS
-            .iter()
-            .find(|keyword| **keyword == lowered)
-            .map_or("anonymous", |keyword| *keyword)
+        CrossOrigin::parse(value).unwrap_or(CrossOrigin::Anonymous)
     };
-    Ok(Some(rquickjs::String::from_str(ctx.clone(), canonical)?))
+    Ok(Some(rquickjs::String::from_str(
+        ctx.clone(),
+        canonical.keyword(),
+    )?))
 }
 
 pub(super) fn set_cross_origin(
@@ -3012,15 +2988,6 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_hyperlink_element_utils_generated::install(ctx)?;
     Ok(())
 }
-
-/// The `dir` attribute keywords; `dir` reflects with no missing or invalid
-/// default (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
-pub(super) const DIR_KEYWORDS: &[&str] = &["ltr", "rtl", "auto"];
-
-// Shared enumerated keyword tables for content-attribute reflection.
-pub(super) const CROSS_ORIGIN_KEYWORDS: &[&str] = &["anonymous", "use-credentials"];
-pub(super) const PRELOAD_KEYWORDS: &[&str] = &["none", "metadata", "auto"];
-pub(super) const LAZY_EAGER_KEYWORDS: &[&str] = &["lazy", "eager"];
 
 impl JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute

@@ -31,15 +31,9 @@ fn world_for_window_this<'js>(ctx: &Ctx<'js>, this: &Object<'js>) -> Result<Rc<R
     let Ok(frame) = data.get::<_, f64>("frame") else {
         return Ok(current);
     };
-    if !frame.is_finite() || frame < 0.0 || frame.fract() != 0.0 || frame > f64::from(u32::MAX) {
-        return Ok(current);
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the value is range-checked to a non-negative u32 above"
-    )]
-    let Some(target) = current.borrow().frame_world(FrameId::new(frame as u64)) else {
+    let Some(target) =
+        crate::js::bridge::frame_id(frame).and_then(|frame| current.borrow().frame_world(frame))
+    else {
         return Ok(current);
     };
     // https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get

@@ -50,34 +50,9 @@ mod tests {
     }
 
     #[test]
-    fn trustworthy_urls_cover_secure_contexts_loopback_and_blobs() {
-        for value in [
-            "https://example.com/",
-            "wss://example.com/socket",
-            "file:///tmp/page.html",
-            "data:,hello",
-            "about:blank",
-            "about:srcdoc",
-            "blob:https://example.com/uuid",
-            "http://127.0.0.1/",
-            "http://localhost/",
-            "http://foo.localhost./",
-            "http://[::1]/",
-        ] {
-            assert!(trustworthy(value), "{value} is potentially trustworthy");
-        }
-    }
-
-    #[test]
-    fn untrustworthy_urls_are_plain_http_and_other_creators_blobs() {
-        for value in [
-            "http://example.com/",
-            "ws://example.com/socket",
-            "blob:http://example.com/uuid",
-            "http://192.0.2.1/",
-            "ftp://example.com/",
-        ] {
-            assert!(!trustworthy(value), "{value} is not trustworthy");
-        }
+    fn local_documents_without_an_http_response_are_trustworthy() {
+        // The branches WPT's `secure-contexts/` cannot reach end to end.
+        assert!(trustworthy("about:srcdoc"));
+        assert!(trustworthy("file:///tmp/page.html"));
     }
 }

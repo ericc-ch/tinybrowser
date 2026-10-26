@@ -11,9 +11,10 @@ use rquickjs::{Ctx, Exception, Result, Value};
 
 use crate::dom::insertion::replace_all_journaled;
 use crate::dom::tree::{NodeId, attr, form_owner_of, html_namespace};
+use crate::js::bindings::enumerated::{Autocomplete, FormEnctype, FormMethod, reflect_enumerated};
 
 use super::JsNode;
-use super::element::{content_attr, reflect_enum, reflect_ulong};
+use super::element::{content_attr, reflect_ulong};
 use super::media::is_image_input;
 
 include!(concat!(env!("OUT_DIR"), "/HTMLFormElement.rs"));
@@ -37,9 +38,8 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
     fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let method = reflect_enum(
+        let method = reflect_enumerated::<FormMethod>(
             content_attr(ctx, self.handle.0, "method").as_deref(),
-            &["post", "dialog"],
             "get",
             "get",
         );
@@ -57,9 +57,8 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
     fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let enctype = reflect_enum(
+        let enctype = reflect_enumerated::<FormEnctype>(
             content_attr(ctx, self.handle.0, "enctype").as_deref(),
-            &["multipart/form-data", "text/plain"],
             "application/x-www-form-urlencoded",
             "application/x-www-form-urlencoded",
         );
@@ -93,10 +92,8 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     // `autocomplete` is an on/off enumeration defaulting to on
     // (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-autocomplete>).
     fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        const KEYWORDS: &[&str] = &["on", "off"];
-        let value = reflect_enum(
+        let value = reflect_enumerated::<Autocomplete>(
             content_attr(ctx, self.handle.0, "autocomplete").as_deref(),
-            KEYWORDS,
             "on",
             "on",
         );
@@ -947,9 +944,8 @@ impl JsNode {
         // Enumerated without whitespace stripping: only an exact ASCII
         // case-insensitive keyword matches
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        reflect_enum(
+        reflect_enumerated::<FormMethod>(
             content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
-            &["post", "dialog"],
             "",
             "get",
         )
@@ -963,9 +959,8 @@ impl JsNode {
     pub(super) fn form_enctype(&self, ctx: Ctx<'_>) -> String {
         // Absent reads empty, like `formMethod`; no whitespace stripping
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
-        reflect_enum(
+        reflect_enumerated::<FormEnctype>(
             content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
-            &["multipart/form-data", "text/plain"],
             "",
             "application/x-www-form-urlencoded",
         )

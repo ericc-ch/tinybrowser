@@ -77,30 +77,18 @@ fn rule_path(path: &str) -> Option<Vec<usize>> {
 }
 
 fn sheet_id(id: f64) -> Option<u64> {
-    if !id.is_finite() || id < 1.0 || id.fract() != 0.0 || id > f64::from(u32::MAX) {
-        return None;
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "id is a finite integer in 1..=u32::MAX"
-    )]
-    Some(id as u64)
+    crate::js::bridge::host_index(id)
+        .filter(|id| *id >= 1)
+        .map(u64::from)
 }
 
 /// Web IDL `unsigned long` already applied on the JS side (`index >>> 0`).
 /// A value that is not that integer is a caller bug, not index 0
 /// (<https://webidl.spec.whatwg.org/#idl-unsigned-long>).
 fn rule_index(ctx: &Ctx<'_>, index: f64) -> Result<usize> {
-    if !index.is_finite() || index < 0.0 || index.fract() != 0.0 || index > f64::from(u32::MAX) {
-        return Err(Exception::throw_type(ctx, "invalid rule index"));
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "index is a finite integer in 0..=u32::MAX"
-    )]
-    Ok(index as usize)
+    crate::js::bridge::host_index(index)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| Exception::throw_type(ctx, "invalid rule index"))
 }
 
 fn cssom_throw(ctx: &Ctx<'_>, err: CssomError) -> rquickjs::Error {

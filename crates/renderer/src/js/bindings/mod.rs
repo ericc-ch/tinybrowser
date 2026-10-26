@@ -11,6 +11,7 @@ mod clone;
 mod collections;
 mod cssom_host;
 mod document;
+pub(crate) mod enumerated;
 mod exceptions;
 pub(crate) mod focus;
 pub(crate) mod forms;
@@ -646,14 +647,11 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
 /// `execute_script` work as well as Find Element results
 /// (<https://w3c.github.io/webdriver/#elements>).
 pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "WebDriver element ids are small non-negative integers"
-    )]
-    let remote = remote_id as u64;
+    let Some(remote) = crate::js::bridge::host_index(remote_id) else {
+        return Ok(Value::new_null(ctx));
+    };
     let world = world(&ctx)?;
-    let Some(node) = world.borrow().node_for_remote(remote) else {
+    let Some(node) = world.borrow().node_for_remote(u64::from(remote)) else {
         return Ok(Value::new_null(ctx));
     };
     // Only a live, connected element is a valid element reference.

@@ -39,12 +39,11 @@ use crate::js::world::{DocumentStreamCommand, NodeReference, SameObject};
 
 use crate::ReadyState;
 
+use crate::js::bindings::enumerated::{Dir, Loading, reflect_enumerated};
+
 use super::JsNode;
 use super::core::{adopt_node, document_value};
-use super::element::{
-    DIR_KEYWORDS, LAZY_EAGER_KEYWORDS, content_attr, is_element_data, reflect_enum,
-    reflect_referrer_policy, set_referrer_policy,
-};
+use super::element::{content_attr, is_element_data, reflect_referrer_policy, set_referrer_policy};
 
 include!(concat!(env!("OUT_DIR"), "/Document.rs"));
 include!(concat!(env!("OUT_DIR"), "/DocumentFragment.rs"));
@@ -91,12 +90,12 @@ impl<'js> document_generated::Document<'js> for JsNode {
 
     // https://dom.spec.whatwg.org/#dom-document-documenturi
     fn get_document_uri(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
-        self.document_uri(ctx)
+        self.get_url(ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-url
     fn get_url(&self, ctx: &Ctx<'js>) -> Result<crate::dom_string::DomString> {
-        self.url(ctx)
+        Ok(self.url(ctx))
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-referrer
@@ -112,20 +111,17 @@ impl<'js> document_generated::Document<'js> for JsNode {
 
     /// <https://encoding.spec.whatwg.org/#dom-document-characterset>
     fn get_character_set(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let set = self.character_set(ctx)?;
-        rquickjs::String::from_str(ctx.clone(), set)
+        rquickjs::String::from_str(ctx.clone(), self.character_set(ctx))
     }
 
     /// <https://encoding.spec.whatwg.org/#dom-document-charset>
     fn get_charset(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let set = self.charset(ctx)?;
-        rquickjs::String::from_str(ctx.clone(), set)
+        self.get_character_set(ctx)
     }
 
     /// <https://encoding.spec.whatwg.org/#dom-document-inputencoding>
     fn get_input_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let encoding = self.input_encoding(ctx)?;
-        rquickjs::String::from_str(ctx.clone(), encoding)
+        self.get_character_set(ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-contenttype
@@ -155,7 +151,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
     fn has_focus(&self, ctx: Ctx<'js>) -> Result<bool> {
-        self.has_focus(ctx)
+        Ok(self.has_focus(&ctx))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-activeelement
@@ -189,7 +185,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
             .and_then(|element| content_attr(ctx, element, "dir"));
         rquickjs::String::from_str(
             ctx.clone(),
-            &reflect_enum(value.as_deref(), DIR_KEYWORDS, "", ""),
+            &reflect_enumerated::<Dir>(value.as_deref(), "", ""),
         )
     }
 
@@ -628,9 +624,8 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
     // `loading` defaults to `eager`
     // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading>).
     fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value = reflect_enum(
+        let value = reflect_enumerated::<Loading>(
             content_attr(ctx, self.handle.0, "loading").as_deref(),
-            LAZY_EAGER_KEYWORDS,
             "eager",
             "eager",
         );
@@ -714,12 +709,8 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated operations share one fallible call shape"
-    )]
-    pub(super) fn has_focus(&self, ctx: Ctx<'_>) -> Result<bool> {
-        Ok(is_main_document(&ctx, self.handle.0))
+    pub(super) fn has_focus(&self, ctx: &Ctx<'_>) -> bool {
+        is_main_document(ctx, self.handle.0)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
@@ -1188,30 +1179,13 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-url
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share one fallible call shape"
-    )]
-    pub(super) fn url(&self, ctx: &Ctx<'_>) -> Result<crate::dom_string::DomString> {
-        Ok(document_url_string(ctx, self.handle.0).into())
-    }
-
-    // https://dom.spec.whatwg.org/#dom-document-documenturi
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share one fallible call shape"
-    )]
-    pub(super) fn document_uri(&self, ctx: &Ctx<'_>) -> Result<crate::dom_string::DomString> {
-        Ok(document_url_string(ctx, self.handle.0).into())
+    pub(super) fn url(&self, ctx: &Ctx<'_>) -> crate::dom_string::DomString {
+        document_url_string(ctx, self.handle.0).into()
     }
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-document-baseuri
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share one fallible call shape"
-    )]
-    pub(super) fn base_uri(&self, ctx: &Ctx<'_>) -> Result<crate::dom_string::DomString> {
-        Ok(document_base_url_string(ctx, self.handle.0).into())
+    pub(super) fn base_uri(&self, ctx: &Ctx<'_>) -> crate::dom_string::DomString {
+        document_base_url_string(ctx, self.handle.0).into()
     }
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-location
@@ -1223,28 +1197,8 @@ impl JsNode {
     }
 
     /// <https://encoding.spec.whatwg.org/#dom-document-characterset>
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share one fallible call shape"
-    )]
-    pub(super) fn character_set(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
-        Ok(document_character_set(ctx, self.handle.0))
-    }
-
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share one fallible call shape"
-    )]
-    pub(super) fn charset(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
-        Ok(document_character_set(ctx, self.handle.0))
-    }
-
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share one fallible call shape"
-    )]
-    pub(super) fn input_encoding(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
-        Ok(document_character_set(ctx, self.handle.0))
+    pub(super) fn character_set(&self, ctx: &Ctx<'_>) -> &'static str {
+        document_character_set(ctx, self.handle.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-contenttype
@@ -1481,15 +1435,9 @@ pub(in crate::js::bindings) fn construct_node_in_frame<'js>(
     name: WebIdlString,
     args: Rest<Value<'js>>,
 ) -> Result<Value<'js>> {
-    if !frame.is_finite() || frame < 0.0 || frame.fract() != 0.0 || frame > f64::from(u32::MAX) {
+    let Some(frame) = crate::js::bridge::frame_id(frame) else {
         return Err(Exception::throw_type(&ctx, "no document"));
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the value is range-checked to a non-negative u32 above"
-    )]
-    let frame = crate::protocol::FrameId::new(frame as u64);
+    };
     let current = world(&ctx)?;
     let Some(owner) = current.borrow().frame_world(frame) else {
         return Err(Exception::throw_type(&ctx, "no document"));

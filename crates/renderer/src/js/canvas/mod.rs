@@ -1737,10 +1737,7 @@ fn image_data_pixel_format(this: This<Object<'_>>) -> Result<rquickjs::String<'_
     this.0.get("__tbPixelFormat")
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "accessor setters use the fallible host signature"
-)]
+#[expect(clippy::unnecessary_wraps, reason = "rquickjs callbacks return Result")]
 fn image_data_read_only(_this: This<Object<'_>>, _value: Value<'_>) -> Result<()> {
     Ok(())
 }

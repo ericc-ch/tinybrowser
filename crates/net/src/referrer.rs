@@ -45,7 +45,7 @@ pub enum ReferrerPolicy {
 impl ReferrerPolicy {
     /// Every policy, in spec order
     /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
-    pub(crate) const ALL: [Self; 8] = [
+    pub const ALL: [Self; 8] = [
         Self::NoReferrer,
         Self::NoReferrerWhenDowngrade,
         Self::SameOrigin,
