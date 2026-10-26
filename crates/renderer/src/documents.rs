@@ -17,6 +17,13 @@ use blitz_dom::NodeData;
 pub(crate) struct BlitzDocument {
     /// The Blitz tree, style, and layout state.
     pub base: blitz_dom::BaseDocument,
+    /// Every per-document side table, all default-constructed.
+    pub side: SideTables,
+}
+
+/// Side data that is not part of the Blitz tree.
+#[derive(Default)]
+pub struct SideTables {
     /// Mutations since the last observer drain, in operation order.
     pub journal: Vec<(u64, JournalEntry)>,
     next_journal_position: u64,
@@ -85,36 +92,23 @@ impl BlitzDocument {
     pub(crate) fn from_base(base: blitz_dom::BaseDocument) -> Self {
         Self {
             base,
-            journal: Vec::new(),
-            next_journal_position: 1,
-            recording: false,
-            fragments: HashSet::new(),
-            pi_attributes: HashMap::new(),
-            started_scripts: HashSet::new(),
-            selectedness_normalized: HashSet::new(),
-            option_selectedness: HashMap::new(),
-            option_dirtiness: HashSet::new(),
-            pristine_values: HashSet::new(),
-            ranges: crate::dom::range::RangeTable::default(),
-            exact_text: HashMap::new(),
-            exact_attrs: HashMap::new(),
-            template_owners: HashMap::new(),
+            side: SideTables::default(),
         }
     }
 
     /// Whether a select's option selectedness is already materialized.
     pub(crate) fn selectedness_normalized(&self, select: blitz_traits::node_id::NodeId) -> bool {
-        self.selectedness_normalized.contains(&select)
+        self.side.selectedness_normalized.contains(&select)
     }
 
     /// Marks a select's option selectedness as materialized.
     pub(crate) fn mark_selectedness_normalized(&mut self, select: blitz_traits::node_id::NodeId) {
-        self.selectedness_normalized.insert(select);
+        self.side.selectedness_normalized.insert(select);
     }
 
     /// Drops the materialized selectedness for one select.
     pub(crate) fn invalidate_selectedness(&mut self, select: blitz_traits::node_id::NodeId) {
-        self.selectedness_normalized.remove(&select);
+        self.side.selectedness_normalized.remove(&select);
     }
 
     /// The stored selectedness slot for an option, when materialized.
@@ -122,7 +116,7 @@ impl BlitzDocument {
         &self,
         option: blitz_traits::node_id::NodeId,
     ) -> Option<bool> {
-        self.option_selectedness.get(&option).copied()
+        self.side.option_selectedness.get(&option).copied()
     }
 
     /// Stores an option's selectedness slot.
@@ -131,58 +125,58 @@ impl BlitzDocument {
         option: blitz_traits::node_id::NodeId,
         selected: bool,
     ) {
-        self.option_selectedness.insert(option, selected);
+        self.side.option_selectedness.insert(option, selected);
     }
 
     /// Whether an option's selectedness was set by script.
     pub(crate) fn option_dirty(&self, option: blitz_traits::node_id::NodeId) -> bool {
-        self.option_dirtiness.contains(&option)
+        self.side.option_dirtiness.contains(&option)
     }
 
     /// Marks an option's selectedness as script-set.
     pub(crate) fn mark_option_dirty(&mut self, option: blitz_traits::node_id::NodeId) {
-        self.option_dirtiness.insert(option);
+        self.side.option_dirtiness.insert(option);
     }
 
     /// Clears an option's dirtiness, so its `selected` attribute applies
     /// again.
     pub(crate) fn clear_option_dirty(&mut self, option: blitz_traits::node_id::NodeId) {
-        self.option_dirtiness.remove(&option);
+        self.side.option_dirtiness.remove(&option);
     }
 
     /// Whether an input's stored value is a sanitized pristine value.
     pub(crate) fn pristine_value(&self, node: blitz_traits::node_id::NodeId) -> bool {
-        self.pristine_values.contains(&node)
+        self.side.pristine_values.contains(&node)
     }
 
     /// Marks an input's stored value as sanitized but pristine.
     pub(crate) fn mark_pristine_value(&mut self, node: blitz_traits::node_id::NodeId) {
-        self.pristine_values.insert(node);
+        self.side.pristine_values.insert(node);
     }
 
     /// Clears the pristine marker before a user value supersedes it.
     pub(crate) fn clear_pristine_value(&mut self, node: blitz_traits::node_id::NodeId) {
-        self.pristine_values.remove(&node);
+        self.side.pristine_values.remove(&node);
     }
 
     /// Records `entry` when an observer watches this document.
     pub(crate) fn record(&mut self, entry: JournalEntry) {
-        if self.recording {
-            let position = self.next_journal_position;
-            self.next_journal_position = self.next_journal_position.wrapping_add(1);
-            self.journal.push((position, entry));
+        if self.side.recording {
+            let position = self.side.next_journal_position;
+            self.side.next_journal_position = self.side.next_journal_position.wrapping_add(1);
+            self.side.journal.push((position, entry));
         }
     }
 
     /// Enables or disables observer recording for this document.
     pub(crate) fn set_recording(&mut self, recording: bool) {
-        self.recording = recording;
+        self.side.recording = recording;
     }
 
     /// Whether `id` backs a `DocumentFragment`: a flagged backing element
     /// or a real `Fragment` node (such as template contents).
     pub(crate) fn is_fragment(&self, id: blitz_traits::node_id::NodeId) -> bool {
-        self.fragments.contains(&id)
+        self.side.fragments.contains(&id)
             || self.base.get_node(id).is_some_and(|node| {
                 matches!(
                     node.data,
@@ -199,7 +193,7 @@ impl BlitzDocument {
             markup5ever::LocalName::from("div"),
         );
         let backing = self.base.mutate().create_element(name, Vec::new());
-        self.fragments.insert(backing);
+        self.side.fragments.insert(backing);
         backing
     }
 
@@ -233,7 +227,7 @@ impl BlitzDocument {
             .create_processing_instruction_node(target, data);
         let attributes =
             crate::pseudo_attributes::parse_pseudo_attributes(data).unwrap_or_default();
-        self.pi_attributes.insert(id, attributes);
+        self.side.pi_attributes.insert(id, attributes);
         id
     }
 
@@ -242,7 +236,7 @@ impl BlitzDocument {
         &self,
         id: blitz_traits::node_id::NodeId,
     ) -> Option<&[(String, String)]> {
-        self.pi_attributes.get(&id).map(Vec::as_slice)
+        self.side.pi_attributes.get(&id).map(Vec::as_slice)
     }
 
     /// Replaces the ordered attribute map of a processing instruction.
@@ -259,7 +253,7 @@ impl BlitzDocument {
         // Plain insert: both callers hold a PI (creation and the guarded
         // reparse path), and silently dropping a write desyncs the map from
         // the serialized data it produces.
-        self.pi_attributes.insert(id, attributes);
+        self.side.pi_attributes.insert(id, attributes);
     }
 
     /// Creates a CDATA section whose data is `data`
@@ -276,13 +270,13 @@ impl BlitzDocument {
         to: blitz_traits::node_id::NodeId,
     ) {
         // Pure tax when the document never saw a PI: skip the walk entirely.
-        if self.pi_attributes.is_empty() {
+        if self.side.pi_attributes.is_empty() {
             return;
         }
         let mut stack = vec![(from, to)];
         while let Some((from, to)) = stack.pop() {
-            if let Some(attributes) = self.pi_attributes.get(&from).cloned() {
-                self.pi_attributes.insert(to, attributes);
+            if let Some(attributes) = self.side.pi_attributes.get(&from).cloned() {
+                self.side.pi_attributes.insert(to, attributes);
             }
             stack.extend(crate::dom::adoption::lockstep_children(
                 &self.base, from, &self.base, to,
@@ -319,7 +313,7 @@ impl BlitzDocument {
                     .as_deref()
                     .and_then(crate::pseudo_attributes::parse_pseudo_attributes)
                     .unwrap_or_default();
-                self.pi_attributes.insert(id, attributes);
+                self.side.pi_attributes.insert(id, attributes);
             }
             stack.extend(children);
         }
@@ -352,9 +346,9 @@ impl BlitzDocument {
         data: &DomString,
     ) {
         if data.has_unpaired_surrogate() {
-            self.exact_text.insert(id, data.clone());
+            self.side.exact_text.insert(id, data.clone());
         } else {
-            self.exact_text.remove(&id);
+            self.side.exact_text.remove(&id);
         }
     }
 
@@ -368,9 +362,9 @@ impl BlitzDocument {
     ) {
         let key = (id, name.to_owned());
         if value.has_unpaired_surrogate() {
-            self.exact_attrs.insert(key, value);
+            self.side.exact_attrs.insert(key, value);
         } else {
-            self.exact_attrs.remove(&key);
+            self.side.exact_attrs.remove(&key);
         }
     }
 
@@ -380,7 +374,7 @@ impl BlitzDocument {
         id: blitz_traits::node_id::NodeId,
         name: &str,
     ) -> Option<&DomString> {
-        self.exact_attrs.get(&(id, name.to_owned()))
+        self.side.exact_attrs.get(&(id, name.to_owned()))
     }
 
     /// Records the inert document that owns a template's contents.
@@ -390,7 +384,9 @@ impl BlitzDocument {
         document: u32,
         fragment: blitz_traits::node_id::NodeId,
     ) {
-        self.template_owners.insert(template, (document, fragment));
+        self.side
+            .template_owners
+            .insert(template, (document, fragment));
     }
 
     /// The inert document and fragment for a template, when migrated.
@@ -398,7 +394,7 @@ impl BlitzDocument {
         &self,
         template: blitz_traits::node_id::NodeId,
     ) -> Option<(u32, blitz_traits::node_id::NodeId)> {
-        self.template_owners.get(&template).copied()
+        self.side.template_owners.get(&template).copied()
     }
 
     /// The `CharacterData` of `id` as UTF-16 code units
@@ -407,7 +403,7 @@ impl BlitzDocument {
     /// Unpaired surrogates live in `exact_text`. The UTF-8 tree holds the
     /// lossy form for layout.
     pub(crate) fn character_data(&self, id: blitz_traits::node_id::NodeId) -> DomString {
-        if let Some(exact) = self.exact_text.get(&id) {
+        if let Some(exact) = self.side.exact_text.get(&id) {
             return exact.clone();
         }
         match self.base.get_node(id).map(|node| &node.data) {
@@ -450,12 +446,12 @@ impl BlitzDocument {
     /// Whether `id` has already started as a script
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
     pub(crate) fn script_already_started(&self, id: blitz_traits::node_id::NodeId) -> bool {
-        self.started_scripts.contains(&id)
+        self.side.started_scripts.contains(&id)
     }
 
     /// Sets the already-started flag. Returns whether this was the first set.
     pub(crate) fn mark_script_started(&mut self, id: blitz_traits::node_id::NodeId) -> bool {
-        self.started_scripts.insert(id)
+        self.side.started_scripts.insert(id)
     }
 
     /// Copies the already-started flag of `from` onto `to`, then walks both
@@ -467,13 +463,13 @@ impl BlitzDocument {
         to: blitz_traits::node_id::NodeId,
     ) {
         // Pure tax when no script ever started: skip the walk entirely.
-        if self.started_scripts.is_empty() {
+        if self.side.started_scripts.is_empty() {
             return;
         }
         let mut stack = vec![(from, to)];
         while let Some((from, to)) = stack.pop() {
-            if self.started_scripts.contains(&from) {
-                self.started_scripts.insert(to);
+            if self.side.started_scripts.contains(&from) {
+                self.side.started_scripts.insert(to);
             }
             stack.extend(crate::dom::adoption::lockstep_children(
                 &self.base, from, &self.base, to,

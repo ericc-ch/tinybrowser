@@ -60,9 +60,6 @@ const __tbHeaderValue = value => {
 const __tbHttpTrim = value => value.replace(/^[\t ]+|[\t ]+$/g, '');
 // The policy tables live in `net::cors`; the renderer only applies the host
 // predicates, so JS and the preflight decision cannot drift.
-const __tbForbiddenRequestHeader = (name, value) => host.__tbIsForbiddenRequestHeader(name, value);
-const __tbIsForbiddenMethod = value => host.__tbIsForbiddenMethod(value);
-const __tbNoCorsSafelistedHeader = (name, value) => host.__tbIsNoCorsSafelistedHeader(name, value);
 const __tbHeadersRecord = headers => __tbBrand(headers, __tbHeadersData);
 const __tbHeadersList = headers => __tbHeadersRecord(headers).list;
 const __tbHeadersGuardOf = headers => __tbHeadersRecord(headers).guard;
@@ -137,9 +134,12 @@ const __tbHeadersAllowed = (record, name, value, existing) => {
       return name !== 'set-cookie' && name !== 'set-cookie2';
     case 'request':
     case 'request-no-cors':
-      if (__tbForbiddenRequestHeader(name, value)) return false;
+      if (host.__tbIsForbiddenRequestHeader(name, value)) return false;
       if (record.guard === 'request') return true;
-      return __tbNoCorsSafelistedHeader(name, existing === null ? value : existing + ', ' + value);
+      return host.__tbIsNoCorsSafelistedHeader(
+        name,
+        existing === null ? value : existing + ', ' + value,
+      );
     default:
       throw new TypeError('Invalid headers guard');
   }
@@ -156,7 +156,7 @@ const __tbHeadersDeleteRaw = (headers, name) => {
   if (record.guard === 'immutable') throw new TypeError('Headers are immutable');
   const normalized = __tbHeaderName(name);
   if ((record.guard === 'request' || record.guard === 'request-no-cors')
-      && __tbForbiddenRequestHeader(normalized)) {
+      && host.__tbIsForbiddenRequestHeader(normalized, '')) {
     return;
   }
   for (let index = record.list.length - 1; index >= 0; index--) {

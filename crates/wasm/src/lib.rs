@@ -13,9 +13,9 @@ use std::time::SystemTime;
 
 use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, schemeful_same_site};
 use renderer::{
-    BrowserEvent, BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome,
-    DialRequest, EmbeddedRenderer, HistoryHandling, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount,
-    NetworkHost, RendererEvent, StorageChange, StorageHost, StorageKind,
+    BodyDelivery, BrowserEvent, BrowsingContextHost, DialCompletion, DialFailure, DialKind,
+    DialOutcome, DialRequest, EmbeddedRenderer, HistoryHandling, MAX_RESPONSE_BODY_BYTES,
+    MessagingHost, Mount, NetworkHost, RendererEvent, StorageChange, StorageHost, StorageKind,
 };
 use url::Url;
 use webstorage::StorageArea;
@@ -491,7 +491,7 @@ impl NetworkHost for WasmServices {
                 url,
                 initiator: Url::parse(&request.initiator).ok(),
                 kind: request.kind,
-                read_body: request.read_body,
+                read_body: request.delivery != BodyDelivery::Discard,
                 followed: 0,
                 cross_site_redirect: false,
                 csp: request.csp.as_deref().cloned(),

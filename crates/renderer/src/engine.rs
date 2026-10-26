@@ -1412,7 +1412,7 @@ impl Engine {
                             initiator: origin.ascii_serialization(),
                             referrer_url,
                             // The frame's document always reads the body.
-                            read_body: true,
+                            delivery: crate::protocol::BodyDelivery::Buffer,
                             method: navigation.method.clone(),
                             body: navigation.body.clone(),
                             content_type: navigation.content_type.clone(),
@@ -1424,8 +1424,7 @@ impl Engine {
                             keepalive: false,
                             body_len: 0,
                             integrity: None,
-                            cache: None,
-                            stream_body: false,
+                            cache: crate::protocol::RequestCache::Default,
                             referrer_policy,
                         },
                         ancestors,

@@ -281,9 +281,9 @@ pub fn is_forbidden_method(method: &str) -> bool {
 
 /// Whether a forbidden-method header carries a forbidden method in any
 /// comma-separated member
-/// (<https://fetch.spec.whatwg.org/#forbidden-method>). Members are split on
-/// `,` and stripped of HTTP tab or space only; any other whitespace or trailing
-/// text leaves the member as written.
+/// (<https://fetch.spec.whatwg.org/#forbidden-request-header>). Members come
+/// from the spec's get-decode-split, so a quoted member is compared with its
+/// quotes and is not a method.
 #[must_use]
 pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
     if !matches!(
@@ -292,10 +292,9 @@ pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
     ) {
         return false;
     }
-    value.split(|&byte| byte == b',').any(|part| {
-        std::str::from_utf8(part)
-            .is_ok_and(|member| is_forbidden_method(member.trim_matches([' ', '\t'])))
-    })
+    crate::split_header_value(value)
+        .iter()
+        .any(|method| is_forbidden_method(method))
 }
 
 /// The CORS-unsafe request-header names of `headers`, sorted lowercase
@@ -352,19 +351,11 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 /// The values of `name` split on commas and trimmed
 /// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
 fn list_values(headers: &HeaderMap, name: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    for value in headers.get_all(name) {
-        let Ok(text) = std::str::from_utf8(value) else {
-            continue;
-        };
-        for item in text.split(',') {
-            let item = item.trim();
-            if !item.is_empty() {
-                values.push(item.to_owned());
-            }
-        }
-    }
-    values
+    crate::get_decode_split(headers, name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 /// The CORS check
@@ -421,18 +412,14 @@ fn is_token(text: &str) -> bool {
 /// the preflight fail.
 fn list_tokens(headers: &HeaderMap, name: &str) -> Option<Vec<String>> {
     let mut tokens = Vec::new();
-    for value in headers.get_all(name) {
-        let text = std::str::from_utf8(value).ok()?;
-        for item in text.split(',') {
-            let item = item.trim();
-            if item.is_empty() {
-                continue;
-            }
-            if !is_token(item) {
-                return None;
-            }
-            tokens.push(item.to_owned());
+    for item in crate::get_decode_split(headers, name).unwrap_or_default() {
+        if item.is_empty() {
+            continue;
         }
+        if !is_token(&item) {
+            return None;
+        }
+        tokens.push(item);
     }
     Some(tokens)
 }
@@ -621,14 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_headers_and_method_override_members() {
-        assert!(is_forbidden_request_header("Cookie", b"a"));
-        assert!(is_forbidden_request_header("sec-foo", b"x"));
-        assert!(is_forbidden_request_header("Proxy-Auth", b"x"));
-        assert!(!is_forbidden_request_header("x-custom", b"1"));
-        // Members split on `,` and strip only HTTP tab and space, so the whole
-        // member must be the method
-        // (<https://fetch.spec.whatwg.org/#forbidden-request-header>).
+    fn method_override_members_use_the_header_value_splitter() {
         assert!(is_forbidden_method_header("x-http-method", b" trace , get"));
         assert!(is_forbidden_method_header("x-http-method", b"\ttrack\t"));
         assert!(is_forbidden_method_header("x-http-method", b"get,TRACK"));
@@ -641,7 +621,10 @@ mod tests {
             "x-http-method-override",
             b"connect\x0b"
         ));
-        assert!(is_forbidden_request_header("x-http-method", b"get,TRACK"));
+        assert!(!is_forbidden_method_header(
+            "x-http-method-override",
+            br#""a,trace""#
+        ));
     }
 
     #[test]

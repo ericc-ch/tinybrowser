@@ -126,7 +126,7 @@ impl MutationObservers {
         for parsed in documents.values_mut() {
             let id = parsed.id;
             mutations.extend(
-                std::mem::take(&mut parsed.document.journal)
+                std::mem::take(&mut parsed.document.side.journal)
                     .into_iter()
                     .map(|(position, entry)| (position, id, entry)),
             );

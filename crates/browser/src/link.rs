@@ -643,10 +643,12 @@ async fn route_service_call(
                 );
             let dials = context.dials.clone();
             tokio::spawn(async move {
+                let mut cancel = cancel_rx;
                 let mut outcome = tokio::select! {
                     biased;
                     _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
-                    result = worker_network.dial_request(&request, &initiator, assignment_id, cancel_rx.clone()) => result,
+                    _ = cancel.changed() => Err(renderer::DialFailure::Cancelled),
+                    result = worker_network.dial_request(&request, &initiator, assignment_id) => result,
                 };
                 // A 421 asks for a retry on a different connection, but only an
                 // idempotent method may be replayed
@@ -654,10 +656,16 @@ async fn route_service_call(
                 if is_idempotent(&request.method)
                     && matches!(&outcome, Ok(head) if head.status == 421)
                 {
+                    if let Ok(head) = &outcome
+                        && let Some(stream) = head.stream
+                    {
+                        worker_network.cancel_stream(assignment_id, stream);
+                    }
                     outcome = tokio::select! {
                         biased;
                         _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
-                        result = worker_network.dial_request(&request, &initiator, assignment_id, cancel_rx) => result,
+                        _ = cancel.changed() => Err(renderer::DialFailure::Cancelled),
+                        result = worker_network.dial_request(&request, &initiator, assignment_id) => result,
                     };
                 }
                 dials
