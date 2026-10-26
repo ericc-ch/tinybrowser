@@ -11,11 +11,12 @@ pub mod referrer;
 mod resolve;
 mod transport;
 
-pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
+pub use client::{Agent, AgentOptions, Body, Clock, Request, Response, UserAgent};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method, combined_header};
 pub use referrer::{
     Referrer, ReferrerClient, ReferrerPolicy, determine_referrer, is_potentially_trustworthy,
 };
-pub use transport::Proxy;
+pub use resolve::ResolveRule;
+pub use transport::{Proxy, TrustedCa};

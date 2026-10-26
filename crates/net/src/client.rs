@@ -10,8 +10,8 @@ use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
-use crate::resolve::HostMap;
-use crate::transport::{CallBudget, HopBudget, HttpEngine, Proxy, basic_authorization};
+use crate::resolve::{HostMap, ResolveRule};
+use crate::transport::{CallBudget, HopBudget, HttpEngine, Proxy, TrustedCa, basic_authorization};
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder};
 use bytes::Bytes;
 use cookies::{CookieJar, CookieOp, RetrievalKind};
@@ -68,18 +68,16 @@ impl std::fmt::Debug for Clock {
     }
 }
 
-/// Constructor inputs for [`Agent::new`]. `user_agent` must be a valid field
-/// value, each `resolve` entry must be `PATTERN=ADDR`, and each `tls_cas`
-/// entry must be PEM. `proxy` is already parsed, so credentials never exist as
-/// a plain configuration string here.
+/// Constructor inputs for [`Agent::new`]. Every field is already parsed, so a
+/// bad value fails where the configuration was read instead of at the first
+/// request. `proxy` and `user_agent` never keep their source string here, and
+/// `tls_cas` holds parsed certificates.
 ///
 /// Debug output records whether a proxy is configured, not its URI or credentials.
 #[derive(Clone)]
 pub struct AgentOptions {
     /// Default `User-Agent` for requests that do not set that header themselves.
-    /// An invalid field value makes [`Agent::new`] fail rather than dropping the
-    /// header from every request.
-    pub user_agent: Option<String>,
+    pub user_agent: Option<UserAgent>,
     /// Cap on the whole call, including redirects.
     pub timeout_global: Option<Duration>,
     /// Cap on a single hop.
@@ -90,13 +88,48 @@ pub struct AgentOptions {
     pub proxy: Option<Proxy>,
     /// Wall and monotonic clock reads.
     pub clock: Clock,
-    /// `--resolve=PATTERN=ADDR` rewrites, first match wins. `PATTERN` is an
-    /// exact host or a `*` glob; `ADDR` is an IPv4 literal or `fail`.
-    pub resolve: Vec<String>,
-    /// PEM-encoded certificate authorities to trust in addition to the
-    /// platform's, e.g. a private test CA. Repeatable. A bad entry is
-    /// reported as `CA #n`, counting from 1.
-    pub tls_cas: Vec<Vec<u8>>,
+    /// Parsed `--resolve=PATTERN=ADDR` rewrites, first match wins.
+    pub resolve: Vec<ResolveRule>,
+    /// Certificate authorities to trust in addition to the platform's, e.g. a
+    /// private test CA. Repeatable.
+    pub tls_cas: Vec<TrustedCa>,
+}
+
+/// A validated default `User-Agent` field value.
+///
+/// Built at the configuration boundary so an invalid value is a usage error,
+/// never a header that silently disappears from every request.
+#[derive(Clone, Debug)]
+pub struct UserAgent(HeaderValue);
+
+impl UserAgent {
+    /// Parses one field value.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidUserAgent`] when `value` contains a byte a field
+    /// value cannot carry.
+    pub fn parse(value: &str) -> Result<Self, ProtocolError> {
+        HeaderValue::from_str(value)
+            .map(Self)
+            .map_err(|_| ProtocolError::InvalidUserAgent)
+    }
+
+    /// Wraps a value known to be valid at compile time, for a crate constant.
+    ///
+    /// # Panics
+    ///
+    /// When `value` contains a byte a field value cannot carry. A call in a
+    /// `const` item makes that a compile error, which is how the browser's
+    /// default user agent is checked.
+    #[must_use]
+    pub const fn from_static(value: &'static str) -> Self {
+        Self(HeaderValue::from_static(value))
+    }
+
+    pub(crate) fn header(&self) -> &HeaderValue {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for AgentOptions {
@@ -133,7 +166,7 @@ impl Default for AgentOptions {
 #[derive(Clone)]
 pub struct Agent {
     pub(crate) engine: HttpEngine,
-    ua: Option<HeaderValue>,
+    ua: Option<UserAgent>,
     max_redirects: u32,
     jar: Arc<Mutex<CookieJar>>,
     clock: Clock,
@@ -150,16 +183,11 @@ impl std::fmt::Debug for Agent {
 }
 
 impl Agent {
-    /// Builds an agent from `options`, the only constructor. Every raw value is
-    /// parsed here, before any request can see it.
-    ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::InvalidUserAgent`] when `user_agent` is not a valid
-    /// field value, [`ProtocolError::InvalidResolve`] when a `resolve` entry is
-    /// not `PATTERN=ADDR`, or [`NetError::Transport`] when a `tls_cas` entry is
-    /// not a PEM certificate.
-    pub fn new(options: AgentOptions) -> Result<Agent, NetError> {
+    /// Builds an agent from `options`, the only constructor. Nothing fails
+    /// here: the boundary that read the configuration already parsed every
+    /// value.
+    #[must_use]
+    pub fn new(options: AgentOptions) -> Agent {
         let AgentOptions {
             user_agent,
             timeout_global,
@@ -170,41 +198,20 @@ impl Agent {
             resolve,
             tls_cas,
         } = options;
-        let ua = user_agent
-            .as_deref()
-            .map(|raw| {
-                HeaderValue::from_str(raw)
-                    .map_err(|_| NetError::Protocol(ProtocolError::InvalidUserAgent))
-            })
-            .transpose()?;
-        let mut host_map = HostMap::default();
-        for spec in &resolve {
-            host_map = host_map.with_spec(spec)?;
-        }
-        let mut parsed_cas = Vec::with_capacity(tls_cas.len());
-        for (index, pem) in tls_cas.iter().enumerate() {
-            parsed_cas.push(native_tls::Certificate::from_pem(pem).map_err(|error| {
-                // 1-based: it matches the Nth `tls_cas` (or `--tls-ca`) entry,
-                // so the caller can point at the bad file.
-                NetError::Transport(TransportError::Tls(
-                    format!("CA #{}: {error}", index + 1).into(),
-                ))
-            })?);
-        }
-        Ok(Agent {
+        Agent {
             engine: HttpEngine::new(
                 timeout_global,
                 timeout_per_call,
                 proxy,
                 clock,
-                host_map,
-                &parsed_cas,
+                HostMap::from_rules(resolve),
+                &tls_cas,
             ),
-            ua,
+            ua: user_agent,
             max_redirects,
             jar: Arc::new(Mutex::new(CookieJar::default())),
             clock,
-        })
+        }
     }
 
     /// Borrows the live jar, recovering from a poisoned lock.
@@ -294,7 +301,7 @@ impl Agent {
         if headers.value("user-agent").is_none()
             && let Some(ua) = &self.ua
         {
-            headers.append(header::USER_AGENT, ua.clone());
+            headers.append(header::USER_AGENT, ua.header().clone());
         }
         Ok(())
     }
@@ -338,7 +345,7 @@ impl Agent {
             );
         }
         if let Some(ua) = &self.ua {
-            preflight.append(header::USER_AGENT, ua.clone());
+            preflight.append(header::USER_AGENT, ua.header().clone());
         }
         let (status, preflight_headers, body, _http2) = self
             .engine

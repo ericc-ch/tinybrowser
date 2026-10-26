@@ -6,7 +6,7 @@ use net::{Agent, AgentOptions, Method};
 /// no WPT coverage.
 #[test]
 fn cookie_quota_evicts_the_oldest_entries_globally() {
-    let agent = Agent::new(AgentOptions::default()).expect("default options are valid");
+    let agent = Agent::new(AgentOptions::default());
     let oldest = url::Url::parse("https://oldest.example/").expect("oldest URL");
     agent.set_cookie("secure=1; Path=/; Secure", &oldest);
     for domain in 0..60 {
@@ -23,7 +23,7 @@ fn cookie_quota_evicts_the_oldest_entries_globally() {
 /// domain. Our policy; WPT `cookies/` has no quota cases.
 #[test]
 fn per_domain_quota_keeps_the_newest_fifty() {
-    let agent = Agent::new(AgentOptions::default()).expect("default options are valid");
+    let agent = Agent::new(AgentOptions::default());
     let quota = url::Url::parse("https://quota.example/").expect("quota URL");
     for cookie in 0..51 {
         agent.set_cookie(&format!("n{cookie}={cookie}; Path=/"), &quota);
@@ -40,7 +40,7 @@ fn per_domain_quota_keeps_the_newest_fifty() {
 /// public-suffix cases.
 #[test]
 fn public_suffix_domains_are_rejected() {
-    let agent = Agent::new(AgentOptions::default()).expect("default options are valid");
+    let agent = Agent::new(AgentOptions::default());
 
     let https = url::Url::parse("https://www.example.com/app").expect("https");
     agent.set_cookie("public=1; Path=/; Domain=com", &https);

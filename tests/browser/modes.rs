@@ -143,6 +143,33 @@ fn webdriver_rejects_an_invalid_proxy_before_starting() {
 }
 
 #[test]
+fn webdriver_rejects_an_invalid_resolve_spec_before_starting() {
+    let fixture = Fixture::new("tinybrowser-webdriver-resolve");
+    let output = run(&fixture, &["webdriver", "--port=0", "--resolve=not-a-spec"]);
+    assert_eq!(output.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("--resolve"), "{err}");
+}
+
+#[test]
+fn webdriver_rejects_an_unreadable_tls_ca_before_starting() {
+    let fixture = Fixture::new("tinybrowser-webdriver-tls-ca");
+    let ca = fixture.data().join("not-a-cert.pem");
+    std::fs::write(&ca, b"not a certificate").expect("write CA");
+    let output = run(
+        &fixture,
+        &[
+            "webdriver",
+            "--port=0",
+            &format!("--tls-ca={}", ca.display()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("--tls-ca"), "{err}");
+}
+
+#[test]
 fn profile_and_resolve_stay_on_their_commands() {
     let fixture = Fixture::new("tinybrowser-flag-placement");
     for args in [

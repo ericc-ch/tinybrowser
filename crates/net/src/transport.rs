@@ -246,16 +246,41 @@ impl fmt::Debug for HttpEngine {
     }
 }
 
+/// A PEM certificate authority, already parsed for the TLS connector.
+///
+/// The configuration boundary builds these, so a malformed file is a usage
+/// error instead of a dial-time TLS failure.
+#[derive(Clone)]
+pub struct TrustedCa(native_tls::Certificate);
+
+impl TrustedCa {
+    /// Parses one PEM certificate.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Transport`] with [`TransportError::Tls`] when `pem` is not a
+    /// PEM-encoded certificate.
+    pub fn from_pem(pem: &[u8]) -> Result<Self, NetError> {
+        native_tls::Certificate::from_pem(pem)
+            .map(Self)
+            .map_err(|error| NetError::Transport(TransportError::Tls(format!("{error}").into())))
+    }
+
+    fn certificate(&self) -> native_tls::Certificate {
+        self.0.clone()
+    }
+}
+
 /// `native-tls` connector trusting `cas`.
 ///
 /// ALPN is configured here, not by `hyper-tls`: its `alpn` feature only reports
 /// the protocol the server picked. OpenSSL initialization failure is
 /// unrecoverable for TLS in this process, and `hyper-tls`'s own constructors
 /// panic on it for the same reason.
-fn tls_connector(cas: &[native_tls::Certificate]) -> tokio_native_tls::TlsConnector {
+fn tls_connector(cas: &[TrustedCa]) -> tokio_native_tls::TlsConnector {
     let mut tls = native_tls::TlsConnector::builder();
     for ca in cas {
-        tls.add_root_certificate(ca.clone());
+        tls.add_root_certificate(ca.certificate());
     }
     let tls = tls
         .request_alpns(&["h2", "http/1.1"])
@@ -276,7 +301,7 @@ impl HttpEngine {
         proxy: Option<Proxy>,
         clock: Clock,
         host_map: HostMap,
-        tls_cas: &[native_tls::Certificate],
+        tls_cas: &[TrustedCa],
     ) -> Self {
         let resolver = HostResolver {
             host_map,

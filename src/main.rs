@@ -16,9 +16,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use browser::{
-    AgentOptions, Browser, BrowserOpenError, BrowserOptions, Profile, default_data_home,
-};
+use browser::{AgentOptions, Browser, BrowserOptions, Profile, default_data_home};
 use cli::{Cli, Command};
 use logging::Level;
 
@@ -69,16 +67,11 @@ fn run(cli: &Cli) -> ExitCode {
         Some(Command::Webdriver {
             port,
             profile,
-            proxy,
-            resolve,
-            tls_ca,
-        }) => {
-            let options = match network_config(proxy.as_ref(), resolve, tls_ca) {
-                Ok(options) => options,
-                Err(error) => return usage_error(&error),
-            };
-            run_browser_process("webdriver", serve_webdriver(*port, options, profile))
-        }
+            network,
+        }) => run_browser_process(
+            "webdriver",
+            serve_webdriver(*port, network.as_ref().clone(), profile),
+        ),
         None => {
             print!("{}", cli::HELP);
             ExitCode::from(2)
@@ -120,32 +113,6 @@ fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
     )
 }
 
-/// Parsed `--proxy` plus raw `--resolve` specs and `--tls-ca` PEM bytes for
-/// [`browser::Agent::new`], which validates them when the browser opens. Only
-/// file-read errors fail here.
-fn network_config(
-    proxy: Option<&browser::Proxy>,
-    specs: &[String],
-    tls_ca: &[PathBuf],
-) -> Result<AgentOptions, String> {
-    let mut options = AgentOptions {
-        proxy: proxy.cloned(),
-        resolve: specs.to_vec(),
-        ..AgentOptions::default()
-    };
-    for path in tls_ca {
-        let pem =
-            std::fs::read(path).map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
-        options.tls_cas.push(pem);
-    }
-    Ok(options)
-}
-
-fn usage_error(message: &str) -> ExitCode {
-    logging::error!(target: "cli", "{message}");
-    ExitCode::from(2)
-}
-
 fn run_browser_process(
     target: &'static str,
     future: impl Future<Output = io::Result<()>>,
@@ -165,36 +132,17 @@ fn run_browser_process(
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             logging::error!(target: target, "{error}");
-            // Flag *content* is validated when the profile opens (deferred to
-            // `Agent::new`), so it exits like a usage error. Nothing else in
-            // the workspace produces `InvalidInput`.
-            if error.kind() == io::ErrorKind::InvalidInput {
-                ExitCode::from(2)
-            } else {
-                ExitCode::from(1)
-            }
+            ExitCode::from(1)
         }
     }
 }
 
 async fn serve_webdriver(port: u16, options: AgentOptions, profile: &Profile) -> io::Result<()> {
     let data_home = default_data_home()?;
-    // Open before binding: option content is validated here, so a bad value
-    // surfaces as a usage error before the port is taken.
     let browser = Browser::new(BrowserOptions {
         data_home: Some(data_home),
         profile: profile.clone(),
         network: options,
-    })
-    .map_err(|error| match error {
-        BrowserOpenError::InvalidNetwork(error) => io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid network option (--resolve/--tls-ca): {error}"),
-        ),
-        BrowserOpenError::Profile(error) => {
-            io::Error::new(error.kind(), format!("profile failed: {error}"))
-        }
-        BrowserOpenError::RuntimeUnavailable => io::Error::other("browser runtime unavailable"),
     })?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|error| io::Error::new(error.kind(), format!("bind failed: {error}")))?;
