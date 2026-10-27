@@ -40,12 +40,12 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url, decode_data_url_bounded};
 pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
-    BodyError, BrowserEvent, BrowserServices, BrowsingContextHost, CorsRequest, DialCancellation,
-    DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId, HistoryHandling,
-    HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost, PostedMessage,
-    RendererEvent, ResourceLimit, ResponseHead, STORAGE_QUOTA_BYTES, ScreenshotClip,
-    ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError, StorageHost,
-    StorageKind, TabError, TimerId,
+    BodyDelivery, BodyError, BrowserEvent, BrowserServices, BrowsingContextHost, CorsRequest,
+    DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
+    HistoryHandling, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
+    PostedMessage, RendererEvent, RequestCache, ResourceLimit, ResponseHead, STORAGE_QUOTA_BYTES,
+    ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError,
+    StorageHost, StorageKind, TabError, TimerId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

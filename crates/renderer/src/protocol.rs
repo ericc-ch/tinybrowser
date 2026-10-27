@@ -546,8 +546,9 @@ pub struct DialRequest {
     pub url: String,
     /// Document URL used as the `SameSite`/`Sec-Fetch-*` initiator.
     pub initiator: String,
-    /// Read the response body.
-    pub read_body: bool,
+    /// Whether and how the browser delivers the response body.
+    #[serde(default)]
+    pub delivery: BodyDelivery,
     /// HTTP method; defaults to `GET` for dials that predate bodies.
     #[serde(default = "default_dial_method")]
     pub method: String,
@@ -600,16 +601,63 @@ pub struct DialRequest {
     /// Request cache mode
     /// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>).
     #[serde(default)]
-    pub cache: Option<String>,
-    /// Ask the browser to return headers first and stream the decoded body.
-    #[serde(default)]
-    pub stream_body: bool,
+    pub cache: RequestCache,
     /// The concrete policy main fetch determines under. The renderer resolves
     /// the element's attribute or the document's policy before queueing, so
     /// this is never unset
     /// (<https://fetch.spec.whatwg.org/#concept-request-referrer-policy>).
     #[serde(default)]
     pub referrer_policy: net::ReferrerPolicy,
+}
+
+/// How a dial delivers its response body to the renderer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BodyDelivery {
+    /// Keep the head only; the body is never read.
+    #[default]
+    Discard,
+    /// Read the whole body before answering.
+    Buffer,
+    /// Answer with the head and stream the body in chunks.
+    Stream,
+}
+
+/// A `fetch` request's cache mode
+/// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>). The renderer
+/// parses the `RequestInit.cache` string once; the browser matches on this
+/// instead of re-reading a string.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RequestCache {
+    /// Consult the HTTP cache, and revalidate a stale entry.
+    #[default]
+    Default,
+    /// Neither consult nor populate the HTTP cache.
+    NoStore,
+    /// Bypass the HTTP cache for this request and update it.
+    Reload,
+    /// Bypass the HTTP cache only after revalidating a stored entry.
+    NoCache,
+    /// Use a stored entry even when it is stale.
+    ForceCache,
+    /// Fail when no stored entry exists.
+    OnlyIfCached,
+}
+
+impl RequestCache {
+    /// Parses the IDL enum's string value
+    /// (<https://fetch.spec.whatwg.org/#requestinit>).
+    #[must_use]
+    pub fn from_idl(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "no-store" => Some(Self::NoStore),
+            "reload" => Some(Self::Reload),
+            "no-cache" => Some(Self::NoCache),
+            "force-cache" => Some(Self::ForceCache),
+            "only-if-cached" => Some(Self::OnlyIfCached),
+            _ => None,
+        }
+    }
 }
 
 /// The CORS parameters a page `fetch`/XHR sends over the wire. The browser
@@ -651,7 +699,7 @@ pub struct DialOutcome {
     /// Response headers visible to page scripts, in wire order.
     #[serde(default)]
     pub headers: Vec<(String, String)>,
-    /// Response body, when [`DialRequest::read_body`]. `Err` means the body
+    /// Response body, when [`BodyDelivery::Buffer`]. `Err` means the body
     /// could not be decoded for its `Content-Encoding`; consuming it rejects
     /// instead of returning bytes
     /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).

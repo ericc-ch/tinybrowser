@@ -1445,7 +1445,7 @@ impl JsNode {
                         document,
                         node: kid,
                     };
-                    if !parsed.document.ranges.is_empty() {
+                    if !parsed.document.side.ranges.is_empty() {
                         let index = parsed
                             .document
                             .base
@@ -1454,7 +1454,7 @@ impl JsNode {
                             .and_then(|index| u32::try_from(index).ok());
                         if let Some(index) = index {
                             crate::dom::range::adjust_for_normalize(
-                                &mut parsed.document.ranges,
+                                &mut parsed.document.side.ranges,
                                 target,
                                 dying,
                                 NodeId {
@@ -2681,7 +2681,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(
             };
             crate::dom::insertion::place_journaled(&mut parsed, parent, new_id, next);
             crate::dom::range::adjust_for_split(
-                &mut parsed.document.ranges,
+                &mut parsed.document.side.ranges,
                 id,
                 new_id,
                 parent,
@@ -2707,7 +2707,7 @@ pub(in crate::js::bindings) fn split_text_node<'js>(
             let offset_units = u32::try_from(offset).unwrap_or(u32::MAX);
             let count = u32::try_from(units.len().saturating_sub(offset)).unwrap_or(u32::MAX);
             crate::dom::range::adjust_for_replace_data(
-                &mut parsed.document.ranges,
+                &mut parsed.document.side.ranges,
                 id,
                 offset_units,
                 count,

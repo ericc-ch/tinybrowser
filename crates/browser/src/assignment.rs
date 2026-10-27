@@ -177,6 +177,7 @@ impl Drop for Assignment {
             self.id
         );
         self.registry.note_released(self.id);
+        self.network.release_streams(self.id);
         self.registry
             .live
             .lock()

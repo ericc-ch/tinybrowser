@@ -436,8 +436,8 @@ impl Document {
         dial.req.keepalive = fetch.keepalive;
         dial.req.body_len = fetch.body_len;
         dial.req.integrity = fetch.integrity;
-        dial.req.cache = Some(fetch.cache);
-        dial.req.stream_body = fetch.stream_body;
+        dial.req.cache = fetch.cache;
+        dial.req.delivery = fetch.delivery;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

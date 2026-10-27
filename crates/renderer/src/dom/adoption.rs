@@ -339,13 +339,13 @@ pub(crate) fn detach_for_adopt(
     // Adoption removes the node first, and the remove algorithm runs the
     // live-range pre-remove steps
     // (<https://dom.spec.whatwg.org/#concept-node-adopt>).
-    if !doc.ranges.is_empty() {
+    if !doc.side.ranges.is_empty() {
         let index = u32::try_from(position).unwrap_or(u32::MAX);
         let parent_id = NodeId {
             document: id.document,
             node: parent,
         };
-        crate::dom::range::adjust_for_remove(&doc.base, &mut doc.ranges, parent_id, index, id);
+        crate::dom::range::adjust_for_remove(&doc.base, &mut doc.side.ranges, parent_id, index, id);
     }
     doc.base.mutate().remove_node(id.node);
     doc.record(JournalEntry::ChildList {

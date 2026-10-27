@@ -1992,7 +1992,7 @@ impl World {
             return;
         };
         if let Some(parsed) = documents.get_mut(document) {
-            parsed.document.ranges.free(slot);
+            parsed.document.side.ranges.free(slot);
         }
     }
 

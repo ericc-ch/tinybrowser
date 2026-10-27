@@ -229,7 +229,7 @@ fn is_simple_range(value: &[u8]) -> bool {
 /// set these, and the browser adds them after the preflight decision, so they
 /// never appear in the CORS-unsafe request-header names.
 #[must_use]
-pub fn is_forbidden_request_header(name: &str) -> bool {
+pub fn is_forbidden_request_header_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name.starts_with("proxy-") || name.starts_with("sec-") {
         return true;
@@ -260,6 +260,16 @@ pub fn is_forbidden_request_header(name: &str) -> bool {
     )
 }
 
+/// Whether a page-supplied request header is forbidden: either its name is
+/// forbidden, or it is a method-override header naming a forbidden method
+/// (<https://fetch.spec.whatwg.org/#forbidden-request-header>). The JS
+/// `Headers` guard and the outbound network filter both answer with this one
+/// function, so they cannot disagree about the same header.
+#[must_use]
+pub fn is_forbidden_request_header(name: &str, value: &[u8]) -> bool {
+    is_forbidden_request_header_name(name) || is_forbidden_method_header(name, value)
+}
+
 /// Whether `method` is a forbidden method
 /// (<https://fetch.spec.whatwg.org/#forbidden-method>).
 #[must_use]
@@ -270,8 +280,10 @@ pub fn is_forbidden_method(method: &str) -> bool {
 }
 
 /// Whether a forbidden-method header carries a forbidden method in any
-/// comma-separated token
-/// (<https://fetch.spec.whatwg.org/#forbidden-method>).
+/// comma-separated member
+/// (<https://fetch.spec.whatwg.org/#forbidden-request-header>). Members come
+/// from the spec's get-decode-split, so a quoted member is compared with its
+/// quotes and is not a method.
 #[must_use]
 pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
     if !matches!(
@@ -280,15 +292,9 @@ pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
     ) {
         return false;
     }
-    value.split(|&byte| byte == b',').any(|part| {
-        let token = part
-            .iter()
-            .copied()
-            .skip_while(|byte| *byte == b' ' || *byte == b'\t')
-            .take_while(|byte| *byte != b' ' && *byte != b'\t')
-            .collect::<Vec<u8>>();
-        std::str::from_utf8(&token).is_ok_and(is_forbidden_method)
-    })
+    crate::split_header_value(value)
+        .iter()
+        .any(|method| is_forbidden_method(method))
 }
 
 /// The CORS-unsafe request-header names of `headers`, sorted lowercase
@@ -299,7 +305,7 @@ pub fn unsafe_request_header_names(headers: &HeaderMap) -> Vec<String> {
     let mut potentially_unsafe = Vec::new();
     let mut safelist_value_size = 0usize;
     for (name, value) in headers.iter() {
-        if is_forbidden_request_header(name) {
+        if is_forbidden_request_header_name(name) {
             continue;
         }
         if is_cors_safelisted_request_header(name, value) {
@@ -345,19 +351,11 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 /// The values of `name` split on commas and trimmed
 /// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
 fn list_values(headers: &HeaderMap, name: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    for value in headers.get_all(name) {
-        let Ok(text) = std::str::from_utf8(value) else {
-            continue;
-        };
-        for item in text.split(',') {
-            let item = item.trim();
-            if !item.is_empty() {
-                values.push(item.to_owned());
-            }
-        }
-    }
-    values
+    crate::get_decode_split(headers, name)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 /// The CORS check
@@ -414,18 +412,14 @@ fn is_token(text: &str) -> bool {
 /// the preflight fail.
 fn list_tokens(headers: &HeaderMap, name: &str) -> Option<Vec<String>> {
     let mut tokens = Vec::new();
-    for value in headers.get_all(name) {
-        let text = std::str::from_utf8(value).ok()?;
-        for item in text.split(',') {
-            let item = item.trim();
-            if item.is_empty() {
-                continue;
-            }
-            if !is_token(item) {
-                return None;
-            }
-            tokens.push(item.to_owned());
+    for item in crate::get_decode_split(headers, name).unwrap_or_default() {
+        if item.is_empty() {
+            continue;
         }
+        if !is_token(&item) {
+            return None;
+        }
+        tokens.push(item);
     }
     Some(tokens)
 }
@@ -611,6 +605,26 @@ mod tests {
         // Every other name is refused, safelisted or not.
         assert!(!is_no_cors_safelisted_request_header("X-Custom", b"1"));
         assert!(!is_no_cors_safelisted_request_header("range", b"bytes 0-"));
+    }
+
+    #[test]
+    fn method_override_members_use_the_header_value_splitter() {
+        assert!(is_forbidden_method_header("x-http-method", b" trace , get"));
+        assert!(is_forbidden_method_header("x-http-method", b"\ttrack\t"));
+        assert!(is_forbidden_method_header("x-http-method", b"get,TRACK"));
+        assert!(!is_forbidden_method_header("x-method-override", b"get"));
+        assert!(!is_forbidden_method_header(
+            "X-HTTP-Method-Override",
+            b"connect foo"
+        ));
+        assert!(!is_forbidden_method_header(
+            "x-http-method-override",
+            b"connect\x0b"
+        ));
+        assert!(!is_forbidden_method_header(
+            "x-http-method-override",
+            br#""a,trace""#
+        ));
     }
 
     #[test]

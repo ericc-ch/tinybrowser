@@ -6,7 +6,7 @@ use rquickjs::module::Declared;
 use rquickjs::{Ctx, Error, Module, Result};
 use url::Url;
 
-use crate::protocol::{DialKind, DialRequest};
+use crate::protocol::{BodyDelivery, DialKind, DialRequest, RequestCache};
 
 pub(super) struct WebModuleResolver;
 
@@ -123,7 +123,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             url: name.to_owned(),
             initiator,
             referrer_url,
-            read_body: true,
+            delivery: BodyDelivery::Buffer,
             method: "GET".to_owned(),
             body: Vec::new(),
             content_type: None,
@@ -135,8 +135,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             keepalive: false,
             body_len: 0,
             integrity: None,
-            cache: None,
-            stream_body: false,
+            cache: RequestCache::Default,
             referrer_policy,
         },
         Box::new(move |outcome| {

@@ -455,7 +455,13 @@ impl JsRange {
         world
             .store()
             .get(self.registration.document.get())
-            .and_then(|parsed| parsed.document.ranges.get(self.registration.slot.get()))
+            .and_then(|parsed| {
+                parsed
+                    .document
+                    .side
+                    .ranges
+                    .get(self.registration.slot.get())
+            })
             .ok_or_else(|| Exception::throw_type(ctx, "stale range"))
     }
 
@@ -473,7 +479,7 @@ impl JsRange {
             let Some(mut parsed) = world.document_mut_by_id(owner) else {
                 return Err(Exception::throw_type(ctx, "stale range"));
             };
-            if !parsed.document.ranges.set(slot, state) {
+            if !parsed.document.side.ranges.set(slot, state) {
                 return Err(Exception::throw_type(ctx, "stale range"));
             }
             return Ok(());
@@ -482,13 +488,13 @@ impl JsRange {
             let Some(mut parsed) = world.document_mut_by_id(owner) else {
                 return Err(Exception::throw_type(ctx, "stale range"));
             };
-            parsed.document.ranges.free(slot);
+            parsed.document.side.ranges.free(slot);
         }
         let fresh = {
             let Some(mut parsed) = world.document_mut_by_id(target) else {
                 return Err(Exception::throw_type(ctx, "stale range"));
             };
-            parsed.document.ranges.alloc(state)
+            parsed.document.side.ranges.alloc(state)
         };
         self.registration.document.set(target);
         self.registration.slot.set(fresh);
@@ -502,7 +508,7 @@ fn alloc_range(ctx: &Ctx<'_>, document: u32, state: RangeState) -> Result<(u32, 
     let Some(mut parsed) = world.document_mut_by_id(document) else {
         return Err(Exception::throw_type(ctx, "stale range"));
     };
-    let slot = parsed.document.ranges.alloc(state);
+    let slot = parsed.document.side.ranges.alloc(state);
     Ok((parsed.id, slot))
 }
 

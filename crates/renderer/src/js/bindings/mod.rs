@@ -1419,7 +1419,7 @@ fn replace_character_data_inner(
     // (<https://infra.spec.whatwg.org/#javascript-string-convert>).
     parsed.document.remember_character_data(id.node, &exact);
     crate::dom::range::adjust_for_replace_data(
-        &mut parsed.document.ranges,
+        &mut parsed.document.side.ranges,
         id,
         u32::try_from(offset).unwrap_or(u32::MAX),
         u32::try_from(count).unwrap_or(u32::MAX),

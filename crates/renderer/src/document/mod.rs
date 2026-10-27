@@ -232,7 +232,7 @@ impl QueuedDial {
                 url: url.to_string(),
                 initiator: initiator.ascii_serialization(),
                 referrer_url: referrer_url.to_string(),
-                read_body: true,
+                delivery: crate::protocol::BodyDelivery::Buffer,
                 method: "GET".to_owned(),
                 body: Vec::new(),
                 content_type: None,
@@ -244,8 +244,7 @@ impl QueuedDial {
                 keepalive: false,
                 body_len: 0,
                 integrity: None,
-                cache: None,
-                stream_body: false,
+                cache: crate::protocol::RequestCache::Default,
                 referrer_policy: net::ReferrerPolicy::default(),
             },
             context,
@@ -1354,7 +1353,7 @@ impl Document {
         sandbox: crate::js::world::SandboxFlags,
     ) {
         req.kind = crate::protocol::DialKind::FrameLoad;
-        req.read_body = true;
+        req.delivery = crate::protocol::BodyDelivery::Buffer;
         self.dials.cancel_frame_loads();
         self.initial_blank = false;
         self.queue_dial(QueuedDial {

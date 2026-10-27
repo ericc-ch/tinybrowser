@@ -15,7 +15,10 @@ mod transport;
 pub use client::{Agent, AgentOptions, Body, Clock, Request, Response, UserAgent};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method, combined_header};
+pub use protocol::{
+    HeaderError, HeaderMap, InvalidMethod, Method, combined_header, get_decode_split,
+    isomorphic_decode, isomorphic_encode, split_header_value,
+};
 pub use referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 pub use resolve::{InvalidResolveRule, ResolveRule};
 pub use secure_context::is_potentially_trustworthy;

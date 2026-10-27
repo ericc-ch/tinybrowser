@@ -8,12 +8,118 @@ use hyper::header::{HeaderName, HeaderValue};
 /// list header is extracted
 /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
 pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
-    let values: Vec<&str> = values.map(str::trim).filter(|v| !v.is_empty()).collect();
+    let values: Vec<&str> = values
+        .map(|value| value.trim_matches([' ', '\t']))
+        .filter(|value| !value.is_empty())
+        .collect();
     if values.is_empty() {
         None
     } else {
         Some(values.join(", "))
     }
+}
+
+/// Splits one header value into its members
+/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
+///
+/// Bytes are isomorphic-decoded, so `0x80..=0xFF` stay the same code points.
+/// A comma inside a quoted string does not split, the quoted text keeps its
+/// quotes and escapes, and every member is stripped of leading and trailing
+/// HTTP tab or space.
+#[must_use]
+pub fn split_header_value(value: &[u8]) -> Vec<String> {
+    let input: Vec<char> = value.iter().copied().map(char::from).collect();
+    let mut values = Vec::new();
+    let mut member = String::new();
+    let mut position = 0;
+    loop {
+        while position < input.len() && input[position] != '"' && input[position] != ',' {
+            member.push(input[position]);
+            position += 1;
+        }
+        if position < input.len() && input[position] == '"' {
+            collect_quoted_string(&input, &mut position, &mut member);
+            if position < input.len() {
+                continue;
+            }
+        }
+        values.push(member.trim_matches([' ', '\t']).to_owned());
+        member.clear();
+        if position >= input.len() {
+            return values;
+        }
+        position += 1;
+    }
+}
+
+/// Appends one HTTP quoted string, quotes and escapes included, and leaves
+/// `position` just past it
+/// (<https://fetch.spec.whatwg.org/#collect-an-http-quoted-string>).
+fn collect_quoted_string(input: &[char], position: &mut usize, member: &mut String) {
+    member.push(input[*position]);
+    *position += 1;
+    loop {
+        while *position < input.len() && input[*position] != '"' && input[*position] != '\\' {
+            member.push(input[*position]);
+            *position += 1;
+        }
+        if *position >= input.len() {
+            return;
+        }
+        let quote_or_backslash = input[*position];
+        member.push(quote_or_backslash);
+        *position += 1;
+        if quote_or_backslash == '\\' {
+            if *position >= input.len() {
+                return;
+            }
+            member.push(input[*position]);
+            *position += 1;
+        } else {
+            return;
+        }
+    }
+}
+
+/// The bytes a Web IDL `ByteString` names: every code point must be in
+/// `0x00..=0xFF`, and each becomes that byte
+/// (<https://webidl.spec.whatwg.org/#es-ByteString>,
+/// <https://infra.spec.whatwg.org/#isomorphic-encode>). `None` when a code
+/// point is outside the range, which the `ByteString` conversion rejects.
+#[must_use]
+pub fn isomorphic_encode(value: &str) -> Option<Vec<u8>> {
+    value
+        .chars()
+        .map(|character| u8::try_from(character).ok())
+        .collect()
+}
+
+/// Exposes each byte as the same code point, so a page never sees a
+/// replacement character
+/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
+#[must_use]
+pub fn isomorphic_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|&byte| char::from(byte)).collect()
+}
+
+/// Gets `name` from `headers` and splits it into members
+/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
+///
+/// Repeated fields are combined with `", "` first, as getting a header does.
+/// `None` means the header is absent; present headers with no value produce
+/// one empty member, as the spec requires.
+#[must_use]
+pub fn get_decode_split(headers: &HeaderMap, name: &str) -> Option<Vec<String>> {
+    let mut combined = Vec::new();
+    let mut found = false;
+    for value in headers.get_all(name) {
+        if found {
+            combined.extend_from_slice(b", ");
+        }
+        combined.extend_from_slice(value);
+        found = true;
+    }
+    found.then(|| split_header_value(&combined))
 }
 
 pub(crate) fn is_token_char(c: char) -> bool {
@@ -277,5 +383,41 @@ mod tests {
         assert!(map.insert("bad name", "v").is_err());
         assert!(map.insert("x", "bad\nvalue").is_err());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn splits_header_values_per_spec() {
+        assert_eq!(super::split_header_value(b"nosniff,"), ["nosniff", ""]);
+        assert_eq!(super::split_header_value(b""), [""]);
+        assert_eq!(
+            super::split_header_value(b"text/html;\", x/x"),
+            ["text/html;\", x/x"]
+        );
+        assert_eq!(
+            super::split_header_value(b"x/x;test=\"hi\",y/y"),
+            ["x/x;test=\"hi\"", "y/y"]
+        );
+        assert_eq!(
+            super::split_header_value(b"x / x,,,1"),
+            ["x / x", "", "", "1"]
+        );
+        assert_eq!(super::split_header_value(b"\"1,2\", 3"), ["\"1,2\"", "3"]);
+        // Escaped quotes stay inside the member, so the comma does not split.
+        assert_eq!(
+            super::split_header_value(b"\"a\\\",b\",c"),
+            ["\"a\\\",b\"", "c"]
+        );
+    }
+
+    #[test]
+    fn joins_repeated_fields_before_splitting() {
+        let mut map = HeaderMap::new();
+        map.insert("x-list", "a").expect("valid field");
+        map.insert("x-list", "b").expect("valid field");
+        assert_eq!(
+            super::get_decode_split(&map, "x-list"),
+            Some(vec!["a".to_owned(), "b".to_owned()])
+        );
+        assert_eq!(super::get_decode_split(&map, "x-missing"), None);
     }
 }

@@ -189,8 +189,8 @@ pub(crate) struct JsFetchRequest {
     pub keepalive: bool,
     pub body_len: u64,
     pub integrity: Option<String>,
-    pub cache: String,
-    pub stream_body: bool,
+    pub cache: crate::protocol::RequestCache,
+    pub delivery: crate::protocol::BodyDelivery,
     /// The request's referrer policy (`init.referrerPolicy` or a cloned
     /// `Request`'s); `None` means the document's policy decides.
     pub referrer_policy: Option<net::ReferrerPolicy>,
@@ -1057,9 +1057,13 @@ impl JsRealm {
                     let integrity = parts.next().filter(|value| !value.is_empty());
                     let cache = parts
                         .next()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "default".to_owned());
-                    let stream_body = parts.next().is_some_and(|value| value == "1");
+                        .and_then(|value| crate::protocol::RequestCache::from_idl(&value))
+                        .unwrap_or_default();
+                    let delivery = if parts.next().is_some_and(|value| value == "1") {
+                        crate::protocol::BodyDelivery::Stream
+                    } else {
+                        crate::protocol::BodyDelivery::Buffer
+                    };
                     let referrer_policy = parts
                         .next()
                         .and_then(|value| net::ReferrerPolicy::parse(&value));
@@ -1083,7 +1087,7 @@ impl JsRealm {
                             body_len,
                             integrity,
                             cache,
-                            stream_body,
+                            delivery,
                             referrer_policy,
                         })));
                     Ok::<(), rquickjs::Error>(())
@@ -1727,28 +1731,16 @@ fn install_mime_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
 fn install_header_policy_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
     bridge::object(ctx)?.set(
         "__tbIsForbiddenRequestHeader",
-        Func::from(|name: String| net::cors::is_forbidden_request_header(&name)),
-    )?;
-    bridge::object(ctx)?.set(
-        "__tbIsCorsSafelistedHeader",
         Func::from(|name: String, value: String| {
-            net::cors::is_cors_safelisted_request_header(&name, value.as_bytes())
+            net::isomorphic_encode(&value)
+                .is_some_and(|value| net::cors::is_forbidden_request_header(&name, &value))
         }),
     )?;
     bridge::object(ctx)?.set(
         "__tbIsNoCorsSafelistedHeader",
         Func::from(|name: String, value: String| {
-            net::cors::is_no_cors_safelisted_request_header(&name, value.as_bytes())
-        }),
-    )?;
-    bridge::object(ctx)?.set(
-        "__tbIsForbiddenMethod",
-        Func::from(|method: String| net::cors::is_forbidden_method(&method)),
-    )?;
-    bridge::object(ctx)?.set(
-        "__tbIsForbiddenMethodHeader",
-        Func::from(|name: String, value: String| {
-            net::cors::is_forbidden_method_header(&name, value.as_bytes())
+            net::isomorphic_encode(&value)
+                .is_some_and(|value| net::cors::is_no_cors_safelisted_request_header(&name, &value))
         }),
     )?;
     bridge::object(ctx)?.set(
@@ -1865,7 +1857,7 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             url: request.url,
             initiator: world.origin.ascii_serialization(),
             referrer_url: world.referrer_url.to_string(),
-            read_body: true,
+            delivery: crate::protocol::BodyDelivery::Buffer,
             method: request.method,
             body: request.body,
             content_type: request.content_type,
@@ -1887,8 +1879,7 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             keepalive: false,
             body_len: 0,
             integrity: None,
-            cache: None,
-            stream_body: false,
+            cache: crate::protocol::RequestCache::Default,
             referrer_policy: world.policy.referrer_policy.unwrap_or_default(),
         });
     match outcome {

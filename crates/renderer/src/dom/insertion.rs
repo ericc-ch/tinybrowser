@@ -239,7 +239,7 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
         (parent, previous, next)
     };
     // The index scan only feeds the live-range adjustment.
-    let index = if parsed.document.ranges.is_empty() {
+    let index = if parsed.document.side.ranges.is_empty() {
         None
     } else {
         parent.and_then(|parent| {
@@ -266,7 +266,7 @@ pub(crate) fn unlink_journaled(parsed: &mut crate::Parsed, target: NodeId) {
     parsed.document.base.mutate().remove_node(target.node);
     if let Some((parent, index)) = index {
         let base = &parsed.document.base;
-        let ranges = &mut parsed.document.ranges;
+        let ranges = &mut parsed.document.side.ranges;
         crate::dom::range::adjust_for_remove(
             base,
             ranges,
@@ -300,11 +300,11 @@ pub(crate) fn adjust_children_leaving(
     fragment: NodeId,
     children: &[NodeId],
 ) {
-    if children.is_empty() || parsed.document.ranges.is_empty() {
+    if children.is_empty() || parsed.document.side.ranges.is_empty() {
         return;
     }
     let base = &parsed.document.base;
-    let ranges = &mut parsed.document.ranges;
+    let ranges = &mut parsed.document.side.ranges;
     for child in children {
         crate::dom::range::adjust_for_remove(base, ranges, fragment, 0, *child);
     }
@@ -324,7 +324,7 @@ pub(crate) fn place_journaled(
     // The index scan only feeds the live-range adjustment, and an append
     // (null reference) shifts no offsets
     // (<https://dom.spec.whatwg.org/#concept-node-insert>).
-    if reference.is_none() || parsed.document.ranges.is_empty() {
+    if reference.is_none() || parsed.document.side.ranges.is_empty() {
         return;
     }
     let index = parsed
@@ -338,7 +338,7 @@ pub(crate) fn place_journaled(
         })
         .and_then(|index| u32::try_from(index).ok());
     if let Some(index) = index {
-        let ranges = &mut parsed.document.ranges;
+        let ranges = &mut parsed.document.side.ranges;
         crate::dom::range::adjust_for_insert(ranges, parent, index, 1);
     }
 }
@@ -502,7 +502,7 @@ pub(crate) fn splice_parsed(
     }
     if let Some(index) = reference_index {
         let count = u32::try_from(moved.len()).unwrap_or(u32::MAX);
-        let ranges = &mut parsed.document.ranges;
+        let ranges = &mut parsed.document.side.ranges;
         crate::dom::range::adjust_for_insert(ranges, parent, index, count);
     }
     parsed.document.record(JournalEntry::ChildList {
@@ -595,9 +595,9 @@ pub(crate) fn replace_all_journaled(
     // every affected point on `(parent, 0)`, and the following insert before
     // null shifts nothing
     // (<https://dom.spec.whatwg.org/#concept-node-replace-all>).
-    if !removed.is_empty() && !parsed.document.ranges.is_empty() {
+    if !removed.is_empty() && !parsed.document.side.ranges.is_empty() {
         let base = &parsed.document.base;
-        let ranges = &mut parsed.document.ranges;
+        let ranges = &mut parsed.document.side.ranges;
         crate::dom::range::adjust_for_replace_all(base, ranges, parent);
     }
     for kid in &removed {
@@ -924,7 +924,7 @@ pub(crate) fn move_parsed(
         let (previous, next) = old_parent.map_or((None, None), |old_parent| {
             siblings_around(base, document, old_parent, node.node)
         });
-        let index = if parsed.document.ranges.is_empty() {
+        let index = if parsed.document.side.ranges.is_empty() {
             None
         } else {
             old_parent.and_then(|old_parent| {
@@ -948,7 +948,7 @@ pub(crate) fn move_parsed(
         .move_node(node.node, parent.node, reference.map(|id| id.node));
     if let Some((old_parent, index)) = index {
         let base = &parsed.document.base;
-        let ranges = &mut parsed.document.ranges;
+        let ranges = &mut parsed.document.side.ranges;
         crate::dom::range::adjust_for_remove(
             base,
             ranges,
@@ -983,7 +983,7 @@ pub(crate) fn move_parsed(
         previous: added_previous,
         next: reference,
     });
-    if reference.is_some() && !parsed.document.ranges.is_empty() {
+    if reference.is_some() && !parsed.document.side.ranges.is_empty() {
         let index = parsed
             .document
             .base
@@ -996,7 +996,7 @@ pub(crate) fn move_parsed(
             })
             .and_then(|index| u32::try_from(index).ok());
         if let Some(index) = index {
-            let ranges = &mut parsed.document.ranges;
+            let ranges = &mut parsed.document.side.ranges;
             crate::dom::range::adjust_for_insert(ranges, parent, index, 1);
         }
     }
@@ -1021,13 +1021,13 @@ fn child_index(parsed: &crate::Parsed, parent: NodeId, child: Option<NodeId>) ->
 /// The removal itself carries `suppressObservers`, which does not skip them
 /// (<https://dom.spec.whatwg.org/#concept-node-replace>).
 fn adjust_replace_removal(parsed: &mut crate::Parsed, parent: NodeId, old: NodeId) {
-    if parsed.document.ranges.is_empty() {
+    if parsed.document.side.ranges.is_empty() {
         return;
     }
     let index = child_index(parsed, parent, Some(old));
     if let Some(index) = index {
         let base = &parsed.document.base;
-        let ranges = &mut parsed.document.ranges;
+        let ranges = &mut parsed.document.side.ranges;
         crate::dom::range::adjust_for_remove(base, ranges, parent, index, old);
     }
 }
@@ -1126,7 +1126,7 @@ pub(crate) fn replace_parsed(
     }
     if let Some(index) = reference_index {
         let count = u32::try_from(added.len()).unwrap_or(u32::MAX);
-        let ranges = &mut parsed.document.ranges;
+        let ranges = &mut parsed.document.side.ranges;
         crate::dom::range::adjust_for_insert(ranges, parent, index, count);
     }
     parsed.document.record(JournalEntry::ChildList {
