@@ -672,7 +672,7 @@ async fn route_service_call(
                 // `release_streams` may have run while the dial was in flight.
                 if let Ok(head) = &outcome
                     && let Some(stream) = head.stream
-                    && registry.was_released(assignment_id)
+                    && registry.resolve(assignment_id).is_none()
                 {
                     worker_network.cancel_stream(assignment_id, stream);
                 }
