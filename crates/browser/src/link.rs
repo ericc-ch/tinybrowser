@@ -642,6 +642,7 @@ async fn route_service_call(
                     },
                 );
             let dials = context.dials.clone();
+            let registry = context.registry.clone();
             tokio::spawn(async move {
                 let mut cancel = cancel_rx;
                 let mut outcome = tokio::select! {
@@ -667,6 +668,13 @@ async fn route_service_call(
                         _ = cancel.changed() => Err(renderer::DialFailure::Cancelled),
                         result = worker_network.dial_request(&request, &initiator, assignment_id) => result,
                     };
+                }
+                // `release_streams` may have run while the dial was in flight.
+                if let Ok(head) = &outcome
+                    && let Some(stream) = head.stream
+                    && registry.was_released(assignment_id)
+                {
+                    worker_network.cancel_stream(assignment_id, stream);
                 }
                 dials
                     .lock()
