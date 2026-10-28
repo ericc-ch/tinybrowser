@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::time::Duration;
 
 use native_tls::{Identity, TlsAcceptor};
 use net::{Agent, AgentOptions, Method, NetError, Request, TransportError, TrustedCa};
@@ -53,6 +54,14 @@ fn https_server(responses: usize) -> (url::Url, std::thread::JoinHandle<()>) {
         let mut served = 0;
         while served < responses {
             let (stream, _) = listener.accept().expect("accept");
+            // A peer that connects and sends nothing must not park the
+            // handshake for the rest of the run.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout is settable");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("write timeout is settable");
             let Ok(mut stream) = acceptor.accept(stream) else {
                 continue;
             };
@@ -86,7 +95,7 @@ fn navigation(url: &url::Url) -> Request {
 async fn a_configured_ca_is_what_makes_an_unknown_loopback_certificate_trustworthy() {
     let (url, server) = https_server(1);
 
-    let without = default_agent()
+    let without = agent(Vec::new())
         .send(navigation(&url))
         .await
         .expect_err("an unknown self-signed certificate is not trustworthy");
@@ -96,10 +105,7 @@ async fn a_configured_ca_is_what_makes_an_unknown_loopback_certificate_trustwort
     );
 
     let ca = TrustedCa::from_pem(TLS_CERT_PEM.as_bytes()).expect("the test CA parses");
-    let trusted = Agent::new(AgentOptions {
-        tls_cas: vec![ca],
-        ..AgentOptions::default()
-    });
+    let trusted = agent(vec![ca]);
     let response = trusted
         .send(navigation(&url))
         .await
@@ -109,6 +115,12 @@ async fn a_configured_ca_is_what_makes_an_unknown_loopback_certificate_trustwort
     server.join().expect("server");
 }
 
-fn default_agent() -> Agent {
-    Agent::new(AgentOptions::default())
+/// An agent that cannot wait forever: a broken fixture fails the test instead
+/// of hanging it.
+fn agent(tls_cas: Vec<TrustedCa>) -> Agent {
+    Agent::new(AgentOptions {
+        tls_cas,
+        timeout_global: Some(Duration::from_secs(10)),
+        ..AgentOptions::default()
+    })
 }
