@@ -340,7 +340,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       // XHR's referrer is the client document; the host resolves it against
       // the authorized origin
       // (<https://xhr.spec.whatwg.org/#the-send()-method>).
-      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, ['about:client', data.withCredentials ? '1' : '0'], data.timeout);
+      const result = host.__tbSyncFetch(data.url, data.method, payload.bytes, type, fields, { referrer: 'about:client', withCredentials: data.withCredentials === true }, data.timeout);
       if (result === null || result === undefined) {
         __tbXhrSyncError(data, 'The request failed due to a network error.');
       }
@@ -351,9 +351,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       mode: 'cors',
       credentials: data.withCredentials ? 'include' : 'same-origin',
       redirect: 'follow',
+      keepalive: false,
+      bodySize: 0,
+      delivery: 'buffer',
     }, 'about:client', outcome => {
-      if (outcome.bodyError) __tbXhrError(this, data, 'error');
-      else __tbXhrFinish(this, data, generation, outcome.status, outcome.body, outcome.url, outcome.headers, false);
+      if (outcome.body.kind === 'undecodable') __tbXhrError(this, data, 'error');
+      else __tbXhrFinish(this, data, generation, outcome.status, outcome.body.bytes, outcome.url, outcome.headers, false);
     });
     __tbXhrTimeout(this, data);
   }

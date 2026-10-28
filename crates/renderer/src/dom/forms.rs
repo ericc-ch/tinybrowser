@@ -744,7 +744,7 @@ pub(crate) fn submission_encoding(label: &str) -> &'static encoding_rs::Encoding
 /// `encode` (<https://encoding.spec.whatwg.org/#encode>).
 pub(crate) fn encode_form(text: &str, label: &str) -> String {
     let (bytes, _, _) = submission_encoding(label).encode(text);
-    bytes.iter().map(|&byte| char::from(byte)).collect()
+    net::isomorphic_decode(&bytes)
 }
 
 /// Percent-encodes `text` for form submission: Encoding Standard `encode`

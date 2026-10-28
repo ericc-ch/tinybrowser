@@ -11,8 +11,8 @@ use blitz_dom::NodeData;
 use crate::documents::JournalEntry;
 use crate::dom::TreeError;
 use crate::dom::tree::{
-    BlitzId, NodeId, attr, html_namespace, is_child_navigable_container, is_html_element,
-    is_real_element, mathml_namespace, sibling, svg_namespace,
+    BlitzId, NodeId, attr, html_namespace, is_child_navigable_container, is_element,
+    is_html_element, mathml_namespace, sibling, svg_namespace,
 };
 
 /// The inserted node's side of ensure pre-insert validity.
@@ -38,42 +38,21 @@ pub(crate) fn classify_inserted(
     doc: &crate::documents::BlitzDocument,
     id: BlitzId,
 ) -> InsertedNode {
-    // Fragment backings (flagged elements) and real `Fragment` nodes both
-    // splice their children on insertion.
+    // A fragment node splices its children on insertion, so the shape is its
+    // children's: the DOM cannot hold a fragment inside a fragment, because
+    // inserting one splices it
+    // (<https://dom.spec.whatwg.org/#concept-node-insert>).
     if doc.is_fragment(id) {
-        // Flatten nested fragments: insertion splices fragment children, so a
-        // fragment holding a nested fragment with two elements still inserts
-        // two elements. Iterative: fragment nesting is not depth-limited.
-        // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+        let Some(fragment) = doc.base.get_node(id) else {
+            return InsertedNode::Other;
+        };
         let mut elements = 0;
         let mut has_text = false;
-        let mut stack = vec![id];
-        while let Some(current) = stack.pop() {
-            let kids: Vec<BlitzId> = doc
-                .base
-                .get_node(current)
-                .map(|n| n.children.iter().copied().collect())
-                .unwrap_or_default();
-            for child in kids {
-                if doc.is_fragment(child) {
-                    stack.push(child);
-                    continue;
-                }
-                if doc
-                    .base
-                    .get_node(child)
-                    .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-                {
-                    elements += 1;
-                }
-                if doc.base.get_node(child).is_some_and(|candidate| {
-                    matches!(
-                        candidate.data,
-                        NodeData::Text(_) | NodeData::CDataSection { .. }
-                    )
-                }) {
-                    has_text = true;
-                }
+        for child in &fragment.children {
+            match doc.base.get_node(*child).map(|node| &node.data) {
+                Some(NodeData::Element(_)) => elements += 1,
+                Some(NodeData::Text(_) | NodeData::CDataSection { .. }) => has_text = true,
+                Some(_) | None => {}
             }
         }
         return InsertedNode::Fragment { elements, has_text };
@@ -140,12 +119,10 @@ pub(crate) fn sibling_element_precedes(
     let Some(position) = node.children.iter().position(|kid| *kid == child) else {
         return false;
     };
-    node.children.iter().take(position).any(|kid| {
-        doc.base
-            .get_node(*kid)
-            .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-            && !doc.is_fragment(*kid)
-    })
+    node.children
+        .iter()
+        .take(position)
+        .any(|kid| is_element(&doc.base, *kid))
 }
 
 /// Whether `parent` has an element child that `excluded` does not contain
@@ -156,14 +133,9 @@ pub(crate) fn parent_has_element(
     excluded: &[BlitzId],
 ) -> bool {
     doc.base.get_node(parent).is_some_and(|root| {
-        root.children.iter().any(|child| {
-            !excluded.contains(child)
-                && doc
-                    .base
-                    .get_node(*child)
-                    .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-                && !doc.is_fragment(*child)
-        })
+        root.children
+            .iter()
+            .any(|child| !excluded.contains(child) && is_element(&doc.base, *child))
     })
 }
 
@@ -528,21 +500,7 @@ pub(crate) fn replace_all_with_node(
     node: NodeId,
 ) -> Vec<NodeId> {
     let added = if parsed.document.is_fragment(node.node) {
-        let moved: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(node.node)
-            .map(|backing| {
-                backing
-                    .children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: node.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let moved = fragment_children(&parsed.document, node);
         // The children leave the fragment before the insert, and each
         // removal runs the live-range pre-remove steps
         // (<https://dom.spec.whatwg.org/#concept-node-insert>).
@@ -883,7 +841,7 @@ pub(crate) fn ensure_can_move(
         let has_element = base.get_node(parent.node).is_some_and(|root| {
             root.children
                 .iter()
-                .any(|child| *child != node.node && is_real_element(doc, *child))
+                .any(|child| *child != node.node && is_element(&doc.base, *child))
         });
         if has_element {
             return Err(TreeError::Hierarchy);
@@ -1032,18 +990,47 @@ fn adjust_replace_removal(parsed: &mut crate::Parsed, parent: NodeId, old: NodeI
     }
 }
 
-/// Replaces `old` with the already-adopted `node` (or its children for a
-/// fragment): the node's own unlink keeps a removal record when it moves,
-/// then one combined record carries the replacement
+/// The children of a fragment, as handles in its own document.
+pub(crate) fn fragment_children(
+    doc: &crate::documents::BlitzDocument,
+    fragment: NodeId,
+) -> Vec<NodeId> {
+    crate::dom::tree::child_ids(&doc.base, fragment.document, fragment.node)
+}
+
+/// What takes a replaced child's place
+/// (<https://dom.spec.whatwg.org/#concept-node-replace>).
+pub(crate) enum Replacement {
+    /// One node, in `parent`'s document.
+    Node(NodeId),
+    /// A fragment's children, still in `parent`'s document. They leave the
+    /// fragment inside this operation, so the removal is recorded here.
+    FragmentContents {
+        fragment: NodeId,
+        children: Vec<NodeId>,
+    },
+    /// Children already adopted into `parent`'s document from a fragment in
+    /// another one. Adoption recorded each removal in the old document.
+    Adopted(Vec<NodeId>),
+}
+
+/// Replaces `old` with `replacement`: a node's own unlink keeps a removal
+/// record when it moves, then one combined record carries the replacement
 /// (<https://dom.spec.whatwg.org/#concept-node-replace>). Returns the nodes
 /// the parent gained, for the insertion fixups.
+///
+/// `replacement` owns every child list it needs. A fragment in another
+/// document has no arena entry here, and a Blitz id from one document's arena
+/// names an unrelated node in another's.
 pub(crate) fn replace_parsed(
     parsed: &mut crate::Parsed,
     parent: NodeId,
-    node: NodeId,
     old: NodeId,
+    replacement: Replacement,
 ) -> Vec<NodeId> {
-    if node == old {
+    if let Replacement::Node(node) = replacement
+        && node == old
+    {
         let reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
             document: old.document,
             node: next,
@@ -1066,45 +1053,32 @@ pub(crate) fn replace_parsed(
         document: old.document,
         node: next,
     });
-    if reference == Some(node) {
+    if let Replacement::Node(node) = replacement
+        && reference == Some(node)
+    {
         reference = sibling(&parsed.document.base, node.node, true).map(|next| NodeId {
             document: node.document,
             node: next,
         });
     }
-    let (added, fragment) = if parsed.document.is_fragment(node.node) {
-        let moved: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(node.node)
-            .map(|backing| {
-                backing
-                    .children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: node.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        (moved, true)
-    } else {
-        (vec![node], false)
+    let (added, leaving_fragment, unlink) = match replacement {
+        Replacement::Node(node) => (vec![node], None, Some(node)),
+        Replacement::FragmentContents { fragment, children } => (children, Some(fragment), None),
+        Replacement::Adopted(children) => (children, None, None),
     };
-    if fragment {
+    if let Some(fragment) = leaving_fragment {
         // The fragment's children leave it through the insert, and each
         // removal runs the live-range pre-remove steps
         // (<https://dom.spec.whatwg.org/#concept-node-insert>).
-        adjust_children_leaving(parsed, node, &added);
+        adjust_children_leaving(parsed, fragment, &added);
         parsed.document.record(JournalEntry::ChildList {
-            target: node,
+            target: fragment,
             added: Vec::new(),
             removed: added.clone(),
             previous: None,
             next: None,
         });
-    } else {
+    } else if let Some(node) = unlink {
         unlink_journaled(parsed, node);
     }
     adjust_replace_removal(parsed, parent, old);

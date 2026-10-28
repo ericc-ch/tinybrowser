@@ -2,7 +2,11 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
+use super::{
+    CompletedDial, DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task,
+    Timer,
+};
+use crate::document::dials::AdoptedDials;
 use crate::dom::tree::NodeId;
 use crate::js::{JsFetchId, RealmRequest};
 use crate::protocol::{BrowserEvent, RendererEvent, TimerId};
@@ -73,11 +77,27 @@ impl Document {
     }
 
     fn adopt_dial_completions(&mut self) {
-        for (id, completed) in self.dials.adopt() {
+        let AdoptedDials { settled, abandoned } = self.dials.adopt();
+        for (id, completed) in settled {
             match completed {
                 Ok(done) => self.tasks.push_back(Task::DialFinished(id, Box::new(done))),
                 Err(fail) => self.tasks.push_back(Task::DialFailed(id, fail)),
             }
+        }
+        for completed in abandoned {
+            self.abandon_dial(completed);
+        }
+    }
+
+    /// Drops a completion no task will read. A streamed body's task keeps
+    /// reading into its channel and holds the tab's dial permits until the
+    /// stream is cancelled, so nothing else can reclaim it
+    /// (<https://fetch.spec.whatwg.org/#concept-response-body>).
+    fn abandon_dial(&self, completed: Result<CompletedDial, DialContext>) {
+        if let Ok(done) = completed
+            && let crate::protocol::ResponseBody::Streamed(stream) = done.outcome.body
+        {
+            self.services.cancel_stream(stream);
         }
     }
 
@@ -171,12 +191,11 @@ impl Document {
                                 // as the response's `Content-Type` header
                                 // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
                                 headers: vec![("content-type".to_owned(), content_type)],
-                                body: Ok(body),
+                                body: crate::protocol::ResponseBody::Bytes(body),
                                 response_type: net::cors::ResponseType::Basic,
                                 crossed_origin: false,
                                 redirect_count: 0,
                                 referrer: None,
-                                stream: None,
                             },
                         });
                     } else {
@@ -219,6 +238,8 @@ impl Document {
             Task::DialFinished(id, done) => {
                 if self.dials.settle(id) {
                     self.finish_dial(*done);
+                } else {
+                    self.abandon_dial(Ok(*done));
                 }
             }
             Task::DialFailed(id, fail) => {
@@ -422,22 +443,23 @@ impl Document {
         dial.req.body = fetch.body;
         dial.req.content_type = fetch.content_type;
         dial.req.headers = fetch.headers;
-        dial.req.referrer = fetch.referrer;
+        dial.req.referrer = fetch.options.referrer;
         // An unset request policy means the client's policy container
         // decides: resolve it here so every redirect hop re-determines with
         // the same policy the initial request used
         // (<https://fetch.spec.whatwg.org/#main-fetch>,
         // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
         dial.req.referrer_policy = fetch
+            .options
             .referrer_policy
             .or(self.world.borrow().policy.referrer_policy)
             .unwrap_or_default();
-        dial.req.cors = fetch.cors;
-        dial.req.keepalive = fetch.keepalive;
-        dial.req.body_len = fetch.body_len;
-        dial.req.integrity = fetch.integrity;
-        dial.req.cache = fetch.cache;
-        dial.req.delivery = fetch.delivery;
+        dial.req.cors = Some(fetch.options.cors);
+        dial.req.keepalive = fetch.options.keepalive;
+        dial.req.body_len = fetch.options.body_len;
+        dial.req.integrity = fetch.options.integrity;
+        dial.req.cache = fetch.options.cache;
+        dial.req.delivery = fetch.options.delivery;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

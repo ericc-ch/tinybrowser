@@ -31,9 +31,29 @@ pub enum RequestMode {
     Cors,
 }
 
+impl RequestMode {
+    /// Parses a `RequestInit.mode` string
+    /// (<https://fetch.spec.whatwg.org/#requestinit>).
+    ///
+    /// `navigate` is not accepted: the `Request` constructor rejects it
+    /// (<https://fetch.spec.whatwg.org/#dom-request>), and navigation code
+    /// spells [`RequestMode::Navigate`] directly.
+    #[must_use]
+    pub fn from_idl(value: &str) -> Option<Self> {
+        match value {
+            "no-cors" => Some(Self::NoCors),
+            "same-origin" => Some(Self::SameOrigin),
+            "cors" => Some(Self::Cors),
+            _ => None,
+        }
+    }
+}
+
 /// A request's credentials mode
 /// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialsMode {
     /// Never send or accept credentials; cookies cross the wire only if they
@@ -52,6 +72,18 @@ impl CredentialsMode {
     pub fn includes(self) -> bool {
         matches!(self, Self::Include)
     }
+
+    /// Parses the IDL enum's string value
+    /// (<https://fetch.spec.whatwg.org/#requestinit>).
+    #[must_use]
+    pub fn from_idl(value: &str) -> Option<Self> {
+        match value {
+            "omit" => Some(Self::Omit),
+            "same-origin" => Some(Self::SameOrigin),
+            "include" => Some(Self::Include),
+            _ => None,
+        }
+    }
 }
 
 /// How redirects are handled
@@ -67,6 +99,20 @@ pub enum RedirectMode {
     /// Return an opaque-redirect filtered response; the caller cannot see the
     /// `Location`.
     Manual,
+}
+
+impl RedirectMode {
+    /// Parses the IDL enum's string value
+    /// (<https://fetch.spec.whatwg.org/#requestinit>).
+    #[must_use]
+    pub fn from_idl(value: &str) -> Option<Self> {
+        match value {
+            "follow" => Some(Self::Follow),
+            "error" => Some(Self::Error),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
 }
 
 /// The fetch parameters of one request. `origin` is the request origin; an
@@ -158,7 +204,7 @@ fn contains_unsafe_byte(value: &[u8]) -> bool {
 /// Whether `(name, value)` is a CORS-safelisted request-header
 /// (<https://fetch.spec.whatwg.org/#cors-safelisted-request-header>).
 #[must_use]
-pub fn is_cors_safelisted_request_header(name: &str, value: &[u8]) -> bool {
+fn is_cors_safelisted_request_header(name: &str, value: &[u8]) -> bool {
     if value.len() > 128 {
         return false;
     }
@@ -229,7 +275,7 @@ fn is_simple_range(value: &[u8]) -> bool {
 /// set these, and the browser adds them after the preflight decision, so they
 /// never appear in the CORS-unsafe request-header names.
 #[must_use]
-pub fn is_forbidden_request_header_name(name: &str) -> bool {
+fn is_forbidden_request_header_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if name.starts_with("proxy-") || name.starts_with("sec-") {
         return true;
@@ -270,31 +316,22 @@ pub fn is_forbidden_request_header(name: &str, value: &[u8]) -> bool {
     is_forbidden_request_header_name(name) || is_forbidden_method_header(name, value)
 }
 
-/// Whether `method` is a forbidden method
-/// (<https://fetch.spec.whatwg.org/#forbidden-method>).
-#[must_use]
-pub fn is_forbidden_method(method: &str) -> bool {
-    method.eq_ignore_ascii_case("CONNECT")
-        || method.eq_ignore_ascii_case("TRACE")
-        || method.eq_ignore_ascii_case("TRACK")
-}
-
 /// Whether a forbidden-method header carries a forbidden method in any
 /// comma-separated member
 /// (<https://fetch.spec.whatwg.org/#forbidden-request-header>). Members come
 /// from the spec's get-decode-split, so a quoted member is compared with its
 /// quotes and is not a method.
 #[must_use]
-pub fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
+fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
     if !matches!(
         name.to_ascii_lowercase().as_str(),
         "x-http-method-override" | "x-http-method" | "x-method-override"
     ) {
         return false;
     }
-    crate::split_header_value(value)
+    crate::split_header_value(&crate::isomorphic_decode(value))
         .iter()
-        .any(|method| is_forbidden_method(method))
+        .any(|method| Method::parse(method).is_ok_and(|method| method.is_forbidden()))
 }
 
 /// The CORS-unsafe request-header names of `headers`, sorted lowercase

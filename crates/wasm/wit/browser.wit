@@ -38,8 +38,6 @@ interface types {
         url: string,
         /// Document URL the dial started from.
         initiator: string,
-        /// When false, only status and metadata are used.
-        read-body: bool,
         /// Hard cap on `fetch-response.body`; a larger body is `limit`.
         max-body-bytes: u64,
         /// Value for the `Cookie` request header of this exchange.
@@ -85,7 +83,11 @@ interface types {
         /// A host that cannot observe redirects leaves this empty and reports
         /// the final exchange instead; see `start-fetch`.
         location: option<string>,
-        /// Response bytes, capped by `fetch-request.max-body-bytes`.
+        /// The whole response body, capped by `fetch-request.max-body-bytes`.
+        ///
+        /// This transport has no progressive delivery: a page that asked for a
+        /// streamed body receives this one buffered. A host must answer with
+        /// the complete body rather than a prefix.
         body: list<u8>,
     }
 

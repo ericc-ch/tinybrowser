@@ -24,8 +24,8 @@ use blitz_dom::NodeData;
 use rquickjs::{Array, Class, Ctx, Exception, Function, Persistent, Result, Value};
 
 use crate::dom::insertion::{
-    iframe_containers_in_subtrees, place_journaled, replace_all_journaled, replace_parsed,
-    unlink_journaled,
+    fragment_children, iframe_containers_in_subtrees, place_journaled, replace_all_journaled,
+    replace_parsed, unlink_journaled,
 };
 use crate::dom::serialization;
 use crate::dom::tree::{
@@ -2071,8 +2071,11 @@ impl JsNode {
             let Some(node) = base.get_node(container.node) else {
                 return Err(Exception::throw_type(ctx, "stale node"));
             };
-            if !parsed.document.is_fragment(container.node)
-                && node.data.downcast_element().is_none()
+            // `innerHTML` belongs to `Element` and `ShadowRoot`, not to the
+            // other fragment kinds
+            // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
+            if node.data.downcast_element().is_none()
+                && !matches!(node.data, NodeData::ShadowRoot { .. })
             {
                 return Err(Exception::throw_type(ctx, "innerHTML requires an element"));
             }
@@ -2195,21 +2198,7 @@ impl JsNode {
         let replacement =
             materialize_children(&mut parsed.document, container.document, &snapshots)
                 .map_err(|err| throw_dom_error(ctx, err))?;
-        let added: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(replacement.node)
-            .map(|backing| {
-                backing
-                    .children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: replacement.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let added = fragment_children(&parsed.document, replacement);
         let iframes = replace_all_journaled(&mut parsed, container, added.clone());
         let controls = crate::dom::forms::descendant_controls(
             &parsed.document.base,
@@ -2278,21 +2267,7 @@ impl JsNode {
         }
         let fragment = materialize_children(&mut parsed.document, element.document, &snapshots)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        let moved: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(fragment.node)
-            .map(|backing| {
-                backing
-                    .children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: fragment.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let moved = fragment_children(&parsed.document, fragment);
         match position.as_str() {
             "beforebegin" => {
                 let parent = parent.ok_or_else(|| {
@@ -2389,8 +2364,15 @@ impl JsNode {
         };
         let replacement = materialize_children(&mut parsed.document, element.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
+        drop(parsed);
+        drop(world);
+        let replacement = super::core::replace_target(ctx, parent, replacement)?;
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(element) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
         let target = element;
-        let added = replace_parsed(&mut parsed, parent, replacement, target);
+        let added = replace_parsed(&mut parsed, parent, target, replacement);
         drop(parsed);
         drop(world);
         register_inserted_iframes(ctx, &added)?;
@@ -2512,12 +2494,11 @@ pub(super) fn require_context_element(ctx: &Ctx<'_>, id: NodeId) -> Result<NodeI
         let world = world(ctx)?;
         let world = world.borrow();
         world.document(id).is_some_and(|parsed| {
-            !parsed.document.is_fragment(id.node)
-                && parsed
-                    .document
-                    .base
-                    .get_node(id.node)
-                    .is_some_and(|node| node.data.downcast_element().is_some())
+            parsed
+                .document
+                .base
+                .get_node(id.node)
+                .is_some_and(|node| node.data.downcast_element().is_some())
         })
     };
     if element {

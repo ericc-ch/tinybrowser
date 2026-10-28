@@ -38,8 +38,7 @@ pub(crate) enum CollectionKind {
     SelectOptions,
     SelectedOptions,
     WindowNamed(String),
-    /// `Document.scripts`: HTML `script` descendants of the document element,
-    /// skipping fragment backings
+    /// `Document.scripts`: HTML `script` descendants of the document element
     /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
     HtmlScripts,
     /// `table.tBodies`: HTML `tbody` children of the table
@@ -178,9 +177,6 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
 /// `Document.scripts` is an `HTMLCollection` rooted at the `Document` node
 /// whose filter matches `script` elements
 /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
-/// The synthetic viewport box above the document element is not a DOM
-/// descendant of that node; walking from its first non-fragment element
-/// child keeps fragment backings that sit beside `html` off the list.
 fn collect_html_scripts(
     doc: &crate::documents::BlitzDocument,
     document: u32,
@@ -193,9 +189,6 @@ fn collect_html_scripts(
         .map(|node| node.children.iter().rev().copied().collect())
         .unwrap_or_default();
     while let Some(id) = stack.pop() {
-        if doc.is_fragment(id) {
-            continue;
-        }
         if crate::dom::tree::is_html_element(&doc.base, id, "script")
             && script_is_in_document(doc, id)
         {
@@ -209,12 +202,11 @@ fn collect_html_scripts(
 }
 
 /// A document script is connected: marked in-document by insertion and
-/// ancestor-connected to the document root without crossing a fragment.
+/// ancestor-connected to the document root.
 ///
-/// Fragment children can sit under `body` in the Blitz parent chain without
-/// having run insertion steps. Parent-chain connectedness would count them;
 /// `IS_IN_DOCUMENT` is set only in `process_added_subtree` when the parent is
-/// already in the document
+/// already in the document, so a script inside a detached fragment is not a
+/// document script
 /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>,
 /// <https://dom.spec.whatwg.org/#connected>).
 fn script_is_in_document(doc: &crate::documents::BlitzDocument, mut id: BlitzId) -> bool {
@@ -229,9 +221,6 @@ fn script_is_in_document(doc: &crate::documents::BlitzDocument, mut id: BlitzId)
     loop {
         if id == root {
             return true;
-        }
-        if doc.is_fragment(id) {
-            return false;
         }
         match doc.base.get_node(id).and_then(|node| node.parent) {
             Some(parent) => id = parent,

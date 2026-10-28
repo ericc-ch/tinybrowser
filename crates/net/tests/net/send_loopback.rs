@@ -1,4 +1,4 @@
-use super::common::{TestServer, canned_ok, canned_redirect, scripted};
+use super::common::{TestServer, canned_ok, canned_redirect, read_body, scripted};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -31,7 +31,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             .expect("status is response data");
         assert_eq!(response.status(), status);
         assert_eq!(
-            response.into_body().await.bytes(16).await.expect("body"),
+            read_body(response.into_body().await).await.expect("body"),
             b"no"
         );
         server.assert_clean();
@@ -57,39 +57,19 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         Some(&b"text/plain"[..])
     );
     assert_eq!(
-        response.into_body().await.bytes(16).await.expect("body"),
+        read_body(response.into_body().await).await.expect("body"),
         b"hello"
     );
     server.assert_clean();
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec()]);
-    assert_eq!(
-        default_agent()
-            .send(Request::new(Method::GET, server.url("/chunked")))
-            .await
-            .expect("chunked")
-            .into_body()
-            .await
-            .bytes(64)
-            .await
-            .expect("body"),
-        b"hello world"
-    );
-    server.assert_clean();
-
-    let payload = vec![b'x'; 32];
-    let server = scripted([canned_ok(&[], &payload)]);
-    assert!(matches!(
-        default_agent()
-            .send(Request::new(Method::GET, server.url("/limit")))
-            .await
-            .expect("response")
-            .into_body()
-            .await
-            .bytes(16)
-            .await,
-        Err(NetError::Limit(LimitExceeded::Size(16)))
-    ));
+    let body = default_agent()
+        .send(Request::new(Method::GET, server.url("/chunked")))
+        .await
+        .expect("chunked")
+        .into_body()
+        .await;
+    assert_eq!(read_body(body).await.expect("body"), b"hello world");
     server.assert_clean();
 
     let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -663,7 +643,7 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
         .await
         .expect("ipv6 send");
     assert_eq!(
-        response.into_body().await.bytes(8).await.expect("body"),
+        read_body(response.into_body().await).await.expect("body"),
         b"v6"
     );
     server.assert_clean();
@@ -912,7 +892,7 @@ async fn resolve_maps_hit_miss_and_fail() {
         .await
         .expect("mapped hit");
     assert_eq!(
-        response.into_body().await.bytes(16).await.expect("body"),
+        read_body(response.into_body().await).await.expect("body"),
         b"mapped"
     );
     assert_eq!(
@@ -929,7 +909,7 @@ async fn resolve_maps_hit_miss_and_fail() {
         .await
         .expect("unmapped 127.0.0.1 uses libc");
     assert_eq!(
-        miss.into_body().await.bytes(16).await.expect("body"),
+        read_body(miss.into_body().await).await.expect("body"),
         b"direct"
     );
     miss_server.assert_clean();

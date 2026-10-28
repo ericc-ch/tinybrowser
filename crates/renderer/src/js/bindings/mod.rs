@@ -55,7 +55,7 @@ use markup5ever::{LocalName, Namespace, Prefix, QualName};
 use stylo_taffy::CopyStyleGetters;
 
 use crate::dom::TreeError;
-use crate::dom::tree::{NodeId, is_real_element, sibling};
+use crate::dom::tree::{NodeId, is_element, sibling};
 
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, prelude::This,
@@ -859,21 +859,12 @@ pub(super) fn wrap_new_document_in_world<'js>(
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
-    let is_fragment = {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(id) else {
-            return Err(Exception::throw_type(ctx, "stale node"));
-        };
-        parsed.document.is_fragment(id.node)
-    };
     let brand = with_node_data(ctx, id, |data| match data {
         Some(NodeData::Document(_)) => Some(if document_is_xml_document(ctx, id) {
             "XMLDocument"
         } else {
             "Document"
         }),
-        Some(NodeData::Element(_)) if is_fragment => Some("DocumentFragment"),
         Some(NodeData::Fragment { .. }) => Some("DocumentFragment"),
         Some(NodeData::ShadowRoot { .. }) => Some("ShadowRoot"),
         Some(NodeData::Element(element)) => Some(element_interface(&element.name)),
@@ -1509,7 +1500,7 @@ pub(super) fn element_sibling_value<'js>(
         let base = &parsed.document.base;
         let mut cursor = sibling(base, id.node, forward);
         while let Some(next) = cursor {
-            if is_real_element(&parsed.document, next) {
+            if is_element(&parsed.document.base, next) {
                 break;
             }
             cursor = sibling(base, next, forward);
@@ -1799,6 +1790,87 @@ mod realm_tests {
         registry.borrow_mut().insert_document(id, &world);
         registry.borrow_mut().insert_frame(FrameId::MAIN, &world);
         world
+    }
+
+    #[test]
+    fn replacing_with_a_foreign_fragment_adopts_each_child() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><div id=target><b id=old></b></div>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                r#"
+                var target = document.getElementById("target");
+                var old = document.getElementById("old");
+                var other = document.implementation.createHTMLDocument("");
+                var fragment = other.createDocumentFragment();
+                var span = other.createElement("span");
+                span.textContent = "moved";
+                fragment.appendChild(span);
+                var replaced = target.replaceChild(fragment, old);
+                [
+                  replaced === old,
+                  target.childNodes.length,
+                  target.firstChild.nodeName,
+                  target.firstChild.ownerDocument === document,
+                  target.firstChild.textContent,
+                  fragment.childNodes.length
+                ].join(",");
+                "#,
+            )
+            .expect("cross-document replace");
+        assert_eq!(outcome, "true,1,SPAN,true,moved,0");
+    }
+
+    #[test]
+    fn inserting_a_fragment_splices_its_children_in_tree_order() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><div id=target></div>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                r#"
+                var target = document.getElementById("target");
+                var fragment = document.createDocumentFragment();
+                var first = document.createElement("i");
+                var text = document.createTextNode("gap");
+                var second = document.createElement("u");
+                fragment.append(first, text, second);
+                target.append(fragment);
+                [
+                  target.childNodes.length,
+                  target.childNodes[0].nodeName,
+                  target.childNodes[1].nodeValue,
+                  target.childNodes[2].nodeName,
+                  fragment.childNodes.length,
+                  first.parentNode === target
+                ].join(",");
+                "#,
+            )
+            .expect("fragment insert");
+        assert_eq!(outcome, "3,I,gap,U,0,true");
     }
 
     /// A call is a direct eval only when the callee is `%eval%` itself

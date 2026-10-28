@@ -177,23 +177,115 @@ pub(crate) struct TimeoutRequest {
     pub js_id: PageTimerId,
 }
 
+/// One page `fetch` / XHR dial, parsed from the shim's options object.
 pub(crate) struct JsFetchRequest {
     pub url: String,
     pub js_id: JsFetchId,
-    pub method: String,
+    pub method: net::Method,
     pub body: Vec<u8>,
     pub content_type: Option<String>,
     pub headers: Vec<(String, String)>,
-    pub referrer: net::Referrer,
-    pub cors: Option<crate::protocol::CorsRequest>,
-    pub keepalive: bool,
-    pub body_len: u64,
-    pub integrity: Option<String>,
-    pub cache: crate::protocol::RequestCache,
-    pub delivery: crate::protocol::BodyDelivery,
-    /// The request's referrer policy (`init.referrerPolicy` or a cloned
-    /// `Request`'s); `None` means the document's policy decides.
-    pub referrer_policy: Option<net::ReferrerPolicy>,
+    pub options: DialOptions,
+}
+
+/// The options object `fetch.js` hands `__queueFetch`: one named field per
+/// option the renderer's dial needs, parsed once at the boundary.
+///
+/// The shim writes every key; `null` is how a request with no value says so,
+/// and each `null` has one meaning here: `referrer: null` is no referrer,
+/// `integrity: null` and `referrerPolicy: null` are unset, and `cache: null`
+/// is the IDL default mode. An unknown spelling is a `TypeError` that names
+/// the key and value; it never becomes a different, valid-looking request.
+pub(crate) struct DialOptions {
+    pub(crate) referrer: net::Referrer,
+    pub(crate) cors: crate::protocol::CorsRequest,
+    pub(crate) keepalive: bool,
+    pub(crate) body_len: u64,
+    pub(crate) integrity: Option<String>,
+    pub(crate) cache: crate::protocol::RequestCache,
+    pub(crate) delivery: crate::protocol::BodyDelivery,
+    pub(crate) referrer_policy: Option<net::ReferrerPolicy>,
+}
+
+impl DialOptions {
+    fn from_js(options: &Object<'_>) -> rquickjs::Result<Self> {
+        fn enum_member<T>(
+            ctx: &Ctx<'_>,
+            options: &Object<'_>,
+            key: &'static str,
+            parse: impl Fn(&str) -> Option<T>,
+        ) -> rquickjs::Result<T> {
+            let value: String = options.get(key)?;
+            parse(&value).ok_or_else(|| invalid_option(ctx, key, &value))
+        }
+
+        fn nullable_enum_member<T>(
+            ctx: &Ctx<'_>,
+            options: &Object<'_>,
+            key: &'static str,
+            parse: impl Fn(&str) -> Option<T>,
+        ) -> rquickjs::Result<Option<T>> {
+            match options.get::<_, Option<String>>(key)? {
+                None => Ok(None),
+                Some(value) => parse(&value)
+                    .map(Some)
+                    .ok_or_else(|| invalid_option(ctx, key, &value)),
+            }
+        }
+
+        /// A value the IDL enum does not name is a `TypeError` that says which
+        /// option and which value, at the boundary that reads it.
+        fn invalid_option(ctx: &Ctx<'_>, key: &'static str, value: &str) -> rquickjs::Error {
+            Exception::throw_type(ctx, &format!("{key}: {value:?} is not a request option"))
+        }
+
+        let ctx = options.ctx();
+        let referrer = match options.get::<_, Option<String>>("referrer")? {
+            Some(value) => net::Referrer::from_idl(&value).ok_or_else(|| {
+                Exception::throw_type(ctx, &format!("referrer: {value:?} is not a referrer"))
+            })?,
+            None => net::Referrer::NoReferrer,
+        };
+        let cors = crate::protocol::CorsRequest {
+            // `fetch` always passes the mode its `Request` normalized
+            // (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+            mode: enum_member(ctx, options, "mode", net::cors::RequestMode::from_idl)?,
+            credentials: enum_member(
+                ctx,
+                options,
+                "credentials",
+                net::cors::CredentialsMode::from_idl,
+            )?,
+            redirect: enum_member(ctx, options, "redirect", net::cors::RedirectMode::from_idl)?,
+        };
+        let cache = nullable_enum_member(
+            ctx,
+            options,
+            "cache",
+            crate::protocol::RequestCache::from_idl,
+        )?
+        .unwrap_or_default();
+        let delivery = enum_member(
+            ctx,
+            options,
+            "delivery",
+            crate::protocol::BodyDelivery::from_idl,
+        )?;
+        let referrer_policy =
+            nullable_enum_member(ctx, options, "referrerPolicy", net::ReferrerPolicy::parse)?;
+        Ok(Self {
+            referrer,
+            cors,
+            keepalive: options
+                .get::<_, Option<bool>>("keepalive")?
+                .unwrap_or(false),
+            body_len: options.get::<_, Option<u64>>("bodySize")?.unwrap_or(0),
+            integrity: options.get::<_, Option<String>>("integrity")?,
+            cache,
+            delivery,
+            referrer_policy,
+        })
+    }
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -478,71 +570,73 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let cbs: Object = bridge::object(&ctx)?.get("__tb_fetchCbs")?;
                 let Some(func) = cbs.get::<_, Option<Function>>(js_id.0)? else {
+                    // The page aborted between the dial and this callback.
+                    // A streamed body's task would fill its channel and hold
+                    // the dial permits for nobody, so cancel it here.
+                    if let Some(crate::protocol::ResponseBody::Streamed(id)) =
+                        outcome.as_ref().map(|outcome| &outcome.body)
+                    {
+                        self.world.borrow().runtime.services.cancel_stream(*id);
+                    }
                     return Ok(());
                 };
                 // The header list stays as served: sniffing picks the
                 // document parser, it never adds a field to a `fetch`
                 // Response, and `blob().type` reads the header list
                 // (<https://fetch.spec.whatwg.org/#concept-header-extract-mime-type>).
-                let (
-                    status,
-                    status_text,
-                    body,
-                    url,
-                    content_type,
-                    headers,
-                    response_type,
-                    body_error,
-                    redirect_count,
-                    stream,
-                ) = match outcome {
-                    Some(outcome) => {
-                        let body_error = outcome.body.is_err();
-                        (
-                            i32::from(outcome.status),
-                            outcome.status_text,
-                            outcome.body.unwrap_or_default(),
-                            outcome.final_url,
-                            outcome.content_type.unwrap_or_default(),
-                            outcome
-                                .headers
-                                .into_iter()
-                                .map(|(name, value)| vec![name, value])
-                                .collect::<Vec<_>>(),
-                            outcome.response_type.as_str().to_owned(),
-                            body_error,
-                            outcome.redirect_count,
-                            outcome.stream,
-                        )
+                let callback = Object::new(ctx.clone())?;
+                if let Some(outcome) = outcome {
+                    callback.set("status", i32::from(outcome.status))?;
+                    callback.set("statusText", outcome.status_text)?;
+                    callback.set("url", outcome.final_url)?;
+                    callback.set("contentType", outcome.content_type.unwrap_or_default())?;
+                    callback.set(
+                        "headers",
+                        outcome
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| vec![name, value])
+                            .collect::<Vec<_>>(),
+                    )?;
+                    callback.set("responseType", outcome.response_type.as_str())?;
+                    callback.set("redirectCount", outcome.redirect_count)?;
+                    // One tagged value carries the body. Making the shim
+                    // switch on it keeps "streamed with a decode error"
+                    // out of reach, which the flat body/bodyError/stream
+                    // triple allowed
+                    // (<https://fetch.spec.whatwg.org/#concept-response-body>).
+                    let body = Object::new(ctx.clone())?;
+                    match outcome.body {
+                        crate::protocol::ResponseBody::Bytes(bytes) => {
+                            body.set("kind", "bytes")?;
+                            body.set("bytes", TypedArray::new(ctx.clone(), bytes)?)?;
+                        }
+                        crate::protocol::ResponseBody::Undecodable => {
+                            body.set("kind", "undecodable")?;
+                        }
+                        crate::protocol::ResponseBody::Streamed(id) => {
+                            body.set("kind", "stream")?;
+                            body.set("id", id.get())?;
+                        }
                     }
+                    callback.set("body", body)?;
+                } else {
                     // A failed dial is a network error: the renderer rejects
                     // and `Response.type` never becomes observable
                     // (<https://fetch.spec.whatwg.org/#concept-network-error>).
-                    None => (
-                        0,
-                        String::new(),
-                        Vec::new(),
-                        String::new(),
-                        String::new(),
-                        Vec::new(),
-                        "error".to_owned(),
-                        false,
-                        0,
-                        None,
-                    ),
-                };
-                let outcome = Object::new(ctx.clone())?;
-                outcome.set("status", status)?;
-                outcome.set("statusText", status_text)?;
-                outcome.set("body", TypedArray::new(ctx.clone(), body)?)?;
-                outcome.set("url", url)?;
-                outcome.set("contentType", content_type)?;
-                outcome.set("headers", headers)?;
-                outcome.set("responseType", response_type)?;
-                outcome.set("bodyError", body_error)?;
-                outcome.set("redirectCount", redirect_count)?;
-                outcome.set("stream", stream)?;
-                if let Err(error) = func.call::<_, ()>((outcome,)) {
+                    callback.set("status", 0i32)?;
+                    callback.set("statusText", "")?;
+                    callback.set("url", "")?;
+                    callback.set("contentType", "")?;
+                    callback.set("headers", Vec::<Vec<String>>::new())?;
+                    callback.set("responseType", "error")?;
+                    callback.set("redirectCount", 0u32)?;
+                    let body = Object::new(ctx.clone())?;
+                    body.set("kind", "bytes")?;
+                    body.set("bytes", TypedArray::new(ctx.clone(), Vec::<u8>::new())?)?;
+                    callback.set("body", body)?;
+                }
+                if let Err(error) = func.call::<_, ()>((callback,)) {
                     bindings::host::report_callback_error(&ctx, &error);
                 }
                 Ok(())
@@ -1023,55 +1117,11 @@ impl JsRealm {
                       body: TypedArray<'_, u8>,
                       content_type: Option<String>,
                       headers: Vec<Vec<String>>,
-                      options: Vec<String>| {
+                      options: Object<'_>| {
                     let headers = header_pairs(headers)?;
-                    // `options` is [referrer, mode, credentials, redirect];
-                    // `""` means no referrer, `about:client` the document, and
-                    // a URL an explicit source. A missing mode means the
-                    // caller is not a CORS-enabled `fetch`.
-                    let mut parts = options.into_iter();
-                    let referrer = parts
-                        .next()
-                        .and_then(|value| net::Referrer::from_idl(&value))
-                        .unwrap_or_default();
-                    let mode = parts.next().map(|mode| match mode.as_str() {
-                        "same-origin" => net::cors::RequestMode::SameOrigin,
-                        "no-cors" => net::cors::RequestMode::NoCors,
-                        _ => net::cors::RequestMode::Cors,
-                    });
-                    let credentials = match parts.next().as_deref() {
-                        Some("omit") => net::cors::CredentialsMode::Omit,
-                        Some("include") => net::cors::CredentialsMode::Include,
-                        _ => net::cors::CredentialsMode::SameOrigin,
-                    };
-                    let redirect = match parts.next().as_deref() {
-                        Some("error") => net::cors::RedirectMode::Error,
-                        Some("manual") => net::cors::RedirectMode::Manual,
-                        _ => net::cors::RedirectMode::Follow,
-                    };
-                    let keepalive = parts.next().is_some_and(|value| value == "1");
-                    let body_len = parts
-                        .next()
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(0);
-                    let integrity = parts.next().filter(|value| !value.is_empty());
-                    let cache = parts
-                        .next()
-                        .and_then(|value| crate::protocol::RequestCache::from_idl(&value))
-                        .unwrap_or_default();
-                    let delivery = if parts.next().is_some_and(|value| value == "1") {
-                        crate::protocol::BodyDelivery::Stream
-                    } else {
-                        crate::protocol::BodyDelivery::Buffer
-                    };
-                    let referrer_policy = parts
-                        .next()
-                        .and_then(|value| net::ReferrerPolicy::parse(&value));
-                    let cors = mode.map(|mode| crate::protocol::CorsRequest {
-                        mode,
-                        credentials,
-                        redirect,
-                    });
+                    let method = net::Method::parse(&method)
+                        .map_err(|_| rquickjs::Error::new_from_js("method", "HTTP method"))?;
+                    let options = DialOptions::from_js(&options)?;
                     fetch_outbox
                         .borrow_mut()
                         .push_back(RealmRequest::Fetch(Box::new(JsFetchRequest {
@@ -1081,14 +1131,7 @@ impl JsRealm {
                             body: body.to_vec(),
                             content_type,
                             headers,
-                            referrer,
-                            cors,
-                            keepalive,
-                            body_len,
-                            integrity,
-                            cache,
-                            delivery,
-                            referrer_policy,
+                            options,
                         })));
                     Ok::<(), rquickjs::Error>(())
                 },
@@ -1687,7 +1730,7 @@ type SyncFetchList = rquickjs::prelude::List<(i32, Vec<u8>, String, Vec<Vec<Stri
 
 struct SyncPageFetch {
     url: String,
-    method: String,
+    method: net::Method,
     body: Vec<u8>,
     content_type: Option<String>,
     headers: Vec<(String, String)>,
@@ -1762,7 +1805,7 @@ fn install_stream_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                 .borrow()
                 .runtime
                 .services
-                .dial_read(stream)
+                .dial_read(crate::protocol::StreamId::from_page(stream))
                 .map_err(|_| rquickjs::Error::new_from_js("dial", "network error"))
         }),
     )?;
@@ -1770,7 +1813,11 @@ fn install_stream_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     bridge::object(ctx)?.set(
         "__tbFetchCancel",
         Func::from(move |stream: u64| {
-            cancel_world.borrow().runtime.services.cancel_stream(stream);
+            cancel_world
+                .borrow()
+                .runtime
+                .services
+                .cancel_stream(crate::protocol::StreamId::from_page(stream));
         }),
     )?;
     Ok(())
@@ -1786,19 +1833,27 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                   body: TypedArray<'_, u8>,
                   content_type: Option<String>,
                   headers: Vec<Vec<String>>,
-                  options: Vec<String>,
+                  options: Object<'_>,
                   timeout_ms: f64| {
                 let headers = header_pairs(headers)?;
-                // `[referrer, withCredentials]`, positionally, like
-                // `__queueFetch`'s options
+                let method = net::Method::parse(&method)
+                    .map_err(|_| rquickjs::Error::new_from_js("method", "HTTP method"))?;
+                // `{ referrer, withCredentials }`, named like `__queueFetch`'s
+                // options
                 // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
                 // <https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
-                let mut options = options.into_iter();
-                let referrer = options
-                    .next()
-                    .and_then(|value| net::Referrer::from_idl(&value))
-                    .unwrap_or_default();
-                let with_credentials = options.next().is_some_and(|value| value == "1");
+                let referrer = match options.get::<_, Option<String>>("referrer")? {
+                    Some(value) => net::Referrer::from_idl(&value).ok_or_else(|| {
+                        Exception::throw_type(
+                            options.ctx(),
+                            &format!("referrer: {value:?} is not a referrer"),
+                        )
+                    })?,
+                    None => net::Referrer::default(),
+                };
+                let with_credentials = options
+                    .get::<_, Option<bool>>("withCredentials")?
+                    .unwrap_or(false);
                 Ok::<_, rquickjs::Error>(sync_page_fetch(
                     &sync_world.borrow(),
                     SyncPageFetch {
@@ -1886,7 +1941,9 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         // The header list stays as served; nothing is sniffed into it
         // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
         Ok(outcome) => {
-            let body = outcome.body.ok()?;
+            let crate::protocol::ResponseBody::Bytes(body) = outcome.body else {
+                return None;
+            };
             Some(sync_fetch_value(
                 i32::from(outcome.status),
                 body,

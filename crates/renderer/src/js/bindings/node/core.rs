@@ -23,14 +23,14 @@ use crate::js::world::World;
 
 use crate::dom::equality;
 use crate::dom::insertion::{
-    InsertedNode, InsertionStep, MoveTarget, classify_inserted, collect_html_insertion_steps,
-    ensure_can_move, ensure_document_content_model, ensure_no_cycle, ensure_parented,
-    iframe_containers_in_subtrees, insert_parsed, move_parsed, replace_all_journaled,
-    replace_all_with_node, replace_parsed, unlink_journaled,
+    InsertedNode, InsertionStep, MoveTarget, Replacement, classify_inserted,
+    collect_html_insertion_steps, ensure_can_move, ensure_document_content_model, ensure_no_cycle,
+    ensure_parented, fragment_children, iframe_containers_in_subtrees, insert_parsed, move_parsed,
+    replace_all_journaled, replace_all_with_node, replace_parsed, unlink_journaled,
 };
 use crate::dom::tree::{
     BlitzId, NodeId, ancestor_chain, child_ids, element_node_name, is_connected, is_element,
-    is_html_element, is_real_element, root_of, sibling, tree_order,
+    is_html_element, root_of, sibling, tree_order,
 };
 
 use crate::documents::JournalEntry;
@@ -852,12 +852,13 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
                 NodeReference::Tree(node),
                 Some(NodeReference::Tree(target)),
             )?;
+            let replacement = replace_target(&ctx, parent, node)?;
             let world = world(&ctx)?;
             let world = world.borrow();
             let Some(mut parsed) = world.document_mut(target) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            let moved = replace_parsed(&mut parsed, parent, node, target);
+            let moved = replace_parsed(&mut parsed, parent, target, replacement);
             drop(parsed);
             drop(world);
             for id in &moved {
@@ -936,20 +937,6 @@ impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js>
 impl JsNode {
     pub(super) fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
         // https://dom.spec.whatwg.org/#dom-node-nodetype
-        // Fragment backings are elements flagged in the document's fragment
-        // set. A shadow root is a fragment node too
-        // (<https://dom.spec.whatwg.org/#interface-shadowroot>).
-        let world = world(ctx)?;
-        let is_fragment = world
-            .borrow()
-            .document(self.handle.0)
-            .map(|parsed| parsed.document.is_fragment(self.handle.0.node));
-        let Some(is_fragment) = is_fragment else {
-            return Err(Exception::throw_type(ctx, "stale node"));
-        };
-        if is_fragment {
-            return Ok(11);
-        }
         with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(_)) => Ok(1),
             Some(NodeData::Text(_)) => Ok(3),
@@ -969,17 +956,6 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name
     pub(super) fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
-        let world = world(ctx)?;
-        let special = world.borrow().document(self.handle.0).and_then(|parsed| {
-            if parsed.document.is_fragment(self.handle.0.node) {
-                Some("#document-fragment".to_owned())
-            } else {
-                None
-            }
-        });
-        if let Some(name) = special {
-            return rquickjs::String::from_str(ctx.clone(), &name);
-        }
         let name = with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(element)) => Ok(element_node_name(&element.name, uppercase)),
             Some(NodeData::Text(_)) => Ok("#text".into()),
@@ -1508,7 +1484,7 @@ impl JsNode {
                 .base
                 .get_node(self.handle.0.node)
                 .and_then(|node| node.parent)
-                .filter(|parent| is_real_element(&parsed.document, *parent))
+                .filter(|parent| is_element(&parsed.document.base, *parent))
                 .map(|parent| NodeId {
                     document: parsed.id,
                     node: parent,
@@ -1623,8 +1599,7 @@ impl JsNode {
         }
         // Known gap: form-state cloning (input checkedness/value) has no Blitz
         // equivalent yet; deep clones carry structure only.
-        let live = deep || tree_is_fragment(&ctx, self.handle.0);
-        let clone = if live {
+        let clone = if deep {
             let snapshot = world_rc
                 .borrow()
                 .store()
@@ -1738,14 +1713,14 @@ impl JsNode {
                 "attributes have no parent",
             ));
         };
-        let node = adopt_node(&ctx, parent, node)?;
+        let replacement = replace_target(&ctx, parent, node)?;
         let moved = {
             let world = world(&ctx)?;
             let world = world.borrow();
             let Some(mut parsed) = world.document_mut(parent) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            replace_parsed(&mut parsed, parent, node, child)
+            replace_parsed(&mut parsed, parent, child, replacement)
         };
         fixup_focus_after_removal(&ctx, child)?;
         for id in &moved {
@@ -1876,10 +1851,7 @@ pub(super) fn insertion_excluding_children(
             .document(parent)
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
         let base = &parsed.document.base;
-        // Only documents, elements, and fragments can be parents. Fragment
-        // backings are plain elements, so fragments are covered by the
-        // element case.
-        // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+        // <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>
         let parent_is_document = base.root_node().id == parent.node;
         let parent_is_fragment = base.get_node(parent.node).is_some_and(|node| {
             matches!(
@@ -2057,8 +2029,7 @@ pub(in crate::js::bindings) fn compare_node_position(
     )
 }
 
-/// Whether `node` is a `DocumentFragment` backing (a detached element
-/// flagged in the document's fragment set, never a stray `div`).
+/// Whether `node` is a `DocumentFragment`.
 pub(super) fn tree_is_fragment(ctx: &Ctx<'_>, node: NodeId) -> bool {
     world_for_node(ctx, node)
         .ok()
@@ -2082,7 +2053,7 @@ pub(super) fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> 
 }
 
 /// Same-document insert returns `node`. A node from another document adopts
-/// into the parent's document, preserving fragment backings as fragments
+/// into the parent's document, preserving fragments as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
 pub(in crate::js::bindings) fn adopt_node(
     ctx: &Ctx<'_>,
@@ -2098,6 +2069,51 @@ pub(in crate::js::bindings) fn adopt_node(
         return Ok(node);
     }
     adopt_across_documents(ctx, parent, node)
+}
+
+/// Adopts each child of a fragment that lives in another document into
+/// `parent`'s document. The fragment itself never enters this document, so its
+/// arena ids are meaningless here and must not travel
+/// (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+///
+/// Returns `None` when `node` is not such a fragment.
+pub(super) fn adopt_foreign_fragment_children(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeId,
+) -> Result<Option<Vec<NodeId>>> {
+    if node.document == parent.document || !tree_is_fragment(ctx, node) {
+        return Ok(None);
+    }
+    let children = tree_children(ctx, node)?;
+    let mut adopted = Vec::with_capacity(children.len());
+    for child in children {
+        adopted.push(adopt_across_documents(ctx, parent, child)?);
+    }
+    Ok(Some(adopted))
+}
+
+/// The replacement `node` forms for a child of `parent`: `node` itself,
+/// adopted into `parent`'s document, or the children of a fragment
+/// (<https://dom.spec.whatwg.org/#concept-node-replace>).
+pub(super) fn replace_target(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<Replacement> {
+    let node = adopt_node(ctx, parent, node)?;
+    if let Some(adopted) = adopt_foreign_fragment_children(ctx, parent, node)? {
+        return Ok(Replacement::Adopted(adopted));
+    }
+    let owner = world_for_node(ctx, parent)?;
+    let owner = owner.borrow();
+    let Some(parsed) = owner.document(parent) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    Ok(if parsed.document.is_fragment(node.node) {
+        Replacement::FragmentContents {
+            fragment: node,
+            children: fragment_children(&parsed.document, node),
+        }
+    } else {
+        Replacement::Node(node)
+    })
 }
 
 /// `ParentNode.moveBefore` (<https://dom.spec.whatwg.org/#dom-parentnode-movebefore>).
@@ -2334,12 +2350,7 @@ pub(super) fn insert_tree_node_inner(
     deliver: bool,
 ) -> Result<()> {
     let world_rc = world(ctx)?;
-    if tree_is_fragment(ctx, node) && node.document != parent.document {
-        let children = tree_children(ctx, node)?;
-        let mut moved = Vec::with_capacity(children.len());
-        for child in children {
-            moved.push(adopt_across_documents(ctx, parent, child)?);
-        }
+    if let Some(moved) = adopt_foreign_fragment_children(ctx, parent, node)? {
         {
             let world = world_rc.borrow();
             let Some(mut parsed) = world.document_mut(parent) else {
@@ -2358,21 +2369,7 @@ pub(super) fn insert_tree_node_inner(
             return Err(Exception::throw_type(ctx, "no document"));
         };
         if parsed.document.is_fragment(node.node) {
-            parsed
-                .document
-                .base
-                .get_node(node.node)
-                .map(|backing| {
-                    backing
-                        .children
-                        .iter()
-                        .map(|child| NodeId {
-                            document: node.document,
-                            node: *child,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            fragment_children(&parsed.document, node)
         } else {
             vec![node]
         }

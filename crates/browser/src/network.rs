@@ -12,7 +12,10 @@ use net::{
     Agent, AgentOptions, InitiatorKind, Method, Request, UserAgent, isomorphic_decode,
     isomorphic_encode,
 };
-use renderer::{BodyDelivery, DialFailure, DialKind, DialOutcome, DialRequest, RequestCache};
+use renderer::{
+    BodyDelivery, DialFailure, DialKind, DialOutcome, DialRequest, RequestCache, ResponseBody,
+    StreamId,
+};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
@@ -69,10 +72,16 @@ impl Drop for KeepaliveReservation {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
-    method: String,
+    method: net::Method,
+    /// The request URL's canonical serialization. The dial parses it into a
+    /// `Url` on the way out; a key built before that would only turn the same
+    /// parse failure into a second, hidden one.
     url: String,
-    credentials: String,
-    initiator: String,
+    /// The CORS mode's credentials, when the dial carries a request policy.
+    /// `None` is a navigation or subresource dial, which never shares a cache
+    /// entry with a page request.
+    credentials: Option<net::cors::CredentialsMode>,
+    initiator: url::Origin,
     partition: RendererAssignmentId,
 }
 
@@ -101,7 +110,7 @@ enum CacheDecision {
 }
 
 /// The answer from one dial once the response head is in.
-enum DialHead {
+enum DialProgress {
     /// The dial has its answer: a refused redirect or a 304 merged into the
     /// stored entry.
     Done(Box<DialOutcome>),
@@ -110,6 +119,40 @@ enum DialHead {
         response: Box<net::Response>,
         permits: DialPermits,
     },
+}
+
+/// Everything a dial outcome reports except its body. Each delivery path
+/// fills in the body it actually has, so a streamed outcome is never built
+/// from an empty buffered one
+/// (<https://fetch.spec.whatwg.org/#concept-response>).
+struct DialHead {
+    status: u16,
+    status_text: String,
+    final_url: String,
+    content_type: Option<String>,
+    headers: Vec<(String, String)>,
+    response_type: net::cors::ResponseType,
+    crossed_origin: bool,
+    redirect_count: u32,
+    referrer: Option<String>,
+}
+
+impl DialHead {
+    /// The outcome this head answers with, once its body is known.
+    fn into_outcome(self, body: ResponseBody) -> DialOutcome {
+        DialOutcome {
+            status: self.status,
+            status_text: self.status_text,
+            final_url: self.final_url,
+            content_type: self.content_type,
+            headers: self.headers,
+            body,
+            response_type: self.response_type,
+            crossed_origin: self.crossed_origin,
+            redirect_count: self.redirect_count,
+            referrer: self.referrer,
+        }
+    }
 }
 
 /// The browser-wide and per-tab permits one dial holds until its body is done.
@@ -123,18 +166,28 @@ const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 const DEFAULT_USER_AGENT: UserAgent = UserAgent::from_static(crate::USER_AGENT);
 
+/// The bytes a cache entry holds. Only buffered bodies are ever stored: a
+/// streamed response is buffered into the store as it arrives, and an
+/// undecodable one has nothing to reuse.
+fn stored_bytes(outcome: &DialOutcome) -> usize {
+    match &outcome.body {
+        ResponseBody::Bytes(bytes) => bytes.len(),
+        ResponseBody::Undecodable | ResponseBody::Streamed(_) => 0,
+    }
+}
+
 fn insert_cached(
     cache: &mut HashMap<CacheKey, CachedResponse>,
     key: CacheKey,
     entry: CachedResponse,
 ) {
-    let body_len = entry.outcome.body.as_ref().map_or(0, Vec::len);
+    let body_len = stored_bytes(&entry.outcome);
     if body_len > renderer::MAX_RESPONSE_BODY_BYTES {
         return;
     }
     let mut total = cache
         .values()
-        .map(|entry| entry.outcome.body.as_ref().map_or(0, Vec::len))
+        .map(|entry| stored_bytes(&entry.outcome))
         .sum::<usize>();
     while cache.len() >= CACHE_MAX_ENTRIES || total.saturating_add(body_len) > CACHE_MAX_BYTES {
         let Some(oldest) = cache
@@ -145,7 +198,7 @@ fn insert_cached(
             break;
         };
         if let Some(removed) = cache.remove(&oldest) {
-            total = total.saturating_sub(removed.outcome.body.as_ref().map_or(0, Vec::len));
+            total = total.saturating_sub(stored_bytes(&removed.outcome));
         }
     }
     cache.insert(key, entry);
@@ -160,28 +213,28 @@ enum StreamMessage {
 /// Chunks a body task may buffer ahead of the renderer's next read.
 const STREAM_CHUNK_DEPTH: usize = 16;
 
-struct StreamState {
-    rx: tokio::sync::mpsc::Receiver<StreamMessage>,
-}
-
-#[derive(Clone)]
 struct StreamEntry {
     owner: RendererAssignmentId,
-    state: Arc<tokio::sync::Mutex<StreamState>>,
-    task: Arc<tokio::task::JoinHandle<()>>,
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<StreamMessage>>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-type StreamMap = Arc<Mutex<HashMap<u64, StreamEntry>>>;
+type StreamMap = Arc<Mutex<HashMap<StreamId, StreamEntry>>>;
+
+/// Aborts the body task of a stream removed from the table, so the task stops
+/// reading and releases its dial permits.
+fn abort_stream(entry: Option<StreamEntry>) {
+    if let Some(entry) = entry {
+        entry.task.abort();
+    }
+}
 
 fn cache_key(request: &DialRequest, initiator: &Url, partition: RendererAssignmentId) -> CacheKey {
     CacheKey {
         method: request.method.clone(),
         url: request.url.clone(),
-        credentials: request.cors.map_or_else(
-            || "none".to_owned(),
-            |cors| format!("{:?}", cors.credentials),
-        ),
-        initiator: initiator.origin().ascii_serialization(),
+        credentials: request.cors.map(|cors| cors.credentials),
+        initiator: initiator.origin(),
         partition,
     }
 }
@@ -204,58 +257,68 @@ fn response_forbids_storage(outcome: &DialOutcome) -> bool {
 }
 
 fn vary_matches(entry: &CachedResponse, request: &DialRequest) -> bool {
-    let request_header = |name: &str| {
-        request
+    let vary = net::get_decode_split_decoded(
+        entry
+            .outcome
             .headers
             .iter()
-            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        "vary",
+    );
+    let Some(vary) = vary else {
+        return true;
     };
-    entry
-        .outcome
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
-        .flat_map(|(_, value)| value.split(','))
-        .map(str::trim)
-        .filter(|field| !field.is_empty())
-        .all(|field| {
-            if field == "*" {
-                return false;
-            }
-            let stored = entry
-                .request_headers
-                .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case(field))
-                .map(|(_, value)| value.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            stored == request_header(field)
-        })
+    vary.iter().filter(|field| !field.is_empty()).all(|field| {
+        if field == "*" {
+            return false;
+        }
+        let stored = combined_request_header(&entry.request_headers, field);
+        stored == combined_request_header(&request.headers, field)
+    })
+}
+
+/// Every value of `name` in a decoded header list joined with `", "`, the way
+/// getting a header does
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get>).
+fn combined_request_header(headers: &[(String, String)], name: &str) -> Option<String> {
+    net::combined_header(
+        headers
+            .iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str()),
+    )
 }
 
 fn fresh(entry: &CachedResponse) -> bool {
     let age = entry.stored_at.elapsed().as_secs();
     let mut saw_max_age = false;
-    for (name, value) in &entry.outcome.headers {
-        if !name.eq_ignore_ascii_case("cache-control") {
+    let cache_control = net::get_decode_split_decoded(
+        entry
+            .outcome
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        "cache-control",
+    );
+    for directive in cache_control.iter().flatten() {
+        let Some((name, value)) = directive.split_once('=') else {
             continue;
-        }
-        for directive in value.split(',') {
-            let Some((name, value)) = directive.trim().split_once('=') else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case("max-age") {
-                saw_max_age = true;
-                if value
-                    .trim()
-                    .parse::<u64>()
-                    .is_ok_and(|max_age| age <= max_age)
-                {
-                    return true;
-                }
+        };
+        if name
+            .trim_matches([' ', '\t'])
+            .eq_ignore_ascii_case("max-age")
+        {
+            saw_max_age = true;
+            // Freshness lasts for `max-age` seconds from the store, so an
+            // entry stored at second 0 is stale once the whole second has
+            // passed: at `age == max_age` the lifetime is spent
+            // (<https://www.rfc-editor.org/rfc/rfc9111#section-4.2>).
+            if value
+                .trim_matches([' ', '\t'])
+                .parse::<u64>()
+                .is_ok_and(|max_age| age < max_age)
+            {
+                return true;
             }
         }
     }
@@ -300,9 +363,8 @@ fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOut
 }
 
 /// The shared head of a response as the renderer sees it: the header filter
-/// and the outcome fields both dial paths report, with an empty body and no
-/// stream.
-fn response_head(request: &DialRequest, response: &net::Response) -> DialOutcome {
+/// and the outcome fields both dial paths report, without a body.
+fn response_head(request: &DialRequest, response: &net::Response) -> DialHead {
     let response_type = response.response_type();
     let headers = response
         .headers()
@@ -314,7 +376,7 @@ fn response_head(request: &DialRequest, response: &net::Response) -> DialOutcome
         })
         .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
         .collect();
-    DialOutcome {
+    DialHead {
         status: if response_type.is_opaque() {
             0
         } else {
@@ -331,21 +393,23 @@ fn response_head(request: &DialRequest, response: &net::Response) -> DialOutcome
         },
         content_type: content_type_header(response.headers()),
         headers,
-        body: Ok(Vec::new()),
         response_type,
         crossed_origin: response.crossed_origin(),
         redirect_count: response.redirect_count(),
         referrer: response.referrer().map(ToString::to_string),
-        stream: None,
     }
 }
 
 fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: RequestCache) -> bool {
     request.kind == DialKind::JsFetch
         && !has_page_conditional(request)
-        && request.method.eq_ignore_ascii_case("GET")
+        && request.method == net::Method::GET
+        // A body that failed to decode has nothing to reuse. Storing it would
+        // replay the failure on every hit and every 304 merge, and a
+        // transient truncation would become permanent
+        // (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+        && !matches!(outcome.body, ResponseBody::Undecodable)
         && (200..300).contains(&outcome.status)
-        && outcome.body.is_ok()
         // An opaque response has no readable body and cannot satisfy a later
         // CORS request, so keeping it only creates a response-type mismatch.
         && !outcome.response_type.is_opaque()
@@ -630,28 +694,34 @@ impl TabNetworkHandle {
                 .send_head(request, initiator, stored.as_ref(), etag.as_deref())
                 .await?
             {
-                DialHead::Done(outcome) => {
+                DialProgress::Done(outcome) => {
                     self.remember_response(request, initiator, owner, mode, &outcome);
                     Ok(*outcome)
                 }
-                DialHead::Response { response, permits } => match request.delivery {
-                    BodyDelivery::Discard => Ok(response_head(request, &response)),
+                DialProgress::Response { response, permits } => match request.delivery {
                     BodyDelivery::Buffer => {
                         let _permits = permits;
-                        let mut outcome = response_head(request, &response);
+                        let head = response_head(request, &response);
                         // An opaque response hides its body from the page.
-                        if !outcome.response_type.is_opaque() {
+                        let body = if head.response_type.is_opaque() {
+                            ResponseBody::Bytes(Vec::new())
+                        } else {
                             let mut reader =
                                 BodyReader::new(*response, request.integrity.clone(), true).await;
-                            outcome.body = loop {
+                            loop {
                                 match reader.next().await {
                                     BodyEvent::Chunk(_) => {}
-                                    BodyEvent::Done(body) => break Ok(body),
-                                    BodyEvent::DecodeError => break Err(renderer::BodyError),
+                                    BodyEvent::Done(body) => {
+                                        break ResponseBody::Bytes(body);
+                                    }
+                                    BodyEvent::DecodeError => {
+                                        break ResponseBody::Undecodable;
+                                    }
                                     BodyEvent::Failed(failure) => return Err(failure),
                                 }
-                            };
-                        }
+                            }
+                        };
+                        let outcome = head.into_outcome(body);
                         self.remember_response(request, initiator, owner, mode, &outcome);
                         Ok(outcome)
                     }
@@ -676,15 +746,19 @@ impl TabNetworkHandle {
         initiator: &Url,
         stored: Option<&CachedResponse>,
         etag: Option<&str>,
-    ) -> Result<DialHead, DialFailure> {
+    ) -> Result<DialProgress, DialFailure> {
         let deadline = Instant::now() + Self::dial_budget(request);
         let global = Self::acquire(&self.permits.global, deadline).await?;
         let tab = Self::acquire(&self.tab, deadline).await?;
         let mut outbound = self.build_outbound(request, initiator, deadline)?;
-        if let Some(etag) = etag {
+        if let Some(etag) = etag.and_then(net::isomorphic_encode) {
+            // A validator that cannot be written back as bytes is one the
+            // server sent outside the isomorphic range; skipping the
+            // conditional request is the only honest answer, since the stored
+            // entry still answers a 200.
             outbound
                 .headers
-                .insert("If-None-Match", etag.as_bytes().to_vec())
+                .insert("If-None-Match", etag)
                 .map_err(|_| DialFailure::Connect)?;
         }
         let blocked_redirect = watch_redirects(request, initiator, &mut outbound);
@@ -693,7 +767,7 @@ impl TabNetworkHandle {
             Err(error) => {
                 let done =
                     refused_redirect(&blocked_redirect).ok_or_else(|| dial_failure(&error))?;
-                return Ok(DialHead::Done(Box::new(done)));
+                return Ok(DialProgress::Done(Box::new(done)));
             }
         };
         if request.integrity.is_some() && response.response_type().is_opaque() {
@@ -702,12 +776,12 @@ impl TabNetworkHandle {
         if response.status() == 304
             && let Some(stored) = stored
         {
-            return Ok(DialHead::Done(Box::new(merge_not_modified(
+            return Ok(DialProgress::Done(Box::new(merge_not_modified(
                 &stored.outcome,
                 &response,
             ))));
         }
-        Ok(DialHead::Response {
+        Ok(DialProgress::Response {
             response: Box::new(response),
             permits: DialPermits {
                 _global: global,
@@ -727,28 +801,28 @@ impl TabNetworkHandle {
         response: net::Response,
         permits: DialPermits,
     ) -> DialOutcome {
-        let mut outcome = response_head(request, &response);
-        if outcome.response_type.is_opaque() {
-            return outcome;
+        let head = response_head(request, &response);
+        if head.response_type.is_opaque() {
+            return head.into_outcome(ResponseBody::Bytes(Vec::new()));
         }
+        let mut outcome = head.into_outcome(ResponseBody::Bytes(Vec::new()));
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHUNK_DEPTH);
-        let writer = StreamWriter {
-            store: should_store(request, &outcome, mode),
-            stored: outcome.clone(),
+        let store = should_store(request, &outcome, mode).then(|| PendingStore {
+            outcome: outcome.clone(),
             cache: Arc::clone(&self.cache),
-            cache_key: cache_key(request, initiator, owner),
+            key: cache_key(request, initiator, owner),
             request_headers: request.headers.clone(),
+        });
+        let task = spawn_stream_body(StreamJob {
+            response,
+            integrity: request.integrity.clone(),
+            store,
+            permits,
             kind: request.kind,
             url: request.url.clone(),
-        };
-        let task = Arc::new(spawn_stream_body(
-            response,
-            request.integrity.clone(),
-            writer,
-            permits,
             tx,
-        ));
-        let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        });
+        let id = StreamId::mint(self.next_stream.fetch_add(1, Ordering::Relaxed));
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -756,33 +830,31 @@ impl TabNetworkHandle {
                 id,
                 StreamEntry {
                     owner,
-                    state: Arc::new(tokio::sync::Mutex::new(StreamState { rx })),
+                    rx: Arc::new(tokio::sync::Mutex::new(rx)),
                     task,
                 },
             );
-        outcome.stream = Some(id);
+        outcome.body = ResponseBody::Streamed(id);
         outcome
     }
 
     pub(crate) async fn read_stream(
         &self,
         owner: RendererAssignmentId,
-        id: u64,
+        id: StreamId,
     ) -> Result<Option<Vec<u8>>, DialFailure> {
-        let Some(entry) = self
+        let rx = self
             .streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&id)
-            .cloned()
-        else {
+            .filter(|entry| entry.owner == owner)
+            .map(|entry| Arc::clone(&entry.rx));
+        let Some(rx) = rx else {
             return Ok(None);
         };
-        if entry.owner != owner {
-            return Ok(None);
-        }
-        let mut state = entry.state.lock().await;
-        match state.rx.recv().await {
+        let mut rx = rx.lock().await;
+        match rx.recv().await {
             Some(StreamMessage::Chunk(bytes)) => Ok(Some(bytes)),
             Some(StreamMessage::End) | None => {
                 self.remove_stream(id);
@@ -795,42 +867,41 @@ impl TabNetworkHandle {
         }
     }
 
-    pub(crate) fn cancel_stream(&self, owner: RendererAssignmentId, id: u64) {
-        let matches_owner = self
+    pub(crate) fn cancel_stream(&self, owner: RendererAssignmentId, id: StreamId) {
+        use std::collections::hash_map::Entry;
+        let mut streams = self
             .streams
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-            .is_some_and(|entry| entry.owner == owner);
-        if matches_owner {
-            self.remove_stream(id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Entry::Occupied(entry) = streams.entry(id)
+            && entry.get().owner == owner
+        {
+            abort_stream(Some(entry.remove()));
         }
     }
 
-    fn remove_stream(&self, id: u64) {
-        let entry = self
+    fn remove_stream(&self, id: StreamId) {
+        let mut streams = self
             .streams
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
-        if let Some(entry) = entry {
-            entry.task.abort();
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        abort_stream(streams.remove(&id));
     }
 
     /// Aborts every stream an assignment owns, so a released renderer leaves
     /// no body task reading into memory for nobody.
     pub(crate) fn release_streams(&self, owner: RendererAssignmentId) {
-        let ids: Vec<u64> = self
+        let mut streams = self
             .streams
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let abandoned: Vec<StreamId> = streams
             .iter()
             .filter(|(_, entry)| entry.owner == owner)
-            .map(|(&id, _)| id)
+            .map(|(id, _)| *id)
             .collect();
-        for id in ids {
-            self.remove_stream(id);
+        for id in abandoned {
+            abort_stream(streams.remove(&id));
         }
     }
 
@@ -868,11 +939,10 @@ impl TabNetworkHandle {
         let Some(integrity) = request.integrity.as_deref() else {
             return true;
         };
-        entry
-            .outcome
-            .body
-            .as_ref()
-            .is_ok_and(|body| renderer::integrity_verifies(integrity, body))
+        match &entry.outcome.body {
+            ResponseBody::Bytes(body) => renderer::integrity_verifies(integrity, body),
+            ResponseBody::Undecodable | ResponseBody::Streamed(_) => false,
+        }
     }
 
     fn cached_hit(
@@ -1053,14 +1123,8 @@ fn outbound_request(
     sheets: &HashSet<Url>,
 ) -> Result<Request, DialFailure> {
     let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
-    let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
     // https://fetch.spec.whatwg.org/#forbidden-method
-    if request.kind == DialKind::JsFetch
-        && matches!(
-            method.as_str().to_ascii_uppercase().as_str(),
-            "CONNECT" | "TRACE" | "TRACK"
-        )
-    {
+    if request.kind == DialKind::JsFetch && request.method.is_forbidden() {
         return Err(DialFailure::Connect);
     }
     // A `no-cors` request may only use CORS-safelisted methods and headers:
@@ -1073,10 +1137,10 @@ fn outbound_request(
             .cors
             .as_ref()
             .is_some_and(|cors| cors.mode == net::cors::RequestMode::NoCors);
-    if no_cors && !net::cors::is_cors_safelisted_method(&method) {
+    if no_cors && !net::cors::is_cors_safelisted_method(&request.method) {
         return Err(DialFailure::Connect);
     }
-    let mut outbound = Request::new(method, url);
+    let mut outbound = Request::new(request.method.clone(), url);
     apply_cors(request, initiator, &mut outbound);
     if let Some(content_type) = &request.content_type {
         let content_type = isomorphic_encode(content_type).ok_or(DialFailure::Connect)?;
@@ -1109,10 +1173,7 @@ fn outbound_request(
         DialKind::FrameLoad => "iframe",
         DialKind::CspReport => "report",
     };
-    outbound
-        .headers
-        .insert("Sec-Fetch-Dest", destination.as_bytes().to_vec())
-        .map_err(|_| DialFailure::Connect)?;
+    static_header(&mut outbound, "Sec-Fetch-Dest", destination);
     if request.kind == DialKind::JsFetch {
         let mode = request
             .cors
@@ -1122,10 +1183,7 @@ fn outbound_request(
                 net::cors::RequestMode::SameOrigin => "same-origin",
                 net::cors::RequestMode::Cors | net::cors::RequestMode::Navigate => "cors",
             });
-        outbound
-            .headers
-            .insert("Sec-Fetch-Mode", mode.as_bytes().to_vec())
-            .map_err(|_| DialFailure::Connect)?;
+        static_header(&mut outbound, "Sec-Fetch-Mode", mode);
     }
     if !request.body.is_empty() {
         outbound.body = Some(request.body.clone());
@@ -1199,14 +1257,12 @@ fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
     };
 }
 
-struct StreamWriter {
-    store: bool,
-    stored: DialOutcome,
+/// The cache write a streamed body performs once its bytes are complete.
+struct PendingStore {
+    outcome: DialOutcome,
     cache: ResponseCache,
-    cache_key: CacheKey,
+    key: CacheKey,
     request_headers: Vec<(String, String)>,
-    kind: DialKind,
-    url: String,
 }
 
 /// One event from [`BodyReader`].
@@ -1269,25 +1325,31 @@ impl BodyReader {
     }
 }
 
-fn spawn_stream_body(
+/// Everything one streamed body task owns until its bytes are done: the
+/// response, the permits it borrows, and the cache write it may finish.
+struct StreamJob {
     response: net::Response,
     integrity: Option<String>,
-    writer: StreamWriter,
+    store: Option<PendingStore>,
     permits: DialPermits,
+    kind: DialKind,
+    url: String,
     tx: tokio::sync::mpsc::Sender<StreamMessage>,
-) -> tokio::task::JoinHandle<()> {
+}
+
+fn spawn_stream_body(job: StreamJob) -> tokio::task::JoinHandle<()> {
+    let StreamJob {
+        response,
+        integrity,
+        store,
+        permits,
+        kind,
+        url,
+        tx,
+    } = job;
     tokio::spawn(async move {
         let _permits = permits;
-        let StreamWriter {
-            store,
-            stored,
-            cache,
-            cache_key,
-            request_headers,
-            kind,
-            url,
-        } = writer;
-        let collect = store || integrity.is_some();
+        let collect = store.is_some() || integrity.is_some();
         let mut reader = BodyReader::new(response, integrity, collect).await;
         loop {
             match reader.next().await {
@@ -1297,11 +1359,14 @@ fn spawn_stream_body(
                     }
                 }
                 BodyEvent::Done(body) => {
-                    if store {
-                        let mut stored = stored;
-                        stored.body = Ok(body);
-                        stored.stream = None;
-                        store_response(&cache, cache_key, stored, request_headers);
+                    if let Some(mut store) = store {
+                        store.outcome.body = ResponseBody::Bytes(body);
+                        store_response(
+                            &store.cache,
+                            store.key,
+                            store.outcome,
+                            store.request_headers,
+                        );
                     }
                     let _ = tx.send(StreamMessage::End).await;
                     logging::trace!(target: "browser::net", "stream done {kind:?} {url}");
@@ -1360,12 +1425,11 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         final_url: url.to_string(),
         content_type: None,
         headers: Vec::new(),
-        body: Ok(Vec::new()),
+        body: ResponseBody::Bytes(Vec::new()),
         response_type: net::cors::ResponseType::Basic,
         crossed_origin: false,
         redirect_count: 0,
         referrer: None,
-        stream: None,
     })
 }
 
@@ -1393,16 +1457,16 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
 /// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>,
 /// <https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
 fn chrome_navigation_request(request: &mut Request, url: &Url) {
-    identity_header(request, "Upgrade-Insecure-Requests", "1");
-    identity_header(
+    static_header(request, "Upgrade-Insecure-Requests", "1");
+    static_header(
         request,
         "Accept",
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     );
-    identity_header(request, "Sec-Fetch-Site", "none");
-    identity_header(request, "Sec-Fetch-Mode", "navigate");
-    identity_header(request, "Sec-Fetch-User", "?1");
-    identity_header(request, "Sec-Fetch-Dest", "document");
+    static_header(request, "Sec-Fetch-Site", "none");
+    static_header(request, "Sec-Fetch-Mode", "navigate");
+    static_header(request, "Sec-Fetch-User", "?1");
+    static_header(request, "Sec-Fetch-Dest", "document");
     if net::is_potentially_trustworthy(url) {
         for (name, value) in [
             ("Sec-CH-UA", crate::SEC_CH_UA),
@@ -1413,20 +1477,24 @@ fn chrome_navigation_request(request: &mut Request, url: &Url) {
                 crate::SEC_CH_PREFERS_COLOR_SCHEME,
             ),
         ] {
-            identity_header(request, name, value);
+            static_header(request, name, value);
         }
     }
 }
 
-fn identity_header(request: &mut Request, name: &str, value: &str) {
+/// Sets a request header this process chose, not the page. The value is a
+/// static HTTP token, so a rejected one is a programming error, and the panic
+/// names the header that has none.
+fn static_header(request: &mut Request, name: &str, value: &str) {
     request
         .headers
         .insert(name, value)
-        .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes");
+        .unwrap_or_else(|_| panic!("{name}: {value:?} is not a header value"));
 }
 
-/// Every `Content-Type` value from the response as one string: the values
-/// joined with `", "`, each byte the same code point
+/// Every `Content-Type` value from the response as one string, the way
+/// getting a list header does: values combined with `", "`, each byte the
+/// same code point
 /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>,
 /// <https://infra.spec.whatwg.org/#isomorphic-decode>). The renderer extracts
 /// the MIME type from it
@@ -1436,7 +1504,7 @@ fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
         .get_all("content-type")
         .map(isomorphic_decode)
         .collect();
-    (!values.is_empty()).then(|| values.join(", "))
+    net::combined_header(values.iter().map(String::as_str))
 }
 
 #[cfg(test)]
@@ -1450,7 +1518,7 @@ mod tests {
             url: url.to_owned(),
             initiator: "http://a.test/page".to_owned(),
             delivery: BodyDelivery::Buffer,
-            method: "GET".to_owned(),
+            method: net::Method::GET,
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
@@ -1479,12 +1547,11 @@ mod tests {
                 final_url: "http://a.test/".to_owned(),
                 content_type: None,
                 headers: Vec::new(),
-                body: Ok(Vec::new()),
+                body: ResponseBody::Bytes(Vec::new()),
                 response_type,
                 crossed_origin: false,
                 redirect_count: 0,
                 referrer: None,
-                stream: None,
             },
             stored_at: Instant::now(),
             request_headers: Vec::new(),
@@ -1639,7 +1706,9 @@ mod tests {
             .dial_request(&stream_request, &initiator, owner)
             .await
             .expect("stream head");
-        let stream = outcome.stream.expect("stream id");
+        let ResponseBody::Streamed(stream) = outcome.body else {
+            panic!("the outcome is a stream");
+        };
         assert_eq!(
             handle.permits.global.available_permits(),
             0,
@@ -1667,7 +1736,147 @@ mod tests {
         .await
         .expect("the next dial gets the released permit")
         .expect("next dial");
-        assert_eq!(next.body.expect("body"), b"ok");
+        assert!(
+            matches!(&next.body, ResponseBody::Bytes(body) if body == b"ok"),
+            "the next dial reads its body"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn an_undecodable_body_is_not_stored() {
+        let request = js_fetch(net::cors::RequestMode::SameOrigin, "http://a.test/data");
+        let mut outcome = cached(net::cors::ResponseType::Basic).outcome;
+        assert!(should_store(&request, &outcome, RequestCache::Default));
+        outcome.body = ResponseBody::Undecodable;
+        assert!(
+            !should_store(&request, &outcome, RequestCache::Default),
+            "a decode failure has nothing to reuse, so a hit would replay it"
+        );
+    }
+
+    #[test]
+    fn vary_star_never_matches_and_a_named_field_must_agree() {
+        let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        request.headers = vec![("accept".to_owned(), "text/html".to_owned())];
+        let mut entry = cached(net::cors::ResponseType::Basic);
+        entry.request_headers = request.headers.clone();
+        assert!(
+            vary_matches(&entry, &request),
+            "a stored response without Vary matches"
+        );
+
+        entry.outcome.headers = vec![("vary".to_owned(), "*".to_owned())];
+        assert!(!vary_matches(&entry, &request));
+
+        entry.outcome.headers = vec![("Vary".to_owned(), "Accept".to_owned())];
+        assert!(vary_matches(&entry, &request));
+        request.headers = vec![("accept".to_owned(), "application/json".to_owned())];
+        assert!(
+            !vary_matches(&entry, &request),
+            "a different request header selects a different representation"
+        );
+    }
+
+    #[test]
+    fn fresh_reads_max_age_through_the_header_splitter() {
+        let mut entry = cached(net::cors::ResponseType::Basic);
+        entry.outcome.headers = vec![(
+            "cache-control".to_owned(),
+            "private=\"a,b\", max-age=60".to_owned(),
+        )];
+        assert!(fresh(&entry));
+
+        entry.outcome.headers = vec![("cache-control".to_owned(), "max-age=1".to_owned())];
+        entry.stored_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("two seconds before now");
+        assert!(!fresh(&entry), "an expired max-age is stale");
+
+        // `age` counts whole seconds, so `max-age=0` must not stay fresh for
+        // the first second of its life
+        // (<https://www.rfc-editor.org/rfc/rfc9111#section-4.2>).
+        entry.outcome.headers = vec![("cache-control".to_owned(), "max-age=0".to_owned())];
+        entry.stored_at = Instant::now();
+        assert!(!fresh(&entry), "a zero lifetime is spent on arrival");
+
+        entry.outcome.headers = vec![(
+            "expires".to_owned(),
+            "Thu, 01 Jan 2099 00:00:00 GMT".to_owned(),
+        )];
+        assert!(fresh(&entry), "a future Expires is fresh");
+    }
+
+    /// A stored `ETag` holds isomorphic-decoded bytes, so writing it back must
+    /// keep one byte per code point. UTF-8 would send `0xC3 0xA9` where the
+    /// server sent `0xE9`, and every revalidation would answer 200.
+    #[tokio::test]
+    async fn revalidation_sends_a_non_ascii_etag_as_one_byte_per_code_point() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let context = NetworkContext::new(AgentOptions::default());
+        let handle = context.tab_handle();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let origin = format!("http://{address}");
+        let (replayed_tx, replayed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut replayed_tx = Some(replayed_tx);
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = [0u8; 2048];
+                let read = socket.read(&mut buffer).await.expect("request");
+                if index == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nETag: \"\xE9\"\r\nContent-Length: 2\r\n\r\nhi",
+                        )
+                        .await
+                        .expect("first response");
+                } else {
+                    let _ = replayed_tx
+                        .take()
+                        .expect("one replay")
+                        .send(buffer[..read].to_vec());
+                    socket
+                        .write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"\xE9\"\r\n\r\n")
+                        .await
+                        .expect("304");
+                }
+            }
+        });
+        let initiator = Url::parse(&format!("{origin}/page")).expect("page URL");
+        let owner = RendererAssignmentId::new(1);
+        let mut request = js_fetch(
+            net::cors::RequestMode::SameOrigin,
+            &format!("{origin}/etag"),
+        );
+        request.initiator = initiator.origin().ascii_serialization();
+        request.referrer_url = initiator.to_string();
+        let first = handle
+            .dial_request(&request, &initiator, owner)
+            .await
+            .expect("first dial");
+        assert_eq!(first.status, 200);
+
+        let revalidated = handle
+            .dial_request(&request, &initiator, owner)
+            .await
+            .expect("revalidation");
+        assert_eq!(revalidated.status, 200, "a 304 merges into the stored head");
+        assert_eq!(stored_bytes(&revalidated), 2);
+        assert!(matches!(&revalidated.body, ResponseBody::Bytes(body) if body == b"hi"));
+
+        let replayed = replayed_rx.await.expect("second request");
+        assert!(
+            replayed
+                .windows(b"if-none-match: \"\xE9\"".len())
+                .any(|window| window == b"if-none-match: \"\xE9\""),
+            "the validator went back as the bytes the server sent: {:?}",
+            String::from_utf8_lossy(&replayed)
+        );
         server.abort();
     }
 
@@ -1728,7 +1937,7 @@ mod tests {
             .collect();
         for (index, key) in keys.iter().enumerate() {
             let mut entry = cached(net::cors::ResponseType::Basic);
-            entry.outcome.body = Ok(vec![0; renderer::MAX_RESPONSE_BODY_BYTES]);
+            entry.outcome.body = ResponseBody::Bytes(vec![0; renderer::MAX_RESPONSE_BODY_BYTES]);
             entry.stored_at =
                 Instant::now() + Duration::from_secs(u64::try_from(index).expect("entry index"));
             insert_cached(&mut cache, key.clone(), entry);

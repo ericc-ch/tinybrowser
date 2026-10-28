@@ -695,11 +695,11 @@ fn policy_inline_violation(policy: &Policy, inline: &InlineScript<'_>) -> bool {
 /// extracted (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
 #[must_use]
 pub(crate) fn combined_header(headers: &[(String, String)], name: &str) -> Option<String> {
-    net::combined_header(
+    net::combined_header_in(
         headers
             .iter()
-            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str()),
+            .map(|(header, value)| (header.as_str(), value.as_str())),
+        name,
     )
 }
 

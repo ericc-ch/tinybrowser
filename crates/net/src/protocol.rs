@@ -3,14 +3,18 @@ use std::fmt;
 
 use hyper::header::{HeaderName, HeaderValue};
 
+/// Joins every occurrence of a list header's values with `", "`, the way
+/// combining a header does
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-combine>).
+///
+/// A present header with an empty value is one empty member, not an absent
+/// header: "get, decode, and split" of `A: nosniff` plus `A:` yields
+/// «`nosniff`, `""`» (<https://fetch.spec.whatwg.org/#example-header-value-get-decode-and-split>).
+/// `None` means no occurrence of the header at all.
 #[must_use]
-/// Joins every occurrence of a list header's values with `", "`, the way a
-/// list header is extracted
-/// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
 pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
     let values: Vec<&str> = values
         .map(|value| value.trim_matches([' ', '\t']))
-        .filter(|value| !value.is_empty())
         .collect();
     if values.is_empty() {
         None
@@ -19,64 +23,68 @@ pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<Stri
     }
 }
 
+/// Joins every value of `name` in a decoded header list with `", "`, or
+/// `None` when the header is absent
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get>).
+#[must_use]
+pub fn combined_header_in<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    name: &str,
+) -> Option<String> {
+    combined_header(
+        headers
+            .into_iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value),
+    )
+}
+
 /// Splits one header value into its members
 /// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
 ///
-/// Bytes are isomorphic-decoded, so `0x80..=0xFF` stay the same code points.
 /// A comma inside a quoted string does not split, the quoted text keeps its
 /// quotes and escapes, and every member is stripped of leading and trailing
-/// HTTP tab or space.
+/// HTTP tab or space. Values are isomorphic-decoded, so a byte above `0x7F` is
+/// the code point with the same number
+/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
 #[must_use]
-pub fn split_header_value(value: &[u8]) -> Vec<String> {
-    let input: Vec<char> = value.iter().copied().map(char::from).collect();
+pub fn split_header_value(value: &str) -> Vec<String> {
     let mut values = Vec::new();
     let mut member = String::new();
-    let mut position = 0;
-    loop {
-        while position < input.len() && input[position] != '"' && input[position] != ',' {
-            member.push(input[position]);
-            position += 1;
-        }
-        if position < input.len() && input[position] == '"' {
-            collect_quoted_string(&input, &mut position, &mut member);
-            if position < input.len() {
-                continue;
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            ',' => {
+                values.push(member.trim_matches([' ', '\t']).to_owned());
+                member.clear();
             }
+            '"' => {
+                member.push(character);
+                collect_quoted_string(&mut characters, &mut member);
+            }
+            _ => member.push(character),
         }
-        values.push(member.trim_matches([' ', '\t']).to_owned());
-        member.clear();
-        if position >= input.len() {
-            return values;
-        }
-        position += 1;
     }
+    values.push(member.trim_matches([' ', '\t']).to_owned());
+    values
 }
 
 /// Appends one HTTP quoted string, quotes and escapes included, and leaves
-/// `position` just past it
+/// the iterator just past it
 /// (<https://fetch.spec.whatwg.org/#collect-an-http-quoted-string>).
-fn collect_quoted_string(input: &[char], position: &mut usize, member: &mut String) {
-    member.push(input[*position]);
-    *position += 1;
-    loop {
-        while *position < input.len() && input[*position] != '"' && input[*position] != '\\' {
-            member.push(input[*position]);
-            *position += 1;
-        }
-        if *position >= input.len() {
-            return;
-        }
-        let quote_or_backslash = input[*position];
-        member.push(quote_or_backslash);
-        *position += 1;
-        if quote_or_backslash == '\\' {
-            if *position >= input.len() {
-                return;
+///
+/// An unterminated string runs to the end of the value, escapes included.
+fn collect_quoted_string(characters: &mut std::str::Chars<'_>, member: &mut String) {
+    while let Some(character) = characters.next() {
+        member.push(character);
+        match character {
+            '"' => return,
+            '\\' => {
+                if let Some(escaped) = characters.next() {
+                    member.push(escaped);
+                }
             }
-            member.push(input[*position]);
-            *position += 1;
-        } else {
-            return;
+            _ => {}
         }
     }
 }
@@ -119,7 +127,20 @@ pub fn get_decode_split(headers: &HeaderMap, name: &str) -> Option<Vec<String>> 
         combined.extend_from_slice(value);
         found = true;
     }
-    found.then(|| split_header_value(&combined))
+    found.then(|| split_header_value(&isomorphic_decode(&combined)))
+}
+
+/// Gets `name` from an already isomorphic-decoded header list and splits it
+/// into members, combining repeated fields with `", "` first
+/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
+///
+/// `None` means the header is absent.
+#[must_use]
+pub fn get_decode_split_decoded<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    name: &str,
+) -> Option<Vec<String>> {
+    combined_header_in(headers, name).map(|value| split_header_value(&value))
 }
 
 pub(crate) fn is_token_char(c: char) -> bool {
@@ -286,7 +307,11 @@ pub struct InvalidMethod(Box<str>);
 /// `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, and `OPTIONS` are stored in
 /// canonical uppercase. `PATCH` stays uppercase only when the input was already
 /// `PATCH`. Any other valid token is kept as typed.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// The wire spelling is the text [`Method::parse`] accepts, so a decoded
+/// method is always a parsed method and neither side re-checks the grammar.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Method(Cow<'static, str>);
 
 impl Method {
@@ -337,6 +362,43 @@ impl Method {
         matches!(self.0.as_ref(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
     }
 
+    /// Whether this method is idempotent per
+    /// [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2):
+    /// `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`, matched
+    /// case-sensitively like [`Method::is_safe`].
+    ///
+    /// ```
+    /// use net::Method;
+    ///
+    /// assert!(Method::PUT.is_idempotent());
+    /// assert!(!Method::POST.is_idempotent());
+    /// ```
+    #[must_use]
+    pub fn is_idempotent(&self) -> bool {
+        self.is_safe() || matches!(self.0.as_ref(), "PUT" | "DELETE")
+    }
+
+    /// Whether this method is forbidden to page scripts
+    /// (<https://fetch.spec.whatwg.org/#forbidden-method>).
+    ///
+    /// Unlike the RFC predicates above, Fetch defines this one as a
+    /// byte-case-insensitive match, because it rejects the spelling a page
+    /// typed before normalization.
+    ///
+    /// ```
+    /// use net::Method;
+    ///
+    /// assert!(Method::parse("TRACE").unwrap().is_forbidden());
+    /// assert!(Method::parse("trace").unwrap().is_forbidden());
+    /// assert!(!Method::POST.is_forbidden());
+    /// ```
+    #[must_use]
+    pub fn is_forbidden(&self) -> bool {
+        ["CONNECT", "TRACE", "TRACK"]
+            .iter()
+            .any(|forbidden| self.0.eq_ignore_ascii_case(forbidden))
+    }
+
     /// Wire spelling of this method.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -347,6 +409,20 @@ impl Method {
 impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<String> for Method {
+    type Error = InvalidMethod;
+
+    fn try_from(token: String) -> Result<Self, Self::Error> {
+        Self::parse(&token)
+    }
+}
+
+impl From<Method> for String {
+    fn from(method: Method) -> Self {
+        method.0.into_owned()
     }
 }
 
@@ -387,26 +463,25 @@ mod tests {
 
     #[test]
     fn splits_header_values_per_spec() {
-        assert_eq!(super::split_header_value(b"nosniff,"), ["nosniff", ""]);
-        assert_eq!(super::split_header_value(b""), [""]);
+        assert_eq!(super::split_header_value("nosniff,"), ["nosniff", ""]);
+        assert_eq!(super::split_header_value(""), [""]);
         assert_eq!(
-            super::split_header_value(b"text/html;\", x/x"),
+            super::split_header_value("text/html;\", x/x"),
             ["text/html;\", x/x"]
         );
         assert_eq!(
-            super::split_header_value(b"x/x;test=\"hi\",y/y"),
+            super::split_header_value("x/x;test=\"hi\",y/y"),
             ["x/x;test=\"hi\"", "y/y"]
         );
         assert_eq!(
-            super::split_header_value(b"x / x,,,1"),
+            super::split_header_value("x / x,,,1"),
             ["x / x", "", "", "1"]
         );
-        assert_eq!(super::split_header_value(b"\"1,2\", 3"), ["\"1,2\"", "3"]);
-        // Escaped quotes stay inside the member, so the comma does not split.
-        assert_eq!(
-            super::split_header_value(b"\"a\\\",b\",c"),
-            ["\"a\\\",b\"", "c"]
-        );
+        assert_eq!(super::split_header_value("\"1,2\", 3"), ["\"1,2\"", "3"]);
+        // An escaped comma stays inside the member. Without the escape
+        // branch the quoted string ends at the backslash and the comma
+        // splits, so this pins the branch itself.
+        assert_eq!(super::split_header_value("\"a\\,b\",c"), ["\"a\\,b\"", "c"]);
     }
 
     #[test]
@@ -419,5 +494,21 @@ mod tests {
             Some(vec!["a".to_owned(), "b".to_owned()])
         );
         assert_eq!(super::get_decode_split(&map, "x-missing"), None);
+    }
+
+    /// A present field with an empty value is one empty member. Fetch's own
+    /// table gives `A: nosniff` plus `A:` as «`nosniff`, `""`»
+    /// (<https://fetch.spec.whatwg.org/#example-header-value-get-decode-and-split>).
+    #[test]
+    fn combining_keeps_an_empty_field_value() {
+        assert_eq!(super::combined_header(std::iter::empty()), None);
+        assert_eq!(
+            super::combined_header(["nosniff", ""].into_iter()).as_deref(),
+            Some("nosniff, ")
+        );
+        assert_eq!(
+            super::split_header_value("nosniff, "),
+            ["nosniff".to_owned(), String::new()]
+        );
     }
 }

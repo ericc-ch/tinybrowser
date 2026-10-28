@@ -32,7 +32,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// `content_language` from mount, response-start, and dial outcomes. Version 11
 /// replaced JSON control payloads with postcard. Version 12 replaced
 /// response-start's flat metadata fields with one shared response head.
-pub const PROTOCOL_VERSION: u8 = 12;
+/// Version 13 folded a dial outcome's body and stream into one
+/// [`ResponseBody`](renderer::ResponseBody), made the request method a typed
+/// value, and renumbered `BodyDelivery` (now `Buffer` = 0, `Stream` = 1) with
+/// the removal of `Discard`.
+pub const PROTOCOL_VERSION: u8 = 13;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

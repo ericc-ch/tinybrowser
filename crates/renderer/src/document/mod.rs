@@ -233,7 +233,7 @@ impl QueuedDial {
                 initiator: initiator.ascii_serialization(),
                 referrer_url: referrer_url.to_string(),
                 delivery: crate::protocol::BodyDelivery::Buffer,
-                method: "GET".to_owned(),
+                method: net::Method::GET,
                 body: Vec::new(),
                 content_type: None,
                 headers: Vec::new(),
@@ -2878,7 +2878,7 @@ impl Document {
             &self.dial_initiator(),
             &self.referrer_url(),
         );
-        "POST".clone_into(&mut dial.req.method);
+        dial.req.method = net::Method::POST;
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
         self.queue_dial(dial);
@@ -3267,6 +3267,13 @@ impl Document {
                         None,
                     );
                 if blocked {
+                    // A streamed body's task holds the dial permits until the
+                    // renderer reads or cancels it, so cancel before dropping
+                    // the outcome
+                    // (<https://fetch.spec.whatwg.org/#concept-response-body>).
+                    if let crate::protocol::ResponseBody::Streamed(stream) = outcome.body {
+                        self.services.cancel_stream(stream);
+                    }
                     self.settle_js_fetch(id, None);
                 } else {
                     self.settle_js_fetch(id, Some(outcome));
@@ -3299,7 +3306,11 @@ impl Document {
                 // SRI verification fails the load like a network error:
                 // no execution, no `load` event, and no CSP violation
                 // (<https://www.w3.org/TR/SRI/#verify-integrity>).
-                let body = outcome.body.as_ref().ok();
+                let body = match &outcome.body {
+                    crate::protocol::ResponseBody::Bytes(body) => Some(body.as_slice()),
+                    crate::protocol::ResponseBody::Undecodable
+                    | crate::protocol::ResponseBody::Streamed(_) => None,
+                };
                 let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
                     body.is_some_and(|body| crate::csp::integrity_verifies(metadata, body))
                 });
@@ -3401,7 +3412,7 @@ impl Document {
         self.record_event(RendererEvent::Browser(BrowserEvent::Navigated {
             url: url.to_string(),
         }));
-        let Ok(body) = &outcome.body else {
+        let crate::protocol::ResponseBody::Bytes(body) = &outcome.body else {
             return;
         };
         // Set before the parse runs: the new document's own scripts read
@@ -3431,7 +3442,11 @@ impl Document {
             && destination.is_some_and(|destination| {
                 self.response_url_blocked(&outcome.final_url, request_url, destination, None)
             });
-        let body = outcome.body.as_ref().ok();
+        let body = match &outcome.body {
+            crate::protocol::ResponseBody::Bytes(body) => Some(body.as_slice()),
+            crate::protocol::ResponseBody::Undecodable
+            | crate::protocol::ResponseBody::Streamed(_) => None,
+        };
         let succeeded = !blocked && (200..300).contains(&outcome.status) && body.is_some();
         // A `no-cors` image stays clean only while the request stays on this
         // origin; one cross-origin hop makes the response opaque for the rest
@@ -3444,7 +3459,7 @@ impl Document {
             self.subresource_bytes.insert(
                 outcome.final_url.clone(),
                 SubresourceBody {
-                    bytes: body.clone(),
+                    bytes: body.to_vec(),
                     origin_clean,
                 },
             );
@@ -3486,7 +3501,7 @@ impl Document {
         if succeeded {
             Box::new(handler).bytes(
                 outcome.final_url.clone(),
-                blitz_traits::net::Bytes::from(body.cloned().unwrap_or_default()),
+                blitz_traits::net::Bytes::from(body.unwrap_or_default().to_vec()),
             );
             if destination == Some(crate::csp::Destination::Img) {
                 self.world

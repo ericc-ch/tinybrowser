@@ -1098,7 +1098,14 @@ impl JsNode {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
             if let Some(current) = current {
-                replace_parsed(&mut parsed, root_element, node, current);
+                drop(parsed);
+                drop(world);
+                let replacement = super::core::replace_target(ctx, root_element, node)?;
+                let world = world_rc.borrow();
+                let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                    return Err(Exception::throw_type(ctx, "no document"));
+                };
+                replace_parsed(&mut parsed, root_element, current, replacement);
                 drop(parsed);
                 drop(world);
                 fixup_focus_after_removal(ctx, current)?;
@@ -1788,7 +1795,7 @@ pub(in crate::js::bindings) fn parse_html_fragment_snapshots(
                         scratch
                             .base
                             .get_node(fragment)
-                            .map(|backing| backing.children.iter().copied().collect())
+                            .map(|node| node.children.iter().copied().collect())
                     })
                     .unwrap_or_default()
             }

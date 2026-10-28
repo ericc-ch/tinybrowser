@@ -19,7 +19,7 @@ use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
 use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
 use rquickjs::prelude::Opt;
-use rquickjs::{Array, Ctx, Object, Persistent, Result, TypedArray, Value};
+use rquickjs::{Array, Ctx, Exception, Object, Persistent, Result, TypedArray, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -266,6 +266,19 @@ pub(super) fn form_navigate<'js>(
     // on the way to that conclusion.
     let Some(owner) = owning_world(&ctx, node) else {
         return Ok(());
+    };
+    // A form submission is GET or POST; `method=dialog` never reaches the
+    // host, and the shim normalizes every other spelling to GET
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-method>).
+    let method = match method.as_str() {
+        "GET" => net::Method::GET,
+        "POST" => net::Method::POST,
+        other => {
+            return Err(Exception::throw_type(
+                &ctx,
+                &format!("form method: {other:?} is neither GET nor POST"),
+            ));
+        }
     };
     if focus::cannot_navigate(&owner.borrow(), node) {
         return Ok(());

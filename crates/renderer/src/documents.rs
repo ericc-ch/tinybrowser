@@ -30,11 +30,6 @@ pub struct SideTables {
     /// Whether any observer watches this document; unobserved mutations are
     /// not recorded.
     recording: bool,
-    /// Fragment backings: detached backing elements (for `createDocumentFragment`)
-    /// plus real `Fragment` nodes in the Blitz tree (such as template
-    /// contents). Membership decides the wrapper prototype and fragment-only
-    /// algorithms (serialization, insertion).
-    fragments: HashSet<blitz_traits::node_id::NodeId>,
     /// Processing-instruction attribute maps, keyed by node id. The id's
     /// slot version dies with the node, so a stale entry cannot be mistaken
     /// for a new node in the same slot. The tree holds the data; this map
@@ -173,28 +168,23 @@ impl BlitzDocument {
         self.side.recording = recording;
     }
 
-    /// Whether `id` backs a `DocumentFragment`: a flagged backing element
-    /// or a real `Fragment` node (such as template contents).
+    /// Whether `id` is a `DocumentFragment`: a fragment node or a shadow
+    /// root, which is one too
+    /// (<https://dom.spec.whatwg.org/#interface-documentfragment>,
+    /// <https://dom.spec.whatwg.org/#interface-shadowroot>).
     pub(crate) fn is_fragment(&self, id: blitz_traits::node_id::NodeId) -> bool {
-        self.side.fragments.contains(&id)
-            || self.base.get_node(id).is_some_and(|node| {
-                matches!(
-                    node.data,
-                    NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }
-                )
-            })
+        self.base.get_node(id).is_some_and(|node| {
+            matches!(
+                node.data,
+                NodeData::Fragment { .. } | NodeData::ShadowRoot { .. }
+            )
+        })
     }
 
-    /// Creates a detached backing element for a new `DocumentFragment`.
+    /// Creates a detached `DocumentFragment`
+    /// (<https://dom.spec.whatwg.org/#dom-document-createdocumentfragment>).
     pub(crate) fn create_fragment(&mut self) -> blitz_traits::node_id::NodeId {
-        let name = markup5ever::QualName::new(
-            None,
-            markup5ever::ns!(html),
-            markup5ever::LocalName::from("div"),
-        );
-        let backing = self.base.mutate().create_element(name, Vec::new());
-        self.side.fragments.insert(backing);
-        backing
+        self.base.mutate().create_fragment_node()
     }
 
     /// Creates a document type whose node document is this document

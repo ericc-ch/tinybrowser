@@ -31,6 +31,7 @@ use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use url::Url;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
 /// this is a last-resort wake-up if its reply path dies silently. A renderer
@@ -567,6 +568,24 @@ fn live_assignment(
     Ok(Some(assignment))
 }
 
+/// Runs one dial attempt, racing the process kill switch and this call's
+/// cancellation.
+async fn race_dial(
+    network: &crate::network::TabNetworkHandle,
+    request: &renderer::DialRequest,
+    initiator: &Url,
+    assignment: RendererAssignmentId,
+    mut kill: watch::Receiver<bool>,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<renderer::DialOutcome, renderer::DialFailure> {
+    tokio::select! {
+        biased;
+        _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
+        _ = cancel.changed() => Err(renderer::DialFailure::Cancelled),
+        result = network.dial_request(request, initiator, assignment) => result,
+    }
+}
+
 /// Whether `spec` names an opaque document's origin: its serialization is
 /// `null`, or it is a non-HTTP(S) URL whose origin is opaque. Opaque documents
 /// share their tab's renderer but never match its site lock, so their dials
@@ -628,7 +647,7 @@ async fn route_service_call(
             let worker_network = assignment.network.clone();
             let responder = context.responder.clone();
             let worker_kill = context.kill.clone();
-            let mut kill = context.kill.subscribe();
+            let kill = context.kill.subscribe();
             let (cancel_tx, cancel_rx) = watch::channel(false);
             context
                 .dials
@@ -644,37 +663,42 @@ async fn route_service_call(
             let dials = context.dials.clone();
             let registry = context.registry.clone();
             tokio::spawn(async move {
-                let mut cancel = cancel_rx;
-                let mut outcome = tokio::select! {
-                    biased;
-                    _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
-                    _ = cancel.changed() => Err(renderer::DialFailure::Cancelled),
-                    result = worker_network.dial_request(&request, &initiator, assignment_id) => result,
-                };
+                let mut outcome = race_dial(
+                    &worker_network,
+                    &request,
+                    &initiator,
+                    assignment_id,
+                    kill.clone(),
+                    cancel_rx.clone(),
+                )
+                .await;
                 // A 421 asks for a retry on a different connection, but only an
                 // idempotent method may be replayed
                 // (<https://www.rfc-editor.org/rfc/rfc9110#section-15.5.20>).
-                if is_idempotent(&request.method)
+                if request.method.is_idempotent()
                     && matches!(&outcome, Ok(head) if head.status == 421)
                 {
                     if let Ok(head) = &outcome
-                        && let Some(stream) = head.stream
+                        && let renderer::ResponseBody::Streamed(stream) = &head.body
                     {
-                        worker_network.cancel_stream(assignment_id, stream);
+                        worker_network.cancel_stream(assignment_id, *stream);
                     }
-                    outcome = tokio::select! {
-                        biased;
-                        _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
-                        _ = cancel.changed() => Err(renderer::DialFailure::Cancelled),
-                        result = worker_network.dial_request(&request, &initiator, assignment_id) => result,
-                    };
+                    outcome = race_dial(
+                        &worker_network,
+                        &request,
+                        &initiator,
+                        assignment_id,
+                        kill.clone(),
+                        cancel_rx.clone(),
+                    )
+                    .await;
                 }
                 // `release_streams` may have run while the dial was in flight.
                 if let Ok(head) = &outcome
-                    && let Some(stream) = head.stream
+                    && let renderer::ResponseBody::Streamed(stream) = &head.body
                     && registry.resolve(assignment_id).is_none()
                 {
-                    worker_network.cancel_stream(assignment_id, stream);
+                    worker_network.cancel_stream(assignment_id, *stream);
                 }
                 dials
                     .lock()
@@ -1329,14 +1353,6 @@ pub(crate) async fn spawn_process(
         assignments: AtomicUsize::new(0),
         _slot: slot,
     })
-}
-
-/// Methods a server may safely receive twice after a 421
-/// (<https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2>).
-fn is_idempotent(method: &str) -> bool {
-    ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"]
-        .iter()
-        .any(|candidate| method.eq_ignore_ascii_case(candidate))
 }
 
 async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {

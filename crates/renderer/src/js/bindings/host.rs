@@ -533,7 +533,6 @@ pub(crate) trait SharedClass {
 fn node_interface_matches(
     data: Option<&blitz_dom::NodeData>,
     xml_document: bool,
-    is_fragment: bool,
     interface: &str,
 ) -> Option<bool> {
     use blitz_dom::NodeData;
@@ -558,28 +557,23 @@ fn node_interface_matches(
             matches!(
                 data,
                 Some(NodeData::Fragment { .. } | NodeData::ShadowRoot { .. })
-            ) || (matches!(data, Some(NodeData::Element(_))) && is_fragment)
+            )
         }
         "ShadowRoot" => matches!(data, Some(NodeData::ShadowRoot { .. })),
-        // `DocumentFragment` implements neither `Element` nor `ChildNode`:
-        // fragment backings are plain elements under the hood, so every
-        // Element-family check below excludes them
+        // `DocumentFragment` implements neither `Element` nor `ChildNode`
         // (<https://dom.spec.whatwg.org/#interface-documentfragment>).
         // `ARIAMixin` is included by `Element`, so every element answers it.
-        "Element" | "ARIAMixin" => matches!(data, Some(NodeData::Element(_))) && !is_fragment,
+        "Element" | "ARIAMixin" => matches!(data, Some(NodeData::Element(_))),
         // `ElementContentEditable` is included by `HTMLElement` only, so any
         // HTML element (including unknown elements) answers it.
         "HTMLElement" | "ElementContentEditable" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::dom::tree::html_namespace())
-                && !is_fragment
         }
         "SVGElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::dom::tree::svg_namespace())
-                && !is_fragment
         }
         "MathMLElement" => {
             matches!(data, Some(NodeData::Element(element)) if element.name.ns == crate::dom::tree::mathml_namespace())
-                && !is_fragment
         }
         "CharacterData" => is_character_data,
         // A CDATA section implements `Text`
@@ -603,7 +597,7 @@ fn node_interface_matches(
                 if element.name.ns == crate::dom::tree::html_namespace()
                     || element.name.ns == crate::dom::tree::svg_namespace()
                     || element.name.ns == crate::dom::tree::mathml_namespace()
-            ) && !is_fragment
+            )
         }
         "ParentNode" => matches!(
             data,
@@ -618,15 +612,14 @@ fn node_interface_matches(
         // (<https://dom.spec.whatwg.org/#interface-childnode>), but never a
         // `DocumentFragment`.
         "ChildNode" => {
-            !is_fragment
-                && (is_character_data
-                    || matches!(data, Some(NodeData::Element(_) | NodeData::Doctype { .. })))
+            is_character_data
+                || matches!(data, Some(NodeData::Element(_) | NodeData::Doctype { .. }))
         }
         // `NonDocumentTypeChildNode` includes `Element` and `CharacterData`,
         // not a doctype or a fragment
         // (<https://dom.spec.whatwg.org/#interface-nondocumenttypechildnode>).
         "NonDocumentTypeChildNode" => {
-            !is_fragment && (is_character_data || matches!(data, Some(NodeData::Element(_))))
+            is_character_data || matches!(data, Some(NodeData::Element(_)))
         }
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
@@ -683,8 +676,7 @@ pub(crate) fn require_node_interface(ctx: &Ctx<'_>, id: NodeId, interface: &str)
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    let is_fragment = document.document.is_fragment(id.node);
-    match node_interface_matches(data, document.xml_document, is_fragment, interface) {
+    match node_interface_matches(data, document.xml_document, interface) {
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
         None => Err(Exception::throw_type(ctx, "unknown node interface")),
@@ -710,8 +702,7 @@ pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &
         .base
         .get_node(id.node)
         .map(|node| &node.data);
-    let is_fragment = document.document.is_fragment(id.node);
-    node_interface_matches(data, document.xml_document, is_fragment, interface) == Some(true)
+    node_interface_matches(data, document.xml_document, interface) == Some(true)
 }
 
 /// The receiver JS object for hand methods that keep it (observer identity
