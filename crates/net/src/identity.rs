@@ -48,9 +48,15 @@ impl UserAgent {
     /// [`HeaderError::InvalidValue`] when `value` is not a visible ASCII field
     /// value.
     pub fn parse(value: &str) -> Result<Self, HeaderError> {
-        HeaderValue::from_str(value)
-            .map(Self)
-            .map_err(|_| HeaderError::InvalidValue(value.into()))
+        let header =
+            HeaderValue::from_str(value).map_err(|_| HeaderError::InvalidValue(value.into()))?;
+        // `from_str` also admits the obs-text bytes 0x80..=0xFF, which `to_str`
+        // refuses. A value the type cannot print is a value `as_str` and the
+        // wire would silently lose, so it is invalid here.
+        header
+            .to_str()
+            .map_err(|_| HeaderError::InvalidValue(value.into()))?;
+        Ok(Self(header))
     }
 
     /// The value as a string. The type guarantees visible ASCII, so this is
@@ -381,6 +387,10 @@ mod tests {
         assert!(
             UserAgent::parse("bad\nvalue").is_err(),
             "a field value cannot carry a newline"
+        );
+        assert!(
+            UserAgent::parse("Mozilla caf\u{e9}").is_err(),
+            "obs-text is a field value but not visible ASCII, so `as_str` would be empty"
         );
     }
 }
