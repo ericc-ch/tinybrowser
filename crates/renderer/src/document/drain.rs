@@ -431,7 +431,7 @@ impl Document {
             .referrer_policy
             .or(self.world.borrow().policy.referrer_policy)
             .unwrap_or_default();
-        dial.req.cors = fetch.cors;
+        dial.req.cors = Some(fetch.cors);
         dial.req.keepalive = fetch.keepalive;
         dial.req.body_len = fetch.body_len;
         dial.req.integrity = fetch.integrity;

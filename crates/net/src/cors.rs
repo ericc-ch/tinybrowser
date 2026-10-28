@@ -32,12 +32,15 @@ pub enum RequestMode {
 }
 
 impl RequestMode {
-    /// Parses the IDL enum's string value
+    /// Parses a `RequestInit.mode` string
     /// (<https://fetch.spec.whatwg.org/#requestinit>).
+    ///
+    /// `navigate` is not accepted: the `Request` constructor rejects it
+    /// (<https://fetch.spec.whatwg.org/#dom-request>), and navigation code
+    /// spells [`RequestMode::Navigate`] directly.
     #[must_use]
     pub fn from_idl(value: &str) -> Option<Self> {
         match value {
-            "navigate" => Some(Self::Navigate),
             "no-cors" => Some(Self::NoCors),
             "same-origin" => Some(Self::SameOrigin),
             "cors" => Some(Self::Cors),

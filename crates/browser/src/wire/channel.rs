@@ -33,8 +33,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// replaced JSON control payloads with postcard. Version 12 replaced
 /// response-start's flat metadata fields with one shared response head.
 /// Version 13 folded a dial outcome's body and stream into one
-/// [`ResponseBody`](renderer::ResponseBody) and made the request method a
-/// typed value.
+/// [`ResponseBody`](renderer::ResponseBody), made the request method a typed
+/// value, and renumbered `BodyDelivery` (now `Buffer` = 0, `Stream` = 1) with
+/// the removal of `Discard`.
 pub const PROTOCOL_VERSION: u8 = 13;
 
 /// Fixed frame header size in bytes.

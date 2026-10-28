@@ -2390,8 +2390,15 @@ impl JsNode {
         };
         let replacement = materialize_children(&mut parsed.document, element.document, &snapshots)
             .map_err(|err| throw_dom_error(ctx, err))?;
+        drop(parsed);
+        drop(world);
+        let replacement = super::core::replace_target(ctx, parent, replacement)?;
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(element) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
         let target = element;
-        let added = replace_parsed(&mut parsed, parent, replacement, target);
+        let added = replace_parsed(&mut parsed, parent, target, replacement);
         drop(parsed);
         drop(world);
         register_inserted_iframes(ctx, &added)?;

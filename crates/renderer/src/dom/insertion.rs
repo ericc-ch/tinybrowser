@@ -1020,18 +1020,58 @@ fn adjust_replace_removal(parsed: &mut crate::Parsed, parent: NodeId, old: NodeI
     }
 }
 
-/// Replaces `old` with the already-adopted `node` (or its children for a
-/// fragment): the node's own unlink keeps a removal record when it moves,
-/// then one combined record carries the replacement
+/// The children of a fragment, as handles in its own document.
+pub(crate) fn fragment_children(
+    doc: &crate::documents::BlitzDocument,
+    fragment: NodeId,
+) -> Vec<NodeId> {
+    doc.base
+        .get_node(fragment.node)
+        .map(|node| {
+            node.children
+                .iter()
+                .map(|child| NodeId {
+                    document: fragment.document,
+                    node: *child,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What takes a replaced child's place
+/// (<https://dom.spec.whatwg.org/#concept-node-replace>).
+pub(crate) enum Replacement {
+    /// One node, in `parent`'s document.
+    Node(NodeId),
+    /// A fragment's children, still in `parent`'s document. They leave the
+    /// fragment inside this operation, so the removal is recorded here.
+    FragmentContents {
+        fragment: NodeId,
+        children: Vec<NodeId>,
+    },
+    /// Children already adopted into `parent`'s document from a fragment in
+    /// another one. Adoption recorded each removal in the old document.
+    Adopted(Vec<NodeId>),
+}
+
+/// Replaces `old` with `replacement`: a node's own unlink keeps a removal
+/// record when it moves, then one combined record carries the replacement
 /// (<https://dom.spec.whatwg.org/#concept-node-replace>). Returns the nodes
 /// the parent gained, for the insertion fixups.
+///
+/// `replacement` owns every child list it needs. A fragment in another
+/// document has no arena entry here, and a Blitz id from one document's arena
+/// names an unrelated node in another's.
 pub(crate) fn replace_parsed(
     parsed: &mut crate::Parsed,
     parent: NodeId,
-    node: NodeId,
     old: NodeId,
+    replacement: Replacement,
 ) -> Vec<NodeId> {
-    if node == old {
+    if let Replacement::Node(node) = replacement
+        && node == old
+    {
         let reference = sibling(&parsed.document.base, old.node, true).map(|next| NodeId {
             document: old.document,
             node: next,
@@ -1054,45 +1094,32 @@ pub(crate) fn replace_parsed(
         document: old.document,
         node: next,
     });
-    if reference == Some(node) {
+    if let Replacement::Node(node) = replacement
+        && reference == Some(node)
+    {
         reference = sibling(&parsed.document.base, node.node, true).map(|next| NodeId {
             document: node.document,
             node: next,
         });
     }
-    let (added, fragment) = if parsed.document.is_fragment(node.node) {
-        let moved: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(node.node)
-            .map(|contents| {
-                contents
-                    .children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: node.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        (moved, true)
-    } else {
-        (vec![node], false)
+    let (added, leaving_fragment, unlink) = match replacement {
+        Replacement::Node(node) => (vec![node], None, Some(node)),
+        Replacement::FragmentContents { fragment, children } => (children, Some(fragment), None),
+        Replacement::Adopted(children) => (children, None, None),
     };
-    if fragment {
+    if let Some(fragment) = leaving_fragment {
         // The fragment's children leave it through the insert, and each
         // removal runs the live-range pre-remove steps
         // (<https://dom.spec.whatwg.org/#concept-node-insert>).
-        adjust_children_leaving(parsed, node, &added);
+        adjust_children_leaving(parsed, fragment, &added);
         parsed.document.record(JournalEntry::ChildList {
-            target: node,
+            target: fragment,
             added: Vec::new(),
             removed: added.clone(),
             previous: None,
             next: None,
         });
-    } else {
+    } else if let Some(node) = unlink {
         unlink_journaled(parsed, node);
     }
     adjust_replace_removal(parsed, parent, old);

@@ -178,9 +178,8 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
 /// `Document.scripts` is an `HTMLCollection` rooted at the `Document` node
 /// whose filter matches `script` elements
 /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
-/// The synthetic viewport box above the document element is not a DOM
-/// descendant of that node; walking from its first non-fragment element
-/// child keeps detached fragments that sit beside `html` off the list.
+/// A fragment node is skipped: it is not an element, so it never holds a
+/// document script.
 fn collect_html_scripts(
     doc: &crate::documents::BlitzDocument,
     document: u32,

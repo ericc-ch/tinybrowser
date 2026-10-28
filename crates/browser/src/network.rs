@@ -1656,6 +1656,121 @@ mod tests {
     }
 
     #[test]
+    fn vary_star_never_matches_and_a_named_field_must_agree() {
+        let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        request.headers = vec![("accept".to_owned(), "text/html".to_owned())];
+        let mut entry = cached(net::cors::ResponseType::Basic);
+        entry.request_headers = request.headers.clone();
+        assert!(
+            vary_matches(&entry, &request),
+            "a stored response without Vary matches"
+        );
+
+        entry.outcome.headers = vec![("vary".to_owned(), "*".to_owned())];
+        assert!(!vary_matches(&entry, &request));
+
+        entry.outcome.headers = vec![("Vary".to_owned(), "Accept".to_owned())];
+        assert!(vary_matches(&entry, &request));
+        request.headers = vec![("accept".to_owned(), "application/json".to_owned())];
+        assert!(
+            !vary_matches(&entry, &request),
+            "a different request header selects a different representation"
+        );
+    }
+
+    #[test]
+    fn fresh_reads_max_age_through_the_header_splitter() {
+        let mut entry = cached(net::cors::ResponseType::Basic);
+        entry.outcome.headers = vec![(
+            "cache-control".to_owned(),
+            "private=\"a,b\", max-age=60".to_owned(),
+        )];
+        assert!(fresh(&entry));
+
+        entry.outcome.headers = vec![("cache-control".to_owned(), "max-age=1".to_owned())];
+        entry.stored_at = Instant::now() - Duration::from_secs(2);
+        assert!(!fresh(&entry), "an expired max-age is stale");
+
+        entry.outcome.headers = vec![(
+            "expires".to_owned(),
+            "Thu, 01 Jan 2099 00:00:00 GMT".to_owned(),
+        )];
+        assert!(fresh(&entry), "a future Expires is fresh");
+    }
+
+    /// A stored ETag holds isomorphic-decoded bytes, so writing it back must
+    /// keep one byte per code point. UTF-8 would send `0xC3 0xA9` where the
+    /// server sent `0xE9`, and every revalidation would answer 200.
+    #[tokio::test]
+    async fn revalidation_sends_a_non_ascii_etag_as_one_byte_per_code_point() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let context = NetworkContext::new(AgentOptions::default());
+        let handle = context.tab_handle();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let origin = format!("http://{address}");
+        let (replayed_tx, replayed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut replayed_tx = Some(replayed_tx);
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = [0u8; 2048];
+                let read = socket.read(&mut buffer).await.expect("request");
+                if index == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nETag: \"\xE9\"\r\nContent-Length: 2\r\n\r\nhi",
+                        )
+                        .await
+                        .expect("first response");
+                } else {
+                    let _ = replayed_tx
+                        .take()
+                        .expect("one replay")
+                        .send(buffer[..read].to_vec());
+                    socket
+                        .write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"\xE9\"\r\n\r\n")
+                        .await
+                        .expect("304");
+                }
+            }
+        });
+        let initiator = Url::parse(&format!("{origin}/page")).expect("page URL");
+        let owner = RendererAssignmentId::new(1);
+        let mut request = js_fetch(
+            net::cors::RequestMode::SameOrigin,
+            &format!("{origin}/etag"),
+        );
+        request.initiator = initiator.origin().ascii_serialization();
+        request.referrer_url = initiator.to_string();
+        let first = handle
+            .dial_request(&request, &initiator, owner)
+            .await
+            .expect("first dial");
+        assert_eq!(first.status, 200);
+
+        let revalidated = handle
+            .dial_request(&request, &initiator, owner)
+            .await
+            .expect("revalidation");
+        assert_eq!(revalidated.status, 200, "a 304 merges into the stored head");
+        assert_eq!(revalidated.body.bytes(), Some(b"hi".as_slice()));
+
+        let replayed = replayed_rx.await.expect("second request");
+        assert!(
+            replayed
+                .windows(b"If-None-Match: \"\xE9\"".len())
+                .any(|window| window == b"If-None-Match: \"\xE9\""),
+            "the validator went back as the bytes the server sent: {:?}",
+            String::from_utf8_lossy(&replayed)
+        );
+        server.abort();
+    }
+
+    #[test]
     fn cached_body_still_needs_to_satisfy_integrity_metadata() {
         let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
         request.integrity = Some("sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_owned());

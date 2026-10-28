@@ -36,9 +36,7 @@ mod bindings {
 use bindings::exports::tinybrowser::browser::engine::{
     Event, FrameEvent, Guest, GuestTab, HistoryHandling as HostHistoryHandling,
 };
-use bindings::tinybrowser::browser::types::{
-    BodyDelivery as HostBodyDelivery, FetchError, FetchKind, FetchRequest, FetchResponse,
-};
+use bindings::tinybrowser::browser::types::{FetchError, FetchKind, FetchRequest, FetchResponse};
 
 /// Redirect hops a single dial may follow.
 ///
@@ -100,7 +98,7 @@ impl Guest for Component {
                         start_hop(owner, chain, completion);
                     }
                     Ok(None) => {
-                        completion(decode_fetch_result(response, &chain.url, chain.delivery));
+                        completion(decode_fetch_result(response, &chain.url));
                     }
                     Err(failure) => completion(Err(failure)),
                 }
@@ -226,7 +224,6 @@ struct Chain {
     /// Document URL the dial started from, for `SameSite`.
     initiator: Option<Url>,
     kind: DialKind,
-    delivery: renderer::BodyDelivery,
     /// Hops already followed.
     followed: u32,
     /// Whether any hop so far moved to another site.
@@ -309,10 +306,6 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
             .as_ref()
             .map(Url::to_string)
             .unwrap_or_default(),
-        delivery: match chain.delivery {
-            renderer::BodyDelivery::Buffer => HostBodyDelivery::Buffered,
-            renderer::BodyDelivery::Stream => HostBodyDelivery::Streamed,
-        },
         max_body_bytes: u64::try_from(MAX_RESPONSE_BODY_BYTES).unwrap_or(u64::MAX),
         cookie: cookie_header(&chain),
     };
@@ -415,11 +408,7 @@ fn csp_blocked(url: &Url) -> DialOutcome {
     DialOutcome::basic(0, url.to_string(), None, Vec::new(), Vec::new())
 }
 
-fn decode_fetch_result(
-    response: FetchResponse,
-    hop_url: &Url,
-    delivery: renderer::BodyDelivery,
-) -> Result<DialOutcome, DialFailure> {
+fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOutcome, DialFailure> {
     if response.body.len() > MAX_RESPONSE_BODY_BYTES {
         return Err(DialFailure::Limit);
     }
@@ -429,15 +418,10 @@ fn decode_fetch_result(
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https"))
         .unwrap_or_else(|| hop_url.clone());
-    let body = match delivery {
-        // This host answers with the whole body, so a page that asked for a
-        // progressive body gets it buffered. The renderer accepts a body in
-        // place of a stream, and the page sees a response that was not
-        // streamed.
-        renderer::BodyDelivery::Buffer | renderer::BodyDelivery::Stream => {
-            renderer::ResponseBody::Buffered(Ok(response.body))
-        }
-    };
+    // This transport answers with the whole body, so a page that asked for a
+    // progressive body gets it buffered. The renderer accepts a body in place
+    // of a stream, and the page sees a response that was not streamed.
+    let body = renderer::ResponseBody::Buffered(Ok(response.body));
     let mut outcome = DialOutcome::basic(
         response.status,
         final_url.into(),
@@ -513,7 +497,6 @@ impl NetworkHost for WasmServices {
                 url,
                 initiator: Url::parse(&request.initiator).ok(),
                 kind: request.kind,
-                delivery: request.delivery,
                 followed: 0,
                 cross_site_redirect: false,
                 csp: request.csp.as_deref().cloned(),
@@ -721,8 +704,7 @@ mod tests {
             location: None,
             body: b"hi".to_vec(),
         };
-        let outcome =
-            decode_fetch_result(response, &hop, renderer::BodyDelivery::Buffer).expect("decoded");
+        let outcome = decode_fetch_result(response, &hop).expect("decoded");
         assert_eq!(outcome.body.bytes(), Some(b"hi".as_slice()));
         assert_eq!(outcome.final_url, "https://example.test/docs");
     }

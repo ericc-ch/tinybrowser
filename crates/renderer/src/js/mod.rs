@@ -186,7 +186,7 @@ pub(crate) struct JsFetchRequest {
     pub content_type: Option<String>,
     pub headers: Vec<(String, String)>,
     pub referrer: net::Referrer,
-    pub cors: Option<crate::protocol::CorsRequest>,
+    pub cors: crate::protocol::CorsRequest,
     pub keepalive: bool,
     pub body_len: u64,
     pub integrity: Option<String>,
@@ -200,12 +200,13 @@ pub(crate) struct JsFetchRequest {
 /// The options object `fetch.js` hands `__queueFetch`: one named field per
 /// option the renderer's dial needs, parsed once at the boundary.
 ///
-/// Every enum is the IDL spelling the page already normalized; an unknown
-/// spelling is a `TypeError` here instead of a silently different request.
-/// An absent key is the IDL default for that member.
+/// Every key the shim writes is required except `integrity`, `cache`, and
+/// `referrerPolicy`, which arrive as `null` when the request has none. An
+/// unknown or missing value is a `TypeError`; it never becomes a different,
+/// valid-looking request.
 struct DialOptions {
     referrer: net::Referrer,
-    cors: Option<crate::protocol::CorsRequest>,
+    cors: crate::protocol::CorsRequest,
     keepalive: bool,
     body_len: u64,
     integrity: Option<String>,
@@ -220,6 +221,15 @@ impl DialOptions {
             options: &Object<'_>,
             key: &'static str,
             parse: impl Fn(&str) -> Option<T>,
+        ) -> rquickjs::Result<T> {
+            let value: String = options.get(key)?;
+            parse(&value).ok_or_else(|| rquickjs::Error::new_from_js(key, "request option"))
+        }
+
+        fn nullable_enum_member<T>(
+            options: &Object<'_>,
+            key: &'static str,
+            parse: impl Fn(&str) -> Option<T>,
         ) -> rquickjs::Result<Option<T>> {
             match options.get::<_, Option<String>>(key)? {
                 None => Ok(None),
@@ -229,41 +239,30 @@ impl DialOptions {
             }
         }
 
-        let referrer = match options.get::<_, Option<String>>("referrer")? {
-            Some(value) => net::Referrer::from_idl(&value).unwrap_or_default(),
-            None => net::Referrer::default(),
+        let referrer: String = options.get("referrer")?;
+        let referrer = net::Referrer::from_idl(&referrer)
+            .ok_or_else(|| rquickjs::Error::new_from_js("referrer", "Referrer"))?;
+        let cors = crate::protocol::CorsRequest {
+            // `fetch` always passes the mode its `Request` normalized
+            // (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+            mode: enum_member(options, "mode", net::cors::RequestMode::from_idl)?,
+            credentials: enum_member(options, "credentials", net::cors::CredentialsMode::from_idl)?,
+            redirect: enum_member(options, "redirect", net::cors::RedirectMode::from_idl)?,
         };
-        // `mode` is absent for a non-`fetch` caller; a `fetch` always passes
-        // the mode its `Request` normalized
-        // (<https://fetch.spec.whatwg.org/#concept-request-mode>).
-        let cors = match enum_member(options, "mode", net::cors::RequestMode::from_idl)? {
-            None => None,
-            Some(mode) => Some(crate::protocol::CorsRequest {
-                mode,
-                credentials: enum_member(
-                    options,
-                    "credentials",
-                    net::cors::CredentialsMode::from_idl,
-                )?
-                .unwrap_or_default(),
-                redirect: enum_member(options, "redirect", net::cors::RedirectMode::from_idl)?
-                    .unwrap_or_default(),
-            }),
+        let cache =
+            nullable_enum_member(options, "cache", crate::protocol::RequestCache::from_idl)?
+                .unwrap_or_default();
+        let delivery = match options.get::<_, bool>("stream")? {
+            true => crate::protocol::BodyDelivery::Stream,
+            false => crate::protocol::BodyDelivery::Buffer,
         };
-        let cache = enum_member(options, "cache", crate::protocol::RequestCache::from_idl)?
-            .unwrap_or_default();
-        let delivery = match options.get::<_, Option<bool>>("stream")? {
-            Some(true) => crate::protocol::BodyDelivery::Stream,
-            Some(false) | None => crate::protocol::BodyDelivery::Buffer,
-        };
-        let referrer_policy = enum_member(options, "referrerPolicy", net::ReferrerPolicy::parse)?;
+        let referrer_policy =
+            nullable_enum_member(options, "referrerPolicy", net::ReferrerPolicy::parse)?;
         Ok(Self {
             referrer,
             cors,
-            keepalive: options
-                .get::<_, Option<bool>>("keepalive")?
-                .unwrap_or(false),
-            body_len: options.get::<_, Option<u64>>("bodySize")?.unwrap_or(0),
+            keepalive: options.get("keepalive")?,
+            body_len: options.get("bodySize")?,
             integrity: options.get::<_, Option<String>>("integrity")?,
             cache,
             delivery,
@@ -554,6 +553,15 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let cbs: Object = bridge::object(&ctx)?.get("__tb_fetchCbs")?;
                 let Some(func) = cbs.get::<_, Option<Function>>(js_id.0)? else {
+                    // The page aborted between the dial and this callback.
+                    // A streamed body's task would fill its channel and hold
+                    // the dial permits for nobody, so cancel it here.
+                    if let Some(stream) = outcome
+                        .as_ref()
+                        .and_then(crate::protocol::DialOutcome::stream)
+                    {
+                        self.world.borrow().runtime.services.cancel_stream(stream);
+                    }
                     return Ok(());
                 };
                 // The header list stays as served: sniffing picks the

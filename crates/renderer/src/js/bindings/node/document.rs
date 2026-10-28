@@ -1098,7 +1098,14 @@ impl JsNode {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
             if let Some(current) = current {
-                replace_parsed(&mut parsed, root_element, node, current);
+                drop(parsed);
+                drop(world);
+                let replacement = super::core::replace_target(ctx, root_element, node)?;
+                let world = world_rc.borrow();
+                let Some(mut parsed) = world.document_mut(self.handle.0) else {
+                    return Err(Exception::throw_type(ctx, "no document"));
+                };
+                replace_parsed(&mut parsed, root_element, current, replacement);
                 drop(parsed);
                 drop(world);
                 fixup_focus_after_removal(ctx, current)?;

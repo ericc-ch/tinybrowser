@@ -1792,6 +1792,87 @@ mod realm_tests {
         world
     }
 
+    #[test]
+    fn replacing_with_a_foreign_fragment_adopts_each_child() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><div id=target><b id=old></b></div>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                r#"
+                var target = document.getElementById("target");
+                var old = document.getElementById("old");
+                var other = document.implementation.createHTMLDocument("");
+                var fragment = other.createDocumentFragment();
+                var span = other.createElement("span");
+                span.textContent = "moved";
+                fragment.appendChild(span);
+                var replaced = target.replaceChild(fragment, old);
+                [
+                  replaced === old,
+                  target.childNodes.length,
+                  target.firstChild.nodeName,
+                  target.firstChild.ownerDocument === document,
+                  target.firstChild.textContent,
+                  fragment.childNodes.length
+                ].join(",");
+                "#,
+            )
+            .expect("cross-document replace");
+        assert_eq!(outcome, "true,1,SPAN,true,moved,0");
+    }
+
+    #[test]
+    fn inserting_a_fragment_splices_its_children_in_tree_order() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &shared,
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><div id=target></div>",
+        );
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+        let outcome = realm
+            .eval(
+                r#"
+                var target = document.getElementById("target");
+                var fragment = document.createDocumentFragment();
+                var first = document.createElement("i");
+                var text = document.createTextNode("gap");
+                var second = document.createElement("u");
+                fragment.append(first, text, second);
+                target.append(fragment);
+                [
+                  target.childNodes.length,
+                  target.childNodes[0].nodeName,
+                  target.childNodes[1].nodeValue,
+                  target.childNodes[2].nodeName,
+                  fragment.childNodes.length,
+                  first.parentNode === target
+                ].join(",");
+                "#,
+            )
+            .expect("fragment insert");
+        assert_eq!(outcome, "3,I,gap,U,0,true");
+    }
+
     /// A call is a direct eval only when the callee is `%eval%` itself
     /// (<https://tc39.es/ecma262/#sec-evaluatecall>), and `%eval%` /
     /// `%Function%` expose intrinsic property attributes

@@ -3,14 +3,18 @@ use std::fmt;
 
 use hyper::header::{HeaderName, HeaderValue};
 
+/// Joins every occurrence of a list header's values with `", "`, the way
+/// combining a header does
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-combine>).
+///
+/// A present header with an empty value is one empty member, not an absent
+/// header: "get, decode, and split" of `A: nosniff` plus `A:` yields
+/// «`nosniff`, `""`» (<https://fetch.spec.whatwg.org/#example-header-value-get-decode-and-split>).
+/// `None` means no occurrence of the header at all.
 #[must_use]
-/// Joins every occurrence of a list header's values with `", "`, the way a
-/// list header is extracted
-/// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
 pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
     let values: Vec<&str> = values
         .map(|value| value.trim_matches([' ', '\t']))
-        .filter(|value| !value.is_empty())
         .collect();
     if values.is_empty() {
         None
@@ -522,5 +526,21 @@ mod tests {
             Some(vec!["a".to_owned(), "b".to_owned()])
         );
         assert_eq!(super::get_decode_split(&map, "x-missing"), None);
+    }
+
+    /// A present field with an empty value is one empty member. Fetch's own
+    /// table gives `A: nosniff` plus `A:` as «`nosniff`, `""`»
+    /// (<https://fetch.spec.whatwg.org/#example-header-value-get-decode-and-split>).
+    #[test]
+    fn combining_keeps_an_empty_field_value() {
+        assert_eq!(super::combined_header(std::iter::empty()), None);
+        assert_eq!(
+            super::combined_header(["nosniff", ""].into_iter()).as_deref(),
+            Some("nosniff, ")
+        );
+        assert_eq!(
+            super::split_header_value_str("nosniff, "),
+            ["nosniff".to_owned(), String::new()]
+        );
     }
 }

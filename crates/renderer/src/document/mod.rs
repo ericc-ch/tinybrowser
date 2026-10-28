@@ -3267,6 +3267,13 @@ impl Document {
                         None,
                     );
                 if blocked {
+                    // A streamed body's task holds the dial permits until the
+                    // renderer reads or cancels it, so cancel before dropping
+                    // the outcome
+                    // (<https://fetch.spec.whatwg.org/#concept-response-body>).
+                    if let Some(stream) = outcome.stream() {
+                        self.services.cancel_stream(stream);
+                    }
                     self.settle_js_fetch(id, None);
                 } else {
                     self.settle_js_fetch(id, Some(outcome));

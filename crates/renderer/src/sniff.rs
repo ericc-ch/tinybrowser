@@ -1292,4 +1292,12 @@ mod tests {
         // A non-breaking space is not an HTTP tab or space.
         assert!(!nosniff("\u{a0}nosniff"));
     }
+
+    #[test]
+    fn an_empty_first_field_is_not_nosniff() {
+        let field = |value: &str| ("X-Content-Type-Options".to_owned(), value.to_owned());
+        assert!(headers_nosniff(&[field("nosniff")]));
+        assert!(!headers_nosniff(&[field(""), field("nosniff")]));
+        assert!(!headers_nosniff(&[]));
+    }
 }
