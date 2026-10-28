@@ -1,16 +1,19 @@
 // Navigator identity exposed by the browsing-context global.
 // https://html.spec.whatwg.org/multipage/system-state.html#the-navigator-object
 {
-  const uaBrands = Object.freeze([
-    Object.freeze({ brand: 'Not_A Brand', version: '99' }),
-    Object.freeze({ brand: 'Chromium', version: '152' }),
-    Object.freeze({ brand: 'Google Chrome', version: '152' }),
-  ]);
-  const uaFullVersionList = Object.freeze([
-    Object.freeze({ brand: 'Not_A Brand', version: '99.0.0.0' }),
-    Object.freeze({ brand: 'Chromium', version: '152.0.0.0' }),
-    Object.freeze({ brand: 'Google Chrome', version: '152.0.0.0' }),
-  ]);
+  const identity = host.__tbIdentity();
+  const uaBrands = Object.freeze(identity.brands.map((entry) => Object.freeze(entry)));
+  const uaFullVersionList = Object.freeze(identity.fullVersionList.map((entry) => Object.freeze(entry)));
+  const uaMobile = identity.mobile;
+  const uaPlatform = identity.platform;
+  // `uaFullVersion` reports the engine version, so the Chromium brand wins; an
+  // identity without one falls back to its last brand rather than to nothing
+  // https://wicg.github.io/ua-client-hints/#getHighEntropyValues
+  const chromium = uaFullVersionList.find((entry) => entry.brand === 'Chromium');
+  const lastFullVersion = uaFullVersionList[uaFullVersionList.length - 1];
+  const uaFullVersion = chromium !== undefined
+    ? chromium.version
+    : (lastFullVersion === undefined ? '' : lastFullVersion.version);
   const uaDataKey = host.slots('NavigatorUAData');
   class NavigatorUAData {
     constructor() {
@@ -22,11 +25,11 @@
     }
     get mobile() {
       __tbBrand(this, uaDataKey);
-      return false;
+      return uaMobile;
     }
     get platform() {
       __tbBrand(this, uaDataKey);
-      return 'Linux';
+      return uaPlatform;
     }
     // https://wicg.github.io/ua-client-hints/#getHighEntropyValues
     getHighEntropyValues(hints) {
@@ -48,21 +51,21 @@
         if (step.done) break;
         names.push(String(step.value));
       }
-      const values = { brands: uaBrands, mobile: false, platform: 'Linux' };
-      if (names.includes('architecture')) values.architecture = 'x86';
-      if (names.includes('bitness')) values.bitness = '64';
-      if (names.includes('formFactors')) values.formFactors = Object.freeze(['Desktop']);
+      const values = { brands: uaBrands, mobile: uaMobile, platform: uaPlatform };
+      if (names.includes('architecture')) values.architecture = identity.architecture;
+      if (names.includes('bitness')) values.bitness = identity.bitness;
+      if (names.includes('formFactors')) values.formFactors = Object.freeze(identity.formFactors);
       if (names.includes('fullVersionList')) values.fullVersionList = uaFullVersionList;
-      if (names.includes('model')) values.model = '';
-      if (names.includes('platformVersion')) values.platformVersion = '';
-      if (names.includes('uaFullVersion')) values.uaFullVersion = '152.0.0.0';
-      if (names.includes('wow64')) values.wow64 = false;
+      if (names.includes('model')) values.model = identity.model;
+      if (names.includes('platformVersion')) values.platformVersion = identity.platformVersion;
+      if (names.includes('uaFullVersion')) values.uaFullVersion = uaFullVersion;
+      if (names.includes('wow64')) values.wow64 = identity.wow64;
       return Promise.resolve(values);
     }
     // https://wicg.github.io/ua-client-hints/#h-tojson
     toJSON() {
       __tbBrand(this, uaDataKey);
-      return { brands: uaBrands, mobile: false, platform: 'Linux' };
+      return { brands: uaBrands, mobile: uaMobile, platform: uaPlatform };
     }
   }
   Object.defineProperty(NavigatorUAData.prototype, Symbol.toStringTag, {
@@ -92,7 +95,7 @@
   userActivationKey.set(userActivation, Object.freeze({}));
   class Navigator {
     get userAgent() {
-      return host.__tbUserAgent();
+      return identity.userAgent;
     }
     get appVersion() { return this.userAgent.replace(/^Mozilla\//, ''); }
     get appCodeName() { return 'Mozilla'; }
@@ -101,7 +104,7 @@
     get productSub() { return '20030107'; }
     get vendor() { return 'Google Inc.'; }
     get vendorSub() { return ''; }
-    get platform() { return 'Linux x86_64'; }
+    get platform() { return identity.navigatorPlatform; }
     get language() { return 'en-US'; }
     get languages() { return Object.freeze(['en-US', 'en']); }
     get onLine() { return true; }

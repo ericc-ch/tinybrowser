@@ -21,12 +21,13 @@ pub struct EmbeddedRenderer {
 }
 
 impl EmbeddedRenderer {
-    /// Creates a renderer whose external effects are handled by `host`.
+    /// Creates a renderer whose external effects are handled by `host`, and
+    /// whose pages report `identity`.
     #[must_use]
-    pub fn new(host: Arc<dyn BrowserServices>) -> Self {
+    pub fn new(host: Arc<dyn BrowserServices>, identity: net::Identity) -> Self {
         let stop = Arc::new(Stop::new());
         Self {
-            engine: Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new())),
+            engine: Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new()), identity),
             stop,
             ready_queued: false,
         }

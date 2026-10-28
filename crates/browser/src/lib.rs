@@ -35,20 +35,8 @@ pub use net::{
 pub use profile::{Profile, ProfileError, ProfileName, default_data_home};
 pub use renderer::{
     DEFAULT_VIEWPORT, FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest,
-    ScriptFailure, ScriptSource, TabError, USER_AGENT,
+    ScriptFailure, ScriptSource, TabError,
 };
-
-/// Low-entropy `Sec-CH-UA` brands, kept in lockstep with `navigator.userAgentData`
-/// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>).
-pub const SEC_CH_UA: &str = r#""Not_A Brand";v="99", "Chromium";v="152", "Google Chrome";v="152""#;
-
-/// Desktop Chrome `Sec-CH-UA-Mobile` boolean
-/// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua-mobile>).
-pub const SEC_CH_UA_MOBILE: &str = "?0";
-
-/// Linux `Sec-CH-UA-Platform` brand
-/// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua-platform>).
-pub const SEC_CH_UA_PLATFORM: &str = r#""Linux""#;
 
 /// Dark `Sec-CH-Prefers-Color-Scheme`, kept in lockstep with Stylo and `matchMedia`
 /// (<https://wicg.github.io/user-preference-media-features-headers/#sec-ch-prefers-color-scheme>).

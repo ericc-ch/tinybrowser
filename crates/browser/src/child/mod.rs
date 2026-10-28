@@ -160,8 +160,18 @@ fn read_messages(
         };
         if !greeted {
             match message {
-                Frame::Notify(HostNotice::Hello) => {
+                // The handshake is the first command the session sees, so it
+                // holds the identity every later `Assign` builds its engine
+                // with. Losing it would leave every engine on the default, so a
+                // full lane stops the renderer instead of dropping the frame.
+                Frame::Notify(HostNotice::Hello { identity }) => {
                     greeted = true;
+                    if command_tx
+                        .try_send(Frame::Notify(HostNotice::Hello { identity }))
+                        .is_err()
+                    {
+                        break;
+                    }
                     continue;
                 }
                 Frame::Reply { id, body } => {
@@ -193,7 +203,7 @@ fn route_message(
     client: &Arc<ServiceClient>,
 ) -> bool {
     match message {
-        Frame::Notify(HostNotice::Hello) => {
+        Frame::Notify(HostNotice::Hello { .. }) => {
             logging::error!(target: "renderer::ipc", "duplicate handshake");
             false
         }

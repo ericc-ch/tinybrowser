@@ -58,7 +58,8 @@ use crate::dom::TreeError;
 use crate::dom::tree::{NodeId, is_element, sibling};
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, prelude::This,
+    Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
+    prelude::This,
 };
 
 use super::events::{self, JsEvent, JsEventTarget};
@@ -526,8 +527,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 
 /// Registers the `__tb_*` host functions page scripts call into.
 fn install_host_functions(ctx: &Ctx<'_>) -> Result<()> {
-    crate::js::bridge::object(ctx)?
-        .set("__tbUserAgent", rquickjs::prelude::Func::from(user_agent))?;
+    crate::js::bridge::object(ctx)?.set("__tbIdentity", rquickjs::prelude::Func::from(identity))?;
     crate::js::bridge::object(ctx)?.set(
         "__tb_deliver_mutations",
         rquickjs::prelude::Func::from(deliver_mutations),
@@ -594,11 +594,41 @@ fn viewport_size(ctx: Ctx<'_>) -> Vec<f64> {
     vec![f64::from(width), f64::from(height)]
 }
 
-/// `navigator.userAgent`, from the same constant the browser sends as the
-/// request header
-/// (<https://html.spec.whatwg.org/multipage/system-state.html#dom-navigator-useragent>).
-fn user_agent() -> &'static str {
-    crate::USER_AGENT
+/// The identity every page in this process reports: `navigator.userAgent` and
+/// `navigator.userAgentData`, from the same value the network sends as its
+/// request headers
+/// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+fn identity(ctx: Ctx<'_>) -> Result<Object<'_>> {
+    let identity = world(&ctx)?.borrow().runtime.identity.clone();
+    let object = Object::new(ctx.clone())?;
+    object.set("userAgent", identity.user_agent.as_str().to_owned())?;
+    object.set("platform", identity.platform)?;
+    object.set("platformVersion", identity.platform_version)?;
+    object.set("architecture", identity.architecture)?;
+    object.set("model", identity.model)?;
+    object.set("mobile", identity.mobile)?;
+    object.set("bitness", identity.bitness)?;
+    object.set("wow64", identity.wow64)?;
+    object.set("formFactors", identity.form_factors)?;
+    object.set("navigatorPlatform", identity.navigator_platform)?;
+    object.set("brands", brand_array(&ctx, &identity.brands)?)?;
+    object.set(
+        "fullVersionList",
+        brand_array(&ctx, &identity.full_version_list)?,
+    )?;
+    Ok(object)
+}
+
+/// One brand list as plain objects, which `navigator.js` freezes.
+fn brand_array<'js>(ctx: &Ctx<'js>, brands: &[net::Brand]) -> Result<Array<'js>> {
+    let array = Array::new(ctx.clone())?;
+    for (index, brand) in brands.iter().enumerate() {
+        let entry = Object::new(ctx.clone())?;
+        entry.set("brand", brand.brand.clone())?;
+        entry.set("version", brand.version.clone())?;
+        array.set(index, entry)?;
+    }
+    Ok(array)
 }
 
 /// Captures the pristine intrinsics and host entry points every later lookup
@@ -1766,6 +1796,7 @@ mod realm_tests {
     ) -> Rc<RefCell<World>> {
         let runtime = crate::js::FrameRuntime {
             services: Arc::clone(services),
+            identity: net::Identity::default(),
             js_runtime: js_runtime.handle(),
             wake: Arc::new(tokio::sync::Notify::new()),
             stop: Arc::new(Stop::new()),
@@ -2246,7 +2277,7 @@ mod realm_tests {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let stop = Arc::new(Stop::new());
         let wake = Arc::new(tokio::sync::Notify::new());
-        let mut engine = crate::engine::Engine::new(services, stop, wake);
+        let mut engine = crate::engine::Engine::new(services, stop, wake, net::Identity::default());
         let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
         engine
             .mount_frame(
@@ -2292,7 +2323,7 @@ mod realm_tests {
     #[test]
     fn embedded_yield_is_an_immediate_step() {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
-        let mut renderer = crate::EmbeddedRenderer::new(services);
+        let mut renderer = crate::EmbeddedRenderer::new(services, net::Identity::default());
         let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
         renderer
             .mount_for_test(&crate::protocol::Mount {
@@ -2383,6 +2414,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            net::Identity::default(),
         );
         mount_html(
             &mut engine,
@@ -2408,6 +2440,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            net::Identity::default(),
         );
         mount_html(
             &mut engine,
@@ -2440,6 +2473,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            net::Identity::default(),
         );
         mount_html(
             &mut engine,
@@ -2513,6 +2547,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            net::Identity::default(),
         );
         mount_html(
             &mut engine,
@@ -2533,6 +2568,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            net::Identity::default(),
         );
         mount_html(
             &mut engine,
@@ -2552,6 +2588,7 @@ mod realm_tests {
             services,
             Arc::new(Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            net::Identity::default(),
         );
         mount_html(
             &mut engine,

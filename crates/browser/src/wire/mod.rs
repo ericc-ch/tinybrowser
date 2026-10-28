@@ -150,8 +150,13 @@ pub enum RendererCall {
 /// Browser-originated notifications that do not have replies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum HostNotice {
-    /// First frame from the browser process: protocol handshake.
-    Hello,
+    /// First frame from the browser process: protocol handshake, which also
+    /// carries the identity every page and CDP answer in this process reports
+    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    Hello {
+        /// The browser's identity.
+        identity: net::Identity,
+    },
     /// Stops the renderer process.
     Shutdown,
     /// Creates an isolated page engine inside this renderer process.

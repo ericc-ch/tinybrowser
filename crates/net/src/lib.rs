@@ -6,15 +6,17 @@
 mod client;
 pub mod cors;
 mod error;
+mod identity;
 mod protocol;
 pub mod referrer;
 mod resolve;
 mod secure_context;
 mod transport;
 
-pub use client::{Agent, AgentOptions, Body, Clock, Request, Response, UserAgent};
+pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
+pub use identity::{Brand, ClientHints, DEFAULT_USER_AGENT, Identity, UserAgent};
 pub use protocol::{
     HeaderError, HeaderMap, InvalidMethod, Method, combined_header, combined_header_in,
     get_decode_split, get_decode_split_decoded, isomorphic_decode, isomorphic_encode,

@@ -25,7 +25,7 @@ fn daemon_registers_loopback_and_second_start_reuses_it() {
         .expect("version");
     assert_eq!(
         version["product"],
-        serde_json::json!("Chrome/152.0.7977.82")
+        serde_json::json!(net::Identity::default().product)
     );
 
     fixture.spawn_daemon();
