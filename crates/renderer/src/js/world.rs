@@ -1572,7 +1572,16 @@ pub(crate) struct DocumentState {
     /// the engine runs the callback
     /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
     pub(crate) decoders: HashMap<u64, DecoderSession>,
+    /// The script element whose code is running, which
+    /// `document.currentScript` reports. A module script leaves it unset: the
+    /// attribute is null while a module evaluates
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript>).
     pub current_script: Option<NodeId>,
+    /// The element that started the module graph being fetched. Every fetch in
+    /// the graph reads its `crossorigin` and `referrerpolicy`, while
+    /// `current_script` stays unset so `document.currentScript` is null
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-the-descendants-of-and-link-a-module-script>).
+    pub(crate) module_fetch_root: Option<NodeId>,
 
     /// Existing elements being synchronously upgraded by a custom-element
     /// constructor. `HTMLElement()` consumes the top candidate.
@@ -1620,6 +1629,7 @@ impl DocumentState {
         self.parser_inserted.clear();
         self.decoders.clear();
         self.current_script = None;
+        self.module_fetch_root = None;
         self.custom_construction.clear();
         self.implementations.clear();
         self.active_elements.clear();
@@ -1826,6 +1836,7 @@ impl World {
             self.owned.insert(id);
         }
         self.state.current_script = None;
+        self.state.module_fetch_root = None;
         id
     }
 

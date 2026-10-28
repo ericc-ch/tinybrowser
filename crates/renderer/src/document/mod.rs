@@ -226,7 +226,7 @@ impl QueuedDial {
     }
 }
 
-/// One finished dial with the response it produced./// One finished dial with the response it produced.
+/// One finished dial with the response it produced.
 pub(crate) struct CompletedDial {
     pub(crate) context: DialContext,
     pub(crate) outcome: DialOutcome,
@@ -3729,22 +3729,24 @@ impl Document {
         self.adopt_pending_frames();
     }
 
-    /// Runs `body` with `current_script` naming `element`, restoring the
-    /// previous value afterwards.
+    /// Runs `body` with `element` recorded as the root of the module graph
+    /// being fetched, restoring the previous value afterwards.
     ///
-    /// A module graph's fetches run while its root element's script is being
-    /// evaluated, so every fetch in the graph reads the root's script fetch
-    /// options: its `crossorigin` credentials mode and `referrerpolicy`
+    /// Every fetch in the graph reads the root's script fetch options: its
+    /// `crossorigin` credentials mode and `referrerpolicy`
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-the-descendants-of-and-link-a-module-script>).
-    fn with_current_script<R>(
+    /// `current_script` stays unset, so `document.currentScript` is null while
+    /// a module evaluates
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript>).
+    fn with_module_root<R>(
         &mut self,
         element: Option<crate::dom::tree::NodeId>,
         body: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let previous = self.world.borrow().state.current_script;
-        self.world.borrow_mut().state.current_script = element;
+        let previous = self.world.borrow().state.module_fetch_root;
+        self.world.borrow_mut().state.module_fetch_root = element;
         let result = body(self);
-        self.world.borrow_mut().state.current_script = previous;
+        self.world.borrow_mut().state.module_fetch_root = previous;
         result
     }
 
@@ -3761,7 +3763,7 @@ impl Document {
                         continue;
                     }
                     let name = format!("{}#inline-module-{index}", self.url);
-                    self.with_current_script(Some(element), |this| {
+                    self.with_module_root(Some(element), |this| {
                         this.js
                             .as_ref()
                             .map_or(Ok(()), |js| js.eval_inline_module(&name, &source))
@@ -3776,7 +3778,7 @@ impl Document {
                         if crate::csp::blocks(&violations) {
                             continue;
                         }
-                        self.with_current_script(Some(element), |this| {
+                        self.with_module_root(Some(element), |this| {
                             this.js
                                 .as_ref()
                                 .map_or(Ok(()), |js| js.eval_external_module(url.as_str()))

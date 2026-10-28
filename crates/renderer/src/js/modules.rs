@@ -95,7 +95,8 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-the-descendants-of-and-link-a-module-script>).
         let options = world
             .state
-            .current_script
+            .module_fetch_root
+            .or(world.state.current_script)
             .map(|element| world.subresource_options(element))
             .unwrap_or_default();
         (
