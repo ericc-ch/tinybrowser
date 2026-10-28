@@ -8,11 +8,30 @@ use crate::fixture::Fixture;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
+/// A self-signed P-256 certificate, valid until 2126. It only has to parse as
+/// a trust anchor: the test that uses it never dials TLS. Generated with
+/// `openssl ecparam -name prime256v1 -genkey -noout` and
+/// `openssl req -new -x509 -key ... -days 36500 -subj "/CN=tinybrowser test CA"`.
+const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBlDCCATmgAwIBAgIUHtgz+u6hLKfJ8KlBZW+n7WllidUwCgYIKoZIzj0EAwIw\n\
+HjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBDQTAgFw0yNjEwMjgxMjAwNTVa\n\
+GA8yMTI2MTAwNDEyMDA1NVowHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBD\n\
+QTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPDEdv6i/c0udS8nzd6hXHNdxeAR\n\
+PNB4WCCUEeWEr2Ygg55bOUC3iFt512pC3xmHu7secLobEqcN4bUonDjhYqejUzBR\n\
+MB0GA1UdDgQWBBT3Nq11ijdypbxANzmLPKOJc9jm5zAfBgNVHSMEGDAWgBT3Nq11\n\
+ijdypbxANzmLPKOJc9jm5zAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kA\n\
+MEYCIQCW2cX8boyq7TywFBPkGQZAeTmiuyCD4eGlXBJd7k+q7AIhAJg+orgrgbOx\n\
+c385o8s08MCc2bADMtb1EYRpaI9RZ0Ah\n\
+-----END CERTIFICATE-----\n";
+
 fn start(extra_args: Vec<String>) -> (String, Fixture) {
+    start_in(Fixture::new("tinybrowser-webdriver"), extra_args)
+}
+
+fn start_in(mut fixture: Fixture, extra_args: Vec<String>) -> (String, Fixture) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
-    let mut fixture = Fixture::new("tinybrowser-webdriver");
     let mut command = Command::new(env!("CARGO_BIN_EXE_tinybrowser"));
     command.args(["webdriver", &format!("--port={port}")]);
     command.args(extra_args);
@@ -53,6 +72,19 @@ fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
         }
     }
     panic!("webdriver not reachable: {last_error:?}");
+}
+
+/// A readable `--tls-ca` is part of the network configuration, so the server
+/// starts with it. A refused flag and an unreadable file are covered next to
+/// the other usage errors in `modes`.
+#[test]
+fn a_valid_tls_ca_is_read_before_the_server_starts() {
+    let fixture = Fixture::new("tinybrowser-webdriver-tls-ca-valid");
+    let ca = fixture.data().join("test-ca.pem");
+    std::fs::write(&ca, TEST_CA_PEM).expect("write CA");
+    let (addr, _fixture) = start_in(fixture, vec![format!("--tls-ca={}", ca.display())]);
+    let status = request(&addr, "GET", "/status", None);
+    assert_eq!(status["value"]["ready"], json!(true), "{status}");
 }
 
 #[test]

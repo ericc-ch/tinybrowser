@@ -930,13 +930,18 @@ mod sandbox_flag_tests {
             ),
         ];
         for (keyword, cleared) in expected {
-            let flags = SandboxFlags::parse(Some(keyword));
-            for flag in all_flags() {
-                assert_eq!(
-                    flags.contains(flag),
-                    !cleared.contains(&flag),
-                    "{keyword}: flag {flag:#x}"
-                );
+            // `sandbox` is an enumerated attribute, so a keyword matches ASCII
+            // case-insensitively
+            // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
+            for spelling in [(*keyword).to_owned(), keyword.to_ascii_uppercase()] {
+                let flags = SandboxFlags::parse(Some(&spelling));
+                for flag in all_flags() {
+                    assert_eq!(
+                        flags.contains(flag),
+                        !cleared.contains(&flag),
+                        "{spelling}: flag {flag:#x}"
+                    );
+                }
             }
         }
     }
@@ -950,24 +955,6 @@ mod sandbox_flag_tests {
         assert!(!SandboxFlags::supports(
             "allow-storage-access-by-user-activation"
         ));
-    }
-
-    #[test]
-    fn keywords_clear_exactly_the_flags_they_name() {
-        let flags = SandboxFlags::parse(Some("allow-scripts allow-same-origin"));
-        assert!(!flags.scripts_disabled());
-        assert!(!flags.origin_is_opaque());
-        // `allow-scripts` also relaxes automatic features
-        assert!(!flags.contains(SandboxFlags::AUTOMATIC_FEATURES));
-        assert!(flags.contains(SandboxFlags::AUXILIARY_NAVIGATION));
-        // Keywords are ASCII case-insensitive
-        assert!(
-            !SandboxFlags::parse(Some("ALLOW-POPUPS")).contains(SandboxFlags::AUXILIARY_NAVIGATION)
-        );
-        assert!(
-            !SandboxFlags::parse(Some("allow-top-navigation"))
-                .contains(SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION)
-        );
     }
 
     #[test]

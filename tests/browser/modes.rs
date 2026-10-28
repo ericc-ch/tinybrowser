@@ -166,7 +166,14 @@ fn webdriver_rejects_an_unparseable_tls_ca_before_starting() {
     );
     assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("--tls-ca"), "{err}");
+    // Only the certificate reader names the path; the flag scanner's
+    // "unexpected argument" error does not, so a command that dropped
+    // `--tls-ca` entirely cannot pass this.
+    assert!(
+        err.contains(&format!("--tls-ca {}:", ca.display())),
+        "{err}"
+    );
+    assert!(!err.contains("unexpected argument"), "{err}");
 }
 
 #[test]
@@ -178,7 +185,8 @@ fn webdriver_rejects_a_missing_tls_ca_file_before_starting() {
     );
     assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("--tls-ca"), "{err}");
+    assert!(err.contains("--tls-ca /nonexistent:"), "{err}");
+    assert!(!err.contains("unexpected argument"), "{err}");
 }
 
 #[test]
