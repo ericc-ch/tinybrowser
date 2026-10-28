@@ -26,7 +26,14 @@ impl EmbeddedRenderer {
     pub fn new(host: Arc<dyn BrowserServices>) -> Self {
         let stop = Arc::new(Stop::new());
         Self {
-            engine: Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new())),
+            // An in-process embedder with no browser around it gets the
+            // built-in identity; a carrier that has one passes its own.
+            engine: Engine::new(
+                host,
+                Arc::clone(&stop),
+                Arc::new(Notify::new()),
+                net::Identity::default(),
+            ),
             stop,
             ready_queued: false,
         }

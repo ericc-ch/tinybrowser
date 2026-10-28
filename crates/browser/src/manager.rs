@@ -33,6 +33,8 @@ pub(crate) struct RendererProcessManager {
 }
 
 struct ManagerInner {
+    /// The identity every renderer this manager spawns reports.
+    identity: net::Identity,
     partition: PartitionServices,
     sessions: Arc<SessionStorage>,
     browser: crate::browser::BrowserHandle,
@@ -56,9 +58,11 @@ impl RendererProcessManager {
         sessions: Arc<SessionStorage>,
         browser: crate::browser::BrowserHandle,
         tabs: TabRegistry,
+        identity: net::Identity,
     ) -> Self {
         let (releases, release_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(ManagerInner {
+            identity,
             partition,
             sessions,
             browser,
@@ -227,6 +231,7 @@ async fn spawn_slot(
             id,
             site,
             RendererServices {
+                identity: inner.identity.clone(),
                 partition: inner.partition.clone(),
                 sessions: Arc::clone(&inner.sessions),
                 browser: inner.browser.clone(),

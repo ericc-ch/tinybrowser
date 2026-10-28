@@ -40,6 +40,11 @@ pub(super) async fn run(
 ) {
     let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
     let mut responses = ResponseStreams::default();
+    let mut session = Session {
+        identity: net::Identity::default(),
+        stop: Arc::clone(stop),
+        wake: Arc::clone(&wake),
+    };
     loop {
         if stop.is_set() {
             stop.request();
@@ -62,8 +67,7 @@ pub(super) async fn run(
                         &mut responses,
                         outbox,
                         &client,
-                        stop,
-                        &wake,
+                        &mut session,
                     ) {
                         stop.request();
                         break;
@@ -80,8 +84,7 @@ pub(super) async fn run(
                             &mut responses,
                             outbox,
                             &client,
-                            stop,
-                            &wake,
+                            &mut session,
                         ) {
                             stop.request();
                             break;
@@ -98,18 +101,29 @@ pub(super) async fn run(
     }
 }
 
+/// The values every engine this process hosts shares: the browser's identity,
+/// and the stop and wake handles its loop waits on.
+struct Session {
+    identity: net::Identity,
+    stop: Arc<Stop>,
+    wake: Arc<Notify>,
+}
+
 fn handle_host(
     received: Option<ToRenderer>,
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     responses: &mut ResponseStreams,
     outbox: &exchange::BlockingSender<FromRenderer>,
     client: &Arc<ServiceClient>,
-    stop: &Arc<Stop>,
-    wake: &Arc<Notify>,
+    session: &mut Session,
 ) -> bool {
     match received {
+        Some(Frame::Notify(HostNotice::Hello { identity })) => {
+            session.identity = identity;
+            true
+        }
         Some(Frame::Notify(HostNotice::Assign { assignment })) => {
-            assign_engine(engines, assignment, client, stop, wake)
+            assign_engine(engines, assignment, client, session)
         }
         Some(Frame::Notify(HostNotice::Release { assignment })) => {
             responses.release(assignment, engines);
@@ -199,9 +213,7 @@ fn handle_host(
             true
         }
         Some(
-            Frame::Notify(HostNotice::Hello | HostNotice::Shutdown)
-            | Frame::Reply { .. }
-            | Frame::ResponseChunk { .. },
+            Frame::Notify(HostNotice::Shutdown) | Frame::Reply { .. } | Frame::ResponseChunk { .. },
         )
         | None => false,
     }
@@ -275,8 +287,7 @@ fn assign_engine(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     assignment: RendererAssignmentId,
     client: &Arc<ServiceClient>,
-    stop: &Arc<Stop>,
-    wake: &Arc<Notify>,
+    session: &Session,
 ) -> bool {
     if engines.contains_key(&assignment) {
         return false;
@@ -284,7 +295,12 @@ fn assign_engine(
     let assignment_services = Arc::new(HostServices::new(assignment, Arc::clone(client)));
     engines.insert(
         assignment,
-        Engine::new(assignment_services, Arc::clone(stop), Arc::clone(wake)),
+        Engine::new(
+            assignment_services,
+            Arc::clone(&session.stop),
+            Arc::clone(&session.wake),
+            session.identity.clone(),
+        ),
     );
     true
 }

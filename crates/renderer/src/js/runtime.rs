@@ -25,6 +25,11 @@ use super::RealmRegistry;
 #[derive(Clone)]
 pub(crate) struct FrameRuntime {
     pub(crate) services: Arc<dyn BrowserServices>,
+    /// The browser identity this process was spawned with: the same value the
+    /// network uses for `User-Agent` and the client hints, so a page, a CSP
+    /// report, and a request cannot name different products
+    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    pub(crate) identity: net::Identity,
     pub(crate) js_runtime: JsRuntimeHandle,
     pub(crate) wake: Arc<Notify>,
     pub(crate) stop: Arc<Stop>,

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use net::{
     Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Proxy, Referrer,
-    ReferrerPolicy, Request, ResolveRule, TimeoutKind, TransportError, UserAgent,
+    ReferrerPolicy, Request, ResolveRule, TimeoutKind, TransportError,
 };
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -305,7 +305,10 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()]);
     let agent = Agent::new(AgentOptions {
-        user_agent: Some(UserAgent::from_static("builder/default")),
+        identity: net::Identity {
+            user_agent: net::UserAgent::from_static("builder/default"),
+            ..net::Identity::default()
+        },
         ..AgentOptions::default()
     });
     let mut request = Request::new(Method::POST, server.url("/shape#fragment"));

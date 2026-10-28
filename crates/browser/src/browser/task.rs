@@ -153,11 +153,13 @@ impl BrowserTask {
         browser: BrowserHandle,
     ) -> Self {
         let tabs = TabRegistry::new();
+        let identity = browser.identity().clone();
         let renderers = Arc::new(RendererProcessManager::new(
             context.partition_services(),
             context.session_storage(),
             browser,
             tabs.clone(),
+            identity,
         ));
         Self {
             server,

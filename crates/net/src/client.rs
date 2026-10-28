@@ -73,12 +73,13 @@ impl std::fmt::Debug for Clock {
 /// request. Debug output records whether a proxy is configured, not its URI or
 /// credentials.
 ///
-/// `user_agent` keeps only its validated field value, `proxy` only its parsed
-/// destination and credentials, and `tls_cas` only parsed certificates.
+/// `identity` keeps only a validated user agent and its hints, `proxy` only its
+/// parsed destination and credentials, and `tls_cas` only parsed certificates.
 #[derive(Clone)]
 pub struct AgentOptions {
-    /// Default `User-Agent` for requests that do not set that header themselves.
-    pub user_agent: Option<UserAgent>,
+    /// The browser identity: `User-Agent`, client hints, and the values the
+    /// renderer and CDP report for it.
+    pub identity: crate::Identity,
     /// Cap on the whole call, including redirects.
     pub timeout_global: Option<Duration>,
     /// Cap on a single hop.
@@ -94,32 +95,6 @@ pub struct AgentOptions {
     /// Certificate authorities to trust in addition to the platform's, e.g. a
     /// private test CA. Repeatable.
     pub tls_cas: Vec<TrustedCa>,
-}
-
-/// A validated `User-Agent` field value.
-///
-/// The browser builds it once from the shared `USER_AGENT` constant and hands
-/// it to both the request header and the renderer's `navigator.userAgent`, so
-/// the two cannot disagree.
-#[derive(Clone, Debug)]
-pub struct UserAgent(HeaderValue);
-
-impl UserAgent {
-    /// Wraps a value known to be valid at compile time, for a crate constant.
-    ///
-    /// # Panics
-    ///
-    /// When `value` contains a byte a field value cannot carry. A call in a
-    /// `const` item makes that a compile error, which is how the browser's
-    /// default user agent is checked.
-    #[must_use]
-    pub const fn from_static(value: &'static str) -> Self {
-        Self(HeaderValue::from_static(value))
-    }
-
-    pub(crate) fn header(&self) -> &HeaderValue {
-        &self.0
-    }
 }
 
 impl std::fmt::Debug for AgentOptions {
@@ -138,7 +113,7 @@ impl std::fmt::Debug for AgentOptions {
 impl Default for AgentOptions {
     fn default() -> Self {
         Self {
-            user_agent: None,
+            identity: crate::Identity::default(),
             timeout_global: None,
             timeout_per_call: None,
             max_redirects: DEFAULT_MAX_REDIRECTS,
@@ -156,7 +131,7 @@ impl Default for AgentOptions {
 #[derive(Clone)]
 pub struct Agent {
     pub(crate) engine: HttpEngine,
-    ua: Option<UserAgent>,
+    identity: crate::Identity,
     max_redirects: u32,
     jar: Arc<Mutex<CookieJar>>,
     clock: Clock,
@@ -179,7 +154,7 @@ impl Agent {
     #[must_use]
     pub fn new(options: AgentOptions) -> Agent {
         let AgentOptions {
-            user_agent,
+            identity,
             timeout_global,
             timeout_per_call,
             max_redirects,
@@ -197,11 +172,17 @@ impl Agent {
                 resolve.into(),
                 &tls_cas,
             ),
-            ua: user_agent,
+            identity,
             max_redirects,
             jar: Arc::new(Mutex::new(CookieJar::default())),
             clock,
         }
+    }
+
+    /// The identity every request, page, and CDP answer reports.
+    #[must_use]
+    pub fn identity(&self) -> &crate::Identity {
+        &self.identity
     }
 
     /// Borrows the live jar, recovering from a poisoned lock.
@@ -289,10 +270,11 @@ impl Agent {
                 .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
             headers.set(header::COOKIE, value);
         }
-        if headers.value("user-agent").is_none()
-            && let Some(ua) = &self.ua
-        {
-            headers.append(header::USER_AGENT, ua.header().clone());
+        if headers.value("user-agent").is_none() {
+            headers.append(
+                header::USER_AGENT,
+                self.identity.user_agent.header().clone(),
+            );
         }
         Ok(())
     }
@@ -335,9 +317,10 @@ impl Agent {
                     .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
             );
         }
-        if let Some(ua) = &self.ua {
-            preflight.append(header::USER_AGENT, ua.header().clone());
-        }
+        preflight.append(
+            header::USER_AGENT,
+            self.identity.user_agent.header().clone(),
+        );
         let (status, preflight_headers, body, _http2) = self
             .engine
             .send(&Method::OPTIONS, wire, &preflight, None, budget)
@@ -423,6 +406,7 @@ impl Agent {
         }
         let dial = Dial {
             cors: &request.cors,
+            client_hints: request.client_hints.as_ref(),
             initiator_kind: request.initiator_kind,
             initiator: request.initiator.as_ref(),
             on_redirect: request.on_redirect.as_ref(),
@@ -612,17 +596,9 @@ impl Agent {
         self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget)
             .await?;
         self.prepare_outbound(&mut hop_headers, operation)?;
-        // Credentials mode gates both the `Cookie` header and the
-        // URL-credentials `Authorization` header
-        // (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>,
-        // <https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>).
+        prepare_credentials(dial, url, cross_origin, &mut hop_headers)?;
         let send_credentials =
             crate::cors::credentials_admitted(dial.cors.credentials, cross_origin);
-        if send_credentials {
-            apply_url_credentials(&mut hop_headers, url)?;
-        } else {
-            hop_headers.remove("cookie");
-        }
         let (status, response_headers, reader, http2) = self
             .engine
             .send(
@@ -715,6 +691,12 @@ pub struct Request {
     /// caller fills `origin` from the document it is fetching for, so a
     /// compromised renderer cannot claim another origin.
     pub cors: crate::cors::CorsSettings,
+    /// The browser's identity, when this request is one the browser makes on a
+    /// page's behalf. The client hints are written after the CORS preflight
+    /// decision, because the user agent adds them rather than the request's
+    /// header list, so they never force a preflight
+    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    pub client_hints: Option<crate::Identity>,
     /// Called with the next URL and the redirect count that hop will carry
     /// (`1` for the first redirect) before the hop is followed. `false`
     /// rejects the dial. Unset follows every redirect the cap allows.
@@ -744,6 +726,7 @@ impl std::fmt::Debug for Request {
             .field("deadline", &self.deadline)
             .field("cors", &self.cors)
             .field("on_redirect", &self.on_redirect.is_some())
+            .field("has_client_hints", &self.client_hints.is_some())
             .field("referrer", &self.referrer)
             .field("referrer_policy", &self.referrer_policy)
             .field("referrer_client", &self.referrer_client)
@@ -772,6 +755,7 @@ impl Request {
             body: None,
             deadline: None,
             cors,
+            client_hints: None,
             on_redirect: None,
             referrer: Referrer::NoReferrer,
             referrer_policy: ReferrerPolicy::default(),
@@ -854,9 +838,39 @@ enum HopOutcome {
     Redirect { next: Url },
 }
 
+/// Writes the headers one hop carries after the CORS decision: the
+/// URL-credentials `Authorization`, the `Cookie` gate, and the client hints.
+///
+/// Credentials mode gates both the `Cookie` header and the URL-credentials
+/// `Authorization` header
+/// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>,
+/// <https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>). The hints are
+/// written here, not into the caller's header list, so they never change the
+/// CORS-preflight decision
+/// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+fn prepare_credentials(
+    dial: &Dial<'_>,
+    url: &Url,
+    cross_origin: bool,
+    headers: &mut HeaderMap,
+) -> Result<(), NetError> {
+    if crate::cors::credentials_admitted(dial.cors.credentials, cross_origin) {
+        apply_url_credentials(headers, url)?;
+    } else {
+        headers.remove("cookie");
+    }
+    if let Some(identity) = dial.client_hints {
+        identity
+            .write_client_hints(headers, url)
+            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+    }
+    Ok(())
+}
+
 /// Request-scoped values shared by every hop of one `send` call.
 struct Dial<'a> {
     cors: &'a crate::cors::CorsSettings,
+    client_hints: Option<&'a crate::Identity>,
     initiator_kind: InitiatorKind,
     initiator: Option<&'a Url>,
     on_redirect: Option<&'a RedirectGate>,

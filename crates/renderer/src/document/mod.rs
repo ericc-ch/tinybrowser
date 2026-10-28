@@ -2797,7 +2797,15 @@ impl Document {
             // POST and suppresses `report-uri`
             // (<https://w3c.github.io/webappsec-csp/#directive-report-to>).
             if let Some(url) = self.reporting_url(&violation.report_to) {
-                let body = Self::reporting_api_body(violation);
+                let user_agent = self
+                    .world
+                    .borrow()
+                    .runtime
+                    .identity
+                    .user_agent
+                    .as_str()
+                    .to_owned();
+                let body = Self::reporting_api_body(violation, &user_agent);
                 self.queue_report(
                     &url,
                     body,
@@ -2904,7 +2912,7 @@ impl Document {
     /// list of reports, even when only one fired
     /// (<https://w3c.github.io/webappsec-csp/#cspviolationreportbody>,
     /// <https://w3c.github.io/reporting/#send-reports>).
-    fn reporting_api_body(violation: &crate::csp::Violation) -> Vec<u8> {
+    fn reporting_api_body(violation: &crate::csp::Violation, user_agent: &str) -> Vec<u8> {
         let sample = violation
             .sample
             .as_deref()
@@ -2925,7 +2933,7 @@ impl Document {
         format!(
             "[{{\"type\":\"csp-violation\",\"age\":0,\"url\":{},\"user_agent\":{},\"body\":{{\"documentURL\":{},\"referrer\":\"\",\"blockedURL\":{},\"effectiveDirective\":{},\"originalPolicy\":{},\"sourceFile\":{},\"lineNumber\":{},\"columnNumber\":{},\"sample\":{},\"disposition\":{},\"statusCode\":{}}}}}]",
             Self::json_string(&violation.document_uri),
-            Self::json_string(crate::USER_AGENT),
+            Self::json_string(user_agent),
             Self::json_string(&violation.document_uri),
             Self::json_string(&violation.blocked_uri),
             Self::json_string(&violation.effective_directive),

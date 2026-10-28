@@ -38,8 +38,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// the removal of `Discard`. Version 14 replaced a request's kind and optional
 /// CORS parameters with one [`RequestPolicy`](renderer::RequestPolicy), and a
 /// page request's mode with [`CorsMode`](renderer::CorsMode), which has no
-/// `navigate`.
-pub const PROTOCOL_VERSION: u8 = 14;
+/// `navigate`. Version 15 made the handshake carry the browser identity, so
+/// every page and CDP answer reports the same product as the request headers.
+pub const PROTOCOL_VERSION: u8 = 15;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -498,6 +499,36 @@ mod tests {
             };
             assert_eq!(request.policy, policy, "the policy survives the wire");
         }
+    }
+
+    /// The handshake carries the identity, so the renderer's pages, its CSP
+    /// reports, and CDP answers report the product the request headers do
+    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    #[test]
+    fn a_handshake_carries_the_browser_identity() {
+        let identity = net::Identity {
+            user_agent: net::UserAgent::parse("probe/1").expect("user agent"),
+            brands: vec![net::Brand {
+                brand: "Probe".to_owned(),
+                version: "7".to_owned(),
+            }],
+            ..net::Identity::default()
+        };
+        let message: crate::wire::ToRenderer =
+            crate::exchange::Frame::Notify(crate::wire::HostNotice::Hello {
+                identity: identity.clone(),
+            });
+        let mut bytes = Vec::new();
+        write_control(&mut bytes, &message).expect("write");
+        let back: crate::wire::ToRenderer = read_control(&mut Cursor::new(bytes), &mut Vec::new())
+            .expect("read")
+            .expect("one frame");
+        let crate::exchange::Frame::Notify(crate::wire::HostNotice::Hello { identity: back }) =
+            back
+        else {
+            panic!("expected a handshake");
+        };
+        assert_eq!(back, identity);
     }
 
     #[test]

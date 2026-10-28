@@ -9,8 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use net::{
-    Agent, AgentOptions, InitiatorKind, Method, Request, UserAgent, isomorphic_decode,
-    isomorphic_encode,
+    Agent, AgentOptions, InitiatorKind, Method, Request, isomorphic_decode, isomorphic_encode,
 };
 use renderer::{
     BodyDelivery, DialFailure, DialKind, DialOutcome, DialRequest, RequestCache, RequestPolicy,
@@ -240,8 +239,6 @@ struct DialPermits {
 
 const CACHE_MAX_ENTRIES: usize = 64;
 const CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-
-const DEFAULT_USER_AGENT: UserAgent = UserAgent::from_static(crate::USER_AGENT);
 
 /// The bytes a cache entry holds. Only buffered bodies are ever stored: a
 /// streamed response is buffered into the store as it arrives, and an
@@ -522,13 +519,10 @@ pub(crate) struct NetworkContext {
 }
 
 impl NetworkContext {
-    /// Builds the partition network from caller `options`. Defaults fill only
-    /// where the caller left a field `None`: caller wins on `user_agent` and
-    /// `timeout_per_call`.
+    /// Builds the partition network from caller `options`. The only default is
+    /// `timeout_per_call`: the identity comes from `options`, whose own default
+    /// is the built-in one.
     pub(crate) fn new(mut options: AgentOptions) -> Self {
-        if options.user_agent.is_none() {
-            options.user_agent = Some(DEFAULT_USER_AGENT);
-        }
         if options.timeout_per_call.is_none() {
             options.timeout_per_call = Some(PAGE_FETCH_TIMEOUT);
         }
@@ -545,6 +539,7 @@ impl NetworkContext {
     #[must_use]
     pub(crate) fn tab_handle(&self) -> TabNetworkHandle {
         TabNetworkHandle {
+            identity: self.agent.identity().clone(),
             agent: self.agent.clone(),
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
@@ -557,6 +552,12 @@ impl NetworkContext {
 
     pub(crate) fn agent(&self) -> Agent {
         self.agent.clone()
+    }
+
+    /// The identity this partition was built with, for the renderers it
+    /// spawns.
+    pub(crate) fn identity(&self) -> net::Identity {
+        self.agent.identity().clone()
     }
 
     /// Cookies visible to `url`, including session and `HttpOnly` cookies.
@@ -601,6 +602,8 @@ const MAX_TAB_DIALS: usize = 8;
 /// Completions return to the tab coordinator as renderer events.
 #[derive(Clone)]
 pub(crate) struct TabNetworkHandle {
+    /// The identity this tab reports in request headers and in the renderer.
+    identity: net::Identity,
     agent: Agent,
     permits: NetworkPermits,
     tab: Arc<Semaphore>,
@@ -662,6 +665,7 @@ impl TabNetworkHandle {
         let permits = Self::acquire(&self.permits.navigation, deadline).await?;
         let mut request = Request::new(Method::GET, url.clone());
         chrome_navigation_request(&mut request, url);
+        request.client_hints = Some(self.identity.clone());
         request.initiator_kind = InitiatorKind::Navigation;
         request.initiator = Some(initiator.clone());
         request.cors = net::cors::CorsSettings {
@@ -1100,7 +1104,7 @@ impl TabNetworkHandle {
             .sheets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        outbound_request(request, initiator, deadline, &sheets)
+        outbound_request(request, initiator, deadline, &sheets, &self.identity)
     }
 
     async fn acquire(
@@ -1157,6 +1161,7 @@ fn outbound_request(
     initiator: &Url,
     deadline: Instant,
     sheets: &HashSet<Url>,
+    identity: &net::Identity,
 ) -> Result<Request, DialFailure> {
     let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
     let kind = request.policy.kind();
@@ -1228,6 +1233,9 @@ fn outbound_request(
     };
     static_header(&mut outbound, "Sec-Fetch-Dest", destination);
     static_header(&mut outbound, "Sec-Fetch-Mode", cors.mode.as_str());
+    // Net writes the client hints after the preflight decision, so they never
+    // force one (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    outbound.client_hints = Some(identity.clone());
     if !request.body.is_empty() {
         outbound.body = Some(request.body.clone());
     }
@@ -1486,17 +1494,11 @@ fn chrome_navigation_request(request: &mut Request, url: &Url) {
     static_header(request, "Sec-Fetch-User", "?1");
     static_header(request, "Sec-Fetch-Dest", "document");
     if net::is_potentially_trustworthy(url) {
-        for (name, value) in [
-            ("Sec-CH-UA", crate::SEC_CH_UA),
-            ("Sec-CH-UA-Mobile", crate::SEC_CH_UA_MOBILE),
-            ("Sec-CH-UA-Platform", crate::SEC_CH_UA_PLATFORM),
-            (
-                "Sec-CH-Prefers-Color-Scheme",
-                crate::SEC_CH_PREFERS_COLOR_SCHEME,
-            ),
-        ] {
-            static_header(request, name, value);
-        }
+        static_header(
+            request,
+            "Sec-CH-Prefers-Color-Scheme",
+            crate::SEC_CH_PREFERS_COLOR_SCHEME,
+        );
     }
 }
 
@@ -1588,6 +1590,7 @@ mod tests {
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         let deadline = Instant::now() + Duration::from_secs(5);
         let sheets = HashSet::new();
+        let identity = net::Identity::default();
         let anonymous = Some(net::cors::CrossOrigin::Anonymous);
         let credentials = Some(net::cors::CrossOrigin::UseCredentials);
         let fetch = |mode, credentials| {
@@ -1687,7 +1690,7 @@ mod tests {
         ];
         for (policy, mode, credentials, redirect, fetch_mode, destination) in table {
             let request = dial(policy, "http://b.test/x");
-            let outbound = outbound_request(&request, &initiator, deadline, &sheets)
+            let outbound = outbound_request(&request, &initiator, deadline, &sheets, &identity)
                 .expect("outbound request");
             assert_eq!(outbound.cors.mode, mode, "{:?}", policy.kind());
             assert_eq!(
@@ -1727,6 +1730,7 @@ mod tests {
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         let deadline = Instant::now() + Duration::from_secs(5);
         let sheets = HashSet::new();
+        let identity = net::Identity::default();
         let mut request = dial(
             RequestPolicy::Fetch(renderer::CorsRequest {
                 mode: renderer::CorsMode::NoCors,
@@ -1737,16 +1741,16 @@ mod tests {
         );
         request.method = net::Method::POST;
         request.content_type = Some("application/json".to_owned());
-        let outbound =
-            outbound_request(&request, &initiator, deadline, &sheets).expect("outbound request");
+        let outbound = outbound_request(&request, &initiator, deadline, &sheets, &identity)
+            .expect("outbound request");
         assert!(
             outbound.headers.get("content-type").is_none(),
             "a JSON type would have needed a preflight"
         );
 
         request.content_type = Some("text/plain;charset=UTF-8".to_owned());
-        let outbound =
-            outbound_request(&request, &initiator, deadline, &sheets).expect("outbound request");
+        let outbound = outbound_request(&request, &initiator, deadline, &sheets, &identity)
+            .expect("outbound request");
         assert_eq!(
             outbound.headers.get("content-type"),
             Some(b"text/plain;charset=UTF-8".as_slice()),
@@ -1758,8 +1762,8 @@ mod tests {
         let mut report = dial(RequestPolicy::CspReportUri, "http://b.test/report");
         report.method = net::Method::POST;
         report.content_type = Some("application/csp-report".to_owned());
-        let outbound =
-            outbound_request(&report, &initiator, deadline, &sheets).expect("outbound report");
+        let outbound = outbound_request(&report, &initiator, deadline, &sheets, &identity)
+            .expect("outbound report");
         assert_eq!(
             outbound.headers.get("content-type"),
             Some(b"application/csp-report".as_slice()),
@@ -2279,33 +2283,32 @@ mod tests {
                 .expect("permit after release");
     }
 
+    /// The identity hints are written by the agent, so this builder names only
+    /// the preference hint it owns, and only over a trustworthy transport
+    /// (<https://wicg.github.io/user-preference-media-features-headers/#sec-ch-prefers-color-scheme>).
     #[test]
-    fn chrome_navigation_client_hints_are_limited_to_trustworthy_urls() {
-        let hints = [
-            "sec-ch-ua",
-            "sec-ch-ua-mobile",
-            "sec-ch-ua-platform",
-            "sec-ch-prefers-color-scheme",
-        ];
+    fn chrome_navigation_headers_are_limited_to_trustworthy_urls() {
         let secure = Url::parse("https://example.com/").expect("https url");
         let mut secure_request = net::Request::new(net::Method::GET, secure.clone());
         chrome_navigation_request(&mut secure_request, &secure);
-        for hint in hints {
-            assert!(
-                secure_request.headers.get(hint).is_some(),
-                "{hint} must reach a trustworthy URL"
-            );
-        }
+        assert!(
+            secure_request
+                .headers
+                .get("sec-ch-prefers-color-scheme")
+                .is_some(),
+            "the preference hint reaches a trustworthy URL"
+        );
 
         let insecure = Url::parse("http://example.com/").expect("http url");
         let mut insecure_request = net::Request::new(net::Method::GET, insecure.clone());
         chrome_navigation_request(&mut insecure_request, &insecure);
-        for hint in hints {
-            assert!(
-                insecure_request.headers.get(hint).is_none(),
-                "{hint} must stay off plain http"
-            );
-        }
+        assert!(
+            insecure_request
+                .headers
+                .get("sec-ch-prefers-color-scheme")
+                .is_none(),
+            "the preference hint stays off plain http"
+        );
         assert!(insecure_request.headers.get("sec-fetch-mode").is_some());
         assert!(insecure_request.headers.get("accept").is_some());
     }

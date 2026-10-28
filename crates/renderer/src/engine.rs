@@ -120,12 +120,20 @@ impl Engine {
     ///
     /// `stop` cancels every frame at once; `wake` is notified when a dial
     /// completion or stop arrives, so a carrier can wait instead of polling.
+    /// `identity` is the browser's, and every page this engine hosts reports
+    /// it verbatim.
     #[must_use]
-    pub fn new(services: Arc<dyn BrowserServices>, stop: Arc<Stop>, wake: Arc<Notify>) -> Self {
+    pub fn new(
+        services: Arc<dyn BrowserServices>,
+        stop: Arc<Stop>,
+        wake: Arc<Notify>,
+        identity: net::Identity,
+    ) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let init_scripts: Rc<RefCell<Vec<(u64, String)>>> = Rc::new(RefCell::new(Vec::new()));
         let runtime = FrameRuntime {
             services,
+            identity,
             js_runtime: js_runtime.handle(),
             wake,
             stop,
@@ -2029,12 +2037,29 @@ mod navigator_tests {
     use crate::test_services::NullServices;
     use std::sync::Arc;
 
+    /// One engine whose identity is not the built-in one: whatever the carrier
+    /// spawns it with is what every page reports, header and hints together
+    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
     #[test]
-    fn navigator_user_agent_is_the_shared_identity() {
+    fn navigator_reports_the_identity_the_engine_was_built_with() {
+        let identity = net::Identity {
+            user_agent: net::UserAgent::parse("probe/1").expect("user agent"),
+            brands: vec![net::Brand {
+                brand: "Probe".to_owned(),
+                version: "7".to_owned(),
+            }],
+            full_version_list: vec![net::Brand {
+                brand: "Chromium".to_owned(),
+                version: "7.0.0.0".to_owned(),
+            }],
+            platform: "ProbeOS".to_owned(),
+            mobile: true,
+        };
         let mut engine = Engine::new(
             Arc::new(NullServices),
             Arc::new(crate::js::Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            identity,
         );
         engine
             .mount_frame(
@@ -2049,12 +2074,14 @@ mod navigator_tests {
             )
             .expect("mount");
         let _ready = engine.drain_ready();
+        let mut evaluate = |source: &str| engine.eval_in(FrameId::MAIN, source).expect("evaluate");
+        assert_eq!(evaluate("navigator.userAgent"), "probe/1");
         assert_eq!(
-            engine
-                .eval_in(FrameId::MAIN, "navigator.userAgent")
-                .expect("evaluate"),
-            crate::USER_AGENT
+            evaluate("JSON.stringify(navigator.userAgentData.brands)"),
+            r#"[{"brand":"Probe","version":"7"}]"#
         );
+        assert_eq!(evaluate("navigator.userAgentData.mobile"), "true");
+        assert_eq!(evaluate("navigator.userAgentData.platform"), "ProbeOS");
     }
 }
 
@@ -2126,6 +2153,7 @@ mod messaging_tests {
             Arc::new(NullServices),
             Arc::new(crate::js::Stop::new()),
             Arc::new(tokio::sync::Notify::new()),
+            net::Identity::default(),
         )
     }
 

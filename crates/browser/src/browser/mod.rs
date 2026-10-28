@@ -8,6 +8,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use url::Url;
 
@@ -79,6 +80,10 @@ pub struct Browser {
 #[derive(Clone)]
 pub struct BrowserHandle {
     client: BrowserClient,
+    /// The identity this browser's renderers and CDP answers report. Shared
+    /// with the browser task, which hands it to every renderer it spawns
+    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    identity: Arc<net::Identity>,
 }
 
 /// Parameters for a renderer-initiated `window.open`.
@@ -210,6 +215,7 @@ impl Browser {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| BrowserOpenError::RuntimeUnavailable)?;
         let network = NetworkContext::new(options.network);
+        let identity = Arc::new(network.identity());
         let data_home = match options.data_home {
             Some(data_home) => data_home,
             None => default_data_home().map_err(BrowserOpenError::Profile)?,
@@ -217,7 +223,7 @@ impl Browser {
         let context = BrowserContext::open(&data_home, &options.profile, network)
             .map_err(BrowserOpenError::Profile)?;
         let (client, server) = exchange::local(BROWSER_COMMAND_CAPACITY);
-        let handle = BrowserHandle { client };
+        let handle = BrowserHandle { client, identity };
         let task = BrowserTask::new(server, context, handle.clone());
         runtime.spawn(task.run());
         Ok(Self { handle })
@@ -276,6 +282,13 @@ impl Drop for Browser {
 }
 
 impl BrowserHandle {
+    /// The identity this browser reports
+    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    #[must_use]
+    pub fn identity(&self) -> &net::Identity {
+        &self.identity
+    }
+
     /// Starts a tab coordinator and returns its handle.
     ///
     /// # Errors

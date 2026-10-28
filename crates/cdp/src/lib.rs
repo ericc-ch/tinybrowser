@@ -1068,7 +1068,7 @@ impl Conn {
                 "protocolVersion": "1.3",
                 "product": PRODUCT,
                 "revision": "0",
-                "userAgent": browser::USER_AGENT,
+                "userAgent": self.browser.identity().user_agent.as_str(),
                 "jsVersion": "QuickJS",
             })),
             BrowserHandler::Close => {
