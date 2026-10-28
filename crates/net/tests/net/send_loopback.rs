@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use net::{
-    Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Proxy, Referrer,
-    ReferrerPolicy, Request, ResolveRule, TimeoutKind, TransportError,
+    Agent, AgentOptions, Method, NetError, Proxy, Referrer, ReferrerPolicy, Request, ResolveRule,
+    TimeoutKind, TransportError,
 };
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -344,7 +344,7 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
 /// web-platform contract. Redirect policy itself is WPT's
 /// `fetch/api/redirect/`.
 #[tokio::test]
-async fn max_redirects_cap_returns_limit_exceeded() {
+async fn max_redirects_cap_returns_a_redirect_limit() {
     let empty = scripted([canned_redirect(302, ""), canned_redirect(302, "")]);
     assert!(matches!(
         Agent::new(AgentOptions {
@@ -353,7 +353,7 @@ async fn max_redirects_cap_returns_limit_exceeded() {
         })
         .send(Request::new(Method::GET, empty.url("/empty")))
         .await,
-        Err(NetError::Limit(LimitExceeded::Redirect))
+        Err(NetError::RedirectLimit)
     ));
     assert_eq!(empty.requests().len(), 2);
     empty.assert_clean();
@@ -366,7 +366,7 @@ async fn max_redirects_cap_returns_limit_exceeded() {
         })
         .send(Request::new(Method::GET, server.url("/loop")))
         .await,
-        Err(NetError::Limit(LimitExceeded::Redirect))
+        Err(NetError::RedirectLimit)
     ));
     assert_eq!(server.requests().len(), 3);
     server.assert_clean();
@@ -423,10 +423,7 @@ async fn redirect_gate_can_refuse_the_next_hop() {
         .send(request)
         .await
         .expect_err("refused hop");
-    assert!(matches!(
-        error,
-        NetError::Protocol(ProtocolError::RejectedRequest)
-    ));
+    assert!(matches!(error, NetError::RejectedRequest));
     assert_eq!(
         seen.lock().expect("gate log").as_slice(),
         &[("/landed".to_owned(), 1)]
@@ -678,7 +675,7 @@ async fn url_credentials_and_scheme_rejections_are_wire_visible() {
                 url::Url::parse("ws://127.0.0.1/").expect("ws"),
             ))
             .await,
-        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+        Err(NetError::RejectedRequest)
     ));
 }
 
@@ -709,7 +706,7 @@ async fn same_origin_mode_rejects_a_cross_origin_request_before_sending() {
     );
     assert!(matches!(
         default_agent().send(request).await,
-        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+        Err(NetError::RejectedRequest)
     ));
     assert_eq!(server.requests().len(), 0);
     server.assert_clean();
@@ -734,7 +731,7 @@ async fn same_origin_mode_rejects_a_redirect_that_crosses_origins() {
     );
     assert!(matches!(
         default_agent().send(request).await,
-        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+        Err(NetError::RejectedRequest)
     ));
     assert_eq!(first.requests().len(), 1);
     assert_eq!(landing.requests().len(), 0);
@@ -864,7 +861,7 @@ async fn redirect_taint_serializes_null_and_null_passes_the_cors_check() {
     );
     assert!(matches!(
         default_agent().send(request).await,
-        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+        Err(NetError::RejectedRequest)
     ));
     assert_eq!(echoing.requests().len(), 1);
     redirect.assert_clean();
@@ -1101,7 +1098,7 @@ async fn a_no_cors_error_request_is_sent_and_refuses_a_redirect() {
     assert!(
         matches!(
             default_agent().send(request).await,
-            Err(NetError::Protocol(ProtocolError::RejectedRequest))
+            Err(NetError::RejectedRequest)
         ),
         "the redirect response is a network error"
     );
@@ -1133,7 +1130,7 @@ async fn a_no_cors_manual_request_is_refused_before_sending() {
     };
     assert!(matches!(
         default_agent().send(request).await,
-        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+        Err(NetError::RejectedRequest)
     ));
     assert_eq!(server.requests().len(), 0);
     server.assert_clean();

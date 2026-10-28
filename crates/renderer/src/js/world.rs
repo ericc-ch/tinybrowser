@@ -930,15 +930,55 @@ mod sandbox_flag_tests {
             ),
         ];
         for (keyword, cleared) in expected {
-            let flags = SandboxFlags::parse(Some(keyword));
-            for flag in all_flags() {
-                assert_eq!(
-                    flags.contains(flag),
-                    !cleared.contains(&flag),
-                    "{keyword}: flag {flag:#x}"
-                );
+            // `sandbox` is a set of space-separated tokens that are ASCII
+            // case-insensitive, so a keyword matches in either spelling
+            // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
+            for spelling in [(*keyword).to_owned(), keyword.to_ascii_uppercase()] {
+                let flags = SandboxFlags::parse(Some(&spelling));
+                for flag in all_flags() {
+                    assert_eq!(
+                        flags.contains(flag),
+                        !cleared.contains(&flag),
+                        "{spelling}: flag {flag:#x}"
+                    );
+                }
             }
         }
+        // The table is the parser's own list, not a copy: a keyword added to
+        // `TOKENS` without a row here would otherwise go unchecked, while
+        // `supports` already advertises it.
+        for (keyword, _) in SandboxFlags::TOKENS {
+            assert!(
+                expected.iter().any(|(listed, _)| listed == keyword),
+                "{keyword} is supported but not in this table"
+            );
+        }
+        // Every flag is either cleared by some keyword or is one of the two no
+        // keyword may clear, so a bit missing from `ALL` cannot hide behind a
+        // table that also says it is cleared.
+        let cleared: u32 = expected
+            .iter()
+            .flat_map(|(_, flags)| flags.iter().copied())
+            .fold(0, |all, flag| all | flag);
+        assert_eq!(
+            cleared | SandboxFlags::NAVIGATION | SandboxFlags::DOCUMENT_DOMAIN,
+            SandboxFlags::ALL,
+            "every flag is either clearable or one of the two no keyword clears"
+        );
+    }
+
+    /// `parse` reads the whole attribute, so a sandbox with two keywords sets
+    /// both halves
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#parse-a-sandboxing-directive>).
+    #[test]
+    fn a_sandbox_with_two_keywords_clears_both() {
+        let flags = SandboxFlags::parse(Some("allow-scripts allow-forms"));
+        assert!(!flags.scripts_disabled());
+        assert!(!flags.contains(SandboxFlags::FORMS));
+        assert!(
+            flags.contains(SandboxFlags::ORIGIN),
+            "a keyword it does not name stays clear"
+        );
     }
 
     #[test]
@@ -950,24 +990,6 @@ mod sandbox_flag_tests {
         assert!(!SandboxFlags::supports(
             "allow-storage-access-by-user-activation"
         ));
-    }
-
-    #[test]
-    fn keywords_clear_exactly_the_flags_they_name() {
-        let flags = SandboxFlags::parse(Some("allow-scripts allow-same-origin"));
-        assert!(!flags.scripts_disabled());
-        assert!(!flags.origin_is_opaque());
-        // `allow-scripts` also relaxes automatic features
-        assert!(!flags.contains(SandboxFlags::AUTOMATIC_FEATURES));
-        assert!(flags.contains(SandboxFlags::AUXILIARY_NAVIGATION));
-        // Keywords are ASCII case-insensitive
-        assert!(
-            !SandboxFlags::parse(Some("ALLOW-POPUPS")).contains(SandboxFlags::AUXILIARY_NAVIGATION)
-        );
-        assert!(
-            !SandboxFlags::parse(Some("allow-top-navigation"))
-                .contains(SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION)
-        );
     }
 
     #[test]

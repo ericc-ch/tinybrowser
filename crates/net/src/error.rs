@@ -5,10 +5,6 @@ pub enum TimeoutKind {
     Global,
     #[error("per-call")]
     PerCall,
-    #[error("connect")]
-    Connect,
-    #[error("send-body")]
-    SendBody,
     #[error("recv-body")]
     RecvBody,
 }
@@ -31,34 +27,19 @@ pub enum TransportError {
     Io(#[source] std::io::Error),
 }
 
-/// A configured cap was exceeded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum LimitExceeded {
-    /// Redirect hop count reached [`crate::AgentOptions::max_redirects`].
-    #[error("redirect cap exceeded")]
-    Redirect,
-    /// Response body would exceed the caller-supplied byte cap.
-    #[error("size cap exceeded: {0} bytes")]
-    Size(u64),
-}
-
-/// The request or response could not be represented as HTTP.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ProtocolError {
-    /// The URL, method, or assembled request was rejected.
-    #[error("backend rejected the assembled request")]
-    RejectedRequest,
-}
-
 /// Failure from [`crate::Agent::send`] or body reads.
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("transport: {0}")]
     Transport(#[source] TransportError),
-    #[error("protocol violation: {0}")]
-    Protocol(#[source] ProtocolError),
-    #[error("limit exceeded: {0}")]
-    Limit(#[source] LimitExceeded),
+    /// The request could not be represented as HTTP, or a CORS or redirect
+    /// rule refused it, so no response reaches the caller.
+    #[error("protocol violation: backend rejected the assembled request")]
+    RejectedRequest,
+    /// The redirect hop count reached
+    /// [`crate::AgentOptions::max_redirects`](crate::AgentOptions).
+    #[error("redirect cap exceeded")]
+    RedirectLimit,
     #[error("content decoding failed: {0}")]
     Decode(Box<str>),
 }

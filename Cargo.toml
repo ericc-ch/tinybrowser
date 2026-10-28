@@ -81,6 +81,8 @@ base64 = "0.23"
 # The process-level tests read the built-in identity so a version bump does not
 # leave an assertion naming the old build.
 net = { workspace = true }
+# The TLS tests serve a real certificate, so `--tls-ca` has something to trust.
+native-tls = "0.2"
 
 # ─── Lints ────────────────────────────────────────────────────────────────────
 # Strict (not strict-strict): `all` is error, `pedantic`/`cargo` are warnings.

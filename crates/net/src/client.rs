@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::InitiatorKind;
-use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
+use crate::error::{NetError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 use crate::resolve::ResolveRule;
@@ -272,8 +272,7 @@ impl Agent {
                 }
                 None => cookie,
             };
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+            let value = HeaderValue::from_str(&value).map_err(|_| NetError::RejectedRequest)?;
             headers.set(header::COOKIE, value);
         }
         if headers.value("user-agent").is_none() {
@@ -304,23 +303,19 @@ impl Agent {
         if !crate::cors::needs_preflight(method, &unsafe_names) {
             return Ok(());
         }
-        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin_header)
-            .map_err(NetError::Protocol)?;
+        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin_header);
         let origin = origin_header
             .to_str()
-            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+            .map_err(|_| NetError::RejectedRequest)?;
         if let Some(referrer) = headers.value("referer") {
             // A preflight's Referer is the request's stripped referrer without
             // the origin path slash
             // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-            let referrer = referrer
-                .to_str()
-                .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+            let referrer = referrer.to_str().map_err(|_| NetError::RejectedRequest)?;
             let referrer = referrer.strip_suffix('/').unwrap_or(referrer);
             preflight.append(
                 header::REFERER,
-                HeaderValue::from_str(referrer)
-                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
+                HeaderValue::from_str(referrer).map_err(|_| NetError::RejectedRequest)?,
             );
         }
         preflight.append(
@@ -340,7 +335,7 @@ impl Agent {
             method,
             &unsafe_names,
         ) {
-            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+            return Err(NetError::RejectedRequest);
         }
         Ok(())
     }
@@ -358,8 +353,8 @@ impl Agent {
         budget: HopBudget,
     ) -> Result<(), NetError> {
         let serialized_origin = hop.serialized_origin(settings);
-        let origin_header = HeaderValue::from_str(&serialized_origin)
-            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+        let origin_header =
+            HeaderValue::from_str(&serialized_origin).map_err(|_| NetError::RejectedRequest)?;
         // Case 2 of main fetch sends same-origin, still-`basic` requests
         // straight to scheme fetch, so only a `cors`-tainted hop can need a
         // preflight (<https://fetch.spec.whatwg.org/#main-fetch>).
@@ -401,14 +396,14 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request
-    /// (a failed CORS check or preflight, a redirect the CORS rules refuse, or
-    /// a merged `Cookie` header that is not a valid field value), or an
-    /// unusable `Location`. [`NetError::Limit`] when the redirect cap is
-    /// exceeded. [`NetError::Transport`] when a hop fails.
+    /// [`NetError::RejectedRequest`] for a non-`http`/`https` URL, a rejected
+    /// request (a failed CORS check or preflight, a redirect the CORS rules
+    /// refuse, or a merged `Cookie` header that is not a valid field value), or
+    /// an unusable `Location`. [`NetError::RedirectLimit`] when the redirect
+    /// cap is exceeded. [`NetError::Transport`] when a hop fails.
     pub async fn send(&self, request: Request) -> Result<Response, NetError> {
         if !matches!(request.url.scheme(), "http" | "https") {
-            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+            return Err(NetError::RejectedRequest);
         }
         let dial = Dial {
             cors: &request.cors,
@@ -502,14 +497,14 @@ impl Agent {
                 referrer_policy = policy;
             }
             if followed == self.max_redirects {
-                return Err(NetError::Limit(LimitExceeded::Redirect));
+                return Err(NetError::RedirectLimit);
             }
             // `followed + 1` is the redirect count the next hop will carry.
             // A false gate refuses the hop before any bytes are sent.
             if let Some(gate) = dial.on_redirect
                 && !gate(&next, followed + 1)
             {
-                return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+                return Err(NetError::RejectedRequest);
             }
             cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
             apply_redirect_policy(hop_status, &url, &next, &mut hop);
@@ -538,7 +533,7 @@ impl Agent {
         match referrer {
             Some(referrer) => {
                 let value = HeaderValue::from_str(referrer.as_str())
-                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+                    .map_err(|_| NetError::RejectedRequest)?;
                 headers.set(header::REFERER, value);
             }
             None => headers.remove("referer"),
@@ -786,9 +781,9 @@ fn resolve_location(current: &Url, location: &[u8]) -> Result<Url, NetError> {
         .collect::<String>();
     let mut next = current
         .join(&location)
-        .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+        .map_err(|_| NetError::RejectedRequest)?;
     if !matches!(next.scheme(), "http" | "https") {
-        return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        return Err(NetError::RejectedRequest);
     }
     if next.fragment().is_none()
         && let Some(fragment) = current.fragment()
@@ -929,9 +924,7 @@ fn hop_taint(
     }
     match settings.mode {
         crate::cors::RequestMode::Navigate => Ok(crate::cors::ResponseType::Basic),
-        crate::cors::RequestMode::SameOrigin => {
-            Err(NetError::Protocol(ProtocolError::RejectedRequest))
-        }
+        crate::cors::RequestMode::SameOrigin => Err(NetError::RejectedRequest),
         crate::cors::RequestMode::Cors => Ok(crate::cors::ResponseType::Cors),
         // A cross-origin `no-cors` request is opaque. A non-following
         // redirect mode is decided when a 3xx response arrives, not before the
@@ -942,9 +935,7 @@ fn hop_taint(
         // that main fetch forbids, so that one still fails before sending
         // (<https://fetch.spec.whatwg.org/#main-fetch>).
         crate::cors::RequestMode::NoCors => match settings.redirect {
-            crate::cors::RedirectMode::Manual => {
-                Err(NetError::Protocol(ProtocolError::RejectedRequest))
-            }
+            crate::cors::RedirectMode::Manual => Err(NetError::RejectedRequest),
             crate::cors::RedirectMode::Follow | crate::cors::RedirectMode::Error => {
                 Ok(crate::cors::ResponseType::Opaque)
             }
@@ -1046,7 +1037,7 @@ fn cors_gate(response: &Response, dial: &Dial<'_>, hop: &Hop) -> Result<(), NetE
         &origin,
         dial.credentials_include(),
     ) {
-        return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        return Err(NetError::RejectedRequest);
     }
     Ok(())
 }
@@ -1087,11 +1078,11 @@ fn classify_response(
             || (settings.mode == crate::cors::RequestMode::Cors
                 && settings.origin != next.origin()))
     {
-        return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        return Err(NetError::RejectedRequest);
     }
     match settings.redirect {
         crate::cors::RedirectMode::Error => {
-            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+            return Err(NetError::RejectedRequest);
         }
         // Manual returned above; unreachable here.
         crate::cors::RedirectMode::Manual | crate::cors::RedirectMode::Follow => {}
@@ -1124,8 +1115,7 @@ fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) -> Result<(), NetEr
         .map(|password| percent_decode_str(password).decode_utf8_lossy())
         .unwrap_or_default();
     let value = basic_authorization(&username, &password);
-    let value = HeaderValue::from_str(&value)
-        .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+    let value = HeaderValue::from_str(&value).map_err(|_| NetError::RejectedRequest)?;
     headers.set(header::AUTHORIZATION, value);
     Ok(())
 }
@@ -1209,8 +1199,9 @@ impl Body {
     /// # Errors
     ///
     /// [`NetError::Transport`] when the socket read fails or the deadline
-    /// expires; [`NetError::Decode`] when a decoder rejects the bytes;
-    /// [`NetError::Limit`] when the bytes exceed the carrier's budget.
+    /// expires; [`NetError::Decode`] when a decoder rejects the bytes. The
+    /// carrier's byte budget is enforced by whoever reads the chunks, so it is
+    /// not an error here.
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, NetError> {
         let mut buffer = vec![0; 16 * 1024];
         match self.reader.read(&mut buffer).await {

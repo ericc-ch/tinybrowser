@@ -12,7 +12,6 @@
 
 use hyper::header::{self, HeaderValue};
 
-use crate::error::ProtocolError;
 use crate::protocol::{HeaderMap, Method};
 
 /// A request's CORS mode
@@ -654,27 +653,27 @@ pub fn preflight_ok(
 /// (<https://fetch.spec.whatwg.org/#cors-preflight-fetch>). The spec fixes
 /// `Accept: */*` on the preflight, independent of the original request.
 ///
-/// # Errors
-///
-/// [`ProtocolError::RejectedRequest`] when the method or header names cannot
-/// be represented as a field value.
+/// Infallible: [`Method`] and a [`HeaderMap`] name are token-validated where
+/// they are built, so every value here is already a field value.
 pub(crate) fn preflight_headers(
     method: &Method,
     unsafe_names: &[String],
     origin: &HeaderValue,
-) -> Result<HeaderMap, ProtocolError> {
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.append(header::ACCEPT, HeaderValue::from_static("*/*"));
     headers.append(header::ORIGIN, origin.clone());
-    let method =
-        HeaderValue::from_str(method.as_str()).map_err(|_| ProtocolError::RejectedRequest)?;
-    headers.append(header::ACCESS_CONTROL_REQUEST_METHOD, method);
+    headers.append(
+        header::ACCESS_CONTROL_REQUEST_METHOD,
+        HeaderValue::from_str(method.as_str()).expect("a method is an HTTP token"),
+    );
     if !unsafe_names.is_empty() {
-        let names = HeaderValue::from_str(&unsafe_names.join(","))
-            .map_err(|_| ProtocolError::RejectedRequest)?;
-        headers.append(header::ACCESS_CONTROL_REQUEST_HEADERS, names);
+        headers.append(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_str(&unsafe_names.join(",")).expect("a field name is an HTTP token"),
+        );
     }
-    Ok(headers)
+    headers
 }
 
 /// Whether `name` is a forbidden response-header name, which page script can
@@ -1000,8 +999,7 @@ mod tests {
             &Method::PUT,
             &["x-custom".to_owned()],
             &HeaderValue::from_static("https://a.test"),
-        )
-        .expect("valid preflight fields");
+        );
         assert_eq!(request.get("accept"), Some(b"*/*".as_slice()));
         assert_eq!(request.get("origin"), Some(b"https://a.test".as_slice()));
         assert_eq!(

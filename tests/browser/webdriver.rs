@@ -8,11 +8,22 @@ use crate::fixture::Fixture;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
+/// A self-signed P-256 certificate authority, valid 2020..2126. It only has to
+/// parse as a trust anchor: the test that uses it never dials TLS, and a
+/// backdated `notBefore` keeps it valid on any clock. Generated with
+/// `openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes`
+/// and `openssl x509 -req -not_before 20200101000000Z -extfile ca-ext.cnf`.
+const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\nMIIBgzCCASigAwIBAgIUSNx7VI4e5SLZuNEFo5kbWXRXyE8wCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBDQTAgFw0yMDAxMDEwMDAwMDBa\nGA8yMTI2MTAwNDEyNTAzNlowHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBD\nQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKU9fBtT1+UGeogoYQSLS6nG2tnj\nRw3do3csdFcOKLg/Fxdu2zNZ6jpf92433JR6aWOEFWicdvo49pc38f6so36jQjBA\nMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMB0GA1UdDgQWBBSOZhVi\nNDBFj1qlDs94zVCIB+hc2zAKBggqhkjOPQQDAgNJADBGAiEAplMHuFG4TeQ8yb33\njaO5SVY/gz+vDtYABNvhXOk4uCoCIQDTaPHky5y2ASpqmjjgr9HMD5rS5BlDEFgI\nRIOQknuKug==\n-----END CERTIFICATE-----\n";
+
 fn start(extra_args: Vec<String>) -> (String, Fixture) {
+    start_in(Fixture::new("tinybrowser-webdriver"), extra_args)
+}
+
+fn start_in(mut fixture: Fixture, extra_args: Vec<String>) -> (String, Fixture) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     drop(listener);
-    let mut fixture = Fixture::new("tinybrowser-webdriver");
     let mut command = Command::new(env!("CARGO_BIN_EXE_tinybrowser"));
     command.args(["webdriver", &format!("--port={port}")]);
     command.args(extra_args);
@@ -35,6 +46,9 @@ fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
     while Instant::now() < deadline {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout is settable");
                 let req = format!(
                     "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                     payload.len()
@@ -53,6 +67,108 @@ fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
         }
     }
     panic!("webdriver not reachable: {last_error:?}");
+}
+
+/// The loopback HTTPS server identity: the same backdated P-256 certificate, with `IP:127.0.0.1` in its SAN.
+const TLS_SERVER_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\nMIIBlDCCATqgAwIBAgIUU0WLSMuBxc90xf5bqrSoJ3BhfW4wCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJMTI3LjAuMC4xMCAXDTIwMDEwMTAwMDAwMFoYDzIxMjYxMDA0\nMTI1MDI2WjAUMRIwEAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjO\nPQMBBwNCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8haKduRJhUaGe0xXXBx62Rf7X\nRCdAfnzL4svr8w4EgUe5iEbWNJTWNBdKo2gwZjAPBgNVHREECDAGhwR/AAABMA8G\nA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMBMGA1UdJQQMMAoGCCsGAQUF\nBwMBMB0GA1UdDgQWBBSJt9gEngSo78Z1vt8HrZVBBps2LTAKBggqhkjOPQQDAgNI\nADBFAiAibmMFAzKrTOUYvmE1fHAGvzkU/Rh4hPHDZYQCc3iqowIhAO9S4q5/hvq7\nkoQ6Jyma3wsQ8tFsLRWZ34G9goS0nAyq\n-----END CERTIFICATE-----\n";
+
+/// The key for [`TLS_SERVER_CERT_PEM`]. Test-only: it signs nothing but this fixture.
+const TLS_SERVER_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiOq3Tq7nKzsvkH8R\nCv2ScQ1xyfEou4Fvhl0JLJDob3ihRANCAARaU9LlsB9YYhjXs5HSIoylgAjx9GY8\nhaKduRJhUaGe0xXXBx62Rf7XRCdAfnzL4svr8w4EgUe5iEbWNJTWNBdK\n-----END PRIVATE KEY-----\n";
+
+/// One HTTPS loopback server that answers `responses` navigations with a page
+/// whose title says it was reached over TLS.
+fn https_server(responses: usize) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let identity = native_tls::Identity::from_pkcs8(
+        TLS_SERVER_CERT_PEM.as_bytes(),
+        TLS_SERVER_KEY_PEM.as_bytes(),
+    )
+    .expect("the test identity parses");
+    let acceptor = native_tls::TlsAcceptor::new(identity).expect("tls acceptor");
+    let handle = thread::spawn(move || {
+        let mut served = 0;
+        while served < responses {
+            let (stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout is settable");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("write timeout is settable");
+            // A client that does not trust the certificate fails its
+            // handshake; the server stays up for the dial with `--tls-ca`.
+            let Ok(mut stream) = acceptor.accept(stream) else {
+                continue;
+            };
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).expect("request readable");
+            assert!(read > 0, "peer closed before sending a request");
+            let body = b"<!doctype html><title>trusted</title>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("head written");
+            stream.write_all(body).expect("body written");
+            served += 1;
+        }
+    });
+    (format!("https://{addr}/"), handle)
+}
+
+/// Creates a session and navigates it, returning the `/url` reply.
+fn navigate_new_session(addr: &str, url: &str) -> Value {
+    let created = request(addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    request(
+        addr,
+        "POST",
+        &format!("/session/{id}/url"),
+        Some(&json!({ "url": url }).to_string()),
+    )
+}
+
+/// The CLI's read CA reaches the dial: the same navigation fails without
+/// `--tls-ca` and loads the page with it. Reading the file and dropping it on
+/// the way to `AgentOptions` passes every other test in the suite.
+#[test]
+fn a_tls_ca_from_the_command_line_makes_an_https_navigation_load() {
+    let (url, server) = https_server(1);
+
+    let untrusted = Fixture::new("tinybrowser-webdriver-tls-ca-untrusted");
+    let (addr, _fixture) = start_in(untrusted, Vec::new());
+    let refused = navigate_new_session(&addr, &url);
+    assert!(
+        refused["value"]["error"].is_string(),
+        "an unknown certificate must fail the navigation: {refused}"
+    );
+
+    let trusted = Fixture::new("tinybrowser-webdriver-tls-ca-trusted");
+    let ca = trusted.data().join("test-ca.pem");
+    std::fs::write(&ca, TLS_SERVER_CERT_PEM).expect("write CA");
+    let (addr, _fixture) = start_in(trusted, vec![format!("--tls-ca={}", ca.display())]);
+    let loaded = navigate_new_session(&addr, &url);
+    assert_eq!(loaded["value"], Value::Null, "{loaded}");
+    server.join().expect("server");
+}
+
+/// A readable `--tls-ca` is part of the network configuration, so the server
+/// starts with it. A refused flag and an unreadable file are covered next to
+/// the other usage errors in `modes`.
+#[test]
+fn a_valid_tls_ca_is_read_before_the_server_starts() {
+    let fixture = Fixture::new("tinybrowser-webdriver-tls-ca-valid");
+    let ca = fixture.data().join("test-ca.pem");
+    std::fs::write(&ca, TEST_CA_PEM).expect("write CA");
+    let (addr, _fixture) = start_in(fixture, vec![format!("--tls-ca={}", ca.display())]);
+    let status = request(&addr, "GET", "/status", None);
+    assert_eq!(status["value"]["ready"], json!(true), "{status}");
 }
 
 #[test]

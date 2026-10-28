@@ -3483,6 +3483,7 @@ dependencies = [
  "browser",
  "cdp",
  "logging",
+ "native-tls",
  "net",
  "serde_json",
  "tokio",
