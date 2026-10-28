@@ -219,6 +219,7 @@ impl Agent {
             method_is_safe: true,
             initiator: Some(url),
             cross_site_redirect: false,
+            trustworthy: crate::is_potentially_trustworthy(url),
         }
     }
 
@@ -609,6 +610,7 @@ impl Agent {
             method_is_safe: hop.method.is_safe(),
             initiator: dial.initiator,
             cross_site_redirect,
+            trustworthy: crate::is_potentially_trustworthy(url),
         };
         let mut hop_headers = hop.headers.clone();
         self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget)
@@ -833,23 +835,14 @@ fn apply_redirect_policy(status: u16, current: &Url, next: &Url, hop: &mut Hop) 
         hop.headers.remove("cookie");
         hop.headers.remove("host");
     }
-    if next.scheme() != "https" && !loopback_http(next) {
+    // Client hints are for trustworthy origins only, the same predicate the
+    // navigation headers and the cookie jar use
+    // (<https://wicg.github.io/ua-client-hints/#secure-transport>).
+    if !crate::is_potentially_trustworthy(next) {
         hop.headers.remove("sec-ch-ua");
         hop.headers.remove("sec-ch-ua-mobile");
         hop.headers.remove("sec-ch-ua-platform");
         hop.headers.remove("sec-ch-prefers-color-scheme");
-    }
-}
-
-fn loopback_http(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
-        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
-        Some(url::Host::Domain(host)) => {
-            let host = host.to_ascii_lowercase();
-            host == "localhost" || host.ends_with(".localhost")
-        }
-        None => false,
     }
 }
 

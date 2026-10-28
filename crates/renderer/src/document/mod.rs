@@ -3969,16 +3969,15 @@ impl Document {
                     let parsed = world.main_document()?;
                     let base = &parsed.document.base;
                     let cross = crate::dom::tree::attr(base, element.node, "crossorigin");
-                    let credentials = match cross.map(str::trim) {
-                        Some(value) if value.eq_ignore_ascii_case("use-credentials") => {
-                            net::cors::CredentialsMode::Include
-                        }
-                        Some(_) => net::cors::CredentialsMode::SameOrigin,
-                        None => return None,
-                    };
+                    // Missing means no CORS request; empty or unknown is
+                    // anonymous, the invalid-value default, so the load and
+                    // the reflected `crossOrigin` cannot disagree about
+                    // credentials
+                    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+                    let cross = crate::dom::microsyntaxes::CrossOrigin::from_attr(cross)?;
                     Some(crate::protocol::CorsRequest {
                         mode: net::cors::RequestMode::Cors,
-                        credentials,
+                        credentials: cross.credentials(),
                         redirect: net::cors::RedirectMode::Follow,
                     })
                 });

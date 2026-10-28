@@ -586,3 +586,91 @@ pub(crate) fn range_default(minimum: &Decimal, maximum: &Decimal) -> Decimal {
     };
     Decimal::from_mantissa(half_scaled, scale)
 }
+
+/// `crossorigin`
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#attr-crossorigin>).
+///
+/// An absent attribute is `None`, which means no CORS request at all. An empty
+/// or unknown value is `Anonymous`, the spec's "invalid value default", so an
+/// invalid spelling never sends credentials
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CrossOrigin {
+    Anonymous,
+    UseCredentials,
+}
+
+impl CrossOrigin {
+    /// Every keyword, in spec order.
+    pub(crate) const KEYWORDS: &'static [Self] = &[Self::Anonymous, Self::UseCredentials];
+
+    /// The canonical spelling of the keyword.
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::UseCredentials => "use-credentials",
+        }
+    }
+
+    /// Parses one keyword, ASCII case-insensitively and untrimmed, the way an
+    /// enumerated attribute does.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::KEYWORDS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.keyword().eq_ignore_ascii_case(value))
+    }
+
+    /// The attribute value as an enum: absent stays absent, and an empty or
+    /// unknown value is `Anonymous`.
+    pub(crate) fn from_attr(value: Option<&str>) -> Option<Self> {
+        value.map(|value| Self::parse(value).unwrap_or(Self::Anonymous))
+    }
+
+    /// The credentials mode this attribute selects for a CORS request
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+    pub(crate) fn credentials(self) -> net::cors::CredentialsMode {
+        match self {
+            Self::Anonymous => net::cors::CredentialsMode::SameOrigin,
+            Self::UseCredentials => net::cors::CredentialsMode::Include,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cross_origin_tests {
+    use super::CrossOrigin;
+    use net::cors::CredentialsMode;
+
+    #[test]
+    fn an_invalid_or_empty_crossorigin_never_sends_credentials() {
+        assert_eq!(CrossOrigin::from_attr(None), None);
+        assert_eq!(
+            CrossOrigin::from_attr(Some("")),
+            Some(CrossOrigin::Anonymous)
+        );
+        // Enumerated attributes are an untrimmed match, so a stray space is an
+        // invalid value, and the invalid-value default is anonymous. The
+        // reflected `img.crossOrigin` and the load must agree.
+        assert_eq!(
+            CrossOrigin::from_attr(Some(" use-credentials")),
+            Some(CrossOrigin::Anonymous)
+        );
+        assert_eq!(
+            CrossOrigin::from_attr(Some("use-credentials")),
+            Some(CrossOrigin::UseCredentials)
+        );
+        assert_eq!(
+            CrossOrigin::from_attr(Some("USE-CREDENTIALS")),
+            Some(CrossOrigin::UseCredentials)
+        );
+        assert_eq!(
+            CrossOrigin::UseCredentials.credentials(),
+            CredentialsMode::Include
+        );
+        assert_eq!(
+            CrossOrigin::Anonymous.credentials(),
+            CredentialsMode::SameOrigin
+        );
+    }
+}

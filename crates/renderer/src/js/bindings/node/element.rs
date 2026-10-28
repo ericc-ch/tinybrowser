@@ -14,9 +14,8 @@ use super::super::{
 };
 use super::forms::{fixup_option_on_insert, fixup_radio_on_insert};
 use crate::dom::adoption::materialize_children;
-use crate::js::bindings::enumerated::{
-    CrossOrigin, Dir, EnterKeyHint, Enumerated, InputMode, reflect_enumerated,
-};
+use crate::dom::microsyntaxes::CrossOrigin;
+use crate::js::bindings::enumerated::{Dir, EnterKeyHint, InputMode, reflect_enumerated};
 use std::collections::HashSet;
 
 use blitz_dom::NodeData;
@@ -2880,11 +2879,7 @@ pub(super) fn reflect_cross_origin<'js>(
     let Some(value) = raw.as_deref() else {
         return Ok(None);
     };
-    let canonical = if value.is_empty() {
-        CrossOrigin::Anonymous
-    } else {
-        CrossOrigin::parse(value).unwrap_or(CrossOrigin::Anonymous)
-    };
+    let canonical = CrossOrigin::parse(value).unwrap_or(CrossOrigin::Anonymous);
     Ok(Some(rquickjs::String::from_str(
         ctx.clone(),
         canonical.keyword(),

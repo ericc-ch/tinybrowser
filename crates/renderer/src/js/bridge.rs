@@ -67,6 +67,18 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         slots.realms.insert(ctx.as_raw().as_ptr() as usize);
     }
     world.borrow_mut().bridge = Some(Persistent::save(ctx, bridge));
+    // The environment's secure-context bit is fixed when the realm is created,
+    // and every `[SecureContext]` surface reads this one global
+    // (<https://html.spec.whatwg.org/multipage/webappapis.html#dom-issecurecontext>).
+    // A Web IDL attribute is enumerable, configurable, and has no setter.
+    let secure = world.borrow().is_secure_context();
+    evaluate(
+        ctx,
+        &format!(
+            "Object.defineProperty(globalThis, 'isSecureContext', \
+             {{ value: {secure}, enumerable: true, configurable: true }});"
+        ),
+    )?;
     Ok(())
 }
 

@@ -3493,6 +3493,7 @@ name = "tinybrowser-wasm"
 version = "0.1.0"
 dependencies = [
  "cookies",
+ "net",
  "renderer",
  "url",
  "webstorage",
