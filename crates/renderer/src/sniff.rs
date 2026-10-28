@@ -291,7 +291,7 @@ pub(crate) fn apache_bug_content_type(value: &str) -> bool {
 /// stripped, so `nosniff, nosniff` is nosniff while `foo, nosniff` is not.
 #[must_use]
 pub fn nosniff(value: &str) -> bool {
-    net::split_header_value_str(value)
+    net::split_header_value(value)
         .first()
         .is_some_and(|first| first.eq_ignore_ascii_case("nosniff"))
 }
@@ -324,7 +324,7 @@ pub(crate) fn extract_mime_type(value: &str) -> Option<String> {
     let mut mime_type: Option<MimeType> = None;
     let mut essence: Option<String> = None;
     let mut charset: Option<String> = None;
-    for item in net::split_header_value_str(value) {
+    for item in net::split_header_value(value) {
         let Some(mut parsed) = parse_mime_type(&item) else {
             continue;
         };

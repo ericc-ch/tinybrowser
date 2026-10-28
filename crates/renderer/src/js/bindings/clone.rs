@@ -144,42 +144,24 @@ fn adopted_children(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<NodeId>> {
     let Some(parsed) = owner.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    Ok(parsed
-        .document
-        .base
-        .get_node(id.node)
-        .map(|node| {
-            if let Some(element) = node.data.downcast_element()
-                && crate::dom::tree::is_template_tag(&element.name)
-                && let Some(fragment) = element.template_contents
-            {
-                return parsed
-                    .document
-                    .base
-                    .get_node(fragment)
-                    .map(|contents| {
-                        contents
-                            .children
-                            .iter()
-                            .copied()
-                            .map(|child| NodeId {
-                                document: id.document,
-                                node: child,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            }
-            node.children
-                .iter()
-                .copied()
-                .map(|child| NodeId {
-                    document: id.document,
-                    node: child,
-                })
-                .collect()
-        })
-        .unwrap_or_default())
+    let Some(node) = parsed.document.base.get_node(id.node) else {
+        return Ok(Vec::new());
+    };
+    if let Some(element) = node.data.downcast_element()
+        && crate::dom::tree::is_template_tag(&element.name)
+        && let Some(fragment) = element.template_contents
+    {
+        return Ok(crate::dom::tree::child_ids(
+            &parsed.document.base,
+            id.document,
+            fragment,
+        ));
+    }
+    Ok(crate::dom::tree::child_ids(
+        &parsed.document.base,
+        id.document,
+        id.node,
+    ))
 }
 
 /// Copies cryptographic nonce slots from a cloned subtree to its clone,

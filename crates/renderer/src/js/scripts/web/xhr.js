@@ -351,9 +351,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       mode: 'cors',
       credentials: data.withCredentials ? 'include' : 'same-origin',
       redirect: 'follow',
+      keepalive: false,
+      bodySize: 0,
+      delivery: 'buffer',
     }, 'about:client', outcome => {
-      if (outcome.bodyError) __tbXhrError(this, data, 'error');
-      else __tbXhrFinish(this, data, generation, outcome.status, outcome.body, outcome.url, outcome.headers, false);
+      if (outcome.body.kind === 'undecodable') __tbXhrError(this, data, 'error');
+      else __tbXhrFinish(this, data, generation, outcome.status, outcome.body.bytes, outcome.url, outcome.headers, false);
     });
     __tbXhrTimeout(this, data);
   }

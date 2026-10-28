@@ -267,8 +267,18 @@ pub(super) fn form_navigate<'js>(
     let Some(owner) = owning_world(&ctx, node) else {
         return Ok(());
     };
-    let Ok(method) = net::Method::parse(&method) else {
-        return Err(Exception::throw_type(&ctx, "invalid form method"));
+    // A form submission is GET or POST; `method=dialog` never reaches the
+    // host, and the shim normalizes every other spelling to GET
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-method>).
+    let method = match method.as_str() {
+        "GET" => net::Method::GET,
+        "POST" => net::Method::POST,
+        other => {
+            return Err(Exception::throw_type(
+                &ctx,
+                &format!("form method: {other:?} is neither GET nor POST"),
+            ));
+        }
     };
     if focus::cannot_navigate(&owner.borrow(), node) {
         return Ok(());

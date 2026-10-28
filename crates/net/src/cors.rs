@@ -51,7 +51,9 @@ impl RequestMode {
 
 /// A request's credentials mode
 /// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum CredentialsMode {
     /// Never send or accept credentials; cookies cross the wire only if they
@@ -327,7 +329,7 @@ fn is_forbidden_method_header(name: &str, value: &[u8]) -> bool {
     ) {
         return false;
     }
-    crate::split_header_value(value)
+    crate::split_header_value(&crate::isomorphic_decode(value))
         .iter()
         .any(|method| Method::parse(method).is_ok_and(|method| method.is_forbidden()))
 }

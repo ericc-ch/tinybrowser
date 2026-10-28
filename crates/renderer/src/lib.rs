@@ -40,7 +40,7 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url, decode_data_url_bounded};
 pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
-    BodyDelivery, BodyError, BrowserEvent, BrowserServices, BrowsingContextHost, CorsRequest,
+    BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, CorsRequest,
     DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
     HistoryHandling, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
     PostedMessage, RendererEvent, RequestCache, ResourceLimit, ResponseBody, ResponseHead,

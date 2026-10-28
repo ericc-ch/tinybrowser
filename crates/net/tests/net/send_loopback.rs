@@ -1,4 +1,4 @@
-use super::common::{TestServer, canned_ok, canned_redirect, scripted};
+use super::common::{TestServer, canned_ok, canned_redirect, read_body, scripted};
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -18,22 +18,6 @@ fn default_agent() -> Agent {
     Agent::new(AgentOptions::default())
 }
 
-/// The whole decoded body, failing when it exceeds `limit` bytes. Test
-/// support only: production reads the body in the browser process, which
-/// applies its own cap while streaming.
-async fn read_all(mut body: net::Body, limit: usize) -> Result<Vec<u8>, NetError> {
-    let mut out = Vec::new();
-    while let Some(chunk) = body.read_chunk().await? {
-        if out.len() + chunk.len() > limit {
-            return Err(NetError::Limit(LimitExceeded::Size(
-                u64::try_from(limit).unwrap_or(u64::MAX),
-            )));
-        }
-        out.extend_from_slice(&chunk);
-    }
-    Ok(out)
-}
-
 #[tokio::test]
 async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     for status in [201_u16, 302, 404, 500] {
@@ -47,9 +31,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             .expect("status is response data");
         assert_eq!(response.status(), status);
         assert_eq!(
-            read_all(response.into_body().await, 16)
-                .await
-                .expect("body"),
+            read_body(response.into_body().await).await.expect("body"),
             b"no"
         );
         server.assert_clean();
@@ -75,9 +57,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         Some(&b"text/plain"[..])
     );
     assert_eq!(
-        read_all(response.into_body().await, 16)
-            .await
-            .expect("body"),
+        read_body(response.into_body().await).await.expect("body"),
         b"hello"
     );
     server.assert_clean();
@@ -89,21 +69,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         .expect("chunked")
         .into_body()
         .await;
-    assert_eq!(read_all(body, 64).await.expect("body"), b"hello world");
-    server.assert_clean();
-
-    let payload = vec![b'x'; 32];
-    let server = scripted([canned_ok(&[], &payload)]);
-    let body = default_agent()
-        .send(Request::new(Method::GET, server.url("/limit")))
-        .await
-        .expect("response")
-        .into_body()
-        .await;
-    assert!(matches!(
-        read_all(body, 16).await,
-        Err(NetError::Limit(LimitExceeded::Size(16)))
-    ));
+    assert_eq!(read_body(body).await.expect("body"), b"hello world");
     server.assert_clean();
 
     let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -677,7 +643,7 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
         .await
         .expect("ipv6 send");
     assert_eq!(
-        read_all(response.into_body().await, 8).await.expect("body"),
+        read_body(response.into_body().await).await.expect("body"),
         b"v6"
     );
     server.assert_clean();
@@ -926,9 +892,7 @@ async fn resolve_maps_hit_miss_and_fail() {
         .await
         .expect("mapped hit");
     assert_eq!(
-        read_all(response.into_body().await, 16)
-            .await
-            .expect("body"),
+        read_body(response.into_body().await).await.expect("body"),
         b"mapped"
     );
     assert_eq!(
@@ -945,7 +909,7 @@ async fn resolve_maps_hit_miss_and_fail() {
         .await
         .expect("unmapped 127.0.0.1 uses libc");
     assert_eq!(
-        read_all(miss.into_body().await, 16).await.expect("body"),
+        read_body(miss.into_body().await).await.expect("body"),
         b"direct"
     );
     miss_server.assert_clean();

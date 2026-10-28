@@ -171,7 +171,7 @@ impl Document {
                                 // as the response's `Content-Type` header
                                 // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
                                 headers: vec![("content-type".to_owned(), content_type)],
-                                body: crate::protocol::ResponseBody::Buffered(Ok(body)),
+                                body: crate::protocol::ResponseBody::Bytes(body),
                                 response_type: net::cors::ResponseType::Basic,
                                 crossed_origin: false,
                                 redirect_count: 0,
@@ -421,22 +421,23 @@ impl Document {
         dial.req.body = fetch.body;
         dial.req.content_type = fetch.content_type;
         dial.req.headers = fetch.headers;
-        dial.req.referrer = fetch.referrer;
+        dial.req.referrer = fetch.options.referrer;
         // An unset request policy means the client's policy container
         // decides: resolve it here so every redirect hop re-determines with
         // the same policy the initial request used
         // (<https://fetch.spec.whatwg.org/#main-fetch>,
         // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
         dial.req.referrer_policy = fetch
+            .options
             .referrer_policy
             .or(self.world.borrow().policy.referrer_policy)
             .unwrap_or_default();
-        dial.req.cors = Some(fetch.cors);
-        dial.req.keepalive = fetch.keepalive;
-        dial.req.body_len = fetch.body_len;
-        dial.req.integrity = fetch.integrity;
-        dial.req.cache = fetch.cache;
-        dial.req.delivery = fetch.delivery;
+        dial.req.cors = Some(fetch.options.cors);
+        dial.req.keepalive = fetch.options.keepalive;
+        dial.req.body_len = fetch.options.body_len;
+        dial.req.integrity = fetch.options.integrity;
+        dial.req.cache = fetch.options.cache;
+        dial.req.delivery = fetch.options.delivery;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Connect),
         ));

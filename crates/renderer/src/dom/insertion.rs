@@ -38,37 +38,21 @@ pub(crate) fn classify_inserted(
     doc: &crate::documents::BlitzDocument,
     id: BlitzId,
 ) -> InsertedNode {
-    // A fragment node splices its children on insertion.
+    // A fragment node splices its children on insertion, so the shape is its
+    // children's: the DOM cannot hold a fragment inside a fragment, because
+    // inserting one splices it
+    // (<https://dom.spec.whatwg.org/#concept-node-insert>).
     if doc.is_fragment(id) {
-        // Flatten nested fragments: insertion splices fragment children, so a
-        // fragment holding a nested fragment with two elements still inserts
-        // two elements. Iterative: fragment nesting is not depth-limited.
-        // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+        let Some(fragment) = doc.base.get_node(id) else {
+            return InsertedNode::Other;
+        };
         let mut elements = 0;
         let mut has_text = false;
-        let mut stack = vec![id];
-        while let Some(current) = stack.pop() {
-            let kids: Vec<BlitzId> = doc
-                .base
-                .get_node(current)
-                .map(|n| n.children.iter().copied().collect())
-                .unwrap_or_default();
-            for child in kids {
-                if doc.is_fragment(child) {
-                    stack.push(child);
-                    continue;
-                }
-                if is_element(&doc.base, child) {
-                    elements += 1;
-                }
-                if doc.base.get_node(child).is_some_and(|candidate| {
-                    matches!(
-                        candidate.data,
-                        NodeData::Text(_) | NodeData::CDataSection { .. }
-                    )
-                }) {
-                    has_text = true;
-                }
+        for child in &fragment.children {
+            match doc.base.get_node(*child).map(|node| &node.data) {
+                Some(NodeData::Element(_)) => elements += 1,
+                Some(NodeData::Text(_) | NodeData::CDataSection { .. }) => has_text = true,
+                Some(_) | None => {}
             }
         }
         return InsertedNode::Fragment { elements, has_text };
@@ -516,21 +500,7 @@ pub(crate) fn replace_all_with_node(
     node: NodeId,
 ) -> Vec<NodeId> {
     let added = if parsed.document.is_fragment(node.node) {
-        let moved: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(node.node)
-            .map(|contents| {
-                contents
-                    .children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: node.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let moved = fragment_children(&parsed.document, node);
         // The children leave the fragment before the insert, and each
         // removal runs the live-range pre-remove steps
         // (<https://dom.spec.whatwg.org/#concept-node-insert>).
@@ -1025,18 +995,7 @@ pub(crate) fn fragment_children(
     doc: &crate::documents::BlitzDocument,
     fragment: NodeId,
 ) -> Vec<NodeId> {
-    doc.base
-        .get_node(fragment.node)
-        .map(|node| {
-            node.children
-                .iter()
-                .map(|child| NodeId {
-                    document: fragment.document,
-                    node: *child,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::dom::tree::child_ids(&doc.base, fragment.document, fragment.node)
 }
 
 /// What takes a replaced child's place

@@ -937,8 +937,6 @@ impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js>
 impl JsNode {
     pub(super) fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
         // https://dom.spec.whatwg.org/#dom-node-nodetype
-        // A shadow root is a fragment node too
-        // (<https://dom.spec.whatwg.org/#interface-shadowroot>).
         with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(_)) => Ok(1),
             Some(NodeData::Text(_)) => Ok(3),
@@ -1853,8 +1851,7 @@ pub(super) fn insertion_excluding_children(
             .document(parent)
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
         let base = &parsed.document.base;
-        // Only documents, elements, and fragments can be parents.
-        // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+        // <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>
         let parent_is_document = base.root_node().id == parent.node;
         let parent_is_fragment = base.get_node(parent.node).is_some_and(|node| {
             matches!(

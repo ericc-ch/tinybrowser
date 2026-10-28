@@ -24,8 +24,8 @@ use blitz_dom::NodeData;
 use rquickjs::{Array, Class, Ctx, Exception, Function, Persistent, Result, Value};
 
 use crate::dom::insertion::{
-    iframe_containers_in_subtrees, place_journaled, replace_all_journaled, replace_parsed,
-    unlink_journaled,
+    fragment_children, iframe_containers_in_subtrees, place_journaled, replace_all_journaled,
+    replace_parsed, unlink_journaled,
 };
 use crate::dom::serialization;
 use crate::dom::tree::{
@@ -2198,20 +2198,7 @@ impl JsNode {
         let replacement =
             materialize_children(&mut parsed.document, container.document, &snapshots)
                 .map_err(|err| throw_dom_error(ctx, err))?;
-        let added: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(replacement.node)
-            .map(|node| {
-                node.children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: replacement.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let added = fragment_children(&parsed.document, replacement);
         let iframes = replace_all_journaled(&mut parsed, container, added.clone());
         let controls = crate::dom::forms::descendant_controls(
             &parsed.document.base,
@@ -2280,20 +2267,7 @@ impl JsNode {
         }
         let fragment = materialize_children(&mut parsed.document, element.document, &snapshots)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        let moved: Vec<NodeId> = parsed
-            .document
-            .base
-            .get_node(fragment.node)
-            .map(|node| {
-                node.children
-                    .iter()
-                    .map(|child| NodeId {
-                        document: fragment.document,
-                        node: *child,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let moved = fragment_children(&parsed.document, fragment);
         match position.as_str() {
             "beforebegin" => {
                 let parent = parent.ok_or_else(|| {

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::exchange::{Frame, RequestId};
 use renderer::{
     BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, PostedMessage, RemoteValue,
-    StorageChange, StorageError, StorageKind, TabError,
+    StorageChange, StorageError, StorageKind, StreamId, TabError,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -280,9 +280,9 @@ pub enum NetworkCall {
     /// Cancels a dial submitted by this assignment.
     CancelDial { id: RequestId },
     /// Reads the next decoded body chunk for a streamed dial.
-    DialRead { id: u64 },
+    DialRead { id: StreamId },
     /// Cancels a streamed response body.
-    CancelStream { id: u64 },
+    CancelStream { id: StreamId },
     /// `document.cookie` getter.
     CookieGet {
         /// Document URL.

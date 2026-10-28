@@ -421,15 +421,15 @@ fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOut
     // This transport answers with the whole body, so a page that asked for a
     // progressive body gets it buffered. The renderer accepts a body in place
     // of a stream, and the page sees a response that was not streamed.
-    let body = renderer::ResponseBody::Buffered(Ok(response.body));
     let mut outcome = DialOutcome::basic(
         response.status,
         final_url.into(),
         response.content_type,
         Vec::new(),
-        Vec::new(),
+        response.body,
     );
-    outcome.body = body;
+    // No host header list crosses this transport, so the response has none.
+    outcome.headers = Vec::new();
     Ok(outcome)
 }
 
@@ -705,7 +705,7 @@ mod tests {
             body: b"hi".to_vec(),
         };
         let outcome = decode_fetch_result(response, &hop).expect("decoded");
-        assert_eq!(outcome.body.bytes(), Some(b"hi".as_slice()));
+        assert!(matches!(&outcome.body, renderer::ResponseBody::Bytes(body) if body == b"hi"));
         assert_eq!(outcome.final_url, "https://example.test/docs");
     }
 }

@@ -42,69 +42,49 @@ pub fn combined_header_in<'a>(
 /// Splits one header value into its members
 /// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
 ///
-/// Bytes are isomorphic-decoded, so `0x80..=0xFF` stay the same code points.
-#[must_use]
-pub fn split_header_value(value: &[u8]) -> Vec<String> {
-    split_header_value_str(&isomorphic_decode(value))
-}
-
-/// Splits an already isomorphic-decoded header value into its members
-/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
-///
 /// A comma inside a quoted string does not split, the quoted text keeps its
 /// quotes and escapes, and every member is stripped of leading and trailing
-/// HTTP tab or space.
+/// HTTP tab or space. Values are isomorphic-decoded, so a byte above `0x7F` is
+/// the code point with the same number
+/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
 #[must_use]
-pub fn split_header_value_str(value: &str) -> Vec<String> {
-    let input: Vec<char> = value.chars().collect();
+pub fn split_header_value(value: &str) -> Vec<String> {
     let mut values = Vec::new();
     let mut member = String::new();
-    let mut position = 0;
-    loop {
-        while position < input.len() && input[position] != '"' && input[position] != ',' {
-            member.push(input[position]);
-            position += 1;
-        }
-        if position < input.len() && input[position] == '"' {
-            collect_quoted_string(&input, &mut position, &mut member);
-            if position < input.len() {
-                continue;
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            ',' => {
+                values.push(member.trim_matches([' ', '\t']).to_owned());
+                member.clear();
             }
+            '"' => {
+                member.push(character);
+                collect_quoted_string(&mut characters, &mut member);
+            }
+            _ => member.push(character),
         }
-        values.push(member.trim_matches([' ', '\t']).to_owned());
-        member.clear();
-        if position >= input.len() {
-            return values;
-        }
-        position += 1;
     }
+    values.push(member.trim_matches([' ', '\t']).to_owned());
+    values
 }
 
 /// Appends one HTTP quoted string, quotes and escapes included, and leaves
-/// `position` just past it
+/// the iterator just past it
 /// (<https://fetch.spec.whatwg.org/#collect-an-http-quoted-string>).
-fn collect_quoted_string(input: &[char], position: &mut usize, member: &mut String) {
-    member.push(input[*position]);
-    *position += 1;
-    loop {
-        while *position < input.len() && input[*position] != '"' && input[*position] != '\\' {
-            member.push(input[*position]);
-            *position += 1;
-        }
-        if *position >= input.len() {
-            return;
-        }
-        let quote_or_backslash = input[*position];
-        member.push(quote_or_backslash);
-        *position += 1;
-        if quote_or_backslash == '\\' {
-            if *position >= input.len() {
-                return;
+///
+/// An unterminated string runs to the end of the value, escapes included.
+fn collect_quoted_string(characters: &mut std::str::Chars<'_>, member: &mut String) {
+    while let Some(character) = characters.next() {
+        member.push(character);
+        match character {
+            '"' => return,
+            '\\' => {
+                if let Some(escaped) = characters.next() {
+                    member.push(escaped);
+                }
             }
-            member.push(input[*position]);
-            *position += 1;
-        } else {
-            return;
+            _ => {}
         }
     }
 }
@@ -147,7 +127,7 @@ pub fn get_decode_split(headers: &HeaderMap, name: &str) -> Option<Vec<String>> 
         combined.extend_from_slice(value);
         found = true;
     }
-    found.then(|| split_header_value(&combined))
+    found.then(|| split_header_value(&isomorphic_decode(&combined)))
 }
 
 /// Gets `name` from an already isomorphic-decoded header list and splits it
@@ -160,16 +140,7 @@ pub fn get_decode_split_decoded<'a>(
     headers: impl IntoIterator<Item = (&'a str, &'a str)>,
     name: &str,
 ) -> Option<Vec<String>> {
-    let values: Vec<&str> = headers
-        .into_iter()
-        .filter(|(header, _)| header.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value)
-        .collect();
-    if values.is_empty() {
-        None
-    } else {
-        Some(split_header_value_str(&values.join(", ")))
-    }
+    combined_header_in(headers, name).map(|value| split_header_value(&value))
 }
 
 pub(crate) fn is_token_char(c: char) -> bool {
@@ -492,28 +463,25 @@ mod tests {
 
     #[test]
     fn splits_header_values_per_spec() {
-        assert_eq!(super::split_header_value(b"nosniff,"), ["nosniff", ""]);
-        assert_eq!(super::split_header_value(b""), [""]);
+        assert_eq!(super::split_header_value("nosniff,"), ["nosniff", ""]);
+        assert_eq!(super::split_header_value(""), [""]);
         assert_eq!(
-            super::split_header_value(b"text/html;\", x/x"),
+            super::split_header_value("text/html;\", x/x"),
             ["text/html;\", x/x"]
         );
         assert_eq!(
-            super::split_header_value(b"x/x;test=\"hi\",y/y"),
+            super::split_header_value("x/x;test=\"hi\",y/y"),
             ["x/x;test=\"hi\"", "y/y"]
         );
         assert_eq!(
-            super::split_header_value(b"x / x,,,1"),
+            super::split_header_value("x / x,,,1"),
             ["x / x", "", "", "1"]
         );
-        assert_eq!(super::split_header_value(b"\"1,2\", 3"), ["\"1,2\"", "3"]);
+        assert_eq!(super::split_header_value("\"1,2\", 3"), ["\"1,2\"", "3"]);
         // An escaped comma stays inside the member. Without the escape
         // branch the quoted string ends at the backslash and the comma
         // splits, so this pins the branch itself.
-        assert_eq!(
-            super::split_header_value(b"\"a\\,b\",c"),
-            ["\"a\\,b\"", "c"]
-        );
+        assert_eq!(super::split_header_value("\"a\\,b\",c"), ["\"a\\,b\"", "c"]);
     }
 
     #[test]
@@ -539,7 +507,7 @@ mod tests {
             Some("nosniff, ")
         );
         assert_eq!(
-            super::split_header_value_str("nosniff, "),
+            super::split_header_value("nosniff, "),
             ["nosniff".to_owned(), String::new()]
         );
     }

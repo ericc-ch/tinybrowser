@@ -607,6 +607,20 @@ pub enum BodyDelivery {
     Stream,
 }
 
+impl BodyDelivery {
+    /// Parses the `delivery` value `fetch.js` sends: the one spelling of each
+    /// delivery the renderer accepts, so a typo cannot become a silent buffer
+    /// request.
+    #[must_use]
+    pub fn from_idl(value: &str) -> Option<Self> {
+        match value {
+            "buffer" => Some(Self::Buffer),
+            "stream" => Some(Self::Stream),
+            _ => None,
+        }
+    }
+}
+
 /// A `fetch` request's cache mode
 /// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>). The renderer
 /// parses the `RequestInit.cache` string once; the browser matches on this
@@ -660,10 +674,6 @@ pub struct CorsRequest {
     pub redirect: net::cors::RedirectMode,
 }
 
-/// A response body that could not be decoded.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct BodyError;
-
 /// Browser-side identity of one progressive response body.
 ///
 /// Minted by the browser's stream counter. The renderer carries it back
@@ -674,59 +684,44 @@ pub struct BodyError;
 pub struct StreamId(u64);
 
 impl StreamId {
-    /// The stream handle's wire value.
+    /// The stream handle's wire value, and the number `fetch.js` passes back
+    /// to `__tbFetchRead` / `__tbFetchCancel`.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
-    /// Mints an id from the browser's counter.
+    /// Mints an id from the browser's stream counter.
     #[must_use]
-    pub const fn new(id: u64) -> Self {
+    pub const fn mint(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Rebuilds the handle from the number a page script holds. The bridge is
+    /// the only caller: the page never names a stream the browser did not
+    /// mint, and the browser checks ownership before reading it.
+    #[must_use]
+    pub const fn from_page(id: u64) -> Self {
         Self(id)
     }
 }
 
 /// What one dial answered with, in the one shape the delivery mode decides
 /// (<https://fetch.spec.whatwg.org/#concept-response-body>).
+///
+/// each state carries only its own data: a body is either the whole bytes, a
+/// decode failure, or a handle to bytes that are still arriving. The old
+/// `Result` inside a variant made "streamed with a decode error" spellable and
+/// forced every caller to unwrap two layers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ResponseBody {
-    /// The whole body arrived, or failed to decode for its `Content-Encoding`
+    /// The whole body arrived.
+    Bytes(Vec<u8>),
+    /// The whole body arrived but its `Content-Encoding` decode failed
     /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
-    Buffered(Result<Vec<u8>, BodyError>),
+    Undecodable,
     /// The head arrived and the bytes follow through the network host.
     Streamed(StreamId),
-}
-
-impl ResponseBody {
-    /// The complete body bytes, when the browser buffered them.
-    #[must_use]
-    pub fn bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Buffered(body) => body.as_ref().ok().map(Vec::as_slice),
-            Self::Streamed(_) => None,
-        }
-    }
-
-    /// Takes the buffered body: `None` when the browser is streaming it.
-    #[must_use]
-    pub fn into_bytes(self) -> Option<Result<Vec<u8>, BodyError>> {
-        match self {
-            Self::Buffered(body) => Some(body),
-            Self::Streamed(_) => None,
-        }
-    }
-}
-
-impl DialOutcome {
-    /// The browser-side stream handle, when the body is streamed.
-    #[must_use]
-    pub fn stream(&self) -> Option<StreamId> {
-        match self.body {
-            ResponseBody::Streamed(id) => Some(id),
-            ResponseBody::Buffered(_) => None,
-        }
-    }
 }
 
 /// Result of one blocking GET.
@@ -780,7 +775,7 @@ impl DialOutcome {
             final_url,
             content_type,
             headers,
-            body: ResponseBody::Buffered(Ok(body)),
+            body: ResponseBody::Bytes(body),
             response_type: net::cors::ResponseType::Basic,
             crossed_origin: false,
             redirect_count: 0,

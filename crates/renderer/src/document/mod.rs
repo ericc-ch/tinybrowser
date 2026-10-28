@@ -3271,7 +3271,7 @@ impl Document {
                     // renderer reads or cancels it, so cancel before dropping
                     // the outcome
                     // (<https://fetch.spec.whatwg.org/#concept-response-body>).
-                    if let Some(stream) = outcome.stream() {
+                    if let crate::protocol::ResponseBody::Streamed(stream) = outcome.body {
                         self.services.cancel_stream(stream);
                     }
                     self.settle_js_fetch(id, None);
@@ -3306,7 +3306,11 @@ impl Document {
                 // SRI verification fails the load like a network error:
                 // no execution, no `load` event, and no CSP violation
                 // (<https://www.w3.org/TR/SRI/#verify-integrity>).
-                let body = outcome.body.bytes();
+                let body = match &outcome.body {
+                    crate::protocol::ResponseBody::Bytes(body) => Some(body.as_slice()),
+                    crate::protocol::ResponseBody::Undecodable
+                    | crate::protocol::ResponseBody::Streamed(_) => None,
+                };
                 let integrity_ok = integrity.as_deref().is_none_or(|metadata| {
                     body.is_some_and(|body| crate::csp::integrity_verifies(metadata, body))
                 });
@@ -3408,7 +3412,7 @@ impl Document {
         self.record_event(RendererEvent::Browser(BrowserEvent::Navigated {
             url: url.to_string(),
         }));
-        let Some(body) = outcome.body.bytes() else {
+        let crate::protocol::ResponseBody::Bytes(body) = &outcome.body else {
             return;
         };
         // Set before the parse runs: the new document's own scripts read
@@ -3438,7 +3442,11 @@ impl Document {
             && destination.is_some_and(|destination| {
                 self.response_url_blocked(&outcome.final_url, request_url, destination, None)
             });
-        let body = outcome.body.bytes();
+        let body = match &outcome.body {
+            crate::protocol::ResponseBody::Bytes(body) => Some(body.as_slice()),
+            crate::protocol::ResponseBody::Undecodable
+            | crate::protocol::ResponseBody::Streamed(_) => None,
+        };
         let succeeded = !blocked && (200..300).contains(&outcome.status) && body.is_some();
         // A `no-cors` image stays clean only while the request stays on this
         // origin; one cross-origin hop makes the response opaque for the rest

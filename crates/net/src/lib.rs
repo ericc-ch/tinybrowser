@@ -18,7 +18,7 @@ pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportEr
 pub use protocol::{
     HeaderError, HeaderMap, InvalidMethod, Method, combined_header, combined_header_in,
     get_decode_split, get_decode_split_decoded, isomorphic_decode, isomorphic_encode,
-    split_header_value, split_header_value_str,
+    split_header_value,
 };
 pub use referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 pub use resolve::{InvalidResolveRule, ResolveRule};

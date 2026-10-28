@@ -636,8 +636,8 @@ impl Agent {
             .await?;
         let content_encoding: Vec<String> =
             crate::get_decode_split(&response_headers, "content-encoding")
-                .unwrap_or_default()
                 .into_iter()
+                .flatten()
                 .map(|coding| coding.to_ascii_lowercase())
                 .filter(|coding| !coding.is_empty())
                 .collect();
@@ -1328,23 +1328,18 @@ impl Response {
 #[cfg(test)]
 mod decode_tests {
     use super::{Arc, AtomicBool, Body, Mutex, NetError};
-
-    async fn read_all(mut body: Body, limit: usize) -> Result<Vec<u8>, NetError> {
-        let mut out = Vec::new();
-        while let Some(chunk) = body.read_chunk().await? {
-            if out.len() + chunk.len() > limit {
-                return Err(NetError::Limit(crate::LimitExceeded::Size(
-                    u64::try_from(limit).unwrap_or(u64::MAX),
-                )));
-            }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
-    }
     use flate2::Compression;
     use flate2::write::{DeflateEncoder, GzEncoder};
     use std::io::Write as _;
     use tokio::io::{AsyncWriteExt as _, duplex};
+
+    async fn read_all(mut body: Body) -> Result<Vec<u8>, NetError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.read_chunk().await? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
 
     async fn decode(bytes: &[u8], coding: &str) -> Result<Vec<u8>, NetError> {
         let (mut writer, reader) = duplex(bytes.len().saturating_add(32).max(64));
@@ -1357,7 +1352,7 @@ mod decode_tests {
             Arc::new(AtomicBool::new(true)),
         )
         .await;
-        read_all(body, 4 * 1024 * 1024).await
+        read_all(body).await
     }
 
     fn gzip(data: &[u8]) -> Vec<u8> {
@@ -1401,27 +1396,6 @@ mod decode_tests {
             Arc::new(AtomicBool::new(false)),
         )
         .await;
-        assert_eq!(read_all(body, 1024).await.expect("empty"), Vec::<u8>::new());
-    }
-
-    #[tokio::test]
-    async fn refuses_decoded_bodies_past_the_limit() {
-        let body = gzip(&vec![0; 2 * 1024 * 1024]);
-        let decoded = Body::wrap(
-            Box::new({
-                let (mut writer, reader) = duplex(body.len() + 32);
-                writer.write_all(&body).await.expect("write");
-                drop(writer);
-                reader
-            }),
-            &["gzip".to_owned()],
-            Arc::new(Mutex::new(None)),
-            Arc::new(AtomicBool::new(true)),
-        )
-        .await;
-        assert!(matches!(
-            read_all(decoded, 1024).await,
-            Err(NetError::Limit(_))
-        ));
+        assert_eq!(read_all(body).await.expect("empty"), Vec::<u8>::new());
     }
 }

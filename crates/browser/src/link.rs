@@ -569,18 +569,15 @@ fn live_assignment(
 }
 
 /// Runs one dial attempt, racing the process kill switch and this call's
-/// cancellation. Both attempts of a 421 retry go through here, so the select
-/// arms exist once.
+/// cancellation.
 async fn race_dial(
     network: &crate::network::TabNetworkHandle,
     request: &renderer::DialRequest,
     initiator: &Url,
     assignment: RendererAssignmentId,
-    kill: &watch::Receiver<bool>,
-    cancel: &watch::Receiver<bool>,
+    mut kill: watch::Receiver<bool>,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<renderer::DialOutcome, renderer::DialFailure> {
-    let mut kill = kill.clone();
-    let mut cancel = cancel.clone();
     tokio::select! {
         biased;
         _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
@@ -671,8 +668,8 @@ async fn route_service_call(
                     &request,
                     &initiator,
                     assignment_id,
-                    &kill,
-                    &cancel_rx,
+                    kill.clone(),
+                    cancel_rx.clone(),
                 )
                 .await;
                 // A 421 asks for a retry on a different connection, but only an
@@ -682,26 +679,26 @@ async fn route_service_call(
                     && matches!(&outcome, Ok(head) if head.status == 421)
                 {
                     if let Ok(head) = &outcome
-                        && let Some(stream) = head.stream()
+                        && let renderer::ResponseBody::Streamed(stream) = &head.body
                     {
-                        worker_network.cancel_stream(assignment_id, stream);
+                        worker_network.cancel_stream(assignment_id, *stream);
                     }
                     outcome = race_dial(
                         &worker_network,
                         &request,
                         &initiator,
                         assignment_id,
-                        &kill,
-                        &cancel_rx,
+                        kill.clone(),
+                        cancel_rx.clone(),
                     )
                     .await;
                 }
                 // `release_streams` may have run while the dial was in flight.
                 if let Ok(head) = &outcome
-                    && let Some(stream) = head.stream()
+                    && let renderer::ResponseBody::Streamed(stream) = &head.body
                     && registry.resolve(assignment_id).is_none()
                 {
-                    worker_network.cancel_stream(assignment_id, stream);
+                    worker_network.cancel_stream(assignment_id, *stream);
                 }
                 dials
                     .lock()
@@ -717,16 +714,11 @@ async fn route_service_call(
             });
         }
         ServiceCall::Network(NetworkCall::DialRead { id: stream }) => {
-            let result = assignment
-                .network
-                .read_stream(assignment_id, renderer::StreamId::new(stream))
-                .await;
+            let result = assignment.network.read_stream(assignment_id, stream).await;
             send_reply(&context.responder, id, ServiceReply::StreamChunk(result)).await?;
         }
         ServiceCall::Network(NetworkCall::CancelStream { id: stream }) => {
-            assignment
-                .network
-                .cancel_stream(assignment_id, renderer::StreamId::new(stream));
+            assignment.network.cancel_stream(assignment_id, stream);
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Network(NetworkCall::CancelDial { id: target }) => {

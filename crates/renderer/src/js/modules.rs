@@ -179,7 +179,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     {
         return Err(Error::new_loading(name));
     }
-    let Some(Ok(body)) = outcome.body.into_bytes() else {
+    let crate::protocol::ResponseBody::Bytes(body) = outcome.body else {
         return Err(Error::new_loading(name));
     };
     Module::declare(ctx.clone(), name, body)
