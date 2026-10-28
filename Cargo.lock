@@ -3483,6 +3483,7 @@ dependencies = [
  "browser",
  "cdp",
  "logging",
+ "net",
  "serde_json",
  "tokio",
  "webdriver",

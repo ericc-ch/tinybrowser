@@ -2054,6 +2054,9 @@ mod navigator_tests {
             }],
             platform: "ProbeOS".to_owned(),
             mobile: true,
+            form_factors: vec!["Mobile".to_owned()],
+            navigator_platform: "ProbeOS 1.0".to_owned(),
+            ..net::Identity::default()
         };
         let mut engine = Engine::new(
             Arc::new(NullServices),
@@ -2082,6 +2085,7 @@ mod navigator_tests {
         );
         assert_eq!(evaluate("navigator.userAgentData.mobile"), "true");
         assert_eq!(evaluate("navigator.userAgentData.platform"), "ProbeOS");
+        assert_eq!(evaluate("navigator.platform"), "ProbeOS 1.0");
     }
 }
 

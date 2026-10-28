@@ -117,7 +117,9 @@ impl GuestTab for Tab {
     fn new(url: String, html: String) -> Result<Self, String> {
         let services = Arc::new(WasmServices::new());
         let owner = services.owner;
-        let mut renderer = EmbeddedRenderer::new(services);
+        // The component is its own host; a host-supplied identity arrives with
+        // the `fetch-request` contract change in #192.
+        let mut renderer = EmbeddedRenderer::new(services, net::Identity::default());
         let mount = Mount {
             head: renderer::ResponseHead::non_http(url, Some("text/html; charset=utf-8".into())),
             body: html.into_bytes(),

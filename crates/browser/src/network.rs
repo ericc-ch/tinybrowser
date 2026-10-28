@@ -539,7 +539,6 @@ impl NetworkContext {
     #[must_use]
     pub(crate) fn tab_handle(&self) -> TabNetworkHandle {
         TabNetworkHandle {
-            identity: self.agent.identity().clone(),
             agent: self.agent.clone(),
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
@@ -602,8 +601,6 @@ const MAX_TAB_DIALS: usize = 8;
 /// Completions return to the tab coordinator as renderer events.
 #[derive(Clone)]
 pub(crate) struct TabNetworkHandle {
-    /// The identity this tab reports in request headers and in the renderer.
-    identity: net::Identity,
     agent: Agent,
     permits: NetworkPermits,
     tab: Arc<Semaphore>,
@@ -665,7 +662,6 @@ impl TabNetworkHandle {
         let permits = Self::acquire(&self.permits.navigation, deadline).await?;
         let mut request = Request::new(Method::GET, url.clone());
         chrome_navigation_request(&mut request, url);
-        request.client_hints = Some(self.identity.clone());
         request.initiator_kind = InitiatorKind::Navigation;
         request.initiator = Some(initiator.clone());
         request.cors = net::cors::CorsSettings {
@@ -1104,7 +1100,7 @@ impl TabNetworkHandle {
             .sheets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        outbound_request(request, initiator, deadline, &sheets, &self.identity)
+        outbound_request(request, initiator, deadline, &sheets)
     }
 
     async fn acquire(
@@ -1161,7 +1157,6 @@ fn outbound_request(
     initiator: &Url,
     deadline: Instant,
     sheets: &HashSet<Url>,
-    identity: &net::Identity,
 ) -> Result<Request, DialFailure> {
     let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
     let kind = request.policy.kind();
@@ -1233,9 +1228,6 @@ fn outbound_request(
     };
     static_header(&mut outbound, "Sec-Fetch-Dest", destination);
     static_header(&mut outbound, "Sec-Fetch-Mode", cors.mode.as_str());
-    // Net writes the client hints after the preflight decision, so they never
-    // force one (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
-    outbound.client_hints = Some(identity.clone());
     if !request.body.is_empty() {
         outbound.body = Some(request.body.clone());
     }
@@ -1590,7 +1582,6 @@ mod tests {
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         let deadline = Instant::now() + Duration::from_secs(5);
         let sheets = HashSet::new();
-        let identity = net::Identity::default();
         let anonymous = Some(net::cors::CrossOrigin::Anonymous);
         let credentials = Some(net::cors::CrossOrigin::UseCredentials);
         let fetch = |mode, credentials| {
@@ -1690,7 +1681,7 @@ mod tests {
         ];
         for (policy, mode, credentials, redirect, fetch_mode, destination) in table {
             let request = dial(policy, "http://b.test/x");
-            let outbound = outbound_request(&request, &initiator, deadline, &sheets, &identity)
+            let outbound = outbound_request(&request, &initiator, deadline, &sheets)
                 .expect("outbound request");
             assert_eq!(outbound.cors.mode, mode, "{:?}", policy.kind());
             assert_eq!(
@@ -1730,7 +1721,6 @@ mod tests {
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         let deadline = Instant::now() + Duration::from_secs(5);
         let sheets = HashSet::new();
-        let identity = net::Identity::default();
         let mut request = dial(
             RequestPolicy::Fetch(renderer::CorsRequest {
                 mode: renderer::CorsMode::NoCors,
@@ -1741,16 +1731,16 @@ mod tests {
         );
         request.method = net::Method::POST;
         request.content_type = Some("application/json".to_owned());
-        let outbound = outbound_request(&request, &initiator, deadline, &sheets, &identity)
-            .expect("outbound request");
+        let outbound =
+            outbound_request(&request, &initiator, deadline, &sheets).expect("outbound request");
         assert!(
             outbound.headers.get("content-type").is_none(),
             "a JSON type would have needed a preflight"
         );
 
         request.content_type = Some("text/plain;charset=UTF-8".to_owned());
-        let outbound = outbound_request(&request, &initiator, deadline, &sheets, &identity)
-            .expect("outbound request");
+        let outbound =
+            outbound_request(&request, &initiator, deadline, &sheets).expect("outbound request");
         assert_eq!(
             outbound.headers.get("content-type"),
             Some(b"text/plain;charset=UTF-8".as_slice()),
@@ -1762,8 +1752,8 @@ mod tests {
         let mut report = dial(RequestPolicy::CspReportUri, "http://b.test/report");
         report.method = net::Method::POST;
         report.content_type = Some("application/csp-report".to_owned());
-        let outbound = outbound_request(&report, &initiator, deadline, &sheets, &identity)
-            .expect("outbound report");
+        let outbound =
+            outbound_request(&report, &initiator, deadline, &sheets).expect("outbound report");
         assert_eq!(
             outbound.headers.get("content-type"),
             Some(b"application/csp-report".as_slice()),

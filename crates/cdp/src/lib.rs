@@ -47,7 +47,6 @@ use dispatch::{
     wait_for_navigation, ws_io,
 };
 
-const PRODUCT: &str = "Chrome/152.0.7977.82";
 /// One default browser context; Playwright requires `browserContextId` on
 /// attached targets.
 const DEFAULT_BROWSER_CONTEXT_ID: &str = "tinybrowser-default";
@@ -274,7 +273,7 @@ struct AppState {
 
 fn version_json(state: &AppState) -> Value {
     json!({
-        "Browser": PRODUCT,
+        "Browser": state.browser.identity().product,
         "Protocol-Version": "1.3",
         "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", state.bound),
     })
@@ -1066,7 +1065,7 @@ impl Conn {
         match handler {
             BrowserHandler::GetVersion => Ok(json!({
                 "protocolVersion": "1.3",
-                "product": PRODUCT,
+                "product": self.browser.identity().product.clone(),
                 "revision": "0",
                 "userAgent": self.browser.identity().user_agent.as_str(),
                 "jsVersion": "QuickJS",

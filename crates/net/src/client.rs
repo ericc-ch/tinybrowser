@@ -132,6 +132,11 @@ impl Default for AgentOptions {
 pub struct Agent {
     pub(crate) engine: HttpEngine,
     identity: crate::Identity,
+    /// The identity's hint values, formatted once. `None` when its brands or
+    /// platform are not field values: `Identity::validate` is how a caller
+    /// checks first, and the browser does so before it opens, so this only
+    /// affects a direct `Agent` caller that skipped it.
+    client_hints: Option<crate::ClientHints>,
     max_redirects: u32,
     jar: Arc<Mutex<CookieJar>>,
     clock: Clock,
@@ -172,6 +177,7 @@ impl Agent {
                 resolve.into(),
                 &tls_cas,
             ),
+            client_hints: identity.client_hints().ok(),
             identity,
             max_redirects,
             jar: Arc::new(Mutex::new(CookieJar::default())),
@@ -406,7 +412,7 @@ impl Agent {
         }
         let dial = Dial {
             cors: &request.cors,
-            client_hints: request.client_hints.as_ref(),
+            client_hints: self.client_hints.as_ref(),
             initiator_kind: request.initiator_kind,
             initiator: request.initiator.as_ref(),
             on_redirect: request.on_redirect.as_ref(),
@@ -691,12 +697,6 @@ pub struct Request {
     /// caller fills `origin` from the document it is fetching for, so a
     /// compromised renderer cannot claim another origin.
     pub cors: crate::cors::CorsSettings,
-    /// The browser's identity, when this request is one the browser makes on a
-    /// page's behalf. The client hints are written after the CORS preflight
-    /// decision, because the user agent adds them rather than the request's
-    /// header list, so they never force a preflight
-    /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
-    pub client_hints: Option<crate::Identity>,
     /// Called with the next URL and the redirect count that hop will carry
     /// (`1` for the first redirect) before the hop is followed. `false`
     /// rejects the dial. Unset follows every redirect the cap allows.
@@ -726,7 +726,6 @@ impl std::fmt::Debug for Request {
             .field("deadline", &self.deadline)
             .field("cors", &self.cors)
             .field("on_redirect", &self.on_redirect.is_some())
-            .field("has_client_hints", &self.client_hints.is_some())
             .field("referrer", &self.referrer)
             .field("referrer_policy", &self.referrer_policy)
             .field("referrer_client", &self.referrer_client)
@@ -755,7 +754,6 @@ impl Request {
             body: None,
             deadline: None,
             cors,
-            client_hints: None,
             on_redirect: None,
             referrer: Referrer::NoReferrer,
             referrer_policy: ReferrerPolicy::default(),
@@ -819,13 +817,13 @@ fn apply_redirect_policy(status: u16, current: &Url, next: &Url, hop: &mut Hop) 
         hop.headers.remove("cookie");
         hop.headers.remove("host");
     }
-    // Client hints are for trustworthy origins only, the same predicate the
-    // navigation headers and the cookie jar use
-    // (<https://wicg.github.io/ua-client-hints/#secure-transport>).
+    // A hint a caller put in the request's own header list is for trustworthy
+    // origins only, the same predicate the navigation headers and the cookie jar
+    // use (<https://wicg.github.io/ua-client-hints/#secure-transport>). The user
+    // agent's own hints are not here: this hop writes them from the identity
+    // after this point, and only when the hop's URL is trustworthy
+    // (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
     if !crate::is_potentially_trustworthy(next) {
-        hop.headers.remove("sec-ch-ua");
-        hop.headers.remove("sec-ch-ua-mobile");
-        hop.headers.remove("sec-ch-ua-platform");
         hop.headers.remove("sec-ch-prefers-color-scheme");
     }
 }
@@ -859,10 +857,8 @@ fn prepare_credentials(
     } else {
         headers.remove("cookie");
     }
-    if let Some(identity) = dial.client_hints {
-        identity
-            .write_client_hints(headers, url)
-            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+    if let Some(hints) = dial.client_hints {
+        hints.write(headers, url);
     }
     Ok(())
 }
@@ -870,7 +866,7 @@ fn prepare_credentials(
 /// Request-scoped values shared by every hop of one `send` call.
 struct Dial<'a> {
     cors: &'a crate::cors::CorsSettings,
-    client_hints: Option<&'a crate::Identity>,
+    client_hints: Option<&'a crate::ClientHints>,
     initiator_kind: InitiatorKind,
     initiator: Option<&'a Url>,
     on_redirect: Option<&'a RedirectGate>,

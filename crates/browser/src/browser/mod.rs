@@ -185,10 +185,12 @@ pub(super) struct AddCookie {
 impl Browser {
     /// Opens the selected profile and starts its browser owner task.
     ///
-    /// `options.network` must already be validated; this function does not
-    /// re-check it. It exclusively locks and restores the profile and starts
-    /// renderer-process management. It must run inside an active Tokio runtime.
-    /// No tab is created automatically.
+    /// The configured identity is checked here, before the profile is touched,
+    /// because one invalid brand would otherwise reach every request, page,
+    /// and CDP answer as a missing or partial hint set. The function then
+    /// exclusively locks and restores the profile and starts renderer-process
+    /// management. It must run inside an active Tokio runtime. No tab is
+    /// created automatically.
     ///
     /// # Examples
     ///
@@ -209,11 +211,18 @@ impl Browser {
     /// # Errors
     ///
     /// Returns [`BrowserOpenError::RuntimeUnavailable`] outside a Tokio
-    /// runtime, or [`BrowserOpenError::Profile`] when the data home or profile
-    /// cannot be created, locked, restored, or quarantined.
+    /// runtime, [`BrowserOpenError::Identity`] when `options.network.identity`
+    /// is not a valid set of field values, or [`BrowserOpenError::Profile`] when
+    /// the data home or profile cannot be created, locked, restored, or
+    /// quarantined.
     pub fn new(options: BrowserOptions) -> Result<Self, BrowserOpenError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| BrowserOpenError::RuntimeUnavailable)?;
+        options
+            .network
+            .identity
+            .validate()
+            .map_err(BrowserOpenError::Identity)?;
         let network = NetworkContext::new(options.network);
         let identity = Arc::new(network.identity());
         let data_home = match options.data_home {
@@ -424,6 +433,9 @@ fn stopped() -> io::Error {
 /// Failure while opening a [`Browser`].
 #[derive(Debug)]
 pub enum BrowserOpenError {
+    /// The configured identity is not a valid set of HTTP field values, so no
+    /// request or page could report it consistently.
+    Identity(net::HeaderError),
     /// The data home or profile could not be created, locked, read, or
     /// quarantined.
     Profile(io::Error),
@@ -434,6 +446,7 @@ pub enum BrowserOpenError {
 impl fmt::Display for BrowserOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Identity(error) => write!(formatter, "identity is not usable: {error}"),
             Self::Profile(error) => write!(formatter, "profile failed: {error}"),
             Self::RuntimeUnavailable => formatter.write_str("browser runtime unavailable"),
         }
@@ -443,6 +456,7 @@ impl fmt::Display for BrowserOpenError {
 impl std::error::Error for BrowserOpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Identity(error) => Some(error),
             Self::Profile(error) => Some(error),
             Self::RuntimeUnavailable => None,
         }
@@ -452,6 +466,10 @@ impl std::error::Error for BrowserOpenError {
 impl From<BrowserOpenError> for io::Error {
     fn from(error: BrowserOpenError) -> Self {
         match error {
+            BrowserOpenError::Identity(error) => Self::new(
+                io::ErrorKind::InvalidInput,
+                format!("identity is not usable: {error}"),
+            ),
             BrowserOpenError::Profile(error) => {
                 Self::new(error.kind(), format!("profile failed: {error}"))
             }
@@ -485,3 +503,46 @@ impl fmt::Display for BrowserError {
 }
 
 impl std::error::Error for BrowserError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{Browser, BrowserOpenError, BrowserOptions};
+    use std::path::PathBuf;
+
+    /// A brand that is not a field value is refused before the profile is
+    /// touched, so no request, page, or CDP answer can ever report half of an
+    /// identity (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+    #[tokio::test]
+    async fn an_unusable_identity_fails_before_the_profile_is_opened() {
+        let data_home = std::env::temp_dir().join(format!(
+            "tinybrowser-identity-rejected-{}",
+            std::process::id()
+        ));
+        let options = BrowserOptions {
+            data_home: Some(PathBuf::from(&data_home)),
+            network: net::AgentOptions {
+                identity: net::Identity {
+                    brands: vec![net::Brand {
+                        brand: "bad\nbrand".to_owned(),
+                        version: "1".to_owned(),
+                    }],
+                    ..net::Identity::default()
+                },
+                ..net::AgentOptions::default()
+            },
+            ..BrowserOptions::default()
+        };
+        let error = match Browser::new(options) {
+            Ok(browser) => {
+                browser.close().await.expect("close");
+                panic!("an unusable identity must not open a browser");
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(error, BrowserOpenError::Identity(_)), "{error:?}");
+        assert!(
+            !data_home.exists(),
+            "the identity is checked before the profile is created"
+        );
+    }
+}

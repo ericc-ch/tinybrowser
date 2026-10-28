@@ -20,7 +20,9 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
     let version = client
         .call("Browser.getVersion", &json!({}), None)
         .expect("version");
-    assert_eq!(version["product"], json!("Chrome/152.0.7977.82"));
+    let identity = net::Identity::default();
+    assert_eq!(version["product"], json!(identity.product));
+    assert_eq!(version["userAgent"], json!(identity.user_agent.as_str()));
 
     let created = client
         .call("Target.createTarget", &json!({"url": "about:blank"}), None)
@@ -120,7 +122,9 @@ fn browser_session_routes_commands_and_events() {
     let version = client
         .call("Browser.getVersion", &json!({}), Some(&session))
         .expect("browser session command");
-    assert_eq!(version["product"], json!("Chrome/152.0.7977.82"));
+    let identity = net::Identity::default();
+    assert_eq!(version["product"], json!(identity.product));
+    assert_eq!(version["userAgent"], json!(identity.user_agent.as_str()));
 
     client
         .call(
@@ -329,7 +333,7 @@ fn json_discovery_page_socket_close_target_and_browser_close() {
     let (slash_status, _) = http_get(addr, "/json/version/");
     assert_eq!(slash_status, 200, "legacy clients append a trailing slash");
     let version: serde_json::Value = serde_json::from_str(&version).expect("version json");
-    assert_eq!(version["Browser"], json!("Chrome/152.0.7977.82"));
+    assert_eq!(version["Browser"], json!(net::Identity::default().product));
     assert_eq!(
         version["webSocketDebuggerUrl"],
         json!(format!("ws://{addr}/devtools/browser"))

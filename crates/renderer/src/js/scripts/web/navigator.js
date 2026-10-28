@@ -6,11 +6,14 @@
   const uaFullVersionList = Object.freeze(identity.fullVersionList.map((entry) => Object.freeze(entry)));
   const uaMobile = identity.mobile;
   const uaPlatform = identity.platform;
-  // The full version is the Chromium brand's: `uaFullVersion` reports the
-  // engine version, not the embedder's
+  // `uaFullVersion` reports the engine version, so the Chromium brand wins; an
+  // identity without one falls back to its last brand rather than to nothing
   // https://wicg.github.io/ua-client-hints/#getHighEntropyValues
   const chromium = uaFullVersionList.find((entry) => entry.brand === 'Chromium');
-  const uaFullVersion = chromium === undefined ? '' : chromium.version;
+  const lastFullVersion = uaFullVersionList[uaFullVersionList.length - 1];
+  const uaFullVersion = chromium !== undefined
+    ? chromium.version
+    : (lastFullVersion === undefined ? '' : lastFullVersion.version);
   const uaDataKey = host.slots('NavigatorUAData');
   class NavigatorUAData {
     constructor() {
@@ -49,14 +52,14 @@
         names.push(String(step.value));
       }
       const values = { brands: uaBrands, mobile: uaMobile, platform: uaPlatform };
-      if (names.includes('architecture')) values.architecture = 'x86';
-      if (names.includes('bitness')) values.bitness = '64';
-      if (names.includes('formFactors')) values.formFactors = Object.freeze(['Desktop']);
+      if (names.includes('architecture')) values.architecture = identity.architecture;
+      if (names.includes('bitness')) values.bitness = identity.bitness;
+      if (names.includes('formFactors')) values.formFactors = Object.freeze(identity.formFactors);
       if (names.includes('fullVersionList')) values.fullVersionList = uaFullVersionList;
-      if (names.includes('model')) values.model = '';
-      if (names.includes('platformVersion')) values.platformVersion = '';
+      if (names.includes('model')) values.model = identity.model;
+      if (names.includes('platformVersion')) values.platformVersion = identity.platformVersion;
       if (names.includes('uaFullVersion')) values.uaFullVersion = uaFullVersion;
-      if (names.includes('wow64')) values.wow64 = false;
+      if (names.includes('wow64')) values.wow64 = identity.wow64;
       return Promise.resolve(values);
     }
     // https://wicg.github.io/ua-client-hints/#h-tojson
@@ -101,7 +104,7 @@
     get productSub() { return '20030107'; }
     get vendor() { return 'Google Inc.'; }
     get vendorSub() { return ''; }
-    get platform() { return 'Linux x86_64'; }
+    get platform() { return identity.navigatorPlatform; }
     get language() { return 'en-US'; }
     get languages() { return Object.freeze(['en-US', 'en']); }
     get onLine() { return true; }

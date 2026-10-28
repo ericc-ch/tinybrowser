@@ -162,11 +162,12 @@ fn read_messages(
             match message {
                 // The handshake is the first command the session sees, so it
                 // holds the identity every later `Assign` builds its engine
-                // with.
+                // with. Losing it would leave every engine on the default, so a
+                // full lane stops the renderer instead of dropping the frame.
                 Frame::Notify(HostNotice::Hello { identity }) => {
                     greeted = true;
                     if command_tx
-                        .try_send_lossy(Frame::Notify(HostNotice::Hello { identity }))
+                        .try_send(Frame::Notify(HostNotice::Hello { identity }))
                         .is_err()
                     {
                         break;

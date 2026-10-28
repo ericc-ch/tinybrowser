@@ -603,7 +603,14 @@ fn identity(ctx: Ctx<'_>) -> Result<Object<'_>> {
     let object = Object::new(ctx.clone())?;
     object.set("userAgent", identity.user_agent.as_str().to_owned())?;
     object.set("platform", identity.platform)?;
+    object.set("platformVersion", identity.platform_version)?;
+    object.set("architecture", identity.architecture)?;
+    object.set("model", identity.model)?;
     object.set("mobile", identity.mobile)?;
+    object.set("bitness", identity.bitness)?;
+    object.set("wow64", identity.wow64)?;
+    object.set("formFactors", identity.form_factors)?;
+    object.set("navigatorPlatform", identity.navigator_platform)?;
     object.set("brands", brand_array(&ctx, &identity.brands)?)?;
     object.set(
         "fullVersionList",
@@ -2316,7 +2323,7 @@ mod realm_tests {
     #[test]
     fn embedded_yield_is_an_immediate_step() {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
-        let mut renderer = crate::EmbeddedRenderer::new(services);
+        let mut renderer = crate::EmbeddedRenderer::new(services, net::Identity::default());
         let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
         renderer
             .mount_for_test(&crate::protocol::Mount {

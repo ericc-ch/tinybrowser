@@ -1138,3 +1138,44 @@ async fn a_no_cors_manual_request_is_refused_before_sending() {
     assert_eq!(server.requests().len(), 0);
     server.assert_clean();
 }
+
+/// A hop the user agent makes to a potentially trustworthy URL carries the
+/// identity's `User-Agent` and its client hints. Loopback is potentially
+/// trustworthy, so this is the https path without a TLS fixture
+/// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).
+#[tokio::test]
+async fn a_trustworthy_hop_carries_the_identity_and_its_hints() {
+    let server = scripted([canned_ok(&[], b"")]);
+    let identity = net::Identity {
+        user_agent: net::UserAgent::parse("probe/1").expect("user agent"),
+        ..net::Identity::default()
+    };
+    let agent = Agent::new(AgentOptions {
+        identity: identity.clone(),
+        ..AgentOptions::default()
+    });
+    agent
+        .send(Request::new(Method::GET, server.url("/")))
+        .await
+        .expect("request");
+    let request = &server.requests()[0];
+    assert_eq!(
+        request.header("user-agent"),
+        Some("probe/1"),
+        "the header names the configured identity"
+    );
+    assert_eq!(
+        request.header("sec-ch-ua"),
+        Some(identity.sec_ch_ua().as_str()),
+        "the low-entropy brands agree with the user agent"
+    );
+    assert_eq!(
+        request.header("sec-ch-ua-mobile"),
+        Some(identity.sec_ch_ua_mobile())
+    );
+    assert_eq!(
+        request.header("sec-ch-ua-platform"),
+        Some(identity.sec_ch_ua_platform().as_str())
+    );
+    server.assert_clean();
+}
