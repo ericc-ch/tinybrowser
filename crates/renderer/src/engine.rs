@@ -2244,8 +2244,9 @@ mod messaging_tests {
         // A target origin that names a different document is checked when the
         // task runs, so the message never reaches this realm.
         engine.receive_remote_window_message(crate::protocol::PostedMessage {
-            origin: "https://other.test".to_owned(),
-            target_origin: "https://different.test".to_owned(),
+            origin: crate::protocol::SerializedOrigin::parse("https://other.test").expect("origin"),
+            target_origin: crate::protocol::TargetOrigin::parse("https://different.test", None)
+                .expect("target"),
             payload: payload.clone(),
         });
         let _ready = engine.drain_ready();
@@ -2259,8 +2260,9 @@ mod messaging_tests {
         // The matching target origin delivers, and `event.origin` is the
         // sender's origin at post time, not an empty string.
         engine.receive_remote_window_message(crate::protocol::PostedMessage {
-            origin: "https://other.test".to_owned(),
-            target_origin: "https://example.test".to_owned(),
+            origin: crate::protocol::SerializedOrigin::parse("https://other.test").expect("origin"),
+            target_origin: crate::protocol::TargetOrigin::parse("https://example.test", None)
+                .expect("target"),
             payload,
         });
         let _ready = engine.drain_ready();

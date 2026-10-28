@@ -649,19 +649,29 @@ impl StorageHost for WasmServices {
 }
 
 impl BrowsingContextHost for WasmServices {
-    fn window_open(&self, _url: &str, _name: &str, _opener: renderer::OpenerPolicy) -> Option<u64> {
+    fn window_open(
+        &self,
+        _url: &str,
+        _name: &str,
+        _opener: renderer::OpenerPolicy,
+    ) -> Option<renderer::WindowId> {
         None
     }
 
-    fn window_close(&self, _tab: u64) {}
+    fn window_close(&self, _window: renderer::WindowId) {}
 
-    fn window_opener(&self) -> Option<u64> {
+    fn window_opener(&self) -> Option<renderer::WindowId> {
         None
     }
 
-    fn window_post_message(&self, _tab: u64, _message: renderer::PostedMessage) {}
+    fn window_post_message(&self, _window: renderer::WindowId, _message: renderer::PostedMessage) {}
 
-    fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
+    fn remote_session_get(
+        &self,
+        _window: renderer::WindowId,
+        _origin: &str,
+        _key: &str,
+    ) -> Option<String> {
         None
     }
 }

@@ -46,8 +46,8 @@ pub use protocol::{
     HistoryHandling, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
     OpenerPolicy, PostedMessage, ReferrerRequest, RendererEvent, RequestCache, RequestPolicy,
     ResourceLimit, ResponseBody, ResponseHead, STORAGE_QUOTA_BYTES, ScreenshotClip,
-    ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError, StorageHost,
-    StorageKind, StreamId, TabError, TimerId,
+    ScreenshotRequest, ScriptFailure, ScriptSource, SerializedOrigin, StorageChange, StorageError,
+    StorageHost, StorageKind, StreamId, TabError, TargetOrigin, TimerId, WindowId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

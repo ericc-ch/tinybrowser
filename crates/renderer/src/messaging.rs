@@ -14,7 +14,6 @@ use std::rc::Rc;
 
 use crate::dom::tree::NodeId;
 use crate::protocol::FrameId;
-use url::Url;
 
 /// Handle every realm holds to the renderer-process shared state.
 pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
@@ -648,41 +647,6 @@ impl PortTable {
     }
 }
 
-/// The intended target origin one posted message carries, resolved at the
-/// post-time boundary: `*` accepts any document, and an exact origin compares
-/// with origin identity, so two opaque origins (`"null"` serialized) never
-/// match each other
-/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TargetOrigin {
-    Any,
-    Exact(url::Origin),
-}
-
-impl TargetOrigin {
-    /// Resolves the sender's target-origin argument. `sender` is the posting
-    /// document's origin when the caller knows its identity; `/` names it
-    /// exactly. A serialized remote sender only keeps its URL, so an opaque
-    /// sender's `/` cannot be reconstructed and the message is dropped before
-    /// it reaches another document
-    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-    pub(crate) fn parse(spec: &str, sender: Option<&url::Origin>) -> Option<Self> {
-        match spec {
-            "*" => Some(Self::Any),
-            "/" => sender.map(|origin| Self::Exact(origin.clone())),
-            other => Url::parse(other).ok().map(|url| Self::Exact(url.origin())),
-        }
-    }
-
-    /// Whether a document with `origin` may receive the message.
-    pub(crate) fn admits(&self, origin: &url::Origin) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Exact(target) => target == origin,
-        }
-    }
-}
-
 /// Identity of one document instance in a frame. A navigation replaces the
 /// instance, so a task or delivery stamped with an older id belongs to a
 /// document whose tasks are no longer runnable
@@ -707,7 +671,7 @@ pub(crate) enum Delivery {
         /// The sender's origin at post time, serialized.
         origin: String,
         /// The target origin the sender asked for.
-        target_origin: TargetOrigin,
+        target_origin: crate::protocol::TargetOrigin,
         payload: String,
         /// Transferred endpoints, in transfer-list order.
         ports: Vec<u64>,

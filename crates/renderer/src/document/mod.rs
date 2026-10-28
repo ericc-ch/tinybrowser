@@ -21,7 +21,8 @@ use crate::js::{
     DocumentStreamCommand, FrameNavigation, FrameRuntime, JsFetchId, JsRuntimeHandle, PageTimerId,
     PolicyContainer, World,
 };
-use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
+use crate::messaging::{DocumentId, SharedHandle};
+use crate::protocol::TargetOrigin;
 use crate::protocol::{
     BrowserEvent, BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent,
     ResponseHead, ScriptFailure, TabError, TimerId,
@@ -1643,18 +1644,14 @@ impl Document {
         // The intended target origin is checked when the task runs, against the
         // document active then
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-        let sender = Url::parse(&message.origin).ok().map(|url| url.origin());
-        let Some(target_origin) = TargetOrigin::parse(&message.target_origin, sender.as_ref())
-        else {
-            return;
-        };
-        if !target_origin.admits(&self.world.borrow().origin) {
+        if !message.target_origin.admits(&self.world.borrow().origin) {
             return;
         }
         if !self.ensure_js_ok() {
             return;
         }
-        self.fire_js(|js| js.deliver_remote_message(&message.origin, &message.payload));
+        let origin = message.origin.to_string();
+        self.fire_js(|js| js.deliver_remote_message(&origin, &message.payload));
         self.adopt_js_work();
     }
 

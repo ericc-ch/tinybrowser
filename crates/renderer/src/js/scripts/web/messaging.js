@@ -784,14 +784,10 @@ host.__tbFrameProxy = __tbFrameProxy;
 // for the host to resolve with origin identity intact; anything else but `*`
 // must parse as a URL, throwing `SyntaxError` here before anything is queued.
 function __tbNormalizeTargetOrigin(targetOrigin) {
-  const checked = targetOrigin === undefined ? '/' : String(targetOrigin);
-  if (checked === '/' || checked === '*') return checked;
-  try {
-    new globalThis.URL(checked);
-  } catch (error) {
-    throw new globalThis.DOMException('Invalid target origin', 'SyntaxError');
-  }
-  return checked;
+  // The engine parses the target origin, so this shim only fills the IDL
+  // default; an unparseable value throws `SyntaxError` there
+  // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+  return targetOrigin === undefined ? '/' : String(targetOrigin);
 }
 function __tbPostMessage(targetFrame, argumentCount, message, targetOrigin, transfer) {
   if (argumentCount === 0) {

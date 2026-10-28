@@ -46,6 +46,28 @@ impl FrameId {
     }
 }
 
+/// Browser-process identity of one top-level browsing context, as a renderer
+/// holds it through a `WindowProxy`.
+///
+/// The browser mints it when it opens a tab; a renderer only ever echoes a
+/// value it received, so it cannot address a tab it was not given.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    /// Constructs a window id from a protocol integer.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Stable numeric identity for protocol messages.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Selects the evaluation environment at the browser-to-renderer boundary.
 /// Page sources run globally. Browser expressions receive the private bridge
 /// and must never contain interpolated author code.
@@ -1188,20 +1210,20 @@ impl OpenerPolicy {
 pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
     /// to open a window. `url` is absolute, or empty for `about:blank`.
-    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<u64>;
+    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<WindowId>;
 
     /// `window.close()` on a window this realm opened.
-    fn window_close(&self, tab: u64);
+    fn window_close(&self, window: WindowId);
 
     /// `window.opener` for this realm's tab; `None` when there is none.
-    fn window_opener(&self) -> Option<u64>;
+    fn window_opener(&self) -> Option<WindowId>;
 
     /// `postMessage` to a window this realm opened, encoded by the caller's
     /// realm. The target resolves the message when the delivery task runs.
-    fn window_post_message(&self, tab: u64, message: PostedMessage);
+    fn window_post_message(&self, window: WindowId, message: PostedMessage);
 
     /// Reads one key from another tab's same-origin session area.
-    fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;
+    fn remote_session_get(&self, window: WindowId, origin: &str, key: &str) -> Option<String>;
 }
 
 /// Cross-context messaging effects the page engine asks its host to perform.
@@ -1210,15 +1232,137 @@ pub trait MessagingHost: Send + Sync + 'static {
     fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64);
 }
 
+/// An origin as a cross-tab message carries it: a tuple origin, or the opaque
+/// `"null"` serialization that every opaque document shares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SerializedOrigin {
+    /// An opaque origin.
+    Opaque,
+    /// A tuple origin: scheme, host, and port.
+    Tuple(url::Origin),
+}
+
+impl SerializedOrigin {
+    /// Reads one serialized origin: `"null"`, or a URL whose origin is the
+    /// value.
+    #[must_use]
+    pub fn parse(spec: &str) -> Option<Self> {
+        if spec == "null" {
+            return Some(Self::Opaque);
+        }
+        Url::parse(spec).ok().map(|url| Self::Tuple(url.origin()))
+    }
+
+    /// The tuple origin, or `None` for an opaque one.
+    #[must_use]
+    pub fn tuple(self) -> Option<url::Origin> {
+        match self {
+            Self::Opaque => None,
+            Self::Tuple(origin) => Some(origin),
+        }
+    }
+}
+
+impl From<&url::Origin> for SerializedOrigin {
+    fn from(origin: &url::Origin) -> Self {
+        match origin {
+            url::Origin::Opaque(_) => Self::Opaque,
+            url::Origin::Tuple(..) => Self::Tuple(origin.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for SerializedOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opaque => formatter.write_str("null"),
+            Self::Tuple(origin) => formatter.write_str(&origin.ascii_serialization()),
+        }
+    }
+}
+
+impl Serialize for SerializedOrigin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for SerializedOrigin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| serde::de::Error::custom("invalid origin"))
+    }
+}
+
+/// The intended target origin one posted message carries, resolved at the
+/// post-time boundary: `*` accepts any document, and an exact origin compares
+/// with origin identity, so two opaque origins (`"null"` serialized) never
+/// match each other
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetOrigin {
+    /// `*`: any document may receive the message.
+    Any,
+    /// Only a document on this origin may receive it.
+    Exact(url::Origin),
+}
+
+impl TargetOrigin {
+    /// Resolves the sender's target-origin argument. `sender` is the posting
+    /// document's origin when the caller knows its identity; `/` names it
+    /// exactly
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+    #[must_use]
+    pub fn parse(spec: &str, sender: Option<&url::Origin>) -> Option<Self> {
+        match spec {
+            "*" => Some(Self::Any),
+            "/" => sender.map(|origin| Self::Exact(origin.clone())),
+            other => Url::parse(other).ok().map(|url| Self::Exact(url.origin())),
+        }
+    }
+
+    /// Whether a document with `origin` may receive the message.
+    #[must_use]
+    pub fn admits(&self, origin: &url::Origin) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(target) => target == origin,
+        }
+    }
+}
+
+impl Serialize for TargetOrigin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Any => serializer.serialize_str("*"),
+            Self::Exact(origin) => serializer.serialize_str(&origin.ascii_serialization()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetOrigin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "*" => Ok(Self::Any),
+            other => match SerializedOrigin::parse(other) {
+                Some(SerializedOrigin::Tuple(origin)) => Ok(Self::Exact(origin)),
+                _ => Err(serde::de::Error::custom("invalid target origin")),
+            },
+        }
+    }
+}
+
 /// One cross-context post, as it travels from the posting realm to the target
 /// document. The browser authorizes `origin` before forwarding the rest
 /// unchanged, so every hop carries the same value instead of rebuilding it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PostedMessage {
-    /// The sender's serialized origin at post time.
-    pub origin: String,
-    /// The normalized target origin: `*`, `/`, or a serialized origin.
-    pub target_origin: String,
+    /// The sender's origin at post time.
+    pub origin: SerializedOrigin,
+    /// The intended target, resolved where `/` still had the sender's origin
+    /// identity.
+    pub target_origin: TargetOrigin,
     /// `__tbEncode` payload from the sender's realm.
     pub payload: String,
 }

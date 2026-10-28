@@ -12,7 +12,8 @@ use rquickjs::{Ctx, Object, Persistent, Result, Value};
 
 use crate::js::world::World;
 
-use crate::messaging::{Delivery, MAX_FRAMES, PAYLOAD_VERSION, Shared, TargetOrigin};
+use crate::messaging::{Delivery, MAX_FRAMES, PAYLOAD_VERSION, Shared};
+use crate::protocol::TargetOrigin;
 
 use crate::protocol::FrameId;
 
@@ -109,12 +110,16 @@ fn post_window_message(
     if !shared.borrow().ports.all_in_transit_from(&ports, source) {
         return Ok(());
     }
-    // The shim checked the syntax and threw `SyntaxError` before detaching;
     // `/` keeps the sender's origin identity, which a serialized `"null"`
-    // cannot carry.
+    // cannot carry, so the target is resolved here
+    // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
     let Some(target_origin) = TargetOrigin::parse(&target_origin, Some(&origin_identity)) else {
         shared.borrow_mut().forget_endpoints(&ports);
-        return Ok(());
+        return Err(crate::js::bindings::throw_dom(
+            &ctx,
+            "SyntaxError",
+            "Invalid target origin",
+        ));
     };
     // The task is bound to the target window's document as of post time
     // (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>).

@@ -1015,6 +1015,7 @@ impl JsRealm {
             Self::install_crypto_host_functions(&ctx)?;
             install_storage_host_functions(&ctx, &world)?;
             install_window_host_functions(&ctx, &world)?;
+            install_window_messaging_functions(&ctx, &world)?;
             install_history_host_functions(&ctx, &world)?;
             url_parts::install(&ctx)?;
             encoding::install(&ctx)?;
@@ -1409,6 +1410,7 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                     .runtime
                     .services
                     .window_open(&spec, &name, opener)
+                    .map(|window| crate::js::js_number(window.get()))
             })
         }),
     )?;
@@ -1416,43 +1418,92 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     let window_close = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowClose",
-        Func::from(move |tab: u64| {
-            window_close.borrow().runtime.services.window_close(tab);
+        Func::from(move |window: u64| {
+            window_close
+                .borrow()
+                .runtime
+                .services
+                .window_close(crate::protocol::WindowId::new(window));
         }),
     )?;
 
     let opener = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowOpener",
-        Func::from(move || opener.borrow().runtime.services.window_opener()),
+        Func::from(move || {
+            opener
+                .borrow()
+                .runtime
+                .services
+                .window_opener()
+                .map(|window| crate::js::js_number(window.get()))
+        }),
     )?;
 
+    install_auxiliary_host_functions(ctx, world)?;
+    Ok(())
+}
+
+/// The hooks a `WindowProxy` uses to exchange messages: a cross-tab
+/// `postMessage`, a remote same-origin `sessionStorage` read, and a
+/// `BroadcastChannel` post.
+fn install_window_messaging_functions(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+) -> Result<(), JsError> {
     let post_message = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowPostMessage",
-        Func::from(move |tab: u64, target_origin: String, payload: String| {
-            let world = post_message.borrow();
-            world.runtime.services.window_post_message(
-                tab,
-                crate::protocol::PostedMessage {
-                    origin: world.origin_string(),
-                    target_origin,
-                    payload,
-                },
-            );
-        }),
+        Func::from(
+            move |ctx: Ctx<'_>, window: u64, target_origin: String, payload: String| {
+                let world = post_message.borrow();
+                // The sender resolves the target, because `/` names the
+                // sender's own origin identity, which no serialized value can
+                // carry
+                // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+                let Some(target) =
+                    crate::protocol::TargetOrigin::parse(&target_origin, Some(&world.origin))
+                else {
+                    return Err(crate::js::bindings::throw_dom(
+                        &ctx,
+                        "SyntaxError",
+                        "Invalid target origin",
+                    ));
+                };
+                if target != crate::protocol::TargetOrigin::Any
+                    && matches!(
+                        &target,
+                        crate::protocol::TargetOrigin::Exact(url::Origin::Opaque(_))
+                    )
+                {
+                    // An opaque origin names no document, so a cross-tab post
+                    // with an exact opaque target can never be delivered.
+                    return Ok(());
+                }
+                world.runtime.services.window_post_message(
+                    crate::protocol::WindowId::new(window),
+                    crate::protocol::PostedMessage {
+                        origin: crate::protocol::SerializedOrigin::from(&world.origin),
+                        target_origin: target,
+                        payload,
+                    },
+                );
+                Ok(())
+            },
+        ),
     )?;
 
     let remote_session = world.clone();
     bridge::object(ctx)?.set(
         "__tbRemoteSessionGet",
-        Func::from(move |tab: u64, key: String| {
+        Func::from(move |window: u64, key: String| {
             let world = remote_session.borrow();
             world.storage_origin().and_then(|origin| {
-                world
-                    .runtime
-                    .services
-                    .remote_session_get(tab, &origin, &key)
+                world.runtime.services.remote_session_get(
+                    crate::protocol::WindowId::new(window),
+                    &origin,
+                    &key,
+                )
             })
         }),
     )?;
@@ -1475,7 +1526,6 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
             },
         ),
     )?;
-    install_auxiliary_host_functions(ctx, world)?;
     Ok(())
 }
 

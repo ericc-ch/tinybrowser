@@ -824,13 +824,13 @@ async fn route_window_call(
                     })
                     .await
                     .ok()
-                    .map(TabId::get),
+                    .map(|tab| renderer::WindowId::new(tab.get())),
                 None => None,
             };
             send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
         }
-        BrowsingContextCall::WindowClose { tab } => {
-            let target = TabId::new(tab);
+        BrowsingContextCall::WindowClose { window } => {
+            let target = TabId::new(window.get());
             // A page may close itself or a tab it opened; anything else is a
             // forged target.
             if close_related(context, assignment, target) {
@@ -839,10 +839,13 @@ async fn route_window_call(
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         BrowsingContextCall::Opener => {
-            let opener = context.tabs.opener(assignment.tab).map(TabId::get);
+            let opener = context
+                .tabs
+                .opener(assignment.tab)
+                .map(|tab| renderer::WindowId::new(tab.get()));
             send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
-        BrowsingContextCall::WindowMessage { tab, message } => {
+        BrowsingContextCall::WindowMessage { window, message } => {
             // A page can only hold a `WindowProxy` for a related window: its
             // own, its opener, or a tab it opened. An unrelated target is a
             // forged call and is ignored.
@@ -851,10 +854,10 @@ async fn route_window_call(
             // site lock. An opaque origin has no authority to claim: its
             // serialized `null` passes through, and no tuple-origin document
             // admits it.
-            if message.origin != "null" && assignment.site.authorize(&message.origin).is_none() {
+            if !assignment.site.allows_serialized_origin(&message.origin) {
                 return Err(RendererViolation);
             }
-            let target = TabId::new(tab);
+            let target = TabId::new(window.get());
             if message_related(context, assignment, target) {
                 // Enqueue on the target's mailbox and return: the spec's
                 // `postMessage` is asynchronous, and waiting here would let a
@@ -865,11 +868,15 @@ async fn route_window_call(
             }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
-        BrowsingContextCall::RemoteSessionGet { tab, origin, key } => {
+        BrowsingContextCall::RemoteSessionGet {
+            window,
+            origin,
+            key,
+        } => {
             if !assignment.authorize_origin(&origin) {
                 return Err(RendererViolation);
             }
-            let target = TabId::new(tab);
+            let target = TabId::new(window.get());
             let related = target == assignment.tab
                 || context.tabs.opener(target) == Some(assignment.tab)
                 || context.tabs.opener(assignment.tab) == Some(target);
