@@ -27,6 +27,14 @@ pub(crate) struct QueuedEntry {
     pub(crate) delay: Option<LoadDelayGuard>,
 }
 
+/// What one adoption pass found: completions whose dial is still filed, and
+/// completions that outlived their cancellation.
+#[derive(Default)]
+pub(crate) struct AdoptedDials {
+    pub(crate) settled: Vec<(DialId, Result<CompletedDial, DialContext>)>,
+    pub(crate) abandoned: Vec<Result<CompletedDial, DialContext>>,
+}
+
 /// One started dial and the resources it releases on settle.
 pub(crate) struct InFlightDial {
     context: DialContext,
@@ -125,15 +133,19 @@ impl DialLedger {
     /// Collects finished dials in completion order (oldest first). The
     /// `InFlightDial` stays filed, so its guard still delays `load` until the
     /// task that handles the completion actually runs.
-    pub(crate) fn adopt(&mut self) -> Vec<(DialId, Result<CompletedDial, DialContext>)> {
-        let mut completed = Vec::new();
-        while let Ok((id, outcome)) = self.rx.try_recv() {
+    pub(crate) fn adopt(&mut self) -> AdoptedDials {
+        let mut adopted = AdoptedDials::default();
+        while let Ok((id, completed)) = self.rx.try_recv() {
             if !self.in_flight.contains_key(&id) {
+                // The dial was cancelled after it finished, so no task will
+                // read this response
+                // (<https://fetch.spec.whatwg.org/#concept-response-body>).
+                adopted.abandoned.push(completed);
                 continue;
             }
-            completed.push((id, outcome));
+            adopted.settled.push((id, completed));
         }
-        completed
+        adopted
     }
 
     /// Settles the dial whose completion task is running: the entry drops

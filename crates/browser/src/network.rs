@@ -404,6 +404,11 @@ fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: RequestCache
     request.kind == DialKind::JsFetch
         && !has_page_conditional(request)
         && request.method == net::Method::GET
+        // A body that failed to decode has nothing to reuse. Storing it would
+        // replay the failure on every hit and every 304 merge, and a
+        // transient truncation would become permanent
+        // (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+        && !matches!(outcome.body, ResponseBody::Undecodable)
         && (200..300).contains(&outcome.status)
         // An opaque response has no readable body and cannot satisfy a later
         // CORS request, so keeping it only creates a response-type mismatch.
@@ -1736,6 +1741,18 @@ mod tests {
             "the next dial reads its body"
         );
         server.abort();
+    }
+
+    #[test]
+    fn an_undecodable_body_is_not_stored() {
+        let request = js_fetch(net::cors::RequestMode::SameOrigin, "http://a.test/data");
+        let mut outcome = cached(net::cors::ResponseType::Basic).outcome;
+        assert!(should_store(&request, &outcome, RequestCache::Default));
+        outcome.body = ResponseBody::Undecodable;
+        assert!(
+            !should_store(&request, &outcome, RequestCache::Default),
+            "a decode failure has nothing to reuse, so a hit would replay it"
+        );
     }
 
     #[test]
