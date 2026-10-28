@@ -144,12 +144,20 @@ pub struct Identity {
 
 impl Default for Identity {
     fn default() -> Self {
+        // The brand versions are the full version's major, so a build bump is
+        // one edit. The reduced UA repeats the major because it is a `const`
+        // string; `the_default_identity_names_one_build_everywhere` holds the
+        // two together.
+        let major = DEFAULT_FULL_VERSION
+            .split('.')
+            .next()
+            .unwrap_or(DEFAULT_FULL_VERSION);
         Self {
             user_agent: DEFAULT_IDENTITY_USER_AGENT,
             brands: vec![
                 Brand::new("Not_A Brand", "99"),
-                Brand::new("Chromium", "152"),
-                Brand::new("Google Chrome", "152"),
+                Brand::new("Chromium", major),
+                Brand::new("Google Chrome", major),
             ],
             full_version_list: vec![
                 Brand::new("Not_A Brand", "99.0.0.0"),
