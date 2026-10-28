@@ -129,15 +129,6 @@ impl fmt::Display for TlsCaError {
     }
 }
 
-impl std::error::Error for TlsCaError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Read(error) => Some(error),
-            Self::Parse(error) => Some(error),
-        }
-    }
-}
-
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -175,19 +166,6 @@ impl fmt::Display for CliError {
             }
             Self::MissingPort => formatter
                 .write_str("the following required arguments were not provided:\n  --port <PORT>"),
-        }
-    }
-}
-
-impl std::error::Error for CliError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidProfile(error) => Some(error),
-            Self::InvalidLogLevel(error) => Some(error),
-            Self::InvalidResolve(error) => Some(error),
-            Self::InvalidProxy(error) => Some(error),
-            Self::TlsCa { source, .. } => Some(source),
-            _ => None,
         }
     }
 }
@@ -246,6 +224,9 @@ enum Partial {
         port: Option<u16>,
         profile: Option<Profile>,
         network: Box<AgentOptions>,
+        /// `--tls-ca` paths, read in `finish` so `--help` and the missing-port
+        /// error keep their precedence over a file that cannot be opened.
+        tls_ca: Vec<PathBuf>,
     },
 }
 
@@ -402,8 +383,8 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             "tls-ca" => {
                 let raw = self.value("tls-ca", "<PATH>", inline)?;
                 match &mut self.command {
-                    Some(Partial::Webdriver { network, .. }) => {
-                        network.tls_cas.push(read_ca(&raw)?);
+                    Some(Partial::Webdriver { tls_ca, .. }) => {
+                        tls_ca.push(PathBuf::from(raw));
                         Ok(None)
                     }
                     _ => Err(unexpected(name)),
@@ -461,6 +442,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                     port: None,
                     profile: None,
                     network: Box::new(AgentOptions::default()),
+                    tls_ca: Vec::new(),
                 });
                 Ok(None)
             }
@@ -513,9 +495,13 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             Some(Partial::Webdriver {
                 port,
                 profile,
-                network,
+                mut network,
+                tls_ca,
             }) => {
                 let port = port.ok_or(CliError::MissingPort)?;
+                for path in tls_ca {
+                    network.tls_cas.push(read_ca(&path)?);
+                }
                 Some(Command::Webdriver {
                     port,
                     profile: profile.unwrap_or_default(),
@@ -540,14 +526,13 @@ fn unexpected(name: &str) -> CliError {
 ///
 /// The scanner is the inbound adapter, so the certificate is parsed before the
 /// browser opens and a bad file is a usage error, not a dial-time failure.
-fn read_ca(raw: &str) -> Result<TrustedCa, CliError> {
-    let path = PathBuf::from(raw);
-    let pem = std::fs::read(&path).map_err(|source| CliError::TlsCa {
-        path: path.clone(),
+fn read_ca(path: &std::path::Path) -> Result<TrustedCa, CliError> {
+    let pem = std::fs::read(path).map_err(|source| CliError::TlsCa {
+        path: path.to_owned(),
         source: TlsCaError::Read(source),
     })?;
     TrustedCa::from_pem(&pem).map_err(|source| CliError::TlsCa {
-        path: path.clone(),
+        path: path.to_owned(),
         source: TlsCaError::Parse(source),
     })
 }

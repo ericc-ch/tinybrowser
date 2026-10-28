@@ -51,24 +51,54 @@ pub(crate) trait Enumerated: Copy + 'static {
     }
 }
 
-/// Enumerated reflection: the canonical keyword, `missing` when the attribute
-/// is absent, or `invalid` when it names no keyword.
+/// When an enumerated attribute names no keyword: what its getter answers with
+/// the attribute absent, and with the attribute present but invalid.
 ///
-/// The defaults are enum values, not spellings: a typo cannot compile, and the
-/// empty string is the spec's "no state" where a getter has one. Every answer
-/// is a `keyword()` or that empty string, so the caller gets a static string
-/// instead of an allocation per read
+/// The defaults are enum values, not spellings, so a typo cannot compile; the
+/// two named fields make an exchange of the spec's missing-value default for
+/// its invalid-value default impossible to write by accident.
+/// `None` is the spec's "no state", which a getter reports as the empty string
 /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
+#[derive(Clone, Copy)]
+pub(crate) struct Defaults<T> {
+    /// The missing-value default.
+    pub(crate) missing: Option<T>,
+    /// The invalid-value default.
+    pub(crate) invalid: Option<T>,
+}
+
+impl<T> Defaults<T> {
+    /// No default for either state. A `const` so getters that answer the empty
+    /// string need not name the enum twice.
+    pub(crate) const NONE: Self = Self {
+        missing: None,
+        invalid: None,
+    };
+
+    /// The same default for both states.
+    pub(crate) const fn both(value: T) -> Self
+    where
+        T: Copy,
+    {
+        Self {
+            missing: Some(value),
+            invalid: Some(value),
+        }
+    }
+}
+
+/// Enumerated reflection: the canonical keyword, the missing-value default
+/// when the attribute is absent, or the invalid-value default when it names no
+/// keyword.
 pub(crate) fn reflect_enumerated<T: Enumerated>(
     raw: Option<&str>,
-    missing: Option<T>,
-    invalid: Option<T>,
+    defaults: Defaults<T>,
 ) -> &'static str {
     let Some(raw) = raw else {
-        return missing.map_or("", |value| value.keyword());
+        return defaults.missing.map_or("", |value| value.keyword());
     };
     T::parse(raw)
-        .or(invalid)
+        .or(defaults.invalid)
         .map_or("", |value| value.keyword())
 }
 
@@ -239,6 +269,47 @@ impl Enumerated for net::ReferrerPolicy {
     /// header, the meta form, and reflection cannot drift.
     fn parse(value: &str) -> Option<Self> {
         net::ReferrerPolicy::parse(value)
+    }
+}
+
+#[cfg(test)]
+mod reflection_tests {
+    use super::{Defaults, TrackKind, reflect_enumerated};
+
+    /// The four answers a getter can give, from the spec's missing-value and
+    /// invalid-value defaults
+    /// (<https://html.spec.whatwg.org/multipage/media.html#dom-track-kind>).
+    #[test]
+    fn reflection_answers_each_state_once() {
+        let track = Defaults {
+            missing: Some(TrackKind::Subtitles),
+            invalid: Some(TrackKind::Metadata),
+        };
+        assert_eq!(reflect_enumerated::<TrackKind>(None, track), "subtitles");
+        assert_eq!(
+            reflect_enumerated::<TrackKind>(Some("captions"), track),
+            "captions"
+        );
+        assert_eq!(
+            reflect_enumerated::<TrackKind>(Some("CAPTIONS"), track),
+            "captions",
+            "a keyword matches ASCII case-insensitively"
+        );
+        assert_eq!(
+            reflect_enumerated::<TrackKind>(Some("bogus"), track),
+            "metadata",
+            "an invalid value reads the invalid-value default"
+        );
+        assert_eq!(
+            reflect_enumerated::<TrackKind>(None, Defaults::NONE),
+            "",
+            "no missing-value default reads the empty string"
+        );
+        assert_eq!(
+            reflect_enumerated::<TrackKind>(Some("bogus"), Defaults::NONE),
+            "",
+            "no invalid-value default reads the empty string"
+        );
     }
 }
 

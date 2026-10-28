@@ -310,14 +310,13 @@ impl RealmRegistry {
 
     /// The next process-unique `WebDriver` element id.
     ///
-    /// A page receives the id as a JS number, so it may not pass
-    /// [`crate::js::bridge::HostId::MAX`]
+    /// Ids keep counting past [`crate::js::bridge::HostId::MAX`]: the
+    /// `WebDriver` string form still addresses them, while the page's JS-number
+    /// form rounds and the parser then rejects it, which is an honest "no such
+    /// element" rather than an id two nodes share
     /// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>).
     pub(crate) fn allocate_remote(&mut self) -> u64 {
-        self.next_remote = self
-            .next_remote
-            .saturating_add(1)
-            .min(crate::js::bridge::HostId::MAX);
+        self.next_remote = self.next_remote.saturating_add(1);
         self.next_remote
     }
 
@@ -953,6 +952,25 @@ mod sandbox_flag_tests {
                 "{keyword} is supported but not in this table"
             );
         }
+        // `ALL` is the only list `parse` folds, and every loop above reads it,
+        // so a flag dropped from it would take itself out of the oracle. Check
+        // the bare-sandbox set against this table instead: a clearable flag
+        // missing from `ALL` is never set, and a new variant that forgot `ALL`
+        // leaves the count short.
+        assert_eq!(
+            SandboxFlag::ALL.len(),
+            16,
+            "a new flag is added to `SandboxFlag::ALL`"
+        );
+        let bare = SandboxFlags::parse(Some(""));
+        for (_, cleared) in expected {
+            for flag in *cleared {
+                assert!(bare.contains(*flag), "{flag:?} missing from a bare sandbox");
+            }
+        }
+        assert!(
+            bare.contains(SandboxFlag::Navigation) && bare.contains(SandboxFlag::DocumentDomain)
+        );
         // Every flag is either cleared by some keyword or one of the two no
         // keyword may clear. A flag absent from this table is a flag the sandbox
         // would never lift, which no feature could notice.

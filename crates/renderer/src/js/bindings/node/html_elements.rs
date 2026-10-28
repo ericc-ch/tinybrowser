@@ -22,7 +22,9 @@ use super::element::{
     content_attr, reflect_clamped_ulong, reflect_cross_origin, reflect_referrer_policy,
     reflect_ulong, set_cross_origin, set_referrer_policy,
 };
-use crate::js::bindings::enumerated::{LinkAs, TableScope, TrackKind, reflect_enumerated};
+use crate::js::bindings::enumerated::{
+    Defaults, LinkAs, TableScope, TrackKind, reflect_enumerated,
+};
 
 include!(concat!(env!("OUT_DIR"), "/HTMLAnchorElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLAreaElement.rs"));
@@ -228,8 +230,7 @@ impl<'js> html_table_cell_element_generated::HTMLTableCellElement<'js> for JsNod
     fn get_scope(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<TableScope>(
             content_attr(ctx, self.handle.0, "scope").as_deref(),
-            None,
-            None,
+            Defaults::NONE,
         );
         rquickjs::String::from_str(ctx.clone(), value)
     }
@@ -295,8 +296,7 @@ impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
     fn get_as(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<LinkAs>(
             content_attr(ctx, self.handle.0, "as").as_deref(),
-            None,
-            None,
+            Defaults::NONE,
         );
         rquickjs::String::from_str(ctx.clone(), value)
     }
@@ -359,8 +359,10 @@ impl<'js> html_track_element_generated::HTMLTrackElement<'js> for JsNode {
     fn get_kind(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<TrackKind>(
             content_attr(ctx, self.handle.0, "kind").as_deref(),
-            Some(TrackKind::Subtitles),
-            Some(TrackKind::Metadata),
+            Defaults {
+                missing: Some(TrackKind::Subtitles),
+                invalid: Some(TrackKind::Metadata),
+            },
         );
         rquickjs::String::from_str(ctx.clone(), value)
     }

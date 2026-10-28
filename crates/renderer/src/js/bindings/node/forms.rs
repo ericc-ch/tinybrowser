@@ -11,7 +11,9 @@ use rquickjs::{Ctx, Exception, Result, Value};
 
 use crate::dom::insertion::replace_all_journaled;
 use crate::dom::tree::{NodeId, attr, form_owner_of, html_namespace};
-use crate::js::bindings::enumerated::{Autocomplete, FormEnctype, FormMethod, reflect_enumerated};
+use crate::js::bindings::enumerated::{
+    Autocomplete, Defaults, FormEnctype, FormMethod, reflect_enumerated,
+};
 
 use super::JsNode;
 use super::element::{content_attr, reflect_ulong};
@@ -40,8 +42,7 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let method = reflect_enumerated::<FormMethod>(
             content_attr(ctx, self.handle.0, "method").as_deref(),
-            Some(FormMethod::Get),
-            Some(FormMethod::Get),
+            Defaults::both(FormMethod::Get),
         );
         rquickjs::String::from_str(ctx.clone(), method)
     }
@@ -59,8 +60,7 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let enctype = reflect_enumerated::<FormEnctype>(
             content_attr(ctx, self.handle.0, "enctype").as_deref(),
-            Some(FormEnctype::UrlEncoded),
-            Some(FormEnctype::UrlEncoded),
+            Defaults::both(FormEnctype::UrlEncoded),
         );
         rquickjs::String::from_str(ctx.clone(), enctype)
     }
@@ -94,8 +94,7 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<Autocomplete>(
             content_attr(ctx, self.handle.0, "autocomplete").as_deref(),
-            Some(Autocomplete::On),
-            Some(Autocomplete::On),
+            Defaults::both(Autocomplete::On),
         );
         rquickjs::String::from_str(ctx.clone(), value)
     }
@@ -946,8 +945,10 @@ impl JsNode {
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
         reflect_enumerated::<FormMethod>(
             content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
-            None,
-            Some(FormMethod::Get),
+            Defaults {
+                missing: None,
+                invalid: Some(FormMethod::Get),
+            },
         )
     }
 
@@ -961,8 +962,10 @@ impl JsNode {
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
         reflect_enumerated::<FormEnctype>(
             content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
-            None,
-            Some(FormEnctype::UrlEncoded),
+            Defaults {
+                missing: None,
+                invalid: Some(FormEnctype::UrlEncoded),
+            },
         )
     }
 

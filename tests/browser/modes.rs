@@ -223,6 +223,28 @@ fn webdriver_rejects_a_missing_tls_ca_file_before_starting() {
     assert!(!err.contains("unexpected argument"), "{err}");
 }
 
+/// `--help` short-circuits where it appears, before any flag reads a file.
+#[test]
+fn help_wins_over_an_unreadable_tls_ca() {
+    let fixture = Fixture::new("tinybrowser-help-tls-ca");
+    let output = run(&fixture, &["webdriver", "--tls-ca=/missing", "--help"]);
+    assert!(output.status.success(), "{output:?}");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("Usage:"), "{out}");
+}
+
+/// A missing required flag is reported before a file the flag would read, so
+/// the message does not depend on argument order.
+#[test]
+fn a_missing_port_is_reported_before_an_unreadable_tls_ca() {
+    let fixture = Fixture::new("tinybrowser-port-tls-ca");
+    let output = run(&fixture, &["webdriver", "--tls-ca=/missing"]);
+    assert_eq!(output.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("--port <PORT>"), "{err}");
+    assert!(!err.contains("--tls-ca"), "{err}");
+}
+
 #[test]
 fn profile_and_resolve_stay_on_their_commands() {
     let fixture = Fixture::new("tinybrowser-flag-placement");

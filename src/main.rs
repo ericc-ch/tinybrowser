@@ -44,8 +44,6 @@ fn main() -> ExitCode {
             }
             code
         }
-        // Every `CliError` renders its own cause in its message, so a chain
-        // printed here would repeat it.
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::from(2)

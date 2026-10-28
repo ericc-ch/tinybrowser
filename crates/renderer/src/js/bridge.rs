@@ -111,12 +111,12 @@ pub(crate) fn object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
         .restore(ctx)
 }
 
-/// One id this engine mints for script.
+/// One id or index a binding receives from script as a JS number.
 ///
-/// The engine keys its maps with `u64` counters, and a page receives an id as a
-/// JS number, which holds integers exactly only up to `2^53 - 1`
+/// The engine keys its maps with `u64` counters, and a page receives the value
+/// as a JS number, which holds integers exactly only up to `2^53 - 1`
 /// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>). Both facts live
-/// here: [`Self::MAX`] is the JS bound, and parsing a number yields an id or
+/// here: [`Self::MAX`] is the JS bound, and parsing a number yields the value or
 /// nothing, so no caller narrows to `u32` or widens back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct HostId(u64);
@@ -125,6 +125,10 @@ impl HostId {
     /// The largest id a JS number carries exactly, `Number.MAX_SAFE_INTEGER`.
     pub(crate) const MAX: u64 = (1 << 53) - 1;
 
+    /// [`Self::MAX`] as the float [`Self::parse`] compares against, spelled out
+    /// because casting it back would be the precision loss the bound prevents.
+    const MAX_EXACT: f64 = 9_007_199_254_740_991.0;
+
     /// The id as the `u64` the engine's maps are keyed by.
     pub(crate) fn get(self) -> u64 {
         self.0
@@ -132,16 +136,17 @@ impl HostId {
 
     /// Parses one id from the number a binding received.
     pub(crate) fn parse(value: f64) -> Option<Self> {
-        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        // The bound is compared as a float first, so the cast below only ever
+        // sees an integer `u64` holds exactly (`2^53 - 1` is representable).
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > Self::MAX_EXACT {
             return None;
         }
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "the guards admit exactly the integers 0..=Number.MAX_SAFE_INTEGER"
+            reason = "the guards admit exactly the integers 0..=2^53-1"
         )]
-        let raw = value as u64;
-        (raw <= Self::MAX).then_some(Self(raw))
+        Some(Self(value as u64))
     }
 }
 

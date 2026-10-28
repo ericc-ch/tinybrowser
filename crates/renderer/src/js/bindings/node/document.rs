@@ -39,7 +39,7 @@ use crate::js::world::{DocumentStreamCommand, NodeReference, SameObject};
 
 use crate::ReadyState;
 
-use crate::js::bindings::enumerated::{Dir, Loading, reflect_enumerated};
+use crate::js::bindings::enumerated::{Defaults, Dir, Loading, reflect_enumerated};
 
 use super::JsNode;
 use super::core::{adopt_node, document_value};
@@ -185,7 +185,7 @@ impl<'js> document_generated::Document<'js> for JsNode {
             .and_then(|element| content_attr(ctx, element, "dir"));
         rquickjs::String::from_str(
             ctx.clone(),
-            reflect_enumerated::<Dir>(value.as_deref(), None, None),
+            reflect_enumerated::<Dir>(value.as_deref(), Defaults::NONE),
         )
     }
 
@@ -626,8 +626,7 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
     fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<Loading>(
             content_attr(ctx, self.handle.0, "loading").as_deref(),
-            Some(Loading::Eager),
-            Some(Loading::Eager),
+            Defaults::both(Loading::Eager),
         );
         rquickjs::String::from_str(ctx.clone(), value)
     }
