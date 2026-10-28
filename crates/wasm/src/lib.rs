@@ -221,9 +221,15 @@ struct Chain {
     dial: u64,
     /// URL of the hop in flight.
     url: Url,
-    /// Document URL the dial started from, for `SameSite`.
+    /// Document URL the dial started from, for `SameSite` and the
+    /// credentials-mode origin comparison.
     initiator: Option<Url>,
     kind: DialKind,
+    /// The request's mode, credentials mode, and redirect mode. The host
+    /// transport carries only `kind` today, so the component applies what it
+    /// can itself: the credentials mode decides whether a cookie header is
+    /// computed at all.
+    cors: net::cors::CorsParameters,
     /// Hops already followed.
     followed: u32,
     /// Whether any hop so far moved to another site.
@@ -327,6 +333,11 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
 
 /// The `Cookie` header for the hop in flight.
 fn cookie_header(chain: &Chain) -> String {
+    let initiator = chain.initiator.as_ref();
+    let cross_origin = initiator.is_some_and(|initiator| initiator.origin() != chain.url.origin());
+    if !net::cors::credentials_admitted(chain.cors.credentials, cross_origin) {
+        return String::new();
+    }
     lock(cookie_jar()).cookie_string(CookieOp {
         url: &chain.url,
         now: SystemTime::now(),
@@ -474,7 +485,7 @@ impl NetworkHost for WasmServices {
         // transport (`fetch-request` carries neither), so the report is
         // dropped here instead of sent as a bogus GET. The native carrier
         // sends the real POST; the renderer already fired the event.
-        if request.kind == DialKind::CspReport {
+        if request.policy.kind() == DialKind::CspReport {
             completion(Ok(DialOutcome::basic(
                 204,
                 request.url,
@@ -498,7 +509,8 @@ impl NetworkHost for WasmServices {
                 dial,
                 url,
                 initiator: Url::parse(&request.initiator).ok(),
-                kind: request.kind,
+                kind: request.policy.kind(),
+                cors: request.policy.cors(),
                 followed: 0,
                 cross_site_redirect: false,
                 csp: request.csp.as_deref().cloned(),

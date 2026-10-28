@@ -1256,6 +1256,18 @@ impl SandboxFlags {
     }
 }
 
+/// The request inputs an element's own attributes supply: its `crossorigin`
+/// CORS settings state and its `referrerpolicy` override
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
+/// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attributes>).
+#[derive(Default)]
+pub(crate) struct SubresourceOptions {
+    /// The `crossorigin` CORS settings state; `None` is the `No CORS` state.
+    pub(crate) crossorigin: Option<net::cors::CrossOrigin>,
+    /// The element's `referrerpolicy`, when it names one.
+    pub(crate) referrer_policy: Option<net::ReferrerPolicy>,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -1560,7 +1572,16 @@ pub(crate) struct DocumentState {
     /// the engine runs the callback
     /// (<https://encoding.spec.whatwg.org/#dom-textdecoder-decode>).
     pub(crate) decoders: HashMap<u64, DecoderSession>,
+    /// The script element whose code is running, which
+    /// `document.currentScript` reports. A module script leaves it unset: the
+    /// attribute is null while a module evaluates
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript>).
     pub current_script: Option<NodeId>,
+    /// The element that started the module graph being fetched. Every fetch in
+    /// the graph reads its `crossorigin` and `referrerpolicy`, while
+    /// `current_script` stays unset so `document.currentScript` is null
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-the-descendants-of-and-link-a-module-script>).
+    pub(crate) module_fetch_root: Option<NodeId>,
 
     /// Existing elements being synchronously upgraded by a custom-element
     /// constructor. `HTMLElement()` consumes the top candidate.
@@ -1608,6 +1629,7 @@ impl DocumentState {
         self.parser_inserted.clear();
         self.decoders.clear();
         self.current_script = None;
+        self.module_fetch_root = None;
         self.custom_construction.clear();
         self.implementations.clear();
         self.active_elements.clear();
@@ -1814,6 +1836,7 @@ impl World {
             self.owned.insert(id);
         }
         self.state.current_script = None;
+        self.state.module_fetch_root = None;
         id
     }
 
@@ -1893,6 +1916,31 @@ impl World {
             store.get(id.document_id())
         })
         .ok()
+    }
+
+    /// The fetch-relevant attributes of a subresource element: its
+    /// `crossorigin` state and its `referrerpolicy` override, read from one
+    /// document lookup.
+    ///
+    /// Both are per-request inputs, not reflected properties the load path may
+    /// re-derive, so one helper keeps the load and every reader of the
+    /// attribute in agreement
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
+    pub(crate) fn subresource_options(&self, element: NodeId) -> SubresourceOptions {
+        let Some(parsed) = self.document(element) else {
+            return SubresourceOptions::default();
+        };
+        let base = &parsed.document.base;
+        SubresourceOptions {
+            crossorigin: crate::dom::microsyntaxes::cross_origin(crate::dom::tree::attr(
+                base,
+                element.node,
+                "crossorigin",
+            )),
+            referrer_policy: crate::dom::tree::attr(base, element.node, "referrerpolicy")
+                .and_then(net::ReferrerPolicy::parse),
+        }
     }
 
     /// The tree store, for realm-free algorithms that take `&DocumentStore`.

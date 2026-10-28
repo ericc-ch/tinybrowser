@@ -3,10 +3,12 @@
 //!
 //! Only the pieces the browser process needs to make the cross-origin
 //! decision live here: request/response classification, the CORS check, the
-//! preflight request shape and its validation, and response-header
-//! filtering. The `fetch` algorithm itself runs in the renderer and the
-//! browser enforces this module's verdicts, so a compromised renderer cannot
-//! widen its own access.
+//! preflight request shape and its validation, and response-header filtering.
+//! The `fetch` algorithm's policy decisions run in the renderer, and the
+//! browser enforces the ones that face the network: the request origin, the
+//! CORS check, preflights, and redirect gating. Which view a dial reports
+//! follows the kind the renderer names; probing that label with response-body
+//! sniffing is tracked in #190.
 
 use hyper::header::{self, HeaderValue};
 
@@ -32,19 +34,15 @@ pub enum RequestMode {
 }
 
 impl RequestMode {
-    /// Parses a `RequestInit.mode` string
+    /// The IDL value of this mode, which is also the `Sec-Fetch-Mode` token
     /// (<https://fetch.spec.whatwg.org/#requestinit>).
-    ///
-    /// `navigate` is not accepted: the `Request` constructor rejects it
-    /// (<https://fetch.spec.whatwg.org/#dom-request>), and navigation code
-    /// spells [`RequestMode::Navigate`] directly.
     #[must_use]
-    pub fn from_idl(value: &str) -> Option<Self> {
-        match value {
-            "no-cors" => Some(Self::NoCors),
-            "same-origin" => Some(Self::SameOrigin),
-            "cors" => Some(Self::Cors),
-            _ => None,
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::NoCors => "no-cors",
+            Self::SameOrigin => "same-origin",
+            Self::Cors => "cors",
         }
     }
 }
@@ -83,6 +81,146 @@ impl CredentialsMode {
             "include" => Some(Self::Include),
             _ => None,
         }
+    }
+}
+
+/// The state of a present `crossorigin` content attribute
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+///
+/// An absent attribute is `None`, which is the `No CORS` state: `no-cors` with
+/// credentials included. A present attribute is `Anonymous` or
+/// `Use Credentials`; an empty or unknown spelling is `Anonymous`, the
+/// enumerated attribute's invalid value default, so a bad spelling never sends
+/// credentials
+/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CrossOrigin {
+    /// CORS mode with `same-origin` credentials.
+    Anonymous,
+    /// CORS mode with `include` credentials.
+    UseCredentials,
+}
+
+impl CrossOrigin {
+    /// Every keyword, in spec order.
+    pub const KEYWORDS: &'static [Self] = &[Self::Anonymous, Self::UseCredentials];
+
+    /// The canonical spelling of the keyword.
+    #[must_use]
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::UseCredentials => "use-credentials",
+        }
+    }
+
+    /// Parses one keyword, ASCII case-insensitively and untrimmed, the way an
+    /// enumerated attribute does.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::KEYWORDS
+            .iter()
+            .copied()
+            .find(|candidate| candidate.keyword().eq_ignore_ascii_case(value))
+    }
+
+    /// The `CORS settings attribute credentials mode`
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+    #[must_use]
+    pub fn credentials(self) -> CredentialsMode {
+        match self {
+            Self::Anonymous => CredentialsMode::SameOrigin,
+            Self::UseCredentials => CredentialsMode::Include,
+        }
+    }
+}
+
+/// Whether a credentials mode admits credentials for a hop that is (or is
+/// not) cross-origin
+/// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
+///
+/// Every carrier that sends a request with a cookie header applies this rule,
+/// so the native agent and the wasm host cannot drift.
+#[must_use]
+pub fn credentials_admitted(mode: CredentialsMode, cross_origin: bool) -> bool {
+    match mode {
+        CredentialsMode::Omit => false,
+        CredentialsMode::SameOrigin => !cross_origin,
+        CredentialsMode::Include => true,
+    }
+}
+
+/// The CORS parameters a request is sent under, before the browser fills in
+/// the origin it authorized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CorsParameters {
+    /// Request mode (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+    pub mode: RequestMode,
+    /// Credentials mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
+    pub credentials: CredentialsMode,
+    /// Redirect mode
+    /// (<https://fetch.spec.whatwg.org/#concept-request-redirect-mode>).
+    pub redirect: RedirectMode,
+}
+
+impl CorsParameters {
+    /// The same parameters for one authorized origin.
+    #[must_use]
+    pub fn with_origin(self, origin: url::Origin) -> CorsSettings {
+        CorsSettings {
+            mode: self.mode,
+            credentials: self.credentials,
+            redirect: self.redirect,
+            origin,
+        }
+    }
+}
+
+/// How a response was filtered for page script
+/// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
+///
+/// The *internal* response keeps what the server sent. This is which filtered
+/// projection a page `fetch` may observe; an engine consumer reads the
+/// internal response instead
+/// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filtering {
+    /// Same-origin, unfiltered; every field but the forbidden names is
+    /// readable.
+    Basic,
+    /// Passed the CORS check. `credentials_include` decides whether
+    /// `Access-Control-Expose-Headers: *` is literal.
+    Cors {
+        /// Whether the request's credentials mode was `include`.
+        credentials_include: bool,
+    },
+    /// `no-cors` across an origin boundary: no status, URL, headers, or body.
+    Opaque,
+    /// A `redirect: "manual"` response across an origin boundary: no status or
+    /// headers, and the URL is the request's own.
+    OpaqueRedirect,
+}
+
+impl Filtering {
+    /// The response type this projection reports
+    /// (<https://fetch.spec.whatwg.org/#concept-response-type>).
+    #[must_use]
+    pub fn response_type(self) -> ResponseType {
+        match self {
+            Self::Basic => ResponseType::Basic,
+            Self::Cors { .. } => ResponseType::Cors,
+            Self::Opaque => ResponseType::Opaque,
+            Self::OpaqueRedirect => ResponseType::OpaqueRedirect,
+        }
+    }
+
+    /// Whether this projection hides the status, URL, headers, and body from
+    /// page script.
+    #[must_use]
+    pub fn is_opaque(self) -> bool {
+        matches!(self, Self::Opaque | Self::OpaqueRedirect)
     }
 }
 
@@ -539,7 +677,11 @@ pub(crate) fn preflight_headers(
     Ok(headers)
 }
 
-fn is_forbidden_response_header(name: &str) -> bool {
+/// Whether `name` is a forbidden response-header name, which page script can
+/// never read
+/// (<https://fetch.spec.whatwg.org/#forbidden-response-header-name>).
+#[must_use]
+pub fn is_forbidden_response_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
 }
 
@@ -556,36 +698,43 @@ fn is_cors_safelisted_response_header(name: &str) -> bool {
     )
 }
 
-/// The header list a `cors` response exposes to scripts: CORS-safelisted
-/// response headers plus `Access-Control-Expose-Headers`
+/// The rule a `cors` response applies to each header name: CORS-safelisted
+/// response headers plus `Access-Control-Expose-Headers`, minus the forbidden
+/// response-header names
 /// (<https://fetch.spec.whatwg.org/#cors-safelisted-response-header-name>).
-#[must_use]
-pub fn exposed_response_headers(headers: &HeaderMap, credentials_include: bool) -> HeaderMap {
-    let expose = list_values(headers, "access-control-expose-headers");
-    let expose_all = !credentials_include && expose.iter().any(|value| value == "*");
-    let mut exposed = HeaderMap::new();
-    for (name, value) in headers.typed_iter() {
-        if is_forbidden_response_header(name.as_str()) {
-            continue;
-        }
-        let keep = is_cors_safelisted_response_header(name.as_str())
-            || expose_all
-            || expose
-                .iter()
-                .any(|item| item.eq_ignore_ascii_case(name.as_str()));
-        if keep {
-            exposed.insert_wire(name.clone(), value.clone());
-        }
-    }
-    exposed
+///
+/// Built once from the internal header list, then asked about each name, so a
+/// filtered view does not clone the list it is filtering.
+pub struct ExposedHeaders {
+    /// `Access-Control-Expose-Headers` names, lowercased.
+    names: Vec<String>,
+    /// `Access-Control-Expose-Headers: *` without credentials.
+    expose_all: bool,
 }
 
-/// A `no-cors` response reached across an origin boundary is opaque: scripts
-/// see no status and no headers
-/// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
-#[must_use]
-pub fn opaque_response_headers() -> HeaderMap {
-    HeaderMap::new()
+impl ExposedHeaders {
+    /// Reads the expose rule out of one response's header list.
+    #[must_use]
+    pub fn new(headers: &HeaderMap, credentials_include: bool) -> Self {
+        let names: Vec<String> = list_values(headers, "access-control-expose-headers")
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let expose_all = !credentials_include && names.iter().any(|name| name == "*");
+        Self { names, expose_all }
+    }
+
+    /// Whether this rule exposes the field named `name`.
+    #[must_use]
+    pub fn keeps(&self, name: &str) -> bool {
+        if is_forbidden_response_header(name) {
+            return false;
+        }
+        let name = name.to_ascii_lowercase();
+        is_cors_safelisted_response_header(&name)
+            || self.expose_all
+            || self.names.iter().any(|exposed| exposed == &name)
+    }
 }
 
 #[cfg(test)]
@@ -891,26 +1040,21 @@ mod tests {
             ("Access-Control-Expose-Headers", "X-Exposed"),
             ("Set-Cookie", "a=b"),
         ]);
-        let exposed = exposed_response_headers(&response, false);
-        assert!(exposed.get("content-type").is_some());
-        assert!(exposed.get("x-exposed").is_some());
-        assert!(exposed.get("x-hidden").is_none());
-        assert!(exposed.get("set-cookie").is_none());
-        assert!(exposed.get("access-control-expose-headers").is_none());
+        let rule = ExposedHeaders::new(&response, false);
+        assert!(rule.keeps("content-type"));
+        assert!(rule.keeps("x-exposed"), "an exposed name is readable");
+        assert!(!rule.keeps("x-hidden"));
+        assert!(!rule.keeps("set-cookie"));
+        assert!(!rule.keeps("access-control-expose-headers"));
     }
 
     #[test]
     fn expose_star_is_literal_with_credentials() {
         let response = headers(&[("X-Thing", "1"), ("Access-Control-Expose-Headers", "*")]);
+        assert!(ExposedHeaders::new(&response, false).keeps("x-thing"));
         assert!(
-            exposed_response_headers(&response, false)
-                .get("x-thing")
-                .is_some()
-        );
-        assert!(
-            exposed_response_headers(&response, true)
-                .get("x-thing")
-                .is_none()
+            !ExposedHeaders::new(&response, true).keeps("x-thing"),
+            "a credentialed request treats `*` as a literal name"
         );
     }
 }

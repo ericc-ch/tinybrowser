@@ -35,8 +35,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Version 13 folded a dial outcome's body and stream into one
 /// [`ResponseBody`](renderer::ResponseBody), made the request method a typed
 /// value, and renumbered `BodyDelivery` (now `Buffer` = 0, `Stream` = 1) with
-/// the removal of `Discard`.
-pub const PROTOCOL_VERSION: u8 = 13;
+/// the removal of `Discard`. Version 14 replaced a request's kind and optional
+/// CORS parameters with one [`RequestPolicy`](renderer::RequestPolicy), and a
+/// page request's mode with [`CorsMode`](renderer::CorsMode), which has no
+/// `navigate`.
+pub const PROTOCOL_VERSION: u8 = 14;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -429,6 +432,71 @@ mod tests {
             };
             // `Debug` keeps `NaN` comparable and distinguishes `-0.0`.
             assert_eq!(format!("{back:?}"), expected, "round trip");
+        }
+    }
+
+    /// Every request policy survives the wire unchanged. The enum is the
+    /// record of what a dial is, so a variant that cannot round-trip is a dial
+    /// the browser would send with another mode.
+    #[test]
+    fn a_dial_request_round_trips_every_policy() {
+        use renderer::{CorsMode, CorsRequest, RequestPolicy};
+        let cors = CorsRequest {
+            mode: CorsMode::SameOrigin,
+            credentials: net::cors::CredentialsMode::Include,
+            redirect: net::cors::RedirectMode::Follow,
+        };
+        for policy in [
+            RequestPolicy::Fetch(cors),
+            RequestPolicy::ClassicScript {
+                crossorigin: Some(net::cors::CrossOrigin::UseCredentials),
+            },
+            RequestPolicy::ModuleScript {
+                crossorigin: Some(net::cors::CrossOrigin::Anonymous),
+            },
+            RequestPolicy::ModuleScript { crossorigin: None },
+            RequestPolicy::Stylesheet { crossorigin: None },
+            RequestPolicy::Image {
+                crossorigin: Some(net::cors::CrossOrigin::Anonymous),
+            },
+            RequestPolicy::Font,
+            RequestPolicy::FrameLoad,
+            RequestPolicy::CspReportTo,
+            RequestPolicy::CspReportUri,
+        ] {
+            let request = renderer::DialRequest::new(
+                policy,
+                "https://a.test/x",
+                "https://a.test/",
+                "https://a.test/",
+            );
+            let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
+                id: crate::exchange::RequestId::new(1),
+                body: crate::wire::BrowserCall {
+                    assignment: crate::wire::RendererAssignmentId::new(1),
+                    call: crate::wire::ServiceCall::Network(crate::wire::NetworkCall::Dial(
+                        Box::new(request),
+                    )),
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &message).expect("write");
+            let back: crate::wire::FromRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Call {
+                body: crate::wire::BrowserCall { call, .. },
+                ..
+            } = back
+            else {
+                panic!("expected a call frame");
+            };
+            let crate::wire::ServiceCall::Network(crate::wire::NetworkCall::Dial(request)) = call
+            else {
+                panic!("expected a dial");
+            };
+            assert_eq!(request.policy, policy, "the policy survives the wire");
         }
     }
 

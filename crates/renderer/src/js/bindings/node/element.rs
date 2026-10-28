@@ -14,8 +14,8 @@ use super::super::{
 };
 use super::forms::{fixup_option_on_insert, fixup_radio_on_insert};
 use crate::dom::adoption::materialize_children;
-use crate::dom::microsyntaxes::CrossOrigin;
 use crate::js::bindings::enumerated::{Dir, EnterKeyHint, InputMode, reflect_enumerated};
+use net::cors::CrossOrigin;
 use std::collections::HashSet;
 
 use blitz_dom::NodeData;
