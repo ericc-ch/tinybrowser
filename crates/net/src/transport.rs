@@ -174,8 +174,10 @@ pub struct InvalidProxy;
 #[error("invalid certificate authority: {0}")]
 pub struct InvalidCa(#[source] native_tls::Error);
 
-impl Proxy {
-    fn parse(proxy: &str) -> Result<Self, InvalidProxy> {
+impl FromStr for Proxy {
+    type Err = InvalidProxy;
+
+    fn from_str(proxy: &str) -> Result<Self, Self::Err> {
         let url = Url::parse(proxy).map_err(|_| InvalidProxy)?;
         if url.scheme() != "http" {
             return Err(InvalidProxy);
@@ -215,14 +217,6 @@ impl Proxy {
             Some(value)
         };
         Ok(Self { destination, auth })
-    }
-}
-
-impl FromStr for Proxy {
-    type Err = InvalidProxy;
-
-    fn from_str(proxy: &str) -> Result<Self, Self::Err> {
-        Self::parse(proxy)
     }
 }
 

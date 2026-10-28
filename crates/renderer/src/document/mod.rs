@@ -3816,7 +3816,7 @@ impl Document {
                 .world
                 .borrow()
                 .sandbox
-                .contains(crate::js::world::SandboxFlags::AUTOMATIC_FEATURES)
+                .contains(crate::js::world::SandboxFlag::AutomaticFeatures)
         {
             return;
         }

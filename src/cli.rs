@@ -4,12 +4,20 @@
 //! where they appear and value errors surface in order. Behavior parity with
 //! the removed clap surface (exit codes, streams, rejected forms) is pinned by
 //! `tests/modes.rs`.
+//!
+//! Every flag becomes the typed value its consumer uses: `--proxy` a [`Proxy`],
+//! `--resolve` a [`ResolveRule`], `--tls-ca` a parsed [`TrustedCa`]. The scanner
+//! is the inbound adapter, so a bad value is a [`CliError`] carrying its cause
+//! instead of a string, and `main` only formats it once.
 
 use std::ffi::OsString;
+use std::fmt;
+use std::io;
 use std::iter::Peekable;
 use std::path::PathBuf;
 
-use browser::{Profile, Proxy, ResolveRule};
+use browser::{AgentOptions, InvalidCa, InvalidProxy, InvalidResolveRule, Profile, ProfileError};
+use browser::{Proxy, TrustedCa};
 use logging::Level;
 
 /// Parsed command line: global flags plus an optional subcommand.
@@ -39,22 +47,10 @@ pub(crate) enum Command {
         port: u16,
         /// Named profile.
         profile: Profile,
-        /// Network flags, already parsed except the CA paths, which startup
-        /// reads before the browser opens.
-        network: WebdriverNetwork,
+        /// Network configuration, every flag already parsed. Boxed because an
+        /// `AgentOptions` dwarfs every other command's fields.
+        network: Box<AgentOptions>,
     },
-}
-
-/// The network flags `webdriver` understands.
-pub(crate) struct WebdriverNetwork {
-    /// HTTP CONNECT proxy, parsed so credentials never exist as a plain
-    /// argument past this boundary.
-    pub(crate) proxy: Option<Proxy>,
-    /// Host-to-address rewrites, first match wins.
-    pub(crate) resolve: Vec<ResolveRule>,
-    /// Extra certificate authorities, in flag order. Startup reads and parses
-    /// each file before the browser opens.
-    pub(crate) tls_ca: Vec<PathBuf>,
 }
 
 /// What argument scanning selected.
@@ -65,6 +61,135 @@ pub(crate) enum Outcome {
     Version,
     /// Run with this command line.
     Run(Box<Cli>),
+}
+
+/// One command-line failure.
+#[derive(Debug)]
+pub(crate) enum CliError {
+    /// A token is not UTF-8.
+    NotUtf8,
+    /// A value-taking flag had no value, including `--flag=`.
+    MissingValue {
+        /// Flag name, without dashes.
+        flag: &'static str,
+        /// Its value placeholder, as the help text spells it.
+        placeholder: &'static str,
+    },
+    /// A flag that may appear once appeared again. `spelling` is the flag and
+    /// its placeholder, the way the message quotes it.
+    Repeated {
+        /// Flag and placeholder, e.g. `--port <PORT>`.
+        spelling: &'static str,
+    },
+    /// A flag without a value was given one.
+    UnexpectedValue {
+        /// Flag name, without dashes.
+        flag: &'static str,
+    },
+    /// No flag of the selected subcommand names this token.
+    UnexpectedArgument(String),
+    /// `help` was followed by a name that is not a subcommand.
+    UnrecognizedSubcommand(String),
+    /// `--port` is not a port number.
+    InvalidPort(String),
+    /// `--profile` is not a name.
+    InvalidProfile(ProfileError),
+    /// `--log-level` is not a level.
+    InvalidLogLevel(logging::ParseLevelError),
+    /// `--resolve` is not a `PATTERN=ADDR` rule.
+    InvalidResolve(InvalidResolveRule),
+    /// `--proxy` is not a proxy URI.
+    InvalidProxy(InvalidProxy),
+    /// `--tls-ca` named a file that could not be read or parsed.
+    TlsCa {
+        /// The named path.
+        path: PathBuf,
+        /// Which step failed.
+        source: TlsCaError,
+    },
+    /// `webdriver` was selected without `--port`.
+    MissingPort,
+}
+
+/// The two ways a `--tls-ca` file can fail.
+#[derive(Debug)]
+pub(crate) enum TlsCaError {
+    /// The file could not be read.
+    Read(io::Error),
+    /// The file is not a PEM certificate.
+    Parse(InvalidCa),
+}
+
+impl fmt::Display for TlsCaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(formatter),
+            Self::Parse(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for TlsCaError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Parse(error) => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotUtf8 => {
+                formatter.write_str("Invalid UTF-8 was detected in one or more arguments")
+            }
+            Self::MissingValue { flag, placeholder } => write!(
+                formatter,
+                "a value is required for '--{flag} {placeholder}' but none was supplied"
+            ),
+            Self::Repeated { spelling } => {
+                write!(
+                    formatter,
+                    "the argument '{spelling}' was provided more than once"
+                )
+            }
+            Self::UnexpectedValue { flag } => {
+                write!(formatter, "unexpected value for '--{flag}'")
+            }
+            Self::UnexpectedArgument(token) => {
+                write!(formatter, "unexpected argument '{token}' found")
+            }
+            Self::UnrecognizedSubcommand(token) => {
+                write!(formatter, "unrecognized subcommand '{token}'")
+            }
+            Self::InvalidPort(value) => {
+                write!(formatter, "invalid value '{value}' for '--port <PORT>'")
+            }
+            Self::InvalidProfile(error) => error.fmt(formatter),
+            Self::InvalidLogLevel(error) => error.fmt(formatter),
+            Self::InvalidResolve(error) => error.fmt(formatter),
+            Self::InvalidProxy(error) => error.fmt(formatter),
+            Self::TlsCa { path, source } => {
+                write!(formatter, "--tls-ca {}: {source}", path.display())
+            }
+            Self::MissingPort => formatter
+                .write_str("the following required arguments were not provided:\n  --port <PORT>"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidProfile(error) => Some(error),
+            Self::InvalidLogLevel(error) => Some(error),
+            Self::InvalidResolve(error) => Some(error),
+            Self::InvalidProxy(error) => Some(error),
+            Self::TlsCa { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 /// Full help text, also printed when no subcommand is given.
@@ -97,9 +222,8 @@ Options:
 ///
 /// # Errors
 ///
-/// Returns a message for the first unrecognized, misplaced, repeated, or
-/// invalid argument.
-pub(crate) fn parse(args: impl Iterator<Item = OsString>) -> Result<Outcome, String> {
+/// Returns the first unrecognized, misplaced, repeated, or invalid argument.
+pub(crate) fn parse(args: impl Iterator<Item = OsString>) -> Result<Outcome, CliError> {
     Scanner::new(args).scan()
 }
 
@@ -121,7 +245,7 @@ enum Partial {
     Webdriver {
         port: Option<u16>,
         profile: Option<Profile>,
-        network: WebdriverNetwork,
+        network: Box<AgentOptions>,
     },
 }
 
@@ -137,11 +261,9 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
         }
     }
 
-    fn scan(mut self) -> Result<Outcome, String> {
+    fn scan(mut self) -> Result<Outcome, CliError> {
         while let Some(arg) = self.args.next() {
-            let text = arg
-                .to_str()
-                .ok_or_else(|| "Invalid UTF-8 was detected in one or more arguments".to_owned())?;
+            let text = arg.to_str().ok_or(CliError::NotUtf8)?;
             if let Some(outcome) = self.token(text)? {
                 return Ok(outcome);
             }
@@ -149,11 +271,11 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
         self.finish()
     }
 
-    fn token(&mut self, text: &str) -> Result<Option<Outcome>, String> {
+    fn token(&mut self, text: &str) -> Result<Option<Outcome>, CliError> {
         if self.end_of_flags {
             // clap treats tokens after `--` as positional values; there are
             // none, so even a subcommand name is an error.
-            return Err(format!("unexpected argument '{text}' found"));
+            return Err(CliError::UnexpectedArgument(text.to_owned()));
         }
         if text == "--" {
             self.end_of_flags = true;
@@ -170,7 +292,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
         self.positional(text)
     }
 
-    fn long(&mut self, long: &str) -> Result<Option<Outcome>, String> {
+    fn long(&mut self, long: &str) -> Result<Option<Outcome>, CliError> {
         let (name, inline) = match long.split_once('=') {
             Some((name, value)) => (name, Some(value)),
             None => (long, None),
@@ -179,45 +301,44 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             "log-level" => {
                 let raw = self.value("log-level", "<LEVEL>", inline)?;
                 if self.log_level.is_some() {
-                    return Err(
-                        "the argument '--log-level <LEVEL>' was provided more than once".into(),
-                    );
+                    return Err(CliError::Repeated {
+                        spelling: "--log-level <LEVEL>",
+                    });
                 }
-                self.log_level = Some(
-                    raw.parse()
-                        .map_err(|error: logging::ParseLevelError| error.to_string())?,
-                );
+                self.log_level = Some(raw.parse().map_err(CliError::InvalidLogLevel)?);
                 Ok(None)
             }
             "log-file" => {
                 let raw = self.value("log-file", "<PATH>", inline)?;
                 if self.log_file.is_some() {
-                    return Err(
-                        "the argument '--log-file <PATH>' was provided more than once".into(),
-                    );
+                    return Err(CliError::Repeated {
+                        spelling: "--log-file <PATH>",
+                    });
                 }
                 self.log_file = Some(PathBuf::from(raw));
                 Ok(None)
             }
             "verbose" => {
                 if inline.is_some() {
-                    return Err("unexpected value for '--verbose'".into());
+                    return Err(CliError::UnexpectedValue { flag: "verbose" });
                 }
                 if self.verbose {
-                    return Err("the argument '--verbose' was provided more than once".into());
+                    return Err(CliError::Repeated {
+                        spelling: "--verbose",
+                    });
                 }
                 self.verbose = true;
                 Ok(None)
             }
             "version" => {
                 if inline.is_some() {
-                    return Err("unexpected value for '--version'".into());
+                    return Err(CliError::UnexpectedValue { flag: "version" });
                 }
                 Ok(Some(Outcome::Version))
             }
             "help" => {
                 if inline.is_some() {
-                    return Err("unexpected value for '--help'".into());
+                    return Err(CliError::UnexpectedValue { flag: "help" });
                 }
                 Ok(Some(Outcome::Help))
             }
@@ -230,104 +351,101 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
         &mut self,
         name: &str,
         inline: Option<&str>,
-    ) -> Result<Option<Outcome>, String> {
+    ) -> Result<Option<Outcome>, CliError> {
         match name {
             "profile" => {
                 let raw = self.value("profile", "<NAME>", inline)?;
-                let profile = Profile::parse(&raw).map_err(|error| error.to_string())?;
+                let profile = Profile::parse(&raw).map_err(CliError::InvalidProfile)?;
                 match &mut self.command {
                     Some(
                         Partial::Daemon { profile: slot }
                         | Partial::Webdriver { profile: slot, .. },
                     ) => {
                         if slot.is_some() {
-                            return Err(
-                                "the argument '--profile <NAME>' was provided more than once"
-                                    .into(),
-                            );
+                            return Err(CliError::Repeated {
+                                spelling: "--profile <NAME>",
+                            });
                         }
                         *slot = Some(profile);
                         Ok(None)
                     }
-                    _ => Err("unexpected argument '--profile' found".into()),
+                    _ => Err(unexpected(name)),
                 }
             }
             "port" => {
                 let raw = self.value("port", "<PORT>", inline)?;
-                let port: u16 = raw
-                    .parse()
-                    .map_err(|_| format!("invalid value '{raw}' for '--port <PORT>'"))?;
+                let port: u16 = raw.parse().map_err(|_| CliError::InvalidPort(raw))?;
                 match &mut self.command {
                     Some(Partial::Webdriver { port: slot, .. }) => {
                         if slot.is_some() {
-                            return Err(
-                                "the argument '--port <PORT>' was provided more than once".into()
-                            );
+                            return Err(CliError::Repeated {
+                                spelling: "--port <PORT>",
+                            });
                         }
                         *slot = Some(port);
                         Ok(None)
                     }
-                    _ => Err("unexpected argument '--port' found".into()),
+                    _ => Err(unexpected(name)),
                 }
             }
             "resolve" => {
                 let raw = self.value("resolve", "<PATTERN=ADDR>", inline)?;
                 match &mut self.command {
                     Some(Partial::Webdriver { network, .. }) => {
-                        let rule = ResolveRule::parse(&raw).map_err(|error| error.to_string())?;
+                        let rule = raw.parse().map_err(CliError::InvalidResolve)?;
                         network.resolve.push(rule);
                         Ok(None)
                     }
-                    _ => Err("unexpected argument '--resolve' found".into()),
+                    _ => Err(unexpected(name)),
                 }
             }
             "tls-ca" => {
                 let raw = self.value("tls-ca", "<PATH>", inline)?;
                 match &mut self.command {
                     Some(Partial::Webdriver { network, .. }) => {
-                        network.tls_ca.push(PathBuf::from(raw));
+                        network.tls_cas.push(read_ca(&raw)?);
                         Ok(None)
                     }
-                    _ => Err("unexpected argument '--tls-ca' found".into()),
+                    _ => Err(unexpected(name)),
                 }
             }
             "proxy" => {
                 let raw = self.value("proxy", "<URI>", inline)?;
-                let proxy = raw.parse::<Proxy>().map_err(|error| error.to_string())?;
+                let proxy = raw.parse::<Proxy>().map_err(CliError::InvalidProxy)?;
                 match &mut self.command {
                     Some(Partial::Webdriver { network, .. }) => {
                         if network.proxy.is_some() {
-                            return Err(
-                                "the argument '--proxy <URI>' was provided more than once".into()
-                            );
+                            return Err(CliError::Repeated {
+                                spelling: "--proxy <URI>",
+                            });
                         }
                         network.proxy = Some(proxy);
                         Ok(None)
                     }
-                    _ => Err("unexpected argument '--proxy' found".into()),
+                    _ => Err(unexpected(name)),
                 }
             }
-            _ => Err(format!("unexpected argument '--{name}' found")),
+            _ => Err(CliError::UnexpectedArgument(format!("--{name}"))),
         }
     }
 
-    fn short(short: &str) -> Result<Option<Outcome>, String> {
+    fn short(short: &str) -> Result<Option<Outcome>, CliError> {
         match short {
             "v" | "V" => Ok(Some(Outcome::Version)),
             "h" => Ok(Some(Outcome::Help)),
-            _ => Err(format!("unexpected argument '-{short}' found")),
+            _ => Err(CliError::UnexpectedArgument(format!("-{short}"))),
         }
     }
 
-    fn positional(&mut self, text: &str) -> Result<Option<Outcome>, String> {
+    fn positional(&mut self, text: &str) -> Result<Option<Outcome>, CliError> {
         if let Some(Partial::Help) = self.command {
             return match text {
                 "daemon" | "renderer" | "webdriver" | "help" => Ok(Some(Outcome::Help)),
-                _ => Err(format!("unrecognized subcommand '{text}'")),
+                _ => Err(CliError::UnrecognizedSubcommand(text.to_owned())),
             };
         }
         if self.command.is_some() {
-            return Err(format!("unexpected argument '{text}' found"));
+            return Err(CliError::UnexpectedArgument(text.to_owned()));
         }
         match text {
             "daemon" => {
@@ -342,11 +460,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 self.command = Some(Partial::Webdriver {
                     port: None,
                     profile: None,
-                    network: WebdriverNetwork {
-                        proxy: None,
-                        resolve: Vec::new(),
-                        tls_ca: Vec::new(),
-                    },
+                    network: Box::new(AgentOptions::default()),
                 });
                 Ok(None)
             }
@@ -354,46 +468,41 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 self.command = Some(Partial::Help);
                 Ok(None)
             }
-            _ => Err(format!("unrecognized subcommand '{text}'")),
+            _ => Err(CliError::UnrecognizedSubcommand(text.to_owned())),
         }
     }
 
     fn value(
         &mut self,
-        flag: &str,
-        placeholder: &str,
+        flag: &'static str,
+        placeholder: &'static str,
         inline: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, CliError> {
+        let missing = || CliError::MissingValue { flag, placeholder };
         if let Some(raw) = inline {
             if raw.is_empty() {
                 // `--flag=` is never meaningful here, and every value-taking
                 // flag wants the same message for it.
-                return Err(format!(
-                    "a value is required for '--{flag} {placeholder}' but none was supplied"
-                ));
+                return Err(missing());
             }
             return Ok(raw.to_owned());
         }
-        let missing =
-            || format!("a value is required for '--{flag} {placeholder}' but none was supplied");
         let Some(next) = self.args.peek() else {
             return Err(missing());
         };
         let Some(text) = next.to_str() else {
-            return Err("Invalid UTF-8 was detected in one or more arguments".into());
+            return Err(CliError::NotUtf8);
         };
         if text.starts_with('-') {
             return Err(missing());
         }
         match self.args.next() {
-            Some(arg) => arg
-                .into_string()
-                .map_err(|_| "Invalid UTF-8 was detected in one or more arguments".into()),
+            Some(arg) => arg.into_string().map_err(|_| CliError::NotUtf8),
             None => Err(missing()),
         }
     }
 
-    fn finish(self) -> Result<Outcome, String> {
+    fn finish(self) -> Result<Outcome, CliError> {
         let command = match self.command {
             None => None,
             Some(Partial::Help) => return Ok(Outcome::Help),
@@ -406,12 +515,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 profile,
                 network,
             }) => {
-                let Some(port) = port else {
-                    return Err(
-                        "the following required arguments were not provided:\n  --port <PORT>"
-                            .into(),
-                    );
-                };
+                let port = port.ok_or(CliError::MissingPort)?;
                 Some(Command::Webdriver {
                     port,
                     profile: profile.unwrap_or_default(),
@@ -426,4 +530,24 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             command,
         })))
     }
+}
+
+fn unexpected(name: &str) -> CliError {
+    CliError::UnexpectedArgument(format!("--{name}"))
+}
+
+/// Reads and parses one `--tls-ca` file.
+///
+/// The scanner is the inbound adapter, so the certificate is parsed before the
+/// browser opens and a bad file is a usage error, not a dial-time failure.
+fn read_ca(raw: &str) -> Result<TrustedCa, CliError> {
+    let path = PathBuf::from(raw);
+    let pem = std::fs::read(&path).map_err(|source| CliError::TlsCa {
+        path: path.clone(),
+        source: TlsCaError::Read(source),
+    })?;
+    TrustedCa::from_pem(&pem).map_err(|source| CliError::TlsCa {
+        path: path.clone(),
+        source: TlsCaError::Parse(source),
+    })
 }

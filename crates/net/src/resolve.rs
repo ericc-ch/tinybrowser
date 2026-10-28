@@ -1,5 +1,6 @@
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Resolution-phase failure. `hyper-util` wraps it in its own connect error;
@@ -47,14 +48,16 @@ pub struct ResolveRule {
     target: Target,
 }
 
-impl ResolveRule {
+impl FromStr for ResolveRule {
+    type Err = InvalidResolveRule;
+
     /// Parses one `PATTERN=ADDR` spec.
     ///
     /// # Errors
     ///
     /// [`InvalidResolveRule`] carrying `spec` when it has no `=`, either half
     /// is empty, or `ADDR` is neither an IPv4 literal nor `fail`.
-    pub fn parse(spec: &str) -> Result<Self, InvalidResolveRule> {
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
         let Some((pattern, addr)) = spec.split_once('=') else {
             return Err(InvalidResolveRule(spec.into()));
         };

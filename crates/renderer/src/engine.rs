@@ -1122,13 +1122,13 @@ impl Engine {
         }
         if tree.top_level(initiator) == chosen {
             let flag = if activated {
-                crate::js::world::SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+                crate::js::world::SandboxFlag::TopLevelNavigationWithUserActivation
             } else {
-                crate::js::world::SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+                crate::js::world::SandboxFlag::TopLevelNavigationWithoutUserActivation
             };
             return !flags.contains(flag);
         }
-        !flags.contains(crate::js::world::SandboxFlags::NAVIGATION)
+        !flags.contains(crate::js::world::SandboxFlag::Navigation)
     }
 
     /// Installs the flags a navigation commits on `child`'s document. Local

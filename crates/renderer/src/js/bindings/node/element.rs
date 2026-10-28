@@ -506,7 +506,7 @@ impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
         let raw = content_attr(ctx, self.handle.0, "dir");
         rquickjs::String::from_str(
             ctx.clone(),
-            &reflect_enumerated::<Dir>(raw.as_deref(), "", ""),
+            reflect_enumerated::<Dir>(raw.as_deref(), None, None),
         )
     }
 
@@ -1269,10 +1269,10 @@ impl<'js> element_content_editable_generated::ElementContentEditable<'js> for Js
     fn get_enter_key_hint(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<EnterKeyHint>(
             content_attr(ctx, self.handle.0, "enterkeyhint").as_deref(),
-            "",
-            "",
+            None,
+            None,
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-enterkeyhint
@@ -1284,10 +1284,10 @@ impl<'js> element_content_editable_generated::ElementContentEditable<'js> for Js
     fn get_input_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<InputMode>(
             content_attr(ctx, self.handle.0, "inputmode").as_deref(),
-            "",
-            "",
+            None,
+            None,
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-inputmode
@@ -2852,10 +2852,10 @@ pub(super) fn reflect_referrer_policy<'js>(
 ) -> Result<rquickjs::String<'js>> {
     let value = reflect_enumerated::<net::ReferrerPolicy>(
         content_attr(ctx, id, "referrerpolicy").as_deref(),
-        "",
-        "",
+        None,
+        None,
     );
-    rquickjs::String::from_str(ctx.clone(), &value)
+    rquickjs::String::from_str(ctx.clone(), value)
 }
 
 pub(super) fn set_referrer_policy(

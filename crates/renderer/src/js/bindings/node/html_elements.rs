@@ -228,10 +228,10 @@ impl<'js> html_table_cell_element_generated::HTMLTableCellElement<'js> for JsNod
     fn get_scope(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<TableScope>(
             content_attr(ctx, self.handle.0, "scope").as_deref(),
-            "",
-            "",
+            None,
+            None,
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/tables.html#dom-tdth-scope
@@ -293,9 +293,12 @@ impl<'js> html_link_element_generated::HTMLLinkElement<'js> for JsNode {
     // destinations, defaulting to the empty string
     // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as>).
     fn get_as(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        let value =
-            reflect_enumerated::<LinkAs>(content_attr(ctx, self.handle.0, "as").as_deref(), "", "");
-        rquickjs::String::from_str(ctx.clone(), &value)
+        let value = reflect_enumerated::<LinkAs>(
+            content_attr(ctx, self.handle.0, "as").as_deref(),
+            None,
+            None,
+        );
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/semantics.html#dom-link-as
@@ -356,10 +359,10 @@ impl<'js> html_track_element_generated::HTMLTrackElement<'js> for JsNode {
     fn get_kind(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<TrackKind>(
             content_attr(ctx, self.handle.0, "kind").as_deref(),
-            "subtitles",
-            "metadata",
+            Some(TrackKind::Subtitles),
+            Some(TrackKind::Metadata),
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-track-kind

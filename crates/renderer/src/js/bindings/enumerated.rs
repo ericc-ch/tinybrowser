@@ -53,15 +53,23 @@ pub(crate) trait Enumerated: Copy + 'static {
 
 /// Enumerated reflection: the canonical keyword, `missing` when the attribute
 /// is absent, or `invalid` when it names no keyword.
+///
+/// The defaults are enum values, not spellings: a typo cannot compile, and the
+/// empty string is the spec's "no state" where a getter has one. Every answer
+/// is a `keyword()` or that empty string, so the caller gets a static string
+/// instead of an allocation per read
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
 pub(crate) fn reflect_enumerated<T: Enumerated>(
     raw: Option<&str>,
-    missing: &str,
-    invalid: &str,
-) -> String {
+    missing: Option<T>,
+    invalid: Option<T>,
+) -> &'static str {
     let Some(raw) = raw else {
-        return missing.to_owned();
+        return missing.map_or("", |value| value.keyword());
     };
-    T::parse(raw).map_or_else(|| invalid.to_owned(), |value| value.keyword().to_owned())
+    T::parse(raw)
+        .or(invalid)
+        .map_or("", |value| value.keyword())
 }
 
 enumerated! {
@@ -225,6 +233,12 @@ impl Enumerated for net::ReferrerPolicy {
 
     fn keyword(self) -> &'static str {
         net::ReferrerPolicy::keyword(self)
+    }
+
+    /// `net` owns this keyword set, so its parser is the one parser: the
+    /// header, the meta form, and reflection cannot drift.
+    fn parse(value: &str) -> Option<Self> {
+        net::ReferrerPolicy::parse(value)
     }
 }
 

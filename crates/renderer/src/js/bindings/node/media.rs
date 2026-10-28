@@ -90,10 +90,10 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
     fn get_preload(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<Preload>(
             content_attr(ctx, self.handle.0, "preload").as_deref(),
-            "auto",
-            "auto",
+            Some(Preload::Auto),
+            Some(Preload::Auto),
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-preload
@@ -105,10 +105,10 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
     fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<Loading>(
             content_attr(ctx, self.handle.0, "loading").as_deref(),
-            "eager",
-            "eager",
+            Some(Loading::Eager),
+            Some(Loading::Eager),
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading
@@ -308,10 +308,10 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     fn get_decoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<Decoding>(
             content_attr(ctx, self.handle.0, "decoding").as_deref(),
-            "auto",
-            "auto",
+            Some(Decoding::Auto),
+            Some(Decoding::Auto),
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decoding
@@ -324,10 +324,10 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     fn get_loading(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<Loading>(
             content_attr(ctx, self.handle.0, "loading").as_deref(),
-            "eager",
-            "eager",
+            Some(Loading::Eager),
+            Some(Loading::Eager),
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-loading

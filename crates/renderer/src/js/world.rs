@@ -309,8 +309,15 @@ impl RealmRegistry {
     }
 
     /// The next process-unique `WebDriver` element id.
+    ///
+    /// A page receives the id as a JS number, so it may not pass
+    /// [`crate::js::bridge::HostId::MAX`]
+    /// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>).
     pub(crate) fn allocate_remote(&mut self) -> u64 {
-        self.next_remote = self.next_remote.saturating_add(1);
+        self.next_remote = self
+            .next_remote
+            .saturating_add(1)
+            .min(crate::js::bridge::HostId::MAX);
         self.next_remote
     }
 
@@ -864,69 +871,62 @@ fn opaque_url_matches(
 
 #[cfg(test)]
 mod sandbox_flag_tests {
-    use super::SandboxFlags;
+    use super::{SandboxFlag, SandboxFlags};
 
     #[test]
     fn an_absent_attribute_sets_no_flags() {
-        assert!(!SandboxFlags::parse(None).contains(SandboxFlags::ORIGIN));
+        assert!(!SandboxFlags::parse(None).contains(SandboxFlag::Origin));
         assert!(!SandboxFlags::parse(None).scripts_disabled());
     }
 
     #[test]
     fn a_bare_sandbox_sets_every_flag_the_standard_lists() {
         let flags = SandboxFlags::parse(Some(""));
-        for flag in all_flags() {
-            assert!(flags.contains(flag), "flag {flag:#x} must be set");
+        for flag in SandboxFlag::ALL {
+            assert!(flags.contains(*flag), "flag {flag:?} must be set");
         }
-    }
-
-    /// Every flag one keyword can clear, from the one bit list the parser owns.
-    fn all_flags() -> impl Iterator<Item = u32> {
-        (0..u32::BITS)
-            .map(|bit| 1u32 << bit)
-            .filter(|flag| SandboxFlags::ALL & flag != 0)
     }
 
     #[test]
     fn every_keyword_clears_exactly_the_flags_the_standard_names() {
-        let expected: &[(&str, &[u32])] = &[
+        let expected: &[(&str, &[SandboxFlag])] = &[
             (
                 "allow-popups",
                 &[
-                    SandboxFlags::AUXILIARY_NAVIGATION,
-                    SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+                    SandboxFlag::AuxiliaryNavigation,
+                    SandboxFlag::CustomProtocolsNavigation,
                 ],
             ),
             (
                 "allow-top-navigation",
                 &[
-                    SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
-                    SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
-                    SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
+                    SandboxFlag::TopLevelNavigationWithoutUserActivation,
+                    SandboxFlag::TopLevelNavigationWithUserActivation,
+                    SandboxFlag::CustomProtocolsNavigation,
                 ],
             ),
             (
                 "allow-top-navigation-by-user-activation",
-                &[SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION],
+                &[SandboxFlag::TopLevelNavigationWithUserActivation],
             ),
-            ("allow-same-origin", &[SandboxFlags::ORIGIN]),
-            ("allow-forms", &[SandboxFlags::FORMS]),
-            ("allow-pointer-lock", &[SandboxFlags::POINTER_LOCK]),
+            ("allow-same-origin", &[SandboxFlag::Origin]),
+            ("allow-forms", &[SandboxFlag::Forms]),
+            ("allow-pointer-lock", &[SandboxFlag::PointerLock]),
             (
                 "allow-scripts",
-                &[SandboxFlags::SCRIPTS, SandboxFlags::AUTOMATIC_FEATURES],
+                &[SandboxFlag::Scripts, SandboxFlag::AutomaticFeatures],
             ),
             (
                 "allow-popups-to-escape-sandbox",
-                &[SandboxFlags::PROPAGATES_TO_AUXILIARY],
+                &[SandboxFlag::PropagatesToAuxiliary],
             ),
-            ("allow-modals", &[SandboxFlags::MODALS]),
-            ("allow-orientation-lock", &[SandboxFlags::ORIENTATION_LOCK]),
-            ("allow-presentation", &[SandboxFlags::PRESENTATION]),
-            ("allow-downloads", &[SandboxFlags::DOWNLOADS]),
+            ("allow-modals", &[SandboxFlag::Modals]),
+            ("allow-orientation-lock", &[SandboxFlag::OrientationLock]),
+            ("allow-presentation", &[SandboxFlag::Presentation]),
+            ("allow-downloads", &[SandboxFlag::Downloads]),
             (
                 "allow-top-navigation-to-custom-protocols",
-                &[SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION],
+                &[SandboxFlag::CustomProtocolsNavigation],
             ),
         ];
         for (keyword, cleared) in expected {
@@ -935,11 +935,11 @@ mod sandbox_flag_tests {
             // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
             for spelling in [(*keyword).to_owned(), keyword.to_ascii_uppercase()] {
                 let flags = SandboxFlags::parse(Some(&spelling));
-                for flag in all_flags() {
+                for flag in SandboxFlag::ALL {
                     assert_eq!(
-                        flags.contains(flag),
-                        !cleared.contains(&flag),
-                        "{spelling}: flag {flag:#x}"
+                        flags.contains(*flag),
+                        !cleared.contains(flag),
+                        "{spelling}: flag {flag:?}"
                     );
                 }
             }
@@ -953,18 +953,17 @@ mod sandbox_flag_tests {
                 "{keyword} is supported but not in this table"
             );
         }
-        // Every flag is either cleared by some keyword or is one of the two no
-        // keyword may clear, so a bit missing from `ALL` cannot hide behind a
-        // table that also says it is cleared.
-        let cleared: u32 = expected
-            .iter()
-            .flat_map(|(_, flags)| flags.iter().copied())
-            .fold(0, |all, flag| all | flag);
-        assert_eq!(
-            cleared | SandboxFlags::NAVIGATION | SandboxFlags::DOCUMENT_DOMAIN,
-            SandboxFlags::ALL,
-            "every flag is either clearable or one of the two no keyword clears"
-        );
+        // Every flag is either cleared by some keyword or one of the two no
+        // keyword may clear. A flag absent from this table is a flag the sandbox
+        // would never lift, which no feature could notice.
+        for flag in SandboxFlag::ALL {
+            let clearable = expected.iter().any(|(_, flags)| flags.contains(flag));
+            let always_set = matches!(flag, SandboxFlag::Navigation | SandboxFlag::DocumentDomain);
+            assert!(
+                clearable || always_set,
+                "{flag:?} is neither clearable nor always set"
+            );
+        }
     }
 
     /// `parse` reads the whole attribute, so a sandbox with two keywords sets
@@ -974,9 +973,9 @@ mod sandbox_flag_tests {
     fn a_sandbox_with_two_keywords_clears_both() {
         let flags = SandboxFlags::parse(Some("allow-scripts allow-forms"));
         assert!(!flags.scripts_disabled());
-        assert!(!flags.contains(SandboxFlags::FORMS));
+        assert!(!flags.contains(SandboxFlag::Forms));
         assert!(
-            flags.contains(SandboxFlags::ORIGIN),
+            flags.contains(SandboxFlag::Origin),
             "a keyword it does not name stays clear"
         );
     }
@@ -1103,6 +1102,97 @@ pub(crate) struct PolicyContainer {
     pub(crate) referrer_policy: Option<ReferrerPolicy>,
 }
 
+/// One flag in a sandboxing flag set
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing-flag-set>).
+///
+/// The enum is the only list: [`SandboxFlags::ALL`], the keyword table, and the
+/// oracle tests all read it, so a flag cannot exist as a bare bit nothing names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SandboxFlag {
+    /// `iframe sandbox`: no navigating any other browsing context.
+    Navigation,
+    /// `allow-popups`: creating new auxiliary browsing contexts.
+    AuxiliaryNavigation,
+    /// `allow-top-navigation`: navigating the top-level context without
+    /// transient activation.
+    TopLevelNavigationWithoutUserActivation,
+    /// `allow-top-navigation` or `allow-top-navigation-by-user-activation`:
+    /// navigating the top-level context with transient activation.
+    TopLevelNavigationWithUserActivation,
+    /// `allow-same-origin`: an opaque origin, no cookies or web storage.
+    Origin,
+    /// `allow-forms`: form submission.
+    Forms,
+    /// `allow-pointer-lock`.
+    PointerLock,
+    /// `allow-scripts`: script execution, event handler content attributes,
+    /// and `javascript:` navigations.
+    Scripts,
+    /// `allow-scripts`: features that trigger automatically, such as
+    /// declarative refresh, autoplay, and autofocus.
+    AutomaticFeatures,
+    /// The `document.domain` setter is always blocked while sandboxed.
+    DocumentDomain,
+    /// `allow-popups-to-escape-sandbox`: the sandbox propagates into
+    /// auxiliary contexts.
+    PropagatesToAuxiliary,
+    /// `allow-modals`.
+    Modals,
+    /// `allow-orientation-lock`.
+    OrientationLock,
+    /// `allow-presentation`.
+    Presentation,
+    /// `allow-downloads`.
+    Downloads,
+    /// `allow-top-navigation-to-custom-protocols`.
+    CustomProtocolsNavigation,
+}
+
+impl SandboxFlag {
+    /// Every flag, in bit order, so `parse` and the tests walk one list
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Navigation,
+        Self::AuxiliaryNavigation,
+        Self::TopLevelNavigationWithoutUserActivation,
+        Self::TopLevelNavigationWithUserActivation,
+        Self::Origin,
+        Self::Forms,
+        Self::PointerLock,
+        Self::Scripts,
+        Self::AutomaticFeatures,
+        Self::DocumentDomain,
+        Self::PropagatesToAuxiliary,
+        Self::Modals,
+        Self::OrientationLock,
+        Self::Presentation,
+        Self::Downloads,
+        Self::CustomProtocolsNavigation,
+    ];
+
+    /// This flag's bit.
+    const fn bit(self) -> u32 {
+        match self {
+            Self::Navigation => 1 << 0,
+            Self::AuxiliaryNavigation => 1 << 1,
+            Self::TopLevelNavigationWithoutUserActivation => 1 << 2,
+            Self::TopLevelNavigationWithUserActivation => 1 << 3,
+            Self::Origin => 1 << 4,
+            Self::Forms => 1 << 5,
+            Self::PointerLock => 1 << 6,
+            Self::Scripts => 1 << 7,
+            Self::AutomaticFeatures => 1 << 8,
+            Self::DocumentDomain => 1 << 9,
+            Self::PropagatesToAuxiliary => 1 << 10,
+            Self::Modals => 1 << 11,
+            Self::OrientationLock => 1 << 12,
+            Self::Presentation => 1 << 13,
+            Self::Downloads => 1 << 14,
+            Self::CustomProtocolsNavigation => 1 << 15,
+        }
+    }
+}
+
 /// A sandboxing flag set: the flags one `iframe` (and its ancestors) impose on
 /// the documents it loads, parsed from the `sandbox` content attribute
 /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing-flag-set>).
@@ -1114,103 +1204,61 @@ pub(crate) struct PolicyContainer {
 pub(crate) struct SandboxFlags(u32);
 
 impl SandboxFlags {
-    /// `iframe sandbox`: no navigating any other browsing context.
-    pub(crate) const NAVIGATION: u32 = 1 << 0;
-    /// `allow-popups`: creating new auxiliary browsing contexts.
-    pub(crate) const AUXILIARY_NAVIGATION: u32 = 1 << 1;
-    /// `allow-top-navigation`: navigating the top-level context without
-    /// transient activation.
-    pub(crate) const TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION: u32 = 1 << 2;
-    /// `allow-top-navigation` or `allow-top-navigation-by-user-activation`:
-    /// navigating the top-level context with transient activation.
-    pub(crate) const TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION: u32 = 1 << 3;
-    /// `allow-same-origin`: an opaque origin, no cookies or web storage.
-    pub(crate) const ORIGIN: u32 = 1 << 4;
-    /// `allow-forms`: form submission.
-    pub(crate) const FORMS: u32 = 1 << 5;
-    /// `allow-pointer-lock`.
-    const POINTER_LOCK: u32 = 1 << 6;
-    /// `allow-scripts`: script execution, event handler content attributes,
-    /// and `javascript:` navigations.
-    pub(crate) const SCRIPTS: u32 = 1 << 7;
-    /// `allow-scripts`: features that trigger automatically, such as
-    /// declarative refresh, autoplay, and autofocus.
-    pub(crate) const AUTOMATIC_FEATURES: u32 = 1 << 8;
-    /// The `document.domain` setter is always blocked while sandboxed.
-    const DOCUMENT_DOMAIN: u32 = 1 << 9;
-    /// `allow-popups-to-escape-sandbox`: the sandbox propagates into
-    /// auxiliary contexts.
-    const PROPAGATES_TO_AUXILIARY: u32 = 1 << 10;
-    /// `allow-modals`.
-    const MODALS: u32 = 1 << 11;
-    /// `allow-orientation-lock`.
-    const ORIENTATION_LOCK: u32 = 1 << 12;
-    /// `allow-presentation`.
-    const PRESENTATION: u32 = 1 << 13;
-    /// `allow-downloads`.
-    const DOWNLOADS: u32 = 1 << 14;
-    /// `allow-top-navigation-to-custom-protocols`.
-    const CUSTOM_PROTOCOLS_NAVIGATION: u32 = 1 << 15;
+    /// Every flag, so a bare `sandbox` can start from the full set.
+    const ALL: u32 = Self::bits(SandboxFlag::ALL);
 
-    /// Every flag bit above, so `parse` and the tests walk one list. A new
-    /// flag adds its bit here, next to its definition
-    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
-    pub(crate) const ALL: u32 = Self::NAVIGATION
-        | Self::AUXILIARY_NAVIGATION
-        | Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
-        | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
-        | Self::ORIGIN
-        | Self::FORMS
-        | Self::POINTER_LOCK
-        | Self::SCRIPTS
-        | Self::AUTOMATIC_FEATURES
-        | Self::DOCUMENT_DOMAIN
-        | Self::PROPAGATES_TO_AUXILIARY
-        | Self::MODALS
-        | Self::ORIENTATION_LOCK
-        | Self::PRESENTATION
-        | Self::DOWNLOADS
-        | Self::CUSTOM_PROTOCOLS_NAVIGATION;
+    const fn bits(flags: &[SandboxFlag]) -> u32 {
+        let mut bits = 0;
+        let mut index = 0;
+        while index < flags.len() {
+            bits |= flags[index].bit();
+            index += 1;
+        }
+        bits
+    }
 
     /// The `sandbox` keywords and the flags each one clears. This is the only
     /// list: [`Self::parse`] reads it and [`Self::supports`] answers from it,
     /// so a keyword cannot be advertised without taking effect
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-sandbox>).
-    const TOKENS: &[(&str, Self)] = &[
+    const TOKENS: &'static [(&'static str, &'static [SandboxFlag])] = &[
         (
             "allow-popups",
-            Self(Self::AUXILIARY_NAVIGATION | Self::CUSTOM_PROTOCOLS_NAVIGATION),
+            &[
+                SandboxFlag::AuxiliaryNavigation,
+                SandboxFlag::CustomProtocolsNavigation,
+            ],
         ),
         (
             "allow-top-navigation",
-            Self(
-                Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
-                    | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
-                    | Self::CUSTOM_PROTOCOLS_NAVIGATION,
-            ),
+            &[
+                SandboxFlag::TopLevelNavigationWithoutUserActivation,
+                SandboxFlag::TopLevelNavigationWithUserActivation,
+                SandboxFlag::CustomProtocolsNavigation,
+            ],
         ),
         (
             "allow-top-navigation-by-user-activation",
-            Self(Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION),
+            &[SandboxFlag::TopLevelNavigationWithUserActivation],
         ),
-        ("allow-same-origin", Self(Self::ORIGIN)),
-        ("allow-forms", Self(Self::FORMS)),
-        ("allow-pointer-lock", Self(Self::POINTER_LOCK)),
+        ("allow-same-origin", &[SandboxFlag::Origin]),
+        ("allow-forms", &[SandboxFlag::Forms]),
+        ("allow-pointer-lock", &[SandboxFlag::PointerLock]),
         (
             "allow-scripts",
-            Self(Self::SCRIPTS | Self::AUTOMATIC_FEATURES),
+            &[SandboxFlag::Scripts, SandboxFlag::AutomaticFeatures],
         ),
         (
             "allow-popups-to-escape-sandbox",
-            Self(Self::PROPAGATES_TO_AUXILIARY),
+            &[SandboxFlag::PropagatesToAuxiliary],
         ),
-        ("allow-modals", Self(Self::MODALS)),
-        ("allow-orientation-lock", Self(Self::ORIENTATION_LOCK)),
-        ("allow-presentation", Self(Self::PRESENTATION)),
-        ("allow-downloads", Self(Self::DOWNLOADS)),
+        ("allow-modals", &[SandboxFlag::Modals]),
+        ("allow-orientation-lock", &[SandboxFlag::OrientationLock]),
+        ("allow-presentation", &[SandboxFlag::Presentation]),
+        ("allow-downloads", &[SandboxFlag::Downloads]),
         (
             "allow-top-navigation-to-custom-protocols",
-            Self(Self::CUSTOM_PROTOCOLS_NAVIGATION),
+            &[SandboxFlag::CustomProtocolsNavigation],
         ),
     ];
 
@@ -1236,14 +1284,17 @@ impl SandboxFlags {
                 .iter()
                 .find(|(keyword, _)| keyword.eq_ignore_ascii_case(token))
             {
-                flags.0 &= !cleared.0;
+                for flag in *cleared {
+                    flags.0 &= !flag.bit();
+                }
             }
         }
         flags
     }
 
-    pub(crate) fn contains(self, flag: u32) -> bool {
-        self.0 & flag != 0
+    /// Whether `flag` is set.
+    pub(crate) fn contains(self, flag: SandboxFlag) -> bool {
+        self.0 & flag.bit() != 0
     }
 
     /// The union of two flag sets, which is how an `iframe`'s directive and the
@@ -1256,13 +1307,13 @@ impl SandboxFlags {
     /// Whether scripts are blocked
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-scripts-browsing-context-flag>).
     pub(crate) fn scripts_disabled(self) -> bool {
-        self.contains(Self::SCRIPTS)
+        self.contains(SandboxFlag::Scripts)
     }
 
     /// Whether this document gets a fresh opaque origin
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-origin-browsing-context-flag>).
     pub(crate) fn origin_is_opaque(self) -> bool {
-        self.contains(Self::ORIGIN)
+        self.contains(SandboxFlag::Origin)
     }
 
     /// The flags an auxiliary context this document opens inherits: the whole
@@ -1270,7 +1321,7 @@ impl SandboxFlags {
     /// `allow-popups-to-escape-sandbox`
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandbox-propagates-to-auxiliary-browsing-contexts-flag>).
     pub(crate) fn auxiliary_flags(self) -> Self {
-        if self.contains(Self::PROPAGATES_TO_AUXILIARY) {
+        if self.contains(SandboxFlag::PropagatesToAuxiliary) {
             self
         } else {
             Self::default()
@@ -2256,7 +2307,9 @@ impl World {
     /// (`allow-popups`)
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxed-auxiliary-navigation-browsing-context-flag>).
     pub(crate) fn allows_auxiliary_navigation(&self) -> bool {
-        !self.sandbox.contains(SandboxFlags::AUXILIARY_NAVIGATION)
+        !self
+            .sandbox
+            .contains(crate::js::world::SandboxFlag::AuxiliaryNavigation)
     }
 
     /// Opens an auxiliary top-level browsing context, or returns the one a

@@ -77,17 +77,17 @@ fn rule_path(path: &str) -> Option<Vec<usize>> {
 }
 
 fn sheet_id(id: f64) -> Option<u64> {
-    crate::js::bridge::host_index(id)
+    crate::js::bridge::HostId::parse(id)
+        .map(crate::js::bridge::HostId::get)
         .filter(|id| *id >= 1)
-        .map(u64::from)
 }
 
 /// Web IDL `unsigned long` already applied on the JS side (`index >>> 0`).
 /// A value that is not that integer is a caller bug, not index 0
 /// (<https://webidl.spec.whatwg.org/#idl-unsigned-long>).
 fn rule_index(ctx: &Ctx<'_>, index: f64) -> Result<usize> {
-    crate::js::bridge::host_index(index)
-        .and_then(|index| usize::try_from(index).ok())
+    crate::js::bridge::HostId::parse(index)
+        .and_then(|index| usize::try_from(index.get()).ok())
         .ok_or_else(|| Exception::throw_type(ctx, "invalid rule index"))
 }
 

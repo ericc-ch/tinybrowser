@@ -111,25 +111,44 @@ pub(crate) fn object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
         .restore(ctx)
 }
 
-/// A JS number that names a host id: a finite integer in `0..=u32::MAX`, the
-/// range every id this engine hands to script fits in.
-#[must_use]
-pub(crate) fn host_index(value: f64) -> Option<u32> {
-    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > f64::from(u32::MAX) {
-        return None;
+/// One id this engine mints for script.
+///
+/// The engine keys its maps with `u64` counters, and a page receives an id as a
+/// JS number, which holds integers exactly only up to `2^53 - 1`
+/// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>). Both facts live
+/// here: [`Self::MAX`] is the JS bound, and parsing a number yields an id or
+/// nothing, so no caller narrows to `u32` or widens back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct HostId(u64);
+
+impl HostId {
+    /// The largest id a JS number carries exactly, `Number.MAX_SAFE_INTEGER`.
+    pub(crate) const MAX: u64 = (1 << 53) - 1;
+
+    /// The id as the `u64` the engine's maps are keyed by.
+    pub(crate) fn get(self) -> u64 {
+        self.0
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the guard admits exactly the integers 0..=u32::MAX"
-    )]
-    Some(value as u32)
+
+    /// Parses one id from the number a binding received.
+    pub(crate) fn parse(value: f64) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the guards admit exactly the integers 0..=Number.MAX_SAFE_INTEGER"
+        )]
+        let raw = value as u64;
+        (raw <= Self::MAX).then_some(Self(raw))
+    }
 }
 
 /// A JS number naming a frame, or `None` when it is not a host id.
 #[must_use]
 pub(crate) fn frame_id(value: f64) -> Option<crate::protocol::FrameId> {
-    host_index(value).map(|raw| crate::protocol::FrameId::new(u64::from(raw)))
+    HostId::parse(value).map(|id| crate::protocol::FrameId::new(id.get()))
 }
 
 pub(crate) fn evaluate(ctx: &Ctx<'_>, source: &str) -> Result<()> {
@@ -157,4 +176,34 @@ pub(crate) fn evaluate_page(ctx: Ctx<'_>, source: String) -> Result<Value<'_>> {
     let mut options = EvalOptions::default();
     options.strict = false;
     ctx.eval_with_options(source, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostId;
+
+    #[test]
+    fn a_host_id_is_a_js_integer_the_engine_can_key() {
+        assert_eq!(HostId::parse(0.0).map(HostId::get), Some(0));
+        assert_eq!(HostId::parse(7.0).map(HostId::get), Some(7));
+        assert_eq!(
+            HostId::parse(9_007_199_254_740_991.0).map(HostId::get),
+            Some(HostId::MAX),
+            "the largest exact JS integer is a host id"
+        );
+        assert_eq!(
+            HostId::parse(f64::from(u32::MAX) * 10.0).map(HostId::get),
+            Some(u64::from(u32::MAX) * 10),
+            "an id past u32 is still exact in a JS number"
+        );
+        for rejected in [
+            -1.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            9_007_199_254_740_992.0, // 2^53, one past MAX
+        ] {
+            assert_eq!(HostId::parse(rejected), None, "{rejected}");
+        }
+    }
 }
