@@ -30,7 +30,7 @@ use crate::dom::insertion::{
 };
 use crate::dom::tree::{
     BlitzId, NodeId, ancestor_chain, child_ids, element_node_name, is_connected, is_element,
-    is_html_element, is_real_element, root_of, sibling, tree_order,
+    is_html_element, root_of, sibling, tree_order,
 };
 
 use crate::documents::JournalEntry;
@@ -936,20 +936,8 @@ impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js>
 impl JsNode {
     pub(super) fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
         // https://dom.spec.whatwg.org/#dom-node-nodetype
-        // Fragment backings are elements flagged in the document's fragment
-        // set. A shadow root is a fragment node too
+        // A shadow root is a fragment node too
         // (<https://dom.spec.whatwg.org/#interface-shadowroot>).
-        let world = world(ctx)?;
-        let is_fragment = world
-            .borrow()
-            .document(self.handle.0)
-            .map(|parsed| parsed.document.is_fragment(self.handle.0.node));
-        let Some(is_fragment) = is_fragment else {
-            return Err(Exception::throw_type(ctx, "stale node"));
-        };
-        if is_fragment {
-            return Ok(11);
-        }
         with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(_)) => Ok(1),
             Some(NodeData::Text(_)) => Ok(3),
@@ -969,17 +957,6 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name
     pub(super) fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let uppercase = document_is_html_content(ctx, self.handle.0);
-        let world = world(ctx)?;
-        let special = world.borrow().document(self.handle.0).and_then(|parsed| {
-            if parsed.document.is_fragment(self.handle.0.node) {
-                Some("#document-fragment".to_owned())
-            } else {
-                None
-            }
-        });
-        if let Some(name) = special {
-            return rquickjs::String::from_str(ctx.clone(), &name);
-        }
         let name = with_node_data(ctx, self.handle.0, |data| match data {
             Some(NodeData::Element(element)) => Ok(element_node_name(&element.name, uppercase)),
             Some(NodeData::Text(_)) => Ok("#text".into()),
@@ -1508,7 +1485,7 @@ impl JsNode {
                 .base
                 .get_node(self.handle.0.node)
                 .and_then(|node| node.parent)
-                .filter(|parent| is_real_element(&parsed.document, *parent))
+                .filter(|parent| is_element(&parsed.document.base, *parent))
                 .map(|parent| NodeId {
                     document: parsed.id,
                     node: parent,
@@ -1876,9 +1853,7 @@ pub(super) fn insertion_excluding_children(
             .document(parent)
             .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
         let base = &parsed.document.base;
-        // Only documents, elements, and fragments can be parents. Fragment
-        // backings are plain elements, so fragments are covered by the
-        // element case.
+        // Only documents, elements, and fragments can be parents.
         // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
         let parent_is_document = base.root_node().id == parent.node;
         let parent_is_fragment = base.get_node(parent.node).is_some_and(|node| {
@@ -2057,8 +2032,7 @@ pub(in crate::js::bindings) fn compare_node_position(
     )
 }
 
-/// Whether `node` is a `DocumentFragment` backing (a detached element
-/// flagged in the document's fragment set, never a stray `div`).
+/// Whether `node` is a `DocumentFragment`.
 pub(super) fn tree_is_fragment(ctx: &Ctx<'_>, node: NodeId) -> bool {
     world_for_node(ctx, node)
         .ok()
@@ -2082,7 +2056,7 @@ pub(super) fn tree_children(ctx: &Ctx<'_>, node: NodeId) -> Result<Vec<NodeId>> 
 }
 
 /// Same-document insert returns `node`. A node from another document adopts
-/// into the parent's document, preserving fragment backings as fragments
+/// into the parent's document, preserving fragments as fragments
 /// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
 pub(in crate::js::bindings) fn adopt_node(
     ctx: &Ctx<'_>,
@@ -2362,8 +2336,8 @@ pub(super) fn insert_tree_node_inner(
                 .document
                 .base
                 .get_node(node.node)
-                .map(|backing| {
-                    backing
+                .map(|contents| {
+                    contents
                         .children
                         .iter()
                         .map(|child| NodeId {

@@ -289,16 +289,21 @@ impl NetworkHost for HostServices {
         })
     }
 
-    fn dial_read(&self, stream: u64) -> Result<Option<Vec<u8>>, renderer::DialFailure> {
-        match self.call(ServiceCall::Network(NetworkCall::DialRead { id: stream })) {
+    fn dial_read(
+        &self,
+        stream: renderer::StreamId,
+    ) -> Result<Option<Vec<u8>>, renderer::DialFailure> {
+        match self.call(ServiceCall::Network(NetworkCall::DialRead {
+            id: stream.get(),
+        })) {
             Some(ServiceReply::StreamChunk(result)) => result,
             _ => Err(renderer::DialFailure::Connect),
         }
     }
 
-    fn cancel_stream(&self, stream: u64) {
+    fn cancel_stream(&self, stream: renderer::StreamId) {
         let _result = self.call(ServiceCall::Network(NetworkCall::CancelStream {
-            id: stream,
+            id: stream.get(),
         }));
     }
 

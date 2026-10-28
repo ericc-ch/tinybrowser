@@ -360,16 +360,10 @@ pub(crate) fn sibling(
     }
 }
 
-/// Whether `id` is an element node (including fragment backings, which are
-/// flagged elements).
+/// Whether `id` is an element node.
 pub(crate) fn is_element(base: &blitz_dom::BaseDocument, id: BlitzId) -> bool {
     base.get_node(id)
         .is_some_and(|node| matches!(node.data, NodeData::Element(_)))
-}
-
-/// Whether `id` is an element that is not a fragment backing.
-pub(crate) fn is_real_element(doc: &crate::documents::BlitzDocument, id: BlitzId) -> bool {
-    !doc.is_fragment(id) && is_element(&doc.base, id)
 }
 
 /// The root of the tree `id` participates in (itself when detached).

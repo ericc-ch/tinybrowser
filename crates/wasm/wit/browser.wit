@@ -25,6 +25,15 @@ interface types {
         frame-load,
     }
 
+    /// How a dial's response body is delivered
+    /// (<https://fetch.spec.whatwg.org/#concept-response-body>).
+    enum body-delivery {
+        /// The whole body arrives with the response.
+        buffered,
+        /// The page asked for a progressive body.
+        streamed,
+    }
+
     record fetch-request {
         /// Correlates this exchange with its completion. Unique within the
         /// component instance, and reused for nothing else.
@@ -38,8 +47,12 @@ interface types {
         url: string,
         /// Document URL the dial started from.
         initiator: string,
-        /// When false, only status and metadata are used.
-        read-body: bool,
+        /// How the component wants the response body delivered.
+        ///
+        /// This host answers with the whole body in `fetch-response.body`, so
+        /// both members come back complete; `stream` records that the page
+        /// asked for a progressive body the host cannot provide.
+        delivery: body-delivery,
         /// Hard cap on `fetch-response.body`; a larger body is `limit`.
         max-body-bytes: u64,
         /// Value for the `Cookie` request header of this exchange.

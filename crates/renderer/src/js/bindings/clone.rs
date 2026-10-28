@@ -157,8 +157,8 @@ fn adopted_children(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<NodeId>> {
                     .document
                     .base
                     .get_node(fragment)
-                    .map(|backing| {
-                        backing
+                    .map(|contents| {
+                        contents
                             .children
                             .iter()
                             .copied()

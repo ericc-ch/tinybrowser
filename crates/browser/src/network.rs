@@ -12,7 +12,10 @@ use net::{
     Agent, AgentOptions, InitiatorKind, Method, Request, UserAgent, isomorphic_decode,
     isomorphic_encode,
 };
-use renderer::{BodyDelivery, DialFailure, DialKind, DialOutcome, DialRequest, RequestCache};
+use renderer::{
+    BodyDelivery, DialFailure, DialKind, DialOutcome, DialRequest, RequestCache, ResponseBody,
+    StreamId,
+};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
@@ -69,7 +72,7 @@ impl Drop for KeepaliveReservation {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
-    method: String,
+    method: net::Method,
     url: String,
     credentials: String,
     initiator: String,
@@ -128,13 +131,13 @@ fn insert_cached(
     key: CacheKey,
     entry: CachedResponse,
 ) {
-    let body_len = entry.outcome.body.as_ref().map_or(0, Vec::len);
+    let body_len = entry.outcome.body.bytes().map_or(0, <[u8]>::len);
     if body_len > renderer::MAX_RESPONSE_BODY_BYTES {
         return;
     }
     let mut total = cache
         .values()
-        .map(|entry| entry.outcome.body.as_ref().map_or(0, Vec::len))
+        .map(|entry| entry.outcome.body.bytes().map_or(0, <[u8]>::len))
         .sum::<usize>();
     while cache.len() >= CACHE_MAX_ENTRIES || total.saturating_add(body_len) > CACHE_MAX_BYTES {
         let Some(oldest) = cache
@@ -145,7 +148,7 @@ fn insert_cached(
             break;
         };
         if let Some(removed) = cache.remove(&oldest) {
-            total = total.saturating_sub(removed.outcome.body.as_ref().map_or(0, Vec::len));
+            total = total.saturating_sub(removed.outcome.body.bytes().map_or(0, <[u8]>::len));
         }
     }
     cache.insert(key, entry);
@@ -160,18 +163,13 @@ enum StreamMessage {
 /// Chunks a body task may buffer ahead of the renderer's next read.
 const STREAM_CHUNK_DEPTH: usize = 16;
 
-struct StreamState {
-    rx: tokio::sync::mpsc::Receiver<StreamMessage>,
-}
-
-#[derive(Clone)]
 struct StreamEntry {
     owner: RendererAssignmentId,
-    state: Arc<tokio::sync::Mutex<StreamState>>,
-    task: Arc<tokio::task::JoinHandle<()>>,
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<StreamMessage>>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-type StreamMap = Arc<Mutex<HashMap<u64, StreamEntry>>>;
+type StreamMap = Arc<Mutex<HashMap<StreamId, StreamEntry>>>;
 
 fn cache_key(request: &DialRequest, initiator: &Url, partition: RendererAssignmentId) -> CacheKey {
     CacheKey {
@@ -204,58 +202,61 @@ fn response_forbids_storage(outcome: &DialOutcome) -> bool {
 }
 
 fn vary_matches(entry: &CachedResponse, request: &DialRequest) -> bool {
-    let request_header = |name: &str| {
-        request
+    let vary = net::get_decode_split_decoded(
+        entry
+            .outcome
             .headers
             .iter()
-            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        "vary",
+    );
+    let Some(vary) = vary else {
+        return true;
     };
-    entry
-        .outcome
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
-        .flat_map(|(_, value)| value.split(','))
-        .map(str::trim)
-        .filter(|field| !field.is_empty())
-        .all(|field| {
-            if field == "*" {
-                return false;
-            }
-            let stored = entry
-                .request_headers
-                .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case(field))
-                .map(|(_, value)| value.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            stored == request_header(field)
-        })
+    vary.iter().filter(|field| !field.is_empty()).all(|field| {
+        if field == "*" {
+            return false;
+        }
+        let stored = combined_request_header(&entry.request_headers, field);
+        stored == combined_request_header(&request.headers, field)
+    })
+}
+
+/// Every value of `name` in a decoded header list joined with `", "`, the way
+/// getting a header does
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get>).
+fn combined_request_header(headers: &[(String, String)], name: &str) -> Option<String> {
+    net::combined_header(
+        headers
+            .iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str()),
+    )
 }
 
 fn fresh(entry: &CachedResponse) -> bool {
     let age = entry.stored_at.elapsed().as_secs();
     let mut saw_max_age = false;
-    for (name, value) in &entry.outcome.headers {
-        if !name.eq_ignore_ascii_case("cache-control") {
+    let cache_control = net::get_decode_split_decoded(
+        entry
+            .outcome
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        "cache-control",
+    );
+    for directive in cache_control.iter().flatten() {
+        let Some((name, value)) = directive.split_once('=') else {
             continue;
-        }
-        for directive in value.split(',') {
-            let Some((name, value)) = directive.trim().split_once('=') else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case("max-age") {
-                saw_max_age = true;
-                if value
-                    .trim()
-                    .parse::<u64>()
-                    .is_ok_and(|max_age| age <= max_age)
-                {
-                    return true;
-                }
+        };
+        if name.eq_ignore_ascii_case("max-age") {
+            saw_max_age = true;
+            if value
+                .trim_matches([' ', '\t'])
+                .parse::<u64>()
+                .is_ok_and(|max_age| age <= max_age)
+            {
+                return true;
             }
         }
     }
@@ -331,21 +332,20 @@ fn response_head(request: &DialRequest, response: &net::Response) -> DialOutcome
         },
         content_type: content_type_header(response.headers()),
         headers,
-        body: Ok(Vec::new()),
+        body: ResponseBody::Buffered(Ok(Vec::new())),
         response_type,
         crossed_origin: response.crossed_origin(),
         redirect_count: response.redirect_count(),
         referrer: response.referrer().map(ToString::to_string),
-        stream: None,
     }
 }
 
 fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: RequestCache) -> bool {
     request.kind == DialKind::JsFetch
         && !has_page_conditional(request)
-        && request.method.eq_ignore_ascii_case("GET")
+        && request.method == net::Method::GET
         && (200..300).contains(&outcome.status)
-        && outcome.body.is_ok()
+        && outcome.body.bytes().is_some()
         // An opaque response has no readable body and cannot satisfy a later
         // CORS request, so keeping it only creates a response-type mismatch.
         && !outcome.response_type.is_opaque()
@@ -635,7 +635,6 @@ impl TabNetworkHandle {
                     Ok(*outcome)
                 }
                 DialHead::Response { response, permits } => match request.delivery {
-                    BodyDelivery::Discard => Ok(response_head(request, &response)),
                     BodyDelivery::Buffer => {
                         let _permits = permits;
                         let mut outcome = response_head(request, &response);
@@ -643,14 +642,14 @@ impl TabNetworkHandle {
                         if !outcome.response_type.is_opaque() {
                             let mut reader =
                                 BodyReader::new(*response, request.integrity.clone(), true).await;
-                            outcome.body = loop {
+                            outcome.body = ResponseBody::Buffered(loop {
                                 match reader.next().await {
                                     BodyEvent::Chunk(_) => {}
                                     BodyEvent::Done(body) => break Ok(body),
                                     BodyEvent::DecodeError => break Err(renderer::BodyError),
                                     BodyEvent::Failed(failure) => return Err(failure),
                                 }
-                            };
+                            });
                         }
                         self.remember_response(request, initiator, owner, mode, &outcome);
                         Ok(outcome)
@@ -682,9 +681,10 @@ impl TabNetworkHandle {
         let tab = Self::acquire(&self.tab, deadline).await?;
         let mut outbound = self.build_outbound(request, initiator, deadline)?;
         if let Some(etag) = etag {
+            let encoded = isomorphic_encode(etag).ok_or(DialFailure::Connect)?;
             outbound
                 .headers
-                .insert("If-None-Match", etag.as_bytes().to_vec())
+                .insert("If-None-Match", encoded)
                 .map_err(|_| DialFailure::Connect)?;
         }
         let blocked_redirect = watch_redirects(request, initiator, &mut outbound);
@@ -732,23 +732,22 @@ impl TabNetworkHandle {
             return outcome;
         }
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHUNK_DEPTH);
-        let writer = StreamWriter {
-            store: should_store(request, &outcome, mode),
-            stored: outcome.clone(),
+        let store = should_store(request, &outcome, mode).then(|| PendingStore {
+            outcome: outcome.clone(),
             cache: Arc::clone(&self.cache),
-            cache_key: cache_key(request, initiator, owner),
+            key: cache_key(request, initiator, owner),
             request_headers: request.headers.clone(),
-            kind: request.kind,
-            url: request.url.clone(),
-        };
-        let task = Arc::new(spawn_stream_body(
+        });
+        let task = spawn_stream_body(
             response,
             request.integrity.clone(),
-            writer,
+            store,
             permits,
+            request.kind,
+            request.url.clone(),
             tx,
-        ));
-        let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        );
+        let id = StreamId::new(self.next_stream.fetch_add(1, Ordering::Relaxed));
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -756,33 +755,31 @@ impl TabNetworkHandle {
                 id,
                 StreamEntry {
                     owner,
-                    state: Arc::new(tokio::sync::Mutex::new(StreamState { rx })),
+                    rx: Arc::new(tokio::sync::Mutex::new(rx)),
                     task,
                 },
             );
-        outcome.stream = Some(id);
+        outcome.body = ResponseBody::Streamed(id);
         outcome
     }
 
     pub(crate) async fn read_stream(
         &self,
         owner: RendererAssignmentId,
-        id: u64,
+        id: StreamId,
     ) -> Result<Option<Vec<u8>>, DialFailure> {
-        let Some(entry) = self
+        let rx = self
             .streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&id)
-            .cloned()
-        else {
+            .filter(|entry| entry.owner == owner)
+            .map(|entry| Arc::clone(&entry.rx));
+        let Some(rx) = rx else {
             return Ok(None);
         };
-        if entry.owner != owner {
-            return Ok(None);
-        }
-        let mut state = entry.state.lock().await;
-        match state.rx.recv().await {
+        let mut rx = rx.lock().await;
+        match rx.recv().await {
             Some(StreamMessage::Chunk(bytes)) => Ok(Some(bytes)),
             Some(StreamMessage::End) | None => {
                 self.remove_stream(id);
@@ -795,19 +792,19 @@ impl TabNetworkHandle {
         }
     }
 
-    pub(crate) fn cancel_stream(&self, owner: RendererAssignmentId, id: u64) {
-        let matches_owner = self
+    pub(crate) fn cancel_stream(&self, owner: RendererAssignmentId, id: StreamId) {
+        let mut streams = self
             .streams
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-            .is_some_and(|entry| entry.owner == owner);
-        if matches_owner {
-            self.remove_stream(id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if streams.get(&id).is_some_and(|entry| entry.owner == owner)
+            && let Some(entry) = streams.remove(&id)
+        {
+            entry.task.abort();
         }
     }
 
-    fn remove_stream(&self, id: u64) {
+    fn remove_stream(&self, id: StreamId) {
         let entry = self
             .streams
             .lock()
@@ -821,17 +818,16 @@ impl TabNetworkHandle {
     /// Aborts every stream an assignment owns, so a released renderer leaves
     /// no body task reading into memory for nobody.
     pub(crate) fn release_streams(&self, owner: RendererAssignmentId) {
-        let ids: Vec<u64> = self
-            .streams
+        self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(_, entry)| entry.owner == owner)
-            .map(|(&id, _)| id)
-            .collect();
-        for id in ids {
-            self.remove_stream(id);
-        }
+            .retain(|_, entry| {
+                let keep = entry.owner != owner;
+                if !keep {
+                    entry.task.abort();
+                }
+                keep
+            });
     }
 
     fn cache_read(
@@ -871,8 +867,8 @@ impl TabNetworkHandle {
         entry
             .outcome
             .body
-            .as_ref()
-            .is_ok_and(|body| renderer::integrity_verifies(integrity, body))
+            .bytes()
+            .is_some_and(|body| renderer::integrity_verifies(integrity, body))
     }
 
     fn cached_hit(
@@ -1053,14 +1049,9 @@ fn outbound_request(
     sheets: &HashSet<Url>,
 ) -> Result<Request, DialFailure> {
     let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
-    let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
+    let method = request.method.clone();
     // https://fetch.spec.whatwg.org/#forbidden-method
-    if request.kind == DialKind::JsFetch
-        && matches!(
-            method.as_str().to_ascii_uppercase().as_str(),
-            "CONNECT" | "TRACE" | "TRACK"
-        )
-    {
+    if request.kind == DialKind::JsFetch && method.is_forbidden() {
         return Err(DialFailure::Connect);
     }
     // A `no-cors` request may only use CORS-safelisted methods and headers:
@@ -1109,10 +1100,7 @@ fn outbound_request(
         DialKind::FrameLoad => "iframe",
         DialKind::CspReport => "report",
     };
-    outbound
-        .headers
-        .insert("Sec-Fetch-Dest", destination.as_bytes().to_vec())
-        .map_err(|_| DialFailure::Connect)?;
+    static_header(&mut outbound, "Sec-Fetch-Dest", destination);
     if request.kind == DialKind::JsFetch {
         let mode = request
             .cors
@@ -1122,10 +1110,7 @@ fn outbound_request(
                 net::cors::RequestMode::SameOrigin => "same-origin",
                 net::cors::RequestMode::Cors | net::cors::RequestMode::Navigate => "cors",
             });
-        outbound
-            .headers
-            .insert("Sec-Fetch-Mode", mode.as_bytes().to_vec())
-            .map_err(|_| DialFailure::Connect)?;
+        static_header(&mut outbound, "Sec-Fetch-Mode", mode);
     }
     if !request.body.is_empty() {
         outbound.body = Some(request.body.clone());
@@ -1199,14 +1184,12 @@ fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
     };
 }
 
-struct StreamWriter {
-    store: bool,
-    stored: DialOutcome,
+/// The cache write a streamed body performs once its bytes are complete.
+struct PendingStore {
+    outcome: DialOutcome,
     cache: ResponseCache,
-    cache_key: CacheKey,
+    key: CacheKey,
     request_headers: Vec<(String, String)>,
-    kind: DialKind,
-    url: String,
 }
 
 /// One event from [`BodyReader`].
@@ -1272,22 +1255,15 @@ impl BodyReader {
 fn spawn_stream_body(
     response: net::Response,
     integrity: Option<String>,
-    writer: StreamWriter,
+    store: Option<PendingStore>,
     permits: DialPermits,
+    kind: DialKind,
+    url: String,
     tx: tokio::sync::mpsc::Sender<StreamMessage>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let _permits = permits;
-        let StreamWriter {
-            store,
-            stored,
-            cache,
-            cache_key,
-            request_headers,
-            kind,
-            url,
-        } = writer;
-        let collect = store || integrity.is_some();
+        let collect = store.is_some() || integrity.is_some();
         let mut reader = BodyReader::new(response, integrity, collect).await;
         loop {
             match reader.next().await {
@@ -1297,11 +1273,14 @@ fn spawn_stream_body(
                     }
                 }
                 BodyEvent::Done(body) => {
-                    if store {
-                        let mut stored = stored;
-                        stored.body = Ok(body);
-                        stored.stream = None;
-                        store_response(&cache, cache_key, stored, request_headers);
+                    if let Some(mut store) = store {
+                        store.outcome.body = ResponseBody::Buffered(Ok(body));
+                        store_response(
+                            &store.cache,
+                            store.key,
+                            store.outcome,
+                            store.request_headers,
+                        );
                     }
                     let _ = tx.send(StreamMessage::End).await;
                     logging::trace!(target: "browser::net", "stream done {kind:?} {url}");
@@ -1360,12 +1339,11 @@ fn refused_redirect(blocked: &std::sync::Mutex<Option<Url>>) -> Option<DialOutco
         final_url: url.to_string(),
         content_type: None,
         headers: Vec::new(),
-        body: Ok(Vec::new()),
+        body: ResponseBody::Buffered(Ok(Vec::new())),
         response_type: net::cors::ResponseType::Basic,
         crossed_origin: false,
         redirect_count: 0,
         referrer: None,
-        stream: None,
     })
 }
 
@@ -1393,16 +1371,16 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
 /// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>,
 /// <https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
 fn chrome_navigation_request(request: &mut Request, url: &Url) {
-    identity_header(request, "Upgrade-Insecure-Requests", "1");
-    identity_header(
+    static_header(request, "Upgrade-Insecure-Requests", "1");
+    static_header(
         request,
         "Accept",
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     );
-    identity_header(request, "Sec-Fetch-Site", "none");
-    identity_header(request, "Sec-Fetch-Mode", "navigate");
-    identity_header(request, "Sec-Fetch-User", "?1");
-    identity_header(request, "Sec-Fetch-Dest", "document");
+    static_header(request, "Sec-Fetch-Site", "none");
+    static_header(request, "Sec-Fetch-Mode", "navigate");
+    static_header(request, "Sec-Fetch-User", "?1");
+    static_header(request, "Sec-Fetch-Dest", "document");
     if net::is_potentially_trustworthy(url) {
         for (name, value) in [
             ("Sec-CH-UA", crate::SEC_CH_UA),
@@ -1413,20 +1391,21 @@ fn chrome_navigation_request(request: &mut Request, url: &Url) {
                 crate::SEC_CH_PREFERS_COLOR_SCHEME,
             ),
         ] {
-            identity_header(request, name, value);
+            static_header(request, name, value);
         }
     }
 }
 
-fn identity_header(request: &mut Request, name: &str, value: &str) {
+fn static_header(request: &mut Request, name: &str, value: &str) {
     request
         .headers
         .insert(name, value)
         .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes");
 }
 
-/// Every `Content-Type` value from the response as one string: the values
-/// joined with `", "`, each byte the same code point
+/// Every `Content-Type` value from the response as one string, the way
+/// getting a list header does: values combined with `", "`, each byte the
+/// same code point, empty members dropped
 /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>,
 /// <https://infra.spec.whatwg.org/#isomorphic-decode>). The renderer extracts
 /// the MIME type from it
@@ -1436,7 +1415,7 @@ fn content_type_header(headers: &net::HeaderMap) -> Option<String> {
         .get_all("content-type")
         .map(isomorphic_decode)
         .collect();
-    (!values.is_empty()).then(|| values.join(", "))
+    net::combined_header(values.iter().map(String::as_str))
 }
 
 #[cfg(test)]
@@ -1450,7 +1429,7 @@ mod tests {
             url: url.to_owned(),
             initiator: "http://a.test/page".to_owned(),
             delivery: BodyDelivery::Buffer,
-            method: "GET".to_owned(),
+            method: net::Method::GET,
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
@@ -1479,12 +1458,11 @@ mod tests {
                 final_url: "http://a.test/".to_owned(),
                 content_type: None,
                 headers: Vec::new(),
-                body: Ok(Vec::new()),
+                body: ResponseBody::Buffered(Ok(Vec::new())),
                 response_type,
                 crossed_origin: false,
                 redirect_count: 0,
                 referrer: None,
-                stream: None,
             },
             stored_at: Instant::now(),
             request_headers: Vec::new(),
@@ -1639,7 +1617,7 @@ mod tests {
             .dial_request(&stream_request, &initiator, owner)
             .await
             .expect("stream head");
-        let stream = outcome.stream.expect("stream id");
+        let stream = outcome.stream().expect("stream id");
         assert_eq!(
             handle.permits.global.available_permits(),
             0,
@@ -1667,7 +1645,13 @@ mod tests {
         .await
         .expect("the next dial gets the released permit")
         .expect("next dial");
-        assert_eq!(next.body.expect("body"), b"ok");
+        assert_eq!(
+            next.body
+                .into_bytes()
+                .expect("buffered body")
+                .expect("body"),
+            b"ok"
+        );
         server.abort();
     }
 
@@ -1728,7 +1712,8 @@ mod tests {
             .collect();
         for (index, key) in keys.iter().enumerate() {
             let mut entry = cached(net::cors::ResponseType::Basic);
-            entry.outcome.body = Ok(vec![0; renderer::MAX_RESPONSE_BODY_BYTES]);
+            entry.outcome.body =
+                ResponseBody::Buffered(Ok(vec![0; renderer::MAX_RESPONSE_BODY_BYTES]));
             entry.stored_at =
                 Instant::now() + Duration::from_secs(u64::try_from(index).expect("entry index"));
             insert_cached(&mut cache, key.clone(), entry);

@@ -1141,8 +1141,7 @@ fn parent_of(ctx: &Ctx<'_>, base: &blitz_dom::BaseDocument, id: NodeId) -> Resul
 }
 
 /// Reject a `surroundContents` parent that can never hold the contents:
-/// documents, doctypes, and fragments (including fragment backings, which
-/// are plain elements in the arena), before any mutation
+/// documents, doctypes, and fragments, before any mutation
 /// (<https://dom.spec.whatwg.org/#dom-range-surroundcontents>).
 fn check_surround_parent(ctx: &Ctx<'_>, new_parent: NodeId) -> Result<()> {
     let world_rc = world(ctx)?;

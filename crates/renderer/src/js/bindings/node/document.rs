@@ -1788,7 +1788,7 @@ pub(in crate::js::bindings) fn parse_html_fragment_snapshots(
                         scratch
                             .base
                             .get_node(fragment)
-                            .map(|backing| backing.children.iter().copied().collect())
+                            .map(|node| node.children.iter().copied().collect())
                     })
                     .unwrap_or_default()
             }

@@ -207,7 +207,7 @@ fn atob<'js>(ctx: Ctx<'js>, input: Value<'js>) -> Result<Option<String>> {
         return Ok(None);
     };
     let decoded = data_url::forgiving_base64::decode_to_vec(&bytes).ok();
-    Ok(decoded.map(|bytes| latin1_from_bytes(&bytes)))
+    Ok(decoded.map(|bytes| net::isomorphic_decode(&bytes)))
 }
 
 /// Latin-1-only `btoa`
@@ -302,8 +302,4 @@ fn reserve_output(decoder: &mut encoding_rs::Decoder, output: &mut String, remai
             .unwrap_or(remaining.saturating_mul(3))
             .max(4),
     );
-}
-
-fn latin1_from_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| char::from(*byte)).collect()
 }

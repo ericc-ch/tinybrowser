@@ -2071,8 +2071,11 @@ impl JsNode {
             let Some(node) = base.get_node(container.node) else {
                 return Err(Exception::throw_type(ctx, "stale node"));
             };
-            if !parsed.document.is_fragment(container.node)
-                && node.data.downcast_element().is_none()
+            // `innerHTML` belongs to `Element` and `ShadowRoot`, not to the
+            // other fragment kinds
+            // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml>).
+            if node.data.downcast_element().is_none()
+                && !matches!(node.data, NodeData::ShadowRoot { .. })
             {
                 return Err(Exception::throw_type(ctx, "innerHTML requires an element"));
             }
@@ -2199,9 +2202,8 @@ impl JsNode {
             .document
             .base
             .get_node(replacement.node)
-            .map(|backing| {
-                backing
-                    .children
+            .map(|node| {
+                node.children
                     .iter()
                     .map(|child| NodeId {
                         document: replacement.document,
@@ -2282,9 +2284,8 @@ impl JsNode {
             .document
             .base
             .get_node(fragment.node)
-            .map(|backing| {
-                backing
-                    .children
+            .map(|node| {
+                node.children
                     .iter()
                     .map(|child| NodeId {
                         document: fragment.document,
@@ -2512,12 +2513,11 @@ pub(super) fn require_context_element(ctx: &Ctx<'_>, id: NodeId) -> Result<NodeI
         let world = world(ctx)?;
         let world = world.borrow();
         world.document(id).is_some_and(|parsed| {
-            !parsed.document.is_fragment(id.node)
-                && parsed
-                    .document
-                    .base
-                    .get_node(id.node)
-                    .is_some_and(|node| node.data.downcast_element().is_some())
+            parsed
+                .document
+                .base
+                .get_node(id.node)
+                .is_some_and(|node| node.data.downcast_element().is_some())
         })
     };
     if element {

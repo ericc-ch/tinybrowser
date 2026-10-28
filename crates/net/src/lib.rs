@@ -16,8 +16,9 @@ pub use client::{Agent, AgentOptions, Body, Clock, Request, Response, UserAgent}
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 pub use protocol::{
-    HeaderError, HeaderMap, InvalidMethod, Method, combined_header, get_decode_split,
-    isomorphic_decode, isomorphic_encode, split_header_value,
+    HeaderError, HeaderMap, InvalidMethod, Method, combined_header, combined_header_in,
+    get_decode_split, get_decode_split_decoded, isomorphic_decode, isomorphic_encode,
+    split_header_value, split_header_value_str,
 };
 pub use referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 pub use resolve::{InvalidResolveRule, ResolveRule};

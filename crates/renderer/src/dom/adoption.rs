@@ -67,24 +67,6 @@ pub(crate) fn import_snapshot(
     id: NodeId,
     deep: bool,
 ) -> Option<ImportSnapshot> {
-    // Fragment backings must snapshot as fragments, not as their `div`
-    // element. Import and adopt would otherwise insert a stray element
-    // (<https://dom.spec.whatwg.org/#concept-node-clone>).
-    if doc.is_fragment(id.node) {
-        let children = if deep {
-            snapshot_children(
-                doc,
-                id.document,
-                doc.base
-                    .get_node(id.node)
-                    .map(|backing| backing.children.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            )
-        } else {
-            Vec::new()
-        };
-        return Some(ImportSnapshot::Fragment(children));
-    }
     let node = doc.base.get_node(id.node)?;
     match &node.data {
         NodeData::Element(element) => {
@@ -102,7 +84,9 @@ pub(crate) fn import_snapshot(
                         .map(|fragment| {
                             doc.base
                                 .get_node(fragment)
-                                .map(|backing| backing.children.iter().copied().collect::<Vec<_>>())
+                                .map(|contents| {
+                                    contents.children.iter().copied().collect::<Vec<_>>()
+                                })
                                 .unwrap_or_default()
                         })
                         .map(|child_ids| snapshot_children(doc, id.document, child_ids))
@@ -241,24 +225,20 @@ pub(crate) fn materialize_import(
     }
 }
 
-/// Materializes `snapshots` into a fresh fragment backing in tree order.
-///
-/// Blitz has no fragment node kind: the fragment is a detached backing
-/// element (see `BlitzDocument::create_fragment`) whose children are the
-/// fragment's children.
+/// Materializes `snapshots` into a fresh fragment in tree order.
 pub(crate) fn materialize_children(
     doc: &mut BlitzDocument,
     document: u32,
     snapshots: &[ImportSnapshot],
 ) -> std::result::Result<NodeId, TreeError> {
-    let backing = doc.create_fragment();
+    let fragment = doc.create_fragment();
     for snapshot in snapshots {
         let child = materialize_import(doc, document, snapshot)?;
-        doc.base.mutate().append_children(backing, &[child.node]);
+        doc.base.mutate().append_children(fragment, &[child.node]);
     }
     Ok(NodeId {
         document,
-        node: backing,
+        node: fragment,
     })
 }
 
@@ -370,20 +350,6 @@ pub(crate) fn clone_within_document(
     id: NodeId,
     deep: bool,
 ) -> std::result::Result<NodeId, TreeError> {
-    // Fragment backings are ordinary `div` elements in the arena. Blitz
-    // `deep_clone_node` would copy that element without the fragment set,
-    // so `cloneNode` would return an `HTMLDivElement` (nodeType 1) instead
-    // of a `DocumentFragment` (nodeType 11)
-    // (<https://dom.spec.whatwg.org/#concept-node-clone>).
-    if doc.is_fragment(id.node) {
-        let snapshot = import_snapshot(doc, id, deep).ok_or(TreeError::Hierarchy)?;
-        let fresh = materialize_import(doc, doc_id, &snapshot)?;
-        // Snapshots carry no side-table state: the already-started flag
-        // follows the same lockstep as the PI map.
-        doc.copy_pi_subtree(id.node, fresh.node);
-        doc.copy_script_started(id.node, fresh.node);
-        return Ok(fresh);
-    }
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
         // Blitz copies node data only; the PI attribute map lives beside

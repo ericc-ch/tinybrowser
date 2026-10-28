@@ -48,44 +48,38 @@ fn equal_view(doc: &BlitzDocument, id: BlitzId) -> Option<EqualView> {
     let (kind, children) = {
         let node = doc.base.get_node(id)?;
         let children = node.children.iter().copied().collect();
-        let kind = if doc.is_fragment(id) {
-            EqualKind::Fragment
-        } else {
-            match &node.data {
-                NodeData::Document(_) => EqualKind::Document,
-                NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => EqualKind::Fragment,
-                NodeData::Element(element) => EqualKind::Element {
-                    name: element.name.clone(),
-                    attributes: element
-                        .attrs
-                        .iter()
-                        .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
-                        .collect(),
-                },
-                NodeData::Text(_) => EqualKind::Text(DomString::default()),
-                NodeData::Comment { .. } => EqualKind::Comment(DomString::default()),
-                // Doctype compares name, public id, and system id. A
-                // processing instruction compares target and data. A CDATA
-                // section implements `Text` and `CDATASection`, so it is not
-                // equal to a `Text` node with the same data.
-                NodeData::Doctype {
-                    name,
-                    public_id,
-                    system_id,
-                } => EqualKind::Doctype {
-                    name: name.clone(),
-                    public_id: public_id.clone(),
-                    system_id: system_id.clone(),
-                },
-                NodeData::ProcessingInstruction { target, .. } => {
-                    EqualKind::ProcessingInstruction {
-                        target: target.clone(),
-                        data: DomString::default(),
-                    }
-                }
-                NodeData::CDataSection { .. } => EqualKind::CData(DomString::default()),
-                NodeData::AnonymousBlock(_) => EqualKind::Other,
-            }
+        let kind = match &node.data {
+            NodeData::Document(_) => EqualKind::Document,
+            NodeData::Fragment { .. } | NodeData::ShadowRoot { .. } => EqualKind::Fragment,
+            NodeData::Element(element) => EqualKind::Element {
+                name: element.name.clone(),
+                attributes: element
+                    .attrs
+                    .iter()
+                    .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+                    .collect(),
+            },
+            NodeData::Text(_) => EqualKind::Text(DomString::default()),
+            NodeData::Comment { .. } => EqualKind::Comment(DomString::default()),
+            // Doctype compares name, public id, and system id. A
+            // processing instruction compares target and data. A CDATA
+            // section implements `Text` and `CDATASection`, so it is not
+            // equal to a `Text` node with the same data.
+            NodeData::Doctype {
+                name,
+                public_id,
+                system_id,
+            } => EqualKind::Doctype {
+                name: name.clone(),
+                public_id: public_id.clone(),
+                system_id: system_id.clone(),
+            },
+            NodeData::ProcessingInstruction { target, .. } => EqualKind::ProcessingInstruction {
+                target: target.clone(),
+                data: DomString::default(),
+            },
+            NodeData::CDataSection { .. } => EqualKind::CData(DomString::default()),
+            NodeData::AnonymousBlock(_) => EqualKind::Other,
         };
         (kind, children)
     };

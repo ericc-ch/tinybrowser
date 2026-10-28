@@ -547,75 +547,60 @@ pub struct DialRequest {
     /// Document URL used as the `SameSite`/`Sec-Fetch-*` initiator.
     pub initiator: String,
     /// Whether and how the browser delivers the response body.
-    #[serde(default)]
     pub delivery: BodyDelivery,
-    /// HTTP method; defaults to `GET` for dials that predate bodies.
-    #[serde(default = "default_dial_method")]
-    pub method: String,
+    /// HTTP method
+    /// (<https://fetch.spec.whatwg.org/#concept-request-method>). The wire
+    /// carries the spelling [`net::Method::parse`] accepts, so a malformed
+    /// method is a decode error at the boundary, not a forged request later.
+    pub method: net::Method,
     /// Request body bytes, empty for `GET`.
-    #[serde(default)]
     pub body: Vec<u8>,
     /// `Content-Type` header for `body`, when there is one.
-    #[serde(default)]
     pub content_type: Option<String>,
     /// Author-supplied request headers, in insertion order.
-    #[serde(default)]
     pub headers: Vec<(String, String)>,
     /// Fetch's request referrer: a client, an explicit URL, or no referrer.
     /// The browser resolves "client" against the authorized initiator and
     /// verifies an explicit URL is same-origin with it
     /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
-    #[serde(default)]
     pub referrer: net::Referrer,
     /// The document URL the `"client"` branch reads, walked out of `srcdoc`
     /// to the container document
     /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-    #[serde(default)]
     pub referrer_url: String,
     /// Caller deadline in milliseconds. `0` keeps the carrier timeout.
     /// A synchronous XHR uses its `timeout` attribute here
     /// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>).
-    #[serde(default)]
     pub timeout_ms: u64,
     /// Enforced CSP for this subresource dial. `None` skips the check, which
     /// is how a document navigation is sent. The network re-checks every
     /// redirect hop with it.
-    #[serde(default)]
     pub csp: Option<Box<crate::RedirectGate>>,
     /// CORS protocol parameters for a page `fetch`/XHR. `None` for navigation
     /// and subresource dials.
-    #[serde(default)]
     pub cors: Option<CorsRequest>,
     /// A `fetch(..., {keepalive: true})` request. The browser enforces the
     /// in-flight byte quota across realms
     /// (<https://fetch.spec.whatwg.org/#keepalive-flag>).
-    #[serde(default)]
     pub keepalive: bool,
     /// Request-body length for the keepalive quota.
-    #[serde(default)]
     pub body_len: u64,
     /// Subresource Integrity metadata; the browser checks the decoded body
     /// before returning it (<https://www.w3.org/TR/SRI/#verify-integrity>).
-    #[serde(default)]
     pub integrity: Option<String>,
     /// Request cache mode
     /// (<https://fetch.spec.whatwg.org/#concept-request-cache-mode>).
-    #[serde(default)]
     pub cache: RequestCache,
     /// The concrete policy main fetch determines under. The renderer resolves
     /// the element's attribute or the document's policy before queueing, so
     /// this is never unset
     /// (<https://fetch.spec.whatwg.org/#concept-request-referrer-policy>).
-    #[serde(default)]
     pub referrer_policy: net::ReferrerPolicy,
 }
 
 /// How a dial delivers its response body to the renderer.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BodyDelivery {
-    /// Keep the head only; the body is never read.
-    #[default]
-    Discard,
     /// Read the whole body before answering.
     Buffer,
     /// Answer with the head and stream the body in chunks.
@@ -675,13 +660,74 @@ pub struct CorsRequest {
     pub redirect: net::cors::RedirectMode,
 }
 
-fn default_dial_method() -> String {
-    "GET".to_owned()
-}
-
 /// A response body that could not be decoded.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BodyError;
+
+/// Browser-side identity of one progressive response body.
+///
+/// Minted by the browser's stream counter. The renderer carries it back
+/// unchanged, and the browser checks the calling assignment owns it before
+/// reading or cancelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StreamId(u64);
+
+impl StreamId {
+    /// The stream handle's wire value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Mints an id from the browser's counter.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// What one dial answered with, in the one shape the delivery mode decides
+/// (<https://fetch.spec.whatwg.org/#concept-response-body>).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ResponseBody {
+    /// The whole body arrived, or failed to decode for its `Content-Encoding`
+    /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
+    Buffered(Result<Vec<u8>, BodyError>),
+    /// The head arrived and the bytes follow through the network host.
+    Streamed(StreamId),
+}
+
+impl ResponseBody {
+    /// The complete body bytes, when the browser buffered them.
+    #[must_use]
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Buffered(body) => body.as_ref().ok().map(Vec::as_slice),
+            Self::Streamed(_) => None,
+        }
+    }
+
+    /// Takes the buffered body: `None` when the browser is streaming it.
+    #[must_use]
+    pub fn into_bytes(self) -> Option<Result<Vec<u8>, BodyError>> {
+        match self {
+            Self::Buffered(body) => Some(body),
+            Self::Streamed(_) => None,
+        }
+    }
+}
+
+impl DialOutcome {
+    /// The browser-side stream handle, when the body is streamed.
+    #[must_use]
+    pub fn stream(&self) -> Option<StreamId> {
+        match self.body {
+            ResponseBody::Streamed(id) => Some(id),
+            ResponseBody::Buffered(_) => None,
+        }
+    }
+}
 
 /// Result of one blocking GET.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -697,36 +743,24 @@ pub struct DialOutcome {
     /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
     pub content_type: Option<String>,
     /// Response headers visible to page scripts, in wire order.
-    #[serde(default)]
     pub headers: Vec<(String, String)>,
-    /// Response body, when [`BodyDelivery::Buffer`]. `Err` means the body
-    /// could not be decoded for its `Content-Encoding`; consuming it rejects
-    /// instead of returning bytes
-    /// (<https://fetch.spec.whatwg.org/#concept-http-network-fetch>).
-    pub body: Result<Vec<u8>, BodyError>,
+    /// How this dial delivers its response body.
+    pub body: ResponseBody,
     /// How the response was filtered
     /// (<https://fetch.spec.whatwg.org/#concept-response-type>); `basic` for
     /// same-origin and subresource responses.
-    #[serde(default)]
     pub response_type: net::cors::ResponseType,
     /// Whether any redirect hop's URL origin differed from the request origin.
     /// A `no-cors` request that crosses an origin gets an opaque response and
     /// never returns to basic, so this is the taint a subresource keeps
     /// (<https://fetch.spec.whatwg.org/#concept-request-response-tainting>).
-    #[serde(default)]
     pub crossed_origin: bool,
     /// Redirect hops followed before this response.
-    #[serde(default)]
     pub redirect_count: u32,
     /// The stripped referrer the final hop was sent with, when it sent one.
     /// A navigated document reports it as `document.referrer`
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-    #[serde(default)]
     pub referrer: Option<String>,
-    /// Browser-side stream handle for a progressive body. The body is empty
-    /// in the head outcome and chunks arrive through the network host.
-    #[serde(default)]
-    pub stream: Option<u64>,
 }
 
 impl DialOutcome {
@@ -746,12 +780,11 @@ impl DialOutcome {
             final_url,
             content_type,
             headers,
-            body: Ok(body),
+            body: ResponseBody::Buffered(Ok(body)),
             response_type: net::cors::ResponseType::Basic,
             crossed_origin: false,
             redirect_count: 0,
             referrer: None,
-            stream: None,
         }
     }
 }
@@ -779,12 +812,12 @@ pub trait NetworkHost: Send + Sync + 'static {
     /// # Errors
     ///
     /// The carrier's network failure or cancellation.
-    fn dial_read(&self, _stream: u64) -> Result<Option<Vec<u8>>, DialFailure> {
+    fn dial_read(&self, _stream: StreamId) -> Result<Option<Vec<u8>>, DialFailure> {
         Err(DialFailure::Connect)
     }
 
     /// Cancels a streamed response body.
-    fn cancel_stream(&self, _stream: u64) {}
+    fn cancel_stream(&self, _stream: StreamId) {}
 
     /// Performs `request` on the calling thread and returns when the response
     /// arrives. The browser process answers on the reader thread, so this does

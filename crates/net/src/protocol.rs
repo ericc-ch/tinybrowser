@@ -19,16 +19,40 @@ pub fn combined_header<'a>(values: impl Iterator<Item = &'a str>) -> Option<Stri
     }
 }
 
+/// Joins every value of `name` in a decoded header list with `", "`, or
+/// `None` when the header is absent
+/// (<https://fetch.spec.whatwg.org/#concept-header-list-get>).
+#[must_use]
+pub fn combined_header_in<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    name: &str,
+) -> Option<String> {
+    combined_header(
+        headers
+            .into_iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value),
+    )
+}
+
 /// Splits one header value into its members
 /// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
 ///
 /// Bytes are isomorphic-decoded, so `0x80..=0xFF` stay the same code points.
+#[must_use]
+pub fn split_header_value(value: &[u8]) -> Vec<String> {
+    split_header_value_str(&isomorphic_decode(value))
+}
+
+/// Splits an already isomorphic-decoded header value into its members
+/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
+///
 /// A comma inside a quoted string does not split, the quoted text keeps its
 /// quotes and escapes, and every member is stripped of leading and trailing
 /// HTTP tab or space.
 #[must_use]
-pub fn split_header_value(value: &[u8]) -> Vec<String> {
-    let input: Vec<char> = value.iter().copied().map(char::from).collect();
+pub fn split_header_value_str(value: &str) -> Vec<String> {
+    let input: Vec<char> = value.chars().collect();
     let mut values = Vec::new();
     let mut member = String::new();
     let mut position = 0;
@@ -120,6 +144,28 @@ pub fn get_decode_split(headers: &HeaderMap, name: &str) -> Option<Vec<String>> 
         found = true;
     }
     found.then(|| split_header_value(&combined))
+}
+
+/// Gets `name` from an already isomorphic-decoded header list and splits it
+/// into members, combining repeated fields with `", "` first
+/// (<https://fetch.spec.whatwg.org/#header-value-get-decode-and-split>).
+///
+/// `None` means the header is absent.
+#[must_use]
+pub fn get_decode_split_decoded<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    name: &str,
+) -> Option<Vec<String>> {
+    let values: Vec<&str> = headers
+        .into_iter()
+        .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(split_header_value_str(&values.join(", ")))
+    }
 }
 
 pub(crate) fn is_token_char(c: char) -> bool {
@@ -286,7 +332,11 @@ pub struct InvalidMethod(Box<str>);
 /// `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, and `OPTIONS` are stored in
 /// canonical uppercase. `PATCH` stays uppercase only when the input was already
 /// `PATCH`. Any other valid token is kept as typed.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// The wire spelling is the text [`Method::parse`] accepts, so a decoded
+/// method is always a parsed method and neither side re-checks the grammar.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Method(Cow<'static, str>);
 
 impl Method {
@@ -337,6 +387,43 @@ impl Method {
         matches!(self.0.as_ref(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
     }
 
+    /// Whether this method is idempotent per
+    /// [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2):
+    /// `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, and `DELETE`, matched
+    /// case-sensitively like [`Method::is_safe`].
+    ///
+    /// ```
+    /// use net::Method;
+    ///
+    /// assert!(Method::PUT.is_idempotent());
+    /// assert!(!Method::POST.is_idempotent());
+    /// ```
+    #[must_use]
+    pub fn is_idempotent(&self) -> bool {
+        self.is_safe() || matches!(self.0.as_ref(), "PUT" | "DELETE")
+    }
+
+    /// Whether this method is forbidden to page scripts
+    /// (<https://fetch.spec.whatwg.org/#forbidden-method>).
+    ///
+    /// Unlike the RFC predicates above, Fetch defines this one as a
+    /// byte-case-insensitive match, because it rejects the spelling a page
+    /// typed before normalization.
+    ///
+    /// ```
+    /// use net::Method;
+    ///
+    /// assert!(Method::parse("TRACE").unwrap().is_forbidden());
+    /// assert!(Method::parse("trace").unwrap().is_forbidden());
+    /// assert!(!Method::POST.is_forbidden());
+    /// ```
+    #[must_use]
+    pub fn is_forbidden(&self) -> bool {
+        ["CONNECT", "TRACE", "TRACK"]
+            .iter()
+            .any(|forbidden| self.0.eq_ignore_ascii_case(forbidden))
+    }
+
     /// Wire spelling of this method.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -347,6 +434,20 @@ impl Method {
 impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<String> for Method {
+    type Error = InvalidMethod;
+
+    fn try_from(token: String) -> Result<Self, Self::Error> {
+        Self::parse(&token)
+    }
+}
+
+impl From<Method> for String {
+    fn from(method: Method) -> Self {
+        method.0.into_owned()
     }
 }
 
@@ -402,10 +503,12 @@ mod tests {
             ["x / x", "", "", "1"]
         );
         assert_eq!(super::split_header_value(b"\"1,2\", 3"), ["\"1,2\"", "3"]);
-        // Escaped quotes stay inside the member, so the comma does not split.
+        // An escaped comma stays inside the member. Without the escape
+        // branch the quoted string ends at the backslash and the comma
+        // splits, so this pins the branch itself.
         assert_eq!(
-            super::split_header_value(b"\"a\\\",b\",c"),
-            ["\"a\\\",b\"", "c"]
+            super::split_header_value(b"\"a\\,b\",c"),
+            ["\"a\\,b\"", "c"]
         );
     }
 

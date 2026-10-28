@@ -39,7 +39,7 @@ pub(crate) enum CollectionKind {
     SelectedOptions,
     WindowNamed(String),
     /// `Document.scripts`: HTML `script` descendants of the document element,
-    /// skipping fragment backings
+    /// skipping detached fragments
     /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
     HtmlScripts,
     /// `table.tBodies`: HTML `tbody` children of the table
@@ -180,7 +180,7 @@ fn query_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<
 /// (<https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>).
 /// The synthetic viewport box above the document element is not a DOM
 /// descendant of that node; walking from its first non-fragment element
-/// child keeps fragment backings that sit beside `html` off the list.
+/// child keeps detached fragments that sit beside `html` off the list.
 fn collect_html_scripts(
     doc: &crate::documents::BlitzDocument,
     document: u32,

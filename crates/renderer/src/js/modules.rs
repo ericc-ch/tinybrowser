@@ -124,7 +124,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             initiator,
             referrer_url,
             delivery: BodyDelivery::Buffer,
-            method: "GET".to_owned(),
+            method: net::Method::GET,
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
@@ -179,6 +179,8 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     {
         return Err(Error::new_loading(name));
     }
-    let body = outcome.body.map_err(|_| Error::new_loading(name))?;
+    let Some(Ok(body)) = outcome.body.into_bytes() else {
+        return Err(Error::new_loading(name));
+    };
     Module::declare(ctx.clone(), name, body)
 }

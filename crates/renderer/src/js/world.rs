@@ -586,7 +586,7 @@ pub(crate) struct FrameNavigation {
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-srcdoc>).
     pub(crate) srcdoc: Option<String>,
     /// HTTP method; `GET` for every navigation but a form submission.
-    pub(crate) method: String,
+    pub(crate) method: net::Method,
     /// Request body, empty for a GET.
     pub(crate) body: Vec<u8>,
     /// `Content-Type` for `body`, when there is one.
@@ -636,7 +636,7 @@ impl FrameNavigation {
             target,
             spec,
             srcdoc: None,
-            method: "GET".to_owned(),
+            method: net::Method::GET,
             body: Vec::new(),
             content_type: None,
             referrer_policy: None,

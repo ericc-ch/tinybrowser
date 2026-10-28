@@ -55,7 +55,7 @@ use markup5ever::{LocalName, Namespace, Prefix, QualName};
 use stylo_taffy::CopyStyleGetters;
 
 use crate::dom::TreeError;
-use crate::dom::tree::{NodeId, is_real_element, sibling};
+use crate::dom::tree::{NodeId, is_element, sibling};
 
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, prelude::This,
@@ -859,21 +859,12 @@ pub(super) fn wrap_new_document_in_world<'js>(
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
-    let is_fragment = {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(id) else {
-            return Err(Exception::throw_type(ctx, "stale node"));
-        };
-        parsed.document.is_fragment(id.node)
-    };
     let brand = with_node_data(ctx, id, |data| match data {
         Some(NodeData::Document(_)) => Some(if document_is_xml_document(ctx, id) {
             "XMLDocument"
         } else {
             "Document"
         }),
-        Some(NodeData::Element(_)) if is_fragment => Some("DocumentFragment"),
         Some(NodeData::Fragment { .. }) => Some("DocumentFragment"),
         Some(NodeData::ShadowRoot { .. }) => Some("ShadowRoot"),
         Some(NodeData::Element(element)) => Some(element_interface(&element.name)),
@@ -1509,7 +1500,7 @@ pub(super) fn element_sibling_value<'js>(
         let base = &parsed.document.base;
         let mut cursor = sibling(base, id.node, forward);
         while let Some(next) = cursor {
-            if is_real_element(&parsed.document, next) {
+            if is_element(&parsed.document.base, next) {
                 break;
             }
             cursor = sibling(base, next, forward);

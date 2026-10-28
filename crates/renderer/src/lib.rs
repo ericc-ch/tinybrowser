@@ -43,9 +43,9 @@ pub use protocol::{
     BodyDelivery, BodyError, BrowserEvent, BrowserServices, BrowsingContextHost, CorsRequest,
     DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
     HistoryHandling, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
-    PostedMessage, RendererEvent, RequestCache, ResourceLimit, ResponseHead, STORAGE_QUOTA_BYTES,
-    ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource, StorageChange, StorageError,
-    StorageHost, StorageKind, TabError, TimerId,
+    PostedMessage, RendererEvent, RequestCache, ResourceLimit, ResponseBody, ResponseHead,
+    STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource,
+    StorageChange, StorageError, StorageHost, StorageKind, StreamId, TabError, TimerId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

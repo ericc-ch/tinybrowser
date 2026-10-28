@@ -7,16 +7,16 @@
 
 use blitz_dom::NodeData;
 
-use crate::dom::tree::{NodeId, is_real_element};
+use crate::dom::tree::{NodeId, is_element};
 
-/// The parent element of `id`, skipping fragment backings
+/// The parent element of `id`, skipping non-element parents
 /// (<https://dom.spec.whatwg.org/#parent-element>).
 pub(crate) fn parent_element_of(
     doc: &crate::documents::BlitzDocument,
     id: NodeId,
 ) -> Option<NodeId> {
     let parent = doc.base.get_node(id.node)?.parent?;
-    is_real_element(doc, parent).then_some(NodeId {
+    is_element(&doc.base, parent).then_some(NodeId {
         document: id.document,
         node: parent,
     })
@@ -32,7 +32,7 @@ pub(crate) fn document_element_of(
         .children
         .iter()
         .find_map(|child| {
-            is_real_element(doc, *child).then_some(NodeId {
+            is_element(&doc.base, *child).then_some(NodeId {
                 document: id.document,
                 node: *child,
             })
@@ -56,7 +56,7 @@ pub(crate) fn locate_namespace(
         return document_element_of(doc, node)
             .and_then(|element| locate_namespace(doc, element, prefix));
     }
-    if !is_real_element(doc, node.node) {
+    if !is_element(&doc.base, node.node) {
         return parent_element_of(doc, node)
             .and_then(|element| locate_namespace(doc, element, prefix));
     }
@@ -125,7 +125,7 @@ pub(crate) fn locate_prefix(
         return document_element_of(doc, node)
             .and_then(|element| locate_prefix(doc, element, namespace));
     }
-    if !is_real_element(doc, node.node) {
+    if !is_element(&doc.base, node.node) {
         return parent_element_of(doc, node)
             .and_then(|element| locate_prefix(doc, element, namespace));
     }

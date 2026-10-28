@@ -164,7 +164,7 @@ fn serialize_html_element(
                 crate::dom::tree::template_contents(base, id)
                     .and_then(|fragment| {
                         base.get_node(fragment)
-                            .map(|backing| backing.children.iter().copied().collect())
+                            .map(|node| node.children.iter().copied().collect())
                     })
                     .unwrap_or_default()
             } else {
@@ -347,7 +347,7 @@ pub(crate) fn serialize_xml_element(
                 crate::dom::tree::template_contents(base, id)
                     .and_then(|fragment| {
                         base.get_node(fragment)
-                            .map(|backing| backing.children.iter().copied().collect())
+                            .map(|node| node.children.iter().copied().collect())
                     })
                     .unwrap_or_default()
             } else {

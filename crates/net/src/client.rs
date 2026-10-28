@@ -634,13 +634,13 @@ impl Agent {
                 budget,
             )
             .await?;
-        let content_encoding: Vec<String> = response_headers
-            .get_all("content-encoding")
-            .filter_map(|value| std::str::from_utf8(value).ok())
-            .flat_map(|value| value.split(','))
-            .map(|coding| coding.trim().to_ascii_lowercase())
-            .filter(|coding| !coding.is_empty())
-            .collect();
+        let content_encoding: Vec<String> =
+            crate::get_decode_split(&response_headers, "content-encoding")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|coding| coding.to_ascii_lowercase())
+                .filter(|coding| !coding.is_empty())
+                .collect();
         let response = Response {
             status,
             status_text: if http2 {
@@ -1140,7 +1140,8 @@ impl Body {
     /// # Errors
     ///
     /// [`NetError::Transport`] when the socket read fails or the deadline
-    /// expires; [`NetError::Decode`] when a decoder rejects the bytes.
+    /// expires; [`NetError::Decode`] when a decoder rejects the bytes;
+    /// [`NetError::Limit`] when the bytes exceed the carrier's budget.
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, NetError> {
         let mut buffer = vec![0; 16 * 1024];
         match self.reader.read(&mut buffer).await {
@@ -1164,23 +1165,6 @@ impl Body {
                 Err(shared.unwrap_or_else(|| NetError::Decode(error.to_string().into())))
             }
         }
-    }
-
-    /// Entire decoded body, failing if it would exceed `limit` bytes.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Limit`] when the decoded body is larger than `limit`.
-    /// [`NetError::Transport`] when a read fails.
-    pub async fn bytes(mut self, limit: usize) -> Result<Vec<u8>, NetError> {
-        let mut out = Vec::new();
-        while let Some(chunk) = self.read_chunk().await? {
-            if out.len() + chunk.len() > limit {
-                return Err(NetError::Limit(LimitExceeded::Size(limit as u64)));
-            }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
     }
 }
 
@@ -1344,6 +1328,19 @@ impl Response {
 #[cfg(test)]
 mod decode_tests {
     use super::{Arc, AtomicBool, Body, Mutex, NetError};
+
+    async fn read_all(mut body: Body, limit: usize) -> Result<Vec<u8>, NetError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.read_chunk().await? {
+            if out.len() + chunk.len() > limit {
+                return Err(NetError::Limit(crate::LimitExceeded::Size(
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                )));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
     use flate2::Compression;
     use flate2::write::{DeflateEncoder, GzEncoder};
     use std::io::Write as _;
@@ -1360,7 +1357,7 @@ mod decode_tests {
             Arc::new(AtomicBool::new(true)),
         )
         .await;
-        body.bytes(4 * 1024 * 1024).await
+        read_all(body, 4 * 1024 * 1024).await
     }
 
     fn gzip(data: &[u8]) -> Vec<u8> {
@@ -1404,7 +1401,7 @@ mod decode_tests {
             Arc::new(AtomicBool::new(false)),
         )
         .await;
-        assert_eq!(body.bytes(1024).await.expect("empty"), Vec::<u8>::new());
+        assert_eq!(read_all(body, 1024).await.expect("empty"), Vec::<u8>::new());
     }
 
     #[tokio::test]
@@ -1422,6 +1419,9 @@ mod decode_tests {
             Arc::new(AtomicBool::new(true)),
         )
         .await;
-        assert!(matches!(decoded.bytes(1024).await, Err(NetError::Limit(_))));
+        assert!(matches!(
+            read_all(decoded, 1024).await,
+            Err(NetError::Limit(_))
+        ));
     }
 }

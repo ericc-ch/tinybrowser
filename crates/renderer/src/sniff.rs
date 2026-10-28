@@ -291,7 +291,7 @@ pub(crate) fn apache_bug_content_type(value: &str) -> bool {
 /// stripped, so `nosniff, nosniff` is nosniff while `foo, nosniff` is not.
 #[must_use]
 pub fn nosniff(value: &str) -> bool {
-    split_header_value(value)
+    net::split_header_value_str(value)
         .first()
         .is_some_and(|first| first.eq_ignore_ascii_case("nosniff"))
 }
@@ -299,12 +299,13 @@ pub fn nosniff(value: &str) -> bool {
 /// `X-Content-Type-Options: nosniff` on a header list.
 #[must_use]
 pub(crate) fn headers_nosniff(headers: &[(String, String)]) -> bool {
-    let values: Vec<&str> = headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("x-content-type-options"))
-        .map(|(_, value)| value.as_str())
-        .collect();
-    nosniff(&values.join(", "))
+    net::combined_header_in(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        "x-content-type-options",
+    )
+    .is_some_and(|value| nosniff(&value))
 }
 
 /// "extract a MIME type" from one combined `Content-Type` value, serialized,
@@ -323,7 +324,7 @@ pub(crate) fn extract_mime_type(value: &str) -> Option<String> {
     let mut mime_type: Option<MimeType> = None;
     let mut essence: Option<String> = None;
     let mut charset: Option<String> = None;
-    for item in split_header_value(value) {
+    for item in net::split_header_value_str(value) {
         let Some(mut parsed) = parse_mime_type(&item) else {
             continue;
         };
@@ -347,66 +348,6 @@ pub(crate) fn extract_mime_type(value: &str) -> Option<String> {
         mime_type = Some(parsed);
     }
     mime_type.map(|mime| mime.serialize())
-}
-
-/// "get, decode, and split" for one header value
-/// (<https://fetch.spec.whatwg.org/#concept-header-value-get-decode-and-split>).
-/// A quoted string keeps commas inside it, and each item is stripped of HTTP
-/// tab or space only — not of the rest of HTTP whitespace, which the
-/// algorithm deliberately leaves in place.
-fn split_header_value(value: &str) -> Vec<String> {
-    let characters: Vec<char> = value.chars().collect();
-    let mut position = 0;
-    let mut values = Vec::new();
-    let mut temporary = String::new();
-    loop {
-        while position < characters.len()
-            && characters[position] != '"'
-            && characters[position] != ','
-        {
-            temporary.push(characters[position]);
-            position += 1;
-        }
-        if position < characters.len() && characters[position] == '"' {
-            collect_http_quoted_string_raw(&characters, &mut position, &mut temporary);
-            if position < characters.len() {
-                continue;
-            }
-        }
-        // An HTTP tab or space byte is 0x09 (HT) or 0x20 (SP)
-        // (<https://fetch.spec.whatwg.org/#http-tab-or-space>).
-        values.push(
-            temporary
-                .trim_matches(|character| character == '\t' || character == ' ')
-                .to_owned(),
-        );
-        temporary = String::new();
-        if position == characters.len() {
-            return values;
-        }
-        position += 1; // Skip the comma.
-    }
-}
-
-/// "collect an HTTP quoted string" without `extract-value`: the raw code
-/// points from the opening quote through the closing quote, or to the end of
-/// input when the quote never closes
-/// (<https://fetch.spec.whatwg.org/#collect-an-http-quoted-string>). The
-/// position points at the opening `"`.
-fn collect_http_quoted_string_raw(characters: &[char], position: &mut usize, value: &mut String) {
-    let start = *position;
-    *position += 1;
-    while *position < characters.len() {
-        match characters[*position] {
-            '\\' if *position + 1 < characters.len() => *position += 2,
-            '"' => {
-                *position += 1;
-                break;
-            }
-            _ => *position += 1,
-        }
-    }
-    value.extend(&characters[start..*position]);
 }
 
 /// A MIME type record
@@ -1337,13 +1278,6 @@ mod tests {
             extracted("text/html;charset=gbk, text/html;x=\",text/plain\"").as_deref(),
             Some("text/html;x=\",text/plain\";charset=gbk")
         );
-    }
-
-    #[test]
-    fn split_keeps_commas_inside_quotes_together() {
-        assert_eq!(split_header_value("a, \"b,c\", d"), ["a", "\"b,c\"", "d"]);
-        assert_eq!(split_header_value("nosniff,"), ["nosniff", ""]);
-        assert_eq!(split_header_value(""), [""]);
     }
 
     #[test]

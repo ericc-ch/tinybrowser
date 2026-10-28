@@ -1111,18 +1111,18 @@ const __tbQueuePageRequest = (url, method, body, headers, cors, referrer, callba
     if (!host.__tb_fetchCbs[id]) return;
     const type = __tbApply(__tbHeadersGet, headers, ['content-type']) === null ? payload.type : null;
     const fields = __tbArray.map(__tbSortedHeaders(headers), entry => [entry[0], entry[1]]);
-    host.__queueFetch(url, id, method, payload.bytes, type, fields, [
-      referrer === null || referrer === undefined ? '' : String(referrer),
-      cors.mode,
-      cors.credentials,
-      cors.redirect,
-      cors.keepalive === true ? '1' : '0',
-      String(cors.bodySize === undefined ? 0 : cors.bodySize),
-      cors.integrity === undefined ? '' : String(cors.integrity),
-      cors.cache === undefined ? '' : String(cors.cache),
-      cors.stream === true ? '1' : '0',
-      cors.referrerPolicy === undefined ? '' : String(cors.referrerPolicy),
-    ]);
+    host.__queueFetch(url, id, method, payload.bytes, type, fields, {
+      referrer: referrer === null || referrer === undefined ? '' : String(referrer),
+      mode: cors.mode,
+      credentials: cors.credentials,
+      redirect: cors.redirect,
+      keepalive: cors.keepalive === true,
+      bodySize: cors.bodySize === undefined ? 0 : cors.bodySize,
+      integrity: cors.integrity === undefined || cors.integrity === '' ? null : String(cors.integrity),
+      cache: cors.cache === undefined || cors.cache === '' ? null : String(cors.cache),
+      stream: cors.stream === true,
+      referrerPolicy: cors.referrerPolicy === undefined || cors.referrerPolicy === '' ? null : String(cors.referrerPolicy),
+    });
   }).catch(() => {
     const done = host.__tb_fetchCbs[id];
     if (done) done({ status: 0, statusText: '', body: new Uint8Array(0), url: '', contentType: '', headers: [], responseType: 'error', bodyError: false });

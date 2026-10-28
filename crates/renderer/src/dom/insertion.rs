@@ -11,8 +11,8 @@ use blitz_dom::NodeData;
 use crate::documents::JournalEntry;
 use crate::dom::TreeError;
 use crate::dom::tree::{
-    BlitzId, NodeId, attr, html_namespace, is_child_navigable_container, is_html_element,
-    is_real_element, mathml_namespace, sibling, svg_namespace,
+    BlitzId, NodeId, attr, html_namespace, is_child_navigable_container, is_element,
+    is_html_element, mathml_namespace, sibling, svg_namespace,
 };
 
 /// The inserted node's side of ensure pre-insert validity.
@@ -38,8 +38,7 @@ pub(crate) fn classify_inserted(
     doc: &crate::documents::BlitzDocument,
     id: BlitzId,
 ) -> InsertedNode {
-    // Fragment backings (flagged elements) and real `Fragment` nodes both
-    // splice their children on insertion.
+    // A fragment node splices its children on insertion.
     if doc.is_fragment(id) {
         // Flatten nested fragments: insertion splices fragment children, so a
         // fragment holding a nested fragment with two elements still inserts
@@ -59,11 +58,7 @@ pub(crate) fn classify_inserted(
                     stack.push(child);
                     continue;
                 }
-                if doc
-                    .base
-                    .get_node(child)
-                    .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-                {
+                if is_element(&doc.base, child) {
                     elements += 1;
                 }
                 if doc.base.get_node(child).is_some_and(|candidate| {
@@ -140,12 +135,10 @@ pub(crate) fn sibling_element_precedes(
     let Some(position) = node.children.iter().position(|kid| *kid == child) else {
         return false;
     };
-    node.children.iter().take(position).any(|kid| {
-        doc.base
-            .get_node(*kid)
-            .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-            && !doc.is_fragment(*kid)
-    })
+    node.children
+        .iter()
+        .take(position)
+        .any(|kid| is_element(&doc.base, *kid))
 }
 
 /// Whether `parent` has an element child that `excluded` does not contain
@@ -156,14 +149,9 @@ pub(crate) fn parent_has_element(
     excluded: &[BlitzId],
 ) -> bool {
     doc.base.get_node(parent).is_some_and(|root| {
-        root.children.iter().any(|child| {
-            !excluded.contains(child)
-                && doc
-                    .base
-                    .get_node(*child)
-                    .is_some_and(|candidate| candidate.data.downcast_element().is_some())
-                && !doc.is_fragment(*child)
-        })
+        root.children
+            .iter()
+            .any(|child| !excluded.contains(child) && is_element(&doc.base, *child))
     })
 }
 
@@ -532,8 +520,8 @@ pub(crate) fn replace_all_with_node(
             .document
             .base
             .get_node(node.node)
-            .map(|backing| {
-                backing
+            .map(|contents| {
+                contents
                     .children
                     .iter()
                     .map(|child| NodeId {
@@ -883,7 +871,7 @@ pub(crate) fn ensure_can_move(
         let has_element = base.get_node(parent.node).is_some_and(|root| {
             root.children
                 .iter()
-                .any(|child| *child != node.node && is_real_element(doc, *child))
+                .any(|child| *child != node.node && is_element(&doc.base, *child))
         });
         if has_element {
             return Err(TreeError::Hierarchy);
@@ -1077,8 +1065,8 @@ pub(crate) fn replace_parsed(
             .document
             .base
             .get_node(node.node)
-            .map(|backing| {
-                backing
+            .map(|contents| {
+                contents
                     .children
                     .iter()
                     .map(|child| NodeId {

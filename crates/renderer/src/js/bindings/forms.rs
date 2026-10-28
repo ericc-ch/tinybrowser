@@ -19,7 +19,7 @@ use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
 use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
 use rquickjs::prelude::Opt;
-use rquickjs::{Array, Ctx, Object, Persistent, Result, TypedArray, Value};
+use rquickjs::{Array, Ctx, Exception, Object, Persistent, Result, TypedArray, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -266,6 +266,9 @@ pub(super) fn form_navigate<'js>(
     // on the way to that conclusion.
     let Some(owner) = owning_world(&ctx, node) else {
         return Ok(());
+    };
+    let Ok(method) = net::Method::parse(&method) else {
+        return Err(Exception::throw_type(&ctx, "invalid form method"));
     };
     if focus::cannot_navigate(&owner.borrow(), node) {
         return Ok(());

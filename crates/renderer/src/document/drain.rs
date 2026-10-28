@@ -171,12 +171,11 @@ impl Document {
                                 // as the response's `Content-Type` header
                                 // (<https://fetch.spec.whatwg.org/#concept-scheme-fetch>).
                                 headers: vec![("content-type".to_owned(), content_type)],
-                                body: Ok(body),
+                                body: crate::protocol::ResponseBody::Buffered(Ok(body)),
                                 response_type: net::cors::ResponseType::Basic,
                                 crossed_origin: false,
                                 redirect_count: 0,
                                 referrer: None,
-                                stream: None,
                             },
                         });
                     } else {
