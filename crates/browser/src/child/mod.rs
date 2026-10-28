@@ -48,6 +48,7 @@ use crate::wire::{
     RendererAssignmentId, RendererNotice, RendererReply, ServiceCall, ServiceReply, StorageCall,
     ToRenderer,
 };
+use renderer::OpenerPolicy;
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
 ///
@@ -426,12 +427,12 @@ impl StorageHost for HostServices {
 }
 
 impl BrowsingContextHost for HostServices {
-    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64> {
+    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<u64> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
                 url: url.to_owned(),
                 name: name.to_owned(),
-                features: features.to_owned(),
+                opener,
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,

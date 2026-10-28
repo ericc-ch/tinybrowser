@@ -166,39 +166,28 @@ fn header_list_members(value: &str) -> Option<Vec<&str>> {
     Some(members)
 }
 
-/// Fetch's request referrer
+/// Fetch's request referrer, resolved against the client environment the
+/// request runs in
 /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+///
+/// The `"client"` branch carries the environment instead of being a marker
+/// beside a nullable one, so "client with no environment" cannot be built.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Referrer {
     /// `"no-referrer"`: the determination is skipped entirely.
     #[default]
     NoReferrer,
-    /// `"client"`: resolve against the request's client environment.
-    Client,
+    /// `"client"`: resolve against this request's client environment.
+    Client(ReferrerClient),
     /// An explicit URL, already checked same-origin with the client by the
     /// browser boundary.
     Url(Url),
 }
 
-impl Referrer {
-    /// The wire/IDL spelling: `""`, `"about:client"`, or a serialized URL.
-    #[must_use]
-    pub fn from_idl(value: &str) -> Option<Self> {
-        if value.is_empty() {
-            return Some(Self::NoReferrer);
-        }
-        if value.eq_ignore_ascii_case("about:client") {
-            return Some(Self::Client);
-        }
-        Url::parse(value).ok().map(Self::Url)
-    }
-}
-
 /// The request's client environment for the `"client"` referrer branch: the
 /// document's origin (the opaque check) and the document URL the spec walks
 /// `srcdoc` parents to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferrerClient {
     /// The document's origin; opaque documents send no referrer.
     pub origin: Origin,
@@ -210,23 +199,19 @@ pub struct ReferrerClient {
 /// `no referrer`
 /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
 ///
-/// `client` is only read for [`Referrer::Client`]; later redirect hops pass
-/// the previous hop's referrer as [`Referrer::Url`], which is what HTTP
-/// redirect fetch does.
+/// Later redirect hops pass the previous hop's referrer as
+/// [`Referrer::Url`], which is what HTTP redirect fetch does, so the client
+/// environment is read once per request rather than once per hop.
 #[must_use]
 pub fn determine_referrer(
     policy: ReferrerPolicy,
-    client: Option<&ReferrerClient>,
     referrer: &Referrer,
     target: &Url,
 ) -> Option<Url> {
-    // Step 3: the referrer switch. Fetch never calls this algorithm for
-    // "no-referrer", so that branch is unreachable there, but treating it as
-    // no referrer here keeps every caller safe.
+    // Step 3: the referrer switch.
     let source = match referrer {
         Referrer::NoReferrer => return None,
-        Referrer::Client => {
-            let client = client?;
+        Referrer::Client(client) => {
             if matches!(client.origin, Origin::Opaque(_)) {
                 return None;
             }

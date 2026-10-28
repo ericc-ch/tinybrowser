@@ -465,12 +465,9 @@ mod tests {
             RequestPolicy::CspReportTo,
             RequestPolicy::CspReportUri,
         ] {
-            let request = renderer::DialRequest::new(
-                policy,
-                "https://a.test/x",
-                "https://a.test/",
-                "https://a.test/",
-            );
+            let url = url::Url::parse("https://a.test/x").expect("URL");
+            let page = url::Url::parse("https://a.test/").expect("URL");
+            let request = renderer::DialRequest::new(policy, &url, "https://a.test/", &page);
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
                 body: crate::wire::BrowserCall {

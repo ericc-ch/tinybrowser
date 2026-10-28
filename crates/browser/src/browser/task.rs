@@ -242,11 +242,11 @@ impl BrowserTask {
         let OpenWindowOptions {
             url,
             source,
-            noopener,
+            opener,
         } = request;
         let handle = self.create_tab()?;
         let id = handle.id();
-        if let (Some(source), false) = (source, noopener) {
+        if let (Some(source), renderer::OpenerPolicy::Keep) = (source, opener) {
             self.tabs.set_opener(id, source);
             self.context.copy_session(source, id);
         }

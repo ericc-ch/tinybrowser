@@ -1119,17 +1119,11 @@ Object.defineProperty(globalThis, 'name', {
     if (spec === null || spec === undefined) return null;
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
-    // Window features are a comma-separated list of name[=value] pairs; the
-    // two that change this algorithm are `noopener` and `noreferrer`
-    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
-    const tokens = new Set(
-      featureString
-        .split(',')
-        .map((feature) => feature.split('=')[0].trim().toLowerCase())
-        .filter((feature) => feature !== ''),
-    );
-    const noopener = tokens.has('noopener') || tokens.has('noreferrer');
-    const noreferrer = tokens.has('noreferrer');
+    // The engine tokenizes and parses the features argument; this shim only
+    // reads the answer, so the grammar lives in one place
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
+    const opener = host.__tbOpenerPolicy(featureString);
+    const noopener = opener !== 'keep';
     const special = name === '' || name.startsWith('_');
     // Without `allow-popups` a sandboxed document cannot create an auxiliary
     // context at all, whether this renderer or the browser would host it
@@ -1139,15 +1133,20 @@ Object.defineProperty(globalThis, 'name', {
       name === '_blank' ||
       (!name.startsWith('_') && !namedWindows.has(name));
     if (creates && !host.__tbMayOpenPopup()) return null;
-    if (!special && namedWindows.has(name)) return namedWindows.get(name);
+    if (!special && namedWindows.has(name)) {
+      // A `noopener` call never hands back a `WindowProxy`, even for a context
+      // the name already selected
+      // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+      return noopener ? null : namedWindows.get(name);
+    }
     // A context this renderer hosts keeps same-origin access to the opener: an
     // auxiliary context for a blank or same-origin URL, or the navigable a
     // name already selects. A cross-origin popup stays a browser tab.
-    const frame = host.__tbOpenAuxiliary(spec, name, noopener, noreferrer);
+    const frame = host.__tbOpenAuxiliary(spec, name, opener);
     if (frame !== null && frame !== undefined) {
       return noopener ? null : __tbFrameProxy(frame);
     }
-    const tab = host.__tbWindowOpen(spec, name, featureString);
+    const tab = host.__tbWindowOpen(spec, name, opener);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
     if (!special) {

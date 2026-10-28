@@ -102,7 +102,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         (
             world.runtime.services.clone(),
             world.origin.ascii_serialization(),
-            world.referrer_url.to_string(),
+            world.referrer_url.clone(),
             options
                 .referrer_policy
                 .or(world.policy.referrer_policy)
@@ -121,13 +121,16 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     module_request_blocked(&world_rc, ctx, name)?;
 
     let (send, receive) = mpsc::sync_channel(1);
+    let Ok(url) = Url::parse(name) else {
+        return Err(Error::new_loading(name));
+    };
     let mut request = DialRequest::new(
         crate::protocol::RequestPolicy::ModuleScript { crossorigin },
-        name,
+        &url,
         &initiator,
         &referrer_url,
     );
-    request.referrer = net::Referrer::Client;
+    request.referrer = crate::protocol::ReferrerRequest::Client;
     request.csp = Some(Box::new(gate));
     request.referrer_policy = referrer_policy;
     let cancel = services.start_dial(

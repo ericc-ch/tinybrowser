@@ -536,16 +536,47 @@ pub struct ScreenshotClip {
     pub height: f32,
 }
 
+/// What the renderer knows about a request's referrer source before the
+/// browser resolves it against the client environment the browser owns
+/// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferrerRequest {
+    /// No `Referer` at all.
+    #[default]
+    NoReferrer,
+    /// The initiator document: the browser reads [`DialRequest::referrer_url`]
+    /// and keeps it only when it is same-origin with the authorized initiator.
+    Client,
+    /// An explicit source URL: the document's referrer for a navigation, or a
+    /// style sheet's URL for a CSS-initiated request. The browser authorizes
+    /// it the same way it authorizes a navigation's referrer.
+    Url(Url),
+}
+
+impl ReferrerRequest {
+    /// The IDL spelling: `""`, `"about:client"`, or a URL
+    /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+    #[must_use]
+    pub fn from_idl(value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return Some(Self::NoReferrer);
+        }
+        if value.eq_ignore_ascii_case("about:client") {
+            return Some(Self::Client);
+        }
+        Url::parse(value).ok().map(Self::Url)
+    }
+}
+
 /// One blocking request the renderer asks the browser process to perform
 /// (a GET for most dials; a navigation may carry a method and body).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialRequest {
     /// Why the dial happens, and the CORS parameters it is sent under.
     pub policy: RequestPolicy,
-    /// Absolute request URL, canonically serialized: every queue site
-    /// stringifies a parsed [`url::Url`], so the scheme is lowercase and a
-    /// `scheme:` prefix test is exact.
-    pub url: String,
+    /// Absolute request URL.
+    pub url: Url,
     /// Document URL used as the `SameSite`/`Sec-Fetch-*` initiator.
     pub initiator: String,
     /// Whether and how the browser delivers the response body.
@@ -561,15 +592,14 @@ pub struct DialRequest {
     pub content_type: Option<String>,
     /// Author-supplied request headers, in insertion order.
     pub headers: Vec<(String, String)>,
-    /// Fetch's request referrer: a client, an explicit URL, or no referrer.
-    /// The browser resolves "client" against the authorized initiator and
-    /// verifies an explicit URL is same-origin with it
+    /// Fetch's request referrer, before the browser resolves it against the
+    /// client environment and verifies an explicit URL is authorized
     /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
-    pub referrer: net::Referrer,
-    /// The document URL the `"client"` branch reads, walked out of `srcdoc`
-    /// to the container document
+    pub referrer: ReferrerRequest,
+    /// The document URL the [`ReferrerRequest::Client`] branch reads, walked
+    /// out of `srcdoc` to the container document
     /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-    pub referrer_url: String,
+    pub referrer_url: Url,
     /// Caller deadline in milliseconds. `0` keeps the carrier timeout.
     /// A synchronous XHR uses its `timeout` attribute here
     /// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>).
@@ -602,18 +632,18 @@ impl DialRequest {
     /// cache mode, and no referrer. Callers with more to say set the fields
     /// their request adds.
     #[must_use]
-    pub fn new(policy: RequestPolicy, url: &str, initiator: &str, referrer_url: &str) -> Self {
+    pub fn new(policy: RequestPolicy, url: &Url, initiator: &str, referrer_url: &Url) -> Self {
         Self {
             policy,
-            url: url.to_owned(),
+            url: url.clone(),
             initiator: initiator.to_owned(),
-            referrer_url: referrer_url.to_owned(),
+            referrer_url: referrer_url.clone(),
             delivery: BodyDelivery::Buffer,
             method: net::Method::GET,
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
-            referrer: net::Referrer::NoReferrer,
+            referrer: ReferrerRequest::NoReferrer,
             timeout_ms: 0,
             csp: None,
             keepalive: false,
@@ -985,7 +1015,7 @@ pub struct DialOutcome {
     /// The stripped referrer the final hop was sent with, when it sent one.
     /// A navigated document reports it as `document.referrer`
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-    pub referrer: Option<String>,
+    pub referrer: Option<Url>,
 }
 
 impl DialOutcome {
@@ -1113,12 +1143,52 @@ pub trait StorageHost: Send + Sync + 'static {
     ) -> Option<StorageChange>;
 }
 
+/// What `window.open`'s `noopener` and `noreferrer` features do to the
+/// context it opens
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-open>).
+///
+/// `noreferrer` implies `noopener`, so the three states are exhaustive and no
+/// caller can carry "noopener off, noreferrer on".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenerPolicy {
+    /// Keep the opener relationship and send the referrer the rules choose.
+    Keep,
+    /// Drop the opener relationship and return no `WindowProxy`.
+    NoOpener,
+    /// [`NoOpener`](Self::NoOpener), and the navigation sends no referrer.
+    NoReferrer,
+}
+
+impl OpenerPolicy {
+    /// The token the page shim exchanges with the host. The shim only passes
+    /// back a token [`Self::parse`] answered, so a rejected token means the
+    /// shim and the engine disagree about the vocabulary.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::NoOpener => "noopener",
+            Self::NoReferrer => "noreferrer",
+        }
+    }
+
+    /// Reads one [`Self::token`].
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "keep" => Some(Self::Keep),
+            "noopener" => Some(Self::NoOpener),
+            "noreferrer" => Some(Self::NoReferrer),
+            _ => None,
+        }
+    }
+}
+
 /// Browsing-context effects the page engine asks its host to perform.
 pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
-    /// to open a window. `url` is absolute, or empty for `about:blank`. `seed`
-    /// is the opener's session copy for the new tab, when there is one.
-    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64>;
+    /// to open a window. `url` is absolute, or empty for `about:blank`.
+    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<u64>;
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, tab: u64);

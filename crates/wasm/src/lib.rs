@@ -490,16 +490,14 @@ impl NetworkHost for WasmServices {
         if request.policy.kind() == DialKind::CspReport {
             completion(Ok(DialOutcome::basic(
                 204,
-                request.url,
+                request.url.to_string(),
                 None,
                 Vec::new(),
                 Vec::new(),
             )));
             return Box::new(|| {});
         }
-        let shaped = Url::parse(&request.url)
-            .ok()
-            .filter(|url| matches!(url.scheme(), "http" | "https"));
+        let shaped = matches!(request.url.scheme(), "http" | "https").then_some(request.url);
         let Some(url) = shaped else {
             completion(Err(DialFailure::Connect));
             return Box::new(|| {});
@@ -651,7 +649,7 @@ impl StorageHost for WasmServices {
 }
 
 impl BrowsingContextHost for WasmServices {
-    fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
+    fn window_open(&self, _url: &str, _name: &str, _opener: renderer::OpenerPolicy) -> Option<u64> {
         None
     }
 

@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::RemoteValue;
-use crate::document::{CreatedFrame, Document, LocalDocumentState, WindowMessage};
+use crate::document::{CreatedFrame, Document, LocalDocumentState, WindowMessage, about_blank};
 use crate::js::FrameRuntime;
 use crate::js::Stop;
 
@@ -418,7 +418,7 @@ impl Engine {
         // A browser-initiated navigation has no source document, so the new
         // document reports no referrer
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-        document.set_document_referrer("");
+        document.set_document_referrer(None);
         document.install_head(head, None);
         Ok(())
     }
@@ -1149,9 +1149,12 @@ impl Engine {
         &self,
         initiator: FrameId,
         navigation: &FrameNavigation,
-    ) -> (net::Referrer, net::ReferrerPolicy) {
+    ) -> (crate::protocol::ReferrerRequest, net::ReferrerPolicy) {
         if navigation.no_referrer {
-            return (net::Referrer::NoReferrer, net::ReferrerPolicy::NoReferrer);
+            return (
+                crate::protocol::ReferrerRequest::NoReferrer,
+                net::ReferrerPolicy::NoReferrer,
+            );
         }
         let policy = navigation.referrer_policy;
         match self.frames.get(&initiator) {
@@ -1159,11 +1162,14 @@ impl Engine {
                 let world = document.world();
                 let world = world.borrow();
                 (
-                    net::Referrer::Client,
+                    crate::protocol::ReferrerRequest::Client,
                     policy.or(world.policy.referrer_policy).unwrap_or_default(),
                 )
             }
-            None => (net::Referrer::NoReferrer, policy.unwrap_or_default()),
+            None => (
+                crate::protocol::ReferrerRequest::NoReferrer,
+                policy.unwrap_or_default(),
+            ),
         }
     }
 
@@ -1177,18 +1183,24 @@ impl Engine {
         initiator: FrameId,
         navigation: &FrameNavigation,
         target: &Url,
-    ) -> String {
+    ) -> Option<Url> {
         let (referrer, policy) = self.navigation_referrer(initiator, navigation);
-        let client = self.frames.get(&initiator).map(|document| {
-            let world = document.world();
-            let world = world.borrow();
-            net::ReferrerClient {
-                origin: world.origin.clone(),
-                url: world.referrer_url.clone(),
-            }
-        });
-        net::determine_referrer(policy, client.as_ref(), &referrer, target)
-            .map_or_else(String::new, |url| url.to_string())
+        let referrer = match referrer {
+            crate::protocol::ReferrerRequest::NoReferrer => net::Referrer::NoReferrer,
+            crate::protocol::ReferrerRequest::Url(url) => net::Referrer::Url(url),
+            crate::protocol::ReferrerRequest::Client => match self.frames.get(&initiator) {
+                Some(document) => {
+                    let world = document.world();
+                    let world = world.borrow();
+                    net::Referrer::Client(net::ReferrerClient {
+                        origin: world.origin.clone(),
+                        url: world.referrer_url.clone(),
+                    })
+                }
+                None => net::Referrer::NoReferrer,
+            },
+        };
+        net::determine_referrer(policy, &referrer, target)
     }
 
     /// The policy a local-scheme document inherits from its initiator
@@ -1215,7 +1227,7 @@ impl Engine {
         let inherited = self.frames.get(&parent).map(|document| {
             (
                 document.inherited_url(),
-                document.referrer_url().to_string(),
+                document.referrer_url(),
                 document.world().borrow().origin.clone(),
             )
         });
@@ -1233,9 +1245,9 @@ impl Engine {
         match inherited {
             Some((url, referrer, origin)) => {
                 document.load_about_blank(Some(&url), Some(origin));
-                document.set_document_referrer(&referrer);
+                document.set_document_referrer(Some(referrer));
             }
-            None => document.load_about_blank(Some("about:blank"), None),
+            None => document.load_about_blank(Some(&about_blank()), None),
         }
         self.inherit_policy(child, parent);
     }
@@ -1381,21 +1393,20 @@ impl Engine {
                 // inherited, not derived from the document URL: an
                 // `about:srcdoc` document has no HTTP URL of its own
                 // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
-                let (origin, referrer_url) = self.frames.get(&initiator).map_or_else(
-                    || (url.origin(), url.to_string()),
-                    |document| {
-                        (
-                            document.dial_initiator(),
-                            document.referrer_url().to_string(),
-                        )
-                    },
-                );
+                let origin = self
+                    .frames
+                    .get(&initiator)
+                    .map_or_else(|| url.origin(), Document::dial_initiator);
                 // Top-level navigations send the source document's referrer
                 // like subresource requests do; without this every
                 // navigation is a no-referrer navigation regardless of
                 // policy
                 // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
                 let (referrer, referrer_policy) = self.navigation_referrer(initiator, navigation);
+                let referrer_url = self
+                    .frames
+                    .get(&initiator)
+                    .map_or_else(|| url.clone(), Document::referrer_url);
                 // The embedder's `frame-src` gate re-checks every redirect hop,
                 // and the ancestor URLs back the child response's
                 // `frame-ancestors` check at commit — both only when the
@@ -1414,14 +1425,14 @@ impl Engine {
                 if let Some(document) = self.frames.get_mut(&child) {
                     let mut request = crate::protocol::DialRequest::new(
                         crate::protocol::RequestPolicy::FrameLoad,
-                        url.as_str(),
+                        url,
                         &origin.ascii_serialization(),
                         &referrer_url,
                     );
+                    request.referrer = referrer;
                     request.method.clone_from(&navigation.method);
                     request.body.clone_from(&navigation.body);
                     request.content_type.clone_from(&navigation.content_type);
-                    request.referrer = referrer;
                     request.csp = gate.map(Box::new);
                     request.referrer_policy = referrer_policy;
                     document.navigate(embedder, request, ancestors, navigation.sandbox);
@@ -1524,7 +1535,7 @@ impl Engine {
         let Some((content_type, body)) = decode_data_url(url.as_str()) else {
             if let Some(document) = self.frames.get_mut(&child) {
                 document.load_about_blank(None, None);
-                document.set_document_referrer(&referrer);
+                document.set_document_referrer(referrer);
             }
             self.inherit_policy(child, parent);
             return;
@@ -1535,7 +1546,7 @@ impl Engine {
             let mut head = ResponseHead::non_http(url.to_string(), Some(content_type));
             head.inherited_policy = Some(policy.csp.clone());
             head.inherited_referrer_policy = policy.referrer_policy;
-            document.set_document_referrer(&referrer);
+            document.set_document_referrer(referrer);
             document.install_frame_response(&head, &body, None);
         }
     }
@@ -1573,7 +1584,7 @@ impl Engine {
                 ResponseHead::non_http(url.to_string(), content_type.as_deref().map(String::from));
             head.inherited_policy = Some(policy.csp.clone());
             head.inherited_referrer_policy = policy.referrer_policy;
-            document.set_document_referrer(&referrer);
+            document.set_document_referrer(referrer);
             document.install_frame_response(&head, contents.as_bytes(), Some(origin));
         }
     }

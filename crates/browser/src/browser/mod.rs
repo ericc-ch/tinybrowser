@@ -92,8 +92,8 @@ pub(crate) struct OpenWindowOptions {
     pub(crate) url: String,
     /// Tab that called `window.open`, when it has one.
     pub(crate) source: Option<TabId>,
-    /// Whether the new context must not receive an opener.
-    pub(crate) noopener: bool,
+    /// What the call's `noopener` and `noreferrer` features asked for.
+    pub(crate) opener: renderer::OpenerPolicy,
 }
 
 pub(super) enum Command {

@@ -168,15 +168,15 @@ impl Document {
                 let super::dials::QueuedEntry { dial, delay } = entry;
                 // The queue holds the parsed URL's serialization, so the
                 // prefix test is the scheme test (see `DialRequest::url`).
-                if dial.req.url.starts_with("data:") {
+                if dial.req.url.scheme() == "data" {
                     completed_data = true;
                     // Same ceiling as a streamed navigation body. Decoding an
                     // unbounded `data:` URL would sit entirely in this process.
                     if let Some((content_type, body)) =
-                        crate::engine::decode_data_url_bounded(&dial.req.url)
+                        crate::engine::decode_data_url_bounded(dial.req.url.as_str())
                     {
                         drop(delay);
-                        let final_url = dial.req.url.clone();
+                        let final_url = dial.req.url.to_string();
                         self.finish_dial(super::CompletedDial {
                             context: dial.context,
                             req: dial.req,
@@ -396,7 +396,7 @@ impl Document {
             &self.dial_initiator(),
             &self.referrer_url(),
         );
-        dial.req.referrer = net::Referrer::Client;
+        dial.req.referrer = crate::protocol::ReferrerRequest::Client;
         dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),

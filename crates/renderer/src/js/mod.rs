@@ -198,7 +198,7 @@ pub(crate) struct JsFetchRequest {
 /// is the IDL default mode. An unknown spelling is a `TypeError` that names
 /// the key and value; it never becomes a different, valid-looking request.
 pub(crate) struct DialOptions {
-    pub(crate) referrer: net::Referrer,
+    pub(crate) referrer: crate::protocol::ReferrerRequest,
     pub(crate) cors: crate::protocol::CorsRequest,
     pub(crate) keepalive: bool,
     pub(crate) body_len: u64,
@@ -242,10 +242,10 @@ impl DialOptions {
 
         let ctx = options.ctx();
         let referrer = match options.get::<_, Option<String>>("referrer")? {
-            Some(value) => net::Referrer::from_idl(&value).ok_or_else(|| {
+            Some(value) => crate::protocol::ReferrerRequest::from_idl(&value).ok_or_else(|| {
                 Exception::throw_type(ctx, &format!("referrer: {value:?} is not a referrer"))
             })?,
-            None => net::Referrer::NoReferrer,
+            None => crate::protocol::ReferrerRequest::NoReferrer,
         };
         let cors = crate::protocol::CorsRequest {
             // `fetch` always passes the mode its `Request` normalized
@@ -1375,10 +1375,24 @@ fn random_bytes(ctx: Ctx<'_>, length: usize) -> rquickjs::Result<TypedArray<'_, 
 
 /// `window.open`/`window.close` hooks the JS shim calls.
 fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    // The shim parses the feature string once through `__tbOpenerPolicy` and
+    // hands the answer back here, so the engine never re-reads a grammar the
+    // page wrote
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
+    bridge::object(ctx)?.set(
+        "__tbOpenerPolicy",
+        Func::from(|features: String| {
+            crate::window_features::WindowFeatures::parse(&features)
+                .opener_policy()
+                .token()
+        }),
+    )?;
+
     let window_open = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowOpen",
-        Func::from(move |url: String, name: String, features: String| {
+        Func::from(move |url: String, name: String, opener: String| {
+            let opener = crate::protocol::OpenerPolicy::parse(&opener)?;
             let spec = if url.is_empty() {
                 Some(String::new())
             } else {
@@ -1394,7 +1408,7 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                     .borrow()
                     .runtime
                     .services
-                    .window_open(&spec, &name, &features)
+                    .window_open(&spec, &name, opener)
             })
         }),
     )?;
@@ -1475,20 +1489,11 @@ fn install_auxiliary_host_functions(
     let open = world.clone();
     bridge::object(ctx)?.set(
         "__tbOpenAuxiliary",
-        Func::from(
-            move |url: String, name: String, noopener: bool, noreferrer: bool| {
-                World::open_auxiliary(
-                    &open,
-                    &url,
-                    &name,
-                    crate::js::world::AuxiliaryOptions {
-                        noopener,
-                        noreferrer,
-                    },
-                )
+        Func::from(move |url: String, name: String, opener: String| {
+            let opener = crate::protocol::OpenerPolicy::parse(&opener)?;
+            World::open_auxiliary(&open, &url, &name, opener)
                 .map(|frame| crate::js::js_number(frame.get()))
-            },
-        ),
+        }),
     )?;
 
     let popups = world.clone();
@@ -1735,7 +1740,7 @@ struct SyncPageFetch {
     body: Vec<u8>,
     content_type: Option<String>,
     headers: Vec<(String, String)>,
-    referrer: net::Referrer,
+    referrer: crate::protocol::ReferrerRequest,
     with_credentials: bool,
     timeout: f64,
 }
@@ -1844,13 +1849,15 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                 // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
                 // <https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
                 let referrer = match options.get::<_, Option<String>>("referrer")? {
-                    Some(value) => net::Referrer::from_idl(&value).ok_or_else(|| {
-                        Exception::throw_type(
-                            options.ctx(),
-                            &format!("referrer: {value:?} is not a referrer"),
-                        )
-                    })?,
-                    None => net::Referrer::default(),
+                    Some(value) => {
+                        crate::protocol::ReferrerRequest::from_idl(&value).ok_or_else(|| {
+                            Exception::throw_type(
+                                options.ctx(),
+                                &format!("referrer: {value:?} is not a referrer"),
+                            )
+                        })?
+                    }
+                    None => crate::protocol::ReferrerRequest::default(),
                 };
                 let with_credentials = options
                     .get::<_, Option<bool>>("withCredentials")?
@@ -1917,9 +1924,9 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             },
             redirect: net::cors::RedirectMode::Follow,
         }),
-        &request.url,
+        &parsed,
         &world.origin.ascii_serialization(),
-        world.referrer_url.as_str(),
+        &world.referrer_url,
     );
     dial.method = request.method;
     dial.body = request.body;

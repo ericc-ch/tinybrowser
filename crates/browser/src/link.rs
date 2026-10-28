@@ -804,7 +804,7 @@ async fn route_window_call(
     call: BrowsingContextCall,
 ) -> Result<(), RendererViolation> {
     match call {
-        BrowsingContextCall::WindowOpen { url, features, .. } => {
+        BrowsingContextCall::WindowOpen { url, opener, .. } => {
             let spec = if url.is_empty() || url == "about:blank" {
                 Some(String::new())
             } else {
@@ -814,19 +814,13 @@ async fn route_window_call(
                     .map(|url| url.to_string())
             };
             let source = Some(assignment.tab);
-            let noopener = features
-                .split(|character: char| character.is_ascii_whitespace() || character == ',')
-                .any(|feature| {
-                    feature.eq_ignore_ascii_case("noopener")
-                        || feature.eq_ignore_ascii_case("noreferrer")
-                });
             let tab = match spec {
                 Some(spec) => context
                     .browser
                     .open_window(crate::browser::OpenWindowOptions {
                         url: spec,
                         source,
-                        noopener,
+                        opener,
                     })
                     .await
                     .ok()

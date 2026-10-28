@@ -619,23 +619,6 @@ pub(crate) struct FrameNavigation {
     pub(crate) source: Option<FrameId>,
 }
 
-/// The feature tokens one `window.open` call applies to the context it opens.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct AuxiliaryOptions {
-    /// `noopener`: return no proxy and drop the opener relationship.
-    pub(crate) noopener: bool,
-    /// `noreferrer`: imply `noopener` and send no referrer.
-    pub(crate) noreferrer: bool,
-}
-
-impl AuxiliaryOptions {
-    /// `noopener` and `noreferrer` both sever the opener link; only
-    /// `noreferrer` also drops the referrer.
-    pub(crate) fn severs_opener(self) -> bool {
-        self.noopener || self.noreferrer
-    }
-}
-
 impl FrameNavigation {
     /// A GET navigation, the shape of every navigation but a form submission.
     pub(crate) fn get(target: NavigationTarget, spec: String) -> Self {
@@ -1083,7 +1066,8 @@ pub(crate) struct WeakReferences {
 pub(crate) type ChildFrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, NodeId)>;
 
 /// Builds an auxiliary top-level context's initial document.
-pub(crate) type AuxiliaryFrameHost = Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, AuxiliaryOptions)>;
+pub(crate) type AuxiliaryFrameHost =
+    Rc<dyn Fn(&Rc<RefCell<World>>, FrameId, crate::protocol::OpenerPolicy)>;
 
 /// Builds the documents the `document` layer owns when a realm asks for one.
 /// Installed by that layer, so the realm asks for a browsing context's
@@ -1376,7 +1360,7 @@ pub(crate) struct World {
     /// creator's URL for a document made locally. `document.referrer` reads
     /// it, and policy never un-redacts it
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-    pub(crate) document_referrer: String,
+    pub(crate) document_referrer: Option<Url>,
     /// The creator document's base URL while this document is an `iframe
     /// srcdoc document`. Its own URL cannot be a base, so its fallback base
     /// URL — what relative URLs resolve against — is the creator's
@@ -1830,7 +1814,7 @@ impl World {
             owned: HashSet::new(),
             origin: document_url.origin(),
             referrer_url: document_url.clone(),
-            document_referrer: String::new(),
+            document_referrer: None,
             document_url,
             base_url: None,
             policy: PolicyContainer::default(),
@@ -2318,7 +2302,7 @@ impl World {
         world_rc: &Rc<RefCell<World>>,
         spec: &str,
         name: &str,
-        options: AuxiliaryOptions,
+        opener: crate::protocol::OpenerPolicy,
     ) -> Option<FrameId> {
         let current = world_rc.borrow().frame;
         // `window.open()` with no URL navigates to about:blank; a fresh
@@ -2337,7 +2321,7 @@ impl World {
         if let Some(frame) = existing.flatten() {
             let mut navigation =
                 FrameNavigation::get(NavigationTarget::Frame(frame), spec.to_owned());
-            if options.noreferrer {
+            if opener == crate::protocol::OpenerPolicy::NoReferrer {
                 navigation = navigation.without_referrer();
             }
             world_rc.borrow_mut().queue_frame_navigation(navigation);
@@ -2356,9 +2340,11 @@ impl World {
                 return None;
             }
             let frame = shared.allocate_frame();
-            shared
-                .tree
-                .add_auxiliary(current, frame, !options.severs_opener());
+            shared.tree.add_auxiliary(
+                current,
+                frame,
+                opener == crate::protocol::OpenerPolicy::Keep,
+            );
             if named {
                 shared.tree.set_name(frame, name.to_owned());
             }
@@ -2374,11 +2360,11 @@ impl World {
                 .remove(frame);
             return None;
         };
-        (host.auxiliary)(world_rc, frame, options);
+        (host.auxiliary)(world_rc, frame, opener);
         if spec != "about:blank" {
             let mut navigation =
                 FrameNavigation::get(NavigationTarget::Frame(frame), spec.to_owned());
-            if options.noreferrer {
+            if opener == crate::protocol::OpenerPolicy::NoReferrer {
                 navigation = navigation.without_referrer();
             }
             world_rc.borrow_mut().queue_frame_navigation(navigation);

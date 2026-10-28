@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange::{Frame, RequestId};
 use renderer::{
-    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, PostedMessage, RemoteValue,
-    StorageChange, StorageError, StorageKind, StreamId, TabError,
+    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, OpenerPolicy, PostedMessage,
+    RemoteValue, StorageChange, StorageError, StorageKind, StreamId, TabError,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -371,8 +371,9 @@ pub enum BrowsingContextCall {
         url: String,
         /// Browsing context name.
         name: String,
-        /// Feature string from the caller.
-        features: String,
+        /// What the `noopener` and `noreferrer` features asked for, already
+        /// parsed by the renderer that read the feature string.
+        opener: OpenerPolicy,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {

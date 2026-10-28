@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::InitiatorKind;
 use crate::error::{NetError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
-use crate::referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
+use crate::referrer::{Referrer, ReferrerPolicy, determine_referrer};
 use crate::resolve::ResolveRule;
 use crate::transport::{CallBudget, HopBudget, HttpEngine, Proxy, TrustedCa, basic_authorization};
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZlibDecoder};
@@ -453,9 +453,7 @@ impl Agent {
         // <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
         let mut referrer = request.referrer;
         let mut referrer_policy = request.referrer_policy;
-        let referrer_client = request.referrer_client;
-        let mut determined =
-            determine_referrer(referrer_policy, referrer_client.as_ref(), &referrer, &url);
+        let mut determined = determine_referrer(referrer_policy, &referrer, &url);
         Self::write_referer(&mut hop.headers, determined.as_ref())?;
         let mut followed = 0u32;
         let mut cross_site_redirect = false;
@@ -517,8 +515,7 @@ impl Agent {
                 Some(url) => Referrer::Url(url),
                 None => Referrer::NoReferrer,
             };
-            determined =
-                determine_referrer(referrer_policy, referrer_client.as_ref(), &referrer, &next);
+            determined = determine_referrer(referrer_policy, &referrer, &next);
             Self::write_referer(&mut hop.headers, determined.as_ref())?;
             url = next;
             followed += 1;
@@ -703,9 +700,6 @@ pub struct Request {
     /// policies are filled from the client's policy container, so this is
     /// never unset here.
     pub referrer_policy: ReferrerPolicy,
-    /// The client environment for [`Referrer::Client`]: the document origin
-    /// and its `srcdoc`-walked URL. Left unset when no environment exists.
-    pub referrer_client: Option<ReferrerClient>,
 }
 
 impl std::fmt::Debug for Request {
@@ -723,7 +717,6 @@ impl std::fmt::Debug for Request {
             .field("on_redirect", &self.on_redirect.is_some())
             .field("referrer", &self.referrer)
             .field("referrer_policy", &self.referrer_policy)
-            .field("referrer_client", &self.referrer_client)
             .finish()
     }
 }
@@ -752,7 +745,6 @@ impl Request {
             on_redirect: None,
             referrer: Referrer::NoReferrer,
             referrer_policy: ReferrerPolicy::default(),
-            referrer_client: None,
         }
     }
 }
