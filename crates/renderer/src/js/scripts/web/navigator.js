@@ -110,7 +110,10 @@
     get cookieEnabled() { return true; }
     get webdriver() { return false; }
     get userAgentData() {
-      if (globalThis.isSecureContext === false) return undefined;
+      // `NavigatorUAData` is `[SecureContext]`, so the member is absent rather
+      // than undefined-valued outside one
+      // (<https://wicg.github.io/ua-client-hints/#dom-navigator-useragentdata>).
+      if (!globalThis.isSecureContext) return undefined;
       return userAgentData;
     }
     get userActivation() {

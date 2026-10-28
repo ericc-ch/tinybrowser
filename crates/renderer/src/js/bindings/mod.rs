@@ -1873,6 +1873,46 @@ mod realm_tests {
         assert_eq!(outcome, "3,I,gap,U,0,true");
     }
 
+    /// The environment's secure-context bit decides every `[SecureContext]`
+    /// surface, so a plain-http document must not see them
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    #[test]
+    fn a_secure_context_gates_the_secure_context_only_surfaces() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        for (url, expected) in [
+            ("https://a.test/", "true,function,false"),
+            // `http://a.test` is not loopback, so it is not potentially
+            // trustworthy.
+            ("http://a.test/", "false,undefined,true"),
+        ] {
+            let stop = Arc::new(Stop::new());
+            let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+            let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+            let world = world_with_document(
+                &shared,
+                &services,
+                &documents,
+                &registry,
+                url,
+                "<!doctype html><p></p>",
+            );
+            let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
+            let outcome = realm
+                .eval(
+                    r#"
+                    [
+                      String(isSecureContext),
+                      typeof crypto.randomUUID,
+                      String(navigator.userAgentData === undefined)
+                    ].join(",");
+                    "#,
+                )
+                .expect("secure context surfaces");
+            assert_eq!(outcome, expected, "{url}");
+        }
+    }
+
     /// A call is a direct eval only when the callee is `%eval%` itself
     /// (<https://tc39.es/ecma262/#sec-evaluatecall>), and `%eval%` /
     /// `%Function%` expose intrinsic property attributes

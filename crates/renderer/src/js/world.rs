@@ -1985,6 +1985,26 @@ impl World {
         self.frame
     }
 
+    /// Whether this realm's environment is a secure context
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    ///
+    /// A document created locally (`about:blank`, `about:srcdoc`) inherits its
+    /// creator's context, and this model records that inheritance as the
+    /// document's origin, so a tuple origin names the URL the ancestor walk
+    /// would reach. An opaque origin cannot name one, and the document URL is
+    /// then the only evidence: `data:` is trustworthy by definition, while a
+    /// sandboxed `about:blank` that inherited an insecure context reads as
+    /// secure here.
+    pub(crate) fn is_secure_context(&self) -> bool {
+        let url = if self.origin.is_tuple() {
+            Url::parse(&self.origin.ascii_serialization())
+                .unwrap_or_else(|_| self.document_url.clone())
+        } else {
+            self.document_url.clone()
+        };
+        net::is_potentially_trustworthy(&url)
+    }
+
     /// Whether this realm's frame is still attached to its document. A
     /// removed iframe's frame may still sit in the tree until the engine
     /// reconciles, so the container's connectedness decides.
