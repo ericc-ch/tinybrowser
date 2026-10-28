@@ -61,7 +61,10 @@ pub(crate) fn document_referrer_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     if !world.is_main_document(id) {
         return String::new();
     }
-    world.document_referrer.clone()
+    world
+        .document_referrer
+        .as_ref()
+        .map_or_else(String::new, ToString::to_string)
 }
 
 /// The document's base URL: the first `base` element's `href` resolved

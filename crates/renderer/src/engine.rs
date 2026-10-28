@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::RemoteValue;
-use crate::document::{CreatedFrame, Document, LocalDocumentState, WindowMessage};
+use crate::document::{CreatedFrame, Document, LocalDocumentState, WindowMessage, about_blank};
 use crate::js::FrameRuntime;
 use crate::js::Stop;
 
@@ -28,7 +28,8 @@ pub const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
 
 use crate::documents::DocumentStore;
 use crate::js::{
-    FrameNavigation, NavigationTarget, PolicyContainer, RealmRegistry, SharedJsRuntime,
+    FrameNavigation, NavigationReferrer, NavigationTarget, PolicyContainer, RealmRegistry,
+    SharedJsRuntime,
 };
 use crate::messaging::{Delivery, SharedHandle};
 use crate::protocol::{
@@ -395,7 +396,7 @@ impl Engine {
                 .clone_from(&mount.head.init_scripts);
         }
         self.remove_descendants(frame);
-        self.frame_mut(frame)?.mount(mount)?;
+        self.frame_mut(frame)?.mount(mount);
         self.reconcile_frames();
         Ok(())
     }
@@ -418,7 +419,7 @@ impl Engine {
         // A browser-initiated navigation has no source document, so the new
         // document reports no referrer
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-        document.set_document_referrer("");
+        document.set_document_referrer(None);
         document.install_head(head, None);
         Ok(())
     }
@@ -1149,21 +1150,31 @@ impl Engine {
         &self,
         initiator: FrameId,
         navigation: &FrameNavigation,
-    ) -> (net::Referrer, net::ReferrerPolicy) {
-        if navigation.no_referrer {
-            return (net::Referrer::NoReferrer, net::ReferrerPolicy::NoReferrer);
-        }
-        let policy = navigation.referrer_policy;
+    ) -> (crate::protocol::ReferrerRequest, net::ReferrerPolicy) {
+        let policy = match navigation.referrer {
+            NavigationReferrer::NoReferrer => {
+                return (
+                    crate::protocol::ReferrerRequest::NoReferrer,
+                    net::ReferrerPolicy::NoReferrer,
+                );
+            }
+            NavigationReferrer::Client { policy } => policy,
+        };
         match self.frames.get(&initiator) {
             Some(document) => {
                 let world = document.world();
                 let world = world.borrow();
                 (
-                    net::Referrer::Client,
+                    crate::protocol::ReferrerRequest::Client {
+                        url: world.referrer_url.clone(),
+                    },
                     policy.or(world.policy.referrer_policy).unwrap_or_default(),
                 )
             }
-            None => (net::Referrer::NoReferrer, policy.unwrap_or_default()),
+            None => (
+                crate::protocol::ReferrerRequest::NoReferrer,
+                policy.unwrap_or_default(),
+            ),
         }
     }
 
@@ -1177,18 +1188,24 @@ impl Engine {
         initiator: FrameId,
         navigation: &FrameNavigation,
         target: &Url,
-    ) -> String {
+    ) -> Option<Url> {
         let (referrer, policy) = self.navigation_referrer(initiator, navigation);
-        let client = self.frames.get(&initiator).map(|document| {
-            let world = document.world();
-            let world = world.borrow();
-            net::ReferrerClient {
-                origin: world.origin.clone(),
-                url: world.referrer_url.clone(),
-            }
-        });
-        net::determine_referrer(policy, client.as_ref(), &referrer, target)
-            .map_or_else(String::new, |url| url.to_string())
+        let referrer = match referrer {
+            crate::protocol::ReferrerRequest::NoReferrer => net::Referrer::NoReferrer,
+            crate::protocol::ReferrerRequest::Url(url) => net::Referrer::Url(url),
+            crate::protocol::ReferrerRequest::Client { url } => match self.frames.get(&initiator) {
+                Some(document) => {
+                    let world = document.world();
+                    let world = world.borrow();
+                    net::Referrer::Client(net::ReferrerClient {
+                        origin: world.origin.clone(),
+                        url,
+                    })
+                }
+                None => net::Referrer::NoReferrer,
+            },
+        };
+        net::determine_referrer(policy, &referrer, target)
     }
 
     /// The policy a local-scheme document inherits from its initiator
@@ -1215,7 +1232,7 @@ impl Engine {
         let inherited = self.frames.get(&parent).map(|document| {
             (
                 document.inherited_url(),
-                document.referrer_url().to_string(),
+                document.referrer_url(),
                 document.world().borrow().origin.clone(),
             )
         });
@@ -1233,9 +1250,9 @@ impl Engine {
         match inherited {
             Some((url, referrer, origin)) => {
                 document.load_about_blank(Some(&url), Some(origin));
-                document.set_document_referrer(&referrer);
+                document.set_document_referrer(Some(referrer));
             }
-            None => document.load_about_blank(Some("about:blank"), None),
+            None => document.load_about_blank(Some(&about_blank()), None),
         }
         self.inherit_policy(child, parent);
     }
@@ -1381,15 +1398,10 @@ impl Engine {
                 // inherited, not derived from the document URL: an
                 // `about:srcdoc` document has no HTTP URL of its own
                 // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
-                let (origin, referrer_url) = self.frames.get(&initiator).map_or_else(
-                    || (url.origin(), url.to_string()),
-                    |document| {
-                        (
-                            document.dial_initiator(),
-                            document.referrer_url().to_string(),
-                        )
-                    },
-                );
+                let origin = self
+                    .frames
+                    .get(&initiator)
+                    .map_or_else(|| url.origin(), Document::dial_initiator);
                 // Top-level navigations send the source document's referrer
                 // like subresource requests do; without this every
                 // navigation is a no-referrer navigation regardless of
@@ -1414,14 +1426,13 @@ impl Engine {
                 if let Some(document) = self.frames.get_mut(&child) {
                     let mut request = crate::protocol::DialRequest::new(
                         crate::protocol::RequestPolicy::FrameLoad,
-                        url.as_str(),
+                        url,
                         &origin.ascii_serialization(),
-                        &referrer_url,
                     );
+                    request.referrer = referrer;
                     request.method.clone_from(&navigation.method);
                     request.body.clone_from(&navigation.body);
                     request.content_type.clone_from(&navigation.content_type);
-                    request.referrer = referrer;
                     request.csp = gate.map(Box::new);
                     request.referrer_policy = referrer_policy;
                     document.navigate(embedder, request, ancestors, navigation.sandbox);
@@ -1524,7 +1535,7 @@ impl Engine {
         let Some((content_type, body)) = decode_data_url(url.as_str()) else {
             if let Some(document) = self.frames.get_mut(&child) {
                 document.load_about_blank(None, None);
-                document.set_document_referrer(&referrer);
+                document.set_document_referrer(referrer);
             }
             self.inherit_policy(child, parent);
             return;
@@ -1532,10 +1543,8 @@ impl Engine {
         if let Some(document) = self.frames.get_mut(&child) {
             // A `data:` URL inherits the initiator's policy container
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
-            let mut head = ResponseHead::non_http(url.to_string(), Some(content_type));
-            head.inherited_policy = Some(policy.csp.clone());
-            head.inherited_referrer_policy = policy.referrer_policy;
-            document.set_document_referrer(&referrer);
+            let head = ResponseHead::local(url.clone(), Some(content_type), Some(policy));
+            document.set_document_referrer(referrer);
             document.install_frame_response(&head, &body, None);
         }
     }
@@ -1569,11 +1578,12 @@ impl Engine {
             // A `blob:` URL inherits the initiator's policy container, and the
             // child's origin is the store entry's creator
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
-            let mut head =
-                ResponseHead::non_http(url.to_string(), content_type.as_deref().map(String::from));
-            head.inherited_policy = Some(policy.csp.clone());
-            head.inherited_referrer_policy = policy.referrer_policy;
-            document.set_document_referrer(&referrer);
+            let head = ResponseHead::local(
+                url.clone(),
+                content_type.as_deref().map(String::from),
+                Some(policy),
+            );
+            document.set_document_referrer(referrer);
             document.install_frame_response(&head, contents.as_bytes(), Some(origin));
         }
     }
@@ -2036,6 +2046,7 @@ mod navigator_tests {
     use super::{Engine, FrameId, Mount, ResponseHead};
     use crate::test_services::NullServices;
     use std::sync::Arc;
+    use url::Url;
 
     /// One engine whose identity is not the built-in one: whatever the carrier
     /// spawns it with is what every page reports, header and hints together
@@ -2068,10 +2079,11 @@ mod navigator_tests {
             .mount_frame(
                 FrameId::MAIN,
                 &Mount {
-                    head: ResponseHead {
-                        url: "https://example.test/".to_owned(),
-                        ..ResponseHead::default()
-                    },
+                    head: ResponseHead::local(
+                        Url::parse("https://example.test/").expect("URL"),
+                        Some("text/html".to_owned()),
+                        None,
+                    ),
                     body: b"<!doctype html><title>identity</title>".to_vec(),
                 },
             )
@@ -2151,6 +2163,7 @@ mod messaging_tests {
     use super::{Engine, FrameId, Mount, ResponseHead};
     use crate::test_services::NullServices;
     use std::sync::Arc;
+    use url::Url;
 
     fn engine() -> Engine {
         Engine::new(
@@ -2163,10 +2176,11 @@ mod messaging_tests {
 
     fn mount(url: &str, body: &str) -> Mount {
         Mount {
-            head: ResponseHead {
-                url: url.to_owned(),
-                ..ResponseHead::default()
-            },
+            head: ResponseHead::local(
+                Url::parse(url).expect("mount URL"),
+                Some("text/html".to_owned()),
+                None,
+            ),
             body: body.as_bytes().to_vec(),
         }
     }
@@ -2233,8 +2247,9 @@ mod messaging_tests {
         // A target origin that names a different document is checked when the
         // task runs, so the message never reaches this realm.
         engine.receive_remote_window_message(crate::protocol::PostedMessage {
-            origin: "https://other.test".to_owned(),
-            target_origin: "https://different.test".to_owned(),
+            origin: crate::protocol::SerializedOrigin::parse("https://other.test").expect("origin"),
+            target_origin: crate::protocol::TargetOrigin::parse("https://different.test", None)
+                .expect("target"),
             payload: payload.clone(),
         });
         let _ready = engine.drain_ready();
@@ -2248,8 +2263,9 @@ mod messaging_tests {
         // The matching target origin delivers, and `event.origin` is the
         // sender's origin at post time, not an empty string.
         engine.receive_remote_window_message(crate::protocol::PostedMessage {
-            origin: "https://other.test".to_owned(),
-            target_origin: "https://example.test".to_owned(),
+            origin: crate::protocol::SerializedOrigin::parse("https://other.test").expect("origin"),
+            target_origin: crate::protocol::TargetOrigin::parse("https://example.test", None)
+                .expect("target"),
             payload,
         });
         let _ready = engine.drain_ready();

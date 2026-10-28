@@ -121,7 +121,11 @@ impl GuestTab for Tab {
         // the `fetch-request` contract change in #192.
         let mut renderer = EmbeddedRenderer::new(services, net::Identity::default());
         let mount = Mount {
-            head: renderer::ResponseHead::non_http(url, Some("text/html; charset=utf-8".into())),
+            head: renderer::ResponseHead::local(
+                url::Url::parse(&url).map_err(|_| format!("invalid url: {url}"))?,
+                Some("text/html; charset=utf-8".into()),
+                None,
+            ),
             body: html.into_bytes(),
         };
         renderer.mount(&mount).map_err(|error| error.to_string())?;
@@ -490,16 +494,14 @@ impl NetworkHost for WasmServices {
         if request.policy.kind() == DialKind::CspReport {
             completion(Ok(DialOutcome::basic(
                 204,
-                request.url,
+                request.url.to_string(),
                 None,
                 Vec::new(),
                 Vec::new(),
             )));
             return Box::new(|| {});
         }
-        let shaped = Url::parse(&request.url)
-            .ok()
-            .filter(|url| matches!(url.scheme(), "http" | "https"));
+        let shaped = matches!(request.url.scheme(), "http" | "https").then_some(request.url);
         let Some(url) = shaped else {
             completion(Err(DialFailure::Connect));
             return Box::new(|| {});
@@ -651,19 +653,29 @@ impl StorageHost for WasmServices {
 }
 
 impl BrowsingContextHost for WasmServices {
-    fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
+    fn window_open(
+        &self,
+        _url: &str,
+        _name: &str,
+        _opener: renderer::OpenerPolicy,
+    ) -> Option<renderer::WindowId> {
         None
     }
 
-    fn window_close(&self, _tab: u64) {}
+    fn window_close(&self, _window: renderer::WindowId) {}
 
-    fn window_opener(&self) -> Option<u64> {
+    fn window_opener(&self) -> Option<renderer::WindowId> {
         None
     }
 
-    fn window_post_message(&self, _tab: u64, _message: renderer::PostedMessage) {}
+    fn window_post_message(&self, _window: renderer::WindowId, _message: renderer::PostedMessage) {}
 
-    fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
+    fn remote_session_get(
+        &self,
+        _window: renderer::WindowId,
+        _origin: &str,
+        _key: &str,
+    ) -> Option<String> {
         None
     }
 }

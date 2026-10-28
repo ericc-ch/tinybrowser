@@ -48,6 +48,7 @@ use crate::wire::{
     RendererAssignmentId, RendererNotice, RendererReply, ServiceCall, ServiceReply, StorageCall,
     ToRenderer,
 };
+use renderer::{OpenerPolicy, WindowId};
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
 ///
@@ -426,12 +427,12 @@ impl StorageHost for HostServices {
 }
 
 impl BrowsingContextHost for HostServices {
-    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64> {
+    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowOpen {
                 url: url.to_owned(),
                 name: name.to_owned(),
-                features: features.to_owned(),
+                opener,
             },
         )) {
             Some(ServiceReply::Window(tab)) => tab,
@@ -439,29 +440,29 @@ impl BrowsingContextHost for HostServices {
         }
     }
 
-    fn window_close(&self, tab: u64) {
+    fn window_close(&self, window: WindowId) {
         let _result = self.call(ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowClose { tab },
+            BrowsingContextCall::WindowClose { window },
         ));
     }
 
-    fn window_opener(&self) -> Option<u64> {
+    fn window_opener(&self) -> Option<WindowId> {
         match self.call(ServiceCall::BrowsingContext(BrowsingContextCall::Opener)) {
             Some(ServiceReply::Window(tab)) => tab,
             _ => None,
         }
     }
 
-    fn window_post_message(&self, tab: u64, message: renderer::PostedMessage) {
+    fn window_post_message(&self, window: WindowId, message: renderer::PostedMessage) {
         let _result = self.call(ServiceCall::BrowsingContext(
-            BrowsingContextCall::WindowMessage { tab, message },
+            BrowsingContextCall::WindowMessage { window, message },
         ));
     }
 
-    fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String> {
+    fn remote_session_get(&self, window: WindowId, origin: &str, key: &str) -> Option<String> {
         match self.call(ServiceCall::BrowsingContext(
             BrowsingContextCall::RemoteSessionGet {
-                tab,
+                window,
                 origin: origin.to_owned(),
                 key: key.to_owned(),
             },

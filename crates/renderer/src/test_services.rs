@@ -67,19 +67,34 @@ impl StorageHost for NullServices {
 }
 
 impl BrowsingContextHost for NullServices {
-    fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
+    fn window_open(
+        &self,
+        _url: &str,
+        _name: &str,
+        _opener: crate::protocol::OpenerPolicy,
+    ) -> Option<crate::protocol::WindowId> {
         None
     }
 
-    fn window_close(&self, _tab: u64) {}
+    fn window_close(&self, _window: crate::protocol::WindowId) {}
 
-    fn window_opener(&self) -> Option<u64> {
+    fn window_opener(&self) -> Option<crate::protocol::WindowId> {
         None
     }
 
-    fn window_post_message(&self, _tab: u64, _message: crate::protocol::PostedMessage) {}
+    fn window_post_message(
+        &self,
+        _window: crate::protocol::WindowId,
+        _message: crate::protocol::PostedMessage,
+    ) {
+    }
 
-    fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
+    fn remote_session_get(
+        &self,
+        _window: crate::protocol::WindowId,
+        _origin: &str,
+        _key: &str,
+    ) -> Option<String> {
         None
     }
 }

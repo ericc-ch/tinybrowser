@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange::{Frame, RequestId};
 use renderer::{
-    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, PostedMessage, RemoteValue,
-    StorageChange, StorageError, StorageKind, StreamId, TabError,
+    BrowserEvent, DialFailure, DialOutcome, DialRequest, FrameId, OpenerPolicy, PostedMessage,
+    RemoteValue, StorageChange, StorageError, StorageKind, StreamId, TabError, WindowId,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -371,27 +371,28 @@ pub enum BrowsingContextCall {
         url: String,
         /// Browsing context name.
         name: String,
-        /// Feature string from the caller.
-        features: String,
+        /// What the `noopener` and `noreferrer` features asked for, already
+        /// parsed by the renderer that read the feature string.
+        opener: OpenerPolicy,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {
-        /// Browser-minted tab identity.
-        tab: u64,
+        /// Browser-minted window identity.
+        window: WindowId,
     },
     /// `window.opener` for this assignment's tab.
     Opener,
     /// `postMessage` to a window this renderer opened.
     WindowMessage {
-        /// Target tab identity.
-        tab: u64,
-        /// The encoded message, with the sender's claimed origin.
+        /// Target window identity.
+        window: WindowId,
+        /// The encoded message, with the sender's origin and resolved target.
         message: PostedMessage,
     },
     /// Reads one key from another tab's session area.
     RemoteSessionGet {
-        /// Target tab identity.
-        tab: u64,
+        /// Target window identity.
+        window: WindowId,
         /// Serialized origin of the calling document.
         origin: String,
         /// Encoded item key.
@@ -430,8 +431,8 @@ pub enum ServiceReply {
     StorageKeys(Vec<String>),
     /// Local storage mutation result; `Ok(None)` means nothing changed.
     StorageChanged(Result<Option<StorageChange>, StorageError>),
-    /// `window.open` result: the new tab, or `None` when it was refused.
-    Window(Option<u64>),
+    /// `window.open` result: the new window, or `None` when it was refused.
+    Window(Option<WindowId>),
     /// No payload (`CookieSet`).
     Unit,
 }

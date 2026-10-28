@@ -34,6 +34,7 @@ pub mod sniff;
 mod storage;
 #[cfg(test)]
 mod test_services;
+mod window_features;
 mod xml;
 
 pub use embedded::EmbeddedRenderer;
@@ -42,11 +43,12 @@ pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
     BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, CorsMode, CorsRequest,
     DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
-    HistoryHandling, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
-    PostedMessage, RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody,
-    ResponseHead, STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure,
-    ScriptSource, StorageChange, StorageError, StorageHost, StorageKind, StreamId, TabError,
-    TimerId,
+    HistoryHandling, HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount,
+    NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage, ReferrerRequest, RendererEvent,
+    RequestCache, RequestPolicy, ResourceLimit, ResponseBody, ResponseHead, ResponseSource,
+    STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource,
+    SerializedOrigin, StorageChange, StorageError, StorageHost, StorageKind, StreamId, TabError,
+    TargetOrigin, TimerId, WindowId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

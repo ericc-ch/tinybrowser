@@ -465,12 +465,8 @@ mod tests {
             RequestPolicy::CspReportTo,
             RequestPolicy::CspReportUri,
         ] {
-            let request = renderer::DialRequest::new(
-                policy,
-                "https://a.test/x",
-                "https://a.test/",
-                "https://a.test/",
-            );
+            let url = url::Url::parse("https://a.test/x").expect("URL");
+            let request = renderer::DialRequest::new(policy, &url, "https://a.test/");
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
                 body: crate::wire::BrowserCall {
@@ -498,6 +494,168 @@ mod tests {
                 panic!("expected a dial");
             };
             assert_eq!(request.policy, policy, "the policy survives the wire");
+        }
+    }
+
+    /// Both response-head shapes survive the postcard wire. The origin variant
+    /// decides whether the document has HTTP status and policy headers, so a
+    /// decoder that could not name it would drop every navigation.
+    #[test]
+    fn a_response_head_round_trips_both_origins() {
+        use renderer::{ResponseHead, ResponseSource};
+        let url = url::Url::parse("https://a.test/").expect("URL");
+        let http = ResponseHead::http(
+            204,
+            url.clone(),
+            Some("text/html".to_owned()),
+            &[("Referrer-Policy".to_owned(), "origin".to_owned())],
+        );
+        let local = ResponseHead::local(url.clone(), None, None);
+        let inherited = ResponseHead::local(
+            url,
+            None,
+            Some(renderer::PolicyContainer {
+                referrer_policy: Some(net::ReferrerPolicy::StrictOrigin),
+                ..renderer::PolicyContainer::default()
+            }),
+        );
+        for head in [http, local, inherited] {
+            let message: crate::wire::ToRenderer = crate::exchange::Frame::Call {
+                id: crate::exchange::RequestId::new(1),
+                body: crate::wire::RendererCall::Response {
+                    response: crate::wire::ResponseStart {
+                        assignment: crate::wire::RendererAssignmentId::new(1),
+                        frame: renderer::FrameId::MAIN,
+                        head: head.clone(),
+                    },
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &message).expect("write");
+            let back: crate::wire::ToRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Call {
+                body: crate::wire::RendererCall::Response { response },
+                ..
+            } = back
+            else {
+                panic!("expected a response frame");
+            };
+            assert_eq!(response.head.url, head.url);
+            assert_eq!(response.head.source.is_http(), head.source.is_http());
+            assert_eq!(response.head.source.status(), head.source.status());
+            assert_eq!(
+                response.head.content_type.as_deref(),
+                head.content_type.as_deref()
+            );
+            match (&response.head.source, &head.source) {
+                (ResponseSource::Http(back), ResponseSource::Http(sent)) => {
+                    assert_eq!(back.refresh, sent.refresh);
+                    assert_eq!(
+                        back.policy.referrer_policy, sent.policy.referrer_policy,
+                        "the parsed policy survives"
+                    );
+                }
+                (
+                    ResponseSource::Local { inherited: back },
+                    ResponseSource::Local { inherited: sent },
+                ) => {
+                    assert_eq!(
+                        back.as_ref().and_then(|policy| policy.referrer_policy),
+                        sent.as_ref().and_then(|policy| policy.referrer_policy),
+                        "the inherited policy survives"
+                    );
+                }
+                _ => panic!("the response origin changed shape on the wire"),
+            }
+        }
+    }
+
+    /// A posted message survives the wire for every origin shape, including
+    /// the opaque `"null"` sender and an exact opaque target. The target was
+    /// once rejected on decode, which stopped the whole read loop.
+    #[test]
+    fn a_posted_message_round_trips_every_origin_shape() {
+        use renderer::{PostedMessage, SerializedOrigin, TargetOrigin, WindowId};
+        let tuple = url::Url::parse("https://a.test/").expect("URL");
+        let opaque_target = url::Url::parse("about:blank").expect("URL");
+        let cases = [
+            PostedMessage {
+                origin: SerializedOrigin::Opaque,
+                target_origin: TargetOrigin::Any,
+                payload: "v1|opaque".to_owned(),
+            },
+            PostedMessage {
+                origin: SerializedOrigin::from(&tuple.origin()),
+                target_origin: TargetOrigin::Exact(tuple.origin()),
+                payload: "v1|tuple".to_owned(),
+            },
+            PostedMessage {
+                origin: SerializedOrigin::from(&tuple.origin()),
+                target_origin: TargetOrigin::Exact(opaque_target.origin()),
+                payload: "v1|opaque target".to_owned(),
+            },
+        ];
+        for message in cases {
+            let sent: crate::wire::FromRenderer = crate::exchange::Frame::Call {
+                id: crate::exchange::RequestId::new(1),
+                body: crate::wire::BrowserCall {
+                    assignment: crate::wire::RendererAssignmentId::new(1),
+                    call: crate::wire::ServiceCall::BrowsingContext(
+                        crate::wire::BrowsingContextCall::WindowMessage {
+                            window: WindowId::new(7),
+                            message: message.clone(),
+                        },
+                    ),
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &sent).expect("write");
+            let back: crate::wire::FromRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Call {
+                body:
+                    crate::wire::BrowserCall {
+                        call:
+                            crate::wire::ServiceCall::BrowsingContext(
+                                crate::wire::BrowsingContextCall::WindowMessage {
+                                    message: back,
+                                    ..
+                                },
+                            ),
+                        ..
+                    },
+                ..
+            } = back
+            else {
+                panic!("expected a window message");
+            };
+            assert_eq!(back.payload, message.payload);
+            match (&back.origin, &message.origin) {
+                (SerializedOrigin::Opaque, SerializedOrigin::Opaque) => {}
+                (SerializedOrigin::Tuple(back), SerializedOrigin::Tuple(sent)) => {
+                    assert_eq!(back, sent);
+                }
+                _ => panic!("the sender origin changed on the wire"),
+            }
+            match (&back.target_origin, &message.target_origin) {
+                (TargetOrigin::Any, TargetOrigin::Any) => {}
+                (TargetOrigin::Exact(back), TargetOrigin::Exact(sent)) => {
+                    assert_eq!(
+                        matches!(back, url::Origin::Opaque(_)),
+                        matches!(sent, url::Origin::Opaque(_)),
+                        "an opaque target stays opaque"
+                    );
+                    if matches!(sent, url::Origin::Tuple(..)) {
+                        assert_eq!(back, sent);
+                    }
+                }
+                _ => panic!("the target origin changed on the wire"),
+            }
         }
     }
 

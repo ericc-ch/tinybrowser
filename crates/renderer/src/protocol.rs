@@ -46,6 +46,30 @@ impl FrameId {
     }
 }
 
+/// Browser-process identity of one top-level browsing context, as a renderer
+/// holds it through a `WindowProxy`.
+///
+/// The value is unauthenticated: a renderer receives it over the wire and can
+/// name any tab with it. Every browser-side use re-authorizes the target
+/// against the opener graph (`close_related`/`message_related`), which is the
+/// guard that makes the id safe to accept.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    /// Constructs a window id from a protocol integer.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Stable numeric identity for protocol messages.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Selects the evaluation environment at the browser-to-renderer boundary.
 /// Page sources run globally. Browser expressions receive the private bridge
 /// and must never contain interpolated author code.
@@ -301,45 +325,35 @@ pub struct Mount {
     pub body: Vec<u8>,
 }
 
-/// The document state a response installs: URL, HTTP status, response
-/// headers that shape the document, and the browser-supplied page state.
+/// The document's policy container: CSP list and referrer policy
+/// (<https://html.spec.whatwg.org/multipage/browsers.html#policy-containers>).
+///
+/// A document carries one of these, and a local-scheme response inherits one
+/// clone, so no load path can leave the two fields out of sync.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PolicyContainer {
+    /// The content security policies that apply.
+    pub csp: crate::csp::List,
+    /// The document's referrer policy, when it has one.
+    pub referrer_policy: Option<net::ReferrerPolicy>,
+}
+
+/// The document state a response installs: URL, content type, and the
+/// browser-supplied page state.
 ///
 /// Every response-install path builds one of these — the browser streams the
 /// top-level response, and carriers, `data:`/`blob:` frames, and child-frame
-/// commits construct it locally — so the renderer derives policy, MIME
-/// guard, reporting endpoints, and status from one head, in one order, in
-/// one place (`Document::install_head`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// commits construct it locally — so the renderer derives policy, MIME guard,
+/// reporting endpoints, and status from one head, in one order, in one place
+/// (`Document::install_head`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseHead {
     /// Absolute document URL.
-    pub url: String,
-    /// Final HTTP status. Violation `status-code` reports it; documents
-    /// without an HTTP response (blank, data) carry zero
-    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-    pub status: u16,
+    pub url: Url,
     /// Every `Content-Type` response header value joined with `", "`
     /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>),
     /// when the document came from the network.
     pub content_type: Option<String>,
-    /// Combined `Content-Security-Policy` header, when the response sent one.
-    pub content_security_policy: Option<String>,
-    /// Combined `Content-Security-Policy-Report-Only` header.
-    pub content_security_policy_report_only: Option<String>,
-    /// Combined `Reporting-Endpoints` header, when the response sent one.
-    /// A violated policy's `report-to` directive resolves its endpoint names
-    /// against it (<https://w3c.github.io/reporting/#header>).
-    pub reporting_endpoints: Option<String>,
-    /// `Referrer-Policy` response header, parsed once at the head
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
-    pub referrer_policy: Option<net::ReferrerPolicy>,
-    /// `Refresh` response header value, decoded as ISO-8859-1. The document
-    /// creation algorithm runs the shared declarative refresh steps on it
-    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-    pub refresh: Option<String>,
-    /// `X-Content-Type-Options: nosniff` on the response.
-    pub no_sniff: bool,
-    /// The body came from HTTP, so the Apache `text/plain` check applies.
-    pub http_response: bool,
     /// Session history visible in the newly opened document.
     pub history: HistorySnapshot,
     /// Emulated viewport size to apply before the document lays out, when the
@@ -348,14 +362,105 @@ pub struct ResponseHead {
     /// Page-scoped init scripts to register before the document's realm runs
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
     pub init_scripts: Vec<(u64, String)>,
-    /// The policy container a local-scheme response (`data:`, `blob:`)
-    /// inherits from its initiator, already parsed
-    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
-    /// When set it replaces the head's CSP header derivation.
-    pub inherited_policy: Option<crate::csp::List>,
-    /// The referrer policy a local-scheme response (`data:`, `blob:`)
-    /// inherits from its initiator, installed with `inherited_policy`.
-    pub inherited_referrer_policy: Option<net::ReferrerPolicy>,
+    /// Whether this document came from an HTTP response or a local scheme.
+    pub source: ResponseSource,
+}
+
+/// What produced one document. An HTTP response carries the status and the
+/// headers that shape the document; a local-scheme response (`data:`,
+/// `blob:`, a carrier mount, `about:blank`) carries only the policy container
+/// it inherits from its initiator.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponseSource {
+    /// A document fetched over HTTP(S).
+    Http(HttpHead),
+    /// A document whose bytes never came over the network.
+    Local {
+        /// The policy container the response inherits from its initiator, when
+        /// there is one
+        /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
+        inherited: Option<PolicyContainer>,
+    },
+}
+
+/// The response state only an HTTP response has, derived once from its
+/// header list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HttpHead {
+    /// Final HTTP status. Violation `status-code` reports it
+    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+    pub status: u16,
+    /// The policy container the headers establish, parsed at the head.
+    pub policy: PolicyContainer,
+    /// Combined `Reporting-Endpoints` header, when the response sent one.
+    /// A violated policy's `report-to` directive resolves its endpoint names
+    /// against it (<https://w3c.github.io/reporting/#header>).
+    pub reporting_endpoints: Option<String>,
+    /// `Refresh` response header value, decoded as ISO-8859-1. The document
+    /// creation algorithm runs the shared declarative refresh steps on it
+    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
+    pub refresh: Option<String>,
+    /// `X-Content-Type-Options: nosniff` on the response.
+    pub no_sniff: bool,
+}
+
+impl ResponseSource {
+    /// The HTTP status a violation reports; documents without an HTTP response
+    /// carry zero
+    /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Http(head) => head.status,
+            Self::Local { .. } => 0,
+        }
+    }
+
+    /// The policy container this document runs under.
+    #[must_use]
+    pub fn policy(&self) -> &PolicyContainer {
+        static EMPTY: std::sync::LazyLock<PolicyContainer> =
+            std::sync::LazyLock::new(PolicyContainer::default);
+        match self {
+            Self::Http(head) => &head.policy,
+            Self::Local { inherited } => inherited.as_ref().unwrap_or(&EMPTY),
+        }
+    }
+
+    /// The reporting endpoint list, when an HTTP response sent one.
+    #[must_use]
+    pub fn reporting_endpoints(&self) -> Option<&str> {
+        match self {
+            Self::Http(head) => head.reporting_endpoints.as_deref(),
+            Self::Local { .. } => None,
+        }
+    }
+
+    /// The declarative refresh value, when an HTTP response sent one.
+    #[must_use]
+    pub fn refresh(&self) -> Option<&str> {
+        match self {
+            Self::Http(head) => head.refresh.as_deref(),
+            Self::Local { .. } => None,
+        }
+    }
+
+    /// Whether the Apache `text/plain` check applies, which needs a real HTTP
+    /// response behind the body.
+    #[must_use]
+    pub fn is_http(&self) -> bool {
+        matches!(self, Self::Http(_))
+    }
+
+    /// Whether the response sent `X-Content-Type-Options: nosniff`.
+    #[must_use]
+    pub fn no_sniff(&self) -> bool {
+        match self {
+            Self::Http(head) => head.no_sniff,
+            Self::Local { .. } => false,
+        }
+    }
 }
 
 impl ResponseHead {
@@ -364,73 +469,66 @@ impl ResponseHead {
     /// `headers`, so every summary path needs nothing but status, URL,
     /// `Content-Type`, and the pairs.
     ///
-    /// History, viewport, and init scripts are caller state; they are
-    /// pasted in before the head is installed.
+    /// History, viewport, and init scripts are caller state; they are set
+    /// before the head is installed.
     #[must_use]
     pub fn http(
         status: u16,
-        final_url: impl Into<String>,
+        final_url: Url,
         content_type: Option<String>,
         headers: &[(String, String)],
     ) -> Self {
         Self {
-            url: final_url.into(),
-            status,
+            url: final_url,
             content_type,
-            content_security_policy: crate::csp::combined_header(
-                headers,
-                "content-security-policy",
-            ),
-            content_security_policy_report_only: crate::csp::combined_header(
-                headers,
-                "content-security-policy-report-only",
-            ),
-            reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
-            // The policy parser needs the field values one by one: extraction
-            // fails as a whole when one value is malformed, which joining
-            // with ", " would hide
-            // (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
-            referrer_policy: net::ReferrerPolicy::from_header(
-                headers
-                    .iter()
-                    .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
-                    .map(|(_, value)| value.as_str()),
-            ),
-            refresh: headers.iter().find_map(|(name, value)| {
-                name.eq_ignore_ascii_case("refresh").then(|| value.clone())
-            }),
-            no_sniff: crate::sniff::headers_nosniff(headers),
-            http_response: true,
             history: HistorySnapshot::default(),
             viewport: None,
             init_scripts: Vec::new(),
-            inherited_policy: None,
-            inherited_referrer_policy: None,
+            source: ResponseSource::Http(HttpHead {
+                status,
+                policy: PolicyContainer {
+                    csp: crate::csp::List::from_headers(
+                        crate::csp::combined_header(headers, "content-security-policy").as_deref(),
+                        crate::csp::combined_header(headers, "content-security-policy-report-only")
+                            .as_deref(),
+                    ),
+                    // The policy parser needs the field values one by one:
+                    // extraction fails as a whole when one value is malformed,
+                    // which joining with ", " would hide
+                    // (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
+                    referrer_policy: net::ReferrerPolicy::from_header(
+                        headers
+                            .iter()
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
+                            .map(|(_, value)| value.as_str()),
+                    ),
+                },
+                reporting_endpoints: crate::csp::combined_header(headers, "reporting-endpoints"),
+                refresh: headers.iter().find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("refresh").then(|| value.clone())
+                }),
+                no_sniff: crate::sniff::headers_nosniff(headers),
+            }),
         }
     }
 
     /// The head of a response that is not an HTTP response: an inline
     /// `<!doctype html>` document, embedded/wasm carrier mounts, or a decoded
-    /// `data:`/`blob:` URL. HTTP-derived state is empty and the document's
-    /// own status reports zero; CSP still arrives through policy inheritance.
+    /// `data:`/`blob:` URL. The document's status reports zero, and the policy
+    /// container comes from `inherited` alone.
     #[must_use]
-    pub fn non_http(final_url: impl Into<String>, content_type: Option<String>) -> Self {
+    pub fn local(
+        final_url: Url,
+        content_type: Option<String>,
+        inherited: Option<PolicyContainer>,
+    ) -> Self {
         Self {
-            url: final_url.into(),
-            status: 0,
+            url: final_url,
             content_type,
-            content_security_policy: None,
-            content_security_policy_report_only: None,
-            reporting_endpoints: None,
-            referrer_policy: None,
-            refresh: None,
-            no_sniff: false,
-            http_response: false,
             history: HistorySnapshot::default(),
             viewport: None,
             init_scripts: Vec::new(),
-            inherited_policy: None,
-            inherited_referrer_policy: None,
+            source: ResponseSource::Local { inherited },
         }
     }
 }
@@ -536,16 +634,55 @@ pub struct ScreenshotClip {
     pub height: f32,
 }
 
+/// What the renderer knows about a request's referrer source before the
+/// browser resolves it against the client environment the browser owns
+/// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferrerRequest {
+    /// No `Referer` at all.
+    #[default]
+    NoReferrer,
+    /// The initiator document's URL, walked out of any `srcdoc` chain. The
+    /// browser keeps it only when it is same-origin with the authorized
+    /// initiator
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    Client {
+        /// The document URL the `"client"` branch reads.
+        url: Url,
+    },
+    /// An explicit source URL: the document's referrer for a navigation, or a
+    /// style sheet's URL for a CSS-initiated request. The browser authorizes
+    /// it the same way it authorizes a navigation's referrer.
+    Url(Url),
+}
+
+impl ReferrerRequest {
+    /// The IDL spelling: `""`, `"about:client"`, or a URL
+    /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+    /// `client_url` is the document the `"client"` spelling resolves to.
+    #[must_use]
+    pub fn from_idl(value: &str, client_url: &Url) -> Option<Self> {
+        if value.is_empty() {
+            return Some(Self::NoReferrer);
+        }
+        if value.eq_ignore_ascii_case("about:client") {
+            return Some(Self::Client {
+                url: client_url.clone(),
+            });
+        }
+        Url::parse(value).ok().map(Self::Url)
+    }
+}
+
 /// One blocking request the renderer asks the browser process to perform
 /// (a GET for most dials; a navigation may carry a method and body).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialRequest {
     /// Why the dial happens, and the CORS parameters it is sent under.
     pub policy: RequestPolicy,
-    /// Absolute request URL, canonically serialized: every queue site
-    /// stringifies a parsed [`url::Url`], so the scheme is lowercase and a
-    /// `scheme:` prefix test is exact.
-    pub url: String,
+    /// Absolute request URL.
+    pub url: Url,
     /// Document URL used as the `SameSite`/`Sec-Fetch-*` initiator.
     pub initiator: String,
     /// Whether and how the browser delivers the response body.
@@ -561,15 +698,10 @@ pub struct DialRequest {
     pub content_type: Option<String>,
     /// Author-supplied request headers, in insertion order.
     pub headers: Vec<(String, String)>,
-    /// Fetch's request referrer: a client, an explicit URL, or no referrer.
-    /// The browser resolves "client" against the authorized initiator and
-    /// verifies an explicit URL is same-origin with it
+    /// Fetch's request referrer, before the browser resolves it against the
+    /// client environment and verifies an explicit URL is authorized
     /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
-    pub referrer: net::Referrer,
-    /// The document URL the `"client"` branch reads, walked out of `srcdoc`
-    /// to the container document
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-    pub referrer_url: String,
+    pub referrer: ReferrerRequest,
     /// Caller deadline in milliseconds. `0` keeps the carrier timeout.
     /// A synchronous XHR uses its `timeout` attribute here
     /// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>).
@@ -602,18 +734,17 @@ impl DialRequest {
     /// cache mode, and no referrer. Callers with more to say set the fields
     /// their request adds.
     #[must_use]
-    pub fn new(policy: RequestPolicy, url: &str, initiator: &str, referrer_url: &str) -> Self {
+    pub fn new(policy: RequestPolicy, url: &Url, initiator: &str) -> Self {
         Self {
             policy,
-            url: url.to_owned(),
+            url: url.clone(),
             initiator: initiator.to_owned(),
-            referrer_url: referrer_url.to_owned(),
             delivery: BodyDelivery::Buffer,
             method: net::Method::GET,
             body: Vec::new(),
             content_type: None,
             headers: Vec::new(),
-            referrer: net::Referrer::NoReferrer,
+            referrer: ReferrerRequest::NoReferrer,
             timeout_ms: 0,
             csp: None,
             keepalive: false,
@@ -985,7 +1116,7 @@ pub struct DialOutcome {
     /// The stripped referrer the final hop was sent with, when it sent one.
     /// A navigated document reports it as `document.referrer`
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-    pub referrer: Option<String>,
+    pub referrer: Option<Url>,
 }
 
 impl DialOutcome {
@@ -1113,25 +1244,68 @@ pub trait StorageHost: Send + Sync + 'static {
     ) -> Option<StorageChange>;
 }
 
+/// What `window.open`'s `noopener` and `noreferrer` features do to the
+/// context it opens
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-open>).
+///
+/// `noreferrer` implies `noopener`, so the three states are exhaustive and no
+/// caller can carry "noopener off, noreferrer on".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenerPolicy {
+    /// Keep the opener relationship. The referrer is not decided here: a
+    /// renderer-hosted auxiliary context resolves it from its creator, while a
+    /// browser-hosted tab currently starts from `about:blank` and sends none
+    /// (#198).
+    Keep,
+    /// Drop the opener relationship and return no `WindowProxy`.
+    NoOpener,
+    /// [`NoOpener`](Self::NoOpener), and the navigation sends no referrer.
+    NoReferrer,
+}
+
+impl OpenerPolicy {
+    /// The token the page shim exchanges with the host. The shim only passes
+    /// back a token [`Self::parse`] answered, so a rejected token means the
+    /// shim and the engine disagree about the vocabulary.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::NoOpener => "noopener",
+            Self::NoReferrer => "noreferrer",
+        }
+    }
+
+    /// Reads one [`Self::token`].
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "keep" => Some(Self::Keep),
+            "noopener" => Some(Self::NoOpener),
+            "noreferrer" => Some(Self::NoReferrer),
+            _ => None,
+        }
+    }
+}
+
 /// Browsing-context effects the page engine asks its host to perform.
 pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
-    /// to open a window. `url` is absolute, or empty for `about:blank`. `seed`
-    /// is the opener's session copy for the new tab, when there is one.
-    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64>;
+    /// to open a window. `url` is absolute, or empty for `about:blank`.
+    fn window_open(&self, url: &str, name: &str, opener: OpenerPolicy) -> Option<WindowId>;
 
     /// `window.close()` on a window this realm opened.
-    fn window_close(&self, tab: u64);
+    fn window_close(&self, window: WindowId);
 
     /// `window.opener` for this realm's tab; `None` when there is none.
-    fn window_opener(&self) -> Option<u64>;
+    fn window_opener(&self) -> Option<WindowId>;
 
     /// `postMessage` to a window this realm opened, encoded by the caller's
     /// realm. The target resolves the message when the delivery task runs.
-    fn window_post_message(&self, tab: u64, message: PostedMessage);
+    fn window_post_message(&self, window: WindowId, message: PostedMessage);
 
     /// Reads one key from another tab's same-origin session area.
-    fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;
+    fn remote_session_get(&self, window: WindowId, origin: &str, key: &str) -> Option<String>;
 }
 
 /// Cross-context messaging effects the page engine asks its host to perform.
@@ -1140,15 +1314,134 @@ pub trait MessagingHost: Send + Sync + 'static {
     fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64);
 }
 
+/// An origin as a cross-tab message carries it: a tuple origin, or the opaque
+/// `"null"` serialization that every opaque document shares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SerializedOrigin {
+    /// An opaque origin.
+    Opaque,
+    /// A tuple origin: scheme, host, and port.
+    Tuple(url::Origin),
+}
+
+impl SerializedOrigin {
+    /// Reads one serialized origin: `"null"`, or a URL whose origin is the
+    /// value. A non-special URL (`data:`, `blob:`) has an opaque origin, so it
+    /// names [`Opaque`](Self::Opaque) rather than a synthetic tuple.
+    #[must_use]
+    pub fn parse(spec: &str) -> Option<Self> {
+        if spec == "null" {
+            return Some(Self::Opaque);
+        }
+        Url::parse(spec).ok().map(|url| Self::from(&url.origin()))
+    }
+}
+
+impl From<&url::Origin> for SerializedOrigin {
+    fn from(origin: &url::Origin) -> Self {
+        match origin {
+            url::Origin::Opaque(_) => Self::Opaque,
+            url::Origin::Tuple(..) => Self::Tuple(origin.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for SerializedOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opaque => formatter.write_str("null"),
+            Self::Tuple(origin) => formatter.write_str(&origin.ascii_serialization()),
+        }
+    }
+}
+
+impl Serialize for SerializedOrigin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for SerializedOrigin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).ok_or_else(|| serde::de::Error::custom("invalid origin"))
+    }
+}
+
+/// The intended target origin one posted message carries, resolved at the
+/// post-time boundary: `*` accepts any document, and an exact origin compares
+/// with origin identity, so two opaque origins (`"null"` serialized) never
+/// match each other
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetOrigin {
+    /// `*`: any document may receive the message.
+    Any,
+    /// Only a document on this origin may receive it.
+    Exact(url::Origin),
+}
+
+impl TargetOrigin {
+    /// Resolves the sender's target-origin argument. `sender` is the posting
+    /// document's origin when the caller knows its identity; `/` names it
+    /// exactly
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+    #[must_use]
+    pub fn parse(spec: &str, sender: Option<&url::Origin>) -> Option<Self> {
+        match spec {
+            "*" => Some(Self::Any),
+            "/" => sender.map(|origin| Self::Exact(origin.clone())),
+            other => Url::parse(other).ok().map(|url| Self::Exact(url.origin())),
+        }
+    }
+
+    /// Whether a document with `origin` may receive the message.
+    #[must_use]
+    pub fn admits(&self, origin: &url::Origin) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(target) => target == origin,
+        }
+    }
+}
+
+impl Serialize for TargetOrigin {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Any => serializer.serialize_str("*"),
+            Self::Exact(origin) => serializer.serialize_str(&origin.ascii_serialization()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetOrigin {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "*" => Ok(Self::Any),
+            // `"null"` is the opaque origin of a URL like `about:blank`. It
+            // cannot match another document, so it is a valid, never-delivered
+            // target rather than a decode failure that would stop the read
+            // loop.
+            other => match SerializedOrigin::parse(other) {
+                Some(SerializedOrigin::Opaque) => Ok(Self::Exact(url::Origin::new_opaque())),
+                Some(SerializedOrigin::Tuple(origin)) => Ok(Self::Exact(origin)),
+                None => Err(serde::de::Error::custom("invalid target origin")),
+            },
+        }
+    }
+}
+
 /// One cross-context post, as it travels from the posting realm to the target
 /// document. The browser authorizes `origin` before forwarding the rest
 /// unchanged, so every hop carries the same value instead of rebuilding it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PostedMessage {
-    /// The sender's serialized origin at post time.
-    pub origin: String,
-    /// The normalized target origin: `*`, `/`, or a serialized origin.
-    pub target_origin: String,
+    /// The sender's origin at post time.
+    pub origin: SerializedOrigin,
+    /// The intended target, resolved where `/` still had the sender's origin
+    /// identity.
+    pub target_origin: TargetOrigin,
     /// `__tbEncode` payload from the sender's realm.
     pub payload: String,
 }
@@ -1321,5 +1614,82 @@ mod request_policy_tests {
             Some(CorsMode::SameOrigin)
         );
         assert_eq!(CorsMode::from_idl("cors "), None);
+    }
+}
+
+#[cfg(test)]
+mod response_head_tests {
+    use super::{PolicyContainer, ResponseHead};
+    use url::Url;
+
+    fn url(spec: &str) -> Url {
+        Url::parse(spec).expect("URL")
+    }
+
+    /// The variant owns what it means: a local response has no status, no
+    /// refresh, no reporting endpoints, and no nosniff, so there is nothing to
+    /// keep in sync with a sibling field.
+    #[test]
+    fn a_local_head_has_no_http_state() {
+        let head = ResponseHead::local(
+            url("data:text/html,x"),
+            Some("text/html".to_owned()),
+            Some(PolicyContainer {
+                referrer_policy: Some(net::ReferrerPolicy::NoReferrer),
+                ..PolicyContainer::default()
+            }),
+        );
+        assert_eq!(head.source.status(), 0);
+        assert_eq!(head.source.refresh(), None);
+        assert_eq!(head.source.reporting_endpoints(), None);
+        assert!(!head.source.no_sniff());
+        assert!(!head.source.is_http());
+        assert_eq!(
+            head.source.policy().referrer_policy,
+            Some(net::ReferrerPolicy::NoReferrer),
+            "the inherited container is the only policy source"
+        );
+
+        let inherited = ResponseHead::local(url("about:blank"), None, None);
+        assert_eq!(inherited.source.policy().referrer_policy, None);
+    }
+
+    /// An HTTP head parses its policy once, from the headers, and reports the
+    /// HTTP-only state the variant owns.
+    #[test]
+    fn an_http_head_derives_its_policy_from_the_headers() {
+        let headers = vec![
+            (
+                "Content-Security-Policy".to_owned(),
+                "default-src 'none'".to_owned(),
+            ),
+            ("Referrer-Policy".to_owned(), "origin".to_owned()),
+            ("X-Content-Type-Options".to_owned(), "nosniff".to_owned()),
+            ("Refresh".to_owned(), "0; url=/next".to_owned()),
+        ];
+        let head = ResponseHead::http(
+            204,
+            url("https://example.test/"),
+            Some("text/html".to_owned()),
+            &headers,
+        );
+        assert_eq!(head.source.status(), 204);
+        assert!(head.source.is_http());
+        assert!(head.source.no_sniff());
+        assert_eq!(head.source.refresh(), Some("0; url=/next"));
+        assert_eq!(
+            head.source.policy().referrer_policy,
+            Some(net::ReferrerPolicy::Origin)
+        );
+        let document = url("https://example.test/");
+        let gate = crate::csp::RedirectGate::new(
+            head.source.policy().csp.clone(),
+            &document.origin(),
+            crate::csp::Destination::Script,
+        );
+        assert!(
+            !gate.allows(&document, &url("https://example.test/app.js"), 0),
+            "the header's policy is enforced, parsed at the head"
+        );
     }
 }

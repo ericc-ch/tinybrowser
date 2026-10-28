@@ -21,7 +21,8 @@ use crate::js::{
     DocumentStreamCommand, FrameNavigation, FrameRuntime, JsFetchId, JsRuntimeHandle, PageTimerId,
     PolicyContainer, World,
 };
-use crate::messaging::{DocumentId, SharedHandle, TargetOrigin};
+use crate::messaging::{DocumentId, SharedHandle};
+use crate::protocol::TargetOrigin;
 use crate::protocol::{
     BrowserEvent, BrowserServices, DialOutcome, DialRequest, FrameId, Mount, RendererEvent,
     ResponseHead, ScriptFailure, TabError, TimerId,
@@ -210,15 +211,9 @@ impl QueuedDial {
         policy: crate::protocol::RequestPolicy,
         url: &Url,
         initiator: &url::Origin,
-        referrer_url: &Url,
     ) -> Self {
         Self {
-            req: crate::protocol::DialRequest::new(
-                policy,
-                url.as_str(),
-                &initiator.ascii_serialization(),
-                referrer_url.as_str(),
-            ),
+            req: crate::protocol::DialRequest::new(policy, url, &initiator.ascii_serialization()),
             context,
             ancestors: Vec::new(),
             integrity: None,
@@ -284,7 +279,7 @@ pub(crate) struct LocalDocumentState {
     /// The fallback base URL the creator supplied.
     pub(crate) base_url: Option<Url>,
     /// The document's own referrer, unredacted.
-    pub(crate) referrer: String,
+    pub(crate) referrer: Option<Url>,
     /// The URL `"client"` referrers resolve against.
     pub(crate) referrer_url: Url,
     pub(crate) origin: url::Origin,
@@ -381,11 +376,11 @@ fn materialize_iframe_document(
         world.policy = world_rc.borrow().policy.clone();
         world.sandbox = sandbox;
     }
-    document.load_about_blank_tree(Some(base_url.as_str()), Some(origin));
+    document.load_about_blank_tree(Some(&base_url), Some(origin));
     // The initial blank reports its creator's URL, walked out of a `srcdoc`
     // chain the same way the referrer source is
     // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
-    document.set_document_referrer(referrer_url.as_str());
+    document.set_document_referrer(Some(referrer_url));
     if let Some(root) = document.document_root() {
         world_rc
             .borrow()
@@ -412,7 +407,7 @@ fn materialize_iframe_document(
 fn materialize_auxiliary_document(
     world_rc: &Rc<RefCell<World>>,
     frame: FrameId,
-    options: crate::js::world::AuxiliaryOptions,
+    opener: crate::protocol::OpenerPolicy,
     new_frames: &Rc<RefCell<Vec<CreatedFrame>>>,
 ) {
     let (runtime, url, origin, policy, sandbox, init_scripts, viewport) = {
@@ -444,9 +439,9 @@ fn materialize_auxiliary_document(
     } else {
         origin
     };
-    document.load_about_blank_tree(Some(url.as_str()), Some(origin));
-    if options.noreferrer {
-        document.set_document_referrer("");
+    document.load_about_blank_tree(Some(&url), Some(origin));
+    if opener == crate::protocol::OpenerPolicy::NoReferrer {
+        document.set_document_referrer(None);
     }
     new_frames
         .borrow_mut()
@@ -496,6 +491,12 @@ enum ImageSettle {
 struct SubresourceBody {
     bytes: Vec<u8>,
     origin_clean: bool,
+}
+
+/// The URL a browsing context starts on when it has no creator to inherit
+/// from.
+pub(crate) fn about_blank() -> Url {
+    Url::parse("about:blank").expect("about:blank is a valid URL")
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
@@ -822,8 +823,8 @@ impl Document {
                     let new_frames = Rc::clone(&new_frames);
                     move |world_rc: &Rc<RefCell<World>>,
                           frame,
-                          options: crate::js::world::AuxiliaryOptions| {
-                        materialize_auxiliary_document(world_rc, frame, options, &new_frames);
+                          opener: crate::protocol::OpenerPolicy| {
+                        materialize_auxiliary_document(world_rc, frame, opener, &new_frames);
                     }
                 }),
             });
@@ -1062,8 +1063,8 @@ impl Document {
                 world.policy = inherited.clone();
                 world.sandbox = sandbox;
             }
-            document.load_about_blank(Some(base_url.as_str()), Some(origin));
-            document.set_document_referrer(referrer_url.as_str());
+            document.load_about_blank(Some(&base_url), Some(origin));
+            document.set_document_referrer(Some(referrer_url.clone()));
             loaded.push(CreatedFrame::Child {
                 frame,
                 container,
@@ -1090,17 +1091,16 @@ impl Document {
     /// parent's origin and, in this engine, its URL
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
     #[must_use]
-    pub(crate) fn inherited_url(&self) -> String {
-        self.url.as_str().to_owned()
+    pub(crate) fn inherited_url(&self) -> Url {
+        self.url.clone()
     }
 
     /// Sets the referrer the active document reports. Local-scheme installs
     /// have no navigation request to read one from; their document reports
     /// the creator's URL instead
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
-    pub(crate) fn set_document_referrer(&mut self, referrer: &str) {
-        let mut world = self.world.borrow_mut();
-        referrer.clone_into(&mut world.document_referrer);
+    pub(crate) fn set_document_referrer(&mut self, referrer: Option<Url>) {
+        self.world.borrow_mut().document_referrer = referrer;
     }
 
     /// The state this document needs to be installed again from a
@@ -1142,11 +1142,8 @@ impl Document {
             );
             return;
         }
-        self.load_about_blank(
-            state.base_url.as_ref().map(Url::as_str),
-            Some(state.origin.clone()),
-        );
-        self.set_document_referrer(&state.referrer);
+        self.load_about_blank(state.base_url.as_ref(), Some(state.origin.clone()));
+        self.set_document_referrer(state.referrer.clone());
         self.world.borrow_mut().policy = state.policy.clone();
     }
 
@@ -1286,7 +1283,7 @@ impl Document {
                     // own host and port, so a policy cannot upgrade a link to a
                     // third party
                     // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
-                    Self::same_host_port(&dial.req.url, self.url.as_str())
+                    Self::same_host_port(&dial.req.url, &self.url)
                 } else {
                     true
                 };
@@ -1313,26 +1310,15 @@ impl Document {
 
     /// Whether `left` and `right` name the same host and port
     /// (<https://url.spec.whatwg.org/#concept-url-host>).
-    fn same_host_port(left: &str, right: &str) -> bool {
-        let (Ok(left), Ok(right)) = (Url::parse(left), Url::parse(right)) else {
-            return false;
-        };
+    fn same_host_port(left: &Url, right: &Url) -> bool {
         left.host_str() == right.host_str()
             && left.port_or_known_default() == right.port_or_known_default()
     }
 
-    /// Rewrites one serialized URL's scheme from `http` to `https`, leaving
-    /// every other scheme alone.
-    fn upgrade_scheme(spec: &mut String) {
-        let Ok(mut url) = Url::parse(spec) else {
-            return;
-        };
-        if url.scheme() != "http" {
-            return;
-        }
-        if url.set_scheme("https").is_ok() {
-            *spec = url.to_string();
-        }
+    /// Rewrites one URL's scheme from `http` to `https`, leaving every other
+    /// scheme alone.
+    fn upgrade_scheme(url: &mut Url) {
+        if url.scheme() == "http" && url.set_scheme("https").is_ok() {}
     }
 
     /// Starts one frame-load dial. `req` is the wire request, with a
@@ -1364,16 +1350,16 @@ impl Document {
     /// URL for relative resolution.
     fn apply_blank_url(
         &mut self,
-        inherited_url: Option<&str>,
+        inherited_url: Option<&Url>,
         inherited_origin: Option<url::Origin>,
     ) {
-        let Some(base) = inherited_url.and_then(|url| Url::parse(url).ok()) else {
+        let Some(base) = inherited_url else {
             return;
         };
-        let blank = Url::parse("about:blank").expect("about:blank is a valid URL");
+        let blank = about_blank();
         let origin = self.sandboxed_origin(inherited_origin);
         self.set_document_url(blank, origin);
-        self.world.borrow_mut().base_url = Some(base);
+        self.world.borrow_mut().base_url = Some(base.clone());
     }
 
     /// Installs an `about:blank` document, with `inherited_url` as its
@@ -1391,15 +1377,14 @@ impl Document {
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#session-history-entry>).
     pub(crate) fn load_about_blank(
         &mut self,
-        inherited_url: Option<&str>,
+        inherited_url: Option<&Url>,
         inherited_origin: Option<url::Origin>,
     ) {
         self.apply_blank_url(inherited_url, inherited_origin);
         // A blank document's referrer is its creator's URL, unredacted by any
         // policy: the initial `about:blank` was never fetched
         // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
-        self.world.borrow_mut().document_referrer =
-            inherited_url.map_or_else(String::new, ToOwned::to_owned);
+        self.world.borrow_mut().document_referrer = inherited_url.cloned();
         // No HTTP response stands behind a blank document.
         self.http_status = 0;
         self.load_html("");
@@ -1432,7 +1417,7 @@ impl Document {
             // A `srcdoc` document's referrer is its creator's URL, like the
             // initial `about:blank` it replaces
             // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
-            world.document_referrer = referrer_url.to_string();
+            world.document_referrer = Some(referrer_url.clone());
         }
         self.inherited_policy = Some(policy.clone());
         self.initial_blank = false;
@@ -1447,14 +1432,13 @@ impl Document {
     /// realm until that script returns.
     pub(crate) fn load_about_blank_tree(
         &mut self,
-        inherited_url: Option<&str>,
+        inherited_url: Option<&Url>,
         inherited_origin: Option<url::Origin>,
     ) {
         self.apply_blank_url(inherited_url, inherited_origin);
         // The initial blank reports its creator's URL as its referrer
         // (<https://html.spec.whatwg.org/multipage/browsers.html#creating-a-new-browsing-context>).
-        self.world.borrow_mut().document_referrer =
-            inherited_url.map_or_else(String::new, ToOwned::to_owned);
+        self.world.borrow_mut().document_referrer = inherited_url.cloned();
         self.defer_js = true;
         self.load_html("");
         self.defer_js = false;
@@ -1653,18 +1637,14 @@ impl Document {
         // The intended target origin is checked when the task runs, against the
         // document active then
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-        let sender = Url::parse(&message.origin).ok().map(|url| url.origin());
-        let Some(target_origin) = TargetOrigin::parse(&message.target_origin, sender.as_ref())
-        else {
-            return;
-        };
-        if !target_origin.admits(&self.world.borrow().origin) {
+        if !message.target_origin.admits(&self.world.borrow().origin) {
             return;
         }
         if !self.ensure_js_ok() {
             return;
         }
-        self.fire_js(|js| js.deliver_remote_message(&message.origin, &message.payload));
+        let origin = message.origin.to_string();
+        self.fire_js(|js| js.deliver_remote_message(&origin, &message.payload));
         self.adopt_js_work();
     }
 
@@ -1827,17 +1807,10 @@ impl Document {
 
     /// Replaces the document from a host mount: new realm, decoded bytes,
     /// parsed to load. The host has already dialed and chosen this renderer.
-    pub(crate) fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
-        // An invalid mount spec fails before anything is touched.
-        if Url::parse(&mount.head.url).is_err() {
-            return Err(TabError::InvalidUrl {
-                spec: mount.head.url.clone(),
-            });
-        }
+    pub(crate) fn mount(&mut self, mount: &Mount) {
         self.set_history(&mount.head.history);
-        self.set_document_referrer("");
+        self.set_document_referrer(None);
         self.install_response(&mount.head, &mount.body, None);
-        Ok(())
     }
 
     /// Opens a parse on `input`, taking ownership of the input stream.
@@ -1889,30 +1862,12 @@ impl Document {
         // (blank, data) report zero rather than a previous page's status.
         // Violation `status-code` reports it
         // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-        self.http_status = head.status;
-        self.set_reporting_endpoints(head);
+        self.http_status = head.source.status();
+        self.set_reporting_endpoints(head.source.reporting_endpoints());
         if let Some((width, height)) = head.viewport {
             self.viewport_size = (width, height);
         }
-        // The parsed URL decides. An unparseable response URL leaves the
-        // previous URL in place, and with it the captured origin: `about:blank`,
-        // `data:`, and `blob:` URLs cannot re-derive one.
-        self.initial_blank = false;
-        // A `blob:` response carries its store entry's creator, which is not
-        // what `Url::origin()` returns for the blob URL
-        // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
-        // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
-        match Url::parse(&head.url) {
-            Ok(url) => {
-                let origin = self.sandboxed_origin(origin);
-                self.set_document_url(url, origin);
-            }
-            Err(_) => {
-                if let Some(origin) = self.sandboxed_origin(origin) {
-                    self.set_document_url(self.url.clone(), Some(origin));
-                }
-            }
-        }
+        self.install_response_url(head, origin);
         let mut world = self.world.borrow_mut();
         // A response document resolves against its own URL; any inherited
         // `about:srcdoc` base stops applying.
@@ -1938,24 +1893,36 @@ impl Document {
         // the exact bytes the server sent before the extraction runs
         // (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
         self.response_content_type.clone_from(&head.content_type);
-        self.response_policy = head.inherited_policy.clone().unwrap_or_else(|| {
-            crate::csp::List::from_headers(
-                head.content_security_policy.as_deref(),
-                head.content_security_policy_report_only.as_deref(),
-            )
-        });
-        self.response_referrer_policy = head.inherited_referrer_policy.or(head.referrer_policy);
+        // The origin variant decides both: an HTTP response carries the
+        // policy its headers establish, and a local-scheme response carries
+        // only what it inherited, so no field can override the other.
+        let policy = head.source.policy();
+        self.response_policy = policy.csp.clone();
+        self.response_referrer_policy = policy.referrer_policy;
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
         self.mime_guard = crate::sniff::MimeGuard {
-            no_sniff: head.no_sniff,
-            http: head.http_response,
+            no_sniff: head.source.no_sniff(),
+            http: head.source.is_http(),
         };
         // A response `Refresh` starts the document's one declarative refresh
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-        if let Some(refresh) = &head.refresh {
+        if let Some(refresh) = head.source.refresh() {
             self.start_declarative_refresh(refresh);
         }
+    }
+
+    /// Points the document at the URL the response head carries.
+    ///
+    /// The URL is parsed at the seam, so the document always takes this
+    /// response's URL. `about:blank`, `data:`, and `blob:` URLs cannot
+    /// re-derive an origin, so their captured one comes from the caller
+    /// (<https://w3c.github.io/FileAPI/#blob-url-entry>,
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    fn install_response_url(&mut self, head: &ResponseHead, origin: Option<url::Origin>) {
+        self.initial_blank = false;
+        let origin = self.sandboxed_origin(origin);
+        self.set_document_url(head.url.clone(), origin);
     }
 
     /// Installs a complete response head and body: [`Self::install_head`]
@@ -1990,10 +1957,8 @@ impl Document {
     /// `frame-ancestors` response dispatches its violations on the fallback
     /// document against the new response's endpoints, so this is also set
     /// before the check.
-    fn set_reporting_endpoints(&mut self, head: &ResponseHead) {
-        self.reporting_endpoints = head
-            .reporting_endpoints
-            .as_deref()
+    fn set_reporting_endpoints(&mut self, endpoints: Option<&str>) {
+        self.reporting_endpoints = endpoints
             .map(crate::csp::parse_reporting_endpoints_value)
             .unwrap_or_default();
     }
@@ -2894,13 +2859,7 @@ impl Document {
         content_type: &str,
         policy: crate::protocol::RequestPolicy,
     ) {
-        let mut dial = QueuedDial::new(
-            DialContext::CspReport,
-            policy,
-            url,
-            &self.dial_initiator(),
-            &self.referrer_url(),
-        );
+        let mut dial = QueuedDial::new(DialContext::CspReport, policy, url, &self.dial_initiator());
         dial.req.method = net::Method::POST;
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
@@ -3139,9 +3098,10 @@ impl Document {
             },
             &url,
             &self.dial_initiator(),
-            &self.referrer_url(),
         );
-        dial.req.referrer = net::Referrer::Client;
+        dial.req.referrer = crate::protocol::ReferrerRequest::Client {
+            url: self.referrer_url(),
+        };
         dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
@@ -3279,6 +3239,40 @@ impl Document {
         Ok(url)
     }
 
+    /// Settles one page `fetch` dial: a post-request CSP check, then the
+    /// response or a network error.
+    fn finish_js_fetch_dial(
+        &mut self,
+        id: crate::js::JsFetchId,
+        redirected: bool,
+        request_url: &Url,
+        outcome: DialOutcome,
+    ) {
+        self.record_event(RendererEvent::Fetch {
+            status: outcome.status,
+        });
+        // A redirect may have landed on a URL the source list does not allow
+        // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
+        let blocked = redirected
+            && self.response_url_blocked(
+                &outcome.final_url,
+                request_url.as_str(),
+                crate::csp::Destination::Connect,
+                None,
+            );
+        if blocked {
+            // A streamed body's task holds the dial permits until the renderer
+            // reads or cancels it, so cancel before dropping the outcome
+            // (<https://fetch.spec.whatwg.org/#concept-response-body>).
+            if let crate::protocol::ResponseBody::Streamed(stream) = outcome.body {
+                self.services.cancel_stream(stream);
+            }
+            self.settle_js_fetch(id, None);
+        } else {
+            self.settle_js_fetch(id, Some(outcome));
+        }
+    }
+
     pub(in crate::document) fn finish_dial(&mut self, done: CompletedDial) {
         let CompletedDial {
             context,
@@ -3287,34 +3281,10 @@ impl Document {
             ancestors,
             integrity,
         } = done;
-        let redirected = outcome.final_url != req.url;
+        let redirected = outcome.final_url != req.url.as_str();
         match context {
             DialContext::JsFetch { id } => {
-                self.record_event(RendererEvent::Fetch {
-                    status: outcome.status,
-                });
-                // Post-request check: a redirect may have landed on a URL
-                // the source list does not allow
-                // (<https://w3c.github.io/webappsec-csp/#should-block-response>).
-                let blocked = redirected
-                    && self.response_url_blocked(
-                        &outcome.final_url,
-                        &req.url,
-                        crate::csp::Destination::Connect,
-                        None,
-                    );
-                if blocked {
-                    // A streamed body's task holds the dial permits until the
-                    // renderer reads or cancels it, so cancel before dropping
-                    // the outcome
-                    // (<https://fetch.spec.whatwg.org/#concept-response-body>).
-                    if let crate::protocol::ResponseBody::Streamed(stream) = outcome.body {
-                        self.services.cancel_stream(stream);
-                    }
-                    self.settle_js_fetch(id, None);
-                } else {
-                    self.settle_js_fetch(id, Some(outcome));
-                }
+                self.finish_js_fetch_dial(id, redirected, &req.url, outcome);
             }
             DialContext::ClassicScript { element } => {
                 self.record_event(RendererEvent::Fetch {
@@ -3336,7 +3306,7 @@ impl Document {
                 let blocked = redirected
                     && self.response_url_blocked(
                         &outcome.final_url,
-                        &req.url,
+                        req.url.as_str(),
                         crate::csp::Destination::Script,
                         Some(element),
                     );
@@ -3378,7 +3348,12 @@ impl Document {
                 if redirected
                     && let Some(embedder) = embedder
                     && let Some(gate) = req.csp.as_deref()
-                    && self.note_frame_redirect(embedder, gate, &outcome.final_url, &req.url)
+                    && self.note_frame_redirect(
+                        embedder,
+                        gate,
+                        &outcome.final_url,
+                        req.url.as_str(),
+                    )
                 {
                     // Leave the current document in place.
                 } else if let Ok(url) = Url::parse(&outcome.final_url) {
@@ -3395,7 +3370,7 @@ impl Document {
                     id,
                     destination,
                     &outcome,
-                    &req.url,
+                    req.url.as_str(),
                     redirected,
                     cors_clean,
                 );
@@ -3421,21 +3396,18 @@ impl Document {
     ) {
         let head = ResponseHead::http(
             outcome.status,
-            url.to_string(),
+            url.clone(),
             outcome.content_type.clone(),
             &outcome.headers,
         );
-        let policy = crate::csp::List::from_headers(
-            head.content_security_policy.as_deref(),
-            head.content_security_policy_report_only.as_deref(),
-        );
+        let policy = &head.source.policy().csp;
         // Set before the `frame-ancestors` decision: a refused response
         // dispatches its violations on the fallback document against the new
         // response's endpoints.
-        self.set_reporting_endpoints(&head);
+        self.set_reporting_endpoints(head.source.reporting_endpoints());
         if embedder.is_some()
             && !ancestors.is_empty()
-            && self.note_frame_ancestors_block(embedder, url, &policy, ancestors)
+            && self.note_frame_ancestors_block(embedder, url, policy, ancestors)
         {
             // The blank completes and fires the container's load.
             return;
@@ -3454,7 +3426,7 @@ impl Document {
         // the referrer the browser actually sent on the final hop, so redirect
         // policy and downgrade rules cannot disagree with the header
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-        self.set_document_referrer(outcome.referrer.as_deref().unwrap_or_default());
+        self.set_document_referrer(outcome.referrer.clone());
         self.install_frame_response(&head, body, None);
     }
 
@@ -4009,9 +3981,14 @@ impl Document {
                         .copied()
                         .or(self.world.borrow().policy.referrer_policy)
                         .unwrap_or_default();
-                    (net::Referrer::Url(sheet), policy)
+                    (crate::protocol::ReferrerRequest::Url(sheet), policy)
                 }
-                None => (net::Referrer::Client, self.subresource_referrer(element)),
+                None => (
+                    crate::protocol::ReferrerRequest::Client {
+                        url: self.referrer_url(),
+                    },
+                    self.subresource_referrer(element),
+                ),
             };
             let mut dial = QueuedDial::new(
                 DialContext::BlitzResource {
@@ -4021,7 +3998,6 @@ impl Document {
                 policy,
                 &fetch.url,
                 &self.dial_initiator(),
-                &self.referrer_url(),
             );
             dial.req.referrer = referrer;
             dial.req.referrer_policy = referrer_policy;
@@ -4089,7 +4065,7 @@ impl Document {
         if blocked {
             let opaque = Url::parse("about:blank")
                 .map_or_else(|_| child_url.origin(), |blank| blank.origin());
-            self.load_about_blank(Some("about:blank"), Some(opaque));
+            self.load_about_blank(Some(&about_blank()), Some(opaque));
         }
         blocked
     }

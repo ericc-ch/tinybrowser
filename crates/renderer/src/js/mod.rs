@@ -46,7 +46,7 @@ use rquickjs::{
 };
 use url::Url;
 
-pub(crate) use world::{CreatorInfo, PolicyContainer, RealmRequest, World};
+pub(crate) use world::{CreatorInfo, NavigationReferrer, PolicyContainer, RealmRequest, World};
 
 /// Shared `QuickJS` heap cap. Forty live subframe realms need more than
 /// 32MB (measured: `Document-createElement-namespace.html`, 40 parallel
@@ -198,7 +198,7 @@ pub(crate) struct JsFetchRequest {
 /// is the IDL default mode. An unknown spelling is a `TypeError` that names
 /// the key and value; it never becomes a different, valid-looking request.
 pub(crate) struct DialOptions {
-    pub(crate) referrer: net::Referrer,
+    pub(crate) referrer: crate::protocol::ReferrerRequest,
     pub(crate) cors: crate::protocol::CorsRequest,
     pub(crate) keepalive: bool,
     pub(crate) body_len: u64,
@@ -209,7 +209,7 @@ pub(crate) struct DialOptions {
 }
 
 impl DialOptions {
-    fn from_js(options: &Object<'_>) -> rquickjs::Result<Self> {
+    fn from_js(options: &Object<'_>, client_url: &url::Url) -> rquickjs::Result<Self> {
         fn enum_member<T>(
             ctx: &Ctx<'_>,
             options: &Object<'_>,
@@ -242,10 +242,11 @@ impl DialOptions {
 
         let ctx = options.ctx();
         let referrer = match options.get::<_, Option<String>>("referrer")? {
-            Some(value) => net::Referrer::from_idl(&value).ok_or_else(|| {
-                Exception::throw_type(ctx, &format!("referrer: {value:?} is not a referrer"))
-            })?,
-            None => net::Referrer::NoReferrer,
+            Some(value) => crate::protocol::ReferrerRequest::from_idl(&value, client_url)
+                .ok_or_else(|| {
+                    Exception::throw_type(ctx, &format!("referrer: {value:?} is not a referrer"))
+                })?,
+            None => crate::protocol::ReferrerRequest::NoReferrer,
         };
         let cors = crate::protocol::CorsRequest {
             // `fetch` always passes the mode its `Request` normalized
@@ -1015,6 +1016,7 @@ impl JsRealm {
             Self::install_crypto_host_functions(&ctx)?;
             install_storage_host_functions(&ctx, &world)?;
             install_window_host_functions(&ctx, &world)?;
+            install_window_messaging_functions(&ctx, &world)?;
             install_history_host_functions(&ctx, &world)?;
             url_parts::install(&ctx)?;
             encoding::install(&ctx)?;
@@ -1109,6 +1111,7 @@ impl JsRealm {
         install_stream_host_functions(ctx, world)?;
         Self::install_csp_host_functions(ctx, world)?;
         let fetch_outbox = Rc::clone(&outbox);
+        let fetch_world = Rc::clone(world);
         bridge::object(ctx)?.set(
             "__queueFetch",
             Func::from(
@@ -1122,7 +1125,8 @@ impl JsRealm {
                     let headers = header_pairs(headers)?;
                     let method = net::Method::parse(&method)
                         .map_err(|_| rquickjs::Error::new_from_js("method", "HTTP method"))?;
-                    let options = DialOptions::from_js(&options)?;
+                    let client_url = fetch_world.borrow().referrer_url.clone();
+                    let options = DialOptions::from_js(&options, &client_url)?;
                     fetch_outbox
                         .borrow_mut()
                         .push_back(RealmRequest::Fetch(Box::new(JsFetchRequest {
@@ -1375,10 +1379,24 @@ fn random_bytes(ctx: Ctx<'_>, length: usize) -> rquickjs::Result<TypedArray<'_, 
 
 /// `window.open`/`window.close` hooks the JS shim calls.
 fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    // The shim parses the feature string once through `__tbOpenerPolicy` and
+    // hands the answer back here, so the engine never re-reads a grammar the
+    // page wrote
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
+    bridge::object(ctx)?.set(
+        "__tbOpenerPolicy",
+        Func::from(|features: String| {
+            crate::window_features::WindowFeatures::parse(&features)
+                .opener_policy()
+                .token()
+        }),
+    )?;
+
     let window_open = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowOpen",
-        Func::from(move |url: String, name: String, features: String| {
+        Func::from(move |url: String, name: String, opener: String| {
+            let opener = crate::protocol::OpenerPolicy::parse(&opener)?;
             let spec = if url.is_empty() {
                 Some(String::new())
             } else {
@@ -1394,7 +1412,8 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                     .borrow()
                     .runtime
                     .services
-                    .window_open(&spec, &name, &features)
+                    .window_open(&spec, &name, opener)
+                    .map(|window| crate::js::js_number(window.get()))
             })
         }),
     )?;
@@ -1402,43 +1421,92 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     let window_close = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowClose",
-        Func::from(move |tab: u64| {
-            window_close.borrow().runtime.services.window_close(tab);
+        Func::from(move |window: u64| {
+            window_close
+                .borrow()
+                .runtime
+                .services
+                .window_close(crate::protocol::WindowId::new(window));
         }),
     )?;
 
     let opener = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowOpener",
-        Func::from(move || opener.borrow().runtime.services.window_opener()),
+        Func::from(move || {
+            opener
+                .borrow()
+                .runtime
+                .services
+                .window_opener()
+                .map(|window| crate::js::js_number(window.get()))
+        }),
     )?;
 
+    install_auxiliary_host_functions(ctx, world)?;
+    Ok(())
+}
+
+/// The hooks a `WindowProxy` uses to exchange messages: a cross-tab
+/// `postMessage`, a remote same-origin `sessionStorage` read, and a
+/// `BroadcastChannel` post.
+fn install_window_messaging_functions(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+) -> Result<(), JsError> {
     let post_message = world.clone();
     bridge::object(ctx)?.set(
         "__tbWindowPostMessage",
-        Func::from(move |tab: u64, target_origin: String, payload: String| {
-            let world = post_message.borrow();
-            world.runtime.services.window_post_message(
-                tab,
-                crate::protocol::PostedMessage {
-                    origin: world.origin_string(),
-                    target_origin,
-                    payload,
-                },
-            );
-        }),
+        Func::from(
+            move |ctx: Ctx<'_>, window: u64, target_origin: String, payload: String| {
+                let world = post_message.borrow();
+                // The sender resolves the target, because `/` names the
+                // sender's own origin identity, which no serialized value can
+                // carry
+                // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+                let Some(target) =
+                    crate::protocol::TargetOrigin::parse(&target_origin, Some(&world.origin))
+                else {
+                    return Err(crate::js::bindings::throw_dom(
+                        &ctx,
+                        "SyntaxError",
+                        "Invalid target origin",
+                    ));
+                };
+                if matches!(
+                    &target,
+                    crate::protocol::TargetOrigin::Exact(url::Origin::Opaque(_))
+                ) {
+                    // An opaque exact target is a different origin object in
+                    // every document, so a cross-tab post with one can never
+                    // be delivered. It is still a valid argument, and the
+                    // shim already serialized the message.
+                    return Ok(());
+                }
+                world.runtime.services.window_post_message(
+                    crate::protocol::WindowId::new(window),
+                    crate::protocol::PostedMessage {
+                        origin: crate::protocol::SerializedOrigin::from(&world.origin),
+                        target_origin: target,
+                        payload,
+                    },
+                );
+                Ok(())
+            },
+        ),
     )?;
 
     let remote_session = world.clone();
     bridge::object(ctx)?.set(
         "__tbRemoteSessionGet",
-        Func::from(move |tab: u64, key: String| {
+        Func::from(move |window: u64, key: String| {
             let world = remote_session.borrow();
             world.storage_origin().and_then(|origin| {
-                world
-                    .runtime
-                    .services
-                    .remote_session_get(tab, &origin, &key)
+                world.runtime.services.remote_session_get(
+                    crate::protocol::WindowId::new(window),
+                    &origin,
+                    &key,
+                )
             })
         }),
     )?;
@@ -1461,7 +1529,6 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
             },
         ),
     )?;
-    install_auxiliary_host_functions(ctx, world)?;
     Ok(())
 }
 
@@ -1475,20 +1542,11 @@ fn install_auxiliary_host_functions(
     let open = world.clone();
     bridge::object(ctx)?.set(
         "__tbOpenAuxiliary",
-        Func::from(
-            move |url: String, name: String, noopener: bool, noreferrer: bool| {
-                World::open_auxiliary(
-                    &open,
-                    &url,
-                    &name,
-                    crate::js::world::AuxiliaryOptions {
-                        noopener,
-                        noreferrer,
-                    },
-                )
+        Func::from(move |url: String, name: String, opener: String| {
+            let opener = crate::protocol::OpenerPolicy::parse(&opener)?;
+            World::open_auxiliary(&open, &url, &name, opener)
                 .map(|frame| crate::js::js_number(frame.get()))
-            },
-        ),
+        }),
     )?;
 
     let popups = world.clone();
@@ -1735,7 +1793,7 @@ struct SyncPageFetch {
     body: Vec<u8>,
     content_type: Option<String>,
     headers: Vec<(String, String)>,
-    referrer: net::Referrer,
+    referrer: crate::protocol::ReferrerRequest,
     with_credentials: bool,
     timeout: f64,
 }
@@ -1843,14 +1901,16 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                 // options
                 // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
                 // <https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
+                let client_url = sync_world.borrow().referrer_url.clone();
                 let referrer = match options.get::<_, Option<String>>("referrer")? {
-                    Some(value) => net::Referrer::from_idl(&value).ok_or_else(|| {
-                        Exception::throw_type(
-                            options.ctx(),
-                            &format!("referrer: {value:?} is not a referrer"),
-                        )
-                    })?,
-                    None => net::Referrer::default(),
+                    Some(value) => crate::protocol::ReferrerRequest::from_idl(&value, &client_url)
+                        .ok_or_else(|| {
+                            Exception::throw_type(
+                                options.ctx(),
+                                &format!("referrer: {value:?} is not a referrer"),
+                            )
+                        })?,
+                    None => crate::protocol::ReferrerRequest::default(),
                 };
                 let with_credentials = options
                     .get::<_, Option<bool>>("withCredentials")?
@@ -1917,9 +1977,8 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             },
             redirect: net::cors::RedirectMode::Follow,
         }),
-        &request.url,
+        &parsed,
         &world.origin.ascii_serialization(),
-        world.referrer_url.as_str(),
     );
     dial.method = request.method;
     dial.body = request.body;

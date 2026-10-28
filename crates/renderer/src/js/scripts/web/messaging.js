@@ -782,16 +782,9 @@ host.__tbFrameProxy = __tbFrameProxy;
 // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage
 // `postMessage` step 5: `/` names the incumbent origin and is passed through
 // for the host to resolve with origin identity intact; anything else but `*`
-// must parse as a URL, throwing `SyntaxError` here before anything is queued.
+// must parse as a URL. The host parses it before the message is serialized.
 function __tbNormalizeTargetOrigin(targetOrigin) {
-  const checked = targetOrigin === undefined ? '/' : String(targetOrigin);
-  if (checked === '/' || checked === '*') return checked;
-  try {
-    new globalThis.URL(checked);
-  } catch (error) {
-    throw new globalThis.DOMException('Invalid target origin', 'SyntaxError');
-  }
-  return checked;
+  return targetOrigin === undefined ? '/' : String(targetOrigin);
 }
 function __tbPostMessage(targetFrame, argumentCount, message, targetOrigin, transfer) {
   if (argumentCount === 0) {
@@ -806,10 +799,12 @@ function __tbPostMessage(targetFrame, argumentCount, message, targetOrigin, tran
     transfer = targetOrigin.transfer;
     targetOrigin = targetOrigin.targetOrigin;
   }
-  // The target origin is parsed before the message is serialized: a
-  // `SyntaxError` must not detach buffers, ports, or canvases
+  // The target origin resolves before the message is serialized, so an
+  // invalid value throws `SyntaxError` without detaching buffers, ports, or
+  // canvases
   // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
   const checkedOrigin = __tbNormalizeTargetOrigin(targetOrigin);
+  host.__tbValidateTargetOrigin(checkedOrigin);
   const encoded = __tbEncode(message, transfer, null);
   host.__tbPostWindowMessage(targetFrame, checkedOrigin, encoded.payload, encoded.ports);
 }
@@ -1070,6 +1065,7 @@ Object.defineProperty(globalThis, 'name', {
               targetOrigin = targetOrigin.targetOrigin;
             }
             const checkedOrigin = __tbNormalizeTargetOrigin(targetOrigin);
+            host.__tbValidateTargetOrigin(checkedOrigin);
             const encoded = __tbEncode(message, transfer, null);
             host.__tbWindowPostMessage(tab, checkedOrigin, encoded.payload);
           };
@@ -1119,17 +1115,15 @@ Object.defineProperty(globalThis, 'name', {
     if (spec === null || spec === undefined) return null;
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
-    // Window features are a comma-separated list of name[=value] pairs; the
-    // two that change this algorithm are `noopener` and `noreferrer`
+    // The engine tokenizes and parses the features argument; this shim only
+    // reads the answer, so the grammar lives in one place
+    // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-window-open-features-tokenize>).
+    const opener = host.__tbOpenerPolicy(featureString);
+    const noopener = opener !== 'keep';
+    // `noopener` withholds the `WindowProxy` only when the call did not target
+    // this context or one of its ancestors
     // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
-    const tokens = new Set(
-      featureString
-        .split(',')
-        .map((feature) => feature.split('=')[0].trim().toLowerCase())
-        .filter((feature) => feature !== ''),
-    );
-    const noopener = tokens.has('noopener') || tokens.has('noreferrer');
-    const noreferrer = tokens.has('noreferrer');
+    const withholds = noopener && !['_self', '_parent', '_top'].includes(name.toLowerCase());
     const special = name === '' || name.startsWith('_');
     // Without `allow-popups` a sandboxed document cannot create an auxiliary
     // context at all, whether this renderer or the browser would host it
@@ -1139,22 +1133,27 @@ Object.defineProperty(globalThis, 'name', {
       name === '_blank' ||
       (!name.startsWith('_') && !namedWindows.has(name));
     if (creates && !host.__tbMayOpenPopup()) return null;
-    if (!special && namedWindows.has(name)) return namedWindows.get(name);
+    if (!special && namedWindows.has(name)) {
+      // A `noopener` call never hands back a `WindowProxy`, even for a context
+      // the name already selected
+      // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#window-open-steps>).
+      return noopener ? null : namedWindows.get(name);
+    }
     // A context this renderer hosts keeps same-origin access to the opener: an
     // auxiliary context for a blank or same-origin URL, or the navigable a
     // name already selects. A cross-origin popup stays a browser tab.
-    const frame = host.__tbOpenAuxiliary(spec, name, noopener, noreferrer);
+    const frame = host.__tbOpenAuxiliary(spec, name, opener);
     if (frame !== null && frame !== undefined) {
-      return noopener ? null : __tbFrameProxy(frame);
+      return withholds ? null : __tbFrameProxy(frame);
     }
-    const tab = host.__tbWindowOpen(spec, name, featureString);
+    const tab = host.__tbWindowOpen(spec, name, opener);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
     if (!special) {
       namedWindows.set(name, proxy);
       tabNames.set(tab, name);
     }
-    return noopener ? null : proxy;
+    return withholds ? null : proxy;
   };
 
   // https://html.spec.whatwg.org/multipage/window-object.html#dom-window-close

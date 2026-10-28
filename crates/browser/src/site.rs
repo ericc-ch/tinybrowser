@@ -47,6 +47,37 @@ impl Site {
     pub(crate) fn authorize(&self, spec: &str) -> Option<Url> {
         Url::parse(spec).ok().filter(|url| self.allows(url))
     }
+
+    /// Whether one message's claimed sender origin belongs in a renderer locked
+    /// to this site.
+    ///
+    /// An opaque origin claims no authority, so it passes: the receiving
+    /// document's target-origin check is what rejects a delivery it does not
+    /// want. A tuple origin must belong to this site.
+    #[must_use]
+    pub(crate) fn allows_serialized_origin(&self, origin: &renderer::SerializedOrigin) -> bool {
+        match origin {
+            renderer::SerializedOrigin::Opaque => true,
+            renderer::SerializedOrigin::Tuple(origin) => self.allows_origin(origin),
+        }
+    }
+
+    /// Whether a parsed origin belongs in a renderer locked to this site.
+    ///
+    /// The origin's scheme and host stand in for a document URL: only an
+    /// HTTP(S) site lock can accept a tuple origin, and an opaque origin names
+    /// no principal to authorize.
+    #[must_use]
+    pub(crate) fn allows_origin(&self, origin: &url::Origin) -> bool {
+        let url::Origin::Tuple(scheme, host, port) = origin else {
+            return false;
+        };
+        let Ok(mut url) = Url::parse(&format!("{scheme}://{host}")) else {
+            return false;
+        };
+        let _ = url.set_port(Some(*port));
+        self.allows(&url)
+    }
 }
 
 #[cfg(test)]

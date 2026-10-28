@@ -72,10 +72,8 @@ impl Drop for KeepaliveReservation {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
     method: net::Method,
-    /// The request URL's canonical serialization. The dial parses it into a
-    /// `Url` on the way out; a key built before that would only turn the same
-    /// parse failure into a second, hidden one.
-    url: String,
+    /// The request URL.
+    url: Url,
     /// The request's credentials mode. A response fetched with `include` is
     /// not the response an `omit` request may reuse.
     credentials: net::cors::CredentialsMode,
@@ -135,7 +133,7 @@ struct DialHead {
     response_type: net::cors::ResponseType,
     crossed_origin: bool,
     redirect_count: u32,
-    referrer: Option<String>,
+    referrer: Option<Url>,
     /// A page-visible opaque response has a null body
     /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
     null_body: bool,
@@ -155,7 +153,7 @@ impl DialHead {
             response_type: response.response_type(),
             crossed_origin: response.crossed_origin(),
             redirect_count: response.redirect_count(),
-            referrer: response.referrer().map(ToString::to_string),
+            referrer: response.referrer().cloned(),
             null_body: false,
         }
     }
@@ -184,7 +182,7 @@ impl DialHead {
             } else {
                 response.redirect_count()
             },
-            referrer: response.referrer().map(ToString::to_string),
+            referrer: response.referrer().cloned(),
             null_body: filtered.response_type().is_opaque(),
         }
     }
@@ -205,13 +203,8 @@ impl DialHead {
     /// becomes policy, endpoints, or the nosniff flag: both read the header
     /// list here and hand it to one derivation
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
-    fn into_document_head(self) -> renderer::ResponseHead {
-        renderer::ResponseHead::http(
-            self.status,
-            self.final_url,
-            self.content_type,
-            &self.headers,
-        )
+    fn into_document_head(self, final_url: Url) -> renderer::ResponseHead {
+        renderer::ResponseHead::http(self.status, final_url, self.content_type, &self.headers)
     }
 
     /// The outcome this head answers with, once its body is known.
@@ -422,7 +415,7 @@ fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOut
     let mut merged = cached.clone();
     merged.status = 200;
     merged.final_url = response.final_url().to_string();
-    merged.referrer = response.referrer().map(ToString::to_string);
+    merged.referrer = response.referrer().cloned();
     merged.crossed_origin = response.crossed_origin();
     for (name, value) in response.filtered().headers() {
         let value = isomorphic_decode(value);
@@ -484,9 +477,7 @@ fn cache_usable(request: &DialRequest, initiator: &Url, entry: &CachedResponse) 
     if entry.outcome.response_type.is_opaque() {
         return false;
     }
-    let Ok(url) = Url::parse(&request.url) else {
-        return false;
-    };
+    let url = &request.url;
     // Only a page `fetch` reads the cache, so the policy is always `Fetch`
     // (<https://fetch.spec.whatwg.org/#http-cache>).
     let RequestPolicy::Fetch(cors) = request.policy else {
@@ -693,7 +684,7 @@ impl TabNetworkHandle {
         // fetch outcome cannot disagree about which header becomes policy,
         // endpoints, or the nosniff flag
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
-        let head = DialHead::internal(&response).into_document_head();
+        let head = DialHead::internal(&response).into_document_head(final_url);
         let body = response.into_body().await;
         Ok(NavOutcome {
             head,
@@ -855,7 +846,7 @@ impl TabNetworkHandle {
             store,
             permits,
             kind: request.policy.kind(),
-            url: request.url.clone(),
+            url: request.url.to_string(),
             tx,
         });
         let id = StreamId::mint(self.next_stream.fetch_add(1, Ordering::Relaxed));
@@ -1009,10 +1000,8 @@ impl TabNetworkHandle {
         let hit = match (mode, cached) {
             (RequestCache::OnlyIfCached, None) => return Err(DialFailure::Connect),
             (RequestCache::OnlyIfCached, Some(cached)) => {
-                if let (Ok(request_url), Ok(final_url)) = (
-                    Url::parse(&request.url),
-                    Url::parse(&cached.outcome.final_url),
-                ) && request_url.origin() != final_url.origin()
+                if let Ok(final_url) = Url::parse(&cached.outcome.final_url)
+                    && request.url.origin() != final_url.origin()
                 {
                     return Err(DialFailure::Connect);
                 }
@@ -1158,7 +1147,7 @@ fn outbound_request(
     deadline: Instant,
     sheets: &HashSet<Url>,
 ) -> Result<Request, DialFailure> {
-    let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
+    let url = request.url.clone();
     let kind = request.policy.kind();
     // https://fetch.spec.whatwg.org/#forbidden-method
     if kind == DialKind::JsFetch && request.method.is_forbidden() {
@@ -1242,22 +1231,21 @@ fn outbound_request(
     // cross-origin to both the document and the target
     // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
     // <https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-    let referrer_client = Url::parse(&request.referrer_url)
-        .ok()
-        .filter(|url| url.origin() == initiator.origin())
-        .map(|url| net::ReferrerClient {
-            origin: initiator.origin(),
-            url,
-        });
     outbound.referrer = match &request.referrer {
-        net::Referrer::Url(url) if referrer_authorized(url, initiator, sheets) => {
+        renderer::ReferrerRequest::Client { url } if url.origin() == initiator.origin() => {
+            net::Referrer::Client(net::ReferrerClient {
+                origin: initiator.origin(),
+                url: url.clone(),
+            })
+        }
+        renderer::ReferrerRequest::Url(url) if referrer_authorized(url, initiator, sheets) => {
             net::Referrer::Url(url.clone())
         }
-        net::Referrer::Url(_) => net::Referrer::NoReferrer,
-        referrer => referrer.clone(),
+        renderer::ReferrerRequest::NoReferrer
+        | renderer::ReferrerRequest::Client { .. }
+        | renderer::ReferrerRequest::Url(_) => net::Referrer::NoReferrer,
     };
     outbound.referrer_policy = request.referrer_policy;
-    outbound.referrer_client = referrer_client;
     Ok(outbound)
 }
 
@@ -1537,7 +1525,8 @@ mod tests {
     use std::time::Duration;
 
     fn dial(policy: RequestPolicy, url: &str) -> DialRequest {
-        DialRequest::new(policy, url, "http://a.test/page", "http://a.test/page")
+        let url = Url::parse(url).expect("dial URL");
+        DialRequest::new(policy, &url, "http://a.test/page")
     }
 
     fn js_fetch(mode: renderer::CorsMode, url: &str) -> DialRequest {
@@ -1901,7 +1890,9 @@ mod tests {
         let mut stream_request =
             js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/stream"));
         stream_request.initiator = initiator.origin().ascii_serialization();
-        stream_request.referrer_url = initiator.to_string();
+        stream_request.referrer = renderer::ReferrerRequest::Client {
+            url: initiator.clone(),
+        };
         stream_request.delivery = BodyDelivery::Stream;
         let outcome = handle
             .dial_request(&stream_request, &initiator, owner)
@@ -1926,7 +1917,9 @@ mod tests {
 
         let mut next_request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/done"));
         next_request.initiator = initiator.origin().ascii_serialization();
-        next_request.referrer_url = initiator.to_string();
+        next_request.referrer = renderer::ReferrerRequest::Client {
+            url: initiator.clone(),
+        };
         let next = tokio::time::timeout(
             Duration::from_secs(1),
             handle.dial_request(&next_request, &initiator, owner),
@@ -2132,7 +2125,9 @@ mod tests {
         let owner = RendererAssignmentId::new(1);
         let mut request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/etag"));
         request.initiator = initiator.origin().ascii_serialization();
-        request.referrer_url = initiator.to_string();
+        request.referrer = renderer::ReferrerRequest::Client {
+            url: initiator.clone(),
+        };
         let first = handle
             .dial_request(&request, &initiator, owner)
             .await
@@ -2194,7 +2189,7 @@ mod tests {
         let keys: Vec<CacheKey> = (0..=CACHE_MAX_ENTRIES)
             .map(|index| {
                 let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
-                request.url = format!("http://a.test/{index}");
+                request.url = Url::parse(&format!("http://a.test/{index}")).expect("URL");
                 cache_key(&request, &initiator, RendererAssignmentId::new(1))
             })
             .collect();
@@ -2223,7 +2218,7 @@ mod tests {
         let keys: Vec<CacheKey> = (0..bodies)
             .map(|index| {
                 let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
-                request.url = format!("http://a.test/{index}");
+                request.url = Url::parse(&format!("http://a.test/{index}")).expect("URL");
                 cache_key(&request, &initiator, RendererAssignmentId::new(1))
             })
             .collect();
