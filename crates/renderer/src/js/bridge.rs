@@ -111,49 +111,85 @@ pub(crate) fn object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
         .restore(ctx)
 }
 
-/// One id or index a binding receives from script as a JS number.
+/// Web IDL's `[EnforceRange] unsigned long` conversion
+/// (<https://webidl.spec.whatwg.org/#abstract-opdef-converttoint>).
 ///
-/// The engine keys its maps with `u64` counters, and a page receives the value
-/// as a JS number, which holds integers exactly only up to `2^53 - 1`
-/// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>). Both facts live
-/// here: [`Self::MAX`] is the JS bound, and parsing a number yields the value or
-/// nothing, so no caller narrows to `u32` or widens back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct HostId(u64);
-
-impl HostId {
-    /// The largest id a JS number carries exactly, `Number.MAX_SAFE_INTEGER`.
-    pub(crate) const MAX: u64 = (1 << 53) - 1;
-
-    /// [`Self::MAX`] as the float [`Self::parse`] compares against, spelled out
-    /// because casting it back would be the precision loss the bound prevents.
-    const MAX_EXACT: f64 = 9_007_199_254_740_991.0;
-
-    /// The id as the `u64` the engine's maps are keyed by.
-    pub(crate) fn get(self) -> u64 {
-        self.0
-    }
-
-    /// Parses one id from the number a binding received.
-    pub(crate) fn parse(value: f64) -> Option<Self> {
-        // The bound is compared as a float first, so the cast below only ever
-        // sees an integer `u64` holds exactly (`2^53 - 1` is representable).
-        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > Self::MAX_EXACT {
-            return None;
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the guards admit exactly the integers 0..=2^53-1"
-        )]
-        Some(Self(value as u64))
-    }
+/// Reads one number a binding received from script as the integer it names in
+/// `0..=4294967295`. The value is truncated toward zero, as the algorithm
+/// says, so `1.9` names 1; `None` covers every value `unsigned long` cannot
+/// hold.
+#[must_use]
+pub(crate) fn enforce_range_u32(value: f64) -> Option<u32> {
+    let value = enforce_range(value, 4_294_967_295.0)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the guard admits exactly the integers 0..=u32::MAX"
+    )]
+    Some(value as u32)
 }
 
-/// A JS number naming a frame, or `None` when it is not a host id.
+/// Web IDL's `[EnforceRange] unsigned long long` conversion
+/// (<https://webidl.spec.whatwg.org/#abstract-opdef-converttoint>).
+///
+/// Reads one number a binding received from script as the integer it names in
+/// `0..=18446744073709551615`, truncated toward zero like its `unsigned long`
+/// twin. Every id this engine hands out is a counter far below the range a JS
+/// number carries exactly, and a number that names no live id simply finds no
+/// object.
+#[must_use]
+pub(crate) fn enforce_range_u64(value: f64) -> Option<u64> {
+    let value = enforce_range(value, U64_MAX_EXACT)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the guard admits exactly the integers 0..=u64::MAX"
+    )]
+    Some(value as u64)
+}
+
+/// The largest integer below `2^64` an `f64` holds, `2^64 - 2048`. `2^64` itself
+/// is the first value an `unsigned long long` cannot hold, and rounding puts it
+/// one step above this, so this is the conversion's inclusive upper bound.
+const U64_MAX_EXACT: f64 = 1.844_674_407_370_955e19;
+
+/// The half both conversions share: truncate toward zero, then admit only
+/// `0..=max`. Both bounds are exact `f64` values, so every accepted number is
+/// an integer the integer cast can hold.
+fn enforce_range(value: f64, max: f64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let value = value.trunc();
+    (value >= 0.0 && value <= max).then_some(value)
+}
+
+/// An id as the JS number a binding hands to script.
+///
+/// A JS number holds an integer exactly up to `2^53 - 1`; an id past that has
+/// no exact number form, so it becomes `NaN` and the shim's lookup answers no
+/// such object instead of addressing a neighbour
+/// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>).
+#[must_use]
+pub(crate) fn js_number(id: u64) -> f64 {
+    /// The largest id a JS number carries exactly.
+    const MAX_EXACT: u64 = (1 << 53) - 1;
+
+    if id > MAX_EXACT {
+        return f64::NAN;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the guard admits only the integers a f64 holds exactly"
+    )]
+    let number = id as f64;
+    number
+}
+
+/// A JS number naming a frame, or `None` when it names no frame id.
 #[must_use]
 pub(crate) fn frame_id(value: f64) -> Option<crate::protocol::FrameId> {
-    HostId::parse(value).map(|id| crate::protocol::FrameId::new(id.get()))
+    enforce_range_u64(value).map(crate::protocol::FrameId::new)
 }
 
 pub(crate) fn evaluate(ctx: &Ctx<'_>, source: &str) -> Result<()> {
@@ -185,30 +221,45 @@ pub(crate) fn evaluate_page(ctx: Ctx<'_>, source: String) -> Result<Value<'_>> {
 
 #[cfg(test)]
 mod tests {
-    use super::HostId;
+    use super::{enforce_range_u32, enforce_range_u64, js_number};
 
     #[test]
-    fn a_host_id_is_a_js_integer_the_engine_can_key() {
-        assert_eq!(HostId::parse(0.0).map(HostId::get), Some(0));
-        assert_eq!(HostId::parse(7.0).map(HostId::get), Some(7));
+    fn an_id_number_follows_the_webidl_enforce_range_algorithm() {
+        assert_eq!(enforce_range_u32(0.0), Some(0));
+        assert_eq!(enforce_range_u32(7.9), Some(7), "truncated toward zero");
+        assert_eq!(enforce_range_u32(4_294_967_295.0), Some(u32::MAX));
         assert_eq!(
-            HostId::parse(9_007_199_254_740_991.0).map(HostId::get),
-            Some(HostId::MAX),
-            "the largest exact JS integer is a host id"
+            enforce_range_u32(4_294_967_296.0),
+            None,
+            "2^32 is not a `unsigned long`"
         );
-        assert_eq!(
-            HostId::parse(f64::from(u32::MAX) * 10.0).map(HostId::get),
-            Some(u64::from(u32::MAX) * 10),
-            "an id past u32 is still exact in a JS number"
-        );
-        for rejected in [
-            -1.0,
-            1.5,
-            f64::NAN,
-            f64::INFINITY,
-            9_007_199_254_740_992.0, // 2^53, one past MAX
-        ] {
-            assert_eq!(HostId::parse(rejected), None, "{rejected}");
+        assert_eq!(enforce_range_u32(-0.5), Some(0), "-0 is the integer zero");
+        for rejected in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(enforce_range_u32(rejected), None, "{rejected}");
         }
+
+        assert_eq!(enforce_range_u64(0.0), Some(0));
+        assert_eq!(
+            enforce_range_u64(9_007_199_254_740_991.0),
+            Some(9_007_199_254_740_991)
+        );
+        assert_eq!(
+            enforce_range_u64(super::U64_MAX_EXACT * 2.0),
+            None,
+            "2^64 is not an `unsigned long long`"
+        );
+        assert_eq!(enforce_range_u64(-1.0), None);
+        assert_eq!(enforce_range_u64(f64::NAN), None);
+    }
+
+    #[test]
+    fn a_js_number_holds_an_id_only_while_it_is_exact() {
+        assert_eq!(js_number(0), 0.0);
+        assert_eq!(js_number(7), 7.0);
+        assert_eq!(js_number((1 << 53) - 1), 9_007_199_254_740_991.0);
+        assert!(
+            js_number(1 << 53).is_nan(),
+            "an id past 2^53 - 1 has no exact number form"
+        );
     }
 }

@@ -9,9 +9,13 @@
 //! `--resolve` a [`ResolveRule`], `--tls-ca` a parsed [`TrustedCa`]. The scanner
 //! is the inbound adapter, so a bad value is a [`CliError`] carrying its cause
 //! instead of a string, and `main` only formats it once.
+//!
+//! Scan order decides which token errors, so `--help` and the missing-port check
+//! keep their precedence over a value that cannot be read: `--tls-ca` names a
+//! path at scan time and the file is read in [`Scanner::finish`], after the
+//! command line is known to be complete.
 
 use std::ffi::OsString;
-use std::fmt;
 use std::io;
 use std::iter::Peekable;
 use std::path::PathBuf;
@@ -47,8 +51,9 @@ pub(crate) enum Command {
         port: u16,
         /// Named profile.
         profile: Profile,
-        /// Network configuration, every flag already parsed. Boxed because an
-        /// `AgentOptions` dwarfs every other command's fields.
+        /// Network configuration from `--proxy` and `--resolve`, both parsed
+        /// where they are scanned; `--tls-ca` adds its files in `finish`.
+        /// Boxed because an `AgentOptions` dwarfs every other command's fields.
         network: Box<AgentOptions>,
     },
 }
@@ -64,11 +69,13 @@ pub(crate) enum Outcome {
 }
 
 /// One command-line failure.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum CliError {
     /// A token is not UTF-8.
+    #[error("Invalid UTF-8 was detected in one or more arguments")]
     NotUtf8,
     /// A value-taking flag had no value, including `--flag=`.
+    #[error("a value is required for '--{flag} {placeholder}' but none was supplied")]
     MissingValue {
         /// Flag name, without dashes.
         flag: &'static str,
@@ -77,30 +84,40 @@ pub(crate) enum CliError {
     },
     /// A flag that may appear once appeared again. `spelling` is the flag and
     /// its placeholder, the way the message quotes it.
+    #[error("the argument '{spelling}' was provided more than once")]
     Repeated {
         /// Flag and placeholder, e.g. `--port <PORT>`.
         spelling: &'static str,
     },
     /// A flag without a value was given one.
+    #[error("unexpected value for '--{flag}'")]
     UnexpectedValue {
         /// Flag name, without dashes.
         flag: &'static str,
     },
     /// No flag of the selected subcommand names this token.
+    #[error("unexpected argument '{0}' found")]
     UnexpectedArgument(String),
     /// `help` was followed by a name that is not a subcommand.
+    #[error("unrecognized subcommand '{0}'")]
     UnrecognizedSubcommand(String),
     /// `--port` is not a port number.
+    #[error("invalid value '{0}' for '--port <PORT>'")]
     InvalidPort(String),
     /// `--profile` is not a name.
-    InvalidProfile(ProfileError),
+    #[error(transparent)]
+    InvalidProfile(#[from] ProfileError),
     /// `--log-level` is not a level.
-    InvalidLogLevel(logging::ParseLevelError),
+    #[error(transparent)]
+    InvalidLogLevel(#[from] logging::ParseLevelError),
     /// `--resolve` is not a `PATTERN=ADDR` rule.
-    InvalidResolve(InvalidResolveRule),
+    #[error(transparent)]
+    InvalidResolve(#[from] InvalidResolveRule),
     /// `--proxy` is not a proxy URI.
-    InvalidProxy(InvalidProxy),
+    #[error(transparent)]
+    InvalidProxy(#[from] InvalidProxy),
     /// `--tls-ca` named a file that could not be read or parsed.
+    #[error("--tls-ca {}: {source}", path.display())]
     TlsCa {
         /// The named path.
         path: PathBuf,
@@ -108,66 +125,19 @@ pub(crate) enum CliError {
         source: TlsCaError,
     },
     /// `webdriver` was selected without `--port`.
+    #[error("the following required arguments were not provided:\n  --port <PORT>")]
     MissingPort,
 }
 
 /// The two ways a `--tls-ca` file can fail.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum TlsCaError {
     /// The file could not be read.
-    Read(io::Error),
+    #[error(transparent)]
+    Read(#[from] io::Error),
     /// The file is not a PEM certificate.
-    Parse(InvalidCa),
-}
-
-impl fmt::Display for TlsCaError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Read(error) => error.fmt(formatter),
-            Self::Parse(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotUtf8 => {
-                formatter.write_str("Invalid UTF-8 was detected in one or more arguments")
-            }
-            Self::MissingValue { flag, placeholder } => write!(
-                formatter,
-                "a value is required for '--{flag} {placeholder}' but none was supplied"
-            ),
-            Self::Repeated { spelling } => {
-                write!(
-                    formatter,
-                    "the argument '{spelling}' was provided more than once"
-                )
-            }
-            Self::UnexpectedValue { flag } => {
-                write!(formatter, "unexpected value for '--{flag}'")
-            }
-            Self::UnexpectedArgument(token) => {
-                write!(formatter, "unexpected argument '{token}' found")
-            }
-            Self::UnrecognizedSubcommand(token) => {
-                write!(formatter, "unrecognized subcommand '{token}'")
-            }
-            Self::InvalidPort(value) => {
-                write!(formatter, "invalid value '{value}' for '--port <PORT>'")
-            }
-            Self::InvalidProfile(error) => error.fmt(formatter),
-            Self::InvalidLogLevel(error) => error.fmt(formatter),
-            Self::InvalidResolve(error) => error.fmt(formatter),
-            Self::InvalidProxy(error) => error.fmt(formatter),
-            Self::TlsCa { path, source } => {
-                write!(formatter, "--tls-ca {}: {source}", path.display())
-            }
-            Self::MissingPort => formatter
-                .write_str("the following required arguments were not provided:\n  --port <PORT>"),
-        }
-    }
+    #[error(transparent)]
+    Parse(#[from] InvalidCa),
 }
 
 /// Full help text, also printed when no subcommand is given.
@@ -286,7 +256,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                         spelling: "--log-level <LEVEL>",
                     });
                 }
-                self.log_level = Some(raw.parse().map_err(CliError::InvalidLogLevel)?);
+                self.log_level = Some(raw.parse()?);
                 Ok(None)
             }
             "log-file" => {
@@ -336,7 +306,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
         match name {
             "profile" => {
                 let raw = self.value("profile", "<NAME>", inline)?;
-                let profile = Profile::parse(&raw).map_err(CliError::InvalidProfile)?;
+                let profile = Profile::parse(&raw)?;
                 match &mut self.command {
                     Some(
                         Partial::Daemon { profile: slot }
@@ -373,7 +343,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 let raw = self.value("resolve", "<PATTERN=ADDR>", inline)?;
                 match &mut self.command {
                     Some(Partial::Webdriver { network, .. }) => {
-                        let rule = raw.parse().map_err(CliError::InvalidResolve)?;
+                        let rule = raw.parse()?;
                         network.resolve.push(rule);
                         Ok(None)
                     }
@@ -392,7 +362,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             }
             "proxy" => {
                 let raw = self.value("proxy", "<URI>", inline)?;
-                let proxy = raw.parse::<Proxy>().map_err(CliError::InvalidProxy)?;
+                let proxy = raw.parse::<Proxy>()?;
                 match &mut self.command {
                     Some(Partial::Webdriver { network, .. }) => {
                         if network.proxy.is_some() {

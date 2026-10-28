@@ -29,6 +29,7 @@ pub(crate) mod world;
 mod observers;
 mod reactions;
 
+pub(crate) use bridge::js_number;
 pub(crate) use runtime::FrameRuntime;
 pub use runtime::Stop;
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
@@ -2193,38 +2194,9 @@ fn millis(delay: f64) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
-/// A protocol id as the JS number the shim exchanges. A JS number holds an
-/// integer exactly up to [`crate::js::bridge::HostId::MAX`], so a larger id is
-/// not addressable from script at all
-/// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>).
-pub(crate) fn js_number(id: u64) -> f64 {
-    if id > crate::js::bridge::HostId::MAX {
-        return f64::NAN;
-    }
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "the guard admits exactly the integers a f64 holds"
-    )]
-    let number = id as f64;
-    number
-}
-
 #[cfg(test)]
 mod tests {
     use super::CreatorInfo;
-
-    /// The JS-number form of an id is exact up to `Number.MAX_SAFE_INTEGER`;
-    /// past it, script cannot address the id at all.
-    #[test]
-    fn a_host_number_is_exact_up_to_the_js_bound() {
-        use super::js_number;
-        use crate::js::bridge::HostId;
-
-        assert_eq!(js_number(0), 0.0);
-        assert_eq!(js_number(7), 7.0);
-        assert_eq!(js_number(HostId::MAX), 9_007_199_254_740_991.0);
-        assert!(js_number(HostId::MAX + 1).is_nan());
-    }
 
     #[test]
     fn stack_top_frame_parses() {

@@ -310,10 +310,11 @@ impl RealmRegistry {
 
     /// The next process-unique `WebDriver` element id.
     ///
-    /// Ids keep counting past [`crate::js::bridge::HostId::MAX`]: the
-    /// `WebDriver` string form still addresses them, while the page's JS-number
-    /// form rounds and the parser then rejects it, which is an honest "no such
-    /// element" rather than an id two nodes share
+    /// Ids keep counting past the range a JS number holds exactly, because
+    /// [`crate::js::bridge::js_number`] turns such an id into `NaN` rather than
+    /// a neighbouring one; the shim then answers no such element, so two nodes
+    /// never share a page-side id. The `WebDriver` string form carries the id
+    /// as decimal text and still addresses it
     /// (<https://tc39.es/ecma262/#sec-number.max_safe_integer>).
     pub(crate) fn allocate_remote(&mut self) -> u64 {
         self.next_remote = self.next_remote.saturating_add(1);
@@ -1120,13 +1121,33 @@ pub(crate) struct PolicyContainer {
     pub(crate) referrer_policy: Option<ReferrerPolicy>,
 }
 
-/// One flag in a sandboxing flag set
+/// Declares the sandboxing flags: the variants, the full list, and the bit each
+/// one owns. The variant list feeds all three, so a flag cannot be declared
+/// without being set by a bare `sandbox`, which is what the oracle test checks
 /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing-flag-set>).
-///
-/// The enum is the only list: [`SandboxFlags::ALL`], the keyword table, and the
-/// oracle tests all read it, so a flag cannot exist as a bare bit nothing names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SandboxFlag {
+macro_rules! sandbox_flags {
+    ($($(#[$doc:meta])* $variant:ident),+ $(,)?) => {
+        /// One flag in a sandboxing flag set.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        #[repr(u8)]
+        pub(crate) enum SandboxFlag {
+            $($(#[$doc])* $variant),+
+        }
+
+        impl SandboxFlag {
+            /// Every flag, in bit order, so `parse` and the tests walk one
+            /// list.
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// This flag's bit: its position in [`Self::ALL`].
+            const fn bit(self) -> u32 {
+                1 << (self as u32)
+            }
+        }
+    };
+}
+
+sandbox_flags! {
     /// `iframe sandbox`: no navigating any other browsing context.
     Navigation,
     /// `allow-popups`: creating new auxiliary browsing contexts.
@@ -1164,51 +1185,6 @@ pub(crate) enum SandboxFlag {
     Downloads,
     /// `allow-top-navigation-to-custom-protocols`.
     CustomProtocolsNavigation,
-}
-
-impl SandboxFlag {
-    /// Every flag, in bit order, so `parse` and the tests walk one list
-    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
-    pub(crate) const ALL: &'static [Self] = &[
-        Self::Navigation,
-        Self::AuxiliaryNavigation,
-        Self::TopLevelNavigationWithoutUserActivation,
-        Self::TopLevelNavigationWithUserActivation,
-        Self::Origin,
-        Self::Forms,
-        Self::PointerLock,
-        Self::Scripts,
-        Self::AutomaticFeatures,
-        Self::DocumentDomain,
-        Self::PropagatesToAuxiliary,
-        Self::Modals,
-        Self::OrientationLock,
-        Self::Presentation,
-        Self::Downloads,
-        Self::CustomProtocolsNavigation,
-    ];
-
-    /// This flag's bit.
-    const fn bit(self) -> u32 {
-        match self {
-            Self::Navigation => 1 << 0,
-            Self::AuxiliaryNavigation => 1 << 1,
-            Self::TopLevelNavigationWithoutUserActivation => 1 << 2,
-            Self::TopLevelNavigationWithUserActivation => 1 << 3,
-            Self::Origin => 1 << 4,
-            Self::Forms => 1 << 5,
-            Self::PointerLock => 1 << 6,
-            Self::Scripts => 1 << 7,
-            Self::AutomaticFeatures => 1 << 8,
-            Self::DocumentDomain => 1 << 9,
-            Self::PropagatesToAuxiliary => 1 << 10,
-            Self::Modals => 1 << 11,
-            Self::OrientationLock => 1 << 12,
-            Self::Presentation => 1 << 13,
-            Self::Downloads => 1 << 14,
-            Self::CustomProtocolsNavigation => 1 << 15,
-        }
-    }
 }
 
 /// A sandboxing flag set: the flags one `iframe` (and its ancestors) impose on
