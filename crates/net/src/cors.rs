@@ -3,10 +3,11 @@
 //!
 //! Only the pieces the browser process needs to make the cross-origin
 //! decision live here: request/response classification, the CORS check, the
-//! preflight request shape and its validation, and response-header
-//! filtering. The `fetch` algorithm itself runs in the renderer and the
-//! browser enforces this module's verdicts, so a compromised renderer cannot
-//! widen its own access.
+//! preflight request shape and its validation, and response-header filtering.
+//! The `fetch` algorithm's policy decisions run in the renderer, and the
+//! browser enforces the ones that face the network: the request origin, the
+//! CORS check, preflights, redirect gating, and which filtered view a page
+//! fetch may report.
 
 use hyper::header::{self, HeaderValue};
 
@@ -539,8 +540,26 @@ pub(crate) fn preflight_headers(
     Ok(headers)
 }
 
-fn is_forbidden_response_header(name: &str) -> bool {
+/// Whether `name` is a forbidden response-header name, which page script can
+/// never read
+/// (<https://fetch.spec.whatwg.org/#forbidden-response-header-name>).
+#[must_use]
+pub fn is_forbidden_response_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
+}
+
+/// The header list a `basic` response exposes to page script: every field the
+/// server sent except the forbidden response-header names
+/// (<https://fetch.spec.whatwg.org/#forbidden-response-header-name>).
+#[must_use]
+pub fn visible_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut visible = HeaderMap::new();
+    for (name, value) in headers.typed_iter() {
+        if !is_forbidden_response_header(name.as_str()) {
+            visible.insert_wire(name.clone(), value.clone());
+        }
+    }
+    visible
 }
 
 fn is_cors_safelisted_response_header(name: &str) -> bool {
@@ -897,6 +916,26 @@ mod tests {
         assert!(exposed.get("x-hidden").is_none());
         assert!(exposed.get("set-cookie").is_none());
         assert!(exposed.get("access-control-expose-headers").is_none());
+    }
+
+    #[test]
+    fn a_basic_response_hides_only_the_forbidden_fields() {
+        let response = headers(&[
+            ("Content-Type", "text/html"),
+            ("X-Hidden", "2"),
+            ("Set-Cookie", "a=b"),
+            ("Set-Cookie2", "c=d"),
+        ]);
+        let visible = visible_response_headers(&response);
+        assert!(visible.get("content-type").is_some());
+        assert!(
+            visible.get("x-hidden").is_some(),
+            "a basic response keeps every field it is allowed to expose"
+        );
+        assert!(
+            visible.get("set-cookie").is_none() && visible.get("set-cookie2").is_none(),
+            "cookies are forbidden response-header names"
+        );
     }
 
     #[test]

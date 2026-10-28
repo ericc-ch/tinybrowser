@@ -35,8 +35,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Version 13 folded a dial outcome's body and stream into one
 /// [`ResponseBody`](renderer::ResponseBody), made the request method a typed
 /// value, and renumbered `BodyDelivery` (now `Buffer` = 0, `Stream` = 1) with
-/// the removal of `Discard`.
-pub const PROTOCOL_VERSION: u8 = 13;
+/// the removal of `Discard`. Version 14 replaced a request's kind and optional
+/// CORS parameters with one [`RequestPolicy`](renderer::RequestPolicy), and a
+/// page request's mode with [`CorsMode`](renderer::CorsMode), which has no
+/// `navigate`.
+pub const PROTOCOL_VERSION: u8 = 14;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -429,6 +432,82 @@ mod tests {
             };
             // `Debug` keeps `NaN` comparable and distinguishes `-0.0`.
             assert_eq!(format!("{back:?}"), expected, "round trip");
+        }
+    }
+
+    /// Every request policy survives the wire unchanged. The enum is the
+    /// record of what a dial is, so a variant that cannot round-trip is a dial
+    /// the browser would send with another mode.
+    #[test]
+    fn a_dial_request_round_trips_every_policy() {
+        use renderer::{CorsMode, CorsRequest, CrossOrigin, RequestPolicy};
+        let cors = CorsRequest {
+            mode: CorsMode::SameOrigin,
+            credentials: net::cors::CredentialsMode::Include,
+            redirect: net::cors::RedirectMode::Follow,
+        };
+        for policy in [
+            RequestPolicy::fetch(cors),
+            RequestPolicy::classic_script(Some(CrossOrigin::UseCredentials)),
+            RequestPolicy::module_script(Some(CrossOrigin::Anonymous)),
+            RequestPolicy::module_script(None),
+            RequestPolicy::stylesheet(None),
+            RequestPolicy::image(Some(CrossOrigin::Anonymous)),
+            RequestPolicy::font(),
+            RequestPolicy::frame_load(),
+            RequestPolicy::csp_report_to(),
+            RequestPolicy::csp_report_uri(),
+        ] {
+            let request = renderer::DialRequest {
+                policy,
+                url: "https://a.test/x".to_owned(),
+                initiator: "https://a.test/".to_owned(),
+                referrer_url: "https://a.test/".to_owned(),
+                delivery: renderer::BodyDelivery::Buffer,
+                method: net::Method::GET,
+                body: Vec::new(),
+                content_type: None,
+                headers: Vec::new(),
+                referrer: net::Referrer::NoReferrer,
+                timeout_ms: 0,
+                csp: None,
+                keepalive: false,
+                body_len: 0,
+                integrity: None,
+                cache: renderer::RequestCache::Default,
+                referrer_policy: net::ReferrerPolicy::default(),
+            };
+            let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
+                id: crate::exchange::RequestId::new(1),
+                body: crate::wire::BrowserCall {
+                    assignment: crate::wire::RendererAssignmentId::new(1),
+                    call: crate::wire::ServiceCall::Network(crate::wire::NetworkCall::Dial(
+                        Box::new(request),
+                    )),
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &message).expect("write");
+            let back: crate::wire::FromRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Call {
+                body: crate::wire::BrowserCall { call, .. },
+                ..
+            } = back
+            else {
+                panic!("expected a call frame");
+            };
+            let crate::wire::ServiceCall::Network(crate::wire::NetworkCall::Dial(request)) = call
+            else {
+                panic!("expected a dial");
+            };
+            assert_eq!(request.policy.kind(), policy.kind());
+            assert_eq!(request.policy.mode(), policy.mode());
+            assert_eq!(request.policy.credentials(), policy.credentials());
+            assert_eq!(request.policy.redirect(), policy.redirect());
+            assert_eq!(request.policy.exposes_response(), policy.exposes_response());
         }
     }
 

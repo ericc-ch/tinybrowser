@@ -504,7 +504,7 @@ impl Agent {
             // (<https://w3c.github.io/webappsec-referrer-policy/#set-requests-referrer-policy-on-redirect>).
             let redirect_policy = ReferrerPolicy::from_header(
                 response
-                    .headers()
+                    .internal_headers()
                     .get_all("referrer-policy")
                     .filter_map(|value| std::str::from_utf8(value).ok()),
             );
@@ -645,15 +645,7 @@ impl Agent {
                 .collect();
         let response = Response {
             status,
-            status_text: if http2 {
-                String::new()
-            } else {
-                hyper::StatusCode::from_u16(status)
-                    .ok()
-                    .and_then(|status| status.canonical_reason())
-                    .unwrap_or("")
-                    .to_owned()
-            },
+            status_text: reason_phrase(status, http2),
             headers: response_headers,
             final_url: url.clone(),
             body: RawBody {
@@ -668,16 +660,18 @@ impl Agent {
             content_encoding,
             redirect_count: 0,
             filtering: hop.response_type,
+            credentials_include: false,
             referrer: None,
             crossed_origin: hop.crossed_origin,
         };
-        // Set-Cookie must be read before CORS filtering removes it, and only
-        // when credentials mode admits them for this origin.
+        // Only when the credentials mode admits cookies for this origin. The
+        // jar is the only reader: the response's internal header list keeps
+        // each `Set-Cookie`, and page script never sees it.
         if send_credentials {
             self.store_set_cookie_lines(
                 operation,
                 response
-                    .headers()
+                    .internal_headers()
                     .get_all("set-cookie")
                     .filter_map(|v| std::str::from_utf8(v).ok()),
             );
@@ -955,7 +949,11 @@ fn cors_gate(response: &Response, dial: &Dial<'_>, hop: &Hop) -> Result<(), NetE
         return Ok(());
     }
     let origin = hop.serialized_origin(dial.cors);
-    if !crate::cors::cors_check(response.headers(), &origin, dial.credentials_include()) {
+    if !crate::cors::cors_check(
+        response.internal_headers(),
+        &origin,
+        dial.credentials_include(),
+    ) {
         return Err(NetError::Protocol(ProtocolError::RejectedRequest));
     }
     Ok(())
@@ -986,7 +984,7 @@ fn classify_response(
             dial.credentials_include(),
         ))));
     }
-    let Some(location) = followable_location(response.status(), response.headers()) else {
+    let Some(location) = followable_location(response.status(), response.internal_headers()) else {
         return Ok(HopOutcome::Final(Box::new(finalize(
             response,
             hop.response_type,
@@ -1015,25 +1013,35 @@ fn classify_response(
     Ok(HopOutcome::Redirect { next })
 }
 
-/// Applies a response's CORS filtering: `cors` exposes only safelisted and
-/// explicitly exposed headers, and the opaque types expose none
+/// The reason phrase one status code carries, or an empty string over HTTP/2,
+/// which does not send one
+/// (<https://fetch.spec.whatwg.org/#concept-response-status-message>).
+fn reason_phrase(status: u16, http2: bool) -> String {
+    if http2 {
+        return String::new();
+    }
+    hyper::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Records a response's CORS filtering, which decides the header list
+/// [`Response::exposed_headers`] builds
 /// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
+///
+/// The internal header list stays as served. Filtering produces the *filtered*
+/// response a page sees; an internal consumer reads the unsafe response, which
+/// keeps its status, URL, header list, and body
+/// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
 fn finalize(
     mut response: Response,
     response_type: crate::cors::ResponseType,
     credentials_include: bool,
 ) -> Response {
     response.filtering = response_type;
-    match response_type {
-        crate::cors::ResponseType::Cors => {
-            response.headers =
-                crate::cors::exposed_response_headers(&response.headers, credentials_include);
-        }
-        crate::cors::ResponseType::Opaque | crate::cors::ResponseType::OpaqueRedirect => {
-            response.headers = crate::cors::opaque_response_headers();
-        }
-        crate::cors::ResponseType::Basic => {}
-    }
+    response.credentials_include = credentials_include;
     response
 }
 
@@ -1253,6 +1261,7 @@ pub struct Response {
     content_encoding: Vec<String>,
     redirect_count: u32,
     filtering: crate::cors::ResponseType,
+    credentials_include: bool,
     referrer: Option<Url>,
     crossed_origin: bool,
 }
@@ -1285,10 +1294,40 @@ impl Response {
         self.crossed_origin
     }
 
-    /// Response fields, including each `Set-Cookie`.
+    /// The internal response's header list, before any filtering: every field
+    /// the server sent, `Set-Cookie` included.
+    ///
+    /// A page `fetch`/XHR reports [`Response::exposed_headers`] instead. An
+    /// internal consumer — an image decoder, a script compiler, a style sheet
+    /// parser — reads this one, because the spec's own algorithms read the
+    /// unsafe response, not the filtered one
+    /// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
     #[must_use]
-    pub fn headers(&self) -> &HeaderMap {
+    pub fn internal_headers(&self) -> &HeaderMap {
         &self.headers
+    }
+
+    /// The header list a page `fetch`/XHR exposes: a `basic` response keeps
+    /// every field but the forbidden response-header names, a `cors` response
+    /// keeps only its safelisted and explicitly exposed fields, and an opaque
+    /// response keeps none
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
+    ///
+    /// Computed on demand: an internal consumer never asks, so a subresource
+    /// dial does not pay for a second header list.
+    #[must_use]
+    pub fn exposed_headers(&self) -> HeaderMap {
+        match self.filtering {
+            crate::cors::ResponseType::Cors => {
+                crate::cors::exposed_response_headers(&self.headers, self.credentials_include)
+            }
+            crate::cors::ResponseType::Opaque | crate::cors::ResponseType::OpaqueRedirect => {
+                crate::cors::opaque_response_headers()
+            }
+            crate::cors::ResponseType::Basic => {
+                crate::cors::visible_response_headers(&self.headers)
+            }
+        }
     }
 
     /// URL after redirects. Fragments from the original request are preserved.
@@ -1313,6 +1352,11 @@ impl Response {
     }
 
     /// Consumes the response and returns its decoded body stream.
+    ///
+    /// This is the *internal* response's body. A page `fetch` reports it only
+    /// when the filtered response has one; an opaque one has none, so the
+    /// caller that hands a body to script must mask it
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
     pub async fn into_body(self) -> Body {
         Body::decoded(self.body, &self.content_encoding).await
     }

@@ -249,7 +249,7 @@ impl DialOptions {
         let cors = crate::protocol::CorsRequest {
             // `fetch` always passes the mode its `Request` normalized
             // (<https://fetch.spec.whatwg.org/#concept-request-mode>).
-            mode: enum_member(ctx, options, "mode", net::cors::RequestMode::from_idl)?,
+            mode: enum_member(ctx, options, "mode", crate::protocol::CorsMode::from_idl)?,
             credentials: enum_member(
                 ctx,
                 options,
@@ -1908,7 +1908,17 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         .runtime
         .services
         .dial_sync(crate::protocol::DialRequest {
-            kind: crate::protocol::DialKind::JsFetch,
+            policy: crate::protocol::RequestPolicy::fetch(crate::protocol::CorsRequest {
+                mode: crate::protocol::CorsMode::Cors,
+                // `withCredentials` selects `include`, else `same-origin`
+                // (<https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
+                credentials: if request.with_credentials {
+                    net::cors::CredentialsMode::Include
+                } else {
+                    net::cors::CredentialsMode::SameOrigin
+                },
+                redirect: net::cors::RedirectMode::Follow,
+            }),
             url: request.url,
             initiator: world.origin.ascii_serialization(),
             referrer_url: world.referrer_url.to_string(),
@@ -1920,17 +1930,6 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
             referrer: request.referrer,
             timeout_ms: u64::from(millis(request.timeout)),
             csp: None,
-            cors: Some(crate::protocol::CorsRequest {
-                mode: net::cors::RequestMode::Cors,
-                // `withCredentials` selects `include`, else `same-origin`
-                // (<https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
-                credentials: if request.with_credentials {
-                    net::cors::CredentialsMode::Include
-                } else {
-                    net::cors::CredentialsMode::SameOrigin
-                },
-                redirect: net::cors::RedirectMode::Follow,
-            }),
             keepalive: false,
             body_len: 0,
             integrity: None,

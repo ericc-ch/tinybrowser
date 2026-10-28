@@ -77,10 +77,9 @@ struct CacheKey {
     /// `Url` on the way out; a key built before that would only turn the same
     /// parse failure into a second, hidden one.
     url: String,
-    /// The CORS mode's credentials, when the dial carries a request policy.
-    /// `None` is a navigation or subresource dial, which never shares a cache
-    /// entry with a page request.
-    credentials: Option<net::cors::CredentialsMode>,
+    /// The request's credentials mode. A response fetched with `include` is
+    /// not the response an `omit` request may reuse.
+    credentials: net::cors::CredentialsMode,
     initiator: url::Origin,
     partition: RendererAssignmentId,
 }
@@ -121,6 +120,31 @@ enum DialProgress {
     },
 }
 
+/// A response whose head is in and whose body is still on the wire, plus the
+/// view its consumer reports.
+struct PendingBody {
+    response: net::Response,
+    permits: DialPermits,
+    visibility: ResponseVisibility,
+}
+
+/// Which response a dial reports.
+///
+/// A page `fetch`/XHR hands its response to script, so it gets the *filtered*
+/// response: an opaque one has no status, URL, headers, or body
+/// (<https://fetch.spec.whatwg.org/#concept-filtered-response>). Every other
+/// dial's response is consumed by the engine itself — an image decoder, a
+/// script compiler, a style sheet parser — and those algorithms read the
+/// *unsafe* response, which keeps what the server sent
+/// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseVisibility {
+    /// Handed to page script.
+    Page,
+    /// Consumed by the engine.
+    Internal,
+}
+
 /// Everything a dial outcome reports except its body. Each delivery path
 /// fills in the body it actually has, so a streamed outcome is never built
 /// from an empty buffered one
@@ -130,6 +154,8 @@ struct DialHead {
     status_text: String,
     final_url: String,
     content_type: Option<String>,
+    /// The response's header list, minus `Set-Cookie`: cookies live in the
+    /// browser's jar, and an `HttpOnly` one must not reach the renderer.
     headers: Vec<(String, String)>,
     response_type: net::cors::ResponseType,
     crossed_origin: bool,
@@ -138,6 +164,75 @@ struct DialHead {
 }
 
 impl DialHead {
+    /// Reads one response head, from the view `visibility` names.
+    ///
+    /// Both dial paths and a document navigation go through this: one place
+    /// decides which headers, status, and URL a response reports.
+    fn read(response: &net::Response, visibility: ResponseVisibility) -> Self {
+        let response_type = response.response_type();
+        let page = visibility == ResponseVisibility::Page;
+        // A page-visible response is always the filtered one: a `cors`
+        // response exposes only its safelisted and exposed fields, and an
+        // opaque one exposes nothing. An internal consumer reads the unsafe
+        // response's list.
+        let visible = if page {
+            std::borrow::Cow::Owned(response.exposed_headers())
+        } else {
+            std::borrow::Cow::Borrowed(response.internal_headers())
+        };
+        let headers: Vec<(String, String)> = visible
+            .iter()
+            .filter(|(name, _)| !net::cors::is_forbidden_response_header(name))
+            .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
+            .collect();
+        // An opaque filtered response has status 0, an empty status message,
+        // an empty header list, a null body, and a URL list of either nothing
+        // (`opaque`) or the request URL (`opaqueredirect`). It must not reveal
+        // where the request landed
+        // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>,
+        // <https://fetch.spec.whatwg.org/#concept-filtered-response-opaque-redirect>).
+        let opaque = page && response_type.is_opaque();
+        let hide_url = page && response_type == net::cors::ResponseType::Opaque;
+        Self {
+            status: if opaque { 0 } else { response.status() },
+            status_text: if opaque {
+                String::new()
+            } else {
+                response.status_text().to_owned()
+            },
+            final_url: if hide_url {
+                String::new()
+            } else {
+                response.final_url().to_string()
+            },
+            content_type: content_type_header(&visible),
+            headers,
+            response_type,
+            crossed_origin: response.crossed_origin(),
+            // `Response.redirected` is "the URL list has more than one entry",
+            // and an opaque response's list holds one
+            // (<https://fetch.spec.whatwg.org/#dom-response-redirected>).
+            redirect_count: if opaque { 0 } else { response.redirect_count() },
+            referrer: response.referrer().map(ToString::to_string),
+        }
+    }
+
+    /// The document head a navigation mounts, from the same fields a fetch
+    /// outcome reports.
+    ///
+    /// The top-level and child-frame paths cannot disagree about how a header
+    /// becomes policy, endpoints, or the nosniff flag: both read the header
+    /// list here and hand it to one derivation
+    /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
+    fn into_document_head(self) -> renderer::ResponseHead {
+        renderer::ResponseHead::http(
+            self.status,
+            self.final_url,
+            self.content_type,
+            &self.headers,
+        )
+    }
+
     /// The outcome this head answers with, once its body is known.
     fn into_outcome(self, body: ResponseBody) -> DialOutcome {
         DialOutcome {
@@ -233,7 +328,7 @@ fn cache_key(request: &DialRequest, initiator: &Url, partition: RendererAssignme
     CacheKey {
         method: request.method.clone(),
         url: request.url.clone(),
-        credentials: request.cors.map(|cors| cors.credentials),
+        credentials: request.policy.credentials(),
         initiator: initiator.origin(),
         partition,
     }
@@ -341,13 +436,17 @@ fn etag(outcome: &DialOutcome) -> Option<String> {
 }
 
 /// Reuses the stored body for a validated 304 and applies the new headers.
+///
+/// Only a page `fetch` stores a response, so the merged header list is the one
+/// the page sees; the internal list would carry `Set-Cookie` back into it.
 fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOutcome {
     let mut merged = cached.clone();
     merged.status = 200;
     merged.final_url = response.final_url().to_string();
     merged.referrer = response.referrer().map(ToString::to_string);
     merged.crossed_origin = response.crossed_origin();
-    for (name, value) in response.headers().iter() {
+    let exposed = response.exposed_headers();
+    for (name, value) in exposed.iter() {
         let value = isomorphic_decode(value);
         if let Some((_, existing)) = merged
             .headers
@@ -362,46 +461,8 @@ fn merge_not_modified(cached: &DialOutcome, response: &net::Response) -> DialOut
     merged
 }
 
-/// The shared head of a response as the renderer sees it: the header filter
-/// and the outcome fields both dial paths report, without a body.
-fn response_head(request: &DialRequest, response: &net::Response) -> DialHead {
-    let response_type = response.response_type();
-    let headers = response
-        .headers()
-        .iter()
-        .filter(|(name, _)| {
-            request.kind != DialKind::JsFetch
-                || (!name.eq_ignore_ascii_case("set-cookie")
-                    && !name.eq_ignore_ascii_case("set-cookie2"))
-        })
-        .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
-        .collect();
-    DialHead {
-        status: if response_type.is_opaque() {
-            0
-        } else {
-            response.status()
-        },
-        status_text: response.status_text().to_owned(),
-        // An opaque filtered response has an empty URL list, so `Response.url`
-        // must not reveal where the request landed
-        // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
-        final_url: if response_type == net::cors::ResponseType::Opaque {
-            String::new()
-        } else {
-            response.final_url().to_string()
-        },
-        content_type: content_type_header(response.headers()),
-        headers,
-        response_type,
-        crossed_origin: response.crossed_origin(),
-        redirect_count: response.redirect_count(),
-        referrer: response.referrer().map(ToString::to_string),
-    }
-}
-
 fn should_store(request: &DialRequest, outcome: &DialOutcome, mode: RequestCache) -> bool {
-    request.kind == DialKind::JsFetch
+    request.policy.exposes_response()
         && !has_page_conditional(request)
         && request.method == net::Method::GET
         // A body that failed to decode has nothing to reuse. Storing it would
@@ -445,18 +506,19 @@ fn cache_usable(request: &DialRequest, initiator: &Url, entry: &CachedResponse) 
     if entry.outcome.response_type.is_opaque() {
         return false;
     }
-    let Some(cors) = request.cors else {
-        return true;
-    };
     let Ok(url) = Url::parse(&request.url) else {
         return false;
     };
-    match cors.mode {
+    match request.policy.mode() {
         net::cors::RequestMode::SameOrigin => url.origin() == initiator.origin(),
         net::cors::RequestMode::NoCors => {
             !matches!(entry.outcome.response_type, net::cors::ResponseType::Cors)
         }
-        net::cors::RequestMode::Cors | net::cors::RequestMode::Navigate => true,
+        net::cors::RequestMode::Cors => true,
+        // Only a page `fetch` reads the cache, and its mode comes from the
+        // `Request` constructor, which rejects `navigate`
+        // (<https://fetch.spec.whatwg.org/#dom-request>).
+        net::cors::RequestMode::Navigate => false,
     }
 }
 
@@ -645,20 +707,11 @@ impl TabNetworkHandle {
             "nav head {url} -> {status} {final_url} in {:?}",
             started.elapsed()
         );
-        let headers = response.headers();
-        // The renderer owns the response-head derivation (`ResponseHead::http`),
-        // so the top-level path and the child-frame path cannot disagree about
-        // how a header becomes policy, endpoints, or the nosniff flag.
-        let pairs: Vec<(String, String)> = headers
-            .iter()
-            .map(|(name, value)| (name.to_owned(), isomorphic_decode(value)))
-            .collect();
-        let head = renderer::ResponseHead::http(
-            status,
-            final_url.to_string(),
-            content_type_header(headers),
-            &pairs,
-        );
+        // One head reader for both dial paths, so the top-level document and a
+        // fetch outcome cannot disagree about which header becomes policy,
+        // endpoints, or the nosniff flag
+        // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
+        let head = DialHead::read(&response, ResponseVisibility::Internal).into_document_head();
         let body = response.into_body().await;
         Ok(NavOutcome {
             head,
@@ -686,9 +739,14 @@ impl TabNetworkHandle {
         logging::trace!(
             target: "browser::net",
             "request start {:?} {}",
-            request.kind,
+            request.policy.kind(),
             request.url
         );
+        let visibility = if request.policy.exposes_response() {
+            ResponseVisibility::Page
+        } else {
+            ResponseVisibility::Internal
+        };
         let result = async {
             match self
                 .send_head(request, initiator, stored.as_ref(), etag.as_deref())
@@ -701,9 +759,13 @@ impl TabNetworkHandle {
                 DialProgress::Response { response, permits } => match request.delivery {
                     BodyDelivery::Buffer => {
                         let _permits = permits;
-                        let head = response_head(request, &response);
-                        // An opaque response hides its body from the page.
-                        let body = if head.response_type.is_opaque() {
+                        let head = DialHead::read(&response, visibility);
+                        // A page-visible opaque response has a null body
+                        // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+                        // An internal consumer still reads the bytes.
+                        let body = if visibility == ResponseVisibility::Page
+                            && head.response_type.is_opaque()
+                        {
                             ResponseBody::Bytes(Vec::new())
                         } else {
                             let mut reader =
@@ -725,9 +787,17 @@ impl TabNetworkHandle {
                         self.remember_response(request, initiator, owner, mode, &outcome);
                         Ok(outcome)
                     }
-                    BodyDelivery::Stream => {
-                        Ok(self.start_stream(request, initiator, owner, mode, *response, permits))
-                    }
+                    BodyDelivery::Stream => Ok(self.start_stream(
+                        request,
+                        initiator,
+                        owner,
+                        mode,
+                        PendingBody {
+                            response: *response,
+                            permits,
+                            visibility,
+                        },
+                    )),
                 },
             }
         }
@@ -798,11 +868,17 @@ impl TabNetworkHandle {
         initiator: &Url,
         owner: RendererAssignmentId,
         mode: RequestCache,
-        response: net::Response,
-        permits: DialPermits,
+        pending: PendingBody,
     ) -> DialOutcome {
-        let head = response_head(request, &response);
-        if head.response_type.is_opaque() {
+        let PendingBody {
+            response,
+            permits,
+            visibility,
+        } = pending;
+        let head = DialHead::read(&response, visibility);
+        // A page-visible opaque response has a null body
+        // (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+        if visibility == ResponseVisibility::Page && head.response_type.is_opaque() {
             return head.into_outcome(ResponseBody::Bytes(Vec::new()));
         }
         let mut outcome = head.into_outcome(ResponseBody::Bytes(Vec::new()));
@@ -818,7 +894,7 @@ impl TabNetworkHandle {
             integrity: request.integrity.clone(),
             store,
             permits,
-            kind: request.kind,
+            kind: request.policy.kind(),
             url: request.url.clone(),
             tx,
         });
@@ -951,7 +1027,7 @@ impl TabNetworkHandle {
         initiator: &Url,
         partition: RendererAssignmentId,
     ) -> Option<CachedResponse> {
-        if request.kind != DialKind::JsFetch {
+        if !request.policy.exposes_response() {
             return None;
         }
         self.cache
@@ -967,7 +1043,7 @@ impl TabNetworkHandle {
         mode: RequestCache,
         cached: Option<&CachedResponse>,
     ) -> Result<Option<DialOutcome>, DialFailure> {
-        if request.kind != DialKind::JsFetch {
+        if !request.policy.exposes_response() {
             return Ok(None);
         }
         let hit = match (mode, cached) {
@@ -1033,7 +1109,7 @@ impl TabNetworkHandle {
     /// never arrived is not recorded: nothing it contained can issue a request
     /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
     fn remember_sheet(&self, request: &DialRequest, status: u16, final_url: &str) {
-        if request.kind != DialKind::Stylesheet || !(200..300).contains(&status) {
+        if request.policy.kind() != DialKind::Stylesheet || !(200..300).contains(&status) {
             return;
         }
         let mut sheets = self
@@ -1123,8 +1199,9 @@ fn outbound_request(
     sheets: &HashSet<Url>,
 ) -> Result<Request, DialFailure> {
     let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
+    let kind = request.policy.kind();
     // https://fetch.spec.whatwg.org/#forbidden-method
-    if request.kind == DialKind::JsFetch && request.method.is_forbidden() {
+    if kind == DialKind::JsFetch && request.method.is_forbidden() {
         return Err(DialFailure::Connect);
     }
     // A `no-cors` request may only use CORS-safelisted methods and headers:
@@ -1132,16 +1209,23 @@ fn outbound_request(
     // boundary enforces it here. Otherwise a page could send an unpreflighted,
     // state-changing cross-origin request with an arbitrary method and headers
     // (<https://fetch.spec.whatwg.org/#concept-headers-guard>).
-    let no_cors = request.kind == DialKind::JsFetch
-        && request
-            .cors
-            .as_ref()
-            .is_some_and(|cors| cors.mode == net::cors::RequestMode::NoCors);
+    let no_cors = request.policy.mode() == net::cors::RequestMode::NoCors;
     if no_cors && !net::cors::is_cors_safelisted_method(&request.method) {
         return Err(DialFailure::Connect);
     }
     let mut outbound = Request::new(request.method.clone(), url);
-    apply_cors(request, initiator, &mut outbound);
+    // The origin comes from the site-authorized initiator, so a compromised
+    // renderer cannot claim an origin outside its renderer's site lock
+    // (<https://fetch.spec.whatwg.org/#concept-request-origin>). It can still
+    // name a different origin *within* that site, which shares the renderer
+    // process; deriving the origin from a per-frame record the browser owns is
+    // a known gap.
+    outbound.cors = net::cors::CorsSettings {
+        mode: request.policy.mode(),
+        credentials: request.policy.credentials(),
+        redirect: request.policy.redirect(),
+        origin: initiator.origin(),
+    };
     if let Some(content_type) = &request.content_type {
         let content_type = isomorphic_encode(content_type).ok_or(DialFailure::Connect)?;
         outbound
@@ -1151,9 +1235,7 @@ fn outbound_request(
     }
     for (name, value) in &request.headers {
         let encoded = isomorphic_encode(value).ok_or(DialFailure::Connect)?;
-        if request.kind == DialKind::JsFetch
-            && net::cors::is_forbidden_request_header(name, &encoded)
-        {
+        if kind == DialKind::JsFetch && net::cors::is_forbidden_request_header(name, &encoded) {
             continue;
         }
         if no_cors && !net::cors::is_no_cors_safelisted_request_header(name, &encoded) {
@@ -1164,7 +1246,7 @@ fn outbound_request(
             .insert(name, encoded)
             .map_err(|_| DialFailure::Connect)?;
     }
-    let destination = match request.kind {
+    let destination = match kind {
         DialKind::JsFetch => "empty",
         DialKind::ClassicScript | DialKind::ModuleScript => "script",
         DialKind::Stylesheet => "style",
@@ -1174,17 +1256,13 @@ fn outbound_request(
         DialKind::CspReport => "report",
     };
     static_header(&mut outbound, "Sec-Fetch-Dest", destination);
-    if request.kind == DialKind::JsFetch {
-        let mode = request
-            .cors
-            .as_ref()
-            .map_or("cors", |cors| match cors.mode {
-                net::cors::RequestMode::NoCors => "no-cors",
-                net::cors::RequestMode::SameOrigin => "same-origin",
-                net::cors::RequestMode::Cors | net::cors::RequestMode::Navigate => "cors",
-            });
-        static_header(&mut outbound, "Sec-Fetch-Mode", mode);
-    }
+    let mode = match request.policy.mode() {
+        net::cors::RequestMode::Navigate => "navigate",
+        net::cors::RequestMode::NoCors => "no-cors",
+        net::cors::RequestMode::SameOrigin => "same-origin",
+        net::cors::RequestMode::Cors => "cors",
+    };
+    static_header(&mut outbound, "Sec-Fetch-Mode", mode);
     if !request.body.is_empty() {
         outbound.body = Some(request.body.clone());
     }
@@ -1230,31 +1308,6 @@ fn referrer_authorized(referrer: &Url, initiator: &Url, sheets: &HashSet<Url>) -
     let mut stripped = referrer.clone();
     stripped.set_fragment(None);
     sheets.contains(&stripped)
-}
-
-/// Copies a page dial's fetch parameters onto the `net` request. The origin
-/// comes from the site-authorized initiator, so a compromised renderer cannot
-/// claim an origin outside its renderer's site lock
-/// (<https://fetch.spec.whatwg.org/#concept-request-origin>). It can still
-/// name a different origin *within* that site, which shares the renderer
-/// process; deriving the origin from a per-frame record the browser owns is a
-/// known gap.
-fn apply_cors(request: &DialRequest, initiator: &Url, outbound: &mut Request) {
-    let origin = initiator.origin();
-    outbound.cors = match request.cors {
-        Some(cors) => net::cors::CorsSettings {
-            mode: cors.mode,
-            credentials: cors.credentials,
-            redirect: cors.redirect,
-            origin,
-        },
-        None => net::cors::CorsSettings {
-            mode: net::cors::RequestMode::Navigate,
-            credentials: net::cors::CredentialsMode::Include,
-            redirect: net::cors::RedirectMode::Follow,
-            origin,
-        },
-    };
 }
 
 /// The cache write a streamed body performs once its bytes are complete.
@@ -1399,7 +1452,7 @@ fn trace_dial_result(
         Ok(outcome) => logging::trace!(
             target: "browser::net",
             "request done {:?} {} -> {} in {:?}",
-            request.kind,
+            request.policy.kind(),
             request.url,
             outcome.status,
             started.elapsed()
@@ -1407,7 +1460,7 @@ fn trace_dial_result(
         Err(failure) => logging::trace!(
             target: "browser::net",
             "request failed {:?} {} in {:?}: {failure:?}",
-            request.kind,
+            request.policy.kind(),
             request.url,
             started.elapsed()
         ),
@@ -1512,9 +1565,13 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn js_fetch(mode: net::cors::RequestMode, url: &str) -> DialRequest {
+    fn js_fetch(mode: renderer::CorsMode, url: &str) -> DialRequest {
         DialRequest {
-            kind: DialKind::JsFetch,
+            policy: renderer::RequestPolicy::fetch(renderer::CorsRequest {
+                mode,
+                credentials: net::cors::CredentialsMode::SameOrigin,
+                redirect: net::cors::RedirectMode::Follow,
+            }),
             url: url.to_owned(),
             initiator: "http://a.test/page".to_owned(),
             delivery: BodyDelivery::Buffer,
@@ -1526,11 +1583,6 @@ mod tests {
             referrer_url: "http://a.test/page".to_owned(),
             timeout_ms: 0,
             csp: None,
-            cors: Some(renderer::CorsRequest {
-                mode,
-                credentials: net::cors::CredentialsMode::SameOrigin,
-                redirect: net::cors::RedirectMode::Follow,
-            }),
             keepalive: false,
             body_len: 0,
             integrity: None,
@@ -1560,7 +1612,7 @@ mod tests {
 
     #[test]
     fn cache_partitions_by_document_and_initiator_origin() {
-        let request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        let request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         let other_initiator = Url::parse("http://b.test/page").expect("other URL");
         let first = cache_key(&request, &initiator, RendererAssignmentId::new(1));
@@ -1574,7 +1626,7 @@ mod tests {
 
     #[test]
     fn cached_cors_response_is_not_reused_as_no_cors_across_origins() {
-        let request = js_fetch(net::cors::RequestMode::NoCors, "http://b.test/data");
+        let request = js_fetch(renderer::CorsMode::NoCors, "http://b.test/data");
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         assert!(!cache_usable(
             &request,
@@ -1586,7 +1638,7 @@ mod tests {
             &initiator,
             &cached(net::cors::ResponseType::Opaque)
         ));
-        let same_origin = js_fetch(net::cors::RequestMode::NoCors, "http://a.test/data");
+        let same_origin = js_fetch(renderer::CorsMode::NoCors, "http://a.test/data");
         assert!(cache_usable(
             &same_origin,
             &initiator,
@@ -1596,7 +1648,7 @@ mod tests {
 
     #[test]
     fn cached_response_follows_the_request_cache_mode() {
-        let request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        let request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
         let mut entry = cached(net::cors::ResponseType::Basic);
         assert_eq!(
             TabNetworkHandle::cached_response(&request, RequestCache::OnlyIfCached, None)
@@ -1695,10 +1747,8 @@ mod tests {
         });
         let initiator = Url::parse(&format!("{origin}/page")).expect("page URL");
         let owner = RendererAssignmentId::new(1);
-        let mut stream_request = js_fetch(
-            net::cors::RequestMode::SameOrigin,
-            &format!("{origin}/stream"),
-        );
+        let mut stream_request =
+            js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/stream"));
         stream_request.initiator = initiator.origin().ascii_serialization();
         stream_request.referrer_url = initiator.to_string();
         stream_request.delivery = BodyDelivery::Stream;
@@ -1723,10 +1773,7 @@ mod tests {
         .await
         .expect("cancelling the stream releases the permit");
 
-        let mut next_request = js_fetch(
-            net::cors::RequestMode::SameOrigin,
-            &format!("{origin}/done"),
-        );
+        let mut next_request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/done"));
         next_request.initiator = initiator.origin().ascii_serialization();
         next_request.referrer_url = initiator.to_string();
         let next = tokio::time::timeout(
@@ -1743,9 +1790,91 @@ mod tests {
         server.abort();
     }
 
+    /// A `no-cors` subresource reads the unsafe response — body, status, and
+    /// headers — because the engine consumes it, while the same request made
+    /// by page script is an opaque filtered response
+    /// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
+    #[tokio::test]
+    async fn an_opaque_subresource_is_readable_by_the_engine_and_not_by_script() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 1024];
+                    let _ = socket.read(&mut buffer).await;
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Type: image/png\r\nSet-Cookie: a=1\r\n\r\npng",
+                        )
+                        .await
+                        .expect("response");
+                });
+            }
+        });
+        let context = NetworkContext::new(AgentOptions::default());
+        let handle = context.tab_handle();
+        let initiator = Url::parse("http://a.test/page").expect("page URL");
+        let owner = RendererAssignmentId::new(1);
+        let url = format!("http://{address}/img");
+
+        let mut image = js_fetch(renderer::CorsMode::NoCors, &url);
+        image.policy = renderer::RequestPolicy::image(None);
+        let outcome = handle
+            .dial_request(&image, &initiator, owner)
+            .await
+            .expect("image dial");
+        assert_eq!(
+            outcome.response_type,
+            net::cors::ResponseType::Opaque,
+            "a cross-origin no-cors image is opaque"
+        );
+        assert_eq!(outcome.status, 200, "the engine reads the unsafe status");
+        assert_eq!(
+            outcome.content_type.as_deref(),
+            Some("image/png"),
+            "the image decoder needs the served type"
+        );
+        assert!(
+            matches!(&outcome.body, ResponseBody::Bytes(body) if body == b"png"),
+            "the engine reads the unsafe body"
+        );
+        assert!(
+            outcome
+                .headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("set-cookie")),
+            "an HttpOnly cookie value must not reach the renderer"
+        );
+
+        let page = js_fetch(renderer::CorsMode::NoCors, &url);
+        let outcome = handle
+            .dial_request(&page, &initiator, owner)
+            .await
+            .expect("page dial");
+        assert_eq!(
+            outcome.status, 0,
+            "an opaque filtered response has no status"
+        );
+        assert!(
+            matches!(&outcome.body, ResponseBody::Bytes(body) if body.is_empty()),
+            "an opaque filtered response has a null body"
+        );
+        assert!(
+            outcome.headers.is_empty(),
+            "an opaque filtered response has no headers"
+        );
+        server.abort();
+    }
+
     #[test]
     fn an_undecodable_body_is_not_stored() {
-        let request = js_fetch(net::cors::RequestMode::SameOrigin, "http://a.test/data");
+        let request = js_fetch(renderer::CorsMode::SameOrigin, "http://a.test/data");
         let mut outcome = cached(net::cors::ResponseType::Basic).outcome;
         assert!(should_store(&request, &outcome, RequestCache::Default));
         outcome.body = ResponseBody::Undecodable;
@@ -1757,7 +1886,7 @@ mod tests {
 
     #[test]
     fn vary_star_never_matches_and_a_named_field_must_agree() {
-        let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
         request.headers = vec![("accept".to_owned(), "text/html".to_owned())];
         let mut entry = cached(net::cors::ResponseType::Basic);
         entry.request_headers = request.headers.clone();
@@ -1831,7 +1960,7 @@ mod tests {
                 if index == 0 {
                     socket
                         .write_all(
-                            b"HTTP/1.1 200 OK\r\nETag: \"\xE9\"\r\nContent-Length: 2\r\n\r\nhi",
+                            b"HTTP/1.1 200 OK\r\nETag: \"\xE9\"\r\nSet-Cookie: sid=secret; HttpOnly\r\nContent-Length: 2\r\n\r\nhi",
                         )
                         .await
                         .expect("first response");
@@ -1841,7 +1970,9 @@ mod tests {
                         .expect("one replay")
                         .send(buffer[..read].to_vec());
                     socket
-                        .write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"\xE9\"\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 304 Not Modified\r\nETag: \"\xE9\"\r\nSet-Cookie: sid=secret; HttpOnly\r\n\r\n",
+                        )
                         .await
                         .expect("304");
                 }
@@ -1849,10 +1980,7 @@ mod tests {
         });
         let initiator = Url::parse(&format!("{origin}/page")).expect("page URL");
         let owner = RendererAssignmentId::new(1);
-        let mut request = js_fetch(
-            net::cors::RequestMode::SameOrigin,
-            &format!("{origin}/etag"),
-        );
+        let mut request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/etag"));
         request.initiator = initiator.origin().ascii_serialization();
         request.referrer_url = initiator.to_string();
         let first = handle
@@ -1860,6 +1988,13 @@ mod tests {
             .await
             .expect("first dial");
         assert_eq!(first.status, 200);
+        assert!(
+            !first
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie")),
+            "an HttpOnly cookie value must not reach page script"
+        );
 
         let revalidated = handle
             .dial_request(&request, &initiator, owner)
@@ -1868,6 +2003,13 @@ mod tests {
         assert_eq!(revalidated.status, 200, "a 304 merges into the stored head");
         assert_eq!(stored_bytes(&revalidated), 2);
         assert!(matches!(&revalidated.body, ResponseBody::Bytes(body) if body == b"hi"));
+        assert!(
+            !revalidated
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie")),
+            "a 304 merge must not add the cookie the page path filtered out"
+        );
 
         let replayed = replayed_rx.await.expect("second request");
         assert!(
@@ -1882,7 +2024,7 @@ mod tests {
 
     #[test]
     fn cached_body_still_needs_to_satisfy_integrity_metadata() {
-        let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+        let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
         request.integrity = Some("sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_owned());
         assert!(TabNetworkHandle::cached_integrity_ok(
             &request,
@@ -1901,7 +2043,7 @@ mod tests {
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         let keys: Vec<CacheKey> = (0..=CACHE_MAX_ENTRIES)
             .map(|index| {
-                let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+                let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
                 request.url = format!("http://a.test/{index}");
                 cache_key(&request, &initiator, RendererAssignmentId::new(1))
             })
@@ -1930,7 +2072,7 @@ mod tests {
         let initiator = Url::parse("http://a.test/page").expect("page URL");
         let keys: Vec<CacheKey> = (0..bodies)
             .map(|index| {
-                let mut request = js_fetch(net::cors::RequestMode::Cors, "http://a.test/data");
+                let mut request = js_fetch(renderer::CorsMode::Cors, "http://a.test/data");
                 request.url = format!("http://a.test/{index}");
                 cache_key(&request, &initiator, RendererAssignmentId::new(1))
             })

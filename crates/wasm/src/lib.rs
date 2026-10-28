@@ -474,7 +474,7 @@ impl NetworkHost for WasmServices {
         // transport (`fetch-request` carries neither), so the report is
         // dropped here instead of sent as a bogus GET. The native carrier
         // sends the real POST; the renderer already fired the event.
-        if request.kind == DialKind::CspReport {
+        if request.policy.kind() == DialKind::CspReport {
             completion(Ok(DialOutcome::basic(
                 204,
                 request.url,
@@ -498,7 +498,7 @@ impl NetworkHost for WasmServices {
                 dial,
                 url,
                 initiator: Url::parse(&request.initiator).ok(),
-                kind: request.kind,
+                kind: request.policy.kind(),
                 followed: 0,
                 cross_site_redirect: false,
                 csp: request.csp.as_deref().cloned(),

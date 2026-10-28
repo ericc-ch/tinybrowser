@@ -53,7 +53,7 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.final_url(), &requested);
     assert_eq!(
-        response.headers().get("CONTENT-TYPE"),
+        response.internal_headers().get("CONTENT-TYPE"),
         Some(&b"text/plain"[..])
     );
     assert_eq!(
@@ -1025,4 +1025,49 @@ fn client_hello_alpn(hello: &[u8]) -> Vec<String> {
         at += length;
     }
     Vec::new()
+}
+
+/// A `no-cors` response that crosses an origin is opaque to page script, but
+/// the internal response keeps the header list the server sent: a script's MIME
+/// check and an image decoder read the unsafe response, not the filtered one
+/// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
+#[tokio::test]
+async fn an_opaque_response_keeps_the_internal_header_list() {
+    let server = scripted([canned_ok(
+        &[("x-internal", "kept"), ("content-type", "image/png")],
+        b"png",
+    )]);
+    let origin = url::Url::parse("https://a.test/")
+        .expect("origin URL")
+        .origin();
+    let mut request = Request::new(Method::GET, server.url("/img"));
+    request.cors = cors_settings(
+        net::cors::RequestMode::NoCors,
+        net::cors::CredentialsMode::Include,
+        origin,
+    );
+    let response = default_agent()
+        .send(request)
+        .await
+        .expect("cross-origin no-cors");
+    assert_eq!(
+        response.response_type(),
+        net::cors::ResponseType::Opaque,
+        "a cross-origin no-cors response is opaque"
+    );
+    assert_eq!(
+        response.internal_headers().get("x-internal"),
+        Some(b"kept".as_slice()),
+        "the unsafe response keeps every field the server sent"
+    );
+    assert!(
+        response.exposed_headers().is_empty(),
+        "page script sees no field of an opaque response"
+    );
+    assert_eq!(
+        read_body(response.into_body().await).await.expect("body"),
+        b"png",
+        "the body still arrives for the engine consumer"
+    );
+    server.assert_clean();
 }

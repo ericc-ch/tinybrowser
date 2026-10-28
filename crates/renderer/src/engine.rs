@@ -1407,7 +1407,7 @@ impl Engine {
                     document.navigate(
                         embedder,
                         crate::protocol::DialRequest {
-                            kind: crate::protocol::DialKind::FrameLoad,
+                            policy: crate::protocol::RequestPolicy::frame_load(),
                             url: url.to_string(),
                             initiator: origin.ascii_serialization(),
                             referrer_url,
@@ -1420,7 +1420,6 @@ impl Engine {
                             referrer,
                             timeout_ms: 0,
                             csp: gate.map(Box::new),
-                            cors: None,
                             keepalive: false,
                             body_len: 0,
                             integrity: None,

@@ -594,18 +594,20 @@ pub(crate) fn range_default(minimum: &Decimal, maximum: &Decimal) -> Decimal {
 /// or unknown value is `Anonymous`, the spec's "invalid value default", so an
 /// invalid spelling never sends credentials
 /// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CrossOrigin {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CrossOrigin {
     Anonymous,
     UseCredentials,
 }
 
 impl CrossOrigin {
     /// Every keyword, in spec order.
-    pub(crate) const KEYWORDS: &'static [Self] = &[Self::Anonymous, Self::UseCredentials];
+    pub const KEYWORDS: &'static [Self] = &[Self::Anonymous, Self::UseCredentials];
 
     /// The canonical spelling of the keyword.
-    pub(crate) fn keyword(self) -> &'static str {
+    #[must_use]
+    pub fn keyword(self) -> &'static str {
         match self {
             Self::Anonymous => "anonymous",
             Self::UseCredentials => "use-credentials",
@@ -614,7 +616,8 @@ impl CrossOrigin {
 
     /// Parses one keyword, ASCII case-insensitively and untrimmed, the way an
     /// enumerated attribute does.
-    pub(crate) fn parse(value: &str) -> Option<Self> {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
         Self::KEYWORDS
             .iter()
             .copied()
@@ -623,13 +626,15 @@ impl CrossOrigin {
 
     /// The attribute value as an enum: absent stays absent, and an empty or
     /// unknown value is `Anonymous`.
-    pub(crate) fn from_attr(value: Option<&str>) -> Option<Self> {
+    #[must_use]
+    pub fn from_attr(value: Option<&str>) -> Option<Self> {
         value.map(|value| Self::parse(value).unwrap_or(Self::Anonymous))
     }
 
     /// The credentials mode this attribute selects for a CORS request
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
-    pub(crate) fn credentials(self) -> net::cors::CredentialsMode {
+    #[must_use]
+    pub fn credentials(self) -> net::cors::CredentialsMode {
         match self {
             Self::Anonymous => net::cors::CredentialsMode::SameOrigin,
             Self::UseCredentials => net::cors::CredentialsMode::Include,

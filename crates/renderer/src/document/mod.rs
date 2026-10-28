@@ -200,10 +200,11 @@ pub(crate) struct QueuedDial {
 }
 
 impl QueuedDial {
-    /// The wire kind a dial context maps to. Plain page subresources reuse
-    /// the image kind; no carrier policy keys off the kind except for
-    /// script-initiated fetches.
-    fn dial_kind(context: &DialContext) -> crate::protocol::DialKind {
+    /// The kind a dial context performs. The request policy a caller passes
+    /// must name the same fetch, which [`QueuedDial::new`] checks: the context
+    /// decides what happens to the response, so a policy from another fetch
+    /// would report one kind and go out under another's mode.
+    fn kind_of(context: &DialContext) -> crate::protocol::DialKind {
         match context {
             DialContext::JsFetch { .. } => crate::protocol::DialKind::JsFetch,
             DialContext::ClassicScript { .. } => crate::protocol::DialKind::ClassicScript,
@@ -219,16 +220,23 @@ impl QueuedDial {
 
     /// A fresh GET dial: the shape of every dial but a form submission and a
     /// page `fetch`. The call sites that need more set the request's fields
-    /// directly (`dial.req.…`).
+    /// directly (`dial.req.…`), and each names the request policy its fetch
+    /// specifies.
     pub(crate) fn new(
         context: DialContext,
+        policy: crate::protocol::RequestPolicy,
         url: &Url,
         initiator: &url::Origin,
         referrer_url: &Url,
     ) -> Self {
+        debug_assert_eq!(
+            policy.kind(),
+            Self::kind_of(&context),
+            "a dial's policy must name the fetch its context performs"
+        );
         Self {
             req: crate::protocol::DialRequest {
-                kind: Self::dial_kind(&context),
+                policy,
                 url: url.to_string(),
                 initiator: initiator.ascii_serialization(),
                 referrer_url: referrer_url.to_string(),
@@ -240,7 +248,6 @@ impl QueuedDial {
                 referrer: net::Referrer::NoReferrer,
                 timeout_ms: 0,
                 csp: None,
-                cors: None,
                 keepalive: false,
                 body_len: 0,
                 integrity: None,
@@ -1285,15 +1292,16 @@ impl Document {
                     ..
                 }
             );
-            let upgrades = if dial.req.kind == crate::protocol::DialKind::FrameLoad && !nested {
-                // A top-level navigation must target the protected resource's
-                // own host and port, so a policy cannot upgrade a link to a
-                // third party
-                // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
-                Self::same_host_port(&dial.req.url, self.url.as_str())
-            } else {
-                true
-            };
+            let upgrades =
+                if dial.req.policy.kind() == crate::protocol::DialKind::FrameLoad && !nested {
+                    // A top-level navigation must target the protected resource's
+                    // own host and port, so a policy cannot upgrade a link to a
+                    // third party
+                    // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>).
+                    Self::same_host_port(&dial.req.url, self.url.as_str())
+                } else {
+                    true
+                };
             if upgrades {
                 Self::upgrade_scheme(&mut dial.req.url);
             }
@@ -1301,7 +1309,7 @@ impl Document {
         // A navigation request advertises the client's upgrade capability so a
         // server can feature-detect it
         // (<https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-requests-http-request-header-field>).
-        if dial.req.kind == crate::protocol::DialKind::FrameLoad
+        if dial.req.policy.kind() == crate::protocol::DialKind::FrameLoad
             && !dial
                 .req
                 .headers
@@ -1339,12 +1347,13 @@ impl Document {
         }
     }
 
-    /// Starts one frame-load dial. `req` is the wire request, with the method,
-    /// body, `Content-Type`, referrer, and the embedder's `frame-src` redirect
-    /// gate already on it; `ancestors` are the ancestor URLs the child
-    /// response's `frame-ancestors` is checked against at commit. It forces the
-    /// response body to be read and cancels an earlier navigation: the newest
-    /// load owns the frame.
+    /// Starts one frame-load dial. `req` is the wire request, with a
+    /// [`crate::protocol::RequestPolicy::frame_load`] policy, the method, body,
+    /// `Content-Type`, referrer, and the embedder's `frame-src` redirect gate
+    /// already on it; `ancestors` are the ancestor URLs the child response's
+    /// `frame-ancestors` is checked against at commit. It forces the response
+    /// body to be read and cancels an earlier navigation: the newest load owns
+    /// the frame.
     pub(crate) fn navigate(
         &mut self,
         embedder: Option<FrameId>,
@@ -1352,7 +1361,6 @@ impl Document {
         ancestors: Vec<Url>,
         sandbox: crate::js::world::SandboxFlags,
     ) {
-        req.kind = crate::protocol::DialKind::FrameLoad;
         req.delivery = crate::protocol::BodyDelivery::Buffer;
         self.dials.cancel_frame_loads();
         self.initial_blank = false;
@@ -2802,7 +2810,12 @@ impl Document {
             // (<https://w3c.github.io/webappsec-csp/#directive-report-to>).
             if let Some(url) = self.reporting_url(&violation.report_to) {
                 let body = Self::reporting_api_body(violation);
-                self.queue_report(&url, body, "application/reports+json");
+                self.queue_report(
+                    &url,
+                    body,
+                    "application/reports+json",
+                    crate::protocol::RequestPolicy::csp_report_to(),
+                );
                 continue;
             }
             if violation.report_uris.is_empty() {
@@ -2845,7 +2858,12 @@ impl Document {
                 if !matches!(url.scheme(), "http" | "https") {
                     continue;
                 }
-                self.queue_report(&url, body.clone(), "application/csp-report");
+                self.queue_report(
+                    &url,
+                    body.clone(),
+                    "application/csp-report",
+                    crate::protocol::RequestPolicy::csp_report_uri(),
+                );
             }
         }
     }
@@ -2870,10 +2888,19 @@ impl Document {
     }
 
     /// Queues one violation report POST. The response is dropped and the
-    /// dial never gates load.
-    fn queue_report(&mut self, url: &Url, body: Vec<u8>, content_type: &str) {
+    /// dial never gates load. The policy is the delivery's own: a `report-to`
+    /// endpoint gets the Reporting API's `cors` request, while a deprecated
+    /// `report-uri` endpoint gets `no-cors` and no preflight.
+    fn queue_report(
+        &mut self,
+        url: &Url,
+        body: Vec<u8>,
+        content_type: &str,
+        policy: crate::protocol::RequestPolicy,
+    ) {
         let mut dial = QueuedDial::new(
             DialContext::CspReport,
+            policy,
             url,
             &self.dial_initiator(),
             &self.referrer_url(),
@@ -3111,6 +3138,7 @@ impl Document {
         let referrer_policy = self.subresource_referrer(Some(id));
         let mut dial = QueuedDial::new(
             DialContext::ClassicScript { element: id },
+            crate::protocol::RequestPolicy::classic_script(self.cross_origin(Some(id))),
             &url,
             &self.dial_initiator(),
             &self.referrer_url(),
@@ -3157,6 +3185,29 @@ impl Document {
             })
             .or(world.policy.referrer_policy)
             .unwrap_or_default()
+    }
+
+    /// The `crossorigin` state of the element a subresource request belongs to.
+    ///
+    /// An absent attribute reads as `None`, which is the `No CORS` state; an
+    /// empty or unknown value is `Anonymous`, the invalid-value default, so
+    /// the load and the reflected `crossOrigin` cannot disagree about
+    /// credentials
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+    fn cross_origin(
+        &self,
+        element: Option<crate::dom::tree::NodeId>,
+    ) -> Option<crate::dom::microsyntaxes::CrossOrigin> {
+        let world = self.world.borrow();
+        element.and_then(|element| {
+            world.document(element).and_then(|parsed| {
+                crate::dom::microsyntaxes::CrossOrigin::from_attr(crate::dom::tree::attr(
+                    &parsed.document.base,
+                    element.node,
+                    "crossorigin",
+                ))
+            })
+        })
     }
 
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
@@ -3353,10 +3404,7 @@ impl Document {
                 }
             }
             DialContext::BlitzResource { id, destination } => {
-                let cors_clean = req
-                    .cors
-                    .as_ref()
-                    .is_some_and(|cors| cors.mode == net::cors::RequestMode::Cors);
+                let cors_clean = req.policy.mode() == net::cors::RequestMode::Cors;
                 self.deliver_blitz_resource(
                     id,
                     destination,
@@ -3946,42 +3994,53 @@ impl Document {
                 }
                 None => (net::Referrer::Client, self.subresource_referrer(element)),
             };
+            let crossorigin = if fetch.style_sheet.is_some() {
+                // A request a style sheet initiates has no `crossorigin`
+                // attribute: the attribute belongs to the element that started
+                // the load, not to every resource the sheet later names
+                // (<https://html.spec.whatwg.org/multipage/semantics.html#create-a-link-request>).
+                None
+            } else {
+                self.cross_origin(element)
+            };
+            let policy = match destination {
+                Some(crate::csp::Destination::StyleSheet) => {
+                    crate::protocol::RequestPolicy::stylesheet(crossorigin)
+                }
+                Some(crate::csp::Destination::Font) => crate::protocol::RequestPolicy::font(),
+                // An image with a `crossorigin` attribute loads under the CORS
+                // protocol: the network sends `Origin` and refuses the load
+                // without a valid `Access-Control-Allow-Origin`; a load that
+                // survives marks the image origin-clean for canvas
+                // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
+                // <https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+                // Without the attribute the request is `no-cors`, and the image
+                // decoder reads the unsafe response either way. `None` is a
+                // resource Blitz classifies as `Other`, which is an image here
+                // (`subresource_destination`).
+                Some(crate::csp::Destination::Img) | None => {
+                    crate::protocol::RequestPolicy::image(crossorigin)
+                }
+                // `subresource_destination` maps Blitz's three request kinds to
+                // exactly the three destinations above.
+                Some(
+                    crate::csp::Destination::Script
+                    | crate::csp::Destination::Connect
+                    | crate::csp::Destination::Frame,
+                ) => unreachable!("a Blitz subresource is a sheet, image, or font"),
+            };
             let mut dial = QueuedDial::new(
                 DialContext::BlitzResource {
                     id: fetch.id,
                     destination,
                 },
+                policy,
                 &fetch.url,
                 &self.dial_initiator(),
                 &self.referrer_url(),
             );
             dial.req.referrer = referrer;
             dial.req.referrer_policy = referrer_policy;
-            // An image with a `crossorigin` content attribute loads in CORS
-            // mode: the network sends `Origin` and refuses the load without a
-            // valid `Access-Control-Allow-Origin`; a load that survives marks
-            // the image origin-clean for canvas
-            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
-            // <https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
-            if destination == Some(crate::csp::Destination::Img) {
-                dial.req.cors = element.and_then(|element| {
-                    let world = self.world.borrow();
-                    let parsed = world.main_document()?;
-                    let base = &parsed.document.base;
-                    let cross = crate::dom::tree::attr(base, element.node, "crossorigin");
-                    // Missing means no CORS request; empty or unknown is
-                    // anonymous, the invalid-value default, so the load and
-                    // the reflected `crossOrigin` cannot disagree about
-                    // credentials
-                    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
-                    let cross = crate::dom::microsyntaxes::CrossOrigin::from_attr(cross)?;
-                    Some(crate::protocol::CorsRequest {
-                        mode: net::cors::RequestMode::Cors,
-                        credentials: cross.credentials(),
-                        redirect: net::cors::RedirectMode::Follow,
-                    })
-                });
-            }
             dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
             self.queue_dial(dial);
         }

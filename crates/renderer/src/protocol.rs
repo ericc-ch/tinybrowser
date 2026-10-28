@@ -13,6 +13,8 @@ use url::Url;
 
 pub use webstorage::{STORAGE_QUOTA_BYTES, StorageChange, StorageError};
 
+use crate::dom::microsyntaxes::CrossOrigin;
+
 /// Maximum aggregate bytes retained for one streamed response.
 ///
 /// A Wikipedia article is already past 1 MiB. 8 MiB still caps one document
@@ -538,8 +540,8 @@ pub struct ScreenshotClip {
 /// (a GET for most dials; a navigation may carry a method and body).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialRequest {
-    /// Why the dial happens.
-    pub kind: DialKind,
+    /// Why the dial happens, and the CORS parameters it is sent under.
+    pub policy: RequestPolicy,
     /// Absolute request URL, canonically serialized: every queue site
     /// stringifies a parsed [`url::Url`], so the scheme is lowercase and a
     /// `scheme:` prefix test is exact.
@@ -576,9 +578,6 @@ pub struct DialRequest {
     /// is how a document navigation is sent. The network re-checks every
     /// redirect hop with it.
     pub csp: Option<Box<crate::RedirectGate>>,
-    /// CORS protocol parameters for a page `fetch`/XHR. `None` for navigation
-    /// and subresource dials.
-    pub cors: Option<CorsRequest>,
     /// A `fetch(..., {keepalive: true})` request. The browser enforces the
     /// in-flight byte quota across realms
     /// (<https://fetch.spec.whatwg.org/#keepalive-flag>).
@@ -659,19 +658,317 @@ impl RequestCache {
     }
 }
 
-/// The CORS parameters a page `fetch`/XHR sends over the wire. The browser
-/// fills in the origin from the document URL, so the renderer cannot claim
-/// one.
+/// A page request's CORS mode, which is Fetch's request mode without
+/// `navigate`
+/// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+///
+/// `navigate` exists for document navigations, and a page request cannot send
+/// under it: `RequestInit.mode` rejects the keyword, and a page `fetch` that
+/// did would skip the CORS check on a response the page can read. Keeping it
+/// out of the type makes that pairing unrepresentable here and across the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorsMode {
+    /// No CORS: same-origin reads, opaque cross-origin reads.
+    NoCors,
+    /// A cross-origin request fails outright.
+    SameOrigin,
+    /// The full CORS protocol runs, and a cross-origin response is readable.
+    Cors,
+}
+
+impl CorsMode {
+    /// Parses a `RequestInit.mode` string
+    /// (<https://fetch.spec.whatwg.org/#requestinit>).
+    #[must_use]
+    pub fn from_idl(value: &str) -> Option<Self> {
+        match net::cors::RequestMode::from_idl(value)? {
+            net::cors::RequestMode::NoCors => Some(Self::NoCors),
+            net::cors::RequestMode::SameOrigin => Some(Self::SameOrigin),
+            net::cors::RequestMode::Cors => Some(Self::Cors),
+            // `from_idl` never accepts `navigate`, and this type cannot hold it.
+            net::cors::RequestMode::Navigate => None,
+        }
+    }
+
+    /// The request mode this sends under.
+    #[must_use]
+    pub fn request_mode(self) -> net::cors::RequestMode {
+        match self {
+            Self::NoCors => net::cors::RequestMode::NoCors,
+            Self::SameOrigin => net::cors::RequestMode::SameOrigin,
+            Self::Cors => net::cors::RequestMode::Cors,
+        }
+    }
+}
+
+/// The CORS parameters a request sends over the wire. The browser fills in the
+/// origin from the document URL, so the renderer cannot claim one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorsRequest {
     /// CORS mode (<https://fetch.spec.whatwg.org/#concept-request-mode>).
-    pub mode: net::cors::RequestMode,
+    pub mode: CorsMode,
     /// Credentials mode
     /// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
     pub credentials: net::cors::CredentialsMode,
     /// Redirect mode
     /// (<https://fetch.spec.whatwg.org/#concept-request-redirect-mode>).
     pub redirect: net::cors::RedirectMode,
+}
+
+/// One dial's request policy: what the renderer is fetching, and the CORS
+/// parameters that fetch is sent under
+/// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+///
+/// The kind and the CORS parameters used to be two independent fields, and the
+/// parameters were optional: an absent `cors` became *navigate* mode with
+/// credentials included, which is how a plain `<img>` dial was sent as a
+/// navigation. They are one value now. Each variant names one fetch, and the
+/// mode, credentials mode, and redirect mode come from that variant's own
+/// rules, so a kind and a mode cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestPolicy {
+    /// A JavaScript `fetch` or `XMLHttpRequest`: the page's own modes, which
+    /// the `Request` constructor already normalized.
+    Fetch(CorsRequest),
+    /// A classic `<script src>` load, with the element's `crossorigin` state
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#create-a-potential-cors-request>).
+    ClassicScript { crossorigin: Option<CrossOrigin> },
+    /// A module graph fetch: always `cors`, with the credentials mode the
+    /// element's `crossorigin` attribute names
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+    ///
+    /// The loader hands every module in a graph the same policy, because a
+    /// nested import has no element of its own. `crossorigin` comes from the
+    /// script that started the fetch, which covers a dynamic `import()` inside
+    /// a classic script; the `<script type=module>` element that starts a graph
+    /// is not tracked while the graph loads, so a `use-credentials` there still
+    /// sends the default credentials mode.
+    ModuleScript { crossorigin: Option<CrossOrigin> },
+    /// A style sheet: a `<link rel=stylesheet>`, a CSS `@import`, or a sheet a
+    /// script loaded, with the element's `crossorigin` state
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#create-a-link-request>).
+    Stylesheet { crossorigin: Option<CrossOrigin> },
+    /// An `<img>` resource or a CSS image, with the element's `crossorigin`
+    /// state. A CSS image has no element and so no attribute.
+    Image { crossorigin: Option<CrossOrigin> },
+    /// A web font a CSS `@font-face` rule names: `cors`, same-origin
+    /// credentials, so a cross-origin font needs an `Access-Control-Allow-Origin`
+    /// (<https://drafts.csswg.org/css-fonts-4/#font-fetching-requirements>).
+    Font,
+    /// A child frame's navigation.
+    FrameLoad,
+    /// A Reporting API `csp-violation` delivery for a `report-to` endpoint:
+    /// `cors` mode with same-origin credentials, so a cross-origin endpoint
+    /// must allow the origin
+    /// (<https://w3c.github.io/reporting/#try-delivery>).
+    CspReportTo,
+    /// The deprecated `report-uri` delivery: `no-cors` mode with same-origin
+    /// credentials. The response is ignored, and a preflight would make the
+    /// report depend on an answer the collector never promised
+    /// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+    ///
+    /// CSP leaves the request's redirect mode at `"error"`; Fetch makes a
+    /// `no-cors` request whose redirect mode is not `"follow"` a network error
+    /// before it is sent, so this follows redirects instead
+    /// (<https://fetch.spec.whatwg.org/#main-fetch>). The report still has no
+    /// reader, so where it lands is unobservable.
+    CspReportUri,
+}
+
+impl RequestPolicy {
+    /// A JavaScript `fetch` or `XMLHttpRequest`.
+    #[must_use]
+    pub fn fetch(cors: CorsRequest) -> Self {
+        Self::Fetch(cors)
+    }
+
+    /// A classic `<script src>` load.
+    #[must_use]
+    pub fn classic_script(crossorigin: Option<CrossOrigin>) -> Self {
+        Self::ClassicScript { crossorigin }
+    }
+
+    /// A module graph fetch.
+    #[must_use]
+    pub fn module_script(crossorigin: Option<CrossOrigin>) -> Self {
+        Self::ModuleScript { crossorigin }
+    }
+
+    /// A style sheet.
+    #[must_use]
+    pub fn stylesheet(crossorigin: Option<CrossOrigin>) -> Self {
+        Self::Stylesheet { crossorigin }
+    }
+
+    /// An `<img>` resource or a CSS image.
+    #[must_use]
+    pub fn image(crossorigin: Option<CrossOrigin>) -> Self {
+        Self::Image { crossorigin }
+    }
+
+    /// A web font a CSS `@font-face` rule names.
+    #[must_use]
+    pub fn font() -> Self {
+        Self::Font
+    }
+
+    /// A child frame's navigation.
+    #[must_use]
+    pub fn frame_load() -> Self {
+        Self::FrameLoad
+    }
+
+    /// A Reporting API `csp-violation` delivery for a `report-to` endpoint.
+    #[must_use]
+    pub fn csp_report_to() -> Self {
+        Self::CspReportTo
+    }
+
+    /// The deprecated `report-uri` delivery.
+    #[must_use]
+    pub fn csp_report_uri() -> Self {
+        Self::CspReportUri
+    }
+
+    /// Why the dial happens.
+    #[must_use]
+    pub fn kind(self) -> DialKind {
+        match self {
+            Self::Fetch(_) => DialKind::JsFetch,
+            Self::ClassicScript { .. } => DialKind::ClassicScript,
+            Self::ModuleScript { .. } => DialKind::ModuleScript,
+            Self::Stylesheet { .. } => DialKind::Stylesheet,
+            Self::Image { .. } => DialKind::Image,
+            Self::Font => DialKind::Font,
+            Self::FrameLoad => DialKind::FrameLoad,
+            Self::CspReportTo | Self::CspReportUri => DialKind::CspReport,
+        }
+    }
+
+    /// The request mode the dial is sent under.
+    #[must_use]
+    pub fn mode(self) -> net::cors::RequestMode {
+        self.cors().mode()
+    }
+
+    /// The credentials mode the dial is sent under.
+    #[must_use]
+    pub fn credentials(self) -> net::cors::CredentialsMode {
+        self.cors().credentials()
+    }
+
+    /// The redirect mode the dial is sent under.
+    #[must_use]
+    pub fn redirect(self) -> net::cors::RedirectMode {
+        self.cors().redirect()
+    }
+
+    /// Whether the response goes back to page script.
+    ///
+    /// A `fetch` or XHR response is filtered for the page: an opaque one has no
+    /// status, no URL, no headers, and no body
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response>). Every
+    /// other dial's response is consumed by the engine itself, which reads the
+    /// unsafe response — the status, URL, header list, and body the server
+    /// sent (<https://fetch.spec.whatwg.org/#concept-internal-response>).
+    #[must_use]
+    pub fn exposes_response(self) -> bool {
+        matches!(self, Self::Fetch(_))
+    }
+
+    /// The CORS parameters one variant's fetch specifies.
+    fn cors(self) -> CorsPolicy {
+        match self {
+            Self::Fetch(cors) => CorsPolicy::Request(cors),
+            Self::ClassicScript { crossorigin }
+            | Self::Stylesheet { crossorigin }
+            | Self::Image { crossorigin } => subresource_cors(crossorigin),
+            Self::ModuleScript { crossorigin } => {
+                cors_protocol(cross_origin_credentials(crossorigin))
+            }
+            Self::Font | Self::CspReportTo => cors_protocol(net::cors::CredentialsMode::SameOrigin),
+            Self::CspReportUri => CorsPolicy::Request(CorsRequest {
+                mode: CorsMode::NoCors,
+                credentials: net::cors::CredentialsMode::SameOrigin,
+                redirect: net::cors::RedirectMode::Follow,
+            }),
+            Self::FrameLoad => CorsPolicy::Navigate,
+        }
+    }
+}
+
+/// The CORS parameters one dial is sent under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorsPolicy {
+    /// A navigation: no CORS protocol, credentials included, and the response
+    /// is never filtered.
+    Navigate,
+    /// No CORS protocol, credentials included. A cross-origin response is
+    /// opaque to page script, while the engine consumer (image decoder, script
+    /// compiler, style sheet parser) still reads the unsafe response
+    /// (<https://fetch.spec.whatwg.org/#concept-request-mode>).
+    NoCors,
+    /// The request's own mode, credentials, and redirect parameters.
+    Request(CorsRequest),
+}
+
+impl CorsPolicy {
+    fn mode(self) -> net::cors::RequestMode {
+        match self {
+            Self::Navigate => net::cors::RequestMode::Navigate,
+            Self::NoCors => net::cors::RequestMode::NoCors,
+            Self::Request(cors) => cors.mode.request_mode(),
+        }
+    }
+
+    fn credentials(self) -> net::cors::CredentialsMode {
+        match self {
+            Self::Navigate | Self::NoCors => net::cors::CredentialsMode::Include,
+            Self::Request(cors) => cors.credentials,
+        }
+    }
+
+    fn redirect(self) -> net::cors::RedirectMode {
+        match self {
+            Self::Navigate | Self::NoCors => net::cors::RedirectMode::Follow,
+            Self::Request(cors) => cors.redirect,
+        }
+    }
+}
+
+fn cors_protocol(credentials: net::cors::CredentialsMode) -> CorsPolicy {
+    CorsPolicy::Request(CorsRequest {
+        mode: CorsMode::Cors,
+        credentials,
+        redirect: net::cors::RedirectMode::Follow,
+    })
+}
+
+/// The CORS parameters a subresource request goes out with, from the element's
+/// `crossorigin` state
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#create-a-potential-cors-request>).
+///
+/// An absent attribute is the `No CORS` state: `no-cors` mode with credentials
+/// included. Any value is `Anonymous` or `Use Credentials`: `cors` mode with
+/// that state's credentials mode. An empty or unknown value already parsed to
+/// `Anonymous` (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+fn subresource_cors(crossorigin: Option<CrossOrigin>) -> CorsPolicy {
+    match crossorigin {
+        None => CorsPolicy::NoCors,
+        Some(cross) => cors_protocol(cross.credentials()),
+    }
+}
+
+/// The `CORS settings attribute credentials mode`: `same-origin` for the
+/// `No CORS` and `Anonymous` states, `include` for `Use Credentials`
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+fn cross_origin_credentials(crossorigin: Option<CrossOrigin>) -> net::cors::CredentialsMode {
+    if crossorigin == Some(CrossOrigin::UseCredentials) {
+        net::cors::CredentialsMode::Include
+    } else {
+        net::cors::CredentialsMode::SameOrigin
+    }
 }
 
 /// Browser-side identity of one progressive response body.
@@ -737,13 +1034,19 @@ pub struct DialOutcome {
     /// the response sent any
     /// (<https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>).
     pub content_type: Option<String>,
-    /// Response headers visible to page scripts, in wire order.
+    /// The response header list this dial reports, in wire order: the
+    /// filtered list for a page fetch ([`RequestPolicy::exposes_response`]),
+    /// the unsafe list the server sent for every other dial, which the engine
+    /// reads for MIME checks, a style sheet's referrer policy, and frame
+    /// policy. `Set-Cookie` and `Set-Cookie2` are removed in both.
     pub headers: Vec<(String, String)>,
     /// How this dial delivers its response body.
     pub body: ResponseBody,
     /// How the response was filtered
-    /// (<https://fetch.spec.whatwg.org/#concept-response-type>); `basic` for
-    /// same-origin and subresource responses.
+    /// (<https://fetch.spec.whatwg.org/#concept-response-type>): `basic` for a
+    /// same-origin response, `cors` for a cross-origin one that passed the CORS
+    /// check, and `opaque` for a cross-origin `no-cors` response, whose
+    /// subresource consumer still reads the unsafe body and headers.
     pub response_type: net::cors::ResponseType,
     /// Whether any redirect hop's URL origin differed from the request origin.
     /// A `no-cors` request that crosses an origin gets an opaque response and
@@ -929,4 +1232,158 @@ pub trait BrowserServices: NetworkHost + StorageHost + BrowsingContextHost + Mes
 impl<T> BrowserServices for T where
     T: NetworkHost + StorageHost + BrowsingContextHost + MessagingHost
 {
+}
+
+#[cfg(test)]
+mod request_policy_tests {
+    use super::RequestPolicy;
+    use crate::dom::microsyntaxes::CrossOrigin;
+    use net::cors::{CredentialsMode, RedirectMode, RequestMode};
+
+    fn mode_of(policy: RequestPolicy) -> RequestMode {
+        policy.mode()
+    }
+
+    fn credentials_of(policy: RequestPolicy) -> CredentialsMode {
+        policy.credentials()
+    }
+
+    #[test]
+    fn a_subresource_without_crossorigin_is_no_cors_with_credentials() {
+        // The `No CORS` state: `no-cors` mode with credentials included
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#create-a-potential-cors-request>).
+        for policy in [
+            RequestPolicy::classic_script(None),
+            RequestPolicy::stylesheet(None),
+            RequestPolicy::image(None),
+        ] {
+            assert_eq!(mode_of(policy), RequestMode::NoCors);
+            assert_eq!(credentials_of(policy), CredentialsMode::Include);
+            assert_eq!(policy.redirect(), RedirectMode::Follow);
+        }
+    }
+
+    #[test]
+    fn an_anonymous_crossorigin_sends_cors_without_credentials() {
+        for policy in [
+            RequestPolicy::classic_script(Some(CrossOrigin::Anonymous)),
+            RequestPolicy::stylesheet(Some(CrossOrigin::Anonymous)),
+            RequestPolicy::image(Some(CrossOrigin::Anonymous)),
+        ] {
+            assert_eq!(mode_of(policy), RequestMode::Cors);
+            assert_eq!(credentials_of(policy), CredentialsMode::SameOrigin);
+        }
+    }
+
+    #[test]
+    fn use_credentials_sends_cors_with_credentials() {
+        for policy in [
+            RequestPolicy::classic_script(Some(CrossOrigin::UseCredentials)),
+            RequestPolicy::stylesheet(Some(CrossOrigin::UseCredentials)),
+            RequestPolicy::image(Some(CrossOrigin::UseCredentials)),
+        ] {
+            assert_eq!(mode_of(policy), RequestMode::Cors);
+            assert_eq!(credentials_of(policy), CredentialsMode::Include);
+        }
+    }
+
+    #[test]
+    fn module_scripts_are_cors_with_the_attributes_credentials_mode() {
+        // The CORS settings attribute credentials mode: `same-origin` for
+        // `No CORS` and `Anonymous`, `include` for `Use Credentials`
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+        for (crossorigin, expected) in [
+            (None, CredentialsMode::SameOrigin),
+            (Some(CrossOrigin::Anonymous), CredentialsMode::SameOrigin),
+            (Some(CrossOrigin::UseCredentials), CredentialsMode::Include),
+        ] {
+            let policy = RequestPolicy::module_script(crossorigin);
+            assert_eq!(mode_of(policy), RequestMode::Cors);
+            assert_eq!(credentials_of(policy), expected);
+        }
+    }
+
+    #[test]
+    fn fonts_reports_and_frames_take_the_modes_their_specs_name() {
+        let font = RequestPolicy::font();
+        assert_eq!(mode_of(font), RequestMode::Cors);
+        assert_eq!(credentials_of(font), CredentialsMode::SameOrigin);
+
+        // A `report-to` delivery is a `cors` request with same-origin
+        // credentials (<https://w3c.github.io/reporting/#try-delivery>).
+        let report_to = RequestPolicy::csp_report_to();
+        assert_eq!(mode_of(report_to), RequestMode::Cors);
+        assert_eq!(credentials_of(report_to), CredentialsMode::SameOrigin);
+
+        // The deprecated `report-uri` delivery is `no-cors`, so a collector
+        // that never promised CORS still receives the report
+        // (<https://w3c.github.io/webappsec-csp/#report-violation>).
+        let report_uri = RequestPolicy::csp_report_uri();
+        assert_eq!(mode_of(report_uri), RequestMode::NoCors);
+        assert_eq!(credentials_of(report_uri), CredentialsMode::SameOrigin);
+        assert_eq!(report_uri.redirect(), RedirectMode::Follow);
+
+        let frame = RequestPolicy::frame_load();
+        assert_eq!(mode_of(frame), RequestMode::Navigate);
+        assert_eq!(credentials_of(frame), CredentialsMode::Include);
+    }
+
+    #[test]
+    fn only_a_page_fetch_exposes_its_response_to_script() {
+        assert!(
+            RequestPolicy::fetch(super::CorsRequest {
+                mode: super::CorsMode::Cors,
+                credentials: CredentialsMode::SameOrigin,
+                redirect: RedirectMode::Follow,
+            })
+            .exposes_response()
+        );
+        for policy in [
+            RequestPolicy::classic_script(None),
+            RequestPolicy::module_script(None),
+            RequestPolicy::stylesheet(None),
+            RequestPolicy::image(None),
+            RequestPolicy::font(),
+            RequestPolicy::frame_load(),
+            RequestPolicy::csp_report_to(),
+            RequestPolicy::csp_report_uri(),
+        ] {
+            assert!(
+                !policy.exposes_response(),
+                "{:?} is consumed by the engine",
+                policy.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn a_policy_reports_the_kind_its_constructor_names() {
+        use super::DialKind;
+        assert_eq!(
+            RequestPolicy::image(None).kind(),
+            DialKind::Image,
+            "an image dial cannot report another fetch's kind"
+        );
+        assert_eq!(
+            RequestPolicy::classic_script(None).kind(),
+            DialKind::ClassicScript
+        );
+        assert_eq!(RequestPolicy::frame_load().kind(), DialKind::FrameLoad);
+    }
+
+    #[test]
+    fn a_page_fetch_mode_cannot_be_navigate() {
+        // `navigate` is not a `CorsMode`, so a page fetch cannot be sent under
+        // it; the IDL parser rejects the keyword for the same reason
+        // (<https://fetch.spec.whatwg.org/#dom-request>).
+        assert_eq!(super::CorsMode::from_idl("navigate"), None);
+        assert_eq!(
+            super::CorsMode::from_idl("no-cors"),
+            Some(super::CorsMode::NoCors)
+        );
+        assert_eq!(
+            super::CorsMode::from_idl("cors"),
+            Some(super::CorsMode::Cors)
+        );
+    }
 }

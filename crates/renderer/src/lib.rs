@@ -36,16 +36,18 @@ mod storage;
 mod test_services;
 mod xml;
 
+pub use dom::microsyntaxes::CrossOrigin;
 pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url, decode_data_url_bounded};
 pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
-    BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, CorsRequest,
+    BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, CorsMode, CorsRequest,
     DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
     HistoryHandling, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
-    PostedMessage, RendererEvent, RequestCache, ResourceLimit, ResponseBody, ResponseHead,
-    STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource,
-    StorageChange, StorageError, StorageHost, StorageKind, StreamId, TabError, TimerId,
+    PostedMessage, RendererEvent, RequestCache, RequestPolicy, ResourceLimit, ResponseBody,
+    ResponseHead, STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure,
+    ScriptSource, StorageChange, StorageError, StorageHost, StorageKind, StreamId, TabError,
+    TimerId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;
