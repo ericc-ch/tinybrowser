@@ -44,11 +44,10 @@ fn main() -> ExitCode {
             }
             code
         }
+        // Every `CliError` renders its own cause in its message, so a chain
+        // printed here would repeat it.
         Err(error) => {
             eprintln!("error: {error}");
-            if let Some(source) = std::error::Error::source(&error) {
-                eprintln!("  caused by: {source}");
-            }
             ExitCode::from(2)
         }
     }
