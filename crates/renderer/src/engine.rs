@@ -1999,7 +1999,6 @@ mod frame_history_tests {
             history.push(marker(spec));
         }
         // Step back to the middle entry, then replace it.
-        // Step back to the middle entry, then replace it.
         assert!(history.target(-1).is_some());
         history.replace(marker("http://marker.test/replaced"));
         assert_eq!(active_spec(&mut history), "http://marker.test/replaced");

@@ -875,47 +875,16 @@ mod sandbox_flag_tests {
     #[test]
     fn a_bare_sandbox_sets_every_flag_the_standard_lists() {
         let flags = SandboxFlags::parse(Some(""));
-        for flag in [
-            SandboxFlags::NAVIGATION,
-            SandboxFlags::AUXILIARY_NAVIGATION,
-            SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
-            SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
-            SandboxFlags::ORIGIN,
-            SandboxFlags::FORMS,
-            SandboxFlags::POINTER_LOCK,
-            SandboxFlags::SCRIPTS,
-            SandboxFlags::AUTOMATIC_FEATURES,
-            SandboxFlags::DOCUMENT_DOMAIN,
-            SandboxFlags::PROPAGATES_TO_AUXILIARY,
-            SandboxFlags::MODALS,
-            SandboxFlags::ORIENTATION_LOCK,
-            SandboxFlags::PRESENTATION,
-            SandboxFlags::DOWNLOADS,
-            SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
-        ] {
+        for flag in all_flags() {
             assert!(flags.contains(flag), "flag {flag:#x} must be set");
         }
     }
 
-    fn all_flags() -> [u32; 16] {
-        [
-            SandboxFlags::NAVIGATION,
-            SandboxFlags::AUXILIARY_NAVIGATION,
-            SandboxFlags::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION,
-            SandboxFlags::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION,
-            SandboxFlags::ORIGIN,
-            SandboxFlags::FORMS,
-            SandboxFlags::POINTER_LOCK,
-            SandboxFlags::SCRIPTS,
-            SandboxFlags::AUTOMATIC_FEATURES,
-            SandboxFlags::DOCUMENT_DOMAIN,
-            SandboxFlags::PROPAGATES_TO_AUXILIARY,
-            SandboxFlags::MODALS,
-            SandboxFlags::ORIENTATION_LOCK,
-            SandboxFlags::PRESENTATION,
-            SandboxFlags::DOWNLOADS,
-            SandboxFlags::CUSTOM_PROTOCOLS_NAVIGATION,
-        ]
+    /// Every flag one keyword can clear, from the one bit list the parser owns.
+    fn all_flags() -> impl Iterator<Item = u32> {
+        (0..u32::BITS)
+            .map(|bit| 1u32 << bit)
+            .filter(|flag| SandboxFlags::ALL & flag != 0)
     }
 
     #[test]
@@ -1161,6 +1130,26 @@ impl SandboxFlags {
     /// `allow-top-navigation-to-custom-protocols`.
     const CUSTOM_PROTOCOLS_NAVIGATION: u32 = 1 << 15;
 
+    /// Every flag bit above, so `parse` and the tests walk one list. A new
+    /// flag adds its bit here, next to its definition
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#sandboxing>).
+    pub(crate) const ALL: u32 = Self::NAVIGATION
+        | Self::AUXILIARY_NAVIGATION
+        | Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
+        | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
+        | Self::ORIGIN
+        | Self::FORMS
+        | Self::POINTER_LOCK
+        | Self::SCRIPTS
+        | Self::AUTOMATIC_FEATURES
+        | Self::DOCUMENT_DOMAIN
+        | Self::PROPAGATES_TO_AUXILIARY
+        | Self::MODALS
+        | Self::ORIENTATION_LOCK
+        | Self::PRESENTATION
+        | Self::DOWNLOADS
+        | Self::CUSTOM_PROTOCOLS_NAVIGATION;
+
     /// The `sandbox` keywords and the flags each one clears. This is the only
     /// list: [`Self::parse`] reads it and [`Self::supports`] answers from it,
     /// so a keyword cannot be advertised without taking effect
@@ -1219,24 +1208,7 @@ impl SandboxFlags {
         let Some(attribute) = attribute else {
             return Self::default();
         };
-        let mut flags = Self(
-            Self::NAVIGATION
-                | Self::AUXILIARY_NAVIGATION
-                | Self::TOP_LEVEL_NAVIGATION_WITHOUT_USER_ACTIVATION
-                | Self::TOP_LEVEL_NAVIGATION_WITH_USER_ACTIVATION
-                | Self::ORIGIN
-                | Self::FORMS
-                | Self::POINTER_LOCK
-                | Self::SCRIPTS
-                | Self::AUTOMATIC_FEATURES
-                | Self::DOCUMENT_DOMAIN
-                | Self::PROPAGATES_TO_AUXILIARY
-                | Self::MODALS
-                | Self::ORIENTATION_LOCK
-                | Self::PRESENTATION
-                | Self::DOWNLOADS
-                | Self::CUSTOM_PROTOCOLS_NAVIGATION,
-        );
+        let mut flags = Self(Self::ALL);
         for token in attribute.split_ascii_whitespace() {
             if let Some((_, cleared)) = Self::TOKENS
                 .iter()

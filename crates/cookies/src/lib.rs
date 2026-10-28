@@ -102,6 +102,13 @@ pub struct CookieOp<'a> {
     pub initiator: Option<&'a Url>,
     /// Whether a redirect chain has crossed sites before this request.
     pub cross_site_redirect: bool,
+    /// Whether `url` is a potentially trustworthy origin
+    /// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
+    ///
+    /// The jar does not judge URLs itself: one predicate decides what counts
+    /// as secure for the `Secure` attribute, the header path, and the
+    /// client-hint path.
+    pub trustworthy: bool,
 }
 
 /// How a cookie operation reached the jar.
@@ -552,7 +559,7 @@ fn receive_cookie(
     let expiry = cookie_expiry(&parsed, now);
     let (host_only, domain, path, path_attr) = cookie_scope(&parsed, request_url, &host)?;
     let secure = parsed.secure;
-    if secure && !is_secure_url(request_url) {
+    if secure && !op.trustworthy {
         return None;
     }
     let http_only = parsed.http_only;
@@ -560,9 +567,7 @@ fn receive_cookie(
         return None;
     }
     // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
-    if !is_secure_url(request_url)
-        && overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure)
-    {
+    if !op.trustworthy && overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure) {
         return None;
     }
     let same_site = parsed.same_site.unwrap_or(SameSite::Default);
@@ -737,7 +742,7 @@ impl StoredCookie {
         if !path_match(request_path, &self.path) {
             return false;
         }
-        if self.secure && !is_secure_url(op.url) {
+        if self.secure && !op.trustworthy {
             return false;
         }
         if self.http_only && !matches!(op.kind, RetrievalKind::Http) {
@@ -961,25 +966,6 @@ fn is_ip(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok()
 }
 
-fn is_secure_url(url: &Url) -> bool {
-    // https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts
-    if url.scheme() == "https" || url.scheme() == "wss" {
-        return true;
-    }
-    if url.scheme() != "http" && url.scheme() != "ws" {
-        return false;
-    }
-    match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(Host::Domain(d)) => {
-            let d = d.trim_end_matches('.').to_ascii_lowercase();
-            d == "localhost" || d.ends_with(".localhost")
-        }
-        None => false,
-    }
-}
-
 fn has_ctl_excluding_htab(s: &str) -> bool {
     s.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
 }
@@ -1191,6 +1177,8 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
+    /// Test URLs are either `https` (trustworthy) or plain `http` (not); a
+    /// case that needs another combination builds its own `CookieOp`.
     fn op(url: &Url, now: SystemTime, kind: RetrievalKind) -> CookieOp<'_> {
         CookieOp {
             url,
@@ -1200,6 +1188,7 @@ mod tests {
             method_is_safe: true,
             initiator: None,
             cross_site_redirect: false,
+            trustworthy: url.scheme() == "https",
         }
     }
 

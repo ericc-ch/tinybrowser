@@ -13,72 +13,83 @@ use url::{Origin, Url};
 
 use crate::secure_context::is_potentially_trustworthy;
 
-/// A referrer policy
-/// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
-///
-/// The empty string is not a variant: it means "no policy here, inherit one",
-/// so callers use `Option<ReferrerPolicy>` until the policy container or the
-/// user agent default supplies a value.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReferrerPolicy {
-    /// Send no `Referer`.
-    NoReferrer,
-    /// Send the full URL unless the target is a downgrade.
-    NoReferrerWhenDowngrade,
-    /// Send the full URL only to the same origin.
-    SameOrigin,
-    /// Send the origin to every origin.
-    Origin,
-    /// Send the origin, except on a downgrade.
-    StrictOrigin,
-    /// Send the full URL same-origin, the origin cross-origin.
-    OriginWhenCrossOrigin,
-    /// Send the full URL same-origin, the origin cross-origin, and nothing on
-    /// a downgrade. The user agent default.
-    #[default]
-    StrictOriginWhenCrossOrigin,
-    /// Send the full URL to every origin.
-    UnsafeUrl,
+/// One referrer policy set: the variant list is the only copy, and it expands
+/// into the enum, `ALL`, and `keyword()`.
+macro_rules! referrer_policies {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident => $keyword:literal
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        pub enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $name {
+            /// Every policy, in spec order
+            /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// The policy's keyword, the one spelling used by the header
+            /// parser, meta content, and content-attribute reflection.
+            #[must_use]
+            pub const fn keyword(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $keyword),+
+                }
+            }
+        }
+    };
+}
+
+referrer_policies! {
+    /// A referrer policy
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
+    ///
+    /// The empty string is not a variant: it means "no policy here, inherit one",
+    /// so callers use `Option<ReferrerPolicy>` until the policy container or the
+    /// user agent default supplies a value.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    ReferrerPolicy {
+        /// Send no `Referer`.
+        NoReferrer => "no-referrer",
+        /// Send the full URL unless the target is a downgrade.
+        NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+        /// Send the full URL only to the same origin.
+        SameOrigin => "same-origin",
+        /// Send the origin to every origin.
+        Origin => "origin",
+        /// Send the origin, except on a downgrade.
+        StrictOrigin => "strict-origin",
+        /// Send the full URL same-origin, the origin cross-origin.
+        OriginWhenCrossOrigin => "origin-when-cross-origin",
+        /// Send the full URL same-origin, the origin cross-origin, and nothing on
+        /// a downgrade. The user agent default.
+        #[default]
+        StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+        /// Send the full URL to every origin.
+        UnsafeUrl => "unsafe-url",
+    }
 }
 
 impl ReferrerPolicy {
-    /// Every policy, in spec order
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
-    pub const ALL: [Self; 8] = [
-        Self::NoReferrer,
-        Self::NoReferrerWhenDowngrade,
-        Self::SameOrigin,
-        Self::Origin,
-        Self::StrictOrigin,
-        Self::OriginWhenCrossOrigin,
-        Self::StrictOriginWhenCrossOrigin,
-        Self::UnsafeUrl,
-    ];
-
-    /// The policy's keyword, the one spelling used by the header parser, meta
-    /// content, and content-attribute reflection.
-    #[must_use]
-    pub const fn keyword(self) -> &'static str {
-        match self {
-            Self::NoReferrer => "no-referrer",
-            Self::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
-            Self::SameOrigin => "same-origin",
-            Self::Origin => "origin",
-            Self::StrictOrigin => "strict-origin",
-            Self::OriginWhenCrossOrigin => "origin-when-cross-origin",
-            Self::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
-            Self::UnsafeUrl => "unsafe-url",
-        }
-    }
-
     /// One policy token, ASCII case-insensitive and untrimmed. Enumerated
     /// attributes and header list members are trimmed by their own parsers,
     /// so a stray space is not a policy here.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
         Self::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .find(|policy| policy.keyword().eq_ignore_ascii_case(token))
     }
 
@@ -293,28 +304,13 @@ mod tests {
 
     #[test]
     fn policy_keywords_are_the_spec_strings() {
-        for (policy, keyword) in [
-            (ReferrerPolicy::NoReferrer, "no-referrer"),
-            (
-                ReferrerPolicy::NoReferrerWhenDowngrade,
-                "no-referrer-when-downgrade",
-            ),
-            (ReferrerPolicy::SameOrigin, "same-origin"),
-            (ReferrerPolicy::Origin, "origin"),
-            (ReferrerPolicy::StrictOrigin, "strict-origin"),
-            (
-                ReferrerPolicy::OriginWhenCrossOrigin,
-                "origin-when-cross-origin",
-            ),
-            (
-                ReferrerPolicy::StrictOriginWhenCrossOrigin,
-                "strict-origin-when-cross-origin",
-            ),
-            (ReferrerPolicy::UnsafeUrl, "unsafe-url"),
-        ] {
-            assert_eq!(policy.keyword(), keyword);
-            assert_eq!(ReferrerPolicy::parse(keyword), Some(policy));
+        let mut seen = std::collections::HashSet::new();
+        for policy in ReferrerPolicy::ALL {
+            let keyword = policy.keyword();
+            assert_eq!(ReferrerPolicy::parse(keyword), Some(*policy), "{keyword}");
+            assert!(seen.insert(keyword), "{keyword} repeats");
         }
+        assert_eq!(ReferrerPolicy::ALL.len(), 8);
     }
 
     #[test]

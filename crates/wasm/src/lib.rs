@@ -335,6 +335,7 @@ fn cookie_header(chain: &Chain) -> String {
         method_is_safe: true,
         initiator: chain.initiator.as_ref(),
         cross_site_redirect: chain.cross_site_redirect,
+        trustworthy: net::is_potentially_trustworthy(&chain.url),
     })
 }
 
@@ -370,6 +371,7 @@ fn store_hop_cookies(url: &Url, chain: &Chain, response: &FetchResponse) {
                 method_is_safe: true,
                 initiator: chain.initiator.as_ref(),
                 cross_site_redirect: chain.cross_site_redirect,
+                trustworthy: net::is_potentially_trustworthy(url),
             },
         );
     }
@@ -529,6 +531,7 @@ impl NetworkHost for WasmServices {
             method_is_safe: true,
             initiator: Some(url),
             cross_site_redirect: false,
+            trustworthy: net::is_potentially_trustworthy(url),
         })
     }
 
@@ -543,6 +546,7 @@ impl NetworkHost for WasmServices {
                 method_is_safe: true,
                 initiator: Some(url),
                 cross_site_redirect: false,
+                trustworthy: net::is_potentially_trustworthy(url),
             },
         );
     }

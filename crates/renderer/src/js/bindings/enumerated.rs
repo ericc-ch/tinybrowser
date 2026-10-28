@@ -6,6 +6,34 @@
 //! or the invalid-value default when it is not a keyword
 //! (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
 
+/// One enumerated attribute's keyword set.
+///
+/// The variant list is the only copy: the macro expands it into the enum, the
+/// `KEYWORDS` table reflection reads, and `keyword()`, so a variant cannot be
+/// missing from the table or spelled two ways without the code saying so.
+macro_rules! enumerated {
+    (
+        $(#[$doc:meta])*
+        $name:ident { $($variant:ident => $keyword:literal),+ $(,)? }
+    ) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(crate) enum $name {
+            $($variant),+
+        }
+
+        impl Enumerated for $name {
+            const KEYWORDS: &'static [Self] = &[$(Self::$variant),+];
+
+            fn keyword(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $keyword),+
+                }
+            }
+        }
+    };
+}
+
 /// One enumerated content attribute's keywords.
 pub(crate) trait Enumerated: Copy + 'static {
     /// Every keyword, in spec order.
@@ -36,382 +64,167 @@ pub(crate) fn reflect_enumerated<T: Enumerated>(
     T::parse(raw).map_or_else(|| invalid.to_owned(), |value| value.keyword().to_owned())
 }
 
-/// `dir` (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Dir {
-    Ltr,
-    Rtl,
-    Auto,
-}
-
-impl Enumerated for Dir {
-    const KEYWORDS: &'static [Self] = &[Self::Ltr, Self::Rtl, Self::Auto];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Ltr => "ltr",
-            Self::Rtl => "rtl",
-            Self::Auto => "auto",
-        }
+enumerated! {
+    /// `dir` (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
+    Dir {
+        Ltr => "ltr",
+        Rtl => "rtl",
+        Auto => "auto",
     }
 }
 
-/// `enterkeyhint`
-/// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EnterKeyHint {
-    Enter,
-    Done,
-    Go,
-    Next,
-    Previous,
-    Search,
-    Send,
-}
-
-impl Enumerated for EnterKeyHint {
-    const KEYWORDS: &'static [Self] = &[
-        Self::Enter,
-        Self::Done,
-        Self::Go,
-        Self::Next,
-        Self::Previous,
-        Self::Search,
-        Self::Send,
-    ];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Enter => "enter",
-            Self::Done => "done",
-            Self::Go => "go",
-            Self::Next => "next",
-            Self::Previous => "previous",
-            Self::Search => "search",
-            Self::Send => "send",
-        }
+enumerated! {
+    /// `enterkeyhint`
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint>).
+    EnterKeyHint {
+        Enter => "enter",
+        Done => "done",
+        Go => "go",
+        Next => "next",
+        Previous => "previous",
+        Search => "search",
+        Send => "send",
     }
 }
 
-/// `inputmode`
-/// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-inputmode>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InputMode {
-    None,
-    Text,
-    Tel,
-    Url,
-    Email,
-    Numeric,
-    Decimal,
-    Search,
-}
-
-impl Enumerated for InputMode {
-    const KEYWORDS: &'static [Self] = &[
-        Self::None,
-        Self::Text,
-        Self::Tel,
-        Self::Url,
-        Self::Email,
-        Self::Numeric,
-        Self::Decimal,
-        Self::Search,
-    ];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Text => "text",
-            Self::Tel => "tel",
-            Self::Url => "url",
-            Self::Email => "email",
-            Self::Numeric => "numeric",
-            Self::Decimal => "decimal",
-            Self::Search => "search",
-        }
+enumerated! {
+    /// `inputmode`
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-inputmode>).
+    InputMode {
+        None => "none",
+        Text => "text",
+        Tel => "tel",
+        Url => "url",
+        Email => "email",
+        Numeric => "numeric",
+        Decimal => "decimal",
+        Search => "search",
     }
 }
 
-/// `loading`
-/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#attr-loading>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Loading {
-    Lazy,
-    Eager,
-}
-
-impl Enumerated for Loading {
-    const KEYWORDS: &'static [Self] = &[Self::Lazy, Self::Eager];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Lazy => "lazy",
-            Self::Eager => "eager",
-        }
+enumerated! {
+    /// `loading`
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#attr-loading>).
+    Loading {
+        Lazy => "lazy",
+        Eager => "eager",
     }
 }
 
-/// `preload`
-/// (<https://html.spec.whatwg.org/multipage/media.html#attr-media-preload>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Preload {
-    None,
-    Metadata,
-    Auto,
-}
-
-impl Enumerated for Preload {
-    const KEYWORDS: &'static [Self] = &[Self::None, Self::Metadata, Self::Auto];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Metadata => "metadata",
-            Self::Auto => "auto",
-        }
+enumerated! {
+    /// `preload`
+    /// (<https://html.spec.whatwg.org/multipage/media.html#attr-media-preload>).
+    Preload {
+        None => "none",
+        Metadata => "metadata",
+        Auto => "auto",
     }
 }
 
-/// `decoding`
-/// (<https://html.spec.whatwg.org/multipage/embedded-content.html#attr-img-decoding>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Decoding {
-    Async,
-    Sync,
-    Auto,
-}
-
-impl Enumerated for Decoding {
-    const KEYWORDS: &'static [Self] = &[Self::Async, Self::Sync, Self::Auto];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Async => "async",
-            Self::Sync => "sync",
-            Self::Auto => "auto",
-        }
+enumerated! {
+    /// `decoding`
+    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#attr-img-decoding>).
+    Decoding {
+        Async => "async",
+        Sync => "sync",
+        Auto => "auto",
     }
 }
 
-/// `method` and `formmethod`
-/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-method>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FormMethod {
-    Get,
-    Post,
-    Dialog,
-}
-
-impl Enumerated for FormMethod {
-    const KEYWORDS: &'static [Self] = &[Self::Get, Self::Post, Self::Dialog];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Get => "get",
-            Self::Post => "post",
-            Self::Dialog => "dialog",
-        }
+enumerated! {
+    /// `method` and `formmethod`
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-method>).
+    FormMethod {
+        Get => "get",
+        Post => "post",
+        Dialog => "dialog",
     }
 }
 
-/// `enctype` and `formenctype`
-/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FormEnctype {
-    UrlEncoded,
-    Multipart,
-    TextPlain,
-}
-
-impl Enumerated for FormEnctype {
-    const KEYWORDS: &'static [Self] = &[Self::UrlEncoded, Self::Multipart, Self::TextPlain];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::UrlEncoded => "application/x-www-form-urlencoded",
-            Self::Multipart => "multipart/form-data",
-            Self::TextPlain => "text/plain",
-        }
+enumerated! {
+    /// `enctype` and `formenctype`
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
+    FormEnctype {
+        UrlEncoded => "application/x-www-form-urlencoded",
+        Multipart => "multipart/form-data",
+        TextPlain => "text/plain",
     }
 }
 
-/// `autocomplete`
-/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-autocomplete>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Autocomplete {
-    On,
-    Off,
-}
-
-impl Enumerated for Autocomplete {
-    const KEYWORDS: &'static [Self] = &[Self::On, Self::Off];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-        }
+enumerated! {
+    /// `autocomplete`
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-autocomplete>).
+    Autocomplete {
+        On => "on",
+        Off => "off",
     }
 }
 
-/// `scope` on `th`
-/// (<https://html.spec.whatwg.org/multipage/tables.html#attr-th-scope>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TableScope {
-    Row,
-    Col,
-    RowGroup,
-    ColGroup,
-}
-
-impl Enumerated for TableScope {
-    const KEYWORDS: &'static [Self] = &[Self::Row, Self::Col, Self::RowGroup, Self::ColGroup];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Row => "row",
-            Self::Col => "col",
-            Self::RowGroup => "rowgroup",
-            Self::ColGroup => "colgroup",
-        }
+enumerated! {
+    /// `scope` on `th`
+    /// (<https://html.spec.whatwg.org/multipage/tables.html#attr-th-scope>).
+    TableScope {
+        Row => "row",
+        Col => "col",
+        RowGroup => "rowgroup",
+        ColGroup => "colgroup",
     }
 }
 
-/// `as` on `link`
-/// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-link-as>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LinkAs {
-    Fetch,
-    Audio,
-    AudioWorklet,
-    Document,
-    Embed,
-    Font,
-    Frame,
-    Iframe,
-    Image,
-    Json,
-    Manifest,
-    Object,
-    PaintWorklet,
-    Report,
-    Script,
-    ServiceWorker,
-    SharedWorker,
-    Style,
-    Track,
-    Video,
-    Worker,
-    Xslt,
-}
-
-impl Enumerated for LinkAs {
-    const KEYWORDS: &'static [Self] = &[
-        Self::Fetch,
-        Self::Audio,
-        Self::AudioWorklet,
-        Self::Document,
-        Self::Embed,
-        Self::Font,
-        Self::Frame,
-        Self::Iframe,
-        Self::Image,
-        Self::Json,
-        Self::Manifest,
-        Self::Object,
-        Self::PaintWorklet,
-        Self::Report,
-        Self::Script,
-        Self::ServiceWorker,
-        Self::SharedWorker,
-        Self::Style,
-        Self::Track,
-        Self::Video,
-        Self::Worker,
-        Self::Xslt,
-    ];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Fetch => "fetch",
-            Self::Audio => "audio",
-            Self::AudioWorklet => "audioworklet",
-            Self::Document => "document",
-            Self::Embed => "embed",
-            Self::Font => "font",
-            Self::Frame => "frame",
-            Self::Iframe => "iframe",
-            Self::Image => "image",
-            Self::Json => "json",
-            Self::Manifest => "manifest",
-            Self::Object => "object",
-            Self::PaintWorklet => "paintworklet",
-            Self::Report => "report",
-            Self::Script => "script",
-            Self::ServiceWorker => "serviceworker",
-            Self::SharedWorker => "sharedworker",
-            Self::Style => "style",
-            Self::Track => "track",
-            Self::Video => "video",
-            Self::Worker => "worker",
-            Self::Xslt => "xslt",
-        }
+enumerated! {
+    /// `as` on `link`
+    /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-link-as>).
+    LinkAs {
+        Fetch => "fetch",
+        Audio => "audio",
+        AudioWorklet => "audioworklet",
+        Document => "document",
+        Embed => "embed",
+        Font => "font",
+        Frame => "frame",
+        Iframe => "iframe",
+        Image => "image",
+        Json => "json",
+        Manifest => "manifest",
+        Object => "object",
+        PaintWorklet => "paintworklet",
+        Report => "report",
+        Script => "script",
+        ServiceWorker => "serviceworker",
+        SharedWorker => "sharedworker",
+        Style => "style",
+        Track => "track",
+        Video => "video",
+        Worker => "worker",
+        Xslt => "xslt",
     }
 }
 
-/// `kind` on `track`
-/// (<https://html.spec.whatwg.org/multipage/media.html#attr-track-kind>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TrackKind {
-    Subtitles,
-    Captions,
-    Descriptions,
-    Chapters,
-    Metadata,
-}
-
-impl Enumerated for TrackKind {
-    const KEYWORDS: &'static [Self] = &[
-        Self::Subtitles,
-        Self::Captions,
-        Self::Descriptions,
-        Self::Chapters,
-        Self::Metadata,
-    ];
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Subtitles => "subtitles",
-            Self::Captions => "captions",
-            Self::Descriptions => "descriptions",
-            Self::Chapters => "chapters",
-            Self::Metadata => "metadata",
-        }
+enumerated! {
+    /// `kind` on `track`
+    /// (<https://html.spec.whatwg.org/multipage/media.html#attr-track-kind>).
+    TrackKind {
+        Subtitles => "subtitles",
+        Captions => "captions",
+        Descriptions => "descriptions",
+        Chapters => "chapters",
+        Metadata => "metadata",
     }
 }
 
-/// `crossorigin`
-/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#attr-crossorigin>).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CrossOrigin {
-    Anonymous,
-    UseCredentials,
-}
-
-impl Enumerated for CrossOrigin {
-    const KEYWORDS: &'static [Self] = &[Self::Anonymous, Self::UseCredentials];
+/// `crossorigin` belongs to the document layer too, which decides an image's
+/// credentials, so the keyword set lives in `dom` and reflection delegates to
+/// it here.
+impl Enumerated for crate::dom::microsyntaxes::CrossOrigin {
+    const KEYWORDS: &'static [Self] = crate::dom::microsyntaxes::CrossOrigin::KEYWORDS;
 
     fn keyword(self) -> &'static str {
-        match self {
-            Self::Anonymous => "anonymous",
-            Self::UseCredentials => "use-credentials",
-        }
+        crate::dom::microsyntaxes::CrossOrigin::keyword(self)
     }
 }
 
 impl Enumerated for net::ReferrerPolicy {
-    const KEYWORDS: &'static [Self] = &net::ReferrerPolicy::ALL;
+    const KEYWORDS: &'static [Self] = net::ReferrerPolicy::ALL;
 
     fn keyword(self) -> &'static str {
         net::ReferrerPolicy::keyword(self)
@@ -421,39 +234,41 @@ impl Enumerated for net::ReferrerPolicy {
 #[cfg(test)]
 mod tests {
     use super::{
-        Autocomplete, CrossOrigin, Decoding, Dir, EnterKeyHint, Enumerated, FormEnctype,
-        FormMethod, InputMode, LinkAs, Loading, Preload, TableScope, TrackKind,
+        Autocomplete, Decoding, Dir, EnterKeyHint, Enumerated, FormEnctype, FormMethod, InputMode,
+        LinkAs, Loading, Preload, TableScope, TrackKind,
     };
 
-    /// Every key must parse back to its own value, and the table must list
-    /// each one exactly once. A variant missing from `KEYWORDS` is invisible
-    /// to reflection but still reachable from `keyword`, so nothing else
-    /// catches the split; `expected` is the variant count from the enum
-    /// definition.
-    fn assert_keyword_table<T: Enumerated + PartialEq + std::fmt::Debug>(expected: usize) {
-        assert_eq!(T::KEYWORDS.len(), expected, "keyword count");
+    /// Every keyword reflects back to its own value, and no two variants
+    /// share a spelling. The macro already generates `KEYWORDS` from the
+    /// variant list, so this pins the strings it cannot check.
+    fn assert_round_trip<T: Enumerated + PartialEq + std::fmt::Debug>() {
         let mut seen = std::collections::HashSet::new();
         for value in T::KEYWORDS {
-            assert_eq!(T::parse(value.keyword()), Some(*value), "{value:?}");
-            assert!(seen.insert(value.keyword()), "{value:?} listed twice");
+            let keyword = value.keyword();
+            assert_eq!(T::parse(keyword), Some(*value), "{value:?}");
+            assert!(
+                T::parse(&keyword.to_ascii_uppercase()) == Some(*value),
+                "{value:?} parses case-insensitively"
+            );
+            assert!(seen.insert(keyword), "{value:?} repeats {keyword:?}");
         }
     }
 
     #[test]
-    fn keyword_tables_cover_every_variant() {
-        assert_keyword_table::<Dir>(3);
-        assert_keyword_table::<EnterKeyHint>(7);
-        assert_keyword_table::<InputMode>(8);
-        assert_keyword_table::<Loading>(2);
-        assert_keyword_table::<Preload>(3);
-        assert_keyword_table::<Decoding>(3);
-        assert_keyword_table::<FormMethod>(3);
-        assert_keyword_table::<FormEnctype>(3);
-        assert_keyword_table::<Autocomplete>(2);
-        assert_keyword_table::<TableScope>(4);
-        assert_keyword_table::<LinkAs>(22);
-        assert_keyword_table::<TrackKind>(5);
-        assert_keyword_table::<CrossOrigin>(2);
-        assert_keyword_table::<net::ReferrerPolicy>(8);
+    fn every_keyword_round_trips_through_reflection() {
+        assert_round_trip::<Dir>();
+        assert_round_trip::<EnterKeyHint>();
+        assert_round_trip::<InputMode>();
+        assert_round_trip::<Loading>();
+        assert_round_trip::<Preload>();
+        assert_round_trip::<Decoding>();
+        assert_round_trip::<FormMethod>();
+        assert_round_trip::<FormEnctype>();
+        assert_round_trip::<Autocomplete>();
+        assert_round_trip::<TableScope>();
+        assert_round_trip::<LinkAs>();
+        assert_round_trip::<TrackKind>();
+        assert_round_trip::<crate::dom::microsyntaxes::CrossOrigin>();
+        assert_round_trip::<net::ReferrerPolicy>();
     }
 }

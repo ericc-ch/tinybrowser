@@ -15,5 +15,6 @@ crate-type = ["cdylib"]
 renderer = { workspace = true }
 webstorage = { workspace = true }
 cookies = { workspace = true }
+net = { workspace = true }
 url = "2"
 wit-bindgen = "0.62"
