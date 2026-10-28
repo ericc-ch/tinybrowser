@@ -15,7 +15,7 @@ mod transport;
 
 pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
-pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
+pub use error::{LimitExceeded, NetError, TimeoutKind, TransportError};
 pub use identity::{Brand, ClientHints, DEFAULT_USER_AGENT, Identity, UserAgent};
 pub use protocol::{
     HeaderError, HeaderMap, InvalidMethod, Method, combined_header, combined_header_in,

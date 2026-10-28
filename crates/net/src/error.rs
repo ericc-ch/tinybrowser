@@ -5,10 +5,6 @@ pub enum TimeoutKind {
     Global,
     #[error("per-call")]
     PerCall,
-    #[error("connect")]
-    Connect,
-    #[error("send-body")]
-    SendBody,
     #[error("recv-body")]
     RecvBody,
 }
@@ -42,21 +38,15 @@ pub enum LimitExceeded {
     Size(u64),
 }
 
-/// The request or response could not be represented as HTTP.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ProtocolError {
-    /// The URL, method, or assembled request was rejected.
-    #[error("backend rejected the assembled request")]
-    RejectedRequest,
-}
-
 /// Failure from [`crate::Agent::send`] or body reads.
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("transport: {0}")]
     Transport(#[source] TransportError),
-    #[error("protocol violation: {0}")]
-    Protocol(#[source] ProtocolError),
+    /// The URL, method, or assembled request could not be represented as
+    /// HTTP, so the request was refused before it left the agent.
+    #[error("protocol violation: backend rejected the assembled request")]
+    RejectedRequest,
     #[error("limit exceeded: {0}")]
     Limit(#[source] LimitExceeded),
     #[error("content decoding failed: {0}")]

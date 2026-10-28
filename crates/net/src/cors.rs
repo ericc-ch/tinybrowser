@@ -12,7 +12,7 @@
 
 use hyper::header::{self, HeaderValue};
 
-use crate::error::ProtocolError;
+use crate::error::NetError;
 use crate::protocol::{HeaderMap, Method};
 
 /// A request's CORS mode
@@ -656,22 +656,21 @@ pub fn preflight_ok(
 ///
 /// # Errors
 ///
-/// [`ProtocolError::RejectedRequest`] when the method or header names cannot
+/// [`NetError::RejectedRequest`] when the method or header names cannot
 /// be represented as a field value.
 pub(crate) fn preflight_headers(
     method: &Method,
     unsafe_names: &[String],
     origin: &HeaderValue,
-) -> Result<HeaderMap, ProtocolError> {
+) -> Result<HeaderMap, NetError> {
     let mut headers = HeaderMap::new();
     headers.append(header::ACCEPT, HeaderValue::from_static("*/*"));
     headers.append(header::ORIGIN, origin.clone());
-    let method =
-        HeaderValue::from_str(method.as_str()).map_err(|_| ProtocolError::RejectedRequest)?;
+    let method = HeaderValue::from_str(method.as_str()).map_err(|_| NetError::RejectedRequest)?;
     headers.append(header::ACCESS_CONTROL_REQUEST_METHOD, method);
     if !unsafe_names.is_empty() {
         let names = HeaderValue::from_str(&unsafe_names.join(","))
-            .map_err(|_| ProtocolError::RejectedRequest)?;
+            .map_err(|_| NetError::RejectedRequest)?;
         headers.append(header::ACCESS_CONTROL_REQUEST_HEADERS, names);
     }
     Ok(headers)

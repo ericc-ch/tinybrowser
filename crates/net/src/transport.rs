@@ -32,7 +32,7 @@ use tower_service::Service;
 use url::Url;
 
 use crate::client::Clock;
-use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
+use crate::error::{NetError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::resolve::{HostMap, ResolveFailure, Target};
 
@@ -342,7 +342,7 @@ impl HttpEngine {
     /// # Errors
     ///
     /// [`NetError::Transport`] for DNS, connect, TLS, timeout, or I/O failure.
-    /// [`NetError::Protocol`] when the request cannot be represented.
+    /// [`NetError::RejectedRequest`] when the request cannot be represented.
     pub(crate) async fn send(
         &self,
         method: &Method,
@@ -361,16 +361,16 @@ impl HttpEngine {
         let mut request = hyper::Request::builder()
             .method(
                 hyper::Method::from_bytes(method.as_str().as_bytes())
-                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
+                    .map_err(|_| NetError::RejectedRequest)?,
             )
             .uri(
                 wire_url
                     .as_str()
                     .parse::<hyper::Uri>()
-                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
+                    .map_err(|_| NetError::RejectedRequest)?,
             )
             .body(request_body)
-            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+            .map_err(|_| NetError::RejectedRequest)?;
         // Browsers state the HTTP/1.1 default explicitly. hyper leaves the
         // field to the caller, and ALPN can only select HTTP/2 over TLS, so a
         // cleartext URL is always the HTTP/1.1 connection this field belongs
