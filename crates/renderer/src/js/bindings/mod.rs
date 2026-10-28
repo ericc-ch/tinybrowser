@@ -2283,11 +2283,11 @@ mod realm_tests {
             .mount_frame(
                 FrameId::MAIN,
                 &crate::protocol::Mount {
-                    head: crate::protocol::ResponseHead {
-                        url: "https://example.test/".into(),
-                        content_type: Some("text/html".into()),
-                        ..crate::protocol::ResponseHead::default()
-                    },
+                    head: crate::protocol::ResponseHead::local(
+                        "https://example.test/".parse().expect("URL"),
+                        Some("text/html".into()),
+                        None,
+                    ),
                     body: html.as_bytes().to_vec(),
                 },
             )
@@ -2327,11 +2327,11 @@ mod realm_tests {
         let html = "<script>globalThis.__n = 0; for (let i = 0; i < 4; i++) setTimeout(() => { globalThis.__n++; for (;;) {} }, 0);</script>";
         renderer
             .mount_for_test(&crate::protocol::Mount {
-                head: crate::protocol::ResponseHead {
-                    url: "https://example.test/".into(),
-                    content_type: Some("text/html".into()),
-                    ..crate::protocol::ResponseHead::default()
-                },
+                head: crate::protocol::ResponseHead::local(
+                    "https://example.test/".parse().expect("URL"),
+                    Some("text/html".into()),
+                    None,
+                ),
                 body: html.as_bytes().to_vec(),
             })
             .expect("mount");
@@ -2381,11 +2381,11 @@ mod realm_tests {
             .mount_frame(
                 FrameId::MAIN,
                 &crate::protocol::Mount {
-                    head: crate::protocol::ResponseHead {
-                        url: "https://example.test/".into(),
-                        content_type: Some("text/html".into()),
-                        ..crate::protocol::ResponseHead::default()
-                    },
+                    head: crate::protocol::ResponseHead::local(
+                        "https://example.test/".parse().expect("URL"),
+                        Some("text/html".into()),
+                        None,
+                    ),
                     body: html.as_bytes().to_vec(),
                 },
             )

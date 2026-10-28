@@ -21,6 +21,8 @@ use crate::js::FrameRuntime;
 use crate::js::canvas::{Canvas2D, Gradient, Pattern, SourceImage};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
+
+pub(crate) use crate::protocol::PolicyContainer;
 use crate::storage::PendingStorageEvent;
 use crate::{Parsed, ReadyState};
 
@@ -1093,16 +1095,6 @@ pub(crate) type FontFamilyEntry = (parley::fontique::FamilyId, Vec<FontFaceKey>)
 pub(crate) struct FontRegistration {
     pub(crate) document: Option<u32>,
     pub(crate) fonts: Vec<FontFamilyEntry>,
-}
-
-/// The document's policy container: CSP list and referrer policy. A
-/// local-scheme document inherits one clone, and a response replaces both
-/// fields once, so no load path can leave the two out of sync
-/// (<https://html.spec.whatwg.org/multipage/browsers.html#policy-containers>).
-#[derive(Clone, Debug, Default)]
-pub(crate) struct PolicyContainer {
-    pub(crate) csp: crate::csp::List,
-    pub(crate) referrer_policy: Option<ReferrerPolicy>,
 }
 
 /// Declares the sandboxing flags: the variants, the full list, and the bit each

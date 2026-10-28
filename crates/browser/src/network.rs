@@ -203,13 +203,8 @@ impl DialHead {
     /// becomes policy, endpoints, or the nosniff flag: both read the header
     /// list here and hand it to one derivation
     /// (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
-    fn into_document_head(self) -> renderer::ResponseHead {
-        renderer::ResponseHead::http(
-            self.status,
-            self.final_url,
-            self.content_type,
-            &self.headers,
-        )
+    fn into_document_head(self, final_url: Url) -> renderer::ResponseHead {
+        renderer::ResponseHead::http(self.status, final_url, self.content_type, &self.headers)
     }
 
     /// The outcome this head answers with, once its body is known.
@@ -689,7 +684,7 @@ impl TabNetworkHandle {
         // fetch outcome cannot disagree about which header becomes policy,
         // endpoints, or the nosniff flag
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object>).
-        let head = DialHead::internal(&response).into_document_head();
+        let head = DialHead::internal(&response).into_document_head(final_url);
         let body = response.into_body().await;
         Ok(NavOutcome {
             head,

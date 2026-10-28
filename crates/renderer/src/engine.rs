@@ -395,7 +395,7 @@ impl Engine {
                 .clone_from(&mount.head.init_scripts);
         }
         self.remove_descendants(frame);
-        self.frame_mut(frame)?.mount(mount)?;
+        self.frame_mut(frame)?.mount(mount);
         self.reconcile_frames();
         Ok(())
     }
@@ -1543,9 +1543,7 @@ impl Engine {
         if let Some(document) = self.frames.get_mut(&child) {
             // A `data:` URL inherits the initiator's policy container
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
-            let mut head = ResponseHead::non_http(url.to_string(), Some(content_type));
-            head.inherited_policy = Some(policy.csp.clone());
-            head.inherited_referrer_policy = policy.referrer_policy;
+            let head = ResponseHead::local(url.clone(), Some(content_type), Some(policy));
             document.set_document_referrer(referrer);
             document.install_frame_response(&head, &body, None);
         }
@@ -1580,10 +1578,11 @@ impl Engine {
             // A `blob:` URL inherits the initiator's policy container, and the
             // child's origin is the store entry's creator
             // (<https://html.spec.whatwg.org/multipage/browsers.html#determining-navigation-params-policy-container>).
-            let mut head =
-                ResponseHead::non_http(url.to_string(), content_type.as_deref().map(String::from));
-            head.inherited_policy = Some(policy.csp.clone());
-            head.inherited_referrer_policy = policy.referrer_policy;
+            let head = ResponseHead::local(
+                url.clone(),
+                content_type.as_deref().map(String::from),
+                Some(policy),
+            );
             document.set_document_referrer(referrer);
             document.install_frame_response(&head, contents.as_bytes(), Some(origin));
         }
@@ -2047,6 +2046,7 @@ mod navigator_tests {
     use super::{Engine, FrameId, Mount, ResponseHead};
     use crate::test_services::NullServices;
     use std::sync::Arc;
+    use url::Url;
 
     /// One engine whose identity is not the built-in one: whatever the carrier
     /// spawns it with is what every page reports, header and hints together
@@ -2079,10 +2079,11 @@ mod navigator_tests {
             .mount_frame(
                 FrameId::MAIN,
                 &Mount {
-                    head: ResponseHead {
-                        url: "https://example.test/".to_owned(),
-                        ..ResponseHead::default()
-                    },
+                    head: ResponseHead::local(
+                        Url::parse("https://example.test/").expect("URL"),
+                        Some("text/html".to_owned()),
+                        None,
+                    ),
                     body: b"<!doctype html><title>identity</title>".to_vec(),
                 },
             )
@@ -2162,6 +2163,7 @@ mod messaging_tests {
     use super::{Engine, FrameId, Mount, ResponseHead};
     use crate::test_services::NullServices;
     use std::sync::Arc;
+    use url::Url;
 
     fn engine() -> Engine {
         Engine::new(
@@ -2174,10 +2176,11 @@ mod messaging_tests {
 
     fn mount(url: &str, body: &str) -> Mount {
         Mount {
-            head: ResponseHead {
-                url: url.to_owned(),
-                ..ResponseHead::default()
-            },
+            head: ResponseHead::local(
+                Url::parse(url).expect("mount URL"),
+                Some("text/html".to_owned()),
+                None,
+            ),
             body: body.as_bytes().to_vec(),
         }
     }

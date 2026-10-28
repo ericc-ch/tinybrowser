@@ -1814,17 +1814,10 @@ impl Document {
 
     /// Replaces the document from a host mount: new realm, decoded bytes,
     /// parsed to load. The host has already dialed and chosen this renderer.
-    pub(crate) fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
-        // An invalid mount spec fails before anything is touched.
-        if Url::parse(&mount.head.url).is_err() {
-            return Err(TabError::InvalidUrl {
-                spec: mount.head.url.clone(),
-            });
-        }
+    pub(crate) fn mount(&mut self, mount: &Mount) {
         self.set_history(&mount.head.history);
         self.set_document_referrer(None);
         self.install_response(&mount.head, &mount.body, None);
-        Ok(())
     }
 
     /// Opens a parse on `input`, taking ownership of the input stream.
@@ -1876,30 +1869,12 @@ impl Document {
         // (blank, data) report zero rather than a previous page's status.
         // Violation `status-code` reports it
         // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-        self.http_status = head.status;
-        self.set_reporting_endpoints(head);
+        self.http_status = head.origin.status();
+        self.set_reporting_endpoints(head.origin.reporting_endpoints());
         if let Some((width, height)) = head.viewport {
             self.viewport_size = (width, height);
         }
-        // The parsed URL decides. An unparseable response URL leaves the
-        // previous URL in place, and with it the captured origin: `about:blank`,
-        // `data:`, and `blob:` URLs cannot re-derive one.
-        self.initial_blank = false;
-        // A `blob:` response carries its store entry's creator, which is not
-        // what `Url::origin()` returns for the blob URL
-        // (<https://w3c.github.io/FileAPI/#blob-url-entry>,
-        // <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
-        match Url::parse(&head.url) {
-            Ok(url) => {
-                let origin = self.sandboxed_origin(origin);
-                self.set_document_url(url, origin);
-            }
-            Err(_) => {
-                if let Some(origin) = self.sandboxed_origin(origin) {
-                    self.set_document_url(self.url.clone(), Some(origin));
-                }
-            }
-        }
+        self.install_response_url(head, origin);
         let mut world = self.world.borrow_mut();
         // A response document resolves against its own URL; any inherited
         // `about:srcdoc` base stops applying.
@@ -1925,24 +1900,36 @@ impl Document {
         // the exact bytes the server sent before the extraction runs
         // (<https://mimesniff.spec.whatwg.org/#supplied-mime-type-detection-algorithm>).
         self.response_content_type.clone_from(&head.content_type);
-        self.response_policy = head.inherited_policy.clone().unwrap_or_else(|| {
-            crate::csp::List::from_headers(
-                head.content_security_policy.as_deref(),
-                head.content_security_policy_report_only.as_deref(),
-            )
-        });
-        self.response_referrer_policy = head.inherited_referrer_policy.or(head.referrer_policy);
+        // The origin variant decides both: an HTTP response carries the
+        // policy its headers establish, and a local-scheme response carries
+        // only what it inherited, so no field can override the other.
+        let policy = head.origin.policy();
+        self.response_policy = policy.csp;
+        self.response_referrer_policy = policy.referrer_policy;
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
         self.mime_guard = crate::sniff::MimeGuard {
-            no_sniff: head.no_sniff,
-            http: head.http_response,
+            no_sniff: head.origin.no_sniff(),
+            http: head.origin.is_http(),
         };
         // A response `Refresh` starts the document's one declarative refresh
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-        if let Some(refresh) = &head.refresh {
+        if let Some(refresh) = head.origin.refresh() {
             self.start_declarative_refresh(refresh);
         }
+    }
+
+    /// Points the document at the URL the response head carries.
+    ///
+    /// The URL is parsed at the seam, so the document always takes this
+    /// response's URL. `about:blank`, `data:`, and `blob:` URLs cannot
+    /// re-derive an origin, so their captured one comes from the caller
+    /// (<https://w3c.github.io/FileAPI/#blob-url-entry>,
+    /// <https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    fn install_response_url(&mut self, head: &ResponseHead, origin: Option<url::Origin>) {
+        self.initial_blank = false;
+        let origin = self.sandboxed_origin(origin);
+        self.set_document_url(head.url.clone(), origin);
     }
 
     /// Installs a complete response head and body: [`Self::install_head`]
@@ -1977,10 +1964,8 @@ impl Document {
     /// `frame-ancestors` response dispatches its violations on the fallback
     /// document against the new response's endpoints, so this is also set
     /// before the check.
-    fn set_reporting_endpoints(&mut self, head: &ResponseHead) {
-        self.reporting_endpoints = head
-            .reporting_endpoints
-            .as_deref()
+    fn set_reporting_endpoints(&mut self, endpoints: Option<&str>) {
+        self.reporting_endpoints = endpoints
             .map(crate::csp::parse_reporting_endpoints_value)
             .unwrap_or_default();
     }
@@ -3423,18 +3408,15 @@ impl Document {
     ) {
         let head = ResponseHead::http(
             outcome.status,
-            url.to_string(),
+            url.clone(),
             outcome.content_type.clone(),
             &outcome.headers,
         );
-        let policy = crate::csp::List::from_headers(
-            head.content_security_policy.as_deref(),
-            head.content_security_policy_report_only.as_deref(),
-        );
+        let policy = head.origin.policy().csp;
         // Set before the `frame-ancestors` decision: a refused response
         // dispatches its violations on the fallback document against the new
         // response's endpoints.
-        self.set_reporting_endpoints(&head);
+        self.set_reporting_endpoints(head.origin.reporting_endpoints());
         if embedder.is_some()
             && !ancestors.is_empty()
             && self.note_frame_ancestors_block(embedder, url, &policy, ancestors)

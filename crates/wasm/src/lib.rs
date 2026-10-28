@@ -121,7 +121,11 @@ impl GuestTab for Tab {
         // the `fetch-request` contract change in #192.
         let mut renderer = EmbeddedRenderer::new(services, net::Identity::default());
         let mount = Mount {
-            head: renderer::ResponseHead::non_http(url, Some("text/html; charset=utf-8".into())),
+            head: renderer::ResponseHead::local(
+                url::Url::parse(&url).map_err(|_| format!("invalid url: {url}"))?,
+                Some("text/html; charset=utf-8".into()),
+                None,
+            ),
             body: html.into_bytes(),
         };
         renderer.mount(&mount).map_err(|error| error.to_string())?;

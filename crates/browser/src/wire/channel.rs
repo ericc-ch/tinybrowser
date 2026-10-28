@@ -498,6 +498,65 @@ mod tests {
         }
     }
 
+    /// Both response-head shapes survive the postcard wire. The origin variant
+    /// decides whether the document has HTTP status and policy headers, so a
+    /// decoder that could not name it would drop every navigation.
+    #[test]
+    fn a_response_head_round_trips_both_origins() {
+        use renderer::{ResponseHead, ResponseOrigin};
+        let url = url::Url::parse("https://a.test/").expect("URL");
+        let http = ResponseHead::http(
+            204,
+            url.clone(),
+            Some("text/html".to_owned()),
+            &[("Referrer-Policy".to_owned(), "origin".to_owned())],
+        );
+        let local = ResponseHead::local(url, None, None);
+        for head in [http, local] {
+            let message: crate::wire::ToRenderer = crate::exchange::Frame::Call {
+                id: crate::exchange::RequestId::new(1),
+                body: crate::wire::RendererCall::Response {
+                    response: crate::wire::ResponseStart {
+                        assignment: crate::wire::RendererAssignmentId::new(1),
+                        frame: renderer::FrameId::MAIN,
+                        head: head.clone(),
+                    },
+                },
+            };
+            let mut bytes = Vec::new();
+            write_control(&mut bytes, &message).expect("write");
+            let back: crate::wire::ToRenderer =
+                read_control(&mut Cursor::new(bytes), &mut Vec::new())
+                    .expect("read")
+                    .expect("one frame");
+            let crate::exchange::Frame::Call {
+                body: crate::wire::RendererCall::Response { response },
+                ..
+            } = back
+            else {
+                panic!("expected a response frame");
+            };
+            assert_eq!(response.head.url, head.url);
+            assert_eq!(response.head.origin.is_http(), head.origin.is_http());
+            assert_eq!(response.head.origin.status(), head.origin.status());
+            assert_eq!(
+                response.head.content_type.as_deref(),
+                head.content_type.as_deref()
+            );
+            match (&response.head.origin, &head.origin) {
+                (ResponseOrigin::Http(back), ResponseOrigin::Http(sent)) => {
+                    assert_eq!(back.refresh, sent.refresh);
+                    assert_eq!(
+                        back.policy.referrer_policy, sent.policy.referrer_policy,
+                        "the parsed policy survives"
+                    );
+                }
+                (ResponseOrigin::Local { .. }, ResponseOrigin::Local { .. }) => {}
+                _ => panic!("the response origin changed shape on the wire"),
+            }
+        }
+    }
+
     /// The handshake carries the identity, so the renderer's pages, its CSP
     /// reports, and CDP answers report the product the request headers do
     /// (<https://wicg.github.io/ua-client-hints/#http-ua-hints>).

@@ -688,9 +688,10 @@ impl Tab {
                 history: self.history.renderer_snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
-                ..ResponseHead::non_http(
-                    self.document_url.to_string(),
+                ..ResponseHead::local(
+                    self.document_url.clone(),
                     Some("text/html; charset=utf-8".to_owned()),
+                    None,
                 )
             },
             body: html.as_bytes().to_vec(),
@@ -849,10 +850,8 @@ impl Tab {
     }
 
     /// Records the browser-owned origin of the document the renderer mounted.
-    fn record_committed_origin(&self, url: &str) {
-        if let Some(renderer) = self.renderer.as_ref()
-            && let Ok(url) = Url::parse(url)
-        {
+    fn record_committed_origin(&self, url: &Url) {
+        if let Some(renderer) = self.renderer.as_ref() {
             renderer.set_committed_origin(url.origin());
         }
     }
@@ -983,7 +982,7 @@ impl Tab {
                 history: history.renderer_snapshot(),
                 viewport: Some(self.viewport),
                 init_scripts: self.init_scripts.clone(),
-                ..ResponseHead::non_http(url.to_string(), Some(content_type))
+                ..ResponseHead::local(url.clone(), Some(content_type), None)
             },
             body,
         };
@@ -1074,10 +1073,7 @@ impl Tab {
 
     /// Returns true when the new document mounted.
     async fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
-        let Ok(final_url) = Url::parse(&outcome.head.url) else {
-            self.navigation_failed = true;
-            return false;
-        };
+        let final_url = outcome.head.url.clone();
         let site = Site::for_url(&final_url).unwrap_or_else(|| Site::opaque(self.id));
         let mut history = self.history.clone();
         if !history.navigate(final_url.clone(), self.traversal.take()) {
@@ -1129,12 +1125,12 @@ impl Tab {
             BrowserEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
                     self.history.navigate(url.clone(), None);
+                    // The committed origin is an authorization input; record it
+                    // from the navigated URL, as a browser-initiated mount does
+                    // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+                    self.record_committed_origin(&url);
                     self.document_url = url;
                 }
-                // The committed origin is an authorization input; record it from
-                // the navigated URL, as a browser-initiated mount does
-                // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
-                self.record_committed_origin(url);
                 self.document_loaded = false;
                 self.navigation_failed = false;
                 self.record_event(TabEvent::Navigated).await;
@@ -1234,7 +1230,11 @@ impl Tab {
 
 fn blank_mount() -> Mount {
     Mount {
-        head: ResponseHead::non_http("about:blank", Some("text/html; charset=utf-8".to_owned())),
+        head: ResponseHead::local(
+            Url::parse("about:blank").expect("about:blank is a valid URL"),
+            Some("text/html; charset=utf-8".to_owned()),
+            None,
+        ),
         body: b"<!doctype html><title></title>".to_vec(),
     }
 }
