@@ -45,7 +45,7 @@ pub use protocol::{
     DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
     HistoryHandling, HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount,
     NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage, ReferrerRequest, RendererEvent,
-    RequestCache, RequestPolicy, ResourceLimit, ResponseBody, ResponseHead, ResponseOrigin,
+    RequestCache, RequestPolicy, ResourceLimit, ResponseBody, ResponseHead, ResponseSource,
     STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource,
     SerializedOrigin, StorageChange, StorageError, StorageHost, StorageKind, StreamId, TabError,
     TargetOrigin, TimerId, WindowId,

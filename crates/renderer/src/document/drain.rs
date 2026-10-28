@@ -393,9 +393,10 @@ impl Document {
             },
             &url,
             &self.dial_initiator(),
-            &self.referrer_url(),
         );
-        dial.req.referrer = crate::protocol::ReferrerRequest::Client;
+        dial.req.referrer = crate::protocol::ReferrerRequest::Client {
+            url: self.referrer_url(),
+        };
         dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
@@ -440,13 +441,23 @@ impl Document {
             crate::protocol::RequestPolicy::Fetch(fetch.options.cors),
             &url,
             &self.dial_initiator(),
-            &self.referrer_url(),
         );
         dial.req.method = fetch.method;
         dial.req.body = fetch.body;
         dial.req.content_type = fetch.content_type;
         dial.req.headers = fetch.headers;
-        dial.req.referrer = fetch.options.referrer;
+        // The dial is built after the request was queued, and a same-turn
+        // `history.replaceState` updates the client URL in between, so resolve
+        // the client branch against the document as it is now
+        // (<https://html.spec.whatwg.org/multipage/history.html#dom-history-replacestate>).
+        dial.req.referrer = match fetch.options.referrer {
+            crate::protocol::ReferrerRequest::Client { .. } => {
+                crate::protocol::ReferrerRequest::Client {
+                    url: self.referrer_url(),
+                }
+            }
+            referrer => referrer,
+        };
         // An unset request policy means the client's policy container
         // decides: resolve it here so every redirect hop re-determines with
         // the same policy the initial request used

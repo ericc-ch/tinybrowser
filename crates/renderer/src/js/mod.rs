@@ -209,7 +209,7 @@ pub(crate) struct DialOptions {
 }
 
 impl DialOptions {
-    fn from_js(options: &Object<'_>) -> rquickjs::Result<Self> {
+    fn from_js(options: &Object<'_>, client_url: &url::Url) -> rquickjs::Result<Self> {
         fn enum_member<T>(
             ctx: &Ctx<'_>,
             options: &Object<'_>,
@@ -242,9 +242,10 @@ impl DialOptions {
 
         let ctx = options.ctx();
         let referrer = match options.get::<_, Option<String>>("referrer")? {
-            Some(value) => crate::protocol::ReferrerRequest::from_idl(&value).ok_or_else(|| {
-                Exception::throw_type(ctx, &format!("referrer: {value:?} is not a referrer"))
-            })?,
+            Some(value) => crate::protocol::ReferrerRequest::from_idl(&value, client_url)
+                .ok_or_else(|| {
+                    Exception::throw_type(ctx, &format!("referrer: {value:?} is not a referrer"))
+                })?,
             None => crate::protocol::ReferrerRequest::NoReferrer,
         };
         let cors = crate::protocol::CorsRequest {
@@ -1110,6 +1111,7 @@ impl JsRealm {
         install_stream_host_functions(ctx, world)?;
         Self::install_csp_host_functions(ctx, world)?;
         let fetch_outbox = Rc::clone(&outbox);
+        let fetch_world = Rc::clone(world);
         bridge::object(ctx)?.set(
             "__queueFetch",
             Func::from(
@@ -1123,7 +1125,8 @@ impl JsRealm {
                     let headers = header_pairs(headers)?;
                     let method = net::Method::parse(&method)
                         .map_err(|_| rquickjs::Error::new_from_js("method", "HTTP method"))?;
-                    let options = DialOptions::from_js(&options)?;
+                    let client_url = fetch_world.borrow().referrer_url.clone();
+                    let options = DialOptions::from_js(&options, &client_url)?;
                     fetch_outbox
                         .borrow_mut()
                         .push_back(RealmRequest::Fetch(Box::new(JsFetchRequest {
@@ -1898,15 +1901,15 @@ fn install_sync_fetch(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), J
                 // options
                 // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
                 // <https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
+                let client_url = sync_world.borrow().referrer_url.clone();
                 let referrer = match options.get::<_, Option<String>>("referrer")? {
-                    Some(value) => {
-                        crate::protocol::ReferrerRequest::from_idl(&value).ok_or_else(|| {
+                    Some(value) => crate::protocol::ReferrerRequest::from_idl(&value, &client_url)
+                        .ok_or_else(|| {
                             Exception::throw_type(
                                 options.ctx(),
                                 &format!("referrer: {value:?} is not a referrer"),
                             )
-                        })?
-                    }
+                        })?,
                     None => crate::protocol::ReferrerRequest::default(),
                 };
                 let with_credentials = options
@@ -1976,7 +1979,6 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
         }),
         &parsed,
         &world.origin.ascii_serialization(),
-        &world.referrer_url,
     );
     dial.method = request.method;
     dial.body = request.body;

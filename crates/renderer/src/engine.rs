@@ -1165,7 +1165,9 @@ impl Engine {
                 let world = document.world();
                 let world = world.borrow();
                 (
-                    crate::protocol::ReferrerRequest::Client,
+                    crate::protocol::ReferrerRequest::Client {
+                        url: world.referrer_url.clone(),
+                    },
                     policy.or(world.policy.referrer_policy).unwrap_or_default(),
                 )
             }
@@ -1191,13 +1193,13 @@ impl Engine {
         let referrer = match referrer {
             crate::protocol::ReferrerRequest::NoReferrer => net::Referrer::NoReferrer,
             crate::protocol::ReferrerRequest::Url(url) => net::Referrer::Url(url),
-            crate::protocol::ReferrerRequest::Client => match self.frames.get(&initiator) {
+            crate::protocol::ReferrerRequest::Client { url } => match self.frames.get(&initiator) {
                 Some(document) => {
                     let world = document.world();
                     let world = world.borrow();
                     net::Referrer::Client(net::ReferrerClient {
                         origin: world.origin.clone(),
-                        url: world.referrer_url.clone(),
+                        url,
                     })
                 }
                 None => net::Referrer::NoReferrer,
@@ -1406,10 +1408,6 @@ impl Engine {
                 // policy
                 // (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
                 let (referrer, referrer_policy) = self.navigation_referrer(initiator, navigation);
-                let referrer_url = self
-                    .frames
-                    .get(&initiator)
-                    .map_or_else(|| url.clone(), Document::referrer_url);
                 // The embedder's `frame-src` gate re-checks every redirect hop,
                 // and the ancestor URLs back the child response's
                 // `frame-ancestors` check at commit — both only when the
@@ -1430,7 +1428,6 @@ impl Engine {
                         crate::protocol::RequestPolicy::FrameLoad,
                         url,
                         &origin.ascii_serialization(),
-                        &referrer_url,
                     );
                     request.referrer = referrer;
                     request.method.clone_from(&navigation.method);

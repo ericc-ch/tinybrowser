@@ -1232,19 +1232,17 @@ fn outbound_request(
     // (<https://fetch.spec.whatwg.org/#concept-request-referrer>,
     // <https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
     outbound.referrer = match &request.referrer {
-        renderer::ReferrerRequest::Client
-            if request.referrer_url.origin() == initiator.origin() =>
-        {
+        renderer::ReferrerRequest::Client { url } if url.origin() == initiator.origin() => {
             net::Referrer::Client(net::ReferrerClient {
                 origin: initiator.origin(),
-                url: request.referrer_url.clone(),
+                url: url.clone(),
             })
         }
         renderer::ReferrerRequest::Url(url) if referrer_authorized(url, initiator, sheets) => {
             net::Referrer::Url(url.clone())
         }
         renderer::ReferrerRequest::NoReferrer
-        | renderer::ReferrerRequest::Client
+        | renderer::ReferrerRequest::Client { .. }
         | renderer::ReferrerRequest::Url(_) => net::Referrer::NoReferrer,
     };
     outbound.referrer_policy = request.referrer_policy;
@@ -1528,8 +1526,7 @@ mod tests {
 
     fn dial(policy: RequestPolicy, url: &str) -> DialRequest {
         let url = Url::parse(url).expect("dial URL");
-        let page = Url::parse("http://a.test/page").expect("page URL");
-        DialRequest::new(policy, &url, "http://a.test/page", &page)
+        DialRequest::new(policy, &url, "http://a.test/page")
     }
 
     fn js_fetch(mode: renderer::CorsMode, url: &str) -> DialRequest {
@@ -1893,7 +1890,9 @@ mod tests {
         let mut stream_request =
             js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/stream"));
         stream_request.initiator = initiator.origin().ascii_serialization();
-        stream_request.referrer_url = initiator.clone();
+        stream_request.referrer = renderer::ReferrerRequest::Client {
+            url: initiator.clone(),
+        };
         stream_request.delivery = BodyDelivery::Stream;
         let outcome = handle
             .dial_request(&stream_request, &initiator, owner)
@@ -1918,7 +1917,9 @@ mod tests {
 
         let mut next_request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/done"));
         next_request.initiator = initiator.origin().ascii_serialization();
-        next_request.referrer_url = initiator.clone();
+        next_request.referrer = renderer::ReferrerRequest::Client {
+            url: initiator.clone(),
+        };
         let next = tokio::time::timeout(
             Duration::from_secs(1),
             handle.dial_request(&next_request, &initiator, owner),
@@ -2124,7 +2125,9 @@ mod tests {
         let owner = RendererAssignmentId::new(1);
         let mut request = js_fetch(renderer::CorsMode::SameOrigin, &format!("{origin}/etag"));
         request.initiator = initiator.origin().ascii_serialization();
-        request.referrer_url = initiator.clone();
+        request.referrer = renderer::ReferrerRequest::Client {
+            url: initiator.clone(),
+        };
         let first = handle
             .dial_request(&request, &initiator, owner)
             .await

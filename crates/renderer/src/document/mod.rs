@@ -211,15 +211,9 @@ impl QueuedDial {
         policy: crate::protocol::RequestPolicy,
         url: &Url,
         initiator: &url::Origin,
-        referrer_url: &Url,
     ) -> Self {
         Self {
-            req: crate::protocol::DialRequest::new(
-                policy,
-                url,
-                &initiator.ascii_serialization(),
-                referrer_url,
-            ),
+            req: crate::protocol::DialRequest::new(policy, url, &initiator.ascii_serialization()),
             context,
             ancestors: Vec::new(),
             integrity: None,
@@ -1868,8 +1862,8 @@ impl Document {
         // (blank, data) report zero rather than a previous page's status.
         // Violation `status-code` reports it
         // (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
-        self.http_status = head.origin.status();
-        self.set_reporting_endpoints(head.origin.reporting_endpoints());
+        self.http_status = head.source.status();
+        self.set_reporting_endpoints(head.source.reporting_endpoints());
         if let Some((width, height)) = head.viewport {
             self.viewport_size = (width, height);
         }
@@ -1902,18 +1896,18 @@ impl Document {
         // The origin variant decides both: an HTTP response carries the
         // policy its headers establish, and a local-scheme response carries
         // only what it inherited, so no field can override the other.
-        let policy = head.origin.policy();
+        let policy = head.source.policy();
         self.response_policy = policy.csp.clone();
         self.response_referrer_policy = policy.referrer_policy;
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
         self.mime_guard = crate::sniff::MimeGuard {
-            no_sniff: head.origin.no_sniff(),
-            http: head.origin.is_http(),
+            no_sniff: head.source.no_sniff(),
+            http: head.source.is_http(),
         };
         // A response `Refresh` starts the document's one declarative refresh
         // (<https://html.spec.whatwg.org/multipage/document-lifecycle.html#creating-and-initializing-a-document-object>).
-        if let Some(refresh) = head.origin.refresh() {
+        if let Some(refresh) = head.source.refresh() {
             self.start_declarative_refresh(refresh);
         }
     }
@@ -2865,13 +2859,7 @@ impl Document {
         content_type: &str,
         policy: crate::protocol::RequestPolicy,
     ) {
-        let mut dial = QueuedDial::new(
-            DialContext::CspReport,
-            policy,
-            url,
-            &self.dial_initiator(),
-            &self.referrer_url(),
-        );
+        let mut dial = QueuedDial::new(DialContext::CspReport, policy, url, &self.dial_initiator());
         dial.req.method = net::Method::POST;
         dial.req.body = body;
         dial.req.content_type = Some(content_type.to_owned());
@@ -3110,9 +3098,10 @@ impl Document {
             },
             &url,
             &self.dial_initiator(),
-            &self.referrer_url(),
         );
-        dial.req.referrer = crate::protocol::ReferrerRequest::Client;
+        dial.req.referrer = crate::protocol::ReferrerRequest::Client {
+            url: self.referrer_url(),
+        };
         dial.req.referrer_policy = referrer_policy;
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
@@ -3411,11 +3400,11 @@ impl Document {
             outcome.content_type.clone(),
             &outcome.headers,
         );
-        let policy = &head.origin.policy().csp;
+        let policy = &head.source.policy().csp;
         // Set before the `frame-ancestors` decision: a refused response
         // dispatches its violations on the fallback document against the new
         // response's endpoints.
-        self.set_reporting_endpoints(head.origin.reporting_endpoints());
+        self.set_reporting_endpoints(head.source.reporting_endpoints());
         if embedder.is_some()
             && !ancestors.is_empty()
             && self.note_frame_ancestors_block(embedder, url, policy, ancestors)
@@ -3995,7 +3984,9 @@ impl Document {
                     (crate::protocol::ReferrerRequest::Url(sheet), policy)
                 }
                 None => (
-                    crate::protocol::ReferrerRequest::Client,
+                    crate::protocol::ReferrerRequest::Client {
+                        url: self.referrer_url(),
+                    },
                     self.subresource_referrer(element),
                 ),
             };
@@ -4007,7 +3998,6 @@ impl Document {
                 policy,
                 &fetch.url,
                 &self.dial_initiator(),
-                &self.referrer_url(),
             );
             dial.req.referrer = referrer;
             dial.req.referrer_policy = referrer_policy;

@@ -466,8 +466,7 @@ mod tests {
             RequestPolicy::CspReportUri,
         ] {
             let url = url::Url::parse("https://a.test/x").expect("URL");
-            let page = url::Url::parse("https://a.test/").expect("URL");
-            let request = renderer::DialRequest::new(policy, &url, "https://a.test/", &page);
+            let request = renderer::DialRequest::new(policy, &url, "https://a.test/");
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
                 body: crate::wire::BrowserCall {
@@ -503,7 +502,7 @@ mod tests {
     /// decoder that could not name it would drop every navigation.
     #[test]
     fn a_response_head_round_trips_both_origins() {
-        use renderer::{ResponseHead, ResponseOrigin};
+        use renderer::{ResponseHead, ResponseSource};
         let url = url::Url::parse("https://a.test/").expect("URL");
         let http = ResponseHead::http(
             204,
@@ -545,14 +544,14 @@ mod tests {
                 panic!("expected a response frame");
             };
             assert_eq!(response.head.url, head.url);
-            assert_eq!(response.head.origin.is_http(), head.origin.is_http());
-            assert_eq!(response.head.origin.status(), head.origin.status());
+            assert_eq!(response.head.source.is_http(), head.source.is_http());
+            assert_eq!(response.head.source.status(), head.source.status());
             assert_eq!(
                 response.head.content_type.as_deref(),
                 head.content_type.as_deref()
             );
-            match (&response.head.origin, &head.origin) {
-                (ResponseOrigin::Http(back), ResponseOrigin::Http(sent)) => {
+            match (&response.head.source, &head.source) {
+                (ResponseSource::Http(back), ResponseSource::Http(sent)) => {
                     assert_eq!(back.refresh, sent.refresh);
                     assert_eq!(
                         back.policy.referrer_policy, sent.policy.referrer_policy,
@@ -560,8 +559,8 @@ mod tests {
                     );
                 }
                 (
-                    ResponseOrigin::Local { inherited: back },
-                    ResponseOrigin::Local { inherited: sent },
+                    ResponseSource::Local { inherited: back },
+                    ResponseSource::Local { inherited: sent },
                 ) => {
                     assert_eq!(
                         back.as_ref().and_then(|policy| policy.referrer_policy),

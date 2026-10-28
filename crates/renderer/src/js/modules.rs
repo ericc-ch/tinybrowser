@@ -128,9 +128,8 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         crate::protocol::RequestPolicy::ModuleScript { crossorigin },
         &url,
         &initiator,
-        &referrer_url,
     );
-    request.referrer = crate::protocol::ReferrerRequest::Client;
+    request.referrer = crate::protocol::ReferrerRequest::Client { url: referrer_url };
     request.csp = Some(Box::new(gate));
     request.referrer_policy = referrer_policy;
     let cancel = services.start_dial(

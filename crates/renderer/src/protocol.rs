@@ -363,7 +363,7 @@ pub struct ResponseHead {
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
     pub init_scripts: Vec<(u64, String)>,
     /// Whether this document came from an HTTP response or a local scheme.
-    pub origin: ResponseOrigin,
+    pub source: ResponseSource,
 }
 
 /// What produced one document. An HTTP response carries the status and the
@@ -372,7 +372,7 @@ pub struct ResponseHead {
 /// it inherits from its initiator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ResponseOrigin {
+pub enum ResponseSource {
     /// A document fetched over HTTP(S).
     Http(HttpHead),
     /// A document whose bytes never came over the network.
@@ -405,7 +405,7 @@ pub struct HttpHead {
     pub no_sniff: bool,
 }
 
-impl ResponseOrigin {
+impl ResponseSource {
     /// The HTTP status a violation reports; documents without an HTTP response
     /// carry zero
     /// (<https://w3c.github.io/webappsec-csp/#create-violation-for-global>).
@@ -484,7 +484,7 @@ impl ResponseHead {
             history: HistorySnapshot::default(),
             viewport: None,
             init_scripts: Vec::new(),
-            origin: ResponseOrigin::Http(HttpHead {
+            source: ResponseSource::Http(HttpHead {
                 status,
                 policy: PolicyContainer {
                     csp: crate::csp::List::from_headers(
@@ -528,7 +528,7 @@ impl ResponseHead {
             history: HistorySnapshot::default(),
             viewport: None,
             init_scripts: Vec::new(),
-            origin: ResponseOrigin::Local { inherited },
+            source: ResponseSource::Local { inherited },
         }
     }
 }
@@ -643,9 +643,14 @@ pub enum ReferrerRequest {
     /// No `Referer` at all.
     #[default]
     NoReferrer,
-    /// The initiator document: the browser reads [`DialRequest::referrer_url`]
-    /// and keeps it only when it is same-origin with the authorized initiator.
-    Client,
+    /// The initiator document's URL, walked out of any `srcdoc` chain. The
+    /// browser keeps it only when it is same-origin with the authorized
+    /// initiator
+    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
+    Client {
+        /// The document URL the `"client"` branch reads.
+        url: Url,
+    },
     /// An explicit source URL: the document's referrer for a navigation, or a
     /// style sheet's URL for a CSS-initiated request. The browser authorizes
     /// it the same way it authorizes a navigation's referrer.
@@ -655,13 +660,16 @@ pub enum ReferrerRequest {
 impl ReferrerRequest {
     /// The IDL spelling: `""`, `"about:client"`, or a URL
     /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
+    /// `client_url` is the document the `"client"` spelling resolves to.
     #[must_use]
-    pub fn from_idl(value: &str) -> Option<Self> {
+    pub fn from_idl(value: &str, client_url: &Url) -> Option<Self> {
         if value.is_empty() {
             return Some(Self::NoReferrer);
         }
         if value.eq_ignore_ascii_case("about:client") {
-            return Some(Self::Client);
+            return Some(Self::Client {
+                url: client_url.clone(),
+            });
         }
         Url::parse(value).ok().map(Self::Url)
     }
@@ -694,10 +702,6 @@ pub struct DialRequest {
     /// client environment and verifies an explicit URL is authorized
     /// (<https://fetch.spec.whatwg.org/#concept-request-referrer>).
     pub referrer: ReferrerRequest,
-    /// The document URL the [`ReferrerRequest::Client`] branch reads, walked
-    /// out of `srcdoc` to the container document
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-    pub referrer_url: Url,
     /// Caller deadline in milliseconds. `0` keeps the carrier timeout.
     /// A synchronous XHR uses its `timeout` attribute here
     /// (<https://xhr.spec.whatwg.org/#the-timeout-attribute>).
@@ -730,12 +734,11 @@ impl DialRequest {
     /// cache mode, and no referrer. Callers with more to say set the fields
     /// their request adds.
     #[must_use]
-    pub fn new(policy: RequestPolicy, url: &Url, initiator: &str, referrer_url: &Url) -> Self {
+    pub fn new(policy: RequestPolicy, url: &Url, initiator: &str) -> Self {
         Self {
             policy,
             url: url.clone(),
             initiator: initiator.to_owned(),
-            referrer_url: referrer_url.clone(),
             delivery: BodyDelivery::Buffer,
             method: net::Method::GET,
             body: Vec::new(),
@@ -1636,19 +1639,19 @@ mod response_head_tests {
                 ..PolicyContainer::default()
             }),
         );
-        assert_eq!(head.origin.status(), 0);
-        assert_eq!(head.origin.refresh(), None);
-        assert_eq!(head.origin.reporting_endpoints(), None);
-        assert!(!head.origin.no_sniff());
-        assert!(!head.origin.is_http());
+        assert_eq!(head.source.status(), 0);
+        assert_eq!(head.source.refresh(), None);
+        assert_eq!(head.source.reporting_endpoints(), None);
+        assert!(!head.source.no_sniff());
+        assert!(!head.source.is_http());
         assert_eq!(
-            head.origin.policy().referrer_policy,
+            head.source.policy().referrer_policy,
             Some(net::ReferrerPolicy::NoReferrer),
             "the inherited container is the only policy source"
         );
 
         let inherited = ResponseHead::local(url("about:blank"), None, None);
-        assert_eq!(inherited.origin.policy().referrer_policy, None);
+        assert_eq!(inherited.source.policy().referrer_policy, None);
     }
 
     /// An HTTP head parses its policy once, from the headers, and reports the
@@ -1670,17 +1673,17 @@ mod response_head_tests {
             Some("text/html".to_owned()),
             &headers,
         );
-        assert_eq!(head.origin.status(), 204);
-        assert!(head.origin.is_http());
-        assert!(head.origin.no_sniff());
-        assert_eq!(head.origin.refresh(), Some("0; url=/next"));
+        assert_eq!(head.source.status(), 204);
+        assert!(head.source.is_http());
+        assert!(head.source.no_sniff());
+        assert_eq!(head.source.refresh(), Some("0; url=/next"));
         assert_eq!(
-            head.origin.policy().referrer_policy,
+            head.source.policy().referrer_policy,
             Some(net::ReferrerPolicy::Origin)
         );
         let document = url("https://example.test/");
         let gate = crate::csp::RedirectGate::new(
-            head.origin.policy().csp.clone(),
+            head.source.policy().csp.clone(),
             &document.origin(),
             crate::csp::Destination::Script,
         );
