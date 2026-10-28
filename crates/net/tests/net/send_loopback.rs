@@ -1060,14 +1060,78 @@ async fn an_opaque_response_keeps_the_internal_header_list() {
         Some(b"kept".as_slice()),
         "the unsafe response keeps every field the server sent"
     );
+    let filtered = response.filtered();
+    assert_eq!(filtered.status(), 0, "page script sees no status");
     assert!(
-        response.exposed_headers().is_empty(),
+        filtered.headers().is_empty(),
         "page script sees no field of an opaque response"
     );
+    assert!(filtered.url().is_none(), "page script sees no URL");
     assert_eq!(
         read_body(response.into_body().await).await.expect("body"),
         b"png",
         "the body still arrives for the engine consumer"
     );
+    server.assert_clean();
+}
+
+/// A `no-cors` request whose redirect mode is `error` is still sent, and a
+/// redirect response is the error. CSP's deprecated `report-uri` delivery is
+/// exactly that request, and it has to reach the collector
+/// (<https://w3c.github.io/webappsec-csp/#report-violation>).
+#[tokio::test]
+async fn a_no_cors_error_request_is_sent_and_refuses_a_redirect() {
+    let landing = url::Url::parse("https://b.test/landed").expect("landing URL");
+    let server = scripted([canned_redirect(302, landing.as_str())]);
+    let origin = url::Url::parse("https://a.test/")
+        .expect("origin URL")
+        .origin();
+    let mut request = Request::new(Method::POST, server.url("/report"));
+    request.cors = net::cors::CorsSettings {
+        redirect: net::cors::RedirectMode::Error,
+        ..cors_settings(
+            net::cors::RequestMode::NoCors,
+            net::cors::CredentialsMode::SameOrigin,
+            origin,
+        )
+    };
+    assert!(
+        matches!(
+            default_agent().send(request).await,
+            Err(NetError::Protocol(ProtocolError::RejectedRequest))
+        ),
+        "the redirect response is a network error"
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "the request still reached the collector"
+    );
+    server.assert_clean();
+}
+
+/// A `no-cors` request that asks for `manual` would hand page script an
+/// opaque-redirect response main fetch forbids, so it never leaves the agent
+/// (<https://fetch.spec.whatwg.org/#main-fetch>).
+#[tokio::test]
+async fn a_no_cors_manual_request_is_refused_before_sending() {
+    let server = scripted([canned_ok(&[], b"must not arrive")]);
+    let origin = url::Url::parse("https://a.test/")
+        .expect("origin URL")
+        .origin();
+    let mut request = Request::new(Method::GET, server.url("/"));
+    request.cors = net::cors::CorsSettings {
+        redirect: net::cors::RedirectMode::Manual,
+        ..cors_settings(
+            net::cors::RequestMode::NoCors,
+            net::cors::CredentialsMode::Include,
+            origin,
+        )
+    };
+    assert!(matches!(
+        default_agent().send(request).await,
+        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+    ));
+    assert_eq!(server.requests().len(), 0);
     server.assert_clean();
 }

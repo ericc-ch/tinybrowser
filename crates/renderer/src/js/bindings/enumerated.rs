@@ -212,14 +212,11 @@ enumerated! {
     }
 }
 
-/// `crossorigin` belongs to the document layer too, which decides an image's
-/// credentials, so the keyword set lives in `dom` and reflection delegates to
-/// it here.
-impl Enumerated for crate::dom::microsyntaxes::CrossOrigin {
-    const KEYWORDS: &'static [Self] = crate::dom::microsyntaxes::CrossOrigin::KEYWORDS;
+impl Enumerated for net::cors::CrossOrigin {
+    const KEYWORDS: &'static [Self] = net::cors::CrossOrigin::KEYWORDS;
 
     fn keyword(self) -> &'static str {
-        crate::dom::microsyntaxes::CrossOrigin::keyword(self)
+        net::cors::CrossOrigin::keyword(self)
     }
 }
 
@@ -268,7 +265,7 @@ mod tests {
         assert_round_trip::<TableScope>();
         assert_round_trip::<LinkAs>();
         assert_round_trip::<TrackKind>();
-        assert_round_trip::<crate::dom::microsyntaxes::CrossOrigin>();
+        assert_round_trip::<net::cors::CrossOrigin>();
         assert_round_trip::<net::ReferrerPolicy>();
     }
 }

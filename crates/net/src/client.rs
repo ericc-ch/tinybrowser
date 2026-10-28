@@ -493,11 +493,7 @@ impl Agent {
             let hop_status = response.status();
             if self.max_redirects == 0 {
                 cors_gate(&response, &dial, &hop)?;
-                return Ok(finalize(
-                    response,
-                    hop.response_type,
-                    dial.credentials_include(),
-                ));
+                return Ok(response);
             }
             // A redirect response's `Referrer-Policy` field updates the
             // request's policy for the remaining hops
@@ -620,7 +616,8 @@ impl Agent {
         // URL-credentials `Authorization` header
         // (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>,
         // <https://fetch.spec.whatwg.org/#http-network-or-cache-fetch>).
-        let send_credentials = credentials_admitted(dial.cors.credentials, cross_origin);
+        let send_credentials =
+            crate::cors::credentials_admitted(dial.cors.credentials, cross_origin);
         if send_credentials {
             apply_url_credentials(&mut hop_headers, url)?;
         } else {
@@ -659,8 +656,17 @@ impl Agent {
             },
             content_encoding,
             redirect_count: 0,
-            filtering: hop.response_type,
-            credentials_include: false,
+            // The filtered projection is decided once, here, from the tainting
+            // the hop reached and the credentials mode it was sent under
+            // (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
+            filtering: match hop.response_type {
+                crate::cors::ResponseType::Basic => crate::cors::Filtering::Basic,
+                crate::cors::ResponseType::Cors => crate::cors::Filtering::Cors {
+                    credentials_include: dial.credentials_include(),
+                },
+                crate::cors::ResponseType::Opaque => crate::cors::Filtering::Opaque,
+                crate::cors::ResponseType::OpaqueRedirect => crate::cors::Filtering::OpaqueRedirect,
+            },
             referrer: None,
             crossed_origin: hop.crossed_origin,
         };
@@ -917,27 +923,103 @@ fn hop_taint(
             Err(NetError::Protocol(ProtocolError::RejectedRequest))
         }
         crate::cors::RequestMode::Cors => Ok(crate::cors::ResponseType::Cors),
-        // A cross-origin `no-cors` request must follow redirects; any other
-        // redirect mode is a network error
+        // A cross-origin `no-cors` request is opaque. A non-following
+        // redirect mode is decided when a 3xx response arrives, not before the
+        // request is sent: main fetch would refuse it up front, but CSP's
+        // `report-uri` delivery is a `no-cors` request whose redirect mode is
+        // `"error"`, and Chromium sends it anyway (docs/upstream.md). A
+        // `manual` request would hand page script an opaque-redirect response
+        // that main fetch forbids, so that one still fails before sending
         // (<https://fetch.spec.whatwg.org/#main-fetch>).
-        crate::cors::RequestMode::NoCors => {
-            if settings.redirect == crate::cors::RedirectMode::Follow {
-                Ok(crate::cors::ResponseType::Opaque)
-            } else {
+        crate::cors::RequestMode::NoCors => match settings.redirect {
+            crate::cors::RedirectMode::Manual => {
                 Err(NetError::Protocol(ProtocolError::RejectedRequest))
             }
-        }
+            crate::cors::RedirectMode::Follow | crate::cors::RedirectMode::Error => {
+                Ok(crate::cors::ResponseType::Opaque)
+            }
+        },
     }
 }
 
-/// Whether a credentials mode admits credentials for a hop that is (or is
-/// not) cross-origin
-/// (<https://fetch.spec.whatwg.org/#concept-request-credentials-mode>).
-fn credentials_admitted(mode: crate::cors::CredentialsMode, cross_origin: bool) -> bool {
-    match mode {
-        crate::cors::CredentialsMode::Omit => false,
-        crate::cors::CredentialsMode::SameOrigin => !cross_origin,
-        crate::cors::CredentialsMode::Include => true,
+/// The page's view of one response
+/// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
+///
+/// Every accessor returns the filtered value: an opaque response has status 0,
+/// an empty status message, no header list, and no URL, so a caller cannot
+/// reach the internal response through this type.
+pub struct FilteredResponse<'a> {
+    response: &'a Response,
+}
+
+impl<'a> FilteredResponse<'a> {
+    /// The filtered status code: 0 for an opaque response.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        if self.response.is_opaque() {
+            0
+        } else {
+            self.response.status
+        }
+    }
+
+    /// The filtered status message: empty for an opaque response.
+    #[must_use]
+    pub fn status_text(&self) -> &'a str {
+        if self.response.is_opaque() {
+            ""
+        } else {
+            &self.response.status_text
+        }
+    }
+
+    /// The filtered URL, or `None` for an opaque response, whose URL list is
+    /// empty
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+    #[must_use]
+    pub fn url(&self) -> Option<&'a Url> {
+        if self.response.filtering == crate::cors::Filtering::Opaque {
+            None
+        } else {
+            Some(&self.response.final_url)
+        }
+    }
+
+    /// How the response was filtered.
+    #[must_use]
+    pub fn response_type(&self) -> crate::cors::ResponseType {
+        self.response.response_type()
+    }
+
+    /// The header list page script may read, in wire order: a `basic` response
+    /// keeps every field but the forbidden response-header names, a `cors`
+    /// response keeps its safelisted and explicitly exposed fields, and an
+    /// opaque response keeps none
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
+    ///
+    /// The entries borrow the internal map; nothing is cloned.
+    #[must_use]
+    pub fn headers(&self) -> Vec<(&'a str, &'a [u8])> {
+        match self.response.filtering {
+            crate::cors::Filtering::Basic => self
+                .response
+                .headers
+                .iter()
+                .filter(|(name, _)| !crate::cors::is_forbidden_response_header(name))
+                .collect(),
+            crate::cors::Filtering::Cors {
+                credentials_include,
+            } => {
+                let rule =
+                    crate::cors::ExposedHeaders::new(&self.response.headers, credentials_include);
+                self.response
+                    .headers
+                    .iter()
+                    .filter(|(name, _)| rule.keeps(name))
+                    .collect()
+            }
+            crate::cors::Filtering::Opaque | crate::cors::Filtering::OpaqueRedirect => Vec::new(),
+        }
     }
 }
 
@@ -978,18 +1060,12 @@ fn classify_response(
     if settings.redirect == crate::cors::RedirectMode::Manual
         && matches!(response.status(), 301 | 302 | 303 | 307 | 308)
     {
-        return Ok(HopOutcome::Final(Box::new(finalize(
-            response,
-            crate::cors::ResponseType::OpaqueRedirect,
-            dial.credentials_include(),
-        ))));
+        let mut response = response;
+        response.filtering = crate::cors::Filtering::OpaqueRedirect;
+        return Ok(HopOutcome::Final(Box::new(response)));
     }
     let Some(location) = followable_location(response.status(), response.internal_headers()) else {
-        return Ok(HopOutcome::Final(Box::new(finalize(
-            response,
-            hop.response_type,
-            dial.credentials_include(),
-        ))));
+        return Ok(HopOutcome::Final(Box::new(response)));
     };
     let next = resolve_location(current_url, &location)?;
     // A redirect to a URL that includes credentials is a network error
@@ -1025,24 +1101,6 @@ fn reason_phrase(status: u16, http2: bool) -> String {
         .and_then(|status| status.canonical_reason())
         .unwrap_or("")
         .to_owned()
-}
-
-/// Records a response's CORS filtering, which decides the header list
-/// [`Response::exposed_headers`] builds
-/// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
-///
-/// The internal header list stays as served. Filtering produces the *filtered*
-/// response a page sees; an internal consumer reads the unsafe response, which
-/// keeps its status, URL, header list, and body
-/// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
-fn finalize(
-    mut response: Response,
-    response_type: crate::cors::ResponseType,
-    credentials_include: bool,
-) -> Response {
-    response.filtering = response_type;
-    response.credentials_include = credentials_include;
-    response
 }
 
 fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) -> Result<(), NetError> {
@@ -1260,8 +1318,7 @@ pub struct Response {
     body: RawBody,
     content_encoding: Vec<String>,
     redirect_count: u32,
-    filtering: crate::cors::ResponseType,
-    credentials_include: bool,
+    filtering: crate::cors::Filtering,
     referrer: Option<Url>,
     crossed_origin: bool,
 }
@@ -1279,11 +1336,19 @@ impl Response {
         &self.status_text
     }
 
-    /// How the response was filtered: basic, CORS, or opaque
+    /// How the response was filtered for page script: basic, CORS, or opaque
     /// (<https://fetch.spec.whatwg.org/#concept-response-type>).
     #[must_use]
     pub fn response_type(&self) -> crate::cors::ResponseType {
-        self.filtering
+        self.filtering.response_type()
+    }
+
+    /// Whether the filtered projection is opaque: no status, URL, headers, or
+    /// body reach page script
+    /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
+    #[must_use]
+    pub fn is_opaque(&self) -> bool {
+        self.filtering.is_opaque()
     }
 
     /// Whether any hop's URL origin differed from the request's origin, which
@@ -1297,37 +1362,23 @@ impl Response {
     /// The internal response's header list, before any filtering: every field
     /// the server sent, `Set-Cookie` included.
     ///
-    /// A page `fetch`/XHR reports [`Response::exposed_headers`] instead. An
-    /// internal consumer — an image decoder, a script compiler, a style sheet
-    /// parser — reads this one, because the spec's own algorithms read the
-    /// unsafe response, not the filtered one
+    /// A page `fetch`/XHR reports [`Response::filtered`] instead. An internal
+    /// consumer — an image decoder, a script compiler, a style sheet parser —
+    /// reads this one, because the spec's own algorithms read the unsafe
+    /// response, not the filtered one
     /// (<https://fetch.spec.whatwg.org/#concept-internal-response>).
     #[must_use]
     pub fn internal_headers(&self) -> &HeaderMap {
         &self.headers
     }
 
-    /// The header list a page `fetch`/XHR exposes: a `basic` response keeps
-    /// every field but the forbidden response-header names, a `cors` response
-    /// keeps only its safelisted and explicitly exposed fields, and an opaque
-    /// response keeps none
+    /// The filtered response page script may observe: its status, URL, headers,
+    /// and redirect flag already projected through [`Filtering`](crate::cors::Filtering). The internal
+    /// response stays out of reach through this type
     /// (<https://fetch.spec.whatwg.org/#concept-filtered-response>).
-    ///
-    /// Computed on demand: an internal consumer never asks, so a subresource
-    /// dial does not pay for a second header list.
     #[must_use]
-    pub fn exposed_headers(&self) -> HeaderMap {
-        match self.filtering {
-            crate::cors::ResponseType::Cors => {
-                crate::cors::exposed_response_headers(&self.headers, self.credentials_include)
-            }
-            crate::cors::ResponseType::Opaque | crate::cors::ResponseType::OpaqueRedirect => {
-                crate::cors::opaque_response_headers()
-            }
-            crate::cors::ResponseType::Basic => {
-                crate::cors::visible_response_headers(&self.headers)
-            }
-        }
+    pub fn filtered(&self) -> FilteredResponse<'_> {
+        FilteredResponse { response: self }
     }
 
     /// URL after redirects. Fragments from the original request are preserved.
@@ -1353,9 +1404,9 @@ impl Response {
 
     /// Consumes the response and returns its decoded body stream.
     ///
-    /// This is the *internal* response's body. A page `fetch` reports it only
-    /// when the filtered response has one; an opaque one has none, so the
-    /// caller that hands a body to script must mask it
+    /// This is the *internal* response's body. A page `fetch` gets it only when
+    /// [`Filtering::is_opaque`](crate::cors::Filtering::is_opaque) is false; an
+    /// opaque filtered response has a null body
     /// (<https://fetch.spec.whatwg.org/#concept-filtered-response-opaque>).
     pub async fn into_body(self) -> Body {
         Body::decoded(self.body, &self.content_encoding).await

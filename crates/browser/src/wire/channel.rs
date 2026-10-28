@@ -440,43 +440,36 @@ mod tests {
     /// the browser would send with another mode.
     #[test]
     fn a_dial_request_round_trips_every_policy() {
-        use renderer::{CorsMode, CorsRequest, CrossOrigin, RequestPolicy};
+        use renderer::{CorsMode, CorsRequest, RequestPolicy};
         let cors = CorsRequest {
             mode: CorsMode::SameOrigin,
             credentials: net::cors::CredentialsMode::Include,
             redirect: net::cors::RedirectMode::Follow,
         };
         for policy in [
-            RequestPolicy::fetch(cors),
-            RequestPolicy::classic_script(Some(CrossOrigin::UseCredentials)),
-            RequestPolicy::module_script(Some(CrossOrigin::Anonymous)),
-            RequestPolicy::module_script(None),
-            RequestPolicy::stylesheet(None),
-            RequestPolicy::image(Some(CrossOrigin::Anonymous)),
-            RequestPolicy::font(),
-            RequestPolicy::frame_load(),
-            RequestPolicy::csp_report_to(),
-            RequestPolicy::csp_report_uri(),
+            RequestPolicy::Fetch(cors),
+            RequestPolicy::ClassicScript {
+                crossorigin: Some(net::cors::CrossOrigin::UseCredentials),
+            },
+            RequestPolicy::ModuleScript {
+                crossorigin: Some(net::cors::CrossOrigin::Anonymous),
+            },
+            RequestPolicy::ModuleScript { crossorigin: None },
+            RequestPolicy::Stylesheet { crossorigin: None },
+            RequestPolicy::Image {
+                crossorigin: Some(net::cors::CrossOrigin::Anonymous),
+            },
+            RequestPolicy::Font,
+            RequestPolicy::FrameLoad,
+            RequestPolicy::CspReportTo,
+            RequestPolicy::CspReportUri,
         ] {
-            let request = renderer::DialRequest {
+            let request = renderer::DialRequest::new(
                 policy,
-                url: "https://a.test/x".to_owned(),
-                initiator: "https://a.test/".to_owned(),
-                referrer_url: "https://a.test/".to_owned(),
-                delivery: renderer::BodyDelivery::Buffer,
-                method: net::Method::GET,
-                body: Vec::new(),
-                content_type: None,
-                headers: Vec::new(),
-                referrer: net::Referrer::NoReferrer,
-                timeout_ms: 0,
-                csp: None,
-                keepalive: false,
-                body_len: 0,
-                integrity: None,
-                cache: renderer::RequestCache::Default,
-                referrer_policy: net::ReferrerPolicy::default(),
-            };
+                "https://a.test/x",
+                "https://a.test/",
+                "https://a.test/",
+            );
             let message: crate::wire::FromRenderer = crate::exchange::Frame::Call {
                 id: crate::exchange::RequestId::new(1),
                 body: crate::wire::BrowserCall {
@@ -503,11 +496,7 @@ mod tests {
             else {
                 panic!("expected a dial");
             };
-            assert_eq!(request.policy.kind(), policy.kind());
-            assert_eq!(request.policy.mode(), policy.mode());
-            assert_eq!(request.policy.credentials(), policy.credentials());
-            assert_eq!(request.policy.redirect(), policy.redirect());
-            assert_eq!(request.policy.exposes_response(), policy.exposes_response());
+            assert_eq!(request.policy, policy, "the policy survives the wire");
         }
     }
 

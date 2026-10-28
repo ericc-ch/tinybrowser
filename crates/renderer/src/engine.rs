@@ -1404,31 +1404,19 @@ impl Engine {
                         (None, None, Vec::new())
                     };
                 if let Some(document) = self.frames.get_mut(&child) {
-                    document.navigate(
-                        embedder,
-                        crate::protocol::DialRequest {
-                            policy: crate::protocol::RequestPolicy::frame_load(),
-                            url: url.to_string(),
-                            initiator: origin.ascii_serialization(),
-                            referrer_url,
-                            // The frame's document always reads the body.
-                            delivery: crate::protocol::BodyDelivery::Buffer,
-                            method: navigation.method.clone(),
-                            body: navigation.body.clone(),
-                            content_type: navigation.content_type.clone(),
-                            headers: Vec::new(),
-                            referrer,
-                            timeout_ms: 0,
-                            csp: gate.map(Box::new),
-                            keepalive: false,
-                            body_len: 0,
-                            integrity: None,
-                            cache: crate::protocol::RequestCache::Default,
-                            referrer_policy,
-                        },
-                        ancestors,
-                        navigation.sandbox,
+                    let mut request = crate::protocol::DialRequest::new(
+                        crate::protocol::RequestPolicy::FrameLoad,
+                        url.as_str(),
+                        &origin.ascii_serialization(),
+                        &referrer_url,
                     );
+                    request.method.clone_from(&navigation.method);
+                    request.body.clone_from(&navigation.body);
+                    request.content_type.clone_from(&navigation.content_type);
+                    request.referrer = referrer;
+                    request.csp = gate.map(Box::new);
+                    request.referrer_policy = referrer_policy;
+                    document.navigate(embedder, request, ancestors, navigation.sandbox);
                 }
             }
             _ => {

@@ -389,7 +389,9 @@ impl Document {
         let referrer_policy = self.subresource_referrer(Some(element));
         let mut dial = QueuedDial::new(
             DialContext::ClassicScript { element },
-            crate::protocol::RequestPolicy::classic_script(self.cross_origin(Some(element))),
+            crate::protocol::RequestPolicy::ClassicScript {
+                crossorigin: self.cross_origin(Some(element)),
+            },
             &url,
             &self.dial_initiator(),
             &self.referrer_url(),
@@ -436,7 +438,7 @@ impl Document {
         }
         let mut dial = QueuedDial::new(
             DialContext::JsFetch { id: fetch.js_id },
-            crate::protocol::RequestPolicy::fetch(fetch.options.cors),
+            crate::protocol::RequestPolicy::Fetch(fetch.options.cors),
             &url,
             &self.dial_initiator(),
             &self.referrer_url(),

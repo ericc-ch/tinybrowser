@@ -1256,6 +1256,18 @@ impl SandboxFlags {
     }
 }
 
+/// The request inputs an element's own attributes supply: its `crossorigin`
+/// CORS settings state and its `referrerpolicy` override
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
+/// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attributes>).
+#[derive(Default)]
+pub(crate) struct SubresourceOptions {
+    /// The `crossorigin` CORS settings state; `None` is the `No CORS` state.
+    pub(crate) crossorigin: Option<net::cors::CrossOrigin>,
+    /// The element's `referrerpolicy`, when it names one.
+    pub(crate) referrer_policy: Option<net::ReferrerPolicy>,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -1893,6 +1905,31 @@ impl World {
             store.get(id.document_id())
         })
         .ok()
+    }
+
+    /// The fetch-relevant attributes of a subresource element: its
+    /// `crossorigin` state and its `referrerpolicy` override, read from one
+    /// document lookup.
+    ///
+    /// Both are per-request inputs, not reflected properties the load path may
+    /// re-derive, so one helper keeps the load and every reader of the
+    /// attribute in agreement
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>,
+    /// <https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
+    pub(crate) fn subresource_options(&self, element: NodeId) -> SubresourceOptions {
+        let Some(parsed) = self.document(element) else {
+            return SubresourceOptions::default();
+        };
+        let base = &parsed.document.base;
+        SubresourceOptions {
+            crossorigin: crate::dom::microsyntaxes::cross_origin(crate::dom::tree::attr(
+                base,
+                element.node,
+                "crossorigin",
+            )),
+            referrer_policy: crate::dom::tree::attr(base, element.node, "referrerpolicy")
+                .and_then(net::ReferrerPolicy::parse),
+        }
     }
 
     /// The tree store, for realm-free algorithms that take `&DocumentStore`.

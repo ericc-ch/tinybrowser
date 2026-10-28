@@ -36,7 +36,6 @@ mod storage;
 mod test_services;
 mod xml;
 
-pub use dom::microsyntaxes::CrossOrigin;
 pub use embedded::EmbeddedRenderer;
 pub use engine::{DEFAULT_VIEWPORT, Engine, decode_data_url, decode_data_url_bounded};
 pub use js::{Stop, TURN_SCRIPT_BUDGET};

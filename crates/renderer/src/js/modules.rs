@@ -6,7 +6,7 @@ use rquickjs::module::Declared;
 use rquickjs::{Ctx, Error, Module, Result};
 use url::Url;
 
-use crate::protocol::{BodyDelivery, DialRequest, RequestCache};
+use crate::protocol::DialRequest;
 
 pub(super) struct WebModuleResolver;
 
@@ -87,35 +87,26 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     let world_rc = super::bindings::world(ctx)?;
     let (services, initiator, referrer_url, referrer_policy, crossorigin, gate) = {
         let world = world_rc.borrow();
-        // A module fetched on behalf of a classic script keeps that script
-        // element's `referrerpolicy` and `crossorigin`: dynamic `import()`
-        // inherits both from the script that initiated it, which is how a
-        // `<script src="data:..." referrerpolicy=origin>` controls the module
-        // it imports and how `crossorigin="use-credentials"` selects its
-        // credentials mode
-        // (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-a-single-module-script>).
-        let element = world.state.current_script;
-        let element_policy = element.and_then(|id| {
-            let parsed = world.document(id)?;
-            crate::dom::tree::attr(&parsed.document.base, id.node, "referrerpolicy")
-                .and_then(net::ReferrerPolicy::parse)
-        });
-        let crossorigin = element.and_then(|id| {
-            let parsed = world.document(id)?;
-            crate::dom::microsyntaxes::CrossOrigin::from_attr(crate::dom::tree::attr(
-                &parsed.document.base,
-                id.node,
-                "crossorigin",
-            ))
-        });
+        // Every fetch in a module graph keeps the graph root's script fetch
+        // options: its `referrerpolicy` and the credentials mode its
+        // `crossorigin` state selects. The document records the root element as
+        // `current_script` while the graph loads, so the same lookup serves the
+        // root and a dynamic `import()` inside a classic script
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#fetch-the-descendants-of-and-link-a-module-script>).
+        let options = world
+            .state
+            .current_script
+            .map(|element| world.subresource_options(element))
+            .unwrap_or_default();
         (
             world.runtime.services.clone(),
             world.origin.ascii_serialization(),
             world.referrer_url.to_string(),
-            element_policy
+            options
+                .referrer_policy
                 .or(world.policy.referrer_policy)
                 .unwrap_or_default(),
-            crossorigin,
+            options.crossorigin,
             crate::RedirectGate::new(
                 world.policy.csp.clone(),
                 &world.origin,
@@ -129,26 +120,17 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     module_request_blocked(&world_rc, ctx, name)?;
 
     let (send, receive) = mpsc::sync_channel(1);
+    let mut request = DialRequest::new(
+        crate::protocol::RequestPolicy::ModuleScript { crossorigin },
+        name,
+        &initiator,
+        &referrer_url,
+    );
+    request.referrer = net::Referrer::Client;
+    request.csp = Some(Box::new(gate));
+    request.referrer_policy = referrer_policy;
     let cancel = services.start_dial(
-        DialRequest {
-            policy: crate::protocol::RequestPolicy::module_script(crossorigin),
-            url: name.to_owned(),
-            initiator,
-            referrer_url,
-            delivery: BodyDelivery::Buffer,
-            method: net::Method::GET,
-            body: Vec::new(),
-            content_type: None,
-            headers: Vec::new(),
-            referrer: net::Referrer::Client,
-            timeout_ms: 0,
-            csp: Some(Box::new(gate)),
-            keepalive: false,
-            body_len: 0,
-            integrity: None,
-            cache: RequestCache::Default,
-            referrer_policy,
-        },
+        request,
         Box::new(move |outcome| {
             let _result = send.send(outcome);
         }),

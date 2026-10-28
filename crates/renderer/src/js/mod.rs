@@ -1904,38 +1904,30 @@ fn sync_page_fetch(world: &World, request: SyncPageFetch) -> Option<SyncFetchLis
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return None;
     }
-    let outcome = world
-        .runtime
-        .services
-        .dial_sync(crate::protocol::DialRequest {
-            policy: crate::protocol::RequestPolicy::fetch(crate::protocol::CorsRequest {
-                mode: crate::protocol::CorsMode::Cors,
-                // `withCredentials` selects `include`, else `same-origin`
-                // (<https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
-                credentials: if request.with_credentials {
-                    net::cors::CredentialsMode::Include
-                } else {
-                    net::cors::CredentialsMode::SameOrigin
-                },
-                redirect: net::cors::RedirectMode::Follow,
-            }),
-            url: request.url,
-            initiator: world.origin.ascii_serialization(),
-            referrer_url: world.referrer_url.to_string(),
-            delivery: crate::protocol::BodyDelivery::Buffer,
-            method: request.method,
-            body: request.body,
-            content_type: request.content_type,
-            headers: request.headers,
-            referrer: request.referrer,
-            timeout_ms: u64::from(millis(request.timeout)),
-            csp: None,
-            keepalive: false,
-            body_len: 0,
-            integrity: None,
-            cache: crate::protocol::RequestCache::Default,
-            referrer_policy: world.policy.referrer_policy.unwrap_or_default(),
-        });
+    let mut dial = crate::protocol::DialRequest::new(
+        crate::protocol::RequestPolicy::Fetch(crate::protocol::CorsRequest {
+            mode: crate::protocol::CorsMode::Cors,
+            // `withCredentials` selects `include`, else `same-origin`
+            // (<https://xhr.spec.whatwg.org/#the-withcredentials-attribute>).
+            credentials: if request.with_credentials {
+                net::cors::CredentialsMode::Include
+            } else {
+                net::cors::CredentialsMode::SameOrigin
+            },
+            redirect: net::cors::RedirectMode::Follow,
+        }),
+        &request.url,
+        &world.origin.ascii_serialization(),
+        world.referrer_url.as_str(),
+    );
+    dial.method = request.method;
+    dial.body = request.body;
+    dial.content_type = request.content_type;
+    dial.headers = request.headers;
+    dial.referrer = request.referrer;
+    dial.timeout_ms = u64::from(millis(request.timeout));
+    dial.referrer_policy = world.policy.referrer_policy.unwrap_or_default();
+    let outcome = world.runtime.services.dial_sync(dial);
     match outcome {
         // The header list stays as served; nothing is sniffed into it
         // (<https://fetch.spec.whatwg.org/#concept-response-header-list>).
