@@ -551,9 +551,9 @@ fn endpoint_owned(world: &Rc<RefCell<World>>, endpoint: u64) -> bool {
     shared.borrow().ports.owner(endpoint) == Some(frame)
 }
 
-/// A JS number naming a protocol id; ids are small non-negative integers.
+/// A JS number naming a protocol id, read as an `unsigned long long`.
 fn protocol_id(value: f64) -> Option<u64> {
-    crate::js::bridge::host_index(value).map(u64::from)
+    crate::js::bridge::enforce_range_u64(value)
 }
 
 fn protocol_ids(values: Vec<f64>) -> Option<Vec<u64>> {

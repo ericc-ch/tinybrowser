@@ -11,7 +11,9 @@ use rquickjs::{Ctx, Exception, Result, Value};
 
 use crate::dom::insertion::replace_all_journaled;
 use crate::dom::tree::{NodeId, attr, form_owner_of, html_namespace};
-use crate::js::bindings::enumerated::{Autocomplete, FormEnctype, FormMethod, reflect_enumerated};
+use crate::js::bindings::enumerated::{
+    Autocomplete, Defaults, FormEnctype, FormMethod, reflect_enumerated,
+};
 
 use super::JsNode;
 use super::element::{content_attr, reflect_ulong};
@@ -40,10 +42,9 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let method = reflect_enumerated::<FormMethod>(
             content_attr(ctx, self.handle.0, "method").as_deref(),
-            "get",
-            "get",
+            Defaults::both(FormMethod::Get),
         );
-        rquickjs::String::from_str(ctx.clone(), &method)
+        rquickjs::String::from_str(ctx.clone(), method)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
@@ -59,10 +60,9 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let enctype = reflect_enumerated::<FormEnctype>(
             content_attr(ctx, self.handle.0, "enctype").as_deref(),
-            "application/x-www-form-urlencoded",
-            "application/x-www-form-urlencoded",
+            Defaults::both(FormEnctype::UrlEncoded),
         );
-        rquickjs::String::from_str(ctx.clone(), &enctype)
+        rquickjs::String::from_str(ctx.clone(), enctype)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
@@ -94,10 +94,9 @@ impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
     fn get_autocomplete(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let value = reflect_enumerated::<Autocomplete>(
             content_attr(ctx, self.handle.0, "autocomplete").as_deref(),
-            "on",
-            "on",
+            Defaults::both(Autocomplete::On),
         );
-        rquickjs::String::from_str(ctx.clone(), &value)
+        rquickjs::String::from_str(ctx.clone(), value)
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-autocomplete
@@ -130,7 +129,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let method = self.form_method(ctx.clone());
-        rquickjs::String::from_str(ctx.clone(), &method)
+        rquickjs::String::from_str(ctx.clone(), method)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
@@ -141,7 +140,7 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let enctype = self.form_enctype(ctx.clone());
-        rquickjs::String::from_str(ctx.clone(), &enctype)
+        rquickjs::String::from_str(ctx.clone(), enctype)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
@@ -478,7 +477,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let method = self.form_method(ctx.clone());
-        rquickjs::String::from_str(ctx.clone(), &method)
+        rquickjs::String::from_str(ctx.clone(), method)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
@@ -489,7 +488,7 @@ impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
     fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let enctype = self.form_enctype(ctx.clone());
-        rquickjs::String::from_str(ctx.clone(), &enctype)
+        rquickjs::String::from_str(ctx.clone(), enctype)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
@@ -940,14 +939,16 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
-    pub(super) fn form_method(&self, ctx: Ctx<'_>) -> String {
+    pub(super) fn form_method(&self, ctx: Ctx<'_>) -> &'static str {
         // Enumerated without whitespace stripping: only an exact ASCII
         // case-insensitive keyword matches
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
         reflect_enumerated::<FormMethod>(
             content_attr(&ctx, self.handle.0, "formmethod").as_deref(),
-            "",
-            "get",
+            Defaults {
+                missing: None,
+                invalid: Some(FormMethod::Get),
+            },
         )
     }
 
@@ -956,13 +957,15 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
-    pub(super) fn form_enctype(&self, ctx: Ctx<'_>) -> String {
+    pub(super) fn form_enctype(&self, ctx: Ctx<'_>) -> &'static str {
         // Absent reads empty, like `formMethod`; no whitespace stripping
         // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>).
         reflect_enumerated::<FormEnctype>(
             content_attr(&ctx, self.handle.0, "formenctype").as_deref(),
-            "",
-            "application/x-www-form-urlencoded",
+            Defaults {
+                missing: None,
+                invalid: Some(FormEnctype::UrlEncoded),
+            },
         )
     }
 

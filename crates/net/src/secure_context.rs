@@ -9,16 +9,15 @@ use url::{Host, Url};
 /// Whether `url` is potentially trustworthy
 /// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
 ///
-/// `about:blank` and `about:srcdoc` inherit their creator's context, `data:`
-/// is trustworthy by definition, and every other URL is judged by its origin:
-/// HTTPS and WSS, file URLs, and loopback or `localhost` hosts over HTTP/WS.
-/// The header, cookie, and client-hint paths share this one definition.
+/// Every answer is decided by the scheme in one place: `about:blank` and
+/// `about:srcdoc` inherit their creator's context, `data:` and `file:` are
+/// trustworthy by definition, `blob:` follows its creator's origin, and
+/// `http`/`ws` need a loopback or `localhost` host. The header, cookie, and
+/// client-hint paths share this one definition.
 #[must_use]
 pub fn is_potentially_trustworthy(url: &Url) -> bool {
-    if url.scheme() == "about" && matches!(url.path(), "blank" | "srcdoc") {
-        return true;
-    }
     match url.scheme() {
+        "about" => matches!(url.path(), "blank" | "srcdoc"),
         "https" | "wss" | "file" | "data" => true,
         "http" | "ws" => match url.host() {
             Some(Host::Ipv4(address)) => address.is_loopback(),
@@ -29,23 +28,21 @@ pub fn is_potentially_trustworthy(url: &Url) -> bool {
             }
             None => false,
         },
-        // `blob:` carries its creator's origin in the path, so it is trustworthy
-        // exactly when that origin is. Only a URL minted by
-        // `URL.createObjectURL()` has a blob URL entry, and its inner URL is the
-        // serialized *origin* — never another `blob:` URL. A nested
-        // `blob:blob:…` therefore names no entry and its origin is opaque
-        // (<https://url.spec.whatwg.org/#origin>), which also keeps this from
-        // recursing on attacker-chosen nesting.
-        "blob" => url
-            .as_str()
-            .strip_prefix("blob:")
-            .and_then(|inner| Url::parse(inner).ok())
-            .is_some_and(|inner| {
-                matches!(inner.scheme(), "http" | "https" | "file")
-                    && is_potentially_trustworthy(&inner)
-            }),
+        "blob" => blob_creator_url(url).is_some_and(|inner| is_potentially_trustworthy(&inner)),
         _ => false,
     }
+}
+
+/// The URL whose origin a `blob:` URL carries, per the URL standard's blob
+/// origin step
+/// (<https://url.spec.whatwg.org/#origin>).
+///
+/// Only an entry minted by `URL.createObjectURL()` exists, and its stored
+/// origin serializes to `http`, `https`, or `file`; any other inner scheme —
+/// including a nested `blob:` — names no entry, so its origin is opaque.
+fn blob_creator_url(url: &Url) -> Option<Url> {
+    let inner = Url::parse(url.as_str().strip_prefix("blob:")?).ok()?;
+    matches!(inner.scheme(), "http" | "https" | "file").then_some(inner)
 }
 
 #[cfg(test)]

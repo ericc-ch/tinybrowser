@@ -77,16 +77,15 @@ fn rule_path(path: &str) -> Option<Vec<usize>> {
 }
 
 fn sheet_id(id: f64) -> Option<u64> {
-    crate::js::bridge::host_index(id)
-        .filter(|id| *id >= 1)
-        .map(u64::from)
+    crate::js::bridge::enforce_range_u64(id).filter(|id| *id >= 1)
 }
 
-/// Web IDL `unsigned long` already applied on the JS side (`index >>> 0`).
-/// A value that is not that integer is a caller bug, not index 0
+/// Web IDL `unsigned long` already applied on the JS side (`index >>> 0`), so
+/// the number names a `usize` here. A value outside that range is a caller bug,
+/// not index 0
 /// (<https://webidl.spec.whatwg.org/#idl-unsigned-long>).
 fn rule_index(ctx: &Ctx<'_>, index: f64) -> Result<usize> {
-    crate::js::bridge::host_index(index)
+    crate::js::bridge::enforce_range_u32(index)
         .and_then(|index| usize::try_from(index).ok())
         .ok_or_else(|| Exception::throw_type(ctx, "invalid rule index"))
 }

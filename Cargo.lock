@@ -3486,6 +3486,7 @@ dependencies = [
  "native-tls",
  "net",
  "serde_json",
+ "thiserror",
  "tokio",
  "webdriver",
 ]

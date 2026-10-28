@@ -16,8 +16,8 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use browser::{AgentOptions, Browser, BrowserOptions, Profile, TrustedCa, default_data_home};
-use cli::{Cli, Command, WebdriverNetwork};
+use browser::{Browser, BrowserOptions, Profile, default_data_home};
+use cli::{Cli, Command};
 use logging::Level;
 
 fn main() -> ExitCode {
@@ -44,8 +44,8 @@ fn main() -> ExitCode {
             }
             code
         }
-        Err(message) => {
-            eprintln!("error: {message}");
+        Err(error) => {
+            eprintln!("error: {error}");
             ExitCode::from(2)
         }
     }
@@ -68,16 +68,7 @@ fn run(cli: Cli) -> ExitCode {
             port,
             profile,
             network,
-        }) => {
-            let options = match network_options(network) {
-                Ok(options) => options,
-                Err(message) => {
-                    logging::error!(target: "cli", "{message}");
-                    return ExitCode::from(2);
-                }
-            };
-            run_browser_process("webdriver", serve_webdriver(port, options, &profile))
-        }
+        }) => run_browser_process("webdriver", serve_webdriver(port, *network, &profile)),
         None => {
             print!("{}", cli::HELP);
             ExitCode::from(2)
@@ -119,28 +110,6 @@ fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
     )
 }
 
-/// Reads and parses the `--tls-ca` files, then assembles the network options
-/// the browser opens with.
-///
-/// Runs before the browser opens, so a missing path, an unreadable file, or a
-/// malformed certificate is a usage error instead of a dial-time failure.
-fn network_options(network: WebdriverNetwork) -> Result<AgentOptions, String> {
-    let mut tls_cas = Vec::with_capacity(network.tls_ca.len());
-    for path in &network.tls_ca {
-        let pem =
-            std::fs::read(path).map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
-        let ca = TrustedCa::from_pem(&pem)
-            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
-        tls_cas.push(ca);
-    }
-    Ok(AgentOptions {
-        proxy: network.proxy,
-        resolve: network.resolve,
-        tls_cas,
-        ..AgentOptions::default()
-    })
-}
-
 fn run_browser_process(
     target: &'static str,
     future: impl Future<Output = io::Result<()>>,
@@ -165,7 +134,11 @@ fn run_browser_process(
     }
 }
 
-async fn serve_webdriver(port: u16, options: AgentOptions, profile: &Profile) -> io::Result<()> {
+async fn serve_webdriver(
+    port: u16,
+    options: browser::AgentOptions,
+    profile: &Profile,
+) -> io::Result<()> {
     let data_home = default_data_home()?;
     let browser = Browser::new(BrowserOptions {
         data_home: Some(data_home),

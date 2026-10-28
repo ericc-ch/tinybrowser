@@ -677,11 +677,11 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
 /// `execute_script` work as well as Find Element results
 /// (<https://w3c.github.io/webdriver/#elements>).
 pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
-    let Some(remote) = crate::js::bridge::host_index(remote_id) else {
+    let Some(remote) = crate::js::bridge::enforce_range_u64(remote_id) else {
         return Ok(Value::new_null(ctx));
     };
     let world = world(&ctx)?;
-    let Some(node) = world.borrow().node_for_remote(u64::from(remote)) else {
+    let Some(node) = world.borrow().node_for_remote(remote) else {
         return Ok(Value::new_null(ctx));
     };
     // Only a live, connected element is a valid element reference.

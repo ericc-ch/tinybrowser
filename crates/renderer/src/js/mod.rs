@@ -29,6 +29,7 @@ pub(crate) mod world;
 mod observers;
 mod reactions;
 
+pub(crate) use bridge::js_number;
 pub(crate) use runtime::FrameRuntime;
 pub use runtime::Stop;
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
@@ -2191,12 +2192,6 @@ fn millis(delay: f64) -> u32 {
     }
     let duration = Duration::from_secs_f64((delay / 1000.0).clamp(0.0, 86_400.0));
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
-}
-
-/// A protocol id as the JS number the shim exchanges; ids are small counters,
-/// so a value that cannot be numbered exactly is not addressable at all.
-pub(crate) fn js_number(id: u64) -> f64 {
-    u32::try_from(id).map_or(f64::NAN, f64::from)
 }
 
 #[cfg(test)]

@@ -871,7 +871,8 @@ async fn redirect_taint_serializes_null_and_null_passes_the_cors_check() {
 #[tokio::test]
 async fn resolve_maps_hit_miss_and_fail() {
     assert_eq!(
-        ResolveRule::parse("not-a-spec")
+        "not-a-spec"
+            .parse::<ResolveRule>()
             .expect_err("invalid spec")
             .to_string(),
         "resolve spec \"not-a-spec\" must be PATTERN=IPv4 or PATTERN=fail"
@@ -882,8 +883,12 @@ async fn resolve_maps_hit_miss_and_fail() {
     let mapped = url::Url::parse(&format!("http://web-platform.test:{port}/")).expect("mapped URL");
     let agent = Agent::new(AgentOptions {
         resolve: vec![
-            ResolveRule::parse("nonexistent.*.test=fail").expect("fail rule"),
-            ResolveRule::parse("*.test=127.0.0.1").expect("rewrite rule"),
+            "nonexistent.*.test=fail"
+                .parse::<ResolveRule>()
+                .expect("fail rule"),
+            "*.test=127.0.0.1"
+                .parse::<ResolveRule>()
+                .expect("rewrite rule"),
         ],
         ..AgentOptions::default()
     });
