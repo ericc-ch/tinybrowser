@@ -8,21 +8,13 @@ use crate::fixture::Fixture;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-/// A self-signed P-256 certificate, valid until 2126. It only has to parse as
-/// a trust anchor: the test that uses it never dials TLS. Generated with
-/// `openssl ecparam -name prime256v1 -genkey -noout` and
-/// `openssl req -new -x509 -key ... -days 36500 -subj "/CN=tinybrowser test CA"`.
-const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
-MIIBlDCCATmgAwIBAgIUHtgz+u6hLKfJ8KlBZW+n7WllidUwCgYIKoZIzj0EAwIw\n\
-HjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBDQTAgFw0yNjEwMjgxMjAwNTVa\n\
-GA8yMTI2MTAwNDEyMDA1NVowHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBD\n\
-QTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPDEdv6i/c0udS8nzd6hXHNdxeAR\n\
-PNB4WCCUEeWEr2Ygg55bOUC3iFt512pC3xmHu7secLobEqcN4bUonDjhYqejUzBR\n\
-MB0GA1UdDgQWBBT3Nq11ijdypbxANzmLPKOJc9jm5zAfBgNVHSMEGDAWgBT3Nq11\n\
-ijdypbxANzmLPKOJc9jm5zAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kA\n\
-MEYCIQCW2cX8boyq7TywFBPkGQZAeTmiuyCD4eGlXBJd7k+q7AIhAJg+orgrgbOx\n\
-c385o8s08MCc2bADMtb1EYRpaI9RZ0Ah\n\
------END CERTIFICATE-----\n";
+/// A self-signed P-256 certificate authority, valid 2020..2126. It only has to
+/// parse as a trust anchor: the test that uses it never dials TLS, and a
+/// backdated `notBefore` keeps it valid on any clock. Generated with
+/// `openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes`
+/// and `openssl x509 -req -not_before 20200101000000Z -extfile ca-ext.cnf`.
+const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\nMIIBgzCCASigAwIBAgIUSNx7VI4e5SLZuNEFo5kbWXRXyE8wCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBDQTAgFw0yMDAxMDEwMDAwMDBa\nGA8yMTI2MTAwNDEyNTAzNlowHjEcMBoGA1UEAwwTdGlueWJyb3dzZXIgdGVzdCBD\nQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKU9fBtT1+UGeogoYQSLS6nG2tnj\nRw3do3csdFcOKLg/Fxdu2zNZ6jpf92433JR6aWOEFWicdvo49pc38f6so36jQjBA\nMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMB0GA1UdDgQWBBSOZhVi\nNDBFj1qlDs94zVCIB+hc2zAKBggqhkjOPQQDAgNJADBGAiEAplMHuFG4TeQ8yb33\njaO5SVY/gz+vDtYABNvhXOk4uCoCIQDTaPHky5y2ASpqmjjgr9HMD5rS5BlDEFgI\nRIOQknuKug==\n-----END CERTIFICATE-----\n";
 
 fn start(extra_args: Vec<String>) -> (String, Fixture) {
     start_in(Fixture::new("tinybrowser-webdriver"), extra_args)

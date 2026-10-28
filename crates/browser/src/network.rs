@@ -1457,7 +1457,7 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
         NetError::Transport(TransportError::Dns(_)) => DialFailure::Dns,
         NetError::Transport(TransportError::Tls(_)) => DialFailure::Tls,
         NetError::Transport(TransportError::Timeout(_)) => DialFailure::Timeout,
-        NetError::Limit(_) => DialFailure::Limit,
+        NetError::RedirectLimit => DialFailure::Limit,
         NetError::Transport(TransportError::Connect(_) | TransportError::Io(_))
         | NetError::RejectedRequest
         | NetError::Decode(_) => DialFailure::Connect,

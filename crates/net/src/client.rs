@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::InitiatorKind;
-use crate::error::{LimitExceeded, NetError, TimeoutKind, TransportError};
+use crate::error::{NetError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
 use crate::referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 use crate::resolve::ResolveRule;
@@ -303,7 +303,7 @@ impl Agent {
         if !crate::cors::needs_preflight(method, &unsafe_names) {
             return Ok(());
         }
-        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin_header)?;
+        let mut preflight = crate::cors::preflight_headers(method, &unsafe_names, origin_header);
         let origin = origin_header
             .to_str()
             .map_err(|_| NetError::RejectedRequest)?;
@@ -399,8 +399,8 @@ impl Agent {
     /// [`NetError::RejectedRequest`] for a non-`http`/`https` URL, a rejected
     /// request (a failed CORS check or preflight, a redirect the CORS rules
     /// refuse, or a merged `Cookie` header that is not a valid field value), or
-    /// an unusable `Location`. [`NetError::Limit`] when the redirect cap is
-    /// exceeded. [`NetError::Transport`] when a hop fails.
+    /// an unusable `Location`. [`NetError::RedirectLimit`] when the redirect
+    /// cap is exceeded. [`NetError::Transport`] when a hop fails.
     pub async fn send(&self, request: Request) -> Result<Response, NetError> {
         if !matches!(request.url.scheme(), "http" | "https") {
             return Err(NetError::RejectedRequest);
@@ -497,7 +497,7 @@ impl Agent {
                 referrer_policy = policy;
             }
             if followed == self.max_redirects {
-                return Err(NetError::Limit(LimitExceeded::Redirect));
+                return Err(NetError::RedirectLimit);
             }
             // `followed + 1` is the redirect count the next hop will carry.
             // A false gate refuses the hop before any bytes are sent.
@@ -1199,8 +1199,9 @@ impl Body {
     /// # Errors
     ///
     /// [`NetError::Transport`] when the socket read fails or the deadline
-    /// expires; [`NetError::Decode`] when a decoder rejects the bytes;
-    /// [`NetError::Limit`] when the bytes exceed the carrier's budget.
+    /// expires; [`NetError::Decode`] when a decoder rejects the bytes. The
+    /// carrier's byte budget is enforced by whoever reads the chunks, so it is
+    /// not an error here.
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, NetError> {
         let mut buffer = vec![0; 16 * 1024];
         match self.reader.read(&mut buffer).await {

@@ -2,13 +2,39 @@
 
 use crate::fixture::Fixture;
 
+/// Runs one command and returns its output.
+///
+/// A usage error must exit, so a command that starts a server instead is a
+/// failure after ten seconds, with its stderr, rather than a hung test that
+/// leaves the server running.
 fn run(fixture: &Fixture, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
         .args(args)
         .env("XDG_RUNTIME_DIR", fixture.runtime())
         .env("XDG_DATA_HOME", fixture.data())
-        .output()
-        .expect("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("wait").is_some() {
+            return child.wait_with_output().expect("output");
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill");
+            let output = child.wait_with_output().expect("output");
+            panic!(
+                "{args:?} did not exit within 10s; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn commands_table(help: &str) -> &str {
@@ -179,13 +205,21 @@ fn webdriver_rejects_an_unparseable_tls_ca_before_starting() {
 #[test]
 fn webdriver_rejects_a_missing_tls_ca_file_before_starting() {
     let fixture = Fixture::new("tinybrowser-webdriver-tls-ca-missing");
+    let missing = fixture.data().join("missing/test-ca.pem");
     let output = run(
         &fixture,
-        &["webdriver", "--port=0", "--tls-ca=/nonexistent"],
+        &[
+            "webdriver",
+            "--port=0",
+            &format!("--tls-ca={}", missing.display()),
+        ],
     );
     assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("--tls-ca /nonexistent:"), "{err}");
+    assert!(
+        err.contains(&format!("--tls-ca {}:", missing.display())),
+        "{err}"
+    );
     assert!(!err.contains("unexpected argument"), "{err}");
 }
 

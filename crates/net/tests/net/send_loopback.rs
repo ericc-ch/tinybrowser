@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use net::{
-    Agent, AgentOptions, LimitExceeded, Method, NetError, Proxy, Referrer, ReferrerPolicy, Request,
-    ResolveRule, TimeoutKind, TransportError,
+    Agent, AgentOptions, Method, NetError, Proxy, Referrer, ReferrerPolicy, Request, ResolveRule,
+    TimeoutKind, TransportError,
 };
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -344,7 +344,7 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
 /// web-platform contract. Redirect policy itself is WPT's
 /// `fetch/api/redirect/`.
 #[tokio::test]
-async fn max_redirects_cap_returns_limit_exceeded() {
+async fn max_redirects_cap_returns_a_redirect_limit() {
     let empty = scripted([canned_redirect(302, ""), canned_redirect(302, "")]);
     assert!(matches!(
         Agent::new(AgentOptions {
@@ -353,7 +353,7 @@ async fn max_redirects_cap_returns_limit_exceeded() {
         })
         .send(Request::new(Method::GET, empty.url("/empty")))
         .await,
-        Err(NetError::Limit(LimitExceeded::Redirect))
+        Err(NetError::RedirectLimit)
     ));
     assert_eq!(empty.requests().len(), 2);
     empty.assert_clean();
@@ -366,7 +366,7 @@ async fn max_redirects_cap_returns_limit_exceeded() {
         })
         .send(Request::new(Method::GET, server.url("/loop")))
         .await,
-        Err(NetError::Limit(LimitExceeded::Redirect))
+        Err(NetError::RedirectLimit)
     ));
     assert_eq!(server.requests().len(), 3);
     server.assert_clean();
