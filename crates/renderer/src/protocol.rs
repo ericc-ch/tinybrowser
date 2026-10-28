@@ -49,8 +49,10 @@ impl FrameId {
 /// Browser-process identity of one top-level browsing context, as a renderer
 /// holds it through a `WindowProxy`.
 ///
-/// The browser mints it when it opens a tab; a renderer only ever echoes a
-/// value it received, so it cannot address a tab it was not given.
+/// The value is unauthenticated: a renderer receives it over the wire and can
+/// name any tab with it. Every browser-side use re-authorizes the target
+/// against the opener graph (`close_related`/`message_related`), which is the
+/// guard that makes the id safe to accept.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WindowId(u64);
 
@@ -417,10 +419,12 @@ impl ResponseOrigin {
 
     /// The policy container this document runs under.
     #[must_use]
-    pub fn policy(&self) -> PolicyContainer {
+    pub fn policy(&self) -> &PolicyContainer {
+        static EMPTY: std::sync::LazyLock<PolicyContainer> =
+            std::sync::LazyLock::new(PolicyContainer::default);
         match self {
-            Self::Http(head) => head.policy.clone(),
-            Self::Local { inherited } => inherited.clone().unwrap_or_default(),
+            Self::Http(head) => &head.policy,
+            Self::Local { inherited } => inherited.as_ref().unwrap_or(&EMPTY),
         }
     }
 
@@ -1245,7 +1249,10 @@ pub trait StorageHost: Send + Sync + 'static {
 /// caller can carry "noopener off, noreferrer on".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenerPolicy {
-    /// Keep the opener relationship and send the referrer the rules choose.
+    /// Keep the opener relationship. The referrer is not decided here: a
+    /// renderer-hosted auxiliary context resolves it from its creator, while a
+    /// browser-hosted tab currently starts from `about:blank` and sends none
+    /// (#198).
     Keep,
     /// Drop the opener relationship and return no `WindowProxy`.
     NoOpener,
@@ -1316,22 +1323,14 @@ pub enum SerializedOrigin {
 
 impl SerializedOrigin {
     /// Reads one serialized origin: `"null"`, or a URL whose origin is the
-    /// value.
+    /// value. A non-special URL (`data:`, `blob:`) has an opaque origin, so it
+    /// names [`Opaque`](Self::Opaque) rather than a synthetic tuple.
     #[must_use]
     pub fn parse(spec: &str) -> Option<Self> {
         if spec == "null" {
             return Some(Self::Opaque);
         }
-        Url::parse(spec).ok().map(|url| Self::Tuple(url.origin()))
-    }
-
-    /// The tuple origin, or `None` for an opaque one.
-    #[must_use]
-    pub fn tuple(self) -> Option<url::Origin> {
-        match self {
-            Self::Opaque => None,
-            Self::Tuple(origin) => Some(origin),
-        }
+        Url::parse(spec).ok().map(|url| Self::from(&url.origin()))
     }
 }
 
@@ -1417,9 +1416,14 @@ impl<'de> Deserialize<'de> for TargetOrigin {
         let raw = String::deserialize(deserializer)?;
         match raw.as_str() {
             "*" => Ok(Self::Any),
+            // `"null"` is the opaque origin of a URL like `about:blank`. It
+            // cannot match another document, so it is a valid, never-delivered
+            // target rather than a decode failure that would stop the read
+            // loop.
             other => match SerializedOrigin::parse(other) {
+                Some(SerializedOrigin::Opaque) => Ok(Self::Exact(url::Origin::new_opaque())),
                 Some(SerializedOrigin::Tuple(origin)) => Ok(Self::Exact(origin)),
-                _ => Err(serde::de::Error::custom("invalid target origin")),
+                None => Err(serde::de::Error::custom("invalid target origin")),
             },
         }
     }
@@ -1676,7 +1680,7 @@ mod response_head_tests {
         );
         let document = url("https://example.test/");
         let gate = crate::csp::RedirectGate::new(
-            head.origin.policy().csp,
+            head.origin.policy().csp.clone(),
             &document.origin(),
             crate::csp::Destination::Script,
         );

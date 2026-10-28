@@ -36,6 +36,10 @@ pub(crate) fn install_messaging(ctx: &Ctx<'_>) -> Result<()> {
         "__tbPostWindowMessage",
         rquickjs::prelude::Func::from(post_window_message),
     )?;
+    globals.set(
+        "__tbValidateTargetOrigin",
+        rquickjs::prelude::Func::from(validate_target_origin),
+    )?;
     globals.set("__tbPortNew", rquickjs::prelude::Func::from(port_new))?;
     globals.set("__tbPortPost", rquickjs::prelude::Func::from(port_post))?;
     globals.set("__tbPortStart", rquickjs::prelude::Func::from(port_start))?;
@@ -71,6 +75,18 @@ pub(crate) fn install_messaging(ctx: &Ctx<'_>) -> Result<()> {
         rquickjs::prelude::Func::from(set_frame_name),
     )?;
     Ok(())
+}
+
+/// Resolves one `targetOrigin` argument without posting. The shim calls this
+/// before `__tbEncode`, because the spec resolves the target and throws
+/// `SyntaxError` before it structured-serializes the message; doing the parse
+/// only in [`post_window_message`] would detach the transferables first
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+fn validate_target_origin(ctx: Ctx<'_>, target_origin: String) -> Result<()> {
+    let origin = world(&ctx)?.borrow().origin.clone();
+    TargetOrigin::parse(&target_origin, Some(&origin))
+        .map(|_| ())
+        .ok_or_else(|| throw_dom(&ctx, "SyntaxError", "Invalid target origin"))
 }
 
 /// One window message: the target origin is resolved here, where `/` still
@@ -114,12 +130,10 @@ fn post_window_message(
     // cannot carry, so the target is resolved here
     // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
     let Some(target_origin) = TargetOrigin::parse(&target_origin, Some(&origin_identity)) else {
+        // The shim validated this argument before serializing the message, so
+        // a failure here is an internal mismatch, not a page error.
         shared.borrow_mut().forget_endpoints(&ports);
-        return Err(crate::js::bindings::throw_dom(
-            &ctx,
-            "SyntaxError",
-            "Invalid target origin",
-        ));
+        return Ok(());
     };
     // The task is bound to the target window's document as of post time
     // (<https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task>).

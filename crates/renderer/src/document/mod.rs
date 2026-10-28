@@ -1045,7 +1045,6 @@ impl Document {
         };
         let mut loaded = Vec::with_capacity(pending.len());
         let inherited = self.world.borrow().policy.clone();
-        let frame_referrer = referrer_url;
         for (frame, container) in pending {
             // Parser-created and script-created frames share this funnel's
             // rule: the container's `sandbox` attribute unioned with this
@@ -1071,7 +1070,7 @@ impl Document {
                 world.sandbox = sandbox;
             }
             document.load_about_blank(Some(&base_url), Some(origin));
-            document.set_document_referrer(Some(frame_referrer.clone()));
+            document.set_document_referrer(Some(referrer_url.clone()));
             loaded.push(CreatedFrame::Child {
                 frame,
                 container,
@@ -1904,7 +1903,7 @@ impl Document {
         // policy its headers establish, and a local-scheme response carries
         // only what it inherited, so no field can override the other.
         let policy = head.origin.policy();
-        self.response_policy = policy.csp;
+        self.response_policy = policy.csp.clone();
         self.response_referrer_policy = policy.referrer_policy;
         self.csp_from_response = true;
         self.apply_mime_sniff = true;
@@ -3412,14 +3411,14 @@ impl Document {
             outcome.content_type.clone(),
             &outcome.headers,
         );
-        let policy = head.origin.policy().csp;
+        let policy = &head.origin.policy().csp;
         // Set before the `frame-ancestors` decision: a refused response
         // dispatches its violations on the fallback document against the new
         // response's endpoints.
         self.set_reporting_endpoints(head.origin.reporting_endpoints());
         if embedder.is_some()
             && !ancestors.is_empty()
-            && self.note_frame_ancestors_block(embedder, url, &policy, ancestors)
+            && self.note_frame_ancestors_block(embedder, url, policy, ancestors)
         {
             // The blank completes and fires the container's load.
             return;

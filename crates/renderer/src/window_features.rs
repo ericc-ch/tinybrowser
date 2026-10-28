@@ -30,7 +30,7 @@ fn normalize(name: &str) -> &str {
 /// A boolean feature's value: absent or empty is true, `yes` and `true` are
 /// true, and anything else is true only when its integer form is non-zero
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#parse-a-boolean-feature>).
-fn boolean(value: &str) -> bool {
+fn parse_boolean(value: &str) -> bool {
     match value {
         "" | "yes" | "true" => true,
         other => {
@@ -105,7 +105,7 @@ impl WindowFeatures {
         self.0
             .iter()
             .find(|(existing, _)| existing == name)
-            .is_some_and(|(_, value)| boolean(value))
+            .is_some_and(|(_, value)| parse_boolean(value))
     }
 
     /// What the parsed `noopener` and `noreferrer` features do to the context

@@ -583,6 +583,31 @@ pub(crate) enum NavigationTarget {
     Target(String),
 }
 
+/// Where a navigation's referrer comes from.
+///
+/// `noreferrer` cannot be combined with a policy, so no caller has to decide
+/// which one wins
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-open>).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NavigationReferrer {
+    /// Determine the referrer from the initiator document, under this
+    /// element's policy when it names one.
+    Client {
+        /// The navigating element's `hyperlink referrer policy`, `None` when
+        /// the initiator document's policy stays in force
+        /// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
+        policy: Option<ReferrerPolicy>,
+    },
+    /// `noreferrer`: the navigation sends no referrer at all.
+    NoReferrer,
+}
+
+impl Default for NavigationReferrer {
+    fn default() -> Self {
+        Self::Client { policy: None }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FrameNavigation {
     /// The frame to navigate.
@@ -600,19 +625,13 @@ pub(crate) struct FrameNavigation {
     pub(crate) body: Vec<u8>,
     /// `Content-Type` for `body`, when there is one.
     pub(crate) content_type: Option<String>,
-    /// The navigating element's `hyperlink referrer policy`, `None` when the
-    /// element has none and the initiator document's policy stays in force
-    /// (<https://html.spec.whatwg.org/multipage/links.html#hyperlink-referrer-policy>).
-    pub(crate) referrer_policy: Option<ReferrerPolicy>,
+    /// Where this navigation's referrer comes from.
+    pub(crate) referrer: NavigationReferrer,
     /// The sandboxing flags the target frame's container imposes on the
     /// document this navigation commits, carried here so a failed or replaced
     /// navigation never changes the current document's flags
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#determine-navigation-params>).
     pub(crate) sandbox: SandboxFlags,
-    /// `window.open(..., 'noreferrer')`: the navigation is a no-referrer
-    /// navigation, whatever the policy would otherwise send
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-open>).
-    pub(crate) no_referrer: bool,
     /// The document that started the navigation when it is not the one the
     /// navigation was queued on: a cross-frame `Location` setter takes its
     /// referrer, policy container, and sandbox rules from the incumbent
@@ -631,9 +650,8 @@ impl FrameNavigation {
             method: net::Method::GET,
             body: Vec::new(),
             content_type: None,
-            referrer_policy: None,
+            referrer: NavigationReferrer::default(),
             sandbox: SandboxFlags::default(),
-            no_referrer: false,
             source: None,
         }
     }
@@ -648,9 +666,12 @@ impl FrameNavigation {
     }
 
     /// The policy this navigation's referrer is determined under, overriding
-    /// the initiator document's for this navigation alone.
+    /// the initiator document's for this navigation alone. A navigation
+    /// already marked no-referrer keeps that decision.
     pub(crate) fn with_referrer_policy(mut self, policy: Option<ReferrerPolicy>) -> Self {
-        self.referrer_policy = policy;
+        if let NavigationReferrer::Client { policy: current } = &mut self.referrer {
+            *current = policy;
+        }
         self
     }
 
@@ -663,7 +684,7 @@ impl FrameNavigation {
     /// Marks this navigation as sending no referrer (`window.open`'s
     /// `noreferrer` feature).
     pub(crate) fn without_referrer(mut self) -> Self {
-        self.no_referrer = true;
+        self.referrer = NavigationReferrer::NoReferrer;
         self
     }
 

@@ -43,11 +43,12 @@ pub use js::{Stop, TURN_SCRIPT_BUDGET};
 pub use protocol::{
     BodyDelivery, BrowserEvent, BrowserServices, BrowsingContextHost, CorsMode, CorsRequest,
     DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
-    HistoryHandling, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
-    OpenerPolicy, PostedMessage, ReferrerRequest, RendererEvent, RequestCache, RequestPolicy,
-    ResourceLimit, ResponseBody, ResponseHead, ResponseOrigin, STORAGE_QUOTA_BYTES, ScreenshotClip,
-    ScreenshotRequest, ScriptFailure, ScriptSource, SerializedOrigin, StorageChange, StorageError,
-    StorageHost, StorageKind, StreamId, TabError, TargetOrigin, TimerId, WindowId,
+    HistoryHandling, HistorySnapshot, HttpHead, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount,
+    NetworkHost, OpenerPolicy, PolicyContainer, PostedMessage, ReferrerRequest, RendererEvent,
+    RequestCache, RequestPolicy, ResourceLimit, ResponseBody, ResponseHead, ResponseOrigin,
+    STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest, ScriptFailure, ScriptSource,
+    SerializedOrigin, StorageChange, StorageError, StorageHost, StorageKind, StreamId, TabError,
+    TargetOrigin, TimerId, WindowId,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

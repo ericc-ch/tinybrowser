@@ -46,7 +46,7 @@ use rquickjs::{
 };
 use url::Url;
 
-pub(crate) use world::{CreatorInfo, PolicyContainer, RealmRequest, World};
+pub(crate) use world::{CreatorInfo, NavigationReferrer, PolicyContainer, RealmRequest, World};
 
 /// Shared `QuickJS` heap cap. Forty live subframe realms need more than
 /// 32MB (measured: `Document-createElement-namespace.html`, 40 parallel
@@ -1470,14 +1470,14 @@ fn install_window_messaging_functions(
                         "Invalid target origin",
                     ));
                 };
-                if target != crate::protocol::TargetOrigin::Any
-                    && matches!(
-                        &target,
-                        crate::protocol::TargetOrigin::Exact(url::Origin::Opaque(_))
-                    )
-                {
-                    // An opaque origin names no document, so a cross-tab post
-                    // with an exact opaque target can never be delivered.
+                if matches!(
+                    &target,
+                    crate::protocol::TargetOrigin::Exact(url::Origin::Opaque(_))
+                ) {
+                    // An opaque exact target is a different origin object in
+                    // every document, so a cross-tab post with one can never
+                    // be delivered. It is still a valid argument, and the
+                    // shim already serialized the message.
                     return Ok(());
                 }
                 world.runtime.services.window_post_message(

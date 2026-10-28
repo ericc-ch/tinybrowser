@@ -28,7 +28,8 @@ pub const DEFAULT_VIEWPORT: (u32, u32) = (800, 600);
 
 use crate::documents::DocumentStore;
 use crate::js::{
-    FrameNavigation, NavigationTarget, PolicyContainer, RealmRegistry, SharedJsRuntime,
+    FrameNavigation, NavigationReferrer, NavigationTarget, PolicyContainer, RealmRegistry,
+    SharedJsRuntime,
 };
 use crate::messaging::{Delivery, SharedHandle};
 use crate::protocol::{
@@ -1150,13 +1151,15 @@ impl Engine {
         initiator: FrameId,
         navigation: &FrameNavigation,
     ) -> (crate::protocol::ReferrerRequest, net::ReferrerPolicy) {
-        if navigation.no_referrer {
-            return (
-                crate::protocol::ReferrerRequest::NoReferrer,
-                net::ReferrerPolicy::NoReferrer,
-            );
-        }
-        let policy = navigation.referrer_policy;
+        let policy = match navigation.referrer {
+            NavigationReferrer::NoReferrer => {
+                return (
+                    crate::protocol::ReferrerRequest::NoReferrer,
+                    net::ReferrerPolicy::NoReferrer,
+                );
+            }
+            NavigationReferrer::Client { policy } => policy,
+        };
         match self.frames.get(&initiator) {
             Some(document) => {
                 let world = document.world();

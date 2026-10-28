@@ -166,8 +166,7 @@ impl Document {
             // start on the new one.
             while let Some(entry) = self.dials.pop_queued() {
                 let super::dials::QueuedEntry { dial, delay } = entry;
-                // The queue holds the parsed URL's serialization, so the
-                // prefix test is the scheme test (see `DialRequest::url`).
+                // The queue holds a parsed URL, so the scheme is its scheme.
                 if dial.req.url.scheme() == "data" {
                     completed_data = true;
                     // Same ceiling as a streamed navigation body. Decoding an

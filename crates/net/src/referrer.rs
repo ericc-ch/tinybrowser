@@ -224,8 +224,8 @@ pub fn determine_referrer(
     if !matches!(source.scheme(), "http" | "https") {
         return None;
     }
-    let referrer_url = strip_url(source, false)?;
-    let referrer_origin = strip_url(source, true)?;
+    let referrer_url = strip_url(source, false);
+    let referrer_origin = strip_url(source, true);
     // Step 6: a referrer serialized over 4096 characters culls to the origin
     // before the policy switch, even under `unsafe-url`.
     let referrer_url = if referrer_url.as_str().len() > 4096 {
@@ -266,12 +266,9 @@ pub fn determine_referrer(
 /// fragment, username, and password, and with `origin_only` the path and
 /// query too.
 ///
-/// A local scheme has no referrer. The serialized origin keeps a trailing
-/// `/` because an empty path serializes that way.
-fn strip_url(url: &Url, origin_only: bool) -> Option<Url> {
-    if matches!(url.scheme(), "about" | "blob" | "data") {
-        return None;
-    }
+/// The serialized origin keeps a trailing `/` because an empty path
+/// serializes that way.
+fn strip_url(url: &Url, origin_only: bool) -> Url {
     let mut stripped = url.clone();
     let _ = stripped.set_username("");
     let _ = stripped.set_password(None);
@@ -280,7 +277,7 @@ fn strip_url(url: &Url, origin_only: bool) -> Option<Url> {
         stripped.set_path("");
         stripped.set_query(None);
     }
-    Some(stripped)
+    stripped
 }
 
 #[cfg(test)]
