@@ -220,4 +220,3 @@ fn intern_mime_essence(essence: String) -> &'static str {
     interned.insert(leaked);
     leaked
 }
-

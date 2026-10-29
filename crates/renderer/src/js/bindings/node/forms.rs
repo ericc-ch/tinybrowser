@@ -522,11 +522,9 @@ impl html_legend_element_generated::HTMLLegendElement<'_> for JsNode {}
 impl JsNode {
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
     //
-    // Known gap: Blitz keeps no control value store (no dirty value flag, no
-    // checkedness or selectedness slots), so every value here is read from
-    // content attributes and descendant text: an input's value is its `value`
-    // attribute, a textarea's is its descendant text, and a select's comes
-    // from the selected option.
+    // The current value, default value, and selectedness live in Blitz's
+    // control slots; this dispatches by element to the one the IDL attribute
+    // returns.
     pub(super) fn value(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -672,8 +670,7 @@ impl JsNode {
                 .document
                 .base
                 .mutate()
-                .set_dirty_value(self.handle.0.node, value);
-            parsed.document.clear_pristine_value(self.handle.0.node);
+                .set_value(self.handle.0.node, value, true);
         }
         if changed && applies {
             world_rc
@@ -893,7 +890,6 @@ impl JsNode {
             }
         }
         for control in controls {
-            parsed.document.clear_pristine_value(control);
             if crate::dom::tree::is_html_element(&parsed.document.base, control, "input") {
                 crate::dom::input::sync_sanitized_value(&mut parsed, control);
             } else if crate::dom::tree::is_html_element(&parsed.document.base, control, "select") {
@@ -1051,9 +1047,11 @@ impl JsNode {
         };
         let mut mutator = parsed.document.base.mutate();
         for member in group {
-            mutator.set_checkedness(member.node, false);
+            mutator.set_checkedness(member.node, false, false);
         }
-        mutator.set_checkedness(self.handle.0.node, value);
+        // The checked IDL attribute also sets the dirty checkedness flag
+        // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-checked>).
+        mutator.set_checkedness(self.handle.0.node, value, true);
         Ok(())
     }
 
@@ -1252,7 +1250,7 @@ pub(super) fn fixup_radio_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     let group = crate::dom::forms::radios_to_uncheck(&parsed.document.base, id.document, id.node);
     let mut mutator = parsed.document.base.mutate();
     for member in group {
-        mutator.set_checkedness(member.node, false);
+        mutator.set_checkedness(member.node, false, false);
     }
     Ok(())
 }

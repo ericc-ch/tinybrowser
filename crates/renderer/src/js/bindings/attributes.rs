@@ -1627,15 +1627,12 @@ fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
         .insert(element, crate::js::CreatorInfo { url, line, column });
 }
 
-/// What a type change does with the current value slot.
-enum InputValueStore {
-    /// Record the value as user-set; later `value` attribute changes do not
-    /// override it.
-    Dirty(String),
-    /// Record the value but leave the dirty value flag false, so the current
-    /// value mirrors the content attribute again.
-    Pristine(String),
-    Keep,
+/// What a type change does with the current value slot: the sanitized value
+/// and the dirty value flag afterwards
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+struct InputValueStore {
+    value: String,
+    dirty: bool,
 }
 
 /// Recomputes an input's sanitized stored value after one of the content
@@ -1667,8 +1664,7 @@ fn apply_select_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str) ->
     let is_option = crate::dom::tree::is_html_element(base, element.node, "option");
     let is_select = crate::dom::tree::is_html_element(base, element.node, "select");
     if local == "selected" && is_option {
-        let selected = crate::dom::tree::attr(base, element.node, "selected").is_some();
-        crate::dom::forms::option_selected_attribute_changed(&mut parsed, element.node, selected);
+        crate::dom::forms::option_selected_attribute_changed(&mut parsed, element.node);
         return Ok(());
     }
     if (local == "multiple" || local == "size") && is_select {
@@ -1731,11 +1727,11 @@ fn input_type_store(
     old: crate::dom::input::InputType,
     new: crate::dom::input::InputType,
     current: &str,
-) -> Result<InputValueStore> {
-    let (attribute, dirty, pristine) = {
+) -> Result<Option<InputValueStore>> {
+    let (attribute, dirty) = {
         let world = world.borrow();
         let Some(parsed) = world.document(element) else {
-            return Ok(InputValueStore::Keep);
+            return Ok(None);
         };
         let base = &parsed.document.base;
         (
@@ -1743,7 +1739,6 @@ fn input_type_store(
             base.get_node(element.node)
                 .and_then(|node| node.data.downcast_element())
                 .is_some_and(|element| element.form_state.dirty_value),
-            parsed.document.pristine_value(element.node),
         )
     };
     let old_mode = old.value_mode();
@@ -1761,20 +1756,18 @@ fn input_type_store(
         if !value.is_empty() {
             set_attribute_sync(ctx, element, "value", &value)?;
         }
-        return Ok(InputValueStore::Keep);
+        return Ok(None);
     }
     if old_mode == crate::dom::input::ValueMode::Current
         && new_mode == crate::dom::input::ValueMode::Current
     {
-        let sanitized = sanitize_current(world, element, new, current);
-        // A user-written value stays dirty; a pristine value is stored with a
-        // marker so the next `value` attribute change still applies
-        // (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
-        return Ok(if dirty && !pristine {
-            InputValueStore::Dirty(sanitized)
-        } else {
-            InputValueStore::Pristine(sanitized)
-        });
+        // Both states carry a value: keep it and sanitize for the new state.
+        // A user-written value stays dirty; a value that followed its
+        // attribute keeps following it.
+        return Ok(Some(InputValueStore {
+            value: sanitize_current(world, element, new, current),
+            dirty,
+        }));
     }
     if old_mode != crate::dom::input::ValueMode::Current
         && new_mode == crate::dom::input::ValueMode::Current
@@ -1783,31 +1776,25 @@ fn input_type_store(
         // sanitizes the stored value
         // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
         let raw = attribute.unwrap_or_default();
-        let sanitized = sanitize_current(world, element, new, &raw);
-        return Ok(InputValueStore::Pristine(sanitized));
+        return Ok(Some(InputValueStore {
+            value: sanitize_current(world, element, new, &raw),
+            dirty: false,
+        }));
     }
-    Ok(InputValueStore::Keep)
+    Ok(None)
 }
 
-fn apply_input_value_store(parsed: &mut crate::Parsed, element: NodeId, store: InputValueStore) {
-    match store {
-        InputValueStore::Dirty(value) => {
-            parsed
-                .document
-                .base
-                .mutate()
-                .set_dirty_value(element.node, value);
-            parsed.document.clear_pristine_value(element.node);
-        }
-        InputValueStore::Pristine(value) => {
-            parsed
-                .document
-                .base
-                .mutate()
-                .set_dirty_value(element.node, value);
-            parsed.document.mark_pristine_value(element.node);
-        }
-        InputValueStore::Keep => {}
+fn apply_input_value_store(
+    parsed: &mut crate::Parsed,
+    element: NodeId,
+    store: Option<InputValueStore>,
+) {
+    if let Some(store) = store {
+        parsed
+            .document
+            .base
+            .mutate()
+            .set_value(element.node, store.value, store.dirty);
     }
 }
 

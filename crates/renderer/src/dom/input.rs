@@ -1,8 +1,9 @@
 //! The `input` element's type state, value modes, and value sanitization.
 //!
-//! The current value is stored sanitized in the dirty-value slot. A pristine
-//! marker keeps attribute-driven values reloadable while the same string feeds
-//! layout; a user-set value stays dirty
+//! The current value is the element's value slot, kept sanitized. A clear
+//! dirty value flag means the `value` attribute still drives the slot, so an
+//! attribute change reloads it; a user-set value sets the flag and survives
+//! attribute changes
 //! (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
 //! The IDL getter, form submission, and type changes all read this value.
 
@@ -162,29 +163,24 @@ pub(crate) fn input_type(base: &BaseDocument, node: BlitzId) -> Option<InputType
     Some(InputType::from_attribute(attr(base, node, "type")))
 }
 
-/// The raw current value: the dirty value when set, otherwise the `value`
-/// content attribute
+/// The current value the type-change steps start from
 /// (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
 pub(crate) fn raw_value(parsed: &Parsed, node: BlitzId, kind: InputType) -> String {
     let base = &parsed.document.base;
-    let element = base
+    let Some(element) = base
         .get_node(node)
-        .and_then(|target| target.data.downcast_element());
-    let pristine = parsed.document.pristine_value(node);
-    let user_dirty = element.is_some_and(|element| element.form_state.dirty_value) && !pristine;
+        .and_then(|target| target.data.downcast_element())
+    else {
+        return String::new();
+    };
     // A color's synthesized default (`#000000`) is not the input's value when
     // the value attribute is absent. A type change must reload the empty
     // attribute, not carry the default into a text state
     // (<https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>).
-    if kind == InputType::Color && !user_dirty {
+    if kind == InputType::Color && !element.form_state.dirty_value {
         return attr(base, node, "value").unwrap_or("").to_owned();
     }
-    match element {
-        Some(element) if element.form_state.dirty_value || pristine => {
-            element.form_state.value.clone()
-        }
-        _ => attr(base, node, "value").unwrap_or("").to_owned(),
-    }
+    element.form_state.value.clone()
 }
 
 /// The current value of an input, dispatched by the value IDL attribute's
@@ -195,25 +191,13 @@ pub(crate) fn current_value(parsed: &Parsed, node: BlitzId) -> String {
         return String::new();
     };
     match kind.value_mode() {
-        ValueMode::Current => {
-            let element = base
-                .get_node(node)
-                .and_then(|target| target.data.downcast_element());
-            match element {
-                Some(element)
-                    if element.form_state.dirty_value || parsed.document.pristine_value(node) =>
-                {
-                    element.form_state.value.clone()
-                }
-                _ => sanitize(
-                    base,
-                    base.device(),
-                    node,
-                    kind,
-                    attr(base, node, "value").unwrap_or(""),
-                ),
-            }
-        }
+        // The slot is sanitized whenever it is written: on parse, on the
+        // attributes sanitization reads, and on every IDL or user set
+        // (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
+        ValueMode::Current => base
+            .get_node(node)
+            .and_then(|target| target.data.downcast_element())
+            .map_or_else(String::new, |element| element.form_state.value.clone()),
         ValueMode::Default => attr(base, node, "value").unwrap_or("").to_owned(),
         ValueMode::DefaultOn => attr(base, node, "value").unwrap_or("on").to_owned(),
         ValueMode::Filename => String::new(),
@@ -509,11 +493,11 @@ fn serialize_color_function(space: &str, [red, green, blue]: [f32; 3], alpha: f3
     }
 }
 
-/// Recomputes an input's stored value from its content attributes and writes
-/// the sanitized string into both the value slot and Blitz's layout editor.
-/// The value stays logically pristine through a [`Parsed`] marker, so a later
-/// `value` attribute change applies, while a user-written value keeps the
-/// dirty flag and ignores attribute changes
+/// Recomputes an input's sanitized value from its content attributes and
+/// writes it into the value slot and Blitz's layout editor. A clear dirty
+/// value flag means the `value` attribute drives the slot; a set one keeps
+/// the current value, except for the states whose sanitization also reads
+/// `min`, `max`, `step`, `colorspace`, `alpha`, or `multiple`
 /// (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
 pub(crate) fn sync_sanitized_value(parsed: &mut Parsed, node: BlitzId) {
     let base = &parsed.document.base;
@@ -529,12 +513,11 @@ pub(crate) fn sync_sanitized_value(parsed: &mut Parsed, node: BlitzId) {
     else {
         return;
     };
-    let pristine = parsed.document.pristine_value(node);
-    let user_dirty = element.form_state.dirty_value && !pristine;
-    if user_dirty && !matches!(kind, InputType::Range | InputType::Color | InputType::Email) {
+    let dirty = element.form_state.dirty_value;
+    if dirty && !matches!(kind, InputType::Range | InputType::Color | InputType::Email) {
         return;
     }
-    let raw = if user_dirty {
+    let raw = if dirty {
         element.form_state.value.clone()
     } else {
         attr(base, node, "value").unwrap_or("").to_owned()
@@ -546,10 +529,5 @@ pub(crate) fn sync_sanitized_value(parsed: &mut Parsed, node: BlitzId) {
         .document
         .base
         .mutate()
-        .set_dirty_value(node, sanitized);
-    if user_dirty {
-        parsed.document.clear_pristine_value(node);
-    } else {
-        parsed.document.mark_pristine_value(node);
-    }
+        .set_value(node, sanitized, dirty);
 }

@@ -395,7 +395,7 @@ pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreAc
                 indeterminate,
             };
             let mut mutator = parsed.document.base.mutate();
-            mutator.set_checkedness(node.node, !checked);
+            mutator.set_checkedness(node.node, !checked, false);
             // Activation clears indeterminateness
             // (<https://html.spec.whatwg.org/multipage/input.html#checkbox-state-(type=checkbox):activation-behavior>).
             mutator.set_indeterminate(node.node, false);
@@ -418,9 +418,9 @@ pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreAc
                 );
                 let mut mutator = parsed.document.base.mutate();
                 for member in members {
-                    mutator.set_checkedness(member.node, false);
+                    mutator.set_checkedness(member.node, false, false);
                 }
-                mutator.set_checkedness(node.node, true);
+                mutator.set_checkedness(node.node, true, false);
                 mutator.set_indeterminate(node.node, false);
                 PreActivation::Radio(previous)
             }
@@ -446,7 +446,7 @@ pub(crate) fn legacy_canceled_activation(
             indeterminate,
         } => {
             let mut mutator = parsed.document.base.mutate();
-            mutator.set_checkedness(node.node, *checked);
+            mutator.set_checkedness(node.node, *checked, false);
             // A canceled activation restores the pre-click state, including
             // indeterminateness; a handler that set it during the click must
             // not leak that change
@@ -455,15 +455,15 @@ pub(crate) fn legacy_canceled_activation(
         }
         PreActivation::Radio(Some(other)) => {
             let mut mutator = parsed.document.base.mutate();
-            mutator.set_checkedness(node.node, false);
-            mutator.set_checkedness(other.node, true);
+            mutator.set_checkedness(node.node, false, false);
+            mutator.set_checkedness(other.node, true, false);
         }
         PreActivation::Radio(None) => {
             parsed
                 .document
                 .base
                 .mutate()
-                .set_checkedness(node.node, false);
+                .set_checkedness(node.node, false, false);
         }
         PreActivation::None => {}
     }
@@ -552,7 +552,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             InputType::Checkbox => {
                 let checked = checkedness(&parsed.document.base, node.node);
                 let mut mutator = parsed.document.base.mutate();
-                mutator.set_checkedness(node.node, !checked);
+                mutator.set_checkedness(node.node, !checked, false);
                 mutator.set_indeterminate(node.node, false);
                 true
             }
@@ -575,9 +575,9 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                     );
                     let mut mutator = parsed.document.base.mutate();
                     for member in members {
-                        mutator.set_checkedness(member.node, false);
+                        mutator.set_checkedness(member.node, false, false);
                     }
-                    mutator.set_checkedness(node.node, true);
+                    mutator.set_checkedness(node.node, true, false);
                     mutator.set_indeterminate(node.node, false);
                     true
                 }
@@ -1167,8 +1167,7 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
                     .document
                     .base
                     .mutate()
-                    .set_dirty_value(node.node, sanitized);
-                parsed.document.clear_pristine_value(node.node);
+                    .set_value(node.node, sanitized, true);
             } else {
                 write_attr(&mut parsed, node, "value", Some(&value.0));
             }
@@ -1178,8 +1177,7 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
                 .document
                 .base
                 .mutate()
-                .set_dirty_value(node.node, value.0);
-            parsed.document.clear_pristine_value(node.node);
+                .set_value(node.node, value.0, true);
         }
         _ => write_attr(&mut parsed, node, "value", Some(&value.0)),
     }
