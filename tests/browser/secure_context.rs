@@ -97,6 +97,16 @@ fn a_child_inherits_its_creators_secure_context() {
         evaluate(&mut client, &session, SELF_REPORT),
         json!("true,true,function,function")
     );
+    // Web IDL names the attribute getter `get userAgentData`
+    // (<https://webidl.spec.whatwg.org/#idl-attributes>).
+    assert_eq!(
+        evaluate(
+            &mut client,
+            &session,
+            "Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgentData').get.name"
+        ),
+        json!("get userAgentData")
+    );
     wait_for(
         &mut client,
         &session,

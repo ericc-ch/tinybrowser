@@ -120,9 +120,14 @@
   if (secureContext) {
     // Both are `[SecureContext]`
     // (<https://wicg.github.io/ua-client-hints/#dom-navigator-useragentdata>).
+    // Web IDL names an attribute getter `get userAgentData`, and an
+    // object-literal accessor is what makes the engine name it
+    // (<https://webidl.spec.whatwg.org/#idl-attributes>).
+    const { get } = Object.getOwnPropertyDescriptor({
+      get userAgentData() { return userAgentData; },
+    }, 'userAgentData');
     Object.defineProperty(Navigator.prototype, 'userAgentData', {
-      get() { return userAgentData; },
-      enumerable: true, configurable: true,
+      get, enumerable: true, configurable: true,
     });
     Object.defineProperty(globalThis, 'NavigatorUAData', {
       value: NavigatorUAData, writable: true, configurable: true,
