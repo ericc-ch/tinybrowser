@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 webstorage = { workspace = true }
+enumerated = { workspace = true }
 net = { workspace = true }
 secure-context = { workspace = true }
 # Parser QualNames flow into Blitz as one type, no conversion layer.

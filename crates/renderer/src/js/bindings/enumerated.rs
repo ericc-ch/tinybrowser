@@ -9,8 +9,8 @@
 //! The declaration form is `net::enumerated`, the same one `net` uses for
 //! `ReferrerPolicy` and `CrossOrigin`.
 
-use net::Enumerated;
-use net::enumerated;
+pub(crate) use enumerated::Enumerated;
+use enumerated::enumerated;
 
 /// When an enumerated attribute names no keyword: what its getter answers with
 /// the attribute absent, and with the attribute present but invalid.
@@ -65,7 +65,6 @@ pub(crate) fn reflect_enumerated<T: Enumerated>(
 
 enumerated! {
     /// `dir` (<https://html.spec.whatwg.org/multipage/dom.html#the-dir-attribute>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) Dir {
         Ltr => "ltr",
         Rtl => "rtl",
@@ -76,7 +75,6 @@ enumerated! {
 enumerated! {
     /// `enterkeyhint`
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) EnterKeyHint {
         Enter => "enter",
         Done => "done",
@@ -91,7 +89,6 @@ enumerated! {
 enumerated! {
     /// `inputmode`
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-inputmode>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) InputMode {
         None => "none",
         Text => "text",
@@ -107,7 +104,6 @@ enumerated! {
 enumerated! {
     /// `loading`
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#attr-loading>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) Loading {
         Lazy => "lazy",
         Eager => "eager",
@@ -117,7 +113,6 @@ enumerated! {
 enumerated! {
     /// `preload`
     /// (<https://html.spec.whatwg.org/multipage/media.html#attr-media-preload>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) Preload {
         None => "none",
         Metadata => "metadata",
@@ -128,7 +123,6 @@ enumerated! {
 enumerated! {
     /// `decoding`
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#attr-img-decoding>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) Decoding {
         Async => "async",
         Sync => "sync",
@@ -139,7 +133,6 @@ enumerated! {
 enumerated! {
     /// `method` and `formmethod`
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-method>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) FormMethod {
         Get => "get",
         Post => "post",
@@ -150,7 +143,6 @@ enumerated! {
 enumerated! {
     /// `enctype` and `formenctype`
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) FormEnctype {
         UrlEncoded => "application/x-www-form-urlencoded",
         Multipart => "multipart/form-data",
@@ -161,7 +153,6 @@ enumerated! {
 enumerated! {
     /// `autocomplete`
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-autocomplete>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) Autocomplete {
         On => "on",
         Off => "off",
@@ -171,7 +162,6 @@ enumerated! {
 enumerated! {
     /// `scope` on `th`
     /// (<https://html.spec.whatwg.org/multipage/tables.html#attr-th-scope>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) TableScope {
         Row => "row",
         Col => "col",
@@ -183,7 +173,6 @@ enumerated! {
 enumerated! {
     /// `as` on `link`
     /// (<https://html.spec.whatwg.org/multipage/semantics.html#attr-link-as>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) LinkAs {
         Fetch => "fetch",
         Audio => "audio",
@@ -213,7 +202,6 @@ enumerated! {
 enumerated! {
     /// `kind` on `track`
     /// (<https://html.spec.whatwg.org/multipage/media.html#attr-track-kind>).
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) TrackKind {
         Subtitles => "subtitles",
         Captions => "captions",

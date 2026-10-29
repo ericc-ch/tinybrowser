@@ -5,6 +5,7 @@ use super::{
     schedule_mutation_delivery, string_value, throw_dom, with_node_data, world, world_for_node,
     wrap_node,
 };
+use enumerated::Enumerated;
 
 use std::cell::RefCell;
 use std::collections::HashSet;

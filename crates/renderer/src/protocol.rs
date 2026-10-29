@@ -1022,11 +1022,13 @@ fn potential_cors(crossorigin: Option<CrossOrigin>) -> net::cors::CorsParameters
 /// `No CORS` and `Anonymous` states, `include` for `Use Credentials`
 /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
 fn cross_origin_credentials(crossorigin: Option<CrossOrigin>) -> net::cors::CredentialsMode {
-    if crossorigin == Some(CrossOrigin::UseCredentials) {
-        net::cors::CredentialsMode::Include
-    } else {
-        net::cors::CredentialsMode::SameOrigin
-    }
+    // A module fetch is always CORS, so an absent attribute means the
+    // `same-origin` credentials of the `No CORS` and `Anonymous` states
+    // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+    crossorigin.map_or(
+        net::cors::CredentialsMode::SameOrigin,
+        CrossOrigin::credentials,
+    )
 }
 
 /// Browser-side identity of one progressive response body.

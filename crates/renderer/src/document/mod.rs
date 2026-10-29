@@ -2,6 +2,7 @@
 //! renderer loop owns every wait; the browser process owns the tab and drives
 //! navigation.
 
+use enumerated::Enumerated;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;

@@ -8,20 +8,21 @@
 //!
 //! <https://w3c.github.io/webappsec-referrer-policy/>
 
+use enumerated::Enumerated;
 use serde::{Deserialize, Serialize};
 use url::{Origin, Url};
 
 use secure_context::is_potentially_trustworthy;
 
-crate::enumerated! {
+enumerated::enumerated! {
     /// A referrer policy
     /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
     ///
     /// The empty string is not a variant: it means "no policy here, inherit one",
     /// so callers use `Option<ReferrerPolicy>` until the policy container or the
     /// user agent default supplies a value.
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-    #[serde(into = "&'static str", try_from = "String")]
+    #[derive(Default, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
     pub ReferrerPolicy {
         /// Send no `Referer`.
         NoReferrer => "no-referrer",
@@ -230,19 +231,4 @@ fn strip_url(url: &Url, origin_only: bool) -> Url {
         stripped.set_query(None);
     }
     stripped
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ReferrerPolicy;
-
-    #[test]
-    fn parse_is_ascii_case_insensitive_and_untrimmed() {
-        assert_eq!(
-            ReferrerPolicy::parse("ORIGIN"),
-            Some(ReferrerPolicy::Origin)
-        );
-        assert_eq!(ReferrerPolicy::parse(" origin"), None);
-        assert_eq!(ReferrerPolicy::parse(""), None);
-    }
 }

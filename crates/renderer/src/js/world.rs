@@ -1,5 +1,6 @@
 //! Shared JS world for the renderer.
 
+use enumerated::Enumerated;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;

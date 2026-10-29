@@ -10,6 +10,7 @@
 //! follows the kind the renderer names; probing that label with response-body
 //! sniffing is tracked in #190.
 
+use enumerated::Enumerated;
 use hyper::header::{self, HeaderValue};
 
 use crate::protocol::{HeaderMap, Method};
@@ -83,7 +84,7 @@ impl CredentialsMode {
     }
 }
 
-crate::enumerated! {
+enumerated::enumerated! {
     /// The state of a present `crossorigin` content attribute
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
     ///
@@ -93,8 +94,8 @@ crate::enumerated! {
     /// enumerated attribute's invalid value default, so a bad spelling never
     /// sends credentials
     /// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    #[serde(into = "&'static str", try_from = "String")]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
     pub CrossOrigin {
         /// CORS mode with `same-origin` credentials.
         Anonymous => "anonymous",

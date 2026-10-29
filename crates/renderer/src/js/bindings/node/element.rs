@@ -15,6 +15,7 @@ use super::super::{
 use super::forms::fixup_controls_on_insert;
 use crate::dom::adoption::materialize_children;
 use crate::js::bindings::enumerated::{Defaults, Dir, EnterKeyHint, InputMode, reflect_enumerated};
+use enumerated::Enumerated;
 use net::cors::CrossOrigin;
 use std::collections::HashSet;
 

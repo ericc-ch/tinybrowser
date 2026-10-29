@@ -34,6 +34,7 @@ pub(crate) use runtime::FrameRuntime;
 pub use runtime::Stop;
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
 
+use enumerated::Enumerated;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::rc::{Rc, Weak};
