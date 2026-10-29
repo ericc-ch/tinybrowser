@@ -963,11 +963,6 @@ impl Engine {
     fn apply_image_lifecycle(&mut self, events: Vec<(FrameId, crate::document::ImageLifecycle)>) {
         for (parent, event) in events {
             match event {
-                crate::document::ImageLifecycle::Connected(element) => {
-                    if let Some(document) = self.frames.get_mut(&parent) {
-                        document.queue_connected_image(element);
-                    }
-                }
                 crate::document::ImageLifecycle::Disconnected(element) => {
                     if let Some(document) = self.frames.get_mut(&parent) {
                         document.disconnect_image(element);

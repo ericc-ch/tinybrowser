@@ -15,6 +15,17 @@ pub use webstorage::{STORAGE_QUOTA_BYTES, StorageChange, StorageError};
 
 use net::cors::CrossOrigin;
 
+/// The CORS settings state a request carried, as the policy the carrier sends
+/// the dial under. This is the one translation from the element-level type to
+/// the wire type
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+pub(crate) fn cross_origin(setting: Option<blitz_traits::net::CorsSetting>) -> Option<CrossOrigin> {
+    setting.map(|setting| match setting {
+        blitz_traits::net::CorsSetting::Anonymous => CrossOrigin::Anonymous,
+        blitz_traits::net::CorsSetting::UseCredentials => CrossOrigin::UseCredentials,
+    })
+}
+
 /// Maximum aggregate bytes retained for one streamed response.
 ///
 /// A Wikipedia article is already past 1 MiB. 8 MiB still caps one document

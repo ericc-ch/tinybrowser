@@ -160,6 +160,15 @@ pub(crate) enum Destination {
     Frame,
 }
 
+impl Destination {
+    /// Whether this request settles through the image lifecycle: an `<img>`
+    /// learns about success and failure from its settlements, not from an
+    /// `error` event on generic resource failure.
+    pub(crate) fn is_image(self) -> bool {
+        self == Self::Img
+    }
+}
+
 /// The directive that decides a check
 /// (<https://w3c.github.io/webappsec-csp/#effective-directive>).
 #[derive(Clone, Copy, PartialEq, Eq)]

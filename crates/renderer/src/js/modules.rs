@@ -107,7 +107,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
                 .referrer_policy
                 .or(world.policy.referrer_policy)
                 .unwrap_or_default(),
-            options.crossorigin,
+            crate::protocol::cross_origin(options.crossorigin),
             crate::RedirectGate::new(
                 world.policy.csp.clone(),
                 &world.origin,

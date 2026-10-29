@@ -3,8 +3,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{
-    CompletedDial, DialContext, Document, ImageUpdate, MAX_PENDING_JS_FETCHES, QueuedDial, Task,
-    Timer,
+    CompletedDial, DialContext, Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer,
 };
 use crate::document::dials::AdoptedDials;
 use crate::dom::tree::NodeId;
@@ -304,10 +303,6 @@ impl Document {
             RealmRequest::DeclarativeRefresh(value) => {
                 self.start_declarative_refresh(&value);
             }
-            RealmRequest::Image(element) => {
-                self.world.borrow_mut().image_update_started(element);
-                self.queue_image(element, ImageUpdate::SrcChanged);
-            }
             RealmRequest::HistoryPush {
                 url,
                 state,
@@ -385,11 +380,11 @@ impl Document {
             self.tasks.push_back(Task::NodeError(element));
             return;
         }
-        let referrer_policy = self.subresource_referrer(Some(element));
+        let options = self.world.borrow().subresource_options(element);
         let mut dial = QueuedDial::new(
             DialContext::ClassicScript { element },
             crate::protocol::RequestPolicy::ClassicScript {
-                crossorigin: self.cross_origin(Some(element)),
+                crossorigin: crate::protocol::cross_origin(options.crossorigin),
             },
             &url,
             &self.dial_initiator(),
@@ -397,7 +392,10 @@ impl Document {
         dial.req.referrer = crate::protocol::ReferrerRequest::Client {
             url: self.referrer_url(),
         };
-        dial.req.referrer_policy = referrer_policy;
+        dial.req.referrer_policy = options
+            .referrer_policy
+            .or(self.world.borrow().policy.referrer_policy)
+            .unwrap_or_default();
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));

@@ -111,15 +111,6 @@ enum Task {
     NodeError(crate::dom::tree::NodeId),
 }
 
-/// What triggered an image load watch: a connected insert may reuse a request
-/// that is already filed, a `src` mutation always starts a new one
-/// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ImageUpdate {
-    Inserted,
-    SrcChanged,
-}
-
 /// Why a realm is being replaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RealmReset {
@@ -169,10 +160,9 @@ pub(crate) enum DialContext {
         /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#determine-navigation-params>).
         sandbox: crate::js::world::SandboxFlags,
     },
-    /// A Blitz subresource (stylesheet, image, font) fetch. The response
-    /// handler waits in [`Document::blitz_handlers`] under this id; delivery
-    /// hands Blitz its bytes through the handler, which releases Blitz's own
-    /// critical hold.
+    /// A Blitz subresource (stylesheet, image, font) fetch. Its record waits
+    /// in [`Document::blitz_requests`] under this id; delivery hands Blitz its
+    /// bytes through the handler, which releases Blitz's own critical hold.
     BlitzResource {
         id: u64,
         /// `style-src-elem`, `img-src`, or `font-src` for this fetch.
@@ -261,11 +251,12 @@ pub(crate) enum IframeLifecycle {
     Removed(crate::dom::tree::NodeId),
 }
 
-/// A connection transition for one `<img>` element in this document.
+/// A connection transition for one `<img>` element in this document. Insertion
+/// needs no event: Blitz's insertion steps start the request, and its
+/// settlement drives the element's state. Removal drops the state this
+/// document keeps for it.
 pub(crate) enum ImageLifecycle {
-    /// A newly connected image to start fetching.
-    Connected(crate::dom::tree::NodeId),
-    /// A disconnected image to stop fetching.
+    /// A disconnected image to stop tracking.
     Disconnected(crate::dom::tree::NodeId),
 }
 
@@ -476,22 +467,26 @@ enum ParseStep {
     Script(crate::dom::tree::NodeId),
 }
 
-/// What settled an image request: a response, or a failure with no usable
-/// pixels.
-#[derive(Clone, Copy)]
-enum ImageSettle {
-    /// The response arrived and decoded; `origin_clean` is its canvas taint.
-    Loaded { origin_clean: bool },
-    /// The request failed; the element's current request becomes broken.
-    Failed,
-}
-
 /// Raw subresource bytes by URL, with the canvas taint the response settled
 /// with, so a repeat Blitz fetch for a URL reuses both instead of dialing.
 #[derive(Clone)]
 struct SubresourceBody {
     bytes: Vec<u8>,
     origin_clean: bool,
+}
+
+/// One filed Blitz subresource request: its handler, the URL it went out
+/// under, the CORS settings state it was created with, and the element that
+/// initiated it. The element is carried, not recovered from the URL, so two
+/// elements on one URL keep their own `crossorigin`, `referrerpolicy`, and
+/// `error` behavior
+/// (<https://fetch.spec.whatwg.org/#concept-request-client>).
+struct BlitzRequest {
+    handler: crate::render::CountingHandler,
+    key: blitz_dom::ImageKey,
+    referrer_policy: Option<String>,
+    node: Option<crate::dom::tree::NodeId>,
+    destination: Option<crate::csp::Destination>,
 }
 
 /// The URL a browsing context starts on when it has no creator to inherit
@@ -518,17 +513,20 @@ pub(crate) struct Document {
     /// Blitz shell: a mutation that changes rendered output asks for a frame,
     /// which is this document's cue to resolve style and layout.
     blitz_shell: std::sync::Arc<crate::render::TinyShell>,
+    /// Image settlements from Blitz, drained on this document's thread.
+    image_settle_rx: std::sync::mpsc::Receiver<blitz_dom::ImageSettlement>,
+    /// Taint of each settled image request, so an element answered from
+    /// Blitz's cache keeps the taint its own request settled with
+    /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+    image_taint: HashMap<blitz_dom::ImageKey, bool>,
     /// Blitz subresource fetches awaiting carrier dials.
     blitz_fetch_rx:
         std::sync::mpsc::Receiver<(crate::render::BlitzFetch, crate::render::CountingHandler)>,
-    /// Filed Blitz response handlers by fetch id, delivered on completion.
-    blitz_handlers: HashMap<u64, crate::render::CountingHandler>,
-    /// Request URL for each filed Blitz handler, so an image delivery settles
-    /// the `<img>` waiters selected for that URL.
-    blitz_request_urls: HashMap<u64, String>,
-    /// Subresource bodies by URL, with the canvas taint each settled with, so
-    /// a repeat Blitz fetch for a URL reuses both instead of dialing again.
-    subresource_bytes: HashMap<String, SubresourceBody>,
+    /// Filed Blitz subresource requests by fetch id, delivered on completion.
+    blitz_requests: HashMap<u64, BlitzRequest>,
+    /// Subresource bodies by request, with the canvas taint each settled with,
+    /// so a repeat Blitz fetch reuses both instead of dialing again.
+    subresource_bytes: HashMap<blitz_dom::ImageKey, SubresourceBody>,
     /// Referrer policy each fetched CSS style sheet's response carried, keyed
     /// by the URL the sheet was located at. A request the sheet initiates uses
     /// it and the sheet's URL, not the document's own
@@ -550,17 +548,18 @@ pub(crate) struct Document {
     next_timer_id: TimerId,
     /// Every queued, in-flight, and cancelled dial for this document.
     dials: DialLedger,
-    /// `<img>` elements awaiting Blitz image state. They delay the document
-    /// load event; Blitz fetches and decodes, we only watch.
-    /// Selected source URL for the current request
-    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    image_selected_src: HashMap<crate::dom::tree::NodeId, String>,
-    /// Elements with an unresolved image request for the current generation.
-    /// The value is the load-event delay token, released when the request
-    /// settles or the element goes away.
-    in_flight_images: HashMap<crate::dom::tree::NodeId, LoadDelayGuard>,
-    /// Connected `<img>` elements the last lifecycle scan saw, so insertion
-    /// starts a fetch and removal drops one
+    /// Image `load`/`error` events queued while the parser is running. They
+    /// fire after the parser stops, so a handler the document's own markup
+    /// installs later still sees them
+    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
+    deferred_image_events: VecDeque<Task>,
+    /// `<img>` requests Blitz started for this document, each with the token
+    /// that delays the document's `load` event until it settles
+    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>,
+    /// <https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+    image_requests: HashMap<crate::dom::tree::NodeId, (blitz_dom::ImageKey, LoadDelayGuard)>,
+    /// Connected `<img>` elements the last lifecycle scan saw, so removal
+    /// drops their state
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     connected_images: HashSet<crate::dom::tree::NodeId>,
     /// Connected `<link rel=stylesheet>` elements already reported as loaded,
@@ -832,7 +831,9 @@ impl Document {
         // Blitz subresources enqueue here and ride carrier dials: the
         // renderer owns no network runtime of its own.
         let (blitz_tx, blitz_rx) = std::sync::mpsc::channel();
-        let net_provider = std::sync::Arc::new(crate::render::TinyNetProvider::new(blitz_tx));
+        let (settle_tx, settle_rx) = std::sync::mpsc::channel();
+        let net_provider =
+            std::sync::Arc::new(crate::render::TinyNetProvider::new(blitz_tx, settle_tx));
         let blitz_nav = std::sync::Arc::new(crate::render::TinyNav::new());
         Self {
             world,
@@ -843,8 +844,8 @@ impl Document {
             blitz_nav,
             blitz_shell: std::sync::Arc::new(crate::render::TinyShell::new()),
             blitz_fetch_rx: blitz_rx,
-            blitz_handlers: HashMap::new(),
-            blitz_request_urls: HashMap::new(),
+            image_settle_rx: settle_rx,
+            blitz_requests: HashMap::new(),
             subresource_bytes: HashMap::new(),
             style_policies: HashMap::new(),
             frame,
@@ -855,8 +856,9 @@ impl Document {
             timers: HashMap::new(),
             next_timer_id: TimerId::default(),
             dials: DialLedger::new(Arc::clone(&runtime.stop), Arc::clone(&runtime.wake)),
-            image_selected_src: HashMap::new(),
-            in_flight_images: HashMap::new(),
+            deferred_image_events: VecDeque::new(),
+            image_requests: HashMap::new(),
+            image_taint: HashMap::new(),
             connected_images: HashSet::new(),
             linked_sheets: HashMap::new(),
             stylesheet_generation: 0,
@@ -1197,11 +1199,6 @@ impl Document {
         let connected_image_set: std::collections::HashSet<crate::dom::tree::NodeId> =
             connected_images.iter().copied().collect();
         let mut image_events = Vec::new();
-        for element in &connected_images {
-            if !self.connected_images.contains(element) {
-                image_events.push(ImageLifecycle::Connected(*element));
-            }
-        }
         let previous = std::mem::replace(&mut self.connected_images, connected_image_set);
         for element in previous {
             if !self.connected_images.contains(&element) {
@@ -1239,18 +1236,12 @@ impl Document {
         self.adopt_js_work();
     }
 
-    /// Queues the image fetch for a newly connected `<img>`, if it still needs one
-    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    pub(crate) fn queue_connected_image(&mut self, element: crate::dom::tree::NodeId) {
-        self.queue_image(element, ImageUpdate::Inserted);
-    }
-
-    /// Drops a disconnected `<img>`'s decoded size and ignores its waiter.
+    /// Drops a disconnected `<img>`'s decoded state. Its request still settles
+    /// through Blitz, which fires `load` or `error` on the element
+    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
     pub(crate) fn disconnect_image(&mut self, element: crate::dom::tree::NodeId) {
-        self.in_flight_images.remove(&element);
-        self.image_selected_src.remove(&element);
-        // A re-insertion starts a new load: drop the old trigger so the
-        // move attributes to itself rather than to a stale `src` set.
+        // A re-insertion starts a new load: drop the old trigger so the move
+        // attributes to itself rather than to a stale `src` set.
         self.world
             .borrow_mut()
             .state
@@ -2203,16 +2194,18 @@ impl Document {
         }
         self.refresh_target = None;
         self.pending_frame_loads.clear();
-        for (_, handler) in self.blitz_handlers.drain() {
-            Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
+        for (_, request) in self.blitz_requests.drain() {
+            Box::new(request.handler)
+                .bytes(String::new(), blitz_traits::net::Bytes::from(Vec::new()));
         }
-        self.blitz_request_urls.clear();
         while self.blitz_fetch_rx.try_recv().is_ok() {}
+        while self.image_settle_rx.try_recv().is_ok() {}
         self.subresource_bytes.clear();
         self.style_policies.clear();
         self.world.borrow_mut().clear_images();
-        self.image_selected_src.clear();
-        self.in_flight_images.clear();
+        self.deferred_image_events.clear();
+        self.image_requests.clear();
+        self.image_taint.clear();
         self.connected_images.clear();
         self.timers.retain(|_, timer| timer.js_id.is_none());
         self.js_timers.clear();
@@ -2295,6 +2288,8 @@ impl Document {
                 as std::sync::Arc<dyn blitz_traits::shell::ShellProvider>),
             base_url: Some(crate::render::blitz_base_url(&base_url)),
             font_ctx: Some(self.shared_font_ctx()),
+            image_settle: Some(std::sync::Arc::clone(&self.net_provider)
+                as std::sync::Arc<dyn blitz_dom::ImageSettleObserver>),
             ..blitz_dom::DocumentConfig::default()
         }
     }
@@ -2566,7 +2561,6 @@ impl Document {
             self.record_event(RendererEvent::ScriptFailed);
             return;
         }
-        self.world.borrow_mut().parser_active = false;
         // Microtask checkpoint before scripts run; parser mutations queued
         // since the last script deliver now. Parser iframes are adopted in
         // tree order with scripts, not all at once before the first fetch.
@@ -2582,7 +2576,7 @@ impl Document {
         if self.run_scripts() {
             return;
         }
-        self.load_images();
+        self.world.borrow_mut().parser_active = false;
         // Deliver parser mutations before the document's events.
         self.deliver_mutations();
         self.fire_document_end();
@@ -3100,11 +3094,11 @@ impl Document {
             return false;
         }
         self.parser_blocked_script = Some(id);
-        let referrer_policy = self.subresource_referrer(Some(id));
+        let options = self.world.borrow().subresource_options(id);
         let mut dial = QueuedDial::new(
             DialContext::ClassicScript { element: id },
             crate::protocol::RequestPolicy::ClassicScript {
-                crossorigin: self.cross_origin(Some(id)),
+                crossorigin: crate::protocol::cross_origin(options.crossorigin),
             },
             &url,
             &self.dial_initiator(),
@@ -3112,7 +3106,10 @@ impl Document {
         dial.req.referrer = crate::protocol::ReferrerRequest::Client {
             url: self.referrer_url(),
         };
-        dial.req.referrer_policy = referrer_policy;
+        dial.req.referrer_policy = options
+            .referrer_policy
+            .or(self.world.borrow().policy.referrer_policy)
+            .unwrap_or_default();
         dial.req.csp = Some(Box::new(
             self.redirect_gate(crate::csp::Destination::Script),
         ));
@@ -3129,41 +3126,6 @@ impl Document {
         world.document(id).and_then(|parsed| {
             crate::dom::tree::attr(&parsed.document.base, id.node, "integrity").map(str::to_owned)
         })
-    }
-
-    /// The request referrer and policy a page subresource sends: the
-    /// element's `referrerpolicy` content attribute when present and valid,
-    /// the document's policy otherwise, and the client environment as the
-    /// source. Sampled when the element starts its request, which is where
-    /// HTML creates the request, so a later `<meta name=referrer>` does not
-    /// rewrite an earlier element's policy
-    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-referrerpolicy>,
-    /// <https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer>).
-    fn subresource_referrer(
-        &self,
-        element: Option<crate::dom::tree::NodeId>,
-    ) -> net::ReferrerPolicy {
-        let world = self.world.borrow();
-        element
-            .map(|element| world.subresource_options(element).referrer_policy)
-            .unwrap_or_default()
-            .or(world.policy.referrer_policy)
-            .unwrap_or_default()
-    }
-
-    /// The `crossorigin` state of the element a subresource request belongs to.
-    ///
-    /// An absent attribute reads as `None`, which is the `No CORS` state; an
-    /// empty or unknown value is `Anonymous`, the invalid-value default, so
-    /// the load and the reflected `crossOrigin` cannot disagree about
-    /// credentials
-    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
-    fn cross_origin(
-        &self,
-        element: Option<crate::dom::tree::NodeId>,
-    ) -> Option<net::cors::CrossOrigin> {
-        let world = self.world.borrow();
-        element.and_then(|element| world.subresource_options(element).crossorigin)
     }
 
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
@@ -3374,16 +3336,11 @@ impl Document {
                     self.commit_frame_response(&outcome, &url, embedder, &ancestors);
                 }
             }
-            DialContext::BlitzResource { id, destination } => {
+            DialContext::BlitzResource { id, .. } => {
                 let cors_clean = req.policy.cors().mode == net::cors::RequestMode::Cors;
-                self.deliver_blitz_resource(
-                    id,
-                    destination,
-                    &outcome,
-                    req.url.as_str(),
-                    redirected,
-                    cors_clean,
-                );
+                if let Some(request) = self.blitz_requests.remove(&id) {
+                    self.deliver_blitz_resource(&outcome, request, redirected, cors_clean);
+                }
             }
             // Fire-and-forget: the endpoint already stored the report, if it
             // cares. A failure is invisible by design.
@@ -3441,19 +3398,19 @@ impl Document {
     }
 
     /// Hands one Blitz subresource response to its handler. A redirect the
-    /// policy refuses is a failed load: empty bytes, and an `error` on the
-    /// element when the tree has one. `cors_clean` records that the request
-    /// went out in CORS mode and survived the check, which makes the loaded
-    /// image origin-clean for canvas.
+    /// policy refuses is a failed load: empty bytes, and the element learns
+    /// through its settlement (`<img>`) or an `error` event. `cors_clean`
+    /// records that the request went out in CORS mode and survived the check,
+    /// which makes the loaded image origin-clean for canvas.
     fn deliver_blitz_resource(
         &mut self,
-        id: u64,
-        destination: Option<crate::csp::Destination>,
         outcome: &DialOutcome,
-        request_url: &str,
+        request: BlitzRequest,
         redirected: bool,
         cors_clean: bool,
     ) {
+        let destination = request.destination;
+        let request_url = request.key.url.as_str();
         let blocked = redirected
             && destination.is_some_and(|destination| {
                 self.response_url_blocked(&outcome.final_url, request_url, destination, None)
@@ -3473,7 +3430,7 @@ impl Document {
         let origin_clean = cors_clean || !outcome.crossed_origin;
         if succeeded && let Some(body) = body {
             self.subresource_bytes.insert(
-                outcome.final_url.clone(),
+                request.key.clone(),
                 SubresourceBody {
                     bytes: body.to_vec(),
                     origin_clean,
@@ -3510,49 +3467,23 @@ impl Document {
                 self.style_policies.insert(request_url.to_owned(), policy);
             }
         }
-        let Some(handler) = self.blitz_handlers.remove(&id) else {
+        if !succeeded {
+            self.fail_blitz_request(request);
             return;
-        };
-        let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
-        if succeeded {
-            Box::new(handler).bytes(
-                outcome.final_url.clone(),
-                blitz_traits::net::Bytes::from(body.unwrap_or_default().to_vec()),
-            );
-            if destination == Some(crate::csp::Destination::Img) {
-                self.world
-                    .borrow_mut()
-                    .images
-                    .url_taint
-                    .insert(request_url.clone(), origin_clean);
-            }
-        } else {
-            Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
-            let element = Url::parse(&request_url)
-                .ok()
-                .and_then(|url| self.subresource_target(&url));
-            if let Some(element) = element {
-                if destination == Some(crate::csp::Destination::Img) {
-                    self.world
-                        .borrow_mut()
-                        .fail_image(element, request_url.clone());
-                } else {
-                    self.tasks.push_back(Task::NodeError(element));
-                }
-            }
         }
+        if destination.is_some_and(crate::csp::Destination::is_image) {
+            // The taint a cached request of this key carries
+            // (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
+            self.image_taint.insert(request.key.clone(), origin_clean);
+        }
+        Box::new(request.handler).bytes(
+            outcome.final_url.clone(),
+            blitz_traits::net::Bytes::from(body.unwrap_or_default().to_vec()),
+        );
         // The arrival changes style or layout; apply it now so the tree is
         // current for the next capture instead of waiting for one to pump
         // the resolve loop.
         self.settle_blitz_layout();
-        self.settle_image_waiters(
-            &request_url,
-            if succeeded {
-                ImageSettle::Loaded { origin_clean }
-            } else {
-                ImageSettle::Failed
-            },
-        );
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
@@ -3577,39 +3508,9 @@ impl Document {
             // container's load event still fires because the frame is no
             // longer waiting. A lost report is invisible by design.
             DialContext::FrameLoad { .. } | DialContext::CspReport => {}
-            DialContext::BlitzResource { id, destination: _ } => {
-                // Deliver empty bytes so Blitz releases the resource as
-                // failed instead of holding it pending forever.
-                if let Some(handler) = self.blitz_handlers.remove(&id) {
-                    let request_url = self.blitz_request_urls.remove(&id).unwrap_or_default();
-                    Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
-                    let target = Url::parse(&request_url)
-                        .ok()
-                        .and_then(|url| self.subresource_target(&url));
-                    let is_image = target.is_some_and(|element| {
-                        self.world.borrow().document(element).is_some_and(|parsed| {
-                            crate::dom::tree::is_html_element(
-                                &parsed.document.base,
-                                element.node,
-                                "img",
-                            )
-                        })
-                    });
-                    if let Some(element) = target {
-                        // A failed request must be visible to later scans; a
-                        // waiterless element would otherwise re-register a
-                        // waiter that never settles. Images report their
-                        // `error` through the lifecycle; other elements here.
-                        if is_image {
-                            self.world
-                                .borrow_mut()
-                                .fail_image(element, request_url.clone());
-                        } else {
-                            self.tasks.push_back(Task::NodeError(element));
-                        }
-                    }
-                    self.settle_blitz_layout();
-                    self.settle_image_waiters(&request_url, ImageSettle::Failed);
+            DialContext::BlitzResource { id, .. } => {
+                if let Some(request) = self.blitz_requests.remove(&id) {
+                    self.fail_blitz_request(request);
                 }
             }
         }
@@ -3629,6 +3530,7 @@ impl Document {
         drop(parsed);
         drop(world);
         self.note_linked_stylesheets();
+        self.drain_image_settlements();
     }
 
     /// Fires `load` on connected `<link rel=stylesheet>` elements whose sheet
@@ -3846,6 +3748,18 @@ impl Document {
     /// consulted
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
     pub(crate) fn check_load(&mut self) -> bool {
+        // Blitz starts image requests from DOM mutations and settles them
+        // from resource messages, so resolving the pending redraw here is
+        // what turns a post-load `src` write into an event; without it the
+        // settlement would wait for a paint
+        // (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
+        if self.blitz_shell.take_redraw() {
+            self.settle_blitz_layout();
+        }
+        self.drain_image_settlements();
+        if !self.world.borrow().parser_active {
+            self.tasks.extend(self.deferred_image_events.drain(..));
+        }
         if self.load_fired {
             return false;
         }
@@ -3878,75 +3792,44 @@ impl Document {
         self.fire_js(crate::js::JsRealm::fire_ready_state_change);
     }
 
-    /// Registers the current document's `<img src>` requests as Blitz image
-    /// waiters. Image requests delay the load event until they succeed or fail
-    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    fn load_images(&mut self) {
-        let images: Vec<crate::dom::tree::NodeId> = self
-            .world
-            .borrow()
-            .with_main_document(|parsed| {
-                let base = &parsed.document.base;
-                let document = parsed.id;
-                let mut images = Vec::new();
-                let mut stack = vec![base.root_node().id];
-                while let Some(id) = stack.pop() {
-                    if crate::dom::tree::is_html_element(base, id, "img")
-                        && crate::dom::tree::attr(base, id, "src").is_some()
-                    {
-                        images.push(crate::dom::tree::NodeId { document, node: id });
-                    }
-                    if let Some(node) = base.get_node(id) {
-                        stack.extend(node.children.iter().rev().copied());
-                    }
-                }
-                images
-            })
-            .unwrap_or_default();
-        for element in images {
-            self.queue_image(element, ImageUpdate::Inserted);
-        }
-    }
-
     /// Moves every queued Blitz subresource fetch onto a carrier dial,
     /// filing its response handler under the fetch id.
     fn drain_blitz_fetches(&mut self) {
         while let Ok((fetch, handler)) = self.blitz_fetch_rx.try_recv() {
-            let url = fetch.url.as_str().to_owned();
-            // The element supplies `crossorigin`; a request a style sheet
-            // initiates has none
-            // (<https://html.spec.whatwg.org/multipage/semantics.html#create-a-link-request>).
-            let element = self.subresource_target(&fetch.url);
-            let crossorigin = if fetch.style_sheet.is_some() {
-                None
-            } else {
-                self.cross_origin(element)
+            let incoming = fetch.request;
+            let key = blitz_dom::ImageKey {
+                url: incoming.url.as_str().to_owned(),
+                crossorigin: incoming.crossorigin,
             };
-            let (policy, destination) = subresource_request(fetch.kind, crossorigin);
-            if let Some(cached) = self.subresource_bytes.get(&url).cloned() {
-                Box::new(handler).bytes(url.clone(), blitz_traits::net::Bytes::from(cached.bytes));
-                if destination == Some(crate::csp::Destination::Img) {
-                    self.world
-                        .borrow_mut()
-                        .images
-                        .url_taint
-                        .insert(url.clone(), cached.origin_clean);
+            let element = self.subresource_element(incoming.node);
+            let (policy, destination) = subresource_request(
+                incoming.kind,
+                crate::protocol::cross_origin(incoming.crossorigin),
+            );
+            if let Some(cached) = self.subresource_bytes.get(&key).cloned() {
+                if destination.is_some_and(crate::csp::Destination::is_image) {
+                    self.image_taint.insert(key.clone(), cached.origin_clean);
                 }
-                self.settle_blitz_layout();
-                self.settle_image_waiters(
-                    &url,
-                    ImageSettle::Loaded {
-                        origin_clean: cached.origin_clean,
-                    },
+                Box::new(handler).bytes(
+                    key.url.clone(),
+                    blitz_traits::net::Bytes::from(cached.bytes),
                 );
+                self.settle_blitz_layout();
                 continue;
             }
+            let request = BlitzRequest {
+                handler,
+                key,
+                referrer_policy: incoming.referrer_policy,
+                node: element,
+                destination,
+            };
             // Per-destination policy: a blocked stylesheet, image, or font is
             // never dialed; the handler receives empty bytes so Blitz
             // releases the resource as failed
             // (<https://w3c.github.io/webappsec-csp/#should-block-request>).
             if let Some(destination) = destination {
-                let violations = self.subresource_violations(&fetch.url, destination);
+                let violations = self.subresource_violations(&incoming.url, destination);
                 let target = element.or_else(|| self.document_node());
                 if !violations.is_empty()
                     && let Some(target) = target
@@ -3954,51 +3837,43 @@ impl Document {
                     self.fire_csp_violations(target, &violations);
                 }
                 if crate::csp::blocks(&violations) {
-                    Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
-                    if let Some(element) = element {
-                        if matches!(destination, crate::csp::Destination::Img) {
-                            // The image lifecycle reports the error when the
-                            // DOM walk reaches the element, so scripts that
-                            // precede it have run.
-                            self.world.borrow_mut().fail_image(element, url.clone());
-                        } else {
-                            // A blocked element load fails with an `error`
-                            // event
-                            // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#fetching-resources>).
-                            self.tasks.push_back(Task::NodeError(element));
-                        }
-                    }
-                    self.settle_blitz_layout();
-                    self.settle_image_waiters(&url, ImageSettle::Failed);
+                    self.fail_blitz_request(request);
                     continue;
                 }
             }
-            self.blitz_request_urls.insert(fetch.id, url);
-            self.blitz_handlers.insert(fetch.id, handler);
             // The Fetch initiator is the document, not the fetch target: the
             // provider never sees the document URL, so it stamps the target
             // as initiator and the document corrects it here
             // (<https://fetch.spec.whatwg.org/#concept-request-initiator>).
-            let (referrer, referrer_policy) = match fetch.style_sheet.clone() {
-                // A request a style sheet initiates uses the sheet's URL as
-                // its referrer and the policy that sheet's response carried,
-                // not the document's
+            let (referrer, referrer_policy) = if let Some(sheet) = incoming.style_sheet.clone() {
+                // A request a style sheet initiates uses the sheet's URL
+                // as its referrer and the policy that sheet's response
+                // carried, not the document's
                 // (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-                Some(sheet) => {
-                    let policy = self
-                        .style_policies
-                        .get(sheet.as_str())
-                        .copied()
-                        .or(self.world.borrow().policy.referrer_policy)
-                        .unwrap_or_default();
-                    (crate::protocol::ReferrerRequest::Url(sheet), policy)
-                }
-                None => (
+                let policy = self
+                    .style_policies
+                    .get(sheet.as_str())
+                    .copied()
+                    .or(self.world.borrow().policy.referrer_policy)
+                    .unwrap_or_default();
+                (crate::protocol::ReferrerRequest::Url(sheet), policy)
+            } else {
+                // HTML samples the element's `referrerpolicy` when the
+                // request is created; Blitz carried that value, so a write
+                // between creation and dial cannot change it
+                // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#referrer-policy-attribute>).
+                let policy = request
+                    .referrer_policy
+                    .as_deref()
+                    .and_then(net::ReferrerPolicy::parse)
+                    .or(self.world.borrow().policy.referrer_policy)
+                    .unwrap_or_default();
+                (
                     crate::protocol::ReferrerRequest::Client {
                         url: self.referrer_url(),
                     },
-                    self.subresource_referrer(element),
-                ),
+                    policy,
+                )
             };
             let mut dial = QueuedDial::new(
                 DialContext::BlitzResource {
@@ -4006,14 +3881,34 @@ impl Document {
                     destination,
                 },
                 policy,
-                &fetch.url,
+                &incoming.url,
                 &self.dial_initiator(),
             );
+            self.blitz_requests.insert(fetch.id, request);
             dial.req.referrer = referrer;
             dial.req.referrer_policy = referrer_policy;
             dial.req.csp = destination.map(|destination| Box::new(self.redirect_gate(destination)));
             self.queue_dial(dial);
         }
+    }
+
+    /// Fails one Blitz request: empty bytes release Blitz's hold, and the
+    /// element that started it learns through its settlement (`<img>`) or an
+    /// `error` event.
+    fn fail_blitz_request(&mut self, request: BlitzRequest) {
+        let BlitzRequest {
+            handler,
+            node,
+            destination,
+            ..
+        } = request;
+        Box::new(handler).bytes(String::new(), blitz_traits::net::Bytes::new());
+        if !destination.is_some_and(crate::csp::Destination::is_image)
+            && let Some(node) = node
+        {
+            self.tasks.push_back(Task::NodeError(node));
+        }
+        self.settle_blitz_layout();
     }
 
     pub(crate) fn redirect_gate(
@@ -4135,149 +4030,84 @@ impl Document {
             .check_request(&world.origin, &world.document_url, url, destination, None)
     }
 
-    /// The element whose subresource load `url` is: a `<link>` or `<img>`
-    /// whose resolved URL matches, when the fetch came from markup.
-    fn subresource_target(&self, url: &Url) -> Option<crate::dom::tree::NodeId> {
-        let candidates: Vec<(crate::dom::tree::NodeId, String)> = {
-            let world = self.world.borrow();
-            let parsed = world.main_document()?;
-            let base = &parsed.document.base;
-            let document = parsed.id;
-            let mut candidates = Vec::new();
-            let mut stack = vec![base.root_node().id];
-            while let Some(id) = stack.pop() {
-                let Some(node) = base.get_node(id) else {
-                    continue;
-                };
-                stack.extend(node.children.iter().copied());
-                let Some(element) = node.data.downcast_element() else {
-                    continue;
-                };
-                if element.name.ns != crate::dom::tree::html_namespace() {
-                    continue;
-                }
-                let attribute = match element.name.local.as_str() {
-                    "link" => "href",
-                    "img" => "src",
-                    _ => continue,
-                };
-                if let Some(spec) = crate::dom::tree::attr(base, id, attribute) {
-                    candidates.push((
-                        crate::dom::tree::NodeId { document, node: id },
-                        spec.to_owned(),
-                    ));
-                }
-            }
-            candidates
-        };
-        for (id, spec) in candidates {
-            if let Ok(resolved) = self.resolve_dial_url(&spec)
-                && resolved == *url
-            {
-                return Some(id);
-            }
-        }
-        None
+    /// The element a Blitz request names, paired with this document. The
+    /// provider is per document and Blitz's own document id is a process-wide
+    /// counter unrelated to this store's id, so the active document is the one
+    /// that issued the fetch.
+    fn subresource_element(
+        &self,
+        node: Option<blitz_traits::node_id::NodeId>,
+    ) -> Option<crate::dom::tree::NodeId> {
+        let document = self.world.borrow().main_document().map(|parsed| parsed.id);
+        document
+            .zip(node)
+            .map(|(document, node)| crate::dom::tree::NodeId { document, node })
     }
 
-    /// Registers the current `<img>` request as a waiter on Blitz image
-    /// state. Blitz fetches and decodes on its own — initial parse,
-    /// insertion, and `src` sets all run through its loader — so this only
-    /// watches: a request Blitz already settled (its image cache, or a
-    /// delivery that beat this registration) settles here, otherwise the
-    /// Blitz delivery for the selected URL settles it.
-    ///
-    /// A connected insert skips work when a request is already in flight or
-    /// decoded; a `src` mutation must reload regardless.
-    pub(in crate::document) fn queue_image(
-        &mut self,
-        element: crate::dom::tree::NodeId,
-        update: ImageUpdate,
-    ) {
-        let inserted = matches!(update, ImageUpdate::Inserted);
-        match update {
-            ImageUpdate::Inserted
-                if self.in_flight_images.contains_key(&element)
-                    || self.world.borrow().images.sizes.contains_key(&element) =>
-            {
-                return;
-            }
-            ImageUpdate::Inserted | ImageUpdate::SrcChanged => {}
+    /// Queues one image event, behind the parser while it runs.
+    fn queue_image_event(&mut self, event: Task) {
+        if self.world.borrow().parser_active {
+            self.deferred_image_events.push_back(event);
+        } else {
+            self.tasks.push_back(event);
         }
-        let src = self.world.borrow().document(element).and_then(|parsed| {
-            crate::dom::tree::is_html_element(&parsed.document.base, element.node, "img")
-                .then(|| {
-                    crate::dom::tree::attr(&parsed.document.base, element.node, "src")
-                        .map(str::to_owned)
-                })
-                .flatten()
-        });
-        let Some(src) = src.filter(|src| !src.is_empty()) else {
-            self.in_flight_images.remove(&element);
-            self.image_selected_src.remove(&element);
-            self.world.borrow_mut().forget_image(element);
-            self.tasks.push_back(Task::NodeError(element));
-            return;
-        };
-        let Ok(url) = self.resolve_dial_url(&src) else {
-            self.in_flight_images.remove(&element);
-            self.image_selected_src.remove(&element);
-            self.world.borrow_mut().fail_image(element, src);
-            self.tasks.push_back(Task::NodeError(element));
-            return;
-        };
-        let selected = url.as_str().to_owned();
-        // A request that already failed (blocked or network error) must not
-        // register a waiter: no delivery will ever settle it, which would
-        // hold the load event forever. The failure reports its `error` event
-        // here, in parser order, instead of when the block decided.
-        if self.world.borrow().image_failed(element, &selected) {
-            self.in_flight_images.remove(&element);
-            self.image_selected_src.remove(&element);
-            if self.world.borrow_mut().report_image_error(element) {
-                self.tasks.push_back(Task::NodeError(element));
-            }
-            return;
-        }
-        self.image_selected_src.insert(element, selected.clone());
-        self.world
-            .borrow_mut()
-            .begin_image(element, selected.clone());
-        // A fresh element can already have pixels: Blitz answers an insertion
-        // from its image cache before the lifecycle scan reaches it. A `src`
-        // change cannot use the same shortcut, because the node still holds
-        // the previous request's pixels and Blitz does not say which URL they
-        // belong to; that request settles through its dial instead.
-        if inserted && let Some((width, height)) = self.blitz_image_dims(element) {
-            self.image_selected_src.remove(&element);
-            // Blitz can hand back pixels it decoded before this element had a
-            // waiter (a delivery that beat the scan, or its image cache). The
-            // taint recorded for the URL covers the first case; a URL with no
-            // record that stays on this origin never crossed one.
-            let origin_clean = {
-                let world = self.world.borrow();
-                world
-                    .images
-                    .url_taint
-                    .get(&selected)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        Url::parse(&selected)
-                            .is_ok_and(|url| url.scheme() == "data" || url.origin() == world.origin)
-                    })
+    }
+
+    /// Applies Blitz's image settlements. Blitz owns request identity, so the
+    /// event says which node and which request; this records the outcome and
+    /// fires the element's event instead of recomputing a key
+    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
+    fn drain_image_settlements(&mut self) {
+        let document = self.world.borrow().main_document().map(|parsed| parsed.id);
+        while let Ok(settlement) = self.image_settle_rx.try_recv() {
+            let Some(document) = document else {
+                // The document this request belonged to is gone, so nothing
+                // observes the settlement.
+                continue;
             };
-            self.world.borrow_mut().store_image_dims(
-                element,
-                width,
-                height,
-                selected,
-                origin_clean,
-            );
-            self.tasks.push_back(Task::NodeLoad(element));
-            return;
+            let element = crate::dom::tree::NodeId {
+                document,
+                node: settlement.node,
+            };
+            match settlement.outcome {
+                blitz_dom::ImageOutcome::Started => {
+                    let delay = self.load_delay.guard();
+                    self.image_requests.insert(element, (settlement.key, delay));
+                    self.world.borrow_mut().image_started(element);
+                }
+                blitz_dom::ImageOutcome::Loaded | blitz_dom::ImageOutcome::Failed => {
+                    // A request the element no longer displays settles
+                    // nothing: a later request replaced it
+                    // (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
+                    let current = self.image_requests.remove(&element);
+                    let Some((key, _delay)) = current.filter(|(key, _)| *key == settlement.key)
+                    else {
+                        continue;
+                    };
+                    if settlement.outcome == blitz_dom::ImageOutcome::Loaded
+                        && let Some((width, height)) = self.blitz_image_dims(element)
+                    {
+                        let origin_clean =
+                            self.image_taint.get(&key).copied().unwrap_or_else(|| {
+                                let world = self.world.borrow();
+                                Url::parse(&key.url).is_ok_and(|url| {
+                                    url.scheme() == "data" || url.origin() == world.origin
+                                })
+                            });
+                        self.world.borrow_mut().image_settled(
+                            element,
+                            key,
+                            (width, height),
+                            origin_clean,
+                        );
+                        self.queue_image_event(Task::NodeLoad(element));
+                    } else {
+                        self.world.borrow_mut().image_failed(element, key);
+                        self.queue_image_event(Task::NodeError(element));
+                    }
+                }
+            }
         }
-        self.in_flight_images
-            .insert(element, self.load_delay.guard());
     }
 
     /// Decoded dimensions Blitz holds for `element`'s current request, if it
@@ -4291,48 +4121,6 @@ impl Document {
             blitz_dom::node::ImageData::Raster(raster) => Some((raster.width, raster.height)),
             blitz_dom::node::ImageData::Svg(svg) => Some(crate::render::svg_natural_size(svg)),
             blitz_dom::node::ImageData::None => None,
-        }
-    }
-
-    /// Settles the in-flight image elements waiting on `url`. `settle` carries
-    /// the taint decision for a delivered response, or `Failed` when the
-    /// request never produced pixels; decoded dimensions fire `load`, anything
-    /// else fires `error`
-    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>).
-    fn settle_image_waiters(&mut self, url: &str, settle: ImageSettle) {
-        let waiting: Vec<crate::dom::tree::NodeId> = self
-            .in_flight_images
-            .keys()
-            .copied()
-            .filter(|element| {
-                self.image_selected_src
-                    .get(element)
-                    .is_some_and(|selected| selected == url)
-            })
-            .collect();
-        for element in &waiting {
-            self.in_flight_images.remove(element);
-            let selected = self.image_selected_src.remove(element).unwrap_or_default();
-            if let Some((width, height)) = self.blitz_image_dims(*element) {
-                let origin_clean = match settle {
-                    ImageSettle::Loaded { origin_clean } => origin_clean,
-                    ImageSettle::Failed => false,
-                };
-                self.world.borrow_mut().store_image_dims(
-                    *element,
-                    width,
-                    height,
-                    selected,
-                    origin_clean,
-                );
-                self.fire_js(|js| js.fire_node_load(*element));
-            } else {
-                self.world.borrow_mut().fail_image(*element, selected);
-                if self.world.borrow_mut().report_image_error(*element) {
-                    self.fire_js(|js| js.fire_node_error(*element));
-                }
-            }
-            self.adopt_js_work();
         }
     }
 

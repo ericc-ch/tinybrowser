@@ -168,7 +168,8 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         let (tx, rx) = std::sync::mpsc::channel();
-        let net = Arc::new(TinyNetProvider::new(tx));
+        let (settle_tx, _settle_rx) = std::sync::mpsc::channel();
+        let net = Arc::new(TinyNetProvider::new(tx, settle_tx));
         let viewport = blitz_traits::shell::Viewport::new(
             200,
             120,
@@ -197,7 +198,7 @@ mod tests {
                     std::net::TcpStream::connect(("127.0.0.1", port)).expect("css server");
                 let request = format!(
                     "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-                    fetch.url.path()
+                    fetch.request.url.path()
                 );
                 stream.write_all(request.as_bytes()).expect("css request");
                 let mut response = Vec::new();
@@ -208,7 +209,7 @@ mod tests {
                     .map(|index| response[index + 4..].to_vec())
                     .unwrap_or_default();
                 Box::new(handler).bytes(
-                    fetch.url.as_str().to_owned(),
+                    fetch.request.url.as_str().to_owned(),
                     blitz_traits::net::Bytes::from(body),
                 );
             }

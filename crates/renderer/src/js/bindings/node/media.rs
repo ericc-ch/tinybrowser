@@ -570,9 +570,9 @@ impl JsNode {
         Ok(world
             .borrow()
             .images
-            .current_src
+            .current_request
             .get(&self.handle.0)
-            .cloned()
+            .map(|request| request.url.clone())
             .unwrap_or_default())
     }
 }
