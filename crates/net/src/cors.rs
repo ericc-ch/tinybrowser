@@ -10,6 +10,7 @@
 //! follows the kind the renderer names; probing that label with response-body
 //! sniffing is tracked in #190.
 
+use enumerated::Enumerated;
 use hyper::header::{self, HeaderValue};
 
 use crate::protocol::{HeaderMap, Method};
@@ -83,47 +84,27 @@ impl CredentialsMode {
     }
 }
 
-/// The state of a present `crossorigin` content attribute
-/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
-///
-/// An absent attribute is `None`, which is the `No CORS` state: `no-cors` with
-/// credentials included. A present attribute is `Anonymous` or
-/// `Use Credentials`; an empty or unknown spelling is `Anonymous`, the
-/// enumerated attribute's invalid value default, so a bad spelling never sends
-/// credentials
-/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CrossOrigin {
-    /// CORS mode with `same-origin` credentials.
-    Anonymous,
-    /// CORS mode with `include` credentials.
-    UseCredentials,
+enumerated::enumerated! {
+    /// The state of a present `crossorigin` content attribute
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+    ///
+    /// An absent attribute is `None`, which is the `No CORS` state: `no-cors`
+    /// with credentials included. A present attribute is `Anonymous` or
+    /// `Use Credentials`; an empty or unknown spelling is `Anonymous`, the
+    /// enumerated attribute's invalid value default, so a bad spelling never
+    /// sends credentials
+    /// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub CrossOrigin {
+        /// CORS mode with `same-origin` credentials.
+        Anonymous => "anonymous",
+        /// CORS mode with `include` credentials.
+        UseCredentials => "use-credentials",
+    }
 }
 
 impl CrossOrigin {
-    /// Every keyword, in spec order.
-    pub const KEYWORDS: &'static [Self] = &[Self::Anonymous, Self::UseCredentials];
-
-    /// The canonical spelling of the keyword.
-    #[must_use]
-    pub fn keyword(self) -> &'static str {
-        match self {
-            Self::Anonymous => "anonymous",
-            Self::UseCredentials => "use-credentials",
-        }
-    }
-
-    /// Parses one keyword, ASCII case-insensitively and untrimmed, the way an
-    /// enumerated attribute does.
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::KEYWORDS
-            .iter()
-            .copied()
-            .find(|candidate| candidate.keyword().eq_ignore_ascii_case(value))
-    }
-
     /// The state of a `crossorigin` content attribute: absent is the `No CORS`
     /// state, and a present attribute that names no keyword takes the invalid
     /// value default

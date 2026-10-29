@@ -1405,6 +1405,46 @@ impl Response {
 }
 
 #[cfg(test)]
+mod redirect_policy_tests {
+    use super::{HeaderMap, Hop, Method, Url, apply_redirect_policy};
+    use crate::cors::ResponseType;
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).expect("url")
+    }
+
+    fn hop_with_hint() -> Hop {
+        let mut headers = HeaderMap::new();
+        headers
+            .insert("sec-ch-prefers-color-scheme", b"dark")
+            .expect("hint header");
+        Hop {
+            method: Method::GET,
+            headers,
+            body: None,
+            response_type: ResponseType::Basic,
+            previous_url: None,
+            origin_tainted: false,
+            crossed_origin: false,
+        }
+    }
+
+    /// A caller-supplied client hint is dropped when the redirect hop is not
+    /// potentially trustworthy (<https://wicg.github.io/ua-client-hints/#secure-transport>).
+    #[test]
+    fn a_redirect_to_an_untrustworthy_origin_drops_the_client_hint() {
+        let mut hop = hop_with_hint();
+        apply_redirect_policy(
+            302,
+            &url("http://a.test/"),
+            &url("http://b.test/"),
+            &mut hop,
+        );
+        assert_eq!(hop.headers.get("sec-ch-prefers-color-scheme"), None);
+    }
+}
+
+#[cfg(test)]
 mod decode_tests {
     use super::{Arc, AtomicBool, Body, Mutex, NetError};
     use flate2::Compression;

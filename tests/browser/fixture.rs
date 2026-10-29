@@ -1,9 +1,12 @@
 //! Shared fixtures for the browser-level integration suites in this binary.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +18,25 @@ use serde_json::json;
 /// the connection failed or the request line was malformed; the server loop
 /// moves on to the next connection.
 pub(crate) fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+    // Only the request line matters, so decode up to its line break and leave
+    // the (possibly non-UTF-8) header bytes alone.
+    let head = read_request_head_bytes(stream)?;
+    let line = match head.windows(2).position(|window| window == b"\r\n") {
+        Some(end) => &head[..end],
+        None => &head[..],
+    };
+    let line = String::from_utf8_lossy(line);
+    line.split_whitespace().nth(1).map(str::to_owned)
+}
+
+/// Reads one request head, including its blank line, and returns it as text so
+/// a test can inspect the headers the client sent.
+pub(crate) fn read_request_head(stream: &mut TcpStream) -> Option<String> {
+    let head = read_request_head_bytes(stream)?;
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+fn read_request_head_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
     // Short polls instead of one long blocking read: under load the request
     // can lag the accept, and a single long read hides which side stalled.
     stream
@@ -43,14 +65,7 @@ pub(crate) fn read_request_path(stream: &mut TcpStream) -> Option<String> {
             }
         }
     }
-    // Only the request line matters, so decode up to its line break and leave
-    // the (possibly non-UTF-8) header bytes alone.
-    let line = match head.windows(2).position(|window| window == b"\r\n") {
-        Some(end) => &head[..end],
-        None => &head[..],
-    };
-    let line = String::from_utf8_lossy(line);
-    line.split_whitespace().nth(1).map(str::to_owned)
+    Some(head)
 }
 
 /// Binds an ephemeral loopback port for a test server. The caller learns the
@@ -113,7 +128,186 @@ pub(crate) fn redirect(location: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Serves one body at `/` on an ephemeral port for every connection it gets.
+/// One 1x1 red PNG.
+pub(crate) const PIXEL: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+    0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// One request a [`TestServer`] accepted: its target and its whole head.
+pub(crate) struct RecordedRequest {
+    pub(crate) path: String,
+    pub(crate) head: String,
+}
+
+/// A route table plus a recorder: serves the response whose path matches,
+/// records every request head, and holds one path until [`Self::release`].
+/// Each connection runs on its own thread, so a held response does not block
+/// the rest. A response echoes the request's `Origin` and allows credentials,
+/// so a CORS subresource completes; a request without one gets `*`.
+pub(crate) struct TestServer {
+    address: std::net::SocketAddr,
+    receiver: Mutex<mpsc::Receiver<RecordedRequest>>,
+    history: Mutex<Vec<RecordedRequest>>,
+    released: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl TestServer {
+    pub(crate) fn start(
+        routes: Vec<(&'static str, &'static str, &'static [u8])>,
+        hold: Option<&'static str>,
+    ) -> Self {
+        let (listener, address) = server();
+        let (sender, receiver) = mpsc::channel();
+        let released: Arc<(Mutex<bool>, Condvar)> = Arc::default();
+        let flag = Arc::clone(&released);
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let sender = sender.clone();
+                let flag = Arc::clone(&flag);
+                let routes = routes.clone();
+                thread::spawn(move || {
+                    let Some(head) = read_request_head(&mut stream) else {
+                        return;
+                    };
+                    let path = request_path(&head);
+                    let _ = sender.send(RecordedRequest {
+                        path: path.clone(),
+                        head: head.clone(),
+                    });
+                    if hold == Some(path.as_str()) {
+                        let (lock, condvar) = &*flag;
+                        let mut released = lock.lock().expect("release flag");
+                        while !*released {
+                            released = condvar.wait(released).expect("release wait");
+                        }
+                    }
+                    let (content_type, body) = routes
+                        .iter()
+                        .find(|(route, _, _)| *route == path)
+                        .map_or(("text/plain", &[][..]), |(_, kind, body)| (*kind, *body));
+                    let response = response_for(&head, content_type, body);
+                    // The client may hang up right after its head; a failed
+                    // write then needs no retry.
+                    let _ = stream.write_all(&response);
+                });
+            }
+        });
+        Self {
+            address,
+            receiver: Mutex::new(receiver),
+            history: Mutex::new(Vec::new()),
+            released,
+        }
+    }
+
+    pub(crate) fn address(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    /// Waits for a request whose target is `path` and returns its head.
+    pub(crate) fn wait(&self, path: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(found) = self
+                .history
+                .lock()
+                .expect("request history")
+                .iter()
+                .rev()
+                .find(|request| request.path == path)
+            {
+                return found.head.clone();
+            }
+            match self
+                .receiver
+                .lock()
+                .expect("request channel")
+                .recv_timeout(Duration::from_millis(100))
+            {
+                Ok(recorded) => self.history.lock().expect("request history").push(recorded),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => panic!("request recorder stopped"),
+            }
+            assert!(Instant::now() < deadline, "no request for {path}");
+        }
+    }
+
+    /// Whether any request for `path` has been accepted.
+    pub(crate) fn requested(&self, path: &str) -> bool {
+        self.drain();
+        self.history
+            .lock()
+            .expect("request history")
+            .iter()
+            .any(|request| request.path == path)
+    }
+
+    /// Every recorded head for `path`, oldest first.
+    pub(crate) fn history(&self, path: &str) -> Vec<String> {
+        self.drain();
+        self.history
+            .lock()
+            .expect("request history")
+            .iter()
+            .filter(|request| request.path == path)
+            .map(|request| request.head.clone())
+            .collect()
+    }
+
+    fn drain(&self) {
+        let receiver = self.receiver.lock().expect("request channel");
+        while let Ok(recorded) = receiver.try_recv() {
+            self.history.lock().expect("request history").push(recorded);
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let (lock, condvar) = &*self.released;
+        *lock.lock().expect("release flag") = true;
+        condvar.notify_all();
+    }
+}
+
+/// The request target of a recorded head.
+fn request_path(head: &str) -> String {
+    head.split_whitespace().nth(1).unwrap_or("/").to_owned()
+}
+
+/// One response, echoing the request's `Origin` when it sent one so a
+/// credentialed CORS request passes the CORS check.
+fn response_for(head: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    match request_header(head, "origin") {
+        Some(origin) => {
+            let _ = write!(
+                response,
+                "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\n"
+            );
+        }
+        None => response.push_str("Access-Control-Allow-Origin: *\r\n"),
+    }
+    response.push_str("\r\n");
+    let mut response = response.into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+/// One request header's value, case-insensitively.
+fn request_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// Serves one body at `/` on an ephemeral port for every connection it gets./// Serves one body at `/` on an ephemeral port for every connection it gets.
 pub(crate) fn serve(body: &'static [u8], content_type: &'static str) -> std::net::SocketAddr {
     let (listener, address) = server();
     serve_on(listener, vec![("/", ok(content_type, body))]);

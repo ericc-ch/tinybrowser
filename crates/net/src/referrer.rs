@@ -8,58 +8,22 @@
 //!
 //! <https://w3c.github.io/webappsec-referrer-policy/>
 
+use enumerated::Enumerated;
 use serde::{Deserialize, Serialize};
 use url::{Origin, Url};
 
 use secure_context::is_potentially_trustworthy;
 
-/// One referrer policy set: the variant list is the only copy, and it expands
-/// into the enum, `ALL`, and `keyword()`.
-macro_rules! referrer_policies {
-    (
-        $(#[$meta:meta])*
-        $name:ident {
-            $(
-                $(#[$variant_meta:meta])*
-                $variant:ident => $keyword:literal
-            ),+ $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        pub enum $name {
-            $(
-                $(#[$variant_meta])*
-                $variant,
-            )+
-        }
-
-        impl $name {
-            /// Every policy, in spec order
-            /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
-            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
-
-            /// The policy's keyword, the one spelling used by the header
-            /// parser, meta content, and content-attribute reflection.
-            #[must_use]
-            pub const fn keyword(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $keyword),+
-                }
-            }
-        }
-    };
-}
-
-referrer_policies! {
+enumerated::enumerated! {
     /// A referrer policy
     /// (<https://w3c.github.io/webappsec-referrer-policy/#referrer-policies>).
     ///
     /// The empty string is not a variant: it means "no policy here, inherit one",
     /// so callers use `Option<ReferrerPolicy>` until the policy container or the
     /// user agent default supplies a value.
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Default, Serialize, Deserialize)]
     #[serde(rename_all = "kebab-case")]
-    ReferrerPolicy {
+    pub ReferrerPolicy {
         /// Send no `Referer`.
         NoReferrer => "no-referrer",
         /// Send the full URL unless the target is a downgrade.
@@ -82,17 +46,6 @@ referrer_policies! {
 }
 
 impl ReferrerPolicy {
-    /// One policy token, ASCII case-insensitive and untrimmed. Enumerated
-    /// attributes and header list members are trimmed by their own parsers,
-    /// so a stray space is not a policy here.
-    #[must_use]
-    pub fn parse(token: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|policy| policy.keyword().eq_ignore_ascii_case(token))
-    }
-
     /// The last recognized token of a `Referrer-Policy` response field list
     /// (<https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>).
     ///
@@ -278,30 +231,4 @@ fn strip_url(url: &Url, origin_only: bool) -> Url {
         stripped.set_query(None);
     }
     stripped
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ReferrerPolicy;
-
-    #[test]
-    fn policy_keywords_are_the_spec_strings() {
-        let mut seen = std::collections::HashSet::new();
-        for policy in ReferrerPolicy::ALL {
-            let keyword = policy.keyword();
-            assert_eq!(ReferrerPolicy::parse(keyword), Some(*policy), "{keyword}");
-            assert!(seen.insert(keyword), "{keyword} repeats");
-        }
-        assert_eq!(ReferrerPolicy::ALL.len(), 8);
-    }
-
-    #[test]
-    fn parse_is_ascii_case_insensitive_and_untrimmed() {
-        assert_eq!(
-            ReferrerPolicy::parse("ORIGIN"),
-            Some(ReferrerPolicy::Origin)
-        );
-        assert_eq!(ReferrerPolicy::parse(" origin"), None);
-        assert_eq!(ReferrerPolicy::parse(""), None);
-    }
 }

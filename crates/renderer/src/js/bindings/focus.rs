@@ -1,6 +1,7 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
 use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for_node, wrap_node};
+use enumerated::Enumerated;
 
 use blitz_dom::Dirtiness;
 use markup5ever::{LocalName, Namespace, QualName};

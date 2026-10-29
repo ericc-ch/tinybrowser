@@ -824,6 +824,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumerated"
+version = "0.1.0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1921,6 +1925,7 @@ dependencies = [
  "base64",
  "bytes",
  "cookies",
+ "enumerated",
  "flate2",
  "http-body-util",
  "hyper",
@@ -2703,6 +2708,7 @@ dependencies = [
  "blitz-traits",
  "data-url",
  "encoding_rs",
+ "enumerated",
  "fixed_decimal",
  "flate2",
  "getrandom",
