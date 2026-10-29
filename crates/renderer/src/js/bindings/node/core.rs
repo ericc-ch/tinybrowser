@@ -8,7 +8,7 @@ use super::super::{
     dom_string, drain_mutation_journal, element_sibling_value, fixup_focus_after_removal,
     live_collection, make_weak, node_is_shadow_root, replace_character_data,
     schedule_mutation_delivery, select_error, selector_matching_elements, set_character_data,
-    set_pi_data, sibling_value, string_value, throw_dom, throw_dom_error,
+    sibling_value, string_value, throw_dom, throw_dom_error,
     valid_attribute_local_name, with_node_data, world, world_for_node, wrap_node,
 };
 use crate::dom::adoption::{clone_within_document, materialize_import};
@@ -2557,30 +2557,39 @@ pub(super) fn pi_target(ctx: &Ctx<'_>, id: NodeId) -> String {
         .unwrap_or_default()
 }
 
+/// The pseudo-attributes the processing instruction's data parses to. A
+/// parse error leaves the map empty, so the accessors and the style-sheet
+/// loader agree (<https://www.w3.org/TR/xml-stylesheet/#dt-parsing>).
 pub(super) fn pi_attributes(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<(String, String)>> {
     let owner = world_for_node(ctx, id)?;
     Ok(owner
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.document.pi_attributes(id.node).map(<[_]>::to_vec))
+        .and_then(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(id.node)
+                .and_then(|node| match &node.data {
+                    NodeData::ProcessingInstruction { contents, .. } => {
+                        blitz_dom::pseudo_attributes::parse(contents)
+                    }
+                    _ => None,
+                })
+        })
         .unwrap_or_default())
 }
 
+/// Rewrites the instruction's data from an attribute map; the map is
+/// derived from the data, so there is no second store to keep in step
+/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
 pub(super) fn write_pi_attributes(
     ctx: &Ctx<'_>,
     id: NodeId,
     attributes: Vec<(String, String)>,
 ) -> Result<()> {
-    let data = crate::pseudo_attributes::serialize_pseudo_attributes(&attributes);
-    {
-        let owner = world_for_node(ctx, id)?;
-        let owner = owner.borrow();
-        let Some(mut parsed) = owner.document_mut(id) else {
-            return Ok(());
-        };
-        parsed.document.set_pi_attributes(id.node, attributes);
-    }
-    set_pi_data(ctx, id, &DomString::from(data))
+    let data = blitz_dom::pseudo_attributes::serialize(&attributes);
+    set_character_data(ctx, id, &DomString::from(data))
 }
 
 pub(super) fn doctype_field(

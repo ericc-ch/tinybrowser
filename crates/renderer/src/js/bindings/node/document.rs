@@ -796,7 +796,7 @@ impl JsNode {
         target: WebIdlString,
         data: WebIdlCodeUnits,
     ) -> Result<Value<'js>> {
-        if !crate::xml::is_valid_name(&target.0) {
+        if !xml5ever::names::is_name(&target.0) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",

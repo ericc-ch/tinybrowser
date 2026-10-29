@@ -81,9 +81,6 @@ fn parse_with_config(
     // nodes, with internal entities expanded up front.
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_xml(input, config).into();
     let mut document = crate::documents::BlitzDocument::from_base(base);
-    // Parsed processing instructions arrive with data but no attribute map;
-    // the bindings read the map, so initialize it from the data here.
-    document.init_parsed_pi_attributes();
     let errors = document.base.take_parse_errors();
     if !errors.is_empty() {
         return parser_error_document(document, content_type, ready_state, xml_document, &errors);
@@ -224,27 +221,3 @@ fn intern_mime_essence(essence: String) -> &'static str {
     leaked
 }
 
-/// Whether `name` matches the XML `Name` production: pure validation for
-/// processing-instruction targets, not tree reconstruction
-/// (<https://www.w3.org/TR/xml/#NT-Name>).
-pub(crate) fn is_valid_name(name: &str) -> bool {
-    let mut characters = name.chars();
-    match characters.next() {
-        Some(first) if is_name_start(first) => characters.all(is_name_char),
-        _ => false,
-    }
-}
-
-/// Whether `character` may start an XML `Name`
-/// (<https://www.w3.org/TR/xml/#NT-NameStartChar>).
-pub(crate) fn is_name_start(character: char) -> bool {
-    matches!(character, ':' | 'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}')
-        || ('\u{10000}'..='\u{EFFFF}').contains(&character)
-}
-
-/// Whether `character` may continue an XML `Name`
-/// (<https://www.w3.org/TR/xml/#NT-NameChar>).
-pub(crate) fn is_name_char(character: char) -> bool {
-    is_name_start(character)
-        || matches!(character, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
-}

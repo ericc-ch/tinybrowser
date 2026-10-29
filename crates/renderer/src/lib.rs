@@ -27,7 +27,6 @@ mod js;
 mod messaging;
 pub(crate) mod names;
 mod protocol;
-mod pseudo_attributes;
 mod remote;
 mod render;
 pub mod sniff;

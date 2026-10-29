@@ -1312,10 +1312,7 @@ pub(super) fn replace_character_data(
     count: u32,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    // Replacing data on a processing instruction reparses its attribute map
-    // unless the caller already updated the map
-    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
-    replace_character_data_inner(ctx, id, offset, count, data, true)
+    replace_character_data_inner(ctx, id, offset, count, data)
 }
 
 /// Whole-data replacement: the `data`, `nodeValue`, and `textContent`
@@ -1326,19 +1323,7 @@ pub(super) fn set_character_data(
     id: NodeId,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    replace_character_data_inner(ctx, id, 0, u32::MAX, data, true)
-}
-
-/// Replaces character data without reparsing a processing instruction's
-/// attribute map. `update data from attributes` passes true for
-/// `piAttributesAlreadyUpdated`
-/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
-pub(super) fn set_pi_data(
-    ctx: &Ctx<'_>,
-    id: NodeId,
-    data: &crate::dom_string::DomString,
-) -> Result<()> {
-    replace_character_data_inner(ctx, id, 0, u32::MAX, data, false)
+    replace_character_data_inner(ctx, id, 0, u32::MAX, data)
 }
 
 /// Writes `utf8` as the node's whole data, by kind. Returns false when the
@@ -1401,7 +1386,6 @@ fn replace_character_data_inner(
     offset: u32,
     count: u32,
     data: &crate::dom_string::DomString,
-    reparse_pi: bool,
 ) -> Result<()> {
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
@@ -1452,26 +1436,6 @@ fn replace_character_data_inner(
             target: id,
             old_value,
         });
-    if reparse_pi
-        && parsed
-            .document
-            .base
-            .get_node(id.node)
-            .is_some_and(|node| matches!(node.data, NodeData::ProcessingInstruction { .. }))
-    {
-        let contents = parsed
-            .document
-            .base
-            .get_node(id.node)
-            .and_then(|node| match &node.data {
-                NodeData::ProcessingInstruction { contents, .. } => Some(contents.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let attributes =
-            crate::pseudo_attributes::parse_pseudo_attributes(&contents).unwrap_or_default();
-        parsed.document.set_pi_attributes(id.node, attributes);
-    }
     drop(parsed);
     drop(owner);
     schedule_mutation_delivery(ctx)
