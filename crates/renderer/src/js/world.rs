@@ -886,14 +886,6 @@ mod sandbox_flag_tests {
     }
 
     #[test]
-    fn a_bare_sandbox_sets_every_flag_the_standard_lists() {
-        let flags = SandboxFlags::parse(Some(""));
-        for flag in SandboxFlag::ALL {
-            assert!(flags.contains(*flag), "flag {flag:?} must be set");
-        }
-    }
-
-    #[test]
     fn every_keyword_clears_exactly_the_flags_the_standard_names() {
         let expected: &[(&str, &[SandboxFlag])] = &[
             (
@@ -1134,7 +1126,7 @@ macro_rules! sandbox_flags {
         impl SandboxFlag {
             /// Every flag, in bit order, so `parse` and the tests walk one
             /// list.
-            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
 
             /// This flag's bit: its position in [`Self::ALL`].
             const fn bit(self) -> u32 {

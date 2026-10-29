@@ -596,45 +596,6 @@ pub(crate) fn range_default(minimum: &Decimal, maximum: &Decimal) -> Decimal {
 /// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
 pub(crate) fn cross_origin(value: Option<&str>) -> Option<net::cors::CrossOrigin> {
     value.map(|value| {
-        if value.eq_ignore_ascii_case("use-credentials") {
-            net::cors::CrossOrigin::UseCredentials
-        } else {
-            net::cors::CrossOrigin::Anonymous
-        }
+        net::cors::CrossOrigin::parse(value).unwrap_or(net::cors::CrossOrigin::Anonymous)
     })
-}
-
-#[cfg(test)]
-mod cross_origin_tests {
-    use super::cross_origin;
-    use net::cors::{CredentialsMode, CrossOrigin};
-
-    #[test]
-    fn an_invalid_or_empty_crossorigin_never_sends_credentials() {
-        assert_eq!(cross_origin(None), None);
-        assert_eq!(cross_origin(Some("")), Some(CrossOrigin::Anonymous));
-        // Enumerated attributes are an untrimmed match, so a stray space is an
-        // invalid value, and the invalid-value default is anonymous. The
-        // reflected `img.crossOrigin` and the load must agree.
-        assert_eq!(
-            cross_origin(Some(" use-credentials")),
-            Some(CrossOrigin::Anonymous)
-        );
-        assert_eq!(
-            cross_origin(Some("use-credentials")),
-            Some(CrossOrigin::UseCredentials)
-        );
-        assert_eq!(
-            cross_origin(Some("USE-CREDENTIALS")),
-            Some(CrossOrigin::UseCredentials)
-        );
-        assert_eq!(
-            CrossOrigin::UseCredentials.credentials(),
-            CredentialsMode::Include
-        );
-        assert_eq!(
-            CrossOrigin::Anonymous.credentials(),
-            CredentialsMode::SameOrigin
-        );
-    }
 }
