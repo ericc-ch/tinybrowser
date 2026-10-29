@@ -1473,7 +1473,7 @@ fn chrome_navigation_request(request: &mut Request, url: &Url) {
     static_header(request, "Sec-Fetch-Mode", "navigate");
     static_header(request, "Sec-Fetch-User", "?1");
     static_header(request, "Sec-Fetch-Dest", "document");
-    if net::is_potentially_trustworthy(url) {
+    if secure_context::is_potentially_trustworthy(url) {
         static_header(
             request,
             "Sec-CH-Prefers-Color-Scheme",

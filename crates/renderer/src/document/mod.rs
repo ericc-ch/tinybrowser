@@ -1358,7 +1358,7 @@ impl Document {
         };
         let blank = about_blank();
         let origin = self.sandboxed_origin(inherited_origin);
-        self.set_document_url(blank, origin);
+        self.commit_document_url(blank, origin);
         self.world.borrow_mut().base_url = Some(base.clone());
     }
 
@@ -1409,7 +1409,7 @@ impl Document {
         let url = Url::parse("about:srcdoc").expect("about:srcdoc parses");
         self.http_status = 0;
         let origin = self.sandboxed_origin(Some(origin));
-        self.set_document_url(url, origin);
+        self.commit_document_url(url, origin);
         {
             let mut world = self.world.borrow_mut();
             world.base_url = Some(base.clone());
@@ -1529,6 +1529,15 @@ impl Document {
         }
         drop(world);
         self.url = url;
+    }
+
+    /// Commits a new document at `url`: writes the URL and captured origin,
+    /// then records the environment's secure-context bit. A same-document
+    /// history update keeps the bit its document already has
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    fn commit_document_url(&mut self, url: Url, origin: Option<url::Origin>) {
+        self.set_document_url(url, origin);
+        self.world.borrow().commit_secure_context();
     }
 
     fn apply_document_url_same_origin(&mut self, url: &str) {
@@ -1922,7 +1931,7 @@ impl Document {
     fn install_response_url(&mut self, head: &ResponseHead, origin: Option<url::Origin>) {
         self.initial_blank = false;
         let origin = self.sandboxed_origin(origin);
-        self.set_document_url(head.url.clone(), origin);
+        self.commit_document_url(head.url.clone(), origin);
     }
 
     /// Installs a complete response head and body: [`Self::install_head`]

@@ -93,6 +93,7 @@
   });
   const userActivation = Object.create(UserActivation.prototype);
   userActivationKey.set(userActivation, Object.freeze({}));
+  const secureContext = host.__tbSecureContext === true;
   class Navigator {
     get userAgent() {
       return identity.userAgent;
@@ -112,20 +113,26 @@
     get maxTouchPoints() { return 0; }
     get cookieEnabled() { return true; }
     get webdriver() { return false; }
-    get userAgentData() {
-      // `NavigatorUAData` is `[SecureContext]`, so the member is absent rather
-      // than undefined-valued outside one
-      // (<https://wicg.github.io/ua-client-hints/#dom-navigator-useragentdata>).
-      if (!globalThis.isSecureContext) return undefined;
-      return userAgentData;
-    }
     get userActivation() {
       return userActivation;
     }
   }
-  Object.defineProperty(globalThis, 'NavigatorUAData', {
-    value: NavigatorUAData, writable: true, configurable: true,
-  });
+  if (secureContext) {
+    // Both are `[SecureContext]`
+    // (<https://wicg.github.io/ua-client-hints/#dom-navigator-useragentdata>).
+    // Web IDL names an attribute getter `get userAgentData`, and an
+    // object-literal accessor is what makes the engine name it
+    // (<https://webidl.spec.whatwg.org/#idl-attributes>).
+    const { get } = Object.getOwnPropertyDescriptor({
+      get userAgentData() { return userAgentData; },
+    }, 'userAgentData');
+    Object.defineProperty(Navigator.prototype, 'userAgentData', {
+      get, enumerable: true, configurable: true,
+    });
+    Object.defineProperty(globalThis, 'NavigatorUAData', {
+      value: NavigatorUAData, writable: true, configurable: true,
+    });
+  }
   Object.defineProperty(globalThis, 'UserActivation', {
     value: UserActivation, writable: true, configurable: true,
   });

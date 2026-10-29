@@ -1924,10 +1924,10 @@ mod realm_tests {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();
         for (url, expected) in [
-            ("https://a.test/", "true,function,false"),
+            ("https://a.test/", "true,function,true,function"),
             // `http://a.test` is not loopback, so it is not potentially
             // trustworthy.
-            ("http://a.test/", "false,undefined,true"),
+            ("http://a.test/", "false,undefined,false,undefined"),
         ] {
             let stop = Arc::new(Stop::new());
             let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
@@ -1947,7 +1947,8 @@ mod realm_tests {
                     [
                       String(isSecureContext),
                       typeof crypto.randomUUID,
-                      String(navigator.userAgentData === undefined)
+                      String('userAgentData' in navigator),
+                      typeof NavigatorUAData
                     ].join(",");
                     "#,
                 )

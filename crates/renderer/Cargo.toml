@@ -11,11 +11,12 @@ workspace = true
 [dependencies]
 webstorage = { workspace = true }
 net = { workspace = true }
+secure-context = { workspace = true }
 # Parser QualNames flow into Blitz as one type, no conversion layer.
-markup5ever = "=0.40.0"
+markup5ever = { workspace = true }
 # The XML `Name` production for `createProcessingInstruction`; the parser fork
 # owns the only copy of the table.
-xml5ever = "0.40"
+xml5ever = { workspace = true }
 encoding_rs = "0.8"
 # Already in Cargo.lock and the shipping binary. Direct deps so renderer can
 # call them: `data-url` for engine data URLs and `atob`,

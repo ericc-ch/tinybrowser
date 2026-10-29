@@ -124,6 +124,15 @@ impl CrossOrigin {
             .find(|candidate| candidate.keyword().eq_ignore_ascii_case(value))
     }
 
+    /// The state of a `crossorigin` content attribute: absent is the `No CORS`
+    /// state, and a present attribute that names no keyword takes the invalid
+    /// value default
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
+    #[must_use]
+    pub fn from_attribute(value: Option<&str>) -> Option<Self> {
+        value.map(|value| Self::parse(value).unwrap_or(Self::Anonymous))
+    }
+
     /// The `CORS settings attribute credentials mode`
     /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#cors-settings-attributes>).
     #[must_use]
@@ -746,6 +755,26 @@ mod tests {
             let _ = map.insert(name, value.as_bytes());
         }
         map
+    }
+
+    #[test]
+    fn a_crossorigin_attribute_is_an_untrimmed_keyword() {
+        assert_eq!(CrossOrigin::from_attribute(None), None);
+        assert_eq!(
+            CrossOrigin::from_attribute(Some("")),
+            Some(CrossOrigin::Anonymous)
+        );
+        // The invalid value default never sends credentials, and a padded
+        // value is invalid because an enumerated attribute does not trim
+        // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
+        assert_eq!(
+            CrossOrigin::from_attribute(Some(" use-credentials")),
+            Some(CrossOrigin::Anonymous)
+        );
+        assert_eq!(
+            CrossOrigin::from_attribute(Some("USE-CREDENTIALS")),
+            Some(CrossOrigin::UseCredentials)
+        );
     }
 
     #[test]

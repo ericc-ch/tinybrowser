@@ -506,7 +506,7 @@ fn option_selectedness(base: &BaseDocument, option: BlitzId) -> bool {
 /// Writes an option's selectedness slot without touching its dirtiness: this
 /// is the selectedness setting algorithm's write
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
-fn set_option_selectedness(parsed: &mut Parsed, option: BlitzId, selected: bool) {
+pub(crate) fn set_option_selectedness(parsed: &mut Parsed, option: BlitzId, selected: bool) {
     parsed
         .document
         .base

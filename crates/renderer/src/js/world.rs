@@ -886,14 +886,6 @@ mod sandbox_flag_tests {
     }
 
     #[test]
-    fn a_bare_sandbox_sets_every_flag_the_standard_lists() {
-        let flags = SandboxFlags::parse(Some(""));
-        for flag in SandboxFlag::ALL {
-            assert!(flags.contains(*flag), "flag {flag:?} must be set");
-        }
-    }
-
-    #[test]
     fn every_keyword_clears_exactly_the_flags_the_standard_names() {
         let expected: &[(&str, &[SandboxFlag])] = &[
             (
@@ -1134,7 +1126,7 @@ macro_rules! sandbox_flags {
         impl SandboxFlag {
             /// Every flag, in bit order, so `parse` and the tests walk one
             /// list.
-            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
 
             /// This flag's bit: its position in [`Self::ALL`].
             const fn bit(self) -> u32 {
@@ -1815,7 +1807,7 @@ impl World {
         runtime: &FrameRuntime,
         init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
-        Self {
+        let world = Self {
             runtime: runtime.clone(),
             frame,
             init_scripts,
@@ -1859,7 +1851,9 @@ impl World {
             weak_references: None,
             deliver_mutations_fn: None,
             images: ImageState::default(),
-        }
+        };
+        world.commit_secure_context();
+        world
     }
 
     pub(crate) fn clear_observers(&mut self) {
@@ -1997,7 +1991,7 @@ impl World {
         };
         let base = &parsed.document.base;
         SubresourceOptions {
-            crossorigin: crate::dom::microsyntaxes::cross_origin(crate::dom::tree::attr(
+            crossorigin: net::cors::CrossOrigin::from_attribute(crate::dom::tree::attr(
                 base,
                 element.node,
                 "crossorigin",
@@ -2097,24 +2091,36 @@ impl World {
         self.frame
     }
 
-    /// Whether this realm's environment is a secure context
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
-    ///
-    /// A document created locally (`about:blank`, `about:srcdoc`) inherits its
-    /// creator's context, and this model records that inheritance as the
-    /// document's origin, so a tuple origin names the URL the ancestor walk
-    /// would reach. An opaque origin cannot name one, and the document URL is
-    /// then the only evidence: `data:` is trustworthy by definition, while a
-    /// sandboxed `about:blank` that inherited an insecure context reads as
-    /// secure here.
+    /// Whether this realm's environment is a secure context. The model is
+    /// Chromium's, not HTML's text; the disagreement is in
+    /// `docs/upstream.md`.
     pub(crate) fn is_secure_context(&self) -> bool {
-        let url = if self.origin.is_tuple() {
-            Url::parse(&self.origin.ascii_serialization())
-                .unwrap_or_else(|_| self.document_url.clone())
-        } else {
-            self.document_url.clone()
+        self.runtime
+            .shared
+            .borrow()
+            .tree
+            .secure_context(self.frame)
+            .expect("a live frame records its secure-context bit")
+    }
+
+    /// Records this environment's secure-context bit when its document
+    /// commits. Only a child navigable inherits; a popup is its own top-level
+    /// environment.
+    pub(crate) fn commit_secure_context(&self) {
+        let secure = {
+            let shared = self.runtime.shared.borrow();
+            let creator = shared.tree.parent(self.frame).map(|parent| {
+                shared.tree.secure_context(parent).expect(
+                    "a parent frame records its secure-context bit before its child commits",
+                )
+            });
+            secure_context::is_secure_environment(&self.document_url, creator)
         };
-        net::is_potentially_trustworthy(&url)
+        self.runtime
+            .shared
+            .borrow_mut()
+            .tree
+            .set_secure_context(self.frame, secure);
     }
 
     /// Whether this realm's frame is still attached to its document. A

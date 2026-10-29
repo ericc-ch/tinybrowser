@@ -24,7 +24,7 @@
   };
   // `randomUUID` is `[SecureContext]`, so the member is absent rather than
   // throwing outside one (https://w3c.github.io/webcrypto/#Crypto-method-randomUUID).
-  if (globalThis.isSecureContext) {
+  if (host.__tbSecureContext === true) {
     crypto.randomUUID = function randomUUID() {
       const bytes = this.getRandomValues(new Uint8Array(16));
       bytes[6] = (bytes[6] & 0x0f) | 0x40;
