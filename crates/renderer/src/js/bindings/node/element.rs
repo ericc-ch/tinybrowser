@@ -12,7 +12,7 @@ use super::super::{
     valid_attribute_local_name, validate_and_extract, with_node_data, world, world_for_node,
     wrap_node,
 };
-use super::forms::{fixup_option_on_insert, fixup_radio_on_insert};
+use super::forms::fixup_controls_on_insert;
 use crate::dom::adoption::materialize_children;
 use crate::js::bindings::enumerated::{Defaults, Dir, EnterKeyHint, InputMode, reflect_enumerated};
 use net::cors::CrossOrigin;
@@ -2205,10 +2205,7 @@ impl JsNode {
         drop(parsed);
         world.destroy_child_navigables(&iframes);
         drop(world);
-        for id in controls {
-            fixup_option_on_insert(ctx, id)?;
-            fixup_radio_on_insert(ctx, id)?;
-        }
+        fixup_controls_on_insert(ctx, container.document, &controls)?;
         register_inserted_iframes(ctx, &added)?;
         upgrade_parsed_tree(ctx, container)?;
         schedule_mutation_delivery(ctx)
@@ -2288,10 +2285,7 @@ impl JsNode {
             .collect();
         drop(parsed);
         drop(world);
-        for id in controls {
-            fixup_option_on_insert(&ctx, id)?;
-            fixup_radio_on_insert(&ctx, id)?;
-        }
+        fixup_controls_on_insert(&ctx, element.document, &controls)?;
         register_inserted_iframes(&ctx, &moved)?;
         // Custom elements in parsed markup upgrade, like the innerHTML and
         // outerHTML paths below.

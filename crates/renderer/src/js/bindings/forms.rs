@@ -15,6 +15,7 @@ use super::{focus, host_node_id, owning_world, world, world_for_node};
 use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
 use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
+use blitz_dom::Dirtiness;
 use rquickjs::prelude::Opt;
 use rquickjs::{Array, Ctx, Exception, Object, Persistent, Result, TypedArray, Value};
 use std::cell::RefCell;
@@ -121,7 +122,11 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    crate::dom::forms::initialize_option_selectedness(&mut parsed, node.node, selected);
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_selectedness(node.node, selected, Dirtiness::Keep);
     Ok(())
 }
 

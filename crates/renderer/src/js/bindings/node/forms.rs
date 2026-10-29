@@ -1067,7 +1067,7 @@ impl JsNode {
                 .base
                 .get_node(self.handle.0.node)
                 .and_then(|node| node.data.downcast_element())
-                .is_some_and(|element| element.form_state.indeterminate)
+                .is_some_and(|element| element.form_state.indeterminate())
         }))
     }
 
@@ -1229,30 +1229,43 @@ impl JsNode {
         )
     }
 }
-/// An inserted option invalidates its select's materialized selectedness and
-/// runs the selectedness setting algorithm
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
-pub(super) fn fixup_option_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
-    let world = world(ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(id) else {
-        return Ok(());
-    };
-    crate::dom::forms::option_inserted(&mut parsed, id.node);
-    Ok(())
-}
-
-/// An inserted checked radio unchecks the other radios it joins.
-pub(super) fn fixup_radio_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+/// Runs the form-control insertion fixups for a batch of inserted nodes: the
+/// option insertion steps once per affected select, then the radio group's
+/// checkedness rule. Both snapshot the state the batch arrived with, because
+/// an earlier inserted control clears a later one before its own step runs;
+/// the last inserted checked control is the one left checked
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>,
+/// <https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+pub(super) fn fixup_controls_on_insert(
+    ctx: &Ctx<'_>,
+    document: u32,
+    controls: &[NodeId],
+) -> Result<()> {
     let world_rc = world(ctx)?;
     let world = world_rc.borrow();
-    let Some(mut parsed) = world.document_mut(id) else {
+    let Some(mut parsed) = world.document_mut_by_id(document) else {
         return Ok(());
     };
-    let group = crate::dom::forms::radios_to_uncheck(&parsed.document.base, id.document, id.node);
-    let mut mutator = parsed.document.base.mutate();
-    for member in group {
-        mutator.set_checkedness(member.node, false, Dirtiness::Keep);
+    let mut ordered = controls.to_vec();
+    ordered.sort_by(|a, b| {
+        crate::dom::tree::tree_order(&parsed.document.base, document, a.node, b.node)
+    });
+    crate::dom::forms::options_inserted(&mut parsed, ordered.iter().map(|id| id.node));
+    let mut radios = Vec::new();
+    for id in &ordered {
+        let group = crate::dom::forms::radios_to_uncheck(&parsed.document.base, document, id.node);
+        if !group.is_empty() {
+            radios.push((id.node, group));
+        }
+    }
+    for (id, group) in radios {
+        let mut mutator = parsed.document.base.mutate();
+        // An earlier radio's step may have cleared this one; the state it
+        // arrived with is what its own step acts on.
+        mutator.set_checkedness(id, true, Dirtiness::Keep);
+        for member in group {
+            mutator.set_checkedness(member.node, false, Dirtiness::Keep);
+        }
     }
     Ok(())
 }

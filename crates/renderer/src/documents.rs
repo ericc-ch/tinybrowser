@@ -131,14 +131,19 @@ impl BlitzDocument {
 
     /// Creates a processing instruction
     /// (<https://dom.spec.whatwg.org/#create-a-processing-instruction-node>).
+    /// The attribute map is given: a fresh instruction parses it from the data
+    /// and an import carries the source's map, which can hold attribute names
+    /// the XML grammar rejects
+    /// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
     pub(crate) fn create_processing_instruction(
         &mut self,
         target: &str,
         data: &str,
+        attributes: Vec<(String, String)>,
     ) -> blitz_traits::node_id::NodeId {
         self.base
             .mutate()
-            .create_processing_instruction_node(target, data)
+            .create_processing_instruction_node_with_attributes(target, data, attributes)
     }
 
     /// Creates a CDATA section whose data is `data`

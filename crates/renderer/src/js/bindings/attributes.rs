@@ -1708,12 +1708,16 @@ fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId, previous: Option<&str
         return Ok(());
     }
     let store = input_type_store(ctx, &world_rc, element, old, new, &current)?;
-    {
+    if let Some(store) = store {
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(element) else {
             return Ok(());
         };
-        apply_input_value_store(&mut parsed, element, store);
+        parsed
+            .document
+            .base
+            .mutate()
+            .set_value(element.node, store.value, store.dirtiness);
     }
     apply_input_selection(&world_rc, element, old, new);
     Ok(())
@@ -1739,7 +1743,7 @@ fn input_type_store(
             crate::dom::tree::attr(base, element.node, "value").map(ToOwned::to_owned),
             base.get_node(element.node)
                 .and_then(|node| node.data.downcast_element())
-                .is_some_and(|element| element.form_state.dirty_value),
+                .is_some_and(|element| element.form_state.dirty_value()),
         )
     };
     let old_mode = old.value_mode();
@@ -1787,20 +1791,6 @@ fn input_type_store(
         }));
     }
     Ok(None)
-}
-
-fn apply_input_value_store(
-    parsed: &mut crate::Parsed,
-    element: NodeId,
-    store: Option<InputValueStore>,
-) {
-    if let Some(store) = store {
-        parsed
-            .document
-            .base
-            .mutate()
-            .set_value(element.node, store.value, store.dirtiness);
-    }
 }
 
 /// Moves the text entry cursor after a type change. A state that gains text

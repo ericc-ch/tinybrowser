@@ -205,7 +205,7 @@ fn checkedness(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
 fn indeterminate(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
     base.get_node(node)
         .and_then(|target| target.data.downcast_element())
-        .is_some_and(|element| element.form_state.indeterminate)
+        .is_some_and(|element| element.form_state.indeterminate())
 }
 
 /// The activation target for a click: the first node in the event path with an

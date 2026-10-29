@@ -169,9 +169,9 @@ pub(crate) fn materialize_import(
             {
                 element.adopt_cloned_state(form_state.clone());
             }
-            // A snapshot comes from a parsed fragment whose control slots hold
-            // the raw attribute; run the sanitization algorithm a parser-created
-            // input gets (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+            // A materialized input runs the value sanitization algorithm a
+            // parser-created one does
+            // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
             crate::dom::input::sync_sanitized_value(doc, blitz_id);
             // Template children materialize into the fresh element's
             // contents fragment, which creation already established.
@@ -220,10 +220,7 @@ pub(crate) fn materialize_import(
             attributes,
         } => {
             let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.create_processing_instruction(target, &text);
-            doc.base
-                .mutate()
-                .set_processing_instruction_attributes(blitz_id, attributes.clone());
+            let blitz_id = doc.create_processing_instruction(target, &text, attributes.clone());
             Ok(NodeId {
                 document,
                 node: blitz_id,

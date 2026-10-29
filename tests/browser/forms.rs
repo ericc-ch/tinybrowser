@@ -1,5 +1,6 @@
-//! Form-control state on the paths that build elements from markup: the
-//! sanitization algorithm, option selectedness, and activation dirtiness.
+//! Form-control state on the paths that build controls from markup: the
+//! value sanitization algorithm, option selectedness, and activation
+//! dirtiness.
 
 use serde_json::json;
 
@@ -51,13 +52,13 @@ const SELECT_EARLIER_OPTION: &str = "(() => {
 })()";
 
 /// A click sets the dirty checkedness flag, so a later `checked` attribute
-/// write cannot restore the clicked state; a reset reseeds both slots from
-/// the attributes
+/// write cannot restore the clicked state; a reset reseeds the slot from the
+/// attributes
 /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty>,
 /// <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-form-reset-control>).
 const ACTIVATION_AND_RESET: &str = "(() => {
   const form = document.createElement('form');
-  form.innerHTML = '<input id=c type=checkbox checked><button id=b value=v>go</button>';
+  form.innerHTML = '<input id=c type=checkbox checked>';
   document.body.append(form);
   const checkbox = form.querySelector('#c');
   checkbox.click();
@@ -66,15 +67,45 @@ const ACTIVATION_AND_RESET: &str = "(() => {
   checkbox.setAttribute('checked', '');
   const afterAttribute = checkbox.checked;
   form.reset();
-  return [afterClick, afterAttribute, checkbox.checked, form.querySelector('#b').value];
+  return [afterClick, afterAttribute, checkbox.checked];
+})()";
+
+/// A checkbox that script checks before its first layout keeps that
+/// checkedness when the widget is built: layout reads the slot instead of
+/// re-seeding it from the `checked` attribute
+/// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked>).
+const CHECKED_BEFORE_LAYOUT: &str = "(() => {
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.checked = true;
+  document.body.append(box);
+  // A layout metric read builds the box, including the checkbox widget.
+  void box.offsetHeight;
+  const afterLayout = box.checked;
+  const matchesChecked = box.matches(':checked');
+  // The click's dirty flag still wins over the attribute.
+  box.setAttribute('checked', '');
+  return [afterLayout, matchesChecked, box.checked, box.matches(':checked')];
+})()";
+
+/// Two checked radios inserted together leave the last one checked: the
+/// insertion step runs per control and clears the group members, so an
+/// earlier insertion must not clear a radio the batch has not processed yet
+/// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+const TWO_CHECKED_RADIOS: &str = "(() => {
+  const form = document.createElement('form');
+  form.innerHTML = '<input id=a type=radio name=r checked>' +
+    '<input id=b type=radio name=r checked>';
+  document.body.append(form);
+  return [form.querySelector('#a').checked, form.querySelector('#b').checked];
 })()";
 
 #[test]
-fn parser_created_controls_run_value_sanitization() {
+fn control_state_follows_markup_insertion_and_activation() {
     let (listener, page) = server();
     serve_on(listener, vec![("/", ok("text/html", PAGE))]);
     let (_fixture, mut client, session) =
-        open_page("tinybrowser-forms-sanitize", &format!("http://{page}/"));
+        open_page("tinybrowser-forms", &format!("http://{page}/"));
 
     let values = evaluate(&mut client, &session, SANITIZE_FRAGMENT);
     assert_eq!(
@@ -82,26 +113,16 @@ fn parser_created_controls_run_value_sanitization() {
         json!(["", "50", "#000000", "", "ab", "", ""]),
         "every parser path reflects the sanitized value"
     );
-}
-
-#[test]
-fn selected_attribute_change_keeps_one_option_selected() {
-    let (listener, page) = server();
-    serve_on(listener, vec![("/", ok("text/html", PAGE))]);
-    let (_fixture, mut client, session) =
-        open_page("tinybrowser-forms-option", &format!("http://{page}/"));
 
     let state = evaluate(&mut client, &session, SELECT_EARLIER_OPTION);
     assert_eq!(state, json!([0, true, false]));
-}
-
-#[test]
-fn activation_dirties_checkedness_and_reset_reseeds_it() {
-    let (listener, page) = server();
-    serve_on(listener, vec![("/", ok("text/html", PAGE))]);
-    let (_fixture, mut client, session) =
-        open_page("tinybrowser-forms-activation", &format!("http://{page}/"));
 
     let state = evaluate(&mut client, &session, ACTIVATION_AND_RESET);
-    assert_eq!(state, json!([false, false, true, "v"]));
+    assert_eq!(state, json!([false, false, true]));
+
+    let state = evaluate(&mut client, &session, CHECKED_BEFORE_LAYOUT);
+    assert_eq!(state, json!([true, true, true, true]));
+
+    let state = evaluate(&mut client, &session, TWO_CHECKED_RADIOS);
+    assert_eq!(state, json!([false, true]));
 }

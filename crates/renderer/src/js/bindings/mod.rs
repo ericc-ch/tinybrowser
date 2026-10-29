@@ -1312,7 +1312,7 @@ pub(super) fn replace_character_data(
     count: u32,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    replace_character_data_inner(ctx, id, offset, count, data, None)
+    replace_character_data_inner(ctx, id, offset, count, data)
 }
 
 /// Whole-data replacement: the `data`, `nodeValue`, and `textContent`
@@ -1323,31 +1323,65 @@ pub(super) fn set_character_data(
     id: NodeId,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    replace_character_data_inner(ctx, id, 0, u32::MAX, data, None)
+    replace_character_data_inner(ctx, id, 0, u32::MAX, data)
 }
 
-/// `update data from attributes`: one write that stores the serialized map and
-/// the map itself, so a name the XML grammar rejects survives and the two
-/// cannot be observed out of step
-/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
+/// `update data from attributes`: the serialized map becomes the
+/// instruction's data, and the map itself is stored as given
+/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>). The data
+/// and the map can differ only by attribute names the XML grammar rejects,
+/// which the serialized form cannot round-trip.
 pub(super) fn set_pi_attributes(
     ctx: &Ctx<'_>,
     id: NodeId,
     attributes: Vec<(String, String)>,
 ) -> Result<()> {
+    let owner = world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(id) else {
+        return Ok(());
+    };
+    if !parsed
+        .document
+        .base
+        .get_node(id.node)
+        .is_some_and(|node| matches!(node.data, NodeData::ProcessingInstruction { .. }))
+    {
+        return Ok(());
+    }
+    let old_value = parsed.document.character_data(id.node);
+    let old_length = old_value.units().len();
     let data =
         crate::dom_string::DomString::from(blitz_dom::pseudo_attributes::serialize(&attributes));
-    replace_character_data_inner(ctx, id, 0, u32::MAX, &data, Some(attributes))
+    // The fork serializes the map into the data itself and reloads an
+    // `xml-stylesheet` sheet the instruction names.
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_processing_instruction_attributes(id.node, attributes);
+    parsed.document.remember_character_data(id.node, &data);
+    crate::dom::range::adjust_for_replace_data(
+        &mut parsed.document.side.ranges,
+        id,
+        0,
+        u32::try_from(old_length).unwrap_or(u32::MAX),
+        u32::try_from(data.units().len()).unwrap_or(u32::MAX),
+    );
+    parsed
+        .document
+        .record(crate::documents::JournalEntry::CharacterData {
+            target: id,
+            old_value,
+        });
+    drop(parsed);
+    drop(owner);
+    schedule_mutation_delivery(ctx)
 }
 
 /// Writes `utf8` as the node's whole data, by kind. Returns false when the
 /// node holds no character data.
-fn write_character_data(
-    base: &mut blitz_dom::BaseDocument,
-    id: NodeId,
-    utf8: &str,
-    pi_attributes: Option<Vec<(String, String)>>,
-) -> bool {
+fn write_character_data(base: &mut blitz_dom::BaseDocument, id: NodeId, utf8: &str) -> bool {
     let Some(node) = base.get_node(id.node) else {
         return false;
     };
@@ -1371,19 +1405,10 @@ fn write_character_data(
         }
         NodeData::ProcessingInstruction { .. } => {
             base.snapshot_node(id.node);
-            match pi_attributes {
-                // The attribute accessors wrote the data themselves, so keep
-                // the map they serialized
-                // (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
-                Some(attributes) => {
-                    base.mutate()
-                        .replace_processing_instruction(id.node, utf8, attributes);
-                }
-                // A data write re-derives the pseudo-attributes, so no reader
-                // sees a map older than the data
-                // (<https://www.w3.org/TR/xml-stylesheet/#dt-parsing>).
-                None => base.mutate().set_processing_instruction_data(id.node, utf8),
-            }
+            // Writing the data re-derives the pseudo-attributes, so no reader
+            // sees a map older than the data
+            // (<https://www.w3.org/TR/xml-stylesheet/#dt-parsing>).
+            base.mutate().set_processing_instruction_data(id.node, utf8);
             true
         }
         NodeData::CDataSection { .. } => {
@@ -1409,7 +1434,6 @@ fn replace_character_data_inner(
     offset: u32,
     count: u32,
     data: &crate::dom_string::DomString,
-    pi_attributes: Option<Vec<(String, String)>>,
 ) -> Result<()> {
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
@@ -1441,7 +1465,7 @@ fn replace_character_data_inner(
     units.splice(offset..offset + count, replacement.iter().copied());
     let exact = crate::dom_string::DomString::from_utf16(units);
     let utf8 = exact.to_string_lossy().into_owned();
-    if !write_character_data(&mut parsed.document.base, id, &utf8, pi_attributes) {
+    if !write_character_data(&mut parsed.document.base, id, &utf8) {
         return Ok(());
     }
     // The tree stores lossy UTF-8. DOM reads return the exact units

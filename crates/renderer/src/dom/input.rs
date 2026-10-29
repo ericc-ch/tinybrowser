@@ -7,11 +7,9 @@
 //! (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
 //! The IDL getter, form submission, and type changes all read this value.
 
-use blitz_dom::BaseDocument;
+use blitz_dom::{BaseDocument, Dirtiness};
 use style::color::{AbsoluteColor, ColorSpace};
 use style::device::Device;
-
-use blitz_dom::Dirtiness;
 
 use crate::Parsed;
 use crate::dom::microsyntaxes::{
@@ -179,10 +177,10 @@ pub(crate) fn raw_value(parsed: &Parsed, node: BlitzId, kind: InputType) -> Stri
     // the value attribute is absent. A type change must reload the empty
     // attribute, not carry the default into a text state
     // (<https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color)>).
-    if kind == InputType::Color && !element.form_state.dirty_value {
+    if kind == InputType::Color && !element.form_state.dirty_value() {
         return attr(base, node, "value").unwrap_or("").to_owned();
     }
-    element.form_state.value.clone()
+    element.form_state.value().to_owned()
 }
 
 /// The current value of an input, dispatched by the value IDL attribute's
@@ -199,7 +197,7 @@ pub(crate) fn current_value(parsed: &Parsed, node: BlitzId) -> String {
         ValueMode::Current => base
             .get_node(node)
             .and_then(|target| target.data.downcast_element())
-            .map_or_else(String::new, |element| element.form_state.value.clone()),
+            .map_or_else(String::new, |element| element.form_state.value().to_owned()),
         ValueMode::Default => attr(base, node, "value").unwrap_or("").to_owned(),
         ValueMode::DefaultOn => attr(base, node, "value").unwrap_or("on").to_owned(),
         ValueMode::Filename => String::new(),
@@ -515,12 +513,12 @@ pub(crate) fn sync_sanitized_value(document: &mut crate::documents::BlitzDocumen
     else {
         return;
     };
-    let dirty = element.form_state.dirty_value;
+    let dirty = element.form_state.dirty_value();
     if dirty && !matches!(kind, InputType::Range | InputType::Color | InputType::Email) {
         return;
     }
     let raw = if dirty {
-        element.form_state.value.clone()
+        element.form_state.value().to_owned()
     } else {
         attr(base, node, "value").unwrap_or("").to_owned()
     };
