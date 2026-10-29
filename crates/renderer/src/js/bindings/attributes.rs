@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use std::rc::Rc;
 
+use blitz_dom::Dirtiness;
 use markup5ever::{LocalName, QualName};
 
 use crate::documents::JournalEntry;
@@ -1632,7 +1633,7 @@ fn note_src_creator(ctx: &Ctx<'_>, element: NodeId) {
 /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
 struct InputValueStore {
     value: String,
-    dirty: bool,
+    dirtiness: Dirtiness,
 }
 
 /// Recomputes an input's sanitized stored value after one of the content
@@ -1647,7 +1648,7 @@ fn apply_input_value_attribute_change(ctx: &Ctx<'_>, element: NodeId) -> Result<
     if !crate::dom::tree::is_html_element(&parsed.document.base, element.node, "input") {
         return Ok(());
     }
-    crate::dom::input::sync_sanitized_value(&mut parsed, element.node);
+    crate::dom::input::sync_sanitized_value(&mut parsed.document, element.node);
     Ok(())
 }
 
@@ -1766,7 +1767,11 @@ fn input_type_store(
         // attribute keeps following it.
         return Ok(Some(InputValueStore {
             value: sanitize_current(world, element, new, current),
-            dirty,
+            dirtiness: if dirty {
+                Dirtiness::Set
+            } else {
+                Dirtiness::Keep
+            },
         }));
     }
     if old_mode != crate::dom::input::ValueMode::Current
@@ -1778,7 +1783,7 @@ fn input_type_store(
         let raw = attribute.unwrap_or_default();
         return Ok(Some(InputValueStore {
             value: sanitize_current(world, element, new, &raw),
-            dirty: false,
+            dirtiness: Dirtiness::Clear,
         }));
     }
     Ok(None)
@@ -1794,7 +1799,7 @@ fn apply_input_value_store(
             .document
             .base
             .mutate()
-            .set_value(element.node, store.value, store.dirty);
+            .set_value(element.node, store.value, store.dirtiness);
     }
 }
 

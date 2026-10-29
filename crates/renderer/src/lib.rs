@@ -136,8 +136,8 @@ pub(crate) fn parse_html(input: &str, mut config: blitz_dom::DocumentConfig) -> 
     let base: blitz_dom::BaseDocument = blitz_html::HtmlDocument::from_html(input, config).into();
     let document = BlitzDocument::from_base(base);
     // The sink appends the doctype as a real document child now. HTML never
-    // produces PI nodes (`<?...?>` is a bogus comment), so there is nothing
-    // to initialize here; XML fills the maps in `xml.rs` after parsing.
+    // produces PI nodes (`<?...?>` is a bogus comment); the tree derives a
+    // processing instruction's pseudo-attributes when it creates the node.
     let mut parsed = Parsed {
         id: 0,
         document,

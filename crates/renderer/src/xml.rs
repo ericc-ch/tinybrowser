@@ -85,7 +85,7 @@ fn parse_with_config(
     if !errors.is_empty() {
         return parser_error_document(document, content_type, ready_state, xml_document, &errors);
     }
-    Parsed {
+    let mut parsed = Parsed {
         id: 0,
         document,
         quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
@@ -98,7 +98,12 @@ fn parse_with_config(
         // `document/mod.rs`, so a future "fix" unifying the two breaks
         // `document.characterSet`.
         character_set: "UTF-8",
-    }
+    };
+    // XML parsing creates elements with their attributes, so the control
+    // slots need the same initial sanitization the HTML parser's do
+    // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+    crate::dom::forms::initialize_controls(&mut parsed);
+    parsed
 }
 
 /// Rebuilds the parsed document as a `parsererror` document for a

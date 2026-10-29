@@ -2,6 +2,7 @@
 
 use super::{LegacyNullString, events, host_node_id, webdriver_element, world_for_node, wrap_node};
 
+use blitz_dom::Dirtiness;
 use markup5ever::{LocalName, Namespace, QualName};
 use rquickjs::{Ctx, Exception, Function, Result, Value, prelude::This};
 
@@ -191,8 +192,8 @@ fn radio_group_checked(
         .find(|member| checkedness(base, member.node))
 }
 
-/// An input's checkedness: the dirty slot when set, otherwise the `checked`
-/// attribute (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty>).
+/// An input's checkedness slot
+/// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked>).
 fn checkedness(base: &blitz_dom::BaseDocument, node: BlitzId) -> bool {
     base.get_node(node)
         .and_then(|target| target.data.downcast_element())
@@ -364,8 +365,9 @@ pub(crate) enum PreActivation {
 }
 
 /// The legacy-pre-activation behavior: a checkbox toggles, a radio becomes
-/// checked and remembers the group's previous checked radio. Blitz keeps no
-/// checkedness slot, so the `checked` attribute is the whole state.
+/// checked and remembers the group's previous checked radio. The interaction
+/// sets the dirty checkedness flag on the control it changes
+/// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty>).
 pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
@@ -395,7 +397,7 @@ pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreAc
                 indeterminate,
             };
             let mut mutator = parsed.document.base.mutate();
-            mutator.set_checkedness(node.node, !checked, false);
+            mutator.set_checkedness(node.node, !checked, Dirtiness::Set);
             // Activation clears indeterminateness
             // (<https://html.spec.whatwg.org/multipage/input.html#checkbox-state-(type=checkbox):activation-behavior>).
             mutator.set_indeterminate(node.node, false);
@@ -418,9 +420,9 @@ pub(crate) fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreAc
                 );
                 let mut mutator = parsed.document.base.mutate();
                 for member in members {
-                    mutator.set_checkedness(member.node, false, false);
+                    mutator.set_checkedness(member.node, false, Dirtiness::Keep);
                 }
-                mutator.set_checkedness(node.node, true, false);
+                mutator.set_checkedness(node.node, true, Dirtiness::Set);
                 mutator.set_indeterminate(node.node, false);
                 PreActivation::Radio(previous)
             }
@@ -446,7 +448,7 @@ pub(crate) fn legacy_canceled_activation(
             indeterminate,
         } => {
             let mut mutator = parsed.document.base.mutate();
-            mutator.set_checkedness(node.node, *checked, false);
+            mutator.set_checkedness(node.node, *checked, Dirtiness::Set);
             // A canceled activation restores the pre-click state, including
             // indeterminateness; a handler that set it during the click must
             // not leak that change
@@ -455,15 +457,15 @@ pub(crate) fn legacy_canceled_activation(
         }
         PreActivation::Radio(Some(other)) => {
             let mut mutator = parsed.document.base.mutate();
-            mutator.set_checkedness(node.node, false, false);
-            mutator.set_checkedness(other.node, true, false);
+            mutator.set_checkedness(node.node, false, Dirtiness::Set);
+            mutator.set_checkedness(other.node, true, Dirtiness::Keep);
         }
         PreActivation::Radio(None) => {
             parsed
                 .document
                 .base
                 .mutate()
-                .set_checkedness(node.node, false, false);
+                .set_checkedness(node.node, false, Dirtiness::Set);
         }
         PreActivation::None => {}
     }
@@ -552,7 +554,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             InputType::Checkbox => {
                 let checked = checkedness(&parsed.document.base, node.node);
                 let mut mutator = parsed.document.base.mutate();
-                mutator.set_checkedness(node.node, !checked, false);
+                mutator.set_checkedness(node.node, !checked, Dirtiness::Set);
                 mutator.set_indeterminate(node.node, false);
                 true
             }
@@ -575,9 +577,9 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                     );
                     let mut mutator = parsed.document.base.mutate();
                     for member in members {
-                        mutator.set_checkedness(member.node, false, false);
+                        mutator.set_checkedness(member.node, false, Dirtiness::Keep);
                     }
-                    mutator.set_checkedness(node.node, true, false);
+                    mutator.set_checkedness(node.node, true, Dirtiness::Set);
                     mutator.set_indeterminate(node.node, false);
                     true
                 }
@@ -1167,7 +1169,7 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
                     .document
                     .base
                     .mutate()
-                    .set_value(node.node, sanitized, true);
+                    .set_value(node.node, sanitized, Dirtiness::Set);
             } else {
                 write_attr(&mut parsed, node, "value", Some(&value.0));
             }
@@ -1177,7 +1179,7 @@ fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullStrin
                 .document
                 .base
                 .mutate()
-                .set_value(node.node, value.0, true);
+                .set_value(node.node, value.0, Dirtiness::Set);
         }
         _ => write_attr(&mut parsed, node, "value", Some(&value.0)),
     }

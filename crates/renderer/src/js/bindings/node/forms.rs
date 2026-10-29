@@ -7,6 +7,7 @@ use super::super::{
     set_attribute_sync, throw_dom, with_node_data, world, world_for_node, wrap_node,
 };
 
+use blitz_dom::Dirtiness;
 use rquickjs::{Ctx, Exception, Result, Value};
 
 use crate::dom::insertion::replace_all_journaled;
@@ -557,10 +558,11 @@ impl JsNode {
             "textarea" => crate::dom::forms::textarea_api_value(base, self.handle.0.node),
             "option" => crate::dom::forms::option_value(base, self.handle.0.node),
             "input" => crate::dom::input::current_value(&parsed, self.handle.0.node),
-            _ => base
-                .get_node(self.handle.0.node)
-                .and_then(|node| node.data.downcast_element())
-                .map_or_else(String::new, |element| element.control_value().to_owned()),
+            // Every other element reflects its `value` content attribute
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-button-value>).
+            _ => attr(base, self.handle.0.node, "value")
+                .unwrap_or_default()
+                .to_owned(),
         })
     }
 
@@ -670,7 +672,7 @@ impl JsNode {
                 .document
                 .base
                 .mutate()
-                .set_value(self.handle.0.node, value, true);
+                .set_value(self.handle.0.node, value, Dirtiness::Set);
         }
         if changed && applies {
             world_rc
@@ -891,7 +893,7 @@ impl JsNode {
         }
         for control in controls {
             if crate::dom::tree::is_html_element(&parsed.document.base, control, "input") {
-                crate::dom::input::sync_sanitized_value(&mut parsed, control);
+                crate::dom::input::sync_sanitized_value(&mut parsed.document, control);
             } else if crate::dom::tree::is_html_element(&parsed.document.base, control, "select") {
                 crate::dom::forms::reset_select_selectedness(&mut parsed, control);
             }
@@ -1047,11 +1049,11 @@ impl JsNode {
         };
         let mut mutator = parsed.document.base.mutate();
         for member in group {
-            mutator.set_checkedness(member.node, false, false);
+            mutator.set_checkedness(member.node, false, Dirtiness::Keep);
         }
         // The checked IDL attribute also sets the dirty checkedness flag
         // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-checked>).
-        mutator.set_checkedness(self.handle.0.node, value, true);
+        mutator.set_checkedness(self.handle.0.node, value, Dirtiness::Set);
         Ok(())
     }
 
@@ -1250,7 +1252,7 @@ pub(super) fn fixup_radio_on_insert(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     let group = crate::dom::forms::radios_to_uncheck(&parsed.document.base, id.document, id.node);
     let mut mutator = parsed.document.base.mutate();
     for member in group {
-        mutator.set_checkedness(member.node, false, false);
+        mutator.set_checkedness(member.node, false, Dirtiness::Keep);
     }
     Ok(())
 }

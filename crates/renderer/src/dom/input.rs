@@ -11,6 +11,8 @@ use blitz_dom::BaseDocument;
 use style::color::{AbsoluteColor, ColorSpace};
 use style::device::Device;
 
+use blitz_dom::Dirtiness;
+
 use crate::Parsed;
 use crate::dom::microsyntaxes::{
     format_number, valid_date, valid_float, valid_local_datetime, valid_month, valid_time,
@@ -499,8 +501,8 @@ fn serialize_color_function(space: &str, [red, green, blue]: [f32; 3], alpha: f3
 /// the current value, except for the states whose sanitization also reads
 /// `min`, `max`, `step`, `colorspace`, `alpha`, or `multiple`
 /// (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
-pub(crate) fn sync_sanitized_value(parsed: &mut Parsed, node: BlitzId) {
-    let base = &parsed.document.base;
+pub(crate) fn sync_sanitized_value(document: &mut crate::documents::BlitzDocument, node: BlitzId) {
+    let base = &document.base;
     let Some(kind) = input_type(base, node) else {
         return;
     };
@@ -524,10 +526,9 @@ pub(crate) fn sync_sanitized_value(parsed: &mut Parsed, node: BlitzId) {
     };
     // The slot this writes feeds every later read, so a system color has to
     // resolve with the document's device here.
-    let sanitized = sanitize_with_device(&mut parsed.document.base, node, kind, &raw);
-    parsed
-        .document
+    let sanitized = sanitize_with_device(&mut document.base, node, kind, &raw);
+    document
         .base
         .mutate()
-        .set_value(node, sanitized, dirty);
+        .set_value(node, sanitized, Dirtiness::Keep);
 }

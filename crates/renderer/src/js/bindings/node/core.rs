@@ -8,8 +8,8 @@ use super::super::{
     dom_string, drain_mutation_journal, element_sibling_value, fixup_focus_after_removal,
     live_collection, make_weak, node_is_shadow_root, replace_character_data,
     schedule_mutation_delivery, select_error, selector_matching_elements, set_character_data,
-    sibling_value, string_value, throw_dom, throw_dom_error, valid_attribute_local_name,
-    with_node_data, world, world_for_node, wrap_node,
+    set_pi_attributes, sibling_value, string_value, throw_dom, throw_dom_error,
+    valid_attribute_local_name, with_node_data, world, world_for_node, wrap_node,
 };
 use crate::dom::adoption::{clone_within_document, materialize_import};
 
@@ -2587,19 +2587,7 @@ pub(super) fn write_pi_attributes(
     id: NodeId,
     attributes: Vec<(String, String)>,
 ) -> Result<()> {
-    let data = blitz_dom::pseudo_attributes::serialize(&attributes);
-    set_character_data(ctx, id, &DomString::from(data))?;
-    let owner = world_for_node(ctx, id)?;
-    let owner = owner.borrow();
-    let Some(mut parsed) = owner.document_mut(id) else {
-        return Ok(());
-    };
-    parsed
-        .document
-        .base
-        .mutate()
-        .set_processing_instruction_attributes(id.node, attributes);
-    Ok(())
+    set_pi_attributes(ctx, id, attributes)
 }
 
 pub(super) fn doctype_field(
