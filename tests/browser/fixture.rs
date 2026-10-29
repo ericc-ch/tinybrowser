@@ -160,6 +160,23 @@ impl TestServer {
         routes: Vec<(&'static str, &'static str, &'static [u8])>,
         hold: Option<&'static str>,
     ) -> Self {
+        Self::with_cors(routes, hold, true)
+    }
+
+    /// A server that sends no CORS headers, so a `cors`-mode request to it
+    /// fails the CORS check
+    /// (<https://fetch.spec.whatwg.org/#cors-check>).
+    pub(crate) fn start_without_cors(
+        routes: Vec<(&'static str, &'static str, &'static [u8])>,
+    ) -> Self {
+        Self::with_cors(routes, None, false)
+    }
+
+    fn with_cors(
+        routes: Vec<(&'static str, &'static str, &'static [u8])>,
+        hold: Option<&'static str>,
+        cors: bool,
+    ) -> Self {
         let (listener, address) = server();
         let (sender, receiver) = mpsc::channel();
         let released: Arc<(Mutex<bool>, Condvar)> = Arc::default();
@@ -189,7 +206,7 @@ impl TestServer {
                         .iter()
                         .find(|(route, _, _)| *route == path)
                         .map_or(("text/plain", &[][..]), |(_, kind, body)| (*kind, *body));
-                    let response = response_for(&head, content_type, body);
+                    let response = response_for(&head, content_type, body, cors);
                     // The client may hang up right after its head; a failed
                     // write then needs no retry.
                     let _ = stream.write_all(&response);
@@ -246,6 +263,14 @@ impl TestServer {
             .any(|request| request.path == path)
     }
 
+    /// Waits until at least `count` requests for `path` have been accepted.
+    pub(crate) fn wait_count(&self, path: &str, count: usize) -> Vec<String> {
+        poll_until(&format!("{count} requests for {path}"), || {
+            let heads = self.history(path);
+            (heads.len() >= count).then_some(heads)
+        })
+    }
+
     /// Every recorded head for `path`, oldest first.
     pub(crate) fn history(&self, path: &str) -> Vec<String> {
         self.drain();
@@ -272,6 +297,18 @@ impl TestServer {
     }
 }
 
+/// Polls `probe` until it answers, failing the test after ten seconds.
+pub(crate) fn poll_until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(answer) = probe() {
+            return answer;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The request target of a recorded head.
 fn request_path(head: &str) -> String {
     head.split_whitespace().nth(1).unwrap_or("/").to_owned()
@@ -279,11 +316,17 @@ fn request_path(head: &str) -> String {
 
 /// One response, echoing the request's `Origin` when it sent one so a
 /// credentialed CORS request passes the CORS check.
-fn response_for(head: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+fn response_for(head: &str, content_type: &str, body: &[u8], cors: bool) -> Vec<u8> {
     let mut response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
+    if !cors {
+        response.push_str("\r\n");
+        let mut response = response.into_bytes();
+        response.extend_from_slice(body);
+        return response;
+    }
     match request_header(head, "origin") {
         Some(origin) => {
             let _ = write!(

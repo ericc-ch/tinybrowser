@@ -11,16 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub(crate) struct BlitzFetch {
     /// Handler id the document files the delivery target under.
     pub id: u64,
-    /// Absolute URL to fetch.
-    pub url: url::Url,
-    /// What the fetch is for, so the document can apply per-destination
-    /// policy (<https://fetch.spec.whatwg.org/#concept-request-destination>).
-    pub kind: blitz_traits::net::RequestKind,
-    /// The CSS style sheet that initiated the fetch, when one did. The
-    /// document sends the sheet's location as the referrer and applies the
-    /// sheet response's `Referrer-Policy`
-    /// (<https://w3c.github.io/webappsec-referrer-policy/#integration-with-css>).
-    pub style_sheet: Option<url::Url>,
+    /// What Blitz asked for: the URL, destination, initiating element, and the
+    /// element state the request was created with.
+    pub request: blitz_traits::net::Request,
 }
 
 /// Delivery target for one fetch: Blitz's response handler, counted so the
@@ -48,20 +41,13 @@ impl CountingHandler {
     /// releases its critical hold).
     fn file(
         in_flight: &std::sync::Arc<AtomicUsize>,
-        url: url::Url,
-        kind: blitz_traits::net::RequestKind,
-        style_sheet: Option<url::Url>,
+        request: blitz_traits::net::Request,
         handler: Box<dyn blitz_traits::net::NetHandler>,
     ) -> (Self, BlitzFetch) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let fetch = BlitzFetch {
-            id,
-            url,
-            kind,
-            style_sheet,
-        };
+        let fetch = BlitzFetch { id, request };
         (
             Self {
                 inner: Some(handler),
@@ -77,14 +63,19 @@ impl CountingHandler {
 /// document dials it and delivers the bytes back.
 pub(crate) struct TinyNetProvider {
     tx: std::sync::mpsc::Sender<(BlitzFetch, CountingHandler)>,
+    settle_tx: std::sync::mpsc::Sender<blitz_dom::ImageSettlement>,
     in_flight: std::sync::Arc<AtomicUsize>,
 }
 
 impl TinyNetProvider {
     /// Builds a provider enqueueing into `tx`, drained by the owning document.
-    pub(crate) fn new(tx: std::sync::mpsc::Sender<(BlitzFetch, CountingHandler)>) -> Self {
+    pub(crate) fn new(
+        tx: std::sync::mpsc::Sender<(BlitzFetch, CountingHandler)>,
+        settle_tx: std::sync::mpsc::Sender<blitz_dom::ImageSettlement>,
+    ) -> Self {
         Self {
             tx,
+            settle_tx,
             in_flight: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -96,6 +87,14 @@ impl TinyNetProvider {
     }
 }
 
+impl blitz_dom::ImageSettleObserver for TinyNetProvider {
+    fn settled(&self, settlement: blitz_dom::ImageSettlement) {
+        // A closed channel means teardown; the settlement is then invisible by
+        // design.
+        let _ = self.settle_tx.send(settlement);
+    }
+}
+
 impl blitz_traits::net::NetProvider for TinyNetProvider {
     fn fetch(
         &self,
@@ -103,13 +102,7 @@ impl blitz_traits::net::NetProvider for TinyNetProvider {
         request: blitz_traits::net::Request,
         handler: Box<dyn blitz_traits::net::NetHandler>,
     ) {
-        let (counting, fetch) = CountingHandler::file(
-            &self.in_flight,
-            request.url,
-            request.kind,
-            request.style_sheet,
-            handler,
-        );
+        let (counting, fetch) = CountingHandler::file(&self.in_flight, request, handler);
         // The document drains the queue on its thread; a disconnected
         // receiver means teardown, and the count already covers the drop.
         let _ = self.tx.send((fetch, counting));
@@ -194,7 +187,8 @@ mod tests {
     #[test]
     fn fetch_enqueues_and_delivery_settles() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let provider = TinyNetProvider::new(tx);
+        let (settle_tx, _settle_rx) = std::sync::mpsc::channel();
+        let provider = TinyNetProvider::new(tx, settle_tx);
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         provider.fetch(
             1,
@@ -203,9 +197,9 @@ mod tests {
         );
         assert_eq!(provider.in_flight(), 1);
         let (fetch, handler) = rx.try_recv().expect("enqueued");
-        assert_eq!(fetch.url.as_str(), "http://127.0.0.1/a.css");
+        assert_eq!(fetch.request.url.as_str(), "http://127.0.0.1/a.css");
         Box::new(handler).bytes(
-            fetch.url.as_str().to_owned(),
+            fetch.request.url.as_str().to_owned(),
             blitz_traits::net::Bytes::from_static(b"div{color:red}"),
         );
         assert_eq!(provider.in_flight(), 0);

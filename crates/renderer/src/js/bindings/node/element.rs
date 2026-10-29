@@ -15,8 +15,6 @@ use super::super::{
 use super::forms::fixup_controls_on_insert;
 use crate::dom::adoption::materialize_children;
 use crate::js::bindings::enumerated::{Defaults, Dir, EnterKeyHint, InputMode, reflect_enumerated};
-use enumerated::Enumerated;
-use net::cors::CrossOrigin;
 use std::collections::HashSet;
 
 use blitz_dom::NodeData;
@@ -2867,14 +2865,15 @@ pub(super) fn reflect_cross_origin<'js>(
     ctx: &Ctx<'js>,
     id: NodeId,
 ) -> Result<Option<rquickjs::String<'js>>> {
-    let Some(canonical) =
-        CrossOrigin::from_attribute(content_attr(ctx, id, "crossorigin").as_deref())
+    let Some(setting) = content_attr(ctx, id, "crossorigin")
+        .as_deref()
+        .map(blitz_traits::net::CorsSetting::parse)
     else {
         return Ok(None);
     };
     Ok(Some(rquickjs::String::from_str(
         ctx.clone(),
-        canonical.keyword(),
+        setting.keyword(),
     )?))
 }
 

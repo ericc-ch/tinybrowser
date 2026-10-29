@@ -2225,9 +2225,11 @@ fn note_picture_move(
             }
         }
     }
-    let mut world = world_rc.borrow_mut();
+    let world = world_rc.borrow();
     for element in updates {
-        world.queue_image_update(element);
+        if let Some(mut parsed) = world.document_mut(element) {
+            parsed.document.base.restart_image(element.node);
+        }
     }
     Ok(())
 }

@@ -1320,7 +1320,7 @@ impl SandboxFlags {
 #[derive(Default)]
 pub(crate) struct SubresourceOptions {
     /// The `crossorigin` CORS settings state; `None` is the `No CORS` state.
-    pub(crate) crossorigin: Option<net::cors::CrossOrigin>,
+    pub(crate) crossorigin: Option<blitz_traits::net::CorsSetting>,
     /// The element's `referrerpolicy`, when it names one.
     pub(crate) referrer_policy: Option<net::ReferrerPolicy>,
 }
@@ -1386,9 +1386,6 @@ pub(crate) struct World {
     pub(crate) history: crate::protocol::HistorySnapshot,
     /// The realm's outgoing work, drained once per turn by the document.
     pub(crate) outbox: Outbox,
-    /// Image elements already queued in `outbox`, so repeated `src` changes
-    /// do not scan the whole queue.
-    queued_images: RefCell<HashSet<NodeId>>,
     /// Files a script set on an `input[type=file]` through `input.files`, so
     /// the form entry list reads them without depending on JS wrapper identity
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
@@ -1472,30 +1469,18 @@ pub(crate) struct ImageState {
     /// Decoded dimensions for script geometry (`naturalWidth/Height`). Blitz
     /// owns the pixels; this only records the settled size.
     pub(crate) sizes: HashMap<NodeId, (u32, u32)>,
-    /// Elements whose current request has not finished, including a `src`
-    /// mutation waiting for `update the image data`
+    /// Elements whose current request has not finished
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
     pub(crate) loading: HashSet<NodeId>,
-    /// Selected URL for each element's current request
+    /// The request each element's `currentSrc` and displayed pixels belong to
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
-    pub(crate) current_src: HashMap<NodeId, String>,
+    pub(crate) current_request: HashMap<NodeId, blitz_dom::ImageKey>,
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
     pub(crate) broken: HashSet<NodeId>,
-    /// Elements whose current request already dispatched its `error` event,
-    /// so a later scan does not repeat it.
-    pub(crate) error_reported: HashSet<NodeId>,
-    /// Whether each element's displayed request is origin-clean for canvas.
-    /// The entry belongs to the *current* request: a `src` change starts a
-    /// pending request but leaves the old pixels on screen, so the bit moves
-    /// only when the new request settles
+    /// Whether each element's displayed request is origin-clean for canvas
     /// (<https://html.spec.whatwg.org/multipage/canvas.html#the-image-argument>).
     pub(crate) origin_clean: HashMap<NodeId, bool>,
-    /// Taint of the last settled request for a URL, keyed by the request URL.
-    /// Blitz can hand an element already-decoded pixels from its cache, with
-    /// no delivery for that element; this is where the taint for that URL
-    /// survives. Cleared with the document.
-    pub(crate) url_taint: HashMap<String, bool>,
 }
 
 impl ImageState {
@@ -1504,11 +1489,9 @@ impl ImageState {
     fn clear(&mut self) {
         self.sizes.clear();
         self.loading.clear();
-        self.current_src.clear();
+        self.current_request.clear();
         self.broken.clear();
-        self.error_reported.clear();
         self.origin_clean.clear();
-        self.url_taint.clear();
     }
 }
 
@@ -1575,7 +1558,7 @@ impl EventTargetState {
 /// One piece of realm work waiting for the document to apply it.
 ///
 /// The realm does not run document tasks itself. Timers, fetch submissions and
-/// aborts, script and image starts, history updates, CSP reports, and
+/// aborts, script starts, history updates, CSP reports, and
 /// `document.write` text land here in enqueue order. The document drains the
 /// queue at the start of a turn. `document.open` and `document.close` stay on
 /// the engine's stream queue because applying them republishes the frame.
@@ -1585,7 +1568,6 @@ pub(crate) enum RealmRequest {
     Fetch(Box<super::JsFetchRequest>),
     AbortFetch(super::JsFetchId),
     Script(NodeId),
-    Image(NodeId),
     HistoryPush {
         url: String,
         state: String,
@@ -1827,7 +1809,6 @@ impl World {
             sandbox: SandboxFlags::default(),
             history: crate::protocol::HistorySnapshot::default(),
             outbox: Rc::new(RefCell::new(VecDeque::new())),
-            queued_images: RefCell::new(HashSet::new()),
             input_files: HashMap::new(),
             font_registrations: HashMap::new(),
             next_font_registration: 1,
@@ -1992,11 +1973,8 @@ impl World {
         };
         let base = &parsed.document.base;
         SubresourceOptions {
-            crossorigin: net::cors::CrossOrigin::from_attribute(crate::dom::tree::attr(
-                base,
-                element.node,
-                "crossorigin",
-            )),
+            crossorigin: crate::dom::tree::attr(base, element.node, "crossorigin")
+                .map(blitz_traits::net::CorsSetting::parse),
             referrer_policy: crate::dom::tree::attr(base, element.node, "referrerpolicy")
                 .and_then(net::ReferrerPolicy::parse),
         }
@@ -2025,15 +2003,6 @@ impl World {
     ) -> Option<R> {
         let store = self.runtime.documents.borrow();
         store.get(id.document_id()).map(reader)
-    }
-
-    /// Whether `id` belongs to this realm's active document. Inert documents
-    /// (`template.content`, `createHTMLDocument`, `DOMParser`) are owned by the
-    /// realm but are not fully active, so image loads and similar side effects
-    /// must wait until a node is adopted into the active document
-    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#fully-active>).
-    pub(crate) fn is_active_document(&self, id: NodeId) -> bool {
-        self.document == Some(id.document_id())
     }
 
     /// Runs `reader` against the frame's active document.
@@ -2684,24 +2653,6 @@ impl World {
         !self.state.frame_navigations.is_empty()
     }
 
-    pub(crate) fn queue_image_update(&mut self, element: NodeId) {
-        // Keep `currentSrc` and decoded pixels until the new request starts.
-        // Mark unavailable now so `complete` is false while the update waits
-        // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
-        // <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
-        self.images.loading.insert(element);
-        if self.queued_images.borrow_mut().insert(element) {
-            self.outbox
-                .borrow_mut()
-                .push_back(RealmRequest::Image(element));
-        }
-    }
-
-    /// The image request is now owned by the document's task queue.
-    pub(crate) fn image_update_started(&mut self, element: NodeId) {
-        self.queued_images.borrow_mut().remove(&element);
-    }
-
     /// Queues a connected `<script src>` element for its fetch prepare steps.
     pub(crate) fn queue_script(&mut self, element: NodeId) {
         self.outbox
@@ -2771,7 +2722,6 @@ impl World {
                     | RealmRequest::HistoryTraverse { .. }
             )
         });
-        self.queued_images.borrow_mut().clear();
     }
 
     /// Drops the old document's realm work before `document.open`, but keeps
@@ -2790,7 +2740,6 @@ impl World {
                     | RealmRequest::HistoryTraverse { .. }
             )
         });
-        self.queued_images.borrow_mut().clear();
     }
 
     /// Appends one in-head `meta` policy the first time it is seen
@@ -2841,67 +2790,47 @@ impl World {
     /// pixels
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
     /// <https://html.spec.whatwg.org/multipage/images.html#img-not-fully-decodable>).
-    pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
+    /// The element's current request started. Its `currentSrc` and pixels stay
+    /// with the previous request until this one settles, but the element is no
+    /// longer `complete` and `drawImage` refuses those pixels
+    /// (<https://html.spec.whatwg.org/multipage/images.html#update-the-image-data>,
+    /// <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
+    pub(crate) fn image_started(&mut self, element: NodeId) {
         self.images.loading.insert(element);
         self.images.broken.remove(&element);
-        self.images.error_reported.remove(&element);
         self.images.origin_clean.remove(&element);
-        if !self.images.sizes.contains_key(&element) {
-            self.images.current_src.insert(element, url);
-        }
     }
 
-    /// Records Blitz's decoded dimensions and canvas taint for `element`'s
-    /// current request.
-    pub(crate) fn store_image_dims(
+    /// Records the settled request, its decoded dimensions, and its canvas
+    /// taint.
+    pub(crate) fn image_settled(
         &mut self,
         element: NodeId,
-        width: u32,
-        height: u32,
-        url: String,
+        request: blitz_dom::ImageKey,
+        size: (u32, u32),
         origin_clean: bool,
     ) {
         self.images.loading.remove(&element);
         self.images.broken.remove(&element);
-        self.images.sizes.remove(&element);
-        self.images.current_src.insert(element, url);
-        self.images.sizes.insert(element, (width, height));
+        self.images.current_request.insert(element, request);
+        self.images.sizes.insert(element, size);
         self.images.origin_clean.insert(element, origin_clean);
     }
 
-    /// The current request finished without usable pixels. `url` is the
-    /// selected source, or the selected source string when URL parsing failed
+    /// The element's current request finished without usable pixels
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
-    pub(crate) fn fail_image(&mut self, element: NodeId, url: String) {
+    pub(crate) fn image_failed(&mut self, element: NodeId, request: blitz_dom::ImageKey) {
         self.images.loading.remove(&element);
         self.images.sizes.remove(&element);
-        self.images.current_src.insert(element, url);
+        self.images.current_request.insert(element, request);
         self.images.origin_clean.insert(element, false);
         self.images.broken.insert(element);
     }
 
-    /// Whether `element`'s current request already failed for `url`, so a
-    /// later scan must not register a waiter that no delivery will settle.
-    pub(crate) fn image_failed(&self, element: NodeId, url: &str) -> bool {
-        self.images.broken.contains(&element)
-            && self
-                .images
-                .current_src
-                .get(&element)
-                .is_some_and(|current| current == url)
-    }
-
-    /// Records the first `error` event for `element`'s current request.
-    /// Returns false when it was already reported.
-    pub(crate) fn report_image_error(&mut self, element: NodeId) -> bool {
-        self.images.error_reported.insert(element)
-    }
-
     pub(crate) fn forget_image(&mut self, element: NodeId) {
         self.images.loading.remove(&element);
-        self.images.current_src.remove(&element);
+        self.images.current_request.remove(&element);
         self.images.broken.remove(&element);
-        self.images.error_reported.remove(&element);
         self.images.origin_clean.remove(&element);
         self.images.sizes.remove(&element);
     }

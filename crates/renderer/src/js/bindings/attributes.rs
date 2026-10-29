@@ -1944,16 +1944,11 @@ pub(crate) fn after_attribute_change(
     if is_img || is_script {
         note_src_creator(ctx, element);
     }
-    // An `<img>` loads from its `src` even while detached (`new Image()`
-    // never enters a document), but only when its node document is fully
-    // active. `template.content`, `createHTMLDocument`, and `DOMParser`
-    // documents are inert and must not fetch.
+    // An `<img>` restarts its request from Blitz's attribute hook, which also
+    // runs for a detached `new Image()`; the settlement events drive the
+    // element's state
+    // (<https://html.spec.whatwg.org/multipage/images.html#reacting-to-dom-mutations>).
     if is_img {
-        // Only `src` selects image data; `srcdoc` is not an `<img>` attribute
-        // and must not mark an otherwise settled image as loading.
-        if local == "src" && world.borrow().is_active_document(element) {
-            world.borrow_mut().queue_image_update(element);
-        }
         return Ok(());
     }
     // A detached `iframe` has no browsing context yet; insertion reads the

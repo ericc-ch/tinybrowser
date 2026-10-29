@@ -8,6 +8,7 @@ mod crossorigin;
 mod daemon;
 mod fixture;
 mod forms;
+mod images;
 mod modes;
 mod pseudo_attributes;
 mod renderer_process;
