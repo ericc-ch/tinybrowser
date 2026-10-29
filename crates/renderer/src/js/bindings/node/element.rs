@@ -2866,11 +2866,11 @@ pub(super) fn reflect_cross_origin<'js>(
     ctx: &Ctx<'js>,
     id: NodeId,
 ) -> Result<Option<rquickjs::String<'js>>> {
-    let raw = content_attr(ctx, id, "crossorigin");
-    let Some(value) = raw.as_deref() else {
+    let Some(canonical) =
+        CrossOrigin::from_attribute(content_attr(ctx, id, "crossorigin").as_deref())
+    else {
         return Ok(None);
     };
-    let canonical = CrossOrigin::parse(value).unwrap_or(CrossOrigin::Anonymous);
     Ok(Some(rquickjs::String::from_str(
         ctx.clone(),
         canonical.keyword(),

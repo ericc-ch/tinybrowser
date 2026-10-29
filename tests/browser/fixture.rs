@@ -15,6 +15,25 @@ use serde_json::json;
 /// the connection failed or the request line was malformed; the server loop
 /// moves on to the next connection.
 pub(crate) fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+    // Only the request line matters, so decode up to its line break and leave
+    // the (possibly non-UTF-8) header bytes alone.
+    let head = read_request_head_bytes(stream)?;
+    let line = match head.windows(2).position(|window| window == b"\r\n") {
+        Some(end) => &head[..end],
+        None => &head[..],
+    };
+    let line = String::from_utf8_lossy(line);
+    line.split_whitespace().nth(1).map(str::to_owned)
+}
+
+/// Reads one request head, including its blank line, and returns it as text so
+/// a test can inspect the headers the client sent.
+pub(crate) fn read_request_head(stream: &mut TcpStream) -> Option<String> {
+    let head = read_request_head_bytes(stream)?;
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+fn read_request_head_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
     // Short polls instead of one long blocking read: under load the request
     // can lag the accept, and a single long read hides which side stalled.
     stream
@@ -43,14 +62,7 @@ pub(crate) fn read_request_path(stream: &mut TcpStream) -> Option<String> {
             }
         }
     }
-    // Only the request line matters, so decode up to its line break and leave
-    // the (possibly non-UTF-8) header bytes alone.
-    let line = match head.windows(2).position(|window| window == b"\r\n") {
-        Some(end) => &head[..end],
-        None => &head[..],
-    };
-    let line = String::from_utf8_lossy(line);
-    line.split_whitespace().nth(1).map(str::to_owned)
+    Some(head)
 }
 
 /// Binds an ephemeral loopback port for a test server. The caller learns the
@@ -111,6 +123,45 @@ pub(crate) fn redirect(location: &str) -> Vec<u8> {
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .into_bytes()
+}
+
+/// One 1x1 red PNG.
+pub(crate) const PIXEL: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+    0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// Request heads a [`recording_server`] received, oldest first.
+pub(crate) type RecordedHeads = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Serves `body` at every path on an ephemeral port, recording each request
+/// head. The response allows any origin so a CORS subresource can complete.
+pub(crate) fn recording_server(
+    content_type: &'static str,
+    body: &'static [u8],
+) -> (std::net::SocketAddr, RecordedHeads) {
+    let (listener, address) = server();
+    let heads: RecordedHeads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&heads);
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let Some(head) = read_request_head(&mut stream) else {
+                continue;
+            };
+            log.lock().expect("request log").push(head);
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            let _ = stream.write_all(&response);
+        }
+    });
+    (address, heads)
 }
 
 /// Serves one body at `/` on an ephemeral port for every connection it gets.

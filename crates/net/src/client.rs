@@ -1405,6 +1405,57 @@ impl Response {
 }
 
 #[cfg(test)]
+mod redirect_policy_tests {
+    use super::{HeaderMap, Hop, Method, Url, apply_redirect_policy};
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).expect("url")
+    }
+
+    fn hop_with_hint() -> Hop {
+        let mut headers = HeaderMap::new();
+        let _ = headers.insert("sec-ch-prefers-color-scheme", b"dark");
+        Hop {
+            method: Method::GET,
+            headers,
+            body: None,
+            response_type: crate::cors::ResponseType::Basic,
+            previous_url: None,
+            origin_tainted: false,
+            crossed_origin: false,
+        }
+    }
+
+    /// A caller-supplied client hint survives a redirect to a trustworthy
+    /// origin only. `localhost.` is `localhost` with a trailing dot, and the
+    /// resolver does not strip it, so the trust check has to
+    /// (<https://wicg.github.io/ua-client-hints/#secure-transport>).
+    #[test]
+    fn a_trailing_dot_localhost_is_trustworthy_for_a_redirect_hop() {
+        let mut hop = hop_with_hint();
+        apply_redirect_policy(
+            302,
+            &url("http://a.test/"),
+            &url("http://localhost./"),
+            &mut hop,
+        );
+        assert_eq!(
+            hop.headers.get("sec-ch-prefers-color-scheme"),
+            Some(&b"dark"[..])
+        );
+
+        let mut hop = hop_with_hint();
+        apply_redirect_policy(
+            302,
+            &url("http://a.test/"),
+            &url("http://b.test/"),
+            &mut hop,
+        );
+        assert_eq!(hop.headers.get("sec-ch-prefers-color-scheme"), None);
+    }
+}
+
+#[cfg(test)]
 mod decode_tests {
     use super::{Arc, AtomicBool, Body, Mutex, NetError};
     use flate2::Compression;

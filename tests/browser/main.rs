@@ -4,6 +4,7 @@
 
 mod canvas;
 mod cdp;
+mod crossorigin;
 mod daemon;
 mod fixture;
 mod forms;

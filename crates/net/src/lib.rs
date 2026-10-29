@@ -5,6 +5,7 @@
 
 mod client;
 pub mod cors;
+mod enumerated;
 mod error;
 mod identity;
 mod protocol;
@@ -14,6 +15,7 @@ mod transport;
 
 pub use client::{Agent, AgentOptions, Body, Clock, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
+pub use enumerated::{Enumerated, UnknownKeyword};
 pub use error::{NetError, TimeoutKind, TransportError};
 pub use identity::{Brand, ClientHints, DEFAULT_USER_AGENT, Identity, UserAgent};
 pub use protocol::{
