@@ -8,7 +8,7 @@ use super::super::{
     dom_string, drain_mutation_journal, element_sibling_value, fixup_focus_after_removal,
     live_collection, make_weak, node_is_shadow_root, replace_character_data,
     schedule_mutation_delivery, select_error, selector_matching_elements, set_character_data,
-    set_pi_data, sibling_value, string_value, throw_dom, throw_dom_error,
+    set_pi_attributes, sibling_value, string_value, throw_dom, throw_dom_error,
     valid_attribute_local_name, with_node_data, world, world_for_node, wrap_node,
 };
 use crate::dom::adoption::{clone_within_document, materialize_import};
@@ -42,7 +42,7 @@ use super::document::{
     prepare_classic_script,
 };
 use super::element::{argument_node_ids, sibling_not_in, tree_parent};
-use super::forms::{fixup_option_on_insert, fixup_radio_on_insert};
+use super::forms::fixup_controls_on_insert;
 
 include!(concat!(env!("OUT_DIR"), "/Node.rs"));
 include!(concat!(env!("OUT_DIR"), "/CharacterData.rs"));
@@ -409,7 +409,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
         } else {
             attributes.push((name, value));
         }
-        write_pi_attributes(&ctx, self.handle.0, attributes)
+        set_pi_attributes(&ctx, self.handle.0, attributes)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-processinginstruction-removeattribute>
@@ -417,7 +417,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
         let name = arg_0.to_string()?;
         let mut attributes = pi_attributes(&ctx, self.handle.0)?;
         attributes.retain(|(attribute, _)| attribute != &name);
-        write_pi_attributes(&ctx, self.handle.0, attributes)
+        set_pi_attributes(&ctx, self.handle.0, attributes)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-processinginstruction-toggleattribute>
@@ -440,7 +440,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
         if !exists {
             if arg_1.unwrap_or(true) {
                 attributes.push((name, String::new()));
-                write_pi_attributes(&ctx, self.handle.0, attributes)?;
+                set_pi_attributes(&ctx, self.handle.0, attributes)?;
                 return Ok(true);
             }
             return Ok(false);
@@ -451,7 +451,7 @@ impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNod
             return Ok(true);
         }
         attributes.retain(|(attribute, _)| attribute != &name);
-        write_pi_attributes(&ctx, self.handle.0, attributes)?;
+        set_pi_attributes(&ctx, self.handle.0, attributes)?;
         Ok(false)
     }
 
@@ -643,10 +643,7 @@ impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
         drop(parsed);
         world.destroy_child_navigables(&iframes);
         drop(world);
-        for id in controls {
-            fixup_option_on_insert(&ctx, id)?;
-            fixup_radio_on_insert(&ctx, id)?;
-        }
+        fixup_controls_on_insert(&ctx, parent.document, &controls)?;
         schedule_mutation_delivery(&ctx)
     }
 
@@ -861,10 +858,7 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
             let moved = replace_parsed(&mut parsed, parent, target, replacement);
             drop(parsed);
             drop(world);
-            for id in &moved {
-                fixup_option_on_insert(&ctx, *id)?;
-                fixup_radio_on_insert(&ctx, *id)?;
-            }
+            fixup_controls_on_insert(&ctx, target.document, &moved)?;
             return schedule_mutation_delivery(&ctx);
         }
         let reference = viable_next.map(|node| NodeId {
@@ -1723,10 +1717,7 @@ impl JsNode {
             replace_parsed(&mut parsed, parent, child, replacement)
         };
         fixup_focus_after_removal(&ctx, child)?;
-        for id in &moved {
-            fixup_option_on_insert(&ctx, *id)?;
-            fixup_radio_on_insert(&ctx, *id)?;
-        }
+        fixup_controls_on_insert(&ctx, parent.document, &moved)?;
         run_html_insertion_steps(&ctx, parent, &moved)?;
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
@@ -2317,19 +2308,7 @@ pub(super) fn apply_inserted(
     moved: &[NodeId],
     deliver: bool,
 ) -> Result<()> {
-    let mut ordered = moved.to_vec();
-    {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        if let Some(parsed) = world.document(parent) {
-            ordered
-                .sort_by(|a, b| tree_order(&parsed.document.base, parent.document, a.node, b.node));
-        }
-    }
-    for id in ordered {
-        fixup_option_on_insert(ctx, id)?;
-        fixup_radio_on_insert(ctx, id)?;
-    }
+    fixup_controls_on_insert(ctx, parent.document, moved)?;
     // Insertion steps run while parent is connected. Queue mutation records
     // first so an inserted script can `takeRecords` its own addition
     // (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:html-element-insertion-steps>,
@@ -2557,30 +2536,26 @@ pub(super) fn pi_target(ctx: &Ctx<'_>, id: NodeId) -> String {
         .unwrap_or_default()
 }
 
+/// The DOM-side pseudo-attribute map. Creation and data writes derive it from
+/// the data; an attribute write stores it as given, so it can hold names the
+/// XML grammar rejects. The style-sheet loader parses the data itself
+/// (<https://dom.spec.whatwg.org/#processinginstruction-initialize>).
 pub(super) fn pi_attributes(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<(String, String)>> {
     let owner = world_for_node(ctx, id)?;
     Ok(owner
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.document.pi_attributes(id.node).map(<[_]>::to_vec))
+        .and_then(|parsed| {
+            parsed
+                .document
+                .base
+                .get_node(id.node)
+                .and_then(|node| match &node.data {
+                    NodeData::ProcessingInstruction { attributes, .. } => Some(attributes.clone()),
+                    _ => None,
+                })
+        })
         .unwrap_or_default())
-}
-
-pub(super) fn write_pi_attributes(
-    ctx: &Ctx<'_>,
-    id: NodeId,
-    attributes: Vec<(String, String)>,
-) -> Result<()> {
-    let data = crate::pseudo_attributes::serialize_pseudo_attributes(&attributes);
-    {
-        let owner = world_for_node(ctx, id)?;
-        let owner = owner.borrow();
-        let Some(mut parsed) = owner.document_mut(id) else {
-            return Ok(());
-        };
-        parsed.document.set_pi_attributes(id.node, attributes);
-    }
-    set_pi_data(ctx, id, &DomString::from(data))
 }
 
 pub(super) fn doctype_field(

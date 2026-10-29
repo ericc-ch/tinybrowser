@@ -1312,10 +1312,7 @@ pub(super) fn replace_character_data(
     count: u32,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    // Replacing data on a processing instruction reparses its attribute map
-    // unless the caller already updated the map
-    // (<https://dom.spec.whatwg.org/#concept-cd-replace>).
-    replace_character_data_inner(ctx, id, offset, count, data, true)
+    replace_character_data_inner(ctx, id, offset, count, data)
 }
 
 /// Whole-data replacement: the `data`, `nodeValue`, and `textContent`
@@ -1326,19 +1323,60 @@ pub(super) fn set_character_data(
     id: NodeId,
     data: &crate::dom_string::DomString,
 ) -> Result<()> {
-    replace_character_data_inner(ctx, id, 0, u32::MAX, data, true)
+    replace_character_data_inner(ctx, id, 0, u32::MAX, data)
 }
 
-/// Replaces character data without reparsing a processing instruction's
-/// attribute map. `update data from attributes` passes true for
-/// `piAttributesAlreadyUpdated`
-/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
-pub(super) fn set_pi_data(
+/// `update data from attributes`: the serialized map becomes the
+/// instruction's data, and the map itself is stored as given
+/// (<https://dom.spec.whatwg.org/#update-data-from-attributes>). The data
+/// and the map can differ only by attribute names the XML grammar rejects,
+/// which the serialized form cannot round-trip.
+pub(super) fn set_pi_attributes(
     ctx: &Ctx<'_>,
     id: NodeId,
-    data: &crate::dom_string::DomString,
+    attributes: Vec<(String, String)>,
 ) -> Result<()> {
-    replace_character_data_inner(ctx, id, 0, u32::MAX, data, false)
+    let owner = world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(id) else {
+        return Ok(());
+    };
+    if !parsed
+        .document
+        .base
+        .get_node(id.node)
+        .is_some_and(|node| matches!(node.data, NodeData::ProcessingInstruction { .. }))
+    {
+        return Ok(());
+    }
+    let old_value = parsed.document.character_data(id.node);
+    let old_length = old_value.units().len();
+    let data =
+        crate::dom_string::DomString::from(blitz_dom::pseudo_attributes::serialize(&attributes));
+    // The fork serializes the map into the data itself and reloads an
+    // `xml-stylesheet` sheet the instruction names.
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_processing_instruction_attributes(id.node, attributes);
+    parsed.document.remember_character_data(id.node, &data);
+    crate::dom::range::adjust_for_replace_data(
+        &mut parsed.document.side.ranges,
+        id,
+        0,
+        u32::try_from(old_length).unwrap_or(u32::MAX),
+        u32::try_from(data.units().len()).unwrap_or(u32::MAX),
+    );
+    parsed
+        .document
+        .record(crate::documents::JournalEntry::CharacterData {
+            target: id,
+            old_value,
+        });
+    drop(parsed);
+    drop(owner);
+    schedule_mutation_delivery(ctx)
 }
 
 /// Writes `utf8` as the node's whole data, by kind. Returns false when the
@@ -1367,16 +1405,11 @@ fn write_character_data(base: &mut blitz_dom::BaseDocument, id: NodeId, utf8: &s
         }
         NodeData::ProcessingInstruction { .. } => {
             base.snapshot_node(id.node);
-            base.get_node_mut(id.node)
-                .and_then(|node| match &mut node.data {
-                    NodeData::ProcessingInstruction { contents, .. } => Some(contents),
-                    _ => None,
-                })
-                .is_some_and(|contents| {
-                    contents.clear();
-                    contents.push_str(utf8);
-                    true
-                })
+            // Writing the data re-derives the pseudo-attributes, so no reader
+            // sees a map older than the data
+            // (<https://www.w3.org/TR/xml-stylesheet/#dt-parsing>).
+            base.mutate().set_processing_instruction_data(id.node, utf8);
+            true
         }
         NodeData::CDataSection { .. } => {
             base.snapshot_node(id.node);
@@ -1401,7 +1434,6 @@ fn replace_character_data_inner(
     offset: u32,
     count: u32,
     data: &crate::dom_string::DomString,
-    reparse_pi: bool,
 ) -> Result<()> {
     let owner = world_for_node(ctx, id)?;
     let owner = owner.borrow();
@@ -1452,26 +1484,6 @@ fn replace_character_data_inner(
             target: id,
             old_value,
         });
-    if reparse_pi
-        && parsed
-            .document
-            .base
-            .get_node(id.node)
-            .is_some_and(|node| matches!(node.data, NodeData::ProcessingInstruction { .. }))
-    {
-        let contents = parsed
-            .document
-            .base
-            .get_node(id.node)
-            .and_then(|node| match &node.data {
-                NodeData::ProcessingInstruction { contents, .. } => Some(contents.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let attributes =
-            crate::pseudo_attributes::parse_pseudo_attributes(&contents).unwrap_or_default();
-        parsed.document.set_pi_attributes(id.node, attributes);
-    }
     drop(parsed);
     drop(owner);
     schedule_mutation_delivery(ctx)

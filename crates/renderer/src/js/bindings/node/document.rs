@@ -796,7 +796,7 @@ impl JsNode {
         target: WebIdlString,
         data: WebIdlCodeUnits,
     ) -> Result<Value<'js>> {
-        if !crate::xml::is_valid_name(&target.0) {
+        if !xml5ever::names::is_name(&target.0) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
@@ -811,10 +811,11 @@ impl JsNode {
         // not reject an `xml` target.
         let text = data.0.to_string_lossy().into_owned();
         let target = target.0;
+        let attributes = blitz_dom::pseudo_attributes::parse(&text).unwrap_or_default();
         create_node(&ctx, self.handle.0, |parsed| {
             parsed
                 .document
-                .create_processing_instruction(&target, &text)
+                .create_processing_instruction(&target, &text, attributes.clone())
         })
     }
 

@@ -5,19 +5,17 @@
 //! and contribute a value. The list is returned to the `FormData` shim as a
 //! flat `[name, value, ...]` array.
 //!
-//! Blitz keeps no form-control value store (no dirty value flag, no
-//! checkedness or selectedness slots), so every value here is read from
-//! content attributes and descendant text: an input's value is its `value`
-//! attribute, checkedness is the presence of `checked`, a select's value
-//! comes from the selected option's `value` attribute or text, and a
-//! textarea's value is its descendant text. Live values assigned through the
-//! `value` IDL setter are a known cutover gap until the control state moves
-//! into the tree.
+//! Values come from the form-control slots in the tree: an input's current
+//! value, an option's selectedness, and a textarea's dirty value or descendant
+//! text. The dirty flags decide whether a content attribute still drives a
+//! slot (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>,
+//! <https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
 
 use super::{focus, host_node_id, owning_world, world, world_for_node};
 use crate::dom::forms::{PendingEntry, encode_form, trim_label, urlencode_form};
 use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
+use blitz_dom::Dirtiness;
 use rquickjs::prelude::Opt;
 use rquickjs::{Array, Ctx, Exception, Object, Persistent, Result, TypedArray, Value};
 use std::cell::RefCell;
@@ -111,9 +109,10 @@ pub(super) fn encoding_name(label: String) -> Option<String> {
         .map(|encoding| encoding.name().to_owned())
 }
 
-/// Sets an option's selectedness without the dirty flag, as the `Option`
-/// constructor does. Blitz models no selectedness slot, so the `selected`
-/// content attribute carries it directly.
+/// Sets an option's selectedness without the dirtiness flag, as the
+/// `Option()` constructor does, and leaves the `selected` content attribute
+/// driving it
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-option>).
 fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bool) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Ok(());
@@ -123,7 +122,11 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    crate::dom::forms::initialize_option_selectedness(&mut parsed, node.node, selected);
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_selectedness(node.node, selected, Dirtiness::Keep);
     Ok(())
 }
 

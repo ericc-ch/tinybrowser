@@ -36,6 +36,10 @@ pub(crate) enum ImportSnapshot {
     ProcessingInstruction {
         target: String,
         data: crate::dom_string::DomString,
+        /// The DOM attribute map. A name the XML grammar rejects (an
+        /// attribute local name such as `$`) cannot be re-derived from the
+        /// serialized data, so an import carries it.
+        attributes: Vec<(String, String)>,
     },
     CData(crate::dom_string::DomString),
     Fragment(Vec<ImportSnapshot>),
@@ -115,12 +119,13 @@ pub(crate) fn import_snapshot(
             public_id: public_id.clone(),
             system_id: system_id.clone(),
         }),
-        NodeData::ProcessingInstruction { target, .. } => {
-            Some(ImportSnapshot::ProcessingInstruction {
-                target: target.clone(),
-                data: doc.character_data(id.node),
-            })
-        }
+        NodeData::ProcessingInstruction {
+            target, attributes, ..
+        } => Some(ImportSnapshot::ProcessingInstruction {
+            target: target.clone(),
+            data: doc.character_data(id.node),
+            attributes: attributes.clone(),
+        }),
         NodeData::CDataSection { .. } => Some(ImportSnapshot::CData(doc.character_data(id.node))),
         NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
             let children = if deep {
@@ -164,6 +169,10 @@ pub(crate) fn materialize_import(
             {
                 element.adopt_cloned_state(form_state.clone());
             }
+            // A materialized input runs the value sanitization algorithm a
+            // parser-created one does
+            // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+            crate::dom::input::sync_sanitized_value(doc, blitz_id);
             // Template children materialize into the fresh element's
             // contents fragment, which creation already established.
             let parent = if crate::dom::tree::is_template_tag(name) {
@@ -205,9 +214,13 @@ pub(crate) fn materialize_import(
                 node: blitz_id,
             })
         }
-        ImportSnapshot::ProcessingInstruction { target, data } => {
+        ImportSnapshot::ProcessingInstruction {
+            target,
+            data,
+            attributes,
+        } => {
             let text = data.to_string_lossy().into_owned();
-            let blitz_id = doc.create_processing_instruction(target, &text);
+            let blitz_id = doc.create_processing_instruction(target, &text, attributes.clone());
             Ok(NodeId {
                 document,
                 node: blitz_id,
@@ -352,9 +365,6 @@ pub(crate) fn clone_within_document(
 ) -> std::result::Result<NodeId, TreeError> {
     if deep {
         let cloned = doc.base.mutate().deep_clone_node(id.node);
-        // Blitz copies node data only; the PI attribute map lives beside
-        // the tree and follows in lockstep.
-        doc.copy_pi_subtree(id.node, cloned);
         doc.copy_script_started(id.node, cloned);
         return Ok(NodeId {
             document: doc_id,
@@ -363,11 +373,10 @@ pub(crate) fn clone_within_document(
     }
     let snapshot = import_snapshot(doc, id, false).ok_or(TreeError::Hierarchy)?;
     let fresh = materialize_import(doc, doc_id, &snapshot)?;
-    // Cloning copies the already-started flag (and the PI map) even when the
-    // clone is shallow: the clone is the node itself, and a later connection
-    // must not run the script again
+    // Cloning copies the already-started flag even when the clone is
+    // shallow: the clone is the node itself, and a later connection must not
+    // run the script again
     // (<https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:cloning-steps>).
-    doc.copy_pi_subtree(id.node, fresh.node);
     doc.copy_script_started(id.node, fresh.node);
     Ok(fresh)
 }

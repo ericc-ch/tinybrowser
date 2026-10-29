@@ -6,6 +6,8 @@ mod canvas;
 mod cdp;
 mod daemon;
 mod fixture;
+mod forms;
 mod modes;
+mod pseudo_attributes;
 mod renderer_process;
 mod webdriver;

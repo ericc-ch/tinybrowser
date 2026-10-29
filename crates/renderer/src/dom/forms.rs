@@ -1,12 +1,13 @@
-//! Form-control state stored alongside the tree.
+//! Form-control algorithms over the control slots in the tree.
 //!
-//! Inputs keep the sanitized current value in Blitz's dirty-value slot with a
-//! pristine marker, and options keep selectedness plus dirtiness in
-//! `BlitzDocument`. The IDL getters, collections, submission, and insertion
-//! fixups all read those slots through the helpers here
+//! Inputs keep the sanitized current value in Blitz's value slot, and options
+//! keep their selectedness in the sibling slot of the same state struct; the
+//! dirty flags decide whether a content attribute still drives a slot. The
+//! IDL getters, collections, submission, and insertion fixups all read those
+//! slots through the helpers here
 //! (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html>).
 
-use blitz_dom::{BaseDocument, NodeData};
+use blitz_dom::{BaseDocument, Dirtiness, NodeData};
 
 use crate::Parsed;
 use crate::dom::tree::{
@@ -67,6 +68,12 @@ pub(crate) fn initialize_controls(parsed: &mut Parsed) {
         let Some(element) = target.data.downcast_element() else {
             continue;
         };
+        // Template contents are a separate fragment, not children: their
+        // controls still need the same initial state
+        // (<https://html.spec.whatwg.org/multipage/scripting.html#template-contents>).
+        if let Some(contents) = element.template_contents {
+            stack.push(contents);
+        }
         if element.name.ns != html_namespace() {
             continue;
         }
@@ -77,7 +84,7 @@ pub(crate) fn initialize_controls(parsed: &mut Parsed) {
         }
     }
     for node in inputs {
-        crate::dom::input::sync_sanitized_value(parsed, node);
+        crate::dom::input::sync_sanitized_value(&mut parsed.document, node);
     }
     for select in selects {
         parsed.document.invalidate_selectedness(select);
@@ -487,25 +494,24 @@ fn select_display_size(base: &BaseDocument, select: BlitzId) -> u32 {
     }
 }
 
-/// Reads an option's selectedness slot, initializing it from the `selected`
-/// attribute the first time the option is observed. Dirtiness stays false, so
-/// a later attribute change applies.
-fn option_selectedness(parsed: &mut Parsed, option: BlitzId) -> bool {
-    if let Some(selected) = parsed.document.option_selectedness(option) {
-        return selected;
-    }
-    let selected = attr(&parsed.document.base, option, "selected").is_some();
-    parsed.document.set_option_selectedness(option, selected);
-    selected
+/// An option's selectedness slot. The slot is authoritative; the tree keeps
+/// it in step with the `selected` attribute while the dirtiness flag is clear
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
+fn option_selectedness(base: &BaseDocument, option: BlitzId) -> bool {
+    base.get_node(option)
+        .and_then(|node| node.data.downcast_element())
+        .is_some_and(blitz_dom::ElementData::selectedness)
 }
 
+/// Writes an option's selectedness slot without touching its dirtiness: this
+/// is the selectedness setting algorithm's write
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
 fn set_option_selectedness(parsed: &mut Parsed, option: BlitzId, selected: bool) {
-    parsed.document.set_option_selectedness(option, selected);
     parsed
         .document
         .base
         .mutate()
-        .set_selectedness(option, selected);
+        .set_selectedness(option, selected, Dirtiness::Keep);
 }
 
 /// Clears selectedness on every option except `keep`. Setting an option's
@@ -514,53 +520,50 @@ fn set_option_selectedness(parsed: &mut Parsed, option: BlitzId, selected: bool)
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
 fn clear_other_options(parsed: &mut Parsed, select: BlitzId, keep: BlitzId) {
     for option in select_options(&parsed.document.base, parsed.id, select) {
-        if option.node != keep
-            && parsed
-                .document
-                .option_selectedness(option.node)
-                .unwrap_or(false)
-        {
+        if option.node != keep && option_selectedness(&parsed.document.base, option.node) {
             set_option_selectedness(parsed, option.node, false);
         }
     }
 }
 
-/// Prepares an option that was just inserted: selectedness from its attribute
-/// is materialized, and a selected option in a single select replaces the
-/// previous selection
+/// Runs the option insertion steps for a batch of inserted nodes, in insertion
+/// order. Adding an option whose selectedness is true clears every other
+/// option in a single select, so the last inserted selected option wins
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
-pub(crate) fn option_inserted(parsed: &mut Parsed, option: BlitzId) {
-    let Some(select) = option_select_owner(&parsed.document.base, option) else {
-        return;
-    };
-    // An option's selected attribute is the default selectedness while its
-    // dirtiness is false. Read the attribute here because an earlier option in
-    // the same insertion batch may have cleared the stored slot already
-    // (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-dirtiness>).
-    let selected = if parsed.document.option_dirty(option) {
-        option_selectedness(parsed, option)
-    } else {
-        // A parsed selected attribute or a slot kept from an earlier tree
-        // position both select the inserted option. An earlier option in the
-        // same batch may have cleared the slot, so the attribute still wins.
-        attr(&parsed.document.base, option, "selected").is_some()
-            || parsed.document.option_selectedness(option).unwrap_or(false)
-    };
-    parsed.document.set_option_selectedness(option, selected);
-    if selected && attr(&parsed.document.base, select, "multiple").is_none() {
-        clear_other_options(parsed, select, option);
+/// The select's selectedness setting algorithm then supplies the default
+/// selection once per affected select.
+pub(crate) fn options_inserted(parsed: &mut Parsed, options: impl IntoIterator<Item = BlitzId>) {
+    // Snapshot what the batch arrived with first: an insertion step clears the
+    // other options in the select, including an option from the same batch
+    // that has not been processed yet
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+    let mut inserted = Vec::new();
+    let mut selects = Vec::new();
+    for option in options {
+        let Some(select) = option_select_owner(&parsed.document.base, option) else {
+            continue;
+        };
+        inserted.push((
+            option,
+            select,
+            option_selectedness(&parsed.document.base, option),
+        ));
+        if !selects.contains(&select) {
+            selects.push(select);
+        }
     }
-    parsed.document.invalidate_selectedness(select);
-    run_selectedness_setting(parsed, select);
-}
-
-/// Sets an option's selectedness from the `Option()` constructor. The
-/// constructor overrides the initial selectedness even when the third argument
-/// set the `selected` attribute, and never sets dirtiness
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-option>).
-pub(crate) fn initialize_option_selectedness(parsed: &mut Parsed, option: BlitzId, selected: bool) {
-    set_option_selectedness(parsed, option, selected);
-    parsed.document.clear_option_dirty(option);
+    for (option, select, selected) in inserted {
+        if selected {
+            set_option_selectedness(parsed, option, true);
+            if attr(&parsed.document.base, select, "multiple").is_none() {
+                clear_other_options(parsed, select, option);
+            }
+        }
+    }
+    for select in selects {
+        parsed.document.invalidate_selectedness(select);
+        run_selectedness_setting(parsed, select);
+    }
 }
 
 /// The selectedness setting algorithm
@@ -573,15 +576,12 @@ pub(crate) fn run_selectedness_setting(parsed: &mut Parsed, select: BlitzId) -> 
     }
     let options = select_options(&parsed.document.base, parsed.id, select);
     if attr(&parsed.document.base, select, "multiple").is_some() {
-        for option in &options {
-            option_selectedness(parsed, option.node);
-        }
         parsed.document.mark_selectedness_normalized(select);
         return false;
     }
     let current: Vec<bool> = options
         .iter()
-        .map(|option| option_selectedness(parsed, option.node))
+        .map(|option| option_selectedness(&parsed.document.base, option.node))
         .collect();
     let last_selected = current.iter().rposition(|selected| *selected);
     let first_enabled = options
@@ -613,12 +613,7 @@ pub(crate) fn effective_selected_options(parsed: &mut Parsed, select: BlitzId) -
     let base = &parsed.document.base;
     select_options(base, parsed.id, select)
         .into_iter()
-        .filter(|option| {
-            parsed
-                .document
-                .option_selectedness(option.node)
-                .unwrap_or_else(|| option_selectedness(parsed, option.node))
-        })
+        .filter(|option| option_selectedness(base, option.node))
         .collect()
 }
 
@@ -626,13 +621,10 @@ pub(crate) fn effective_selected_options(parsed: &mut Parsed, select: BlitzId) -
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
 pub(crate) fn option_effective_selected(parsed: &mut Parsed, option: BlitzId) -> bool {
     let Some(select) = option_select_owner(&parsed.document.base, option) else {
-        return option_selectedness(parsed, option);
+        return option_selectedness(&parsed.document.base, option);
     };
     run_selectedness_setting(parsed, select);
-    parsed
-        .document
-        .option_selectedness(option)
-        .unwrap_or_else(|| option_selectedness(parsed, option))
+    option_selectedness(&parsed.document.base, option)
 }
 
 /// An `option`'s value: its `value` attribute, else its text
@@ -703,8 +695,11 @@ pub(crate) fn selected_index_of(parsed: &mut Parsed, select: BlitzId) -> i32 {
 pub(crate) fn reset_select_selectedness(parsed: &mut Parsed, select: BlitzId) {
     for option in select_options(&parsed.document.base, parsed.id, select) {
         let selected = attr(&parsed.document.base, option.node, "selected").is_some();
-        parsed.document.clear_option_dirty(option.node);
-        set_option_selectedness(parsed, option.node, selected);
+        parsed
+            .document
+            .base
+            .mutate()
+            .set_selectedness(option.node, selected, Dirtiness::Clear);
     }
     parsed.document.invalidate_selectedness(select);
     run_selectedness_setting(parsed, select);
@@ -888,10 +883,10 @@ pub(crate) fn textarea_api_value(base: &blitz_dom::BaseDocument, node: BlitzId) 
     let raw = base
         .get_node(node)
         .and_then(|target| target.data.downcast_element())
-        .filter(|element| element.form_state.dirty_value)
+        .filter(|element| element.form_state.dirty_value())
         .map_or_else(
             || crate::dom::text::child_text_content(base, node),
-            |element| element.form_state.value.clone(),
+            |element| element.form_state.value().to_owned(),
         );
     crate::dom::text::normalize_newlines(&raw)
 }
@@ -952,8 +947,11 @@ pub(crate) fn set_option_selected(parsed: &mut Parsed, option: BlitzId, selected
     {
         clear_other_options(parsed, select, option);
     }
-    set_option_selectedness(parsed, option, selected);
-    parsed.document.mark_option_dirty(option);
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_selectedness(option, selected, Dirtiness::Set);
     if let Some(select) = option_select_owner(&parsed.document.base, option) {
         parsed.document.invalidate_selectedness(select);
         run_selectedness_setting(parsed, select);
@@ -964,16 +962,12 @@ pub(crate) fn set_option_selected(parsed: &mut Parsed, option: BlitzId, selected
 /// the requested index and mark it dirty. No default is applied afterwards
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>).
 pub(crate) fn set_select_selected_index_value(parsed: &mut Parsed, select: BlitzId, value: i32) {
-    let options = select_options(&parsed.document.base, parsed.id, select);
-    let wanted = usize::try_from(value).ok();
-    for (index, option) in options.into_iter().enumerate() {
-        let selected = Some(index) == wanted;
-        set_option_selectedness(parsed, option.node, selected);
-        if selected {
-            parsed.document.mark_option_dirty(option.node);
-        }
-    }
-    parsed.document.mark_selectedness_normalized(select);
+    let wanted = usize::try_from(value).ok().and_then(|index| {
+        select_options(&parsed.document.base, parsed.id, select)
+            .get(index)
+            .map(|option| option.node)
+    });
+    select_only_option(parsed, select, wanted);
 }
 
 /// The `select.value` setter: clear every selectedness, select the first
@@ -987,38 +981,55 @@ pub(crate) fn set_select_value_selectedness(parsed: &mut Parsed, select: BlitzId
             first_matching = Some(option.node);
         }
     }
+    select_only_option(parsed, select, first_matching);
+}
+
+/// Selects `keep` alone and marks it dirty; every other option is cleared
+/// without dirtying. Both `select` setters define the whole selection and skip
+/// the default
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex>,
+/// <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
+fn select_only_option(parsed: &mut Parsed, select: BlitzId, keep: Option<BlitzId>) {
+    let options = select_options(&parsed.document.base, parsed.id, select);
+    let mut mutator = parsed.document.base.mutate();
     for option in options {
-        let selected = first_matching == Some(option.node);
-        set_option_selectedness(parsed, option.node, selected);
-        if selected {
-            parsed.document.mark_option_dirty(option.node);
-        }
+        let selected = Some(option.node) == keep;
+        mutator.set_selectedness(
+            option.node,
+            selected,
+            if selected {
+                Dirtiness::Set
+            } else {
+                Dirtiness::Keep
+            },
+        );
     }
+    drop(mutator);
     parsed.document.mark_selectedness_normalized(select);
 }
 
-/// Handles a change to an option's `selected` attribute: with dirtiness false
-/// the attribute drives selectedness, then the owning select resets
+/// Runs the selectedness rules after an option's `selected` attribute
+/// changed. The tree already wrote the slot while the dirtiness flag was
+/// clear; the owning select then asks for a reset
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-option-selected>).
-pub(crate) fn option_selected_attribute_changed(
-    parsed: &mut Parsed,
-    option: BlitzId,
-    selected: bool,
-) {
-    if parsed.document.option_dirty(option) {
+pub(crate) fn option_selected_attribute_changed(parsed: &mut Parsed, option: BlitzId) {
+    let Some(select) = option_select_owner(&parsed.document.base, option) else {
         return;
-    }
-    if let Some(select) = option_select_owner(&parsed.document.base, option)
-        && selected
-        && attr(&parsed.document.base, select, "multiple").is_none()
-    {
+    };
+    // A selected option in a single select deselects the others, wherever it
+    // sits in tree order
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-option-element>).
+    let selected = parsed
+        .document
+        .base
+        .get_node(option)
+        .and_then(|node| node.data.downcast_element())
+        .is_some_and(|element| !element.form_state.dirty_selectedness() && element.selectedness());
+    if selected && attr(&parsed.document.base, select, "multiple").is_none() {
         clear_other_options(parsed, select, option);
     }
-    set_option_selectedness(parsed, option, selected);
-    if let Some(select) = option_select_owner(&parsed.document.base, option) {
-        parsed.document.invalidate_selectedness(select);
-        run_selectedness_setting(parsed, select);
-    }
+    parsed.document.invalidate_selectedness(select);
+    run_selectedness_setting(parsed, select);
 }
 
 /// Runs the selectedness rules after a select's `multiple`, `size`, or an
@@ -1028,7 +1039,7 @@ pub(crate) fn select_attribute_changed(parsed: &mut Parsed, select: BlitzId, att
     if attribute == "multiple" && attr(&parsed.document.base, select, "multiple").is_none() {
         let mut seen = false;
         for option in select_options(&parsed.document.base, parsed.id, select) {
-            if option_selectedness(parsed, option.node) {
+            if option_selectedness(&parsed.document.base, option.node) {
                 if seen {
                     set_option_selectedness(parsed, option.node, false);
                 } else {

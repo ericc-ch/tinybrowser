@@ -198,6 +198,7 @@ dependencies = [
  "web-time",
  "writeable",
  "wuff",
+ "xml5ever",
 ]
 
 [[package]]
@@ -2732,6 +2733,7 @@ dependencies = [
  "webidl-bindgen",
  "webstorage",
  "writeable",
+ "xml5ever",
 ]
 
 [[package]]

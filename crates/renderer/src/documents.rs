@@ -30,14 +30,6 @@ pub struct SideTables {
     /// Whether any observer watches this document; unobserved mutations are
     /// not recorded.
     recording: bool,
-    /// Processing-instruction attribute maps, keyed by node id. The id's
-    /// slot version dies with the node, so a stale entry cannot be mistaken
-    /// for a new node in the same slot. The tree holds the data; this map
-    /// holds the parsed pseudo-attributes
-    /// (<https://dom.spec.whatwg.org/#processinginstruction-initialize>).
-    /// Everything else about PI, doctype, and CDATA nodes lives in the
-    /// Blitz tree as real node kinds.
-    pi_attributes: HashMap<blitz_traits::node_id::NodeId, Vec<(String, String)>>,
     /// Script elements whose [already started] flag is set
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#already-started>).
     started_scripts: HashSet<blitz_traits::node_id::NodeId>,
@@ -46,21 +38,6 @@ pub struct SideTables {
     /// changes invalidate the entry
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
     selectedness_normalized: HashSet<blitz_traits::node_id::NodeId>,
-    /// Stored option selectedness. Blitz folds selectedness into the
-    /// `selected` attribute unless a dirty bit is set, but the spec keeps a
-    /// separate selectedness slot and dirtiness flag
-    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
-    option_selectedness: HashMap<blitz_traits::node_id::NodeId, bool>,
-    /// Options whose selectedness was set by script or a selectedIndex/value
-    /// setter. A later `selected` attribute change does not override them
-    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-dirtiness>).
-    option_dirtiness: HashSet<blitz_traits::node_id::NodeId>,
-    /// Inputs whose stored value is the sanitized current value while the
-    /// element is still logically pristine. The dirty slot also drives Blitz's
-    /// layout editor, so a marker keeps the sanitized text on screen without
-    /// making the value user-dirty
-    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-fe-value>).
-    pristine_values: HashSet<blitz_traits::node_id::NodeId>,
     /// Live ranges by slot, adjusted by every structural mutation. Slots
     /// free with the document; see `dom::range::RangeTable`.
     pub ranges: crate::dom::range::RangeTable,
@@ -104,54 +81,6 @@ impl BlitzDocument {
     /// Drops the materialized selectedness for one select.
     pub(crate) fn invalidate_selectedness(&mut self, select: blitz_traits::node_id::NodeId) {
         self.side.selectedness_normalized.remove(&select);
-    }
-
-    /// The stored selectedness slot for an option, when materialized.
-    pub(crate) fn option_selectedness(
-        &self,
-        option: blitz_traits::node_id::NodeId,
-    ) -> Option<bool> {
-        self.side.option_selectedness.get(&option).copied()
-    }
-
-    /// Stores an option's selectedness slot.
-    pub(crate) fn set_option_selectedness(
-        &mut self,
-        option: blitz_traits::node_id::NodeId,
-        selected: bool,
-    ) {
-        self.side.option_selectedness.insert(option, selected);
-    }
-
-    /// Whether an option's selectedness was set by script.
-    pub(crate) fn option_dirty(&self, option: blitz_traits::node_id::NodeId) -> bool {
-        self.side.option_dirtiness.contains(&option)
-    }
-
-    /// Marks an option's selectedness as script-set.
-    pub(crate) fn mark_option_dirty(&mut self, option: blitz_traits::node_id::NodeId) {
-        self.side.option_dirtiness.insert(option);
-    }
-
-    /// Clears an option's dirtiness, so its `selected` attribute applies
-    /// again.
-    pub(crate) fn clear_option_dirty(&mut self, option: blitz_traits::node_id::NodeId) {
-        self.side.option_dirtiness.remove(&option);
-    }
-
-    /// Whether an input's stored value is a sanitized pristine value.
-    pub(crate) fn pristine_value(&self, node: blitz_traits::node_id::NodeId) -> bool {
-        self.side.pristine_values.contains(&node)
-    }
-
-    /// Marks an input's stored value as sanitized but pristine.
-    pub(crate) fn mark_pristine_value(&mut self, node: blitz_traits::node_id::NodeId) {
-        self.side.pristine_values.insert(node);
-    }
-
-    /// Clears the pristine marker before a user value supersedes it.
-    pub(crate) fn clear_pristine_value(&mut self, node: blitz_traits::node_id::NodeId) {
-        self.side.pristine_values.remove(&node);
     }
 
     /// Records `entry` when an observer watches this document.
@@ -202,111 +131,25 @@ impl BlitzDocument {
 
     /// Creates a processing instruction
     /// (<https://dom.spec.whatwg.org/#create-a-processing-instruction-node>).
-    ///
-    /// The tree holds the data; the attribute map is initialized from it. A
-    /// parse error leaves the map empty
-    /// (<https://dom.spec.whatwg.org/#processinginstruction-initialize>).
+    /// The attribute map is given: a fresh instruction parses it from the data
+    /// and an import carries the source's map, which can hold attribute names
+    /// the XML grammar rejects
+    /// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
     pub(crate) fn create_processing_instruction(
         &mut self,
         target: &str,
         data: &str,
-    ) -> blitz_traits::node_id::NodeId {
-        let id = self
-            .base
-            .mutate()
-            .create_processing_instruction_node(target, data);
-        let attributes =
-            crate::pseudo_attributes::parse_pseudo_attributes(data).unwrap_or_default();
-        self.side.pi_attributes.insert(id, attributes);
-        id
-    }
-
-    /// The ordered attribute map of a processing instruction, if it has one.
-    pub(crate) fn pi_attributes(
-        &self,
-        id: blitz_traits::node_id::NodeId,
-    ) -> Option<&[(String, String)]> {
-        self.side.pi_attributes.get(&id).map(Vec::as_slice)
-    }
-
-    /// Replaces the ordered attribute map of a processing instruction.
-    ///
-    /// Callers that already updated the map from a `setAttribute`-style
-    /// mutation pass the new map and then replace the data with
-    /// `piAttributesAlreadyUpdated` set, so this write is not parsed again
-    /// (<https://dom.spec.whatwg.org/#concept-cd-replace>).
-    pub(crate) fn set_pi_attributes(
-        &mut self,
-        id: blitz_traits::node_id::NodeId,
         attributes: Vec<(String, String)>,
-    ) {
-        // Plain insert: both callers hold a PI (creation and the guarded
-        // reparse path), and silently dropping a write desyncs the map from
-        // the serialized data it produces.
-        self.side.pi_attributes.insert(id, attributes);
+    ) -> blitz_traits::node_id::NodeId {
+        self.base
+            .mutate()
+            .create_processing_instruction_node_with_attributes(target, data, attributes)
     }
 
     /// Creates a CDATA section whose data is `data`
     /// (<https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
     pub(crate) fn create_cdata_section(&mut self, data: &str) -> blitz_traits::node_id::NodeId {
         self.base.mutate().create_cdata_section_node(data)
-    }
-
-    /// Copies the PI attribute map of `from` onto `to`, then walks both
-    /// subtrees in lockstep. `deep_clone_node` copies Blitz data only.
-    pub(crate) fn copy_pi_subtree(
-        &mut self,
-        from: blitz_traits::node_id::NodeId,
-        to: blitz_traits::node_id::NodeId,
-    ) {
-        // Pure tax when the document never saw a PI: skip the walk entirely.
-        if self.side.pi_attributes.is_empty() {
-            return;
-        }
-        let mut stack = vec![(from, to)];
-        while let Some((from, to)) = stack.pop() {
-            if let Some(attributes) = self.side.pi_attributes.get(&from).cloned() {
-                self.side.pi_attributes.insert(to, attributes);
-            }
-            stack.extend(crate::dom::adoption::lockstep_children(
-                &self.base, from, &self.base, to,
-            ));
-        }
-    }
-
-    /// Initializes the attribute maps of every processing instruction in the
-    /// tree from its data. Parsed documents arrive with data but no map;
-    /// created nodes initialize at creation
-    /// (<https://dom.spec.whatwg.org/#processinginstruction-initialize>).
-    pub(crate) fn init_parsed_pi_attributes(&mut self) {
-        let root = self.base.root_node().id;
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            let (is_pi, data, children) = self
-                .base
-                .get_node(id)
-                .map(|node| {
-                    (
-                        matches!(node.data, NodeData::ProcessingInstruction { .. }),
-                        match &node.data {
-                            NodeData::ProcessingInstruction { contents, .. } => {
-                                Some(contents.clone())
-                            }
-                            _ => None,
-                        },
-                        node.children.clone(),
-                    )
-                })
-                .unwrap_or_default();
-            if is_pi {
-                let attributes = data
-                    .as_deref()
-                    .and_then(crate::pseudo_attributes::parse_pseudo_attributes)
-                    .unwrap_or_default();
-                self.side.pi_attributes.insert(id, attributes);
-            }
-            stack.extend(children);
-        }
     }
 
     /// Creates a text node whose data is `data`
