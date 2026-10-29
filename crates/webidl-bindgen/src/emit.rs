@@ -854,6 +854,7 @@ fn getter_dispatch(getter: &Attribute, interface: &Interface) -> TokenStream {
             | ReturnType::StringSequence
             | ReturnType::NullableDocumentType
             | ReturnType::Uint8Array
+            | ReturnType::ArrayBufferView
             | ReturnType::UnsignedLongLong
             | ReturnType::Short
             | ReturnType::Any => {

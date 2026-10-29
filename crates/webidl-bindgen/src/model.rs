@@ -262,6 +262,10 @@ pub(crate) enum ReturnType {
     /// this shape today; the native side rejects it where it renders
     /// (<https://webidl.spec.whatwg.org/#es-buffer-source-types>).
     Uint8Array,
+    /// An `ArrayBufferView` argument or result: any typed array. Only the
+    /// JavaScript emitter lowers this shape today
+    /// (<https://webidl.spec.whatwg.org/#ArrayBufferView>).
+    ArrayBufferView,
     /// `unsigned long long`: only JavaScript result dictionaries use this
     /// shape today; the native side rejects it where it renders
     /// (<https://webidl.spec.whatwg.org/#idl-unsigned-long-long>).

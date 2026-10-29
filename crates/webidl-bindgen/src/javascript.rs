@@ -232,8 +232,9 @@ fn lower_members(
                     || provided.contains(&(member.identifier.0.into(), Kind::Set)) =>
             {
                 resolved.validate_scopes()?;
-                attributes(member.attributes.as_ref(), &[])?;
+                attributes(member.attributes.as_ref(), &["SecureContext"])?;
                 attributes(member.type_.attributes.as_ref(), &[])?;
+                let secure = has_attribute(member.attributes.as_ref(), "SecureContext");
                 if member.modifier.is_some() {
                     return Err(Error("JS special attributes are not supported yet".into()));
                 }
@@ -242,13 +243,13 @@ fn lower_members(
                 let lowered = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
                 let result = output(database, &lowered, "value")?;
                 members.push(format!(
-                    "[{name:?}, 'get', 0, args => [], (value, realm) => {result}]"
+                    "[{name:?}, 'get', 0, args => [], (value, realm) => {result}, {secure}]"
                 ));
                 if member.readonly.is_none() {
                     signature(&mut implemented, name, Kind::Set, 1)?;
                     let converted = input(&lowered, "args[0]", false)?;
                     members.push(format!(
-                        "[{name:?}, 'set', 1, args => [{converted}], (value, realm) => undefined]"
+                        "[{name:?}, 'set', 1, args => [{converted}], (value, realm) => undefined, {secure}]"
                     ));
                 }
             }
@@ -258,7 +259,8 @@ fn lower_members(
                     .is_some_and(|name| provided.contains(&(name.0.into(), Kind::Method))) =>
             {
                 resolved.validate_scopes()?;
-                attributes(member.attributes.as_ref(), &["NewObject"])?;
+                attributes(member.attributes.as_ref(), &["NewObject", "SecureContext"])?;
+                let secure = has_attribute(member.attributes.as_ref(), "SecureContext");
                 if member.modifier.is_some() || member.special.is_some() {
                     return Err(Error("JS special operations are not supported yet".into()));
                 }
@@ -282,7 +284,7 @@ fn lower_members(
                     }
                 };
                 members.push(format!(
-                    "[{name:?}, 'method', {required}, args => {conversion}, (value, realm) => {result}]"
+                    "[{name:?}, 'method', {required}, args => {conversion}, (value, realm) => {result}, {secure}]"
                 ));
             }
             _ => {}
@@ -311,6 +313,16 @@ fn signature(
             "{name}: JS algorithm signature does not match IDL {kind:?}"
         )))
     }
+}
+
+/// Whether the list carries `[name]`.
+fn has_attribute(list: Option<&ExtendedAttributeList<'_>>, name: &str) -> bool {
+    list.is_some_and(|list| {
+        list.body.list.iter().any(|attribute| match attribute {
+            ExtendedAttribute::NoArgs(item) => item.0.0 == name,
+            _ => false,
+        })
+    })
 }
 
 fn attributes(list: Option<&ExtendedAttributeList<'_>>, supported: &[&str]) -> Result<(), Error> {
@@ -394,6 +406,9 @@ fn input(type_: &ReturnType, value: &str, allow_shared: bool) -> Result<String, 
         ReturnType::String if !allow_shared => Ok(format!("__tbIDLString({value})")),
         ReturnType::UsvString if !allow_shared => Ok(format!("__tbIDLUSVString({value})")),
         ReturnType::Uint8Array => Ok(format!("__tbIDLUint8Array({value}, {allow_shared})")),
+        ReturnType::ArrayBufferView => {
+            Ok(format!("__tbIDLArrayBufferView({value}, {allow_shared})"))
+        }
         _ => Err(Error(format!(
             "JS argument type is not supported yet: {type_:?}"
         ))),
@@ -405,6 +420,7 @@ fn output(database: &Database<'_>, type_: &ReturnType, value: &str) -> Result<St
     match type_ {
         ReturnType::String => Ok(format!("__tbIDLResult({value}, 'string')")),
         ReturnType::Uint8Array => Ok(format!("__tbIDLRealmUint8Array({value}, false, realm)")),
+        ReturnType::ArrayBufferView => Ok(format!("__tbIDLResultArrayBufferView({value})")),
         ReturnType::Dictionary(name) => {
             let dictionary = database.dictionary(name)?;
             attributes(dictionary.attributes.as_ref(), &[])?;

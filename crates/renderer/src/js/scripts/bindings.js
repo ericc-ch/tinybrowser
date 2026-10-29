@@ -29,6 +29,7 @@ const __tbIDLDescriptors = Object.getOwnPropertyDescriptors;
 const __tbIDLDescriptor = Object.getOwnPropertyDescriptor;
 const __tbIDLGet = Reflect.get;
 const __tbIDLSetPrototypeOf = Object.setPrototypeOf;
+const __tbIDLDelete = Reflect.deleteProperty;
 const __tbIDLInstanceOf = Function.prototype[Symbol.hasInstance];
 const __tbIDLTypedArray = Object.getPrototypeOf(Uint8Array.prototype);
 const __tbIDLTypedArrayTag = __tbIDLDescriptor(__tbIDLTypedArray, Symbol.toStringTag).get;
@@ -39,10 +40,11 @@ const __tbIDLResizable = __tbIDLDescriptor(ArrayBuffer.prototype, 'resizable')?.
 const __tbIDLSharedPrototype = globalThis.SharedArrayBuffer?.prototype;
 const __tbIDLSharedLength = __tbIDLSharedPrototype && __tbIDLDescriptor(__tbIDLSharedPrototype, 'byteLength').get;
 const __tbIDLGrowable = __tbIDLSharedPrototype && __tbIDLDescriptor(__tbIDLSharedPrototype, 'growable')?.get;
-const __tbIDLUint8Array = (value, allowShared) => {
+const __tbIDLBufferSource = (value, allowShared, expected) => {
   // https://webidl.spec.whatwg.org/#es-buffer-source-types
-  if (__tbApply(__tbIDLTypedArrayTag, value, []) !== 'Uint8Array') {
-    throw new TypeError('value must be a Uint8Array');
+  const tag = __tbApply(__tbIDLTypedArrayTag, value, []);
+  if (expected !== undefined && tag !== expected) {
+    throw new TypeError('value must be a ' + expected);
   }
   const buffer = __tbApply(__tbIDLTypedArrayBuffer, value, []);
   let shared = false;
@@ -61,6 +63,11 @@ const __tbIDLUint8Array = (value, allowShared) => {
   }
   return value;
 };
+const __tbIDLUint8Array = (value, allowShared) =>
+  __tbIDLBufferSource(value, allowShared, 'Uint8Array');
+const __tbIDLArrayBufferView = (value, allowShared) =>
+  __tbIDLBufferSource(value, allowShared, undefined);
+const __tbIDLResultArrayBufferView = value => __tbIDLArrayBufferView(value, true);
 const __tbIDLRealmUint8Array = (value, allowShared, realm) => {
   // https://webidl.spec.whatwg.org/#es-buffer-source-types
   value = __tbIDLUint8Array(value, allowShared);
@@ -92,6 +99,7 @@ const __tbIDLResultDictionary = (value, fields) => {
   }
   return result;
 };
+const __tbInterfaces = new WeakMap();
 const __tbInstallInterface = (implementation, name, construction, members) => {
   // https://webidl.spec.whatwg.org/#es-interface
   const brand = host.slots('webidl.' + name);
@@ -126,8 +134,17 @@ const __tbInstallInterface = (implementation, name, construction, members) => {
   __tbDefineProperty(constructor, 'prototype', { __proto__: null, value: prototype, writable: false });
   __tbDefineProperty(prototype, 'constructor', { __proto__: null, value: constructor, writable: true, configurable: true });
   __tbDefineProperty(prototype, Symbol.toStringTag, { __proto__: null, value: name, configurable: true });
+  __tbInterfaces.set(constructor, { brand, realm, prototype });
   for (let index = 0; index < members.length; index++) {
-    const [member, kind, count, convert, result] = members[index];
+    const [member, kind, count, convert, result, secure] = members[index];
+    // A `[SecureContext]` member is absent, not throwing, outside a secure
+    // context. The class body already put its raw algorithm on the prototype,
+    // so absence means deleting it
+    // (<https://webidl.spec.whatwg.org/#SecureContext>).
+    if (secure && host.__tbSecureContext !== true) {
+      __tbApply(__tbIDLDelete, undefined, [prototype, member]);
+      continue;
+    }
     const descriptor = descriptors[member];
     const algorithm = kind === 'method' ? descriptor.value : descriptor[kind];
     const operation = {
@@ -153,4 +170,12 @@ const __tbInstallInterface = (implementation, name, construction, members) => {
     __tbDefineProperty(prototype, member, property);
   }
   return constructor;
+};
+// One instance of a non-constructible interface, branded like an instance its
+// interface constructor would have built.
+const __tbCreateInstance = constructor => {
+  const { brand, realm, prototype } = __tbInterfaces.get(constructor);
+  const instance = __tbIDLSetPrototypeOf({}, prototype);
+  brand.set(instance, realm);
+  return instance;
 };

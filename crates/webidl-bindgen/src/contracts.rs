@@ -2405,6 +2405,11 @@ pub(crate) fn native_type(
         Type::Single(SingleType::NonAny(NonAnyType::Uint8Array(item))) if item.q_mark.is_none() => {
             Ok(ReturnType::Uint8Array)
         }
+        Type::Single(SingleType::NonAny(NonAnyType::ArrayBufferView(item)))
+            if item.q_mark.is_none() =>
+        {
+            Ok(ReturnType::ArrayBufferView)
+        }
         Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) => {
             Ok(if item.q_mark.is_some() {
                 ReturnType::NullableString
