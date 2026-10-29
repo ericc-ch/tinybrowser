@@ -9,4 +9,5 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+secure-context = { workspace = true }
 url = "2"

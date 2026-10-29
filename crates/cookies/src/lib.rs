@@ -102,13 +102,6 @@ pub struct CookieOp<'a> {
     pub initiator: Option<&'a Url>,
     /// Whether a redirect chain has crossed sites before this request.
     pub cross_site_redirect: bool,
-    /// Whether `url` is a potentially trustworthy origin
-    /// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
-    ///
-    /// The jar does not judge URLs itself: one predicate decides what counts
-    /// as secure for the `Secure` attribute, the header path, and the
-    /// client-hint path.
-    pub trustworthy: bool,
 }
 
 /// How a cookie operation reached the jar.
@@ -559,7 +552,7 @@ fn receive_cookie(
     let expiry = cookie_expiry(&parsed, now);
     let (host_only, domain, path, path_attr) = cookie_scope(&parsed, request_url, &host)?;
     let secure = parsed.secure;
-    if secure && !op.trustworthy {
+    if secure && !secure_context::is_potentially_trustworthy(op.url) {
         return None;
     }
     let http_only = parsed.http_only;
@@ -567,7 +560,9 @@ fn receive_cookie(
         return None;
     }
     // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
-    if !op.trustworthy && overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure) {
+    if !secure_context::is_potentially_trustworthy(op.url)
+        && overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure)
+    {
         return None;
     }
     let same_site = parsed.same_site.unwrap_or(SameSite::Default);
@@ -742,7 +737,7 @@ impl StoredCookie {
         if !path_match(request_path, &self.path) {
             return false;
         }
-        if self.secure && !op.trustworthy {
+        if self.secure && !secure_context::is_potentially_trustworthy(op.url) {
             return false;
         }
         if self.http_only && !matches!(op.kind, RetrievalKind::Http) {
@@ -1177,8 +1172,6 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    /// Test URLs are either `https` (trustworthy) or plain `http` (not); a
-    /// case that needs another combination builds its own `CookieOp`.
     fn op(url: &Url, now: SystemTime, kind: RetrievalKind) -> CookieOp<'_> {
         CookieOp {
             url,
@@ -1188,7 +1181,6 @@ mod tests {
             method_is_safe: true,
             initiator: None,
             cross_site_redirect: false,
-            trustworthy: url.scheme() == "https",
         }
     }
 

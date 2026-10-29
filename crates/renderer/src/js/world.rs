@@ -1338,6 +1338,11 @@ pub(crate) struct World {
     pub(crate) runtime: FrameRuntime,
     /// The frame this realm belongs to.
     frame: FrameId,
+    /// Whether this realm's environment is a secure context. Fixed when the
+    /// document is created and inherited: an insecure ancestor makes every
+    /// descendant insecure, however secure its own URL looks
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    secure_context: bool,
     /// Page-scoped scripts registered through CDP to run in every new realm
     /// of this tab, shared by every frame's world, with their identifiers
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
@@ -1815,9 +1820,10 @@ impl World {
         runtime: &FrameRuntime,
         init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
-        Self {
+        let mut world = Self {
             runtime: runtime.clone(),
             frame,
+            secure_context: false,
             init_scripts,
             viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),
             pending_frames: Vec::new(),
@@ -1859,7 +1865,9 @@ impl World {
             weak_references: None,
             deliver_mutations_fn: None,
             images: ImageState::default(),
-        }
+        };
+        world.recompute_secure_context();
+        world
     }
 
     pub(crate) fn clear_observers(&mut self) {
@@ -2099,22 +2107,44 @@ impl World {
 
     /// Whether this realm's environment is a secure context
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
-    ///
-    /// A document created locally (`about:blank`, `about:srcdoc`) inherits its
-    /// creator's context, and this model records that inheritance as the
-    /// document's origin, so a tuple origin names the URL the ancestor walk
-    /// would reach. An opaque origin cannot name one, and the document URL is
-    /// then the only evidence: `data:` is trustworthy by definition, while a
-    /// sandboxed `about:blank` that inherited an insecure context reads as
-    /// secure here.
     pub(crate) fn is_secure_context(&self) -> bool {
-        let url = if self.origin.is_tuple() {
-            Url::parse(&self.origin.ascii_serialization())
-                .unwrap_or_else(|_| self.document_url.clone())
-        } else {
-            self.document_url.clone()
+        self.secure_context
+    }
+
+    /// Recomputes the environment's secure-context bit after a navigation or
+    /// history update changed its URL and origin.
+    ///
+    /// The bit is the environment's own origin being potentially trustworthy
+    /// and every ancestor's bit being set: an `https` iframe inside an `http`
+    /// page is not secure, and a `data:` document never is, because its
+    /// origin is opaque.
+    fn recompute_secure_context(&mut self) {
+        let creator = {
+            let shared = self.runtime.shared.borrow();
+            shared
+                .tree
+                .parent(self.frame)
+                .or_else(|| shared.tree.auxiliary_opener(self.frame))
         };
-        net::is_potentially_trustworthy(&url)
+        let inherited = creator.is_none_or(|frame| {
+            self.runtime
+                .shared
+                .borrow()
+                .secure_contexts
+                .get(&frame)
+                .copied()
+                .unwrap_or(false)
+        });
+        // A sandboxed document keeps its `https` URL even though its origin is
+        // opaque, so the URL decides the environment's own answer; a `data:`
+        // document is never trustworthy.
+        let own = net::is_potentially_trustworthy(&self.document_url);
+        self.secure_context = own && inherited;
+        self.runtime
+            .shared
+            .borrow_mut()
+            .secure_contexts
+            .insert(self.frame, self.secure_context);
     }
 
     /// Whether this realm's frame is still attached to its document. A
@@ -2498,6 +2528,7 @@ impl World {
         self.referrer_url = url.clone();
         self.document_url = url;
         self.origin = origin;
+        self.recompute_secure_context();
     }
 
     /// Resolves `spec` against this document's URL, falling back to the

@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use url::{Origin, Url};
 
-use crate::secure_context::is_potentially_trustworthy;
+use secure_context::is_potentially_trustworthy;
 
 /// One referrer policy set: the variant list is the only copy, and it expands
 /// into the enum, `ALL`, and `keyword()`.

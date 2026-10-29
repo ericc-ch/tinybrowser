@@ -93,6 +93,11 @@
   });
   const userActivation = Object.create(UserActivation.prototype);
   userActivationKey.set(userActivation, Object.freeze({}));
+  // `[SecureContext]` members are installed only in a secure context; the bit
+  // is captured once here rather than read from the page-visible global,
+  // which a page can redefine
+  // (<https://webidl.spec.whatwg.org/#SecureContext>).
+  const secureContext = globalThis.isSecureContext === true;
   class Navigator {
     get userAgent() {
       return identity.userAgent;
@@ -112,20 +117,23 @@
     get maxTouchPoints() { return 0; }
     get cookieEnabled() { return true; }
     get webdriver() { return false; }
-    get userAgentData() {
-      // `NavigatorUAData` is `[SecureContext]`, so the member is absent rather
-      // than undefined-valued outside one
-      // (<https://wicg.github.io/ua-client-hints/#dom-navigator-useragentdata>).
-      if (!globalThis.isSecureContext) return undefined;
-      return userAgentData;
-    }
     get userActivation() {
       return userActivation;
     }
   }
-  Object.defineProperty(globalThis, 'NavigatorUAData', {
-    value: NavigatorUAData, writable: true, configurable: true,
-  });
+  if (secureContext) {
+    // `NavigatorUAData` is `[SecureContext]`, so the member is absent outside
+    // one (<https://wicg.github.io/ua-client-hints/#dom-navigator-useragentdata>).
+    Object.defineProperty(Navigator.prototype, 'userAgentData', {
+      get() { return userAgentData; },
+      enumerable: true, configurable: true,
+    });
+  }
+  if (secureContext) {
+    Object.defineProperty(globalThis, 'NavigatorUAData', {
+      value: NavigatorUAData, writable: true, configurable: true,
+    });
+  }
   Object.defineProperty(globalThis, 'UserActivation', {
     value: UserActivation, writable: true, configurable: true,
   });

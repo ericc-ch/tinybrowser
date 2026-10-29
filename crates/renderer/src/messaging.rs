@@ -706,6 +706,11 @@ pub(crate) struct Shared {
     /// `iframe` containers that owned them; the engine drops their documents
     /// at its next turn.
     removed_frames: Vec<(FrameId, Option<NodeId>)>,
+    /// The secure-context bit of each live frame. A child inherits its
+    /// creator's bit, so the bit must be readable without borrowing the
+    /// creator's realm
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    pub(crate) secure_contexts: HashMap<FrameId, bool>,
 }
 
 impl Default for Shared {
@@ -719,6 +724,7 @@ impl Default for Shared {
             document_ids: HashMap::new(),
             next_document: 0,
             removed_frames: Vec::new(),
+            secure_contexts: HashMap::new(),
         }
     }
 }

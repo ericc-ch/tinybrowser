@@ -206,7 +206,6 @@ impl Agent {
             method_is_safe: true,
             initiator: Some(url),
             cross_site_redirect: false,
-            trustworthy: crate::is_potentially_trustworthy(url),
         }
     }
 
@@ -588,7 +587,6 @@ impl Agent {
             method_is_safe: hop.method.is_safe(),
             initiator: dial.initiator,
             cross_site_redirect,
-            trustworthy: crate::is_potentially_trustworthy(url),
         };
         let mut hop_headers = hop.headers.clone();
         self.apply_cors_request(dial.cors, hop, &wire, &mut hop_headers, budget)
