@@ -626,7 +626,7 @@ fn reflect_setter_rejects_member_attributes() {
     // of being silently ignored.
     let idl = [Source {
         name: "html.idl",
-        text: "[Exposed=Window] interface Group { [ReflectSetter, SecureContext] attribute long index; };",
+        text: "[Exposed=Window] interface Group { [ReflectSetter, Clamp] attribute long index; };",
     }];
     let rust = [Source {
         name: "group.rs",
@@ -837,23 +837,145 @@ fn unforgeable_and_scoped_native_members_fail_the_build() {
         text: "[Exposed=Window] interface Sample {}; [LegacyOverrideBuiltIns] partial interface Sample { readonly attribute boolean flag; };",
     }];
     compile_contracts(&scoped, &rust).expect("inert scope is accepted");
+}
+
+#[test]
+fn native_secure_context_resolves_from_every_declaration_site() {
+    // One resolved exposure no matter where `[SecureContext]` sits: on the
+    // member, on the interface, or on a partial interface or mixin scope
+    // (<https://webidl.spec.whatwg.org/#SecureContext>).
+    let rust = [Source {
+        name: "fixture.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_flag(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } fn get_open(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } fn hidden(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> { rquickjs::String::from_str(ctx.clone(), \"\") } fn visible(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> { rquickjs::String::from_str(ctx.clone(), \"\") } }",
+    }];
+    let idl = [Source {
+        name: "fixture.idl",
+        text: "
+        [Exposed=Window] interface Sample {
+            [SecureContext] readonly attribute boolean flag;
+            readonly attribute boolean open;
+            [SecureContext] DOMString hidden();
+            DOMString visible();
+        };
+    ",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile secure members");
+    let generated = bindings[0].rust.replace(' ', "");
+    assert_eq!(
+        generated.matches("secure_context:true").count(),
+        2,
+        "one gated attribute and one gated operation: {generated}"
+    );
+    assert_eq!(generated.matches("secure_context:false").count(), 2);
+
+    // A `[SecureContext]` interface object and prototype are absent outside a
+    // secure context, so both install hooks answer `None`.
+    let interface = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window, SecureContext] interface Sample { readonly attribute boolean flag; };",
+    }];
+    let interface_rust = [Source {
+        name: "fixture.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_flag(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } }",
+    }];
+    let bindings =
+        compile_contracts(&interface, &interface_rust).expect("compile secure interface");
+    let generated = bindings[0].rust.replace(' ', "");
+    assert!(
+        generated.matches("is_secure_context").count() >= 2,
+        "prototype and constructor both gate: {}",
+        &generated[generated.find("fnprototype").unwrap_or(0)..][..600.min(generated.len())]
+    );
+
+    // The same fact declared on a partial interface or a mixin scope reaches
+    // the member.
     for text in [
-        "[Exposed=Window] interface Sample {}; [SecureContext] partial interface Sample { readonly attribute boolean flag; };",
-        "[Exposed=Window] interface Sample {}; [SecureContext] interface mixin Extra { readonly attribute boolean flag; }; Sample includes Extra;",
+        "[Exposed=Window] interface Sample { readonly attribute boolean open; }; [SecureContext] partial interface Sample { readonly attribute boolean flag; };",
+        "[Exposed=Window] interface Sample { readonly attribute boolean open; }; [SecureContext] interface mixin Extra { readonly attribute boolean flag; }; Sample includes Extra;",
     ] {
         let idl = [Source {
             name: "fixture.idl",
             text,
         }];
-        let error = compile_contracts(&idl, &rust)
-            .err()
-            .expect("secure-context member must fail")
-            .to_string();
-        assert!(
-            error.contains("not supported"),
-            "unexpected diagnostic for {text}: {error}"
+        let scoped_rust = [Source {
+            name: "fixture.rs",
+            text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_flag(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } fn get_open(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } }",
+        }];
+        let bindings = compile_contracts(&idl, &scoped_rust).expect("compile scoped secure member");
+        let generated = bindings[0].rust.replace(' ', "");
+        let table = &generated[generated.find("constMEMBERS").unwrap_or(0)..];
+        assert_eq!(
+            generated.matches("secure_context:true").count(),
+            1,
+            "scoped member must be gated: {table}"
+        );
+        assert_eq!(
+            generated.matches("secure_context:false").count(),
+            1,
+            "plain member must stay: {table}"
         );
     }
+}
+
+#[test]
+fn javascript_secure_context_members_carry_their_exposure() {
+    let idl = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window] interface Sample { [SecureContext] readonly attribute DOMString secret; readonly attribute DOMString plain; [SecureContext] DOMString hidden(); DOMString visible(); };",
+    }];
+    let source = Source {
+        name: "fixture.js",
+        text: "
+        __tbInstallInterface(class Sample {
+            get secret() { return 's'; }
+            get plain() { return 'p'; }
+            hidden() { return 'h'; }
+            visible() { return 'v'; }
+        });
+        ",
+    };
+    let output = compile_javascript(&idl, &source)
+        .expect("compile JS secure members")
+        .source;
+    assert_eq!(
+        output.matches("secureContext: true").count(),
+        2,
+        "one gated attribute and one gated operation: {output}"
+    );
+    assert_eq!(output.matches("secureContext: false").count(), 2);
+}
+
+#[test]
+fn javascript_missing_members_need_an_explicit_unimplemented_list() {
+    let idl = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window] interface Sample { DOMString implemented(); DOMString pending(); };",
+    }];
+    let missing = Source {
+        name: "fixture.js",
+        text: "__tbInstallInterface(class Sample { implemented() { return 'x'; } })",
+    };
+    let error = compile_javascript(&idl, &missing)
+        .err()
+        .expect("missing IDL member must fail")
+        .to_string();
+    assert!(error.contains("pending"), "unexpected diagnostic: {error}");
+
+    let listed = Source {
+        name: "fixture.js",
+        text: "__tbInstallInterface(class Sample { implemented() { return 'x'; } }, ['pending'])",
+    };
+    compile_javascript(&idl, &listed).expect("declared gap is accepted");
+
+    let unknown = Source {
+        name: "fixture.js",
+        text: "__tbInstallInterface(class Sample { implemented() { return 'x'; } }, ['absent'])",
+    };
+    let error = compile_javascript(&idl, &unknown)
+        .err()
+        .expect("unimplemented name must name a member")
+        .to_string();
+    assert!(error.contains("absent"), "unexpected diagnostic: {error}");
 }
 
 const JS_ENCODER_IDL: &str = "[Exposed=Window] interface TextEncoder { readonly attribute DOMString encoding; Uint8Array encode(optional DOMString input = \"\"); };";

@@ -40,6 +40,10 @@ pub(crate) struct Interface {
     pub(crate) properties: PropertyHooks,
     /// How `toString` stringifies: an attribute index or a provided method.
     pub(crate) stringifier: Option<Stringifier>,
+    /// `[SecureContext]` on the interface: the interface object, its prototype,
+    /// and every member are absent outside a secure context
+    /// (<https://webidl.spec.whatwg.org/#SecureContext>).
+    pub(crate) secure_context: bool,
     pub(crate) indexed_setter: Option<IndexedSetter>,
     /// Spec mixin members installed on each named interface's prototype
     /// instead of one interface that shares the payload.
@@ -80,6 +84,7 @@ pub(crate) enum PrototypeParent {
 
 pub(crate) struct Operation {
     pub(crate) name: String,
+    pub(crate) exposure: crate::database::Exposure,
     pub(crate) rust: Ident,
     pub(crate) result: OperationResult,
     pub(crate) takes_this: bool,
@@ -174,6 +179,7 @@ impl ConstructorArgumentKind {
 
 pub(crate) struct Attribute {
     pub(crate) name: String,
+    pub(crate) exposure: crate::database::Exposure,
     pub(crate) rust: Ident,
     pub(crate) return_type: ReturnType,
     pub(crate) mapping: GetterMapping,
@@ -262,10 +268,6 @@ pub(crate) enum ReturnType {
     /// this shape today; the native side rejects it where it renders
     /// (<https://webidl.spec.whatwg.org/#es-buffer-source-types>).
     Uint8Array,
-    /// An `ArrayBufferView` argument or result: any typed array. Only the
-    /// JavaScript emitter lowers this shape today
-    /// (<https://webidl.spec.whatwg.org/#ArrayBufferView>).
-    ArrayBufferView,
     /// `unsigned long long`: only JavaScript result dictionaries use this
     /// shape today; the native side rejects it where it renders
     /// (<https://webidl.spec.whatwg.org/#idl-unsigned-long-long>).

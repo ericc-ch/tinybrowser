@@ -1,7 +1,6 @@
 timers.js
 fetch.js
 encoding.js
-crypto.js
 streams.js
 file.js
 xhr.js
@@ -13,6 +12,8 @@ tree_walker.js
 custom_elements.js
 observers.js
 messaging.js
+# `crypto.js` reads `QuotaExceededError`, which `messaging.js` defines.
+crypto.js
 history.js
 ui_events.js
 errors.js

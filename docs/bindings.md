@@ -12,23 +12,27 @@ processing, list ops, attribute reflection.
 Keep host capabilities and shim state private. Page-replaced methods must not
 observe or mutate internals.
 
+
 ## `[SecureContext]`
 
-The generator owns the gate: `[SecureContext]` on a JS-path attribute or
-operation is carried into the install descriptor, and
-`__tbInstallInterface` deletes the member from the prototype when the realm's
-bit is false. The class body supplies the algorithm; the generator supplies
-its absence, which is what Web IDL requires
-(<https://webidl.spec.whatwg.org/#SecureContext>). `crypto.randomUUID` is the
-first member on this path.
+The database resolves the fact once: a member is secure when `[SecureContext]`
+is on the member, on its interface, or on a partial interface or mixin it comes
+from, and both emitters read that one `Exposure`. Neither emitter decides from
+the annotation's position.
 
-`isSecureContext` itself is the Rust accessor in `js/bridge.rs`: the engine has
-no `Window` platform object, so there is no `WindowOrWorkerGlobalScope` mixin
-install to hang a generated accessor on.
+The native path installs the member tables through `host::install_members`,
+which reads the realm's bit once and skips gated members; a `[SecureContext]`
+interface answers `None` from `prototype` and `constructor`, so its interface
+object never exists. The JS path carries `exposure.secureContext` into
+`__tbInstallInterface`, which builds the interface prototype from the member
+list and defines only the exposed members, so an unexposed member is absent
+rather than present and throwing (<https://webidl.spec.whatwg.org/#SecureContext>).
 
-`navigator.userAgentData` still installs through the shim's captured bit.
-Moving it needs two generator features the JS path does not have: resolving
-`Navigator includes NavigatorUA` (members currently come from the interface's
-own declaration only) and lowering `FrozenArray<...>`, dictionary arrays,
-`Promise<...>`, and interface-valued attributes. The shim captures the bit at
-install, so a page cannot turn the member back on.
+A JS interface must name every IDL member it does not implement in the
+installation's second argument, and the build fails otherwise. `Crypto` lists
+`['subtle']`: the algorithms are absent until the engine can implement them
+faithfully. A gated interface object on the JS path, mixin `includes`
+resolution, and structured type lowering are tracked in #212.
+
+`isSecureContext` is a Rust accessor in `js/bridge.rs`; the engine has no
+`Window` platform object to install `WindowOrWorkerGlobalScope` onto.

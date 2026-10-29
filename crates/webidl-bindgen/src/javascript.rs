@@ -95,10 +95,28 @@ impl<'ast> Visit<'ast> for Discovery<'_, '_, '_> {
 
 impl Discovery<'_, '_, '_> {
     fn installation(&mut self, call: &ast::CallExpression<'_>) -> Result<String, Error> {
-        let [ast::Argument::ClassExpression(class)] = call.arguments.as_slice() else {
-            return Err(Error(
-                "interface installation requires one named class expression".into(),
-            ));
+        let (class, unimplemented) = match call.arguments.as_slice() {
+            [ast::Argument::ClassExpression(class)] => (class, BTreeSet::new()),
+            [
+                ast::Argument::ClassExpression(class),
+                ast::Argument::ArrayExpression(list),
+            ] => {
+                let mut names = BTreeSet::new();
+                for element in &list.elements {
+                    let ast::ArrayExpressionElement::StringLiteral(name) = element else {
+                        return Err(Error(
+                            "unimplemented members must be string literals".into(),
+                        ));
+                    };
+                    names.insert(name.value.as_str().to_owned());
+                }
+                (class, names)
+            }
+            _ => {
+                return Err(Error(
+                    "interface installation requires one named class expression and an optional list of unimplemented members".into(),
+                ));
+            }
         };
         if call.optional || class.heritage.is_some() || !class.decorators.is_empty() {
             return Err(Error(
@@ -115,31 +133,27 @@ impl Discovery<'_, '_, '_> {
             return Err(Error(format!("duplicate JS implementation of {name}")));
         }
         let declaration = self.database.interface(name)?;
-        attributes(declaration.attributes.as_ref(), &["Exposed"])?;
-        let exposed = declaration.attributes.as_ref().is_some_and(|attributes| {
-            attributes
-                .body
-                .list
-                .iter()
-                .any(|attribute| match attribute {
-                    ExtendedAttribute::WildCard(item) => item.identifier.0 == "Exposed",
-                    ExtendedAttribute::Ident(item) => {
-                        item.lhs_identifier.0 == "Exposed" && item.rhs.0 == "Window"
-                    }
-                    ExtendedAttribute::IdentList(item) => {
-                        item.identifier.0 == "Exposed"
-                            && item.list.body.list.iter().any(|item| item.0 == "Window")
-                    }
-                    _ => false,
-                })
-        });
+        let interface_attributes = attributes(
+            declaration.attributes.as_ref(),
+            &["Exposed", "SecureContext"],
+        )?;
+        if interface_attributes.contains(&"SecureContext") {
+            return Err(Error(
+                "a secure-only JS interface is not supported yet: the installer does not own global registration".into(),
+            ));
+        }
+        let exposed = crate::database::exposed_in(declaration.attributes.as_ref(), "Window");
         if !exposed || declaration.parent.is_some() {
             return Err(Error(
                 "JS interface exposure or inheritance is not supported yet".into(),
             ));
         }
-        let (constructor, members) =
-            lower_members(self.database, &declaration, implementation_methods(class)?)?;
+        let (constructor, members) = lower_members(
+            self.database,
+            &declaration,
+            implementation_methods(class)?,
+            &unimplemented,
+        )?;
         let constructor = constructor.unwrap_or_else(|| "null".into());
         let implementation = class.span.source_text(self.source);
         Ok(format!(
@@ -201,94 +215,93 @@ fn lower_members(
     database: &Database<'_>,
     declaration: &crate::database::Interface<'_>,
     mut implemented: BTreeMap<(String, Kind), usize>,
+    unimplemented: &BTreeSet<String>,
 ) -> Result<(Option<String>, Vec<String>), Error> {
     let provided: BTreeSet<_> = implemented.keys().cloned().collect();
     let mut constructor = None;
     let mut members = Vec::new();
-    for member in &declaration.members {
-        let resolved = member;
-        match &member.declaration {
+    let mut missing = Vec::new();
+    for resolved in &declaration.members {
+        let exposure = resolved.exposure(declaration);
+        match &resolved.declaration {
             InterfaceMember::Constructor(member)
                 if provided.contains(&("constructor".into(), Kind::Constructor)) =>
             {
-                resolved.validate_scopes()?;
-                attributes(member.attributes.as_ref(), &[])?;
                 if constructor.is_some() {
                     return Err(Error(
                         "JS constructor overloads are not supported yet".into(),
                     ));
                 }
-                let (required, conversion) = arguments(database, &member.args.body.list)?;
-                signature(
+                constructor = Some(lower_constructor_member(
+                    database,
+                    member,
+                    resolved,
                     &mut implemented,
-                    "constructor",
-                    Kind::Constructor,
-                    member.args.body.list.len(),
-                )?;
-                constructor = Some(format!("[{required}, args => {conversion}]"));
+                )?);
             }
             InterfaceMember::Attribute(member)
                 if provided.contains(&(member.identifier.0.into(), Kind::Get))
                     || provided.contains(&(member.identifier.0.into(), Kind::Set)) =>
             {
-                resolved.validate_scopes()?;
-                attributes(member.attributes.as_ref(), &["SecureContext"])?;
-                attributes(member.type_.attributes.as_ref(), &[])?;
-                let secure = has_attribute(member.attributes.as_ref(), "SecureContext");
-                if member.modifier.is_some() {
-                    return Err(Error("JS special attributes are not supported yet".into()));
-                }
-                let name = member.identifier.0;
-                signature(&mut implemented, name, Kind::Get, 0)?;
-                let lowered = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
-                let result = output(database, &lowered, "value")?;
-                members.push(format!(
-                    "[{name:?}, 'get', 0, args => [], (value, realm) => {result}, {secure}]"
-                ));
-                if member.readonly.is_none() {
-                    signature(&mut implemented, name, Kind::Set, 1)?;
-                    let converted = input(&lowered, "args[0]", false)?;
-                    members.push(format!(
-                        "[{name:?}, 'set', 1, args => [{converted}], (value, realm) => undefined, {secure}]"
-                    ));
-                }
+                lower_attribute_member(
+                    database,
+                    member,
+                    resolved,
+                    exposure,
+                    &mut implemented,
+                    &mut members,
+                )?;
             }
             InterfaceMember::Operation(member)
                 if member
                     .identifier
                     .is_some_and(|name| provided.contains(&(name.0.into(), Kind::Method))) =>
             {
-                resolved.validate_scopes()?;
-                attributes(member.attributes.as_ref(), &["NewObject", "SecureContext"])?;
-                let secure = has_attribute(member.attributes.as_ref(), "SecureContext");
-                if member.modifier.is_some() || member.special.is_some() {
-                    return Err(Error("JS special operations are not supported yet".into()));
-                }
-                let name = member
-                    .identifier
-                    .as_ref()
-                    .ok_or_else(|| Error("JS operations must be named".into()))?
-                    .0;
-                signature(
+                lower_operation_member(
+                    database,
+                    member,
+                    resolved,
+                    exposure,
                     &mut implemented,
-                    name,
-                    Kind::Method,
-                    member.args.body.list.len(),
+                    &mut members,
                 )?;
-                let (required, conversion) = arguments(database, &member.args.body.list)?;
-                let result = match &member.return_type {
-                    weedle::types::ReturnType::Undefined(_) => "undefined".into(),
-                    weedle::types::ReturnType::Type(type_) => {
-                        let lowered = native_type(database, type_, &mut BTreeSet::new())?;
-                        output(database, &lowered, "value")?
-                    }
-                };
-                members.push(format!(
-                    "[{name:?}, 'method', {required}, args => {conversion}, (value, realm) => {result}, {secure}]"
-                ));
             }
+            InterfaceMember::Constructor(member) => {
+                missing.push(format!("constructor({})", member.args.body.list.len()));
+            }
+            InterfaceMember::Attribute(member) => missing.push(member.identifier.0.to_owned()),
+            InterfaceMember::Operation(member) => missing.push(
+                member
+                    .identifier
+                    .map_or_else(|| "operation".to_owned(), |name| name.0.to_owned()),
+            ),
             _ => {}
         }
+    }
+    if let Some(name) = unimplemented
+        .iter()
+        .find(|name| !declaration.members.iter().any(|member| matches!(
+            &member.declaration,
+            InterfaceMember::Attribute(attribute) if attribute.identifier.0 == name.as_str()
+        ) || matches!(
+            &member.declaration,
+            InterfaceMember::Operation(operation) if operation.identifier.map(|id| id.0) == Some(name.as_str())
+        )))
+    {
+        return Err(Error(format!(
+            "{0}: unimplemented member {name:?} is not declared by the IDL",
+            declaration.name
+        )));
+    }
+    let missing: Vec<String> = missing
+        .into_iter()
+        .filter(|name| !unimplemented.contains(name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error(format!(
+            "{0}: JS implementation does not cover IDL members {missing:?}; list them in the installation's unimplemented array",
+            declaration.name
+        )));
     }
     if !implemented.is_empty() {
         let name = declaration.name;
@@ -298,6 +311,136 @@ fn lower_members(
         )));
     }
     Ok((constructor, members))
+}
+
+fn lower_constructor_member(
+    database: &Database<'_>,
+    member: &weedle::interface::ConstructorInterfaceMember<'_>,
+    resolved: &crate::database::Member<'_>,
+    implemented: &mut BTreeMap<(String, Kind), usize>,
+) -> Result<String, Error> {
+    resolved.validate_scopes()?;
+    attributes(member.attributes.as_ref(), &[])?;
+    let (required, conversion) = arguments(database, &member.args.body.list)?;
+    signature(
+        implemented,
+        "constructor",
+        Kind::Constructor,
+        member.args.body.list.len(),
+    )?;
+    Ok(format!("[{required}, args => {conversion}]"))
+}
+
+fn lower_attribute_member(
+    database: &Database<'_>,
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    resolved: &crate::database::Member<'_>,
+    exposure: crate::database::Exposure,
+    implemented: &mut BTreeMap<(String, Kind), usize>,
+    members: &mut Vec<String>,
+) -> Result<(), Error> {
+    resolved.validate_scopes()?;
+    attributes(member.attributes.as_ref(), &["SecureContext", "SameObject"])?;
+    attributes(member.type_.attributes.as_ref(), &[])?;
+    if member.modifier.is_some() {
+        return Err(Error("JS special attributes are not supported yet".into()));
+    }
+    let name = member.identifier.0;
+    signature(implemented, name, Kind::Get, 0)?;
+    let lowered = js_type(database, &member.type_.type_)?;
+    let result = output(database, &lowered, "value")?;
+    members.push(member_descriptor(
+        name,
+        "get",
+        0,
+        "args => []",
+        &format!("(value, realm) => {result}"),
+        exposure,
+    ));
+    if member.readonly.is_none() {
+        signature(implemented, name, Kind::Set, 1)?;
+        let converted = input(&lowered, "args[0]", false)?;
+        members.push(member_descriptor(
+            name,
+            "set",
+            1,
+            &format!("args => [{converted}]"),
+            "(value, realm) => undefined",
+            exposure,
+        ));
+    }
+    Ok(())
+}
+
+fn lower_operation_member(
+    database: &Database<'_>,
+    member: &weedle::interface::OperationInterfaceMember<'_>,
+    resolved: &crate::database::Member<'_>,
+    exposure: crate::database::Exposure,
+    implemented: &mut BTreeMap<(String, Kind), usize>,
+    members: &mut Vec<String>,
+) -> Result<(), Error> {
+    resolved.validate_scopes()?;
+    attributes(member.attributes.as_ref(), &["NewObject", "SecureContext"])?;
+    if member.modifier.is_some() || member.special.is_some() {
+        return Err(Error("JS special operations are not supported yet".into()));
+    }
+    let name = member
+        .identifier
+        .as_ref()
+        .ok_or_else(|| Error("JS operations must be named".into()))?
+        .0;
+    signature(implemented, name, Kind::Method, member.args.body.list.len())?;
+    let (required, conversion) = arguments(database, &member.args.body.list)?;
+    let result = match &member.return_type {
+        weedle::types::ReturnType::Undefined(_) => "undefined".into(),
+        weedle::types::ReturnType::Type(type_) => {
+            let lowered = js_type(database, type_)?;
+            output(database, &lowered, "value")?
+        }
+    };
+    members.push(member_descriptor(
+        name,
+        "method",
+        required,
+        &format!("args => {conversion}"),
+        &format!("(value, realm) => {result}"),
+        exposure,
+    ));
+    Ok(())
+}
+
+fn member_descriptor(
+    name: &str,
+    kind: &str,
+    count: usize,
+    convert: &str,
+    result: &str,
+    exposure: crate::database::Exposure,
+) -> String {
+    format!(
+        "{{ name: {name:?}, kind: {kind:?}, count: {count}, convert: {convert}, result: {result}, exposure: {{ secureContext: {} }} }}",
+        exposure.secure_context
+    )
+}
+
+enum JsType {
+    Native(ReturnType),
+    /// `ArrayBufferView`: any typed array or `DataView`
+    /// (<https://webidl.spec.whatwg.org/#ArrayBufferView>).
+    ArrayBufferView,
+}
+
+fn js_type(database: &Database<'_>, type_: &weedle::types::Type<'_>) -> Result<JsType, Error> {
+    if matches!(
+        type_,
+        weedle::types::Type::Single(weedle::types::SingleType::NonAny(
+            weedle::types::NonAnyType::ArrayBufferView(item)
+        )) if item.q_mark.is_none()
+    ) {
+        return Ok(JsType::ArrayBufferView);
+    }
+    native_type(database, type_, &mut BTreeSet::new()).map(JsType::Native)
 }
 
 fn signature(
@@ -315,17 +458,11 @@ fn signature(
     }
 }
 
-/// Whether the list carries `[name]`.
-fn has_attribute(list: Option<&ExtendedAttributeList<'_>>, name: &str) -> bool {
-    list.is_some_and(|list| {
-        list.body.list.iter().any(|attribute| match attribute {
-            ExtendedAttribute::NoArgs(item) => item.0.0 == name,
-            _ => false,
-        })
-    })
-}
-
-fn attributes(list: Option<&ExtendedAttributeList<'_>>, supported: &[&str]) -> Result<(), Error> {
+fn attributes<'a>(
+    list: Option<&'a ExtendedAttributeList<'a>>,
+    supported: &[&str],
+) -> Result<Vec<&'a str>, Error> {
+    let mut names = Vec::new();
     if let Some(list) = list {
         for attribute in &list.body.list {
             let name = match attribute {
@@ -346,9 +483,10 @@ fn attributes(list: Option<&ExtendedAttributeList<'_>>, supported: &[&str]) -> R
                     "JS IDL semantics are not supported yet: {attribute:?}"
                 )));
             }
+            names.push(name);
         }
     }
-    Ok(())
+    Ok(names)
 }
 
 fn arguments(
@@ -370,7 +508,7 @@ fn arguments(
         // would otherwise consult the page-controlled `Array.prototype`.
         let present = format!("args.length > {index}");
         let value = format!("{present} ? args[{index}] : undefined");
-        let lowered = native_type(database, &argument.type_.type_, &mut BTreeSet::new())?;
+        let lowered = js_type(database, &argument.type_.type_)?;
         let converted = input(&lowered, &value, allow_shared)?;
         let converted = match (&argument.optional, &argument.default) {
             (None, None) if !optional => {
@@ -383,7 +521,7 @@ fn arguments(
                     return Err(Error("JS argument defaults are not supported yet".into()));
                 };
                 match &lowered {
-                    ReturnType::String | ReturnType::UsvString => {}
+                    JsType::Native(ReturnType::String | ReturnType::UsvString) => {}
                     _ => return Err(Error("JS string defaults require string arguments".into())),
                 }
                 format!(
@@ -398,30 +536,39 @@ fn arguments(
     Ok((required, format!("[{}]", conversions.join(","))))
 }
 
-fn input(type_: &ReturnType, value: &str, allow_shared: bool) -> Result<String, Error> {
+fn input(type_: &JsType, value: &str, allow_shared: bool) -> Result<String, Error> {
     // https://webidl.spec.whatwg.org/#es-type-mapping
     match type_ {
+        JsType::ArrayBufferView => Ok(format!("__tbIDLBufferSource({value}, {allow_shared})")),
         // `AllowShared` is meaningless on a copied string; only the argument
         // conversion differs from the native side.
-        ReturnType::String if !allow_shared => Ok(format!("__tbIDLString({value})")),
-        ReturnType::UsvString if !allow_shared => Ok(format!("__tbIDLUSVString({value})")),
-        ReturnType::Uint8Array => Ok(format!("__tbIDLUint8Array({value}, {allow_shared})")),
-        ReturnType::ArrayBufferView => {
-            Ok(format!("__tbIDLArrayBufferView({value}, {allow_shared})"))
+        JsType::Native(ReturnType::String) if !allow_shared => {
+            Ok(format!("__tbIDLString({value})"))
         }
-        _ => Err(Error(format!(
-            "JS argument type is not supported yet: {type_:?}"
+        JsType::Native(ReturnType::UsvString) if !allow_shared => {
+            Ok(format!("__tbIDLUSVString({value})"))
+        }
+        JsType::Native(ReturnType::Uint8Array) => {
+            Ok(format!("__tbIDLUint8Array({value}, {allow_shared})"))
+        }
+        JsType::Native(other) => Err(Error(format!(
+            "JS argument type is not supported yet: {other:?}"
         ))),
     }
 }
 
-fn output(database: &Database<'_>, type_: &ReturnType, value: &str) -> Result<String, Error> {
-    // https://webidl.spec.whatwg.org/#es-to-js-dictionary
+fn output(database: &Database<'_>, type_: &JsType, value: &str) -> Result<String, Error> {
     match type_ {
-        ReturnType::String => Ok(format!("__tbIDLResult({value}, 'string')")),
-        ReturnType::Uint8Array => Ok(format!("__tbIDLRealmUint8Array({value}, false, realm)")),
-        ReturnType::ArrayBufferView => Ok(format!("__tbIDLResultArrayBufferView({value})")),
-        ReturnType::Dictionary(name) => {
+        // The conversion of an IDL `ArrayBufferView` back to JS is the object
+        // the argument conversion already validated
+        // (<https://webidl.spec.whatwg.org/#es-buffer-source-types>).
+        JsType::ArrayBufferView => Ok(value.to_owned()),
+        JsType::Native(ReturnType::String) => Ok(format!("__tbIDLResult({value}, 'string')")),
+        JsType::Native(ReturnType::Uint8Array) => {
+            Ok(format!("__tbIDLRealmUint8Array({value}, false, realm)"))
+        }
+        // https://webidl.spec.whatwg.org/#es-to-js-dictionary
+        JsType::Native(ReturnType::Dictionary(name)) => {
             let dictionary = database.dictionary(name)?;
             attributes(dictionary.attributes.as_ref(), &[])?;
             if dictionary.inheritance.is_some() {
@@ -433,10 +580,10 @@ fn output(database: &Database<'_>, type_: &ReturnType, value: &str) -> Result<St
             for member in dictionary.members.body {
                 attributes(member.attributes.as_ref(), &[])?;
                 attributes(member.type_.attributes.as_ref(), &[])?;
-                let lowered = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
+                let lowered = js_type(database, &member.type_.type_)?;
                 if member.required.is_some()
                     || member.default.is_some()
-                    || !matches!(lowered, ReturnType::UnsignedLongLong)
+                    || !matches!(lowered, JsType::Native(ReturnType::UnsignedLongLong))
                 {
                     return Err(Error(
                         "JS result dictionary fields are not supported yet".into(),
@@ -457,8 +604,8 @@ fn output(database: &Database<'_>, type_: &ReturnType, value: &str) -> Result<St
                     .join(",")
             ))
         }
-        _ => Err(Error(format!(
-            "JS result type is not supported yet: {type_:?}"
+        JsType::Native(other) => Err(Error(format!(
+            "JS result type is not supported yet: {other:?}"
         ))),
     }
 }

@@ -74,7 +74,7 @@ Exotic fallthrough machinery the stock engine lacks (2afa33b, 88a9be3, 2339e92, 
 ### Vendored crates (no commits, recorded deltas)
 
 - fontconfig-parser 0.5.8 with roxmltree 0.21.1 (upstream pins 0.20.0). usvg and fontique already pull 0.21.1, so the pin linked two XML parsers; one requirement bump dedups them. Upstream sources and tests unchanged.
-- weedle4 at 7dd96ea plus an async_sequence terminal and type. WebIDL async-iterable support; the generator rejects conversions it cannot generate.
+- weedle4 at 7dd96ea plus an async_sequence terminal and type, and `attribute::has_no_args`/`exposed_in` so the generator asks the parsed list instead of walking it in two places. WebIDL async-iterable support; the generator rejects conversions it cannot generate.
 
 ## Open issues
 

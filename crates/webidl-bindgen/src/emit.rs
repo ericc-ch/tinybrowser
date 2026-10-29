@@ -106,7 +106,8 @@ fn member_tables(interface: &Interface) -> TokenStream {
             } else {
                 quote! { None }
             };
-            quote! { host::Member { name: #name, kind: host::MemberKind::Attribute {
+            let secure_context = attribute.exposure.secure_context;
+            quote! { host::Member { name: #name, secure_context: #secure_context, kind: host::MemberKind::Attribute {
                 getter: host::Operation::new(#id), setter: #setter,
             } } }
         });
@@ -118,11 +119,12 @@ fn member_tables(interface: &Interface) -> TokenStream {
         .iter()
         .take_while(|argument| argument.arity == ArgumentArity::Required)
         .count();
-        quote! { host::Member { name: #name, kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: #length } } }
+        let secure_context = operation.exposure.secure_context;
+        quote! { host::Member { name: #name, secure_context: #secure_context, kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: #length } } }
     });
     let stringifier = interface.stringifier.as_ref().map(|_| {
         let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
-        quote! { host::Member { name: "toString", kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: 0 } } }
+        quote! { host::Member { name: "toString", secure_context: false, kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: 0 } } }
     });
     let members = attributes_members
         .chain(operation_members)
@@ -366,6 +368,13 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
         },
         Some(PrototypeParent::Intrinsic(_)) | None => quote! {},
     };
+    let secure_context = interface.secure_context;
+    let prototype_gate = if secure_context {
+        quote! { if !host::is_secure_context(ctx)? { return Ok(None); } }
+    } else {
+        quote! {}
+    };
+    let constructor_gate = prototype_gate.clone();
     match interface.kind {
         InterfaceKind::Complete => quote! {
             use rquickjs::class::{JsClass, Readable};
@@ -376,12 +385,14 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
                 #property_hooks
 
                 fn prototype(ctx: &Ctx<'js>) -> Result<Option<rquickjs::Object<'js>>> {
+                    #prototype_gate
                     let prototype = host::prototype(ctx, #name, #parent, MEMBERS, CONSTANTS, dispatch)?;
                     host::install_unscopables(&prototype, UNSCOPABLES)?;
                     Ok(Some(prototype))
                 }
 
                 fn constructor(ctx: &Ctx<'js>) -> Result<Option<Constructor<'js>>> {
+                    #constructor_gate
                     let prototype = Self::prototype(ctx)?.ok_or_else(|| {
                         rquickjs::Exception::throw_internal(ctx, "native interface has no prototype")
                     })?;
@@ -854,7 +865,6 @@ fn getter_dispatch(getter: &Attribute, interface: &Interface) -> TokenStream {
             | ReturnType::StringSequence
             | ReturnType::NullableDocumentType
             | ReturnType::Uint8Array
-            | ReturnType::ArrayBufferView
             | ReturnType::UnsignedLongLong
             | ReturnType::Short
             | ReturnType::Any => {
