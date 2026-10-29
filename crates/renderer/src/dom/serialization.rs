@@ -256,7 +256,9 @@ fn serialize_html_node(
             output.push_str(name);
             output.push_str(">");
         }
-        NodeData::ProcessingInstruction { target, contents } => {
+        NodeData::ProcessingInstruction {
+            target, contents, ..
+        } => {
             output.push_str("<?");
             output.push_str(target);
             output.push_str(" ");
@@ -420,7 +422,9 @@ pub(crate) fn serialize_xml_node(doc: &BlitzDocument, id: BlitzId, output: &mut 
             }
             output.push_str(">");
         }
-        NodeData::ProcessingInstruction { target, contents } => {
+        NodeData::ProcessingInstruction {
+            target, contents, ..
+        } => {
             output.push_str("<?");
             output.push_str(target);
             output.push_str(" ");

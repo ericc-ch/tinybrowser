@@ -2571,17 +2571,16 @@ pub(super) fn pi_attributes(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<(String, St
                 .base
                 .get_node(id.node)
                 .and_then(|node| match &node.data {
-                    NodeData::ProcessingInstruction { contents, .. } => {
-                        blitz_dom::pseudo_attributes::parse(contents)
-                    }
+                    NodeData::ProcessingInstruction { attributes, .. } => Some(attributes.clone()),
                     _ => None,
                 })
         })
         .unwrap_or_default())
 }
 
-/// Rewrites the instruction's data from an attribute map; the map is
-/// derived from the data, so there is no second store to keep in step
+/// Rewrites the instruction's data from an attribute map and keeps the map
+/// as given: serializing a name the XML grammar rejects (an attribute local
+/// name such as `$`) must not lose it on the way back
 /// (<https://dom.spec.whatwg.org/#update-data-from-attributes>).
 pub(super) fn write_pi_attributes(
     ctx: &Ctx<'_>,
@@ -2589,7 +2588,18 @@ pub(super) fn write_pi_attributes(
     attributes: Vec<(String, String)>,
 ) -> Result<()> {
     let data = blitz_dom::pseudo_attributes::serialize(&attributes);
-    set_character_data(ctx, id, &DomString::from(data))
+    set_character_data(ctx, id, &DomString::from(data))?;
+    let owner = world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(id) else {
+        return Ok(());
+    };
+    parsed
+        .document
+        .base
+        .mutate()
+        .set_processing_instruction_attributes(id.node, attributes);
+    Ok(())
 }
 
 pub(super) fn doctype_field(

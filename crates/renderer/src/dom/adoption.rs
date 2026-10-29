@@ -36,6 +36,10 @@ pub(crate) enum ImportSnapshot {
     ProcessingInstruction {
         target: String,
         data: crate::dom_string::DomString,
+        /// The DOM attribute map. A name the XML grammar rejects (an
+        /// attribute local name such as `$`) cannot be re-derived from the
+        /// serialized data, so an import carries it.
+        attributes: Vec<(String, String)>,
     },
     CData(crate::dom_string::DomString),
     Fragment(Vec<ImportSnapshot>),
@@ -115,12 +119,13 @@ pub(crate) fn import_snapshot(
             public_id: public_id.clone(),
             system_id: system_id.clone(),
         }),
-        NodeData::ProcessingInstruction { target, .. } => {
-            Some(ImportSnapshot::ProcessingInstruction {
-                target: target.clone(),
-                data: doc.character_data(id.node),
-            })
-        }
+        NodeData::ProcessingInstruction {
+            target, attributes, ..
+        } => Some(ImportSnapshot::ProcessingInstruction {
+            target: target.clone(),
+            data: doc.character_data(id.node),
+            attributes: attributes.clone(),
+        }),
         NodeData::CDataSection { .. } => Some(ImportSnapshot::CData(doc.character_data(id.node))),
         NodeData::AnonymousBlock(_) | NodeData::Fragment { .. } => {
             let children = if deep {
@@ -205,9 +210,16 @@ pub(crate) fn materialize_import(
                 node: blitz_id,
             })
         }
-        ImportSnapshot::ProcessingInstruction { target, data } => {
+        ImportSnapshot::ProcessingInstruction {
+            target,
+            data,
+            attributes,
+        } => {
             let text = data.to_string_lossy().into_owned();
             let blitz_id = doc.create_processing_instruction(target, &text);
+            doc.base
+                .mutate()
+                .set_processing_instruction_attributes(blitz_id, attributes.clone());
             Ok(NodeId {
                 document,
                 node: blitz_id,

@@ -520,14 +520,37 @@ fn clear_other_options(parsed: &mut Parsed, select: BlitzId, keep: BlitzId) {
     }
 }
 
-/// Runs the selectedness setting algorithm when an option enters a select
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
-/// The inserted option's slot already came from its `selected` attribute, so
-/// the algorithm alone picks the last selected option in a single select.
+/// Runs the option insertion steps: a selected option in a single select
+/// deselects the others, then the select's selectedness setting algorithm
+/// applies its default
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-option-element>,
+/// <https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
 pub(crate) fn option_inserted(parsed: &mut Parsed, option: BlitzId) {
     let Some(select) = option_select_owner(&parsed.document.base, option) else {
         return;
     };
+    // An insertion batch replays its insertion steps after every node is in
+    // place, so the slot may already have been cleared by an earlier option.
+    // A clear dirtiness flag means the `selected` attribute is still the
+    // default, and it wins over such a clear; a dirtiness flag means script
+    // set the selectedness and it wins over the attribute
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-dirtiness>).
+    let selected = parsed
+        .document
+        .base
+        .get_node(option)
+        .and_then(|node| node.data.downcast_element())
+        .is_some_and(|element| {
+            if element.form_state.dirty_selectedness {
+                element.selectedness()
+            } else {
+                attr(&parsed.document.base, option, "selected").is_some() || element.selectedness()
+            }
+        });
+    set_option_selectedness(parsed, option, selected);
+    if selected && attr(&parsed.document.base, select, "multiple").is_none() {
+        clear_other_options(parsed, select, option);
+    }
     parsed.document.invalidate_selectedness(select);
     run_selectedness_setting(parsed, select);
 }

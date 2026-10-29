@@ -1352,16 +1352,12 @@ fn write_character_data(base: &mut blitz_dom::BaseDocument, id: NodeId, utf8: &s
         }
         NodeData::ProcessingInstruction { .. } => {
             base.snapshot_node(id.node);
-            base.get_node_mut(id.node)
-                .and_then(|node| match &mut node.data {
-                    NodeData::ProcessingInstruction { contents, .. } => Some(contents),
-                    _ => None,
-                })
-                .is_some_and(|contents| {
-                    contents.clear();
-                    contents.push_str(utf8);
-                    true
-                })
+            // Writing the data re-derives the pseudo-attributes, so the
+            // attribute accessors and the style-sheet loader never read a
+            // map older than the data
+            // (<https://www.w3.org/TR/xml-stylesheet/#dt-parsing>).
+            base.mutate().set_processing_instruction_data(id.node, utf8);
+            true
         }
         NodeData::CDataSection { .. } => {
             base.snapshot_node(id.node);
