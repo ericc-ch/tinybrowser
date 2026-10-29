@@ -23,5 +23,4 @@ pub use protocol::{
 };
 pub use referrer::{Referrer, ReferrerClient, ReferrerPolicy, determine_referrer};
 pub use resolve::{InvalidResolveRule, ResolveRule};
-pub use secure_context::{is_origin_potentially_trustworthy, is_potentially_trustworthy};
 pub use transport::{InvalidCa, InvalidProxy, Proxy, TrustedCa};

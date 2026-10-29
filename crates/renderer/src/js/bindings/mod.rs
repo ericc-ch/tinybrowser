@@ -1924,10 +1924,10 @@ mod realm_tests {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();
         for (url, expected) in [
-            ("https://a.test/", "true,function,false"),
+            ("https://a.test/", "true,function,true,function"),
             // `http://a.test` is not loopback, so it is not potentially
             // trustworthy.
-            ("http://a.test/", "false,undefined,true"),
+            ("http://a.test/", "false,undefined,false,undefined"),
         ] {
             let stop = Arc::new(Stop::new());
             let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
@@ -1947,79 +1947,13 @@ mod realm_tests {
                     [
                       String(isSecureContext),
                       typeof crypto.randomUUID,
-                      String(navigator.userAgentData === undefined)
+                      String('userAgentData' in navigator),
+                      typeof NavigatorUAData
                     ].join(",");
                     "#,
                 )
                 .expect("secure context surfaces");
             assert_eq!(outcome, expected, "{url}");
-        }
-    }
-
-    /// A nested environment inherits its creator's secure-context bit: an
-    /// `https` iframe inside an `http` page is not a secure context even though
-    /// its own URL is, and a `data:` top-level document never is
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
-    #[test]
-    fn a_nested_environment_inherits_its_creators_secure_context() {
-        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
-        let shared = SharedJsRuntime::default();
-        for (parent_url, child_url, expected) in [
-            // An `https` iframe inside an `http` page is still insecure.
-            ("http://a.test/", "https://b.test/", false),
-            // The same iframe inside an `https` page is secure.
-            ("https://a.test/", "https://b.test/", true),
-            // A `data:` top-level document has an opaque origin.
-            ("data:text/html,x", "https://b.test/", false),
-            // The child's own scheme still decides: an `http` iframe is
-            // insecure even inside an `https` page.
-            ("https://a.test/", "http://b.test/", false),
-        ] {
-            let stop = Arc::new(Stop::new());
-            let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
-            let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
-            let runtime = crate::js::FrameRuntime {
-                services: Arc::clone(&services),
-                identity: net::Identity::default(),
-                js_runtime: shared.handle(),
-                wake: Arc::new(tokio::sync::Notify::new()),
-                stop,
-                documents: Rc::clone(&documents),
-                registry: Rc::clone(&registry),
-                shared: Rc::new(RefCell::new(crate::messaging::Shared::default())),
-                pending_storage: Rc::new(RefCell::new(Vec::new())),
-                turn_deadline: Rc::new(std::cell::Cell::new(None)),
-                font_ctx: parley::FontContext::default(),
-            };
-            let parent = Rc::new(RefCell::new(World::new(
-                Url::parse(parent_url).expect("parent url"),
-                FrameId::MAIN,
-                &runtime,
-                Rc::new(RefCell::new(Vec::new())),
-            )));
-            registry.borrow_mut().insert_frame(FrameId::MAIN, &parent);
-
-            let child_frame = runtime.shared.borrow_mut().allocate_frame();
-            runtime.shared.borrow_mut().tree.add_container(
-                FrameId::MAIN,
-                child_frame,
-                crate::dom::tree::NodeId {
-                    document: 0,
-                    node: blitz_dom::NodeId::default(),
-                },
-                None,
-            );
-            let child = World::new(
-                Url::parse(child_url).expect("child url"),
-                child_frame,
-                &runtime,
-                Rc::new(RefCell::new(Vec::new())),
-            );
-            assert_eq!(
-                child.is_secure_context(),
-                expected,
-                "{parent_url} -> {child_url}"
-            );
         }
     }
 

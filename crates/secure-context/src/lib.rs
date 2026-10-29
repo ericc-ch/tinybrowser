@@ -6,24 +6,46 @@
 
 use url::{Host, Origin, Url};
 
+/// Whether `url` is potentially trustworthy
+/// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
+///
+/// `about:blank`, `about:srcdoc`, `data:`, and `file:` are trustworthy by
+/// definition; a `blob:` URL answers for the entry `URL.createObjectURL()`
+/// minted; a tuple URL answers for its scheme and host. This is the URL rule,
+/// not HTML's environment rule: a `data:` document is still never a secure
+/// context, which [`is_secure_environment`] decides.
+#[must_use]
+pub fn is_potentially_trustworthy(url: &Url) -> bool {
+    match url.scheme() {
+        "about" => matches!(url.path(), "blank" | "srcdoc"),
+        "data" | "file" => true,
+        "blob" => is_trustworthy_origin(&url.origin()) || blob_creator_is_file(url),
+        _ => is_trustworthy_origin(&url.origin()),
+    }
+}
+
+/// Whether an environment whose document URL is `url` is a secure context,
+/// given its creator's bit (`None` for a top-level environment)
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+///
+/// This is HTML's environment algorithm rather than the URL rule: a `data:`
+/// document is never a secure context even though its URL is potentially
+/// trustworthy, and an insecure creator makes every descendant insecure.
+#[must_use]
+pub fn is_secure_environment(url: &Url, creator: Option<bool>) -> bool {
+    url.scheme() != "data" && is_potentially_trustworthy(url) && creator.unwrap_or(true)
+}
+
 /// Whether `origin` is potentially trustworthy
 /// (<https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy>).
 ///
-/// An opaque origin is never trustworthy: a `data:` document, a sandboxed
-/// document with an opaque origin, and a `blob:` URL whose creator has no
-/// entry all answer false, whatever their scheme looks like.
-#[must_use]
-pub fn is_origin_potentially_trustworthy(origin: &Origin) -> bool {
+/// An opaque origin is never trustworthy, and `https`/`wss` or a loopback
+/// host is.
+fn is_trustworthy_origin(origin: &Origin) -> bool {
     let Origin::Tuple(scheme, host, _) = origin else {
         return false;
     };
-    if scheme.eq_ignore_ascii_case("https")
-        || scheme.eq_ignore_ascii_case("wss")
-        || scheme.eq_ignore_ascii_case("file")
-    {
-        return true;
-    }
-    is_localhost(host)
+    matches!(scheme.as_str(), "https" | "wss") || is_localhost(host)
 }
 
 /// Whether `host` is a loopback address or a `localhost` name
@@ -39,46 +61,29 @@ fn is_localhost(host: &Host<String>) -> bool {
     }
 }
 
-/// Whether `url` is potentially trustworthy
-/// (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
+/// Whether `url` is a `blob:` URL minted on a `file:` URL.
 ///
-/// The answer comes from the URL's origin: an opaque origin (`data:`) is not
-/// trustworthy, a `blob:` URL answers for its creator's origin, and a tuple
-/// origin answers for its scheme and host. `about:blank` and `about:srcdoc`
-/// inherit their creator's context, which this predicate cannot see; a caller
-/// that knows the creator passes the origin instead.
-#[must_use]
-pub fn is_potentially_trustworthy(url: &Url) -> bool {
-    match url.scheme() {
-        "about" => matches!(url.path(), "blank" | "srcdoc"),
-        // A `file:` URL's origin is opaque in the URL standard, but a local
-        // file is potentially trustworthy
-        // (<https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy>).
-        "file" => true,
-        "blob" => blob_creator_url(url).is_some_and(|inner| is_potentially_trustworthy(&inner)),
-        _ => is_origin_potentially_trustworthy(&url.origin()),
-    }
-}
-
-/// The URL whose origin a `blob:` URL carries, per the URL standard's blob
-/// origin step
-/// (<https://url.spec.whatwg.org/#origin>).
-///
-/// Only an entry minted by `URL.createObjectURL()` exists, and its stored
-/// origin serializes to `http`, `https`, or `file`; any other inner scheme —
-/// including a nested `blob:` — names no entry, so its origin is opaque.
-fn blob_creator_url(url: &Url) -> Option<Url> {
-    let inner = Url::parse(url.as_str().strip_prefix("blob:")?).ok()?;
-    matches!(inner.scheme(), "http" | "https" | "file").then_some(inner)
+/// Every other blob entry resolves through [`Url::origin()`]; a local file is
+/// potentially trustworthy while the url crate reports its origin as opaque,
+/// so this one creator needs the inner URL.
+fn blob_creator_is_file(url: &Url) -> bool {
+    url.as_str()
+        .strip_prefix("blob:")
+        .and_then(|inner| Url::parse(inner).ok())
+        .is_some_and(|inner| inner.scheme() == "file")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_potentially_trustworthy;
+    use super::{is_potentially_trustworthy, is_secure_environment};
     use url::Url;
 
+    fn url(value: &str) -> Url {
+        Url::parse(value).expect("url")
+    }
+
     fn trustworthy(value: &str) -> bool {
-        is_potentially_trustworthy(&Url::parse(value).expect("url"))
+        is_potentially_trustworthy(&url(value))
     }
 
     #[test]
@@ -88,15 +93,34 @@ mod tests {
         assert!(trustworthy("file:///tmp/page.html"));
         assert!(trustworthy("blob:https://example.com/uuid"));
         assert!(trustworthy("blob:http://localhost/uuid"));
+        assert!(trustworthy("blob:file:///tmp/page.html"));
     }
 
     #[test]
-    fn nested_blob_urls_have_an_opaque_origin() {
-        // Only `URL.createObjectURL` mints an entry, and it serializes an
-        // origin, never another `blob:` URL
-        // (<https://url.spec.whatwg.org/#origin>).
-        assert!(!trustworthy("blob:blob:https://example.com/uuid"));
-        assert!(!trustworthy("blob:blob:blob:https://example.com/uuid"));
+    fn a_data_url_is_trustworthy_but_never_a_secure_environment() {
+        // "Is url potentially trustworthy" answers for the URL alone
+        // (<https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>);
+        // HTML excludes `data:` from secure contexts, not this predicate.
+        assert!(trustworthy("data:,x"));
+        assert!(!is_secure_environment(&url("data:,x"), None));
+        assert!(!is_secure_environment(&url("data:,x"), Some(true)));
+    }
+
+    #[test]
+    fn an_environment_is_secure_only_inside_a_secure_creator() {
+        assert!(is_secure_environment(&url("https://a.test/"), None));
+        assert!(is_secure_environment(&url("https://a.test/"), Some(true)));
+        assert!(!is_secure_environment(&url("https://a.test/"), Some(false)));
+        assert!(!is_secure_environment(&url("http://a.test/"), None));
+        assert!(is_secure_environment(&url("http://localhost/"), None));
+    }
+
+    #[test]
+    fn a_blob_url_answers_for_its_creator() {
+        // The blob origin step parses the encoded URL and answers for that
+        // URL's origin (<https://url.spec.whatwg.org/#origin>), so a creator
+        // with no trustworthy origin does not make its blob trustworthy.
         assert!(!trustworthy("blob:data:,x"));
+        assert!(!trustworthy("blob:http://a.test/uuid"));
     }
 }

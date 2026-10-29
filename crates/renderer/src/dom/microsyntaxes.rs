@@ -586,16 +586,3 @@ pub(crate) fn range_default(minimum: &Decimal, maximum: &Decimal) -> Decimal {
     };
     Decimal::from_mantissa(half_scaled, scale)
 }
-
-/// Parses a `crossorigin` content attribute into its CORS settings state
-/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#attr-crossorigin>).
-///
-/// An absent attribute is `None`, which means no CORS request at all. An empty
-/// or unknown value is `Anonymous`, the spec's "invalid value default", so an
-/// invalid spelling never sends credentials
-/// (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#enumerated-attribute>).
-pub(crate) fn cross_origin(value: Option<&str>) -> Option<net::cors::CrossOrigin> {
-    value.map(|value| {
-        net::cors::CrossOrigin::parse(value).unwrap_or(net::cors::CrossOrigin::Anonymous)
-    })
-}

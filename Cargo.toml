@@ -39,11 +39,9 @@ secure-context = { path = "crates/secure-context" }
 server = { path = "crates/server" }
 webdriver = { path = "crates/webdriver" }
 webstorage = { path = "crates/webstorage" }
-# The xml5ever parser fork owns the only copy of the XML `Name` production.
-xml5ever = { path = "third_party/html5ever/xml5ever" }
-# The registry release the parser builds against; pinning it here keeps the
-# renderer on the same atom and tendril types as every other consumer.
-markup5ever = "=0.40.0"
+# `[patch.crates-io]` supplies the fork path.
+xml5ever = "0.40"
+markup5ever = "0.40"
 
 [patch.crates-io]
 # fontconfig-parser 0.5.8 pins roxmltree 0.20; usvg and fontique pin 0.21.
@@ -57,8 +55,8 @@ blitz-traits = { path = "third_party/blitz/packages/blitz-traits" }
 # bump introduced; the vendored copy in the blitz fork has it, and renderer
 # needs the trait to keep its direct clone_* calls compiling.
 stylo_taffy = { path = "third_party/blitz/packages/stylo_taffy" }
-# The xml5ever parser fork. It builds against registry markup5ever so the
-# whole graph shares one atom/tendril/TreeSink type family.
+# The xml5ever parser fork, shared with blitz-dom so the XML name and
+# processing-instruction grammar has one implementation.
 xml5ever = { path = "third_party/html5ever/xml5ever" }
 rquickjs = { path = "third_party/rquickjs" }
 rquickjs-core = { path = "third_party/rquickjs/core" }

@@ -12,10 +12,7 @@
 //! <https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
 
 use super::{focus, host_node_id, owning_world, world, world_for_node};
-use crate::dom::forms::{
-    PendingEntry, encode_form, set_option_selectedness as store_option_selectedness, trim_label,
-    urlencode_form,
-};
+use crate::dom::forms::{self, PendingEntry, encode_form, trim_label, urlencode_form};
 use crate::dom::tree::{NodeId, is_html_element};
 use crate::js::{FrameNavigation, World};
 use rquickjs::prelude::Opt;
@@ -51,7 +48,7 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
     )?;
     globals.set(
         "__tbSetOptionSelectedness",
-        rquickjs::prelude::Func::from(set_option_selectedness),
+        rquickjs::prelude::Func::from(store_option_selectedness),
     )?;
     globals.set(
         "__tbFormCanSubmit",
@@ -115,7 +112,11 @@ pub(super) fn encoding_name(label: String) -> Option<String> {
 /// `Option()` constructor does, and leaves the `selected` content attribute
 /// driving it
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-option>).
-fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bool) -> Result<()> {
+fn store_option_selectedness<'js>(
+    ctx: Ctx<'js>,
+    element: Value<'js>,
+    selected: bool,
+) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Ok(());
     };
@@ -124,7 +125,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    store_option_selectedness(&mut parsed, node.node, selected);
+    forms::set_option_selectedness(&mut parsed, node.node, selected);
     Ok(())
 }
 

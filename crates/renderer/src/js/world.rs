@@ -1330,11 +1330,6 @@ pub(crate) struct World {
     pub(crate) runtime: FrameRuntime,
     /// The frame this realm belongs to.
     frame: FrameId,
-    /// Whether this realm's environment is a secure context. Fixed when the
-    /// document is created and inherited: an insecure ancestor makes every
-    /// descendant insecure, however secure its own URL looks
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
-    secure_context: bool,
     /// Page-scoped scripts registered through CDP to run in every new realm
     /// of this tab, shared by every frame's world, with their identifiers
     /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#method-addScriptToEvaluateOnNewDocument>).
@@ -1812,10 +1807,9 @@ impl World {
         runtime: &FrameRuntime,
         init_scripts: Rc<RefCell<Vec<(u64, String)>>>,
     ) -> Self {
-        let mut world = Self {
+        let world = Self {
             runtime: runtime.clone(),
             frame,
-            secure_context: false,
             init_scripts,
             viewport_size: Cell::new(crate::engine::DEFAULT_VIEWPORT),
             pending_frames: Vec::new(),
@@ -1858,7 +1852,7 @@ impl World {
             deliver_mutations_fn: None,
             images: ImageState::default(),
         };
-        world.recompute_secure_context();
+        world.commit_secure_context();
         world
     }
 
@@ -1997,7 +1991,7 @@ impl World {
         };
         let base = &parsed.document.base;
         SubresourceOptions {
-            crossorigin: crate::dom::microsyntaxes::cross_origin(crate::dom::tree::attr(
+            crossorigin: net::cors::CrossOrigin::from_attribute(crate::dom::tree::attr(
                 base,
                 element.node,
                 "crossorigin",
@@ -2097,46 +2091,36 @@ impl World {
         self.frame
     }
 
-    /// Whether this realm's environment is a secure context
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts>).
+    /// Whether this realm's environment is a secure context. The model is
+    /// Chromium's, not HTML's text; the disagreement is in
+    /// `docs/upstream.md`.
     pub(crate) fn is_secure_context(&self) -> bool {
-        self.secure_context
+        self.runtime
+            .shared
+            .borrow()
+            .tree
+            .secure_context(self.frame)
+            .expect("a live frame records its secure-context bit")
     }
 
-    /// Recomputes the environment's secure-context bit after a navigation or
-    /// history update changed its URL and origin.
-    ///
-    /// The bit is the environment's own origin being potentially trustworthy
-    /// and every ancestor's bit being set: an `https` iframe inside an `http`
-    /// page is not secure, and a `data:` document never is, because its
-    /// origin is opaque.
-    fn recompute_secure_context(&mut self) {
-        let creator = {
+    /// Records this environment's secure-context bit when its document
+    /// commits. Only a child navigable inherits; a popup is its own top-level
+    /// environment.
+    pub(crate) fn commit_secure_context(&self) {
+        let secure = {
             let shared = self.runtime.shared.borrow();
-            shared
-                .tree
-                .parent(self.frame)
-                .or_else(|| shared.tree.auxiliary_opener(self.frame))
+            let creator = shared.tree.parent(self.frame).map(|parent| {
+                shared.tree.secure_context(parent).expect(
+                    "a parent frame records its secure-context bit before its child commits",
+                )
+            });
+            secure_context::is_secure_environment(&self.document_url, creator)
         };
-        let inherited = creator.is_none_or(|frame| {
-            self.runtime
-                .shared
-                .borrow()
-                .secure_contexts
-                .get(&frame)
-                .copied()
-                .unwrap_or(false)
-        });
-        // A sandboxed document keeps its `https` URL even though its origin is
-        // opaque, so the URL decides the environment's own answer; a `data:`
-        // document is never trustworthy.
-        let own = net::is_potentially_trustworthy(&self.document_url);
-        self.secure_context = own && inherited;
         self.runtime
             .shared
             .borrow_mut()
-            .secure_contexts
-            .insert(self.frame, self.secure_context);
+            .tree
+            .set_secure_context(self.frame, secure);
     }
 
     /// Whether this realm's frame is still attached to its document. A
@@ -2520,7 +2504,6 @@ impl World {
         self.referrer_url = url.clone();
         self.document_url = url;
         self.origin = origin;
-        self.recompute_secure_context();
     }
 
     /// Resolves `spec` against this document's URL, falling back to the

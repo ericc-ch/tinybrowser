@@ -259,7 +259,7 @@ impl ClientHints {
     /// trustworthy: a network attacker must not learn the exact build
     /// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>).
     pub fn write(&self, headers: &mut crate::HeaderMap, url: &Url) {
-        if !crate::is_potentially_trustworthy(url) {
+        if !secure_context::is_potentially_trustworthy(url) {
             return;
         }
         headers.insert_wire(HeaderName::from_static("sec-ch-ua"), self.ua.clone());

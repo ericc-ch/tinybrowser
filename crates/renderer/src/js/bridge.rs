@@ -57,6 +57,8 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     }
     bridge.set("evaluatePage", Func::from(evaluate_page))?;
     bridge.set("__tb_mint", Func::from(mint_handle))?;
+    let secure_context = world.borrow().is_secure_context();
+    bridge.set("__tbSecureContext", secure_context)?;
     let install: Function = ctx.eval(format!(
         "(function(host) {{ 'use strict';\n{}\n{}\n}})",
         include_str!("scripts/primordials.js"),
@@ -68,19 +70,13 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     }
     world.borrow_mut().bridge = Some(Persistent::save(ctx, bridge));
     // `isSecureContext` is a Web IDL readonly attribute: an enumerable,
-    // configurable accessor with a getter and no setter, reading the bit fixed
-    // when the realm's document was created
+    // configurable accessor with a getter and no setter
     // (<https://html.spec.whatwg.org/multipage/webappapis.html#dom-issecurecontext>).
-    let secure_world = Rc::downgrade(world);
     ctx.globals().prop(
         "isSecureContext",
-        Accessor::new_get(move || {
-            secure_world
-                .upgrade()
-                .is_some_and(|world| world.borrow().is_secure_context())
-        })
-        .enumerable()
-        .configurable(),
+        Accessor::new_get(move || secure_context)
+            .enumerable()
+            .configurable(),
     )?;
     Ok(())
 }

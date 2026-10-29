@@ -124,7 +124,8 @@ impl CookieJar {
         let Some(parsed) = parse_set_cookie(set_cookie) else {
             return false;
         };
-        let Some(stored) = receive_cookie(parsed, &op, &self.cookies) else {
+        let trustworthy = secure_context::is_potentially_trustworthy(op.url);
+        let Some(stored) = receive_cookie(parsed, &op, &self.cookies, trustworthy) else {
             return false;
         };
         self.cookies
@@ -144,11 +145,12 @@ impl CookieJar {
             return String::new();
         };
         let path = op.url.path();
+        let trustworthy = secure_context::is_potentially_trustworthy(op.url);
         let mut matched: Vec<usize> = self
             .cookies
             .iter()
             .enumerate()
-            .filter(|(_, cookie)| cookie.matches(&host, path, &op))
+            .filter(|(_, cookie)| cookie.matches(&host, path, &op, trustworthy))
             .map(|(i, _)| i)
             .collect();
         for &i in &matched {
@@ -187,9 +189,10 @@ impl CookieJar {
             return Vec::new();
         };
         let path = op.url.path();
+        let trustworthy = secure_context::is_potentially_trustworthy(op.url);
         self.cookies
             .iter()
-            .filter(|cookie| cookie.matches(&host, path, &op))
+            .filter(|cookie| cookie.matches(&host, path, &op, trustworthy))
             .map(StoredCookie::record)
             .collect()
     }
@@ -544,6 +547,7 @@ fn receive_cookie(
     parsed: ParsedSetCookie,
     op: &CookieOp<'_>,
     existing: &[StoredCookie],
+    trustworthy: bool,
 ) -> Option<StoredCookie> {
     let request_url = op.url;
     let now = op.now;
@@ -552,7 +556,7 @@ fn receive_cookie(
     let expiry = cookie_expiry(&parsed, now);
     let (host_only, domain, path, path_attr) = cookie_scope(&parsed, request_url, &host)?;
     let secure = parsed.secure;
-    if secure && !secure_context::is_potentially_trustworthy(op.url) {
+    if secure && !trustworthy {
         return None;
     }
     let http_only = parsed.http_only;
@@ -560,9 +564,7 @@ fn receive_cookie(
         return None;
     }
     // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
-    if !secure_context::is_potentially_trustworthy(op.url)
-        && overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure)
-    {
+    if !trustworthy && overlays_secure_cookie(existing, &parsed.name, &domain, &path, secure) {
         return None;
     }
     let same_site = parsed.same_site.unwrap_or(SameSite::Default);
@@ -725,7 +727,13 @@ impl StoredCookie {
         }
     }
 
-    fn matches(&self, host: &str, request_path: &str, op: &CookieOp<'_>) -> bool {
+    fn matches(
+        &self,
+        host: &str,
+        request_path: &str,
+        op: &CookieOp<'_>,
+        trustworthy: bool,
+    ) -> bool {
         let host_ok = if self.host_only {
             self.domain == host
         } else {
@@ -737,7 +745,7 @@ impl StoredCookie {
         if !path_match(request_path, &self.path) {
             return false;
         }
-        if self.secure && !secure_context::is_potentially_trustworthy(op.url) {
+        if self.secure && !trustworthy {
             return false;
         }
         if self.http_only && !matches!(op.kind, RetrievalKind::Http) {
